@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use colored::Colorize;
 use ed25519_dalek::VerifyingKey;
+use freenet_stdlib::prelude::ContractKey;
 
 #[derive(Subcommand)]
 pub enum InviteCommands {
@@ -77,20 +78,7 @@ pub async fn execute(command: InviteCommands, api: ApiClient, format: OutputForm
             invitation_code,
             nickname,
         } => {
-            // Ask for nickname if not provided
-            let nickname = match nickname {
-                Some(n) => n,
-                None => {
-                    if atty::is(atty::Stream::Stdin) {
-                        dialoguer::Input::<String>::new()
-                            .with_prompt("Enter your nickname")
-                            .default("Anonymous".to_string())
-                            .interact_text()?
-                    } else {
-                        "Anonymous".to_string()
-                    }
-                }
-            };
+            let nickname = resolve_nickname(nickname)?;
 
             if !matches!(format, OutputFormat::Json) {
                 eprintln!("Accepting invitation...");
@@ -98,28 +86,7 @@ pub async fn execute(command: InviteCommands, api: ApiClient, format: OutputForm
 
             match api.accept_invitation(&invitation_code, &nickname).await {
                 Ok((room_owner_vk, contract_key)) => {
-                    let owner_key_str = bs58::encode(room_owner_vk.as_bytes()).into_string();
-
-                    match format {
-                        OutputFormat::Human => {
-                            println!("{}", "Invitation accepted successfully!".green());
-                            println!("Room owner key: {}", owner_key_str);
-                            println!("Contract key: {}", contract_key.id());
-                            println!("\nYou can now:");
-                            println!(
-                                "  - Send messages: riverctl message send {} \"Hello!\"",
-                                owner_key_str
-                            );
-                            println!("  - List members: riverctl member list {}", owner_key_str);
-                        }
-                        OutputFormat::Json => {
-                            println!(
-                                r#"{{"status": "success", "room_owner_key": "{}", "contract_key": "{}"}}"#,
-                                owner_key_str,
-                                contract_key.id()
-                            );
-                        }
-                    }
+                    print_invitation_accepted(format, &room_owner_vk, &contract_key);
                     Ok(())
                 }
                 Err(e) => {
@@ -127,6 +94,57 @@ pub async fn execute(command: InviteCommands, api: ApiClient, format: OutputForm
                     Err(e)
                 }
             }
+        }
+    }
+}
+
+/// Resolve the invitee nickname: use the value the user passed, else prompt
+/// interactively on a TTY, else fall back to "Anonymous". Shared by
+/// `invite accept` and `dm accept` so both entry points behave identically.
+pub fn resolve_nickname(nickname: Option<String>) -> Result<String> {
+    match nickname {
+        Some(n) => Ok(n),
+        None => {
+            if atty::is(atty::Stream::Stdin) {
+                Ok(dialoguer::Input::<String>::new()
+                    .with_prompt("Enter your nickname")
+                    .default("Anonymous".to_string())
+                    .interact_text()?)
+            } else {
+                Ok("Anonymous".to_string())
+            }
+        }
+    }
+}
+
+/// Print the success report after an invitation is accepted. Shared by
+/// `invite accept` and `dm accept` so the post-accept guidance stays
+/// identical regardless of how the invitation reached the user.
+pub fn print_invitation_accepted(
+    format: OutputFormat,
+    room_owner_vk: &VerifyingKey,
+    contract_key: &ContractKey,
+) {
+    let owner_key_str = bs58::encode(room_owner_vk.as_bytes()).into_string();
+
+    match format {
+        OutputFormat::Human => {
+            println!("{}", "Invitation accepted successfully!".green());
+            println!("Room owner key: {}", owner_key_str);
+            println!("Contract key: {}", contract_key.id());
+            println!("\nYou can now:");
+            println!(
+                "  - Send messages: riverctl message send {} \"Hello!\"",
+                owner_key_str
+            );
+            println!("  - List members: riverctl member list {}", owner_key_str);
+        }
+        OutputFormat::Json => {
+            println!(
+                r#"{{"status": "success", "room_owner_key": "{}", "contract_key": "{}"}}"#,
+                owner_key_str,
+                contract_key.id()
+            );
         }
     }
 }

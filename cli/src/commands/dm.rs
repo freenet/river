@@ -8,20 +8,21 @@
 //! the sender + recipient signatures, both produced from helpers that live
 //! in the `river-core` crate.
 
-use crate::api::ApiClient;
+use crate::api::{ApiClient, Invitation};
+use crate::commands::invite::{print_invitation_accepted, resolve_nickname};
 use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::Subcommand;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::chat_delegate::OutboundDmEntry;
 use river_core::room_state::direct_messages::{
     advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
     PurgeToken, MAX_DM_MESSAGES_PER_PAIR,
 };
-use river_core::room_state::dm_body::{decode_body, DirectMessageBody};
+use river_core::room_state::dm_body::{decode_body, DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,6 +73,31 @@ pub enum DmCommands {
         /// `dm list` output.
         token: String,
     },
+    /// Accept a room invitation that arrived as a direct message.
+    ///
+    /// The River UI can "share an invite via DM" (#252): the invitation is
+    /// embedded in a DM rather than handed over as an `?invitation=…` link.
+    /// Such DMs show up in `dm list <room_id>` as `[Invitation to room …]`.
+    /// This command finds that invite DM, decodes the embedded invitation,
+    /// and joins the target room — the CLI counterpart of the UI's "Accept"
+    /// button on the invitation card.
+    ///
+    /// `room_id` is the room the invite DM was *received in* (the carrier
+    /// room), NOT the room you are joining. If you have invite DMs to more
+    /// than one room, narrow the selection with `--from`.
+    Accept {
+        /// Carrier room ID (base58 room owner key) — the room whose DM
+        /// thread contains the invitation.
+        room_id: String,
+        /// Only consider invite DMs sent by this member (short MemberId
+        /// prefix accepted). Use this to disambiguate when you have invite
+        /// DMs to several rooms.
+        #[arg(long)]
+        from: Option<String>,
+        /// Your nickname in the room you are joining.
+        #[arg(short = 'N', long)]
+        nickname: Option<String>,
+    },
 }
 
 pub async fn execute(command: DmCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
@@ -88,6 +114,11 @@ pub async fn execute(command: DmCommands, api: ApiClient, format: OutputFormat) 
             since_minutes,
         } => execute_list(api, format, &room_id, with.as_deref(), limit, since_minutes).await,
         DmCommands::Purge { room_id, token } => execute_purge(api, format, &room_id, &token).await,
+        DmCommands::Accept {
+            room_id,
+            from,
+            nickname,
+        } => execute_accept(api, format, &room_id, from.as_deref(), nickname).await,
     }
 }
 
@@ -381,19 +412,23 @@ async fn execute_list(
         // peers). Outbound DMs go through the local plaintext cache as
         // before — the cache stores the user-facing string regardless of
         // wire shape.
-        let body_str = if is_self_recipient {
+        let (body_str, is_invite) = if is_self_recipient {
             match open_direct_message(&signing_key, msg) {
                 Ok(bytes) => match decode_body(&bytes) {
-                    Ok(body) => format_dm_body_for_cli(&body, &nicknames),
-                    Err(_) => "<unable to decode body>".to_string(),
+                    Ok(body) => {
+                        let invite = matches!(body, DirectMessageBody::Invite(_));
+                        (format_dm_body_for_cli(&body, &nicknames), invite)
+                    }
+                    Err(_) => ("<unable to decode body>".to_string(), false),
                 },
-                Err(_) => "<unable to decrypt>".to_string(),
+                Err(_) => ("<unable to decrypt>".to_string(), false),
             }
         } else {
-            match outbound_lookup.get(&(msg.message.recipient, msg.purge_token())) {
+            let plaintext = match outbound_lookup.get(&(msg.message.recipient, msg.purge_token())) {
                 Some(plaintext) => plaintext.clone(),
                 None => "<sent: ciphertext only>".to_string(),
-            }
+            };
+            (plaintext, false)
         };
 
         decrypted.push(DecryptedDm {
@@ -402,6 +437,7 @@ async fn execute_list(
             timestamp: msg.message.timestamp,
             body: body_str,
             token: msg.purge_token(),
+            is_invite,
         });
     }
 
@@ -458,6 +494,15 @@ async fn execute_list(
                 }
                 println!();
             }
+            // Discoverability: invite-via-DM (#252) bodies render as
+            // `[Invitation to room …]` but aren't actionable until the user
+            // knows the accept command. Point them at it when any is present.
+            if by_peer.values().flatten().any(|dm| dm.is_invite) {
+                println!(
+                    "Tip: accept an invitation that arrived as a DM with \
+                     `riverctl dm accept {room_id}` (add `--from <sender>` if several appear above)."
+                );
+            }
         }
         OutputFormat::Json => {
             let threads: Vec<_> = by_peer
@@ -480,6 +525,7 @@ async fn execute_list(
                                     "timestamp_unix": dm.timestamp,
                                     "body": dm.body,
                                     "purge_token": hex_token(&dm.token),
+                                    "is_invitation": dm.is_invite,
                                 })
                             })
                             .collect::<Vec<_>>(),
@@ -589,6 +635,103 @@ async fn execute_purge(
     Ok(())
 }
 
+/// `dm accept` — join a room from an invitation that arrived as a DM.
+///
+/// The invite-via-DM flow (#252) embeds a CBOR `Invitation` inside a
+/// `DirectMessageBody::Invite` whose ECIES envelope only the recipient can
+/// open, so the invitation never appears as a base58 `?invitation=…` code the
+/// user could paste into `invite accept`. We decrypt every inbound DM in the
+/// carrier room, keep the ones that decode to an `Invite`, optionally filter
+/// by sender (`--from`), then accept the (single) target room through the same
+/// `accept_invitation_struct` core the base58 `invite accept` path uses — so
+/// the re-accept guard, room GET, secret persistence and join publish are all
+/// byte-identical regardless of how the invitation arrived.
+async fn execute_accept(
+    api: ApiClient,
+    format: OutputFormat,
+    room_id: &str,
+    from: Option<&str>,
+    nickname: Option<String>,
+) -> Result<()> {
+    let room_owner_key = parse_room_id(room_id)?;
+    let (signing_key, _, _) = api.storage().get_room(&room_owner_key)?.ok_or_else(|| {
+        anyhow!("Room not found. You must be a member of the carrier room to read its invite DMs.")
+    })?;
+
+    let room_state = api.get_room(&room_owner_key, false).await?;
+
+    let invites = collect_inbound_invites(&room_state, &signing_key, from);
+    if invites.is_empty() {
+        return Err(match from {
+            Some(f) => anyhow!(
+                "No invitation DMs from a sender matching '{}' were found in this room. \
+                 Run `riverctl dm list {}` to see who sent you invitations.",
+                f,
+                room_id
+            ),
+            None => anyhow!(
+                "No invitation DMs found in this room. An invitation sent via DM appears in \
+                 `riverctl dm list {}` as `[Invitation to room …]`.",
+                room_id
+            ),
+        });
+    }
+
+    // Disambiguate to a single TARGET room. Multiple invites to the SAME
+    // target are fine — accepting any one joins that room — so collapse by
+    // target owner key and only refuse when distinct targets remain. The
+    // `room_owner_vk` field is the cheap-to-inspect copy of the target key;
+    // `decode_invitation_from_payload` later verifies it against the signed
+    // invitation before we act on it.
+    let distinct_targets: HashSet<[u8; 32]> = invites
+        .iter()
+        .map(|i| i.payload.room_owner_vk.to_bytes())
+        .collect();
+    if distinct_targets.len() > 1 {
+        let mut lines: Vec<String> = invites
+            .iter()
+            .map(|i| {
+                format!(
+                    "  - room {} (from {})",
+                    short_room_key(&i.payload.room_owner_vk),
+                    short_member_id(&i.sender)
+                )
+            })
+            .collect();
+        lines.sort();
+        lines.dedup();
+        return Err(anyhow!(
+            "Found invitations to {} different rooms in this DM thread:\n{}\n\
+             Re-run with `--from <sender prefix>` to choose which one to accept.",
+            distinct_targets.len(),
+            lines.join("\n")
+        ));
+    }
+
+    // Single target room: accept the most recent invite to it. Each invite
+    // carries its own invitee signing key, so picking the newest is arbitrary
+    // but deterministic — any valid invitation to the room joins it.
+    let chosen = invites
+        .iter()
+        .max_by_key(|i| i.timestamp)
+        .expect("invites is non-empty (checked above)");
+
+    let invitation = decode_invitation_from_payload(&chosen.payload)?;
+    let nickname = resolve_nickname(nickname)?;
+
+    if !matches!(format, OutputFormat::Json) {
+        eprintln!(
+            "Accepting invitation to room {} (from {})...",
+            short_room_key(&chosen.payload.room_owner_vk),
+            short_member_id(&chosen.sender)
+        );
+    }
+
+    let (room_owner_vk, contract_key) = api.accept_invitation_struct(invitation, &nickname).await?;
+    print_invitation_accepted(format, &room_owner_vk, &contract_key);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -599,6 +742,77 @@ struct DecryptedDm {
     timestamp: u64,
     body: String,
     token: PurgeToken,
+    /// True when the decrypted body decoded to a
+    /// `DirectMessageBody::Invite` — drives the `dm list` "accept with…"
+    /// footer tip and the `is_invitation` JSON field.
+    is_invite: bool,
+}
+
+/// One inbound DM that decoded to a `DirectMessageBody::Invite`, surfaced by
+/// [`collect_inbound_invites`] for `dm accept`.
+struct InboundInvite {
+    sender: MemberId,
+    timestamp: u64,
+    payload: InvitePayload,
+}
+
+/// Decrypt every inbound DM in `state` addressed to the local member and
+/// return those that decode to a `DirectMessageBody::Invite`. `from_filter`,
+/// when set, keeps only invites whose sender's MemberId string starts with
+/// the given prefix (same prefix-matching convention as `dm list --with`).
+/// Pure (no I/O) so `dm accept`'s selection logic is unit-testable against a
+/// hand-built room state. Undecryptable or undecodable DMs are skipped rather
+/// than failing the whole command — a single corrupt entry shouldn't block
+/// accepting a valid invitation.
+fn collect_inbound_invites(
+    state: &ChatRoomStateV1,
+    signing_key: &SigningKey,
+    from_filter: Option<&str>,
+) -> Vec<InboundInvite> {
+    let self_id = MemberId::from(&signing_key.verifying_key());
+    let mut out = Vec::new();
+    for msg in &state.direct_messages.messages {
+        if msg.message.recipient != self_id {
+            continue;
+        }
+        if let Some(prefix) = from_filter {
+            if !msg.message.sender.to_string().starts_with(prefix) {
+                continue;
+            }
+        }
+        let Ok(bytes) = open_direct_message(signing_key, msg) else {
+            continue;
+        };
+        let Ok(body) = decode_body(&bytes) else {
+            continue;
+        };
+        if let DirectMessageBody::Invite(payload) = body {
+            out.push(InboundInvite {
+                sender: msg.message.sender,
+                timestamp: msg.message.timestamp,
+                payload: *payload,
+            });
+        }
+    }
+    out
+}
+
+/// Decode the CBOR `Invitation` embedded in an [`InvitePayload`] and verify it
+/// targets the room the payload advertises. The target room key is carried
+/// twice — once in the cheap-to-inspect `room_owner_vk` field and once inside
+/// the signed `Invitation` — and the `dm_body` docs say a client SHOULD reject
+/// a mismatch as malformed (the cleartext "which room" hint disagreeing with
+/// the credential we'd actually act on).
+fn decode_invitation_from_payload(payload: &InvitePayload) -> Result<Invitation> {
+    let invitation: Invitation = ciborium::de::from_reader(&payload.invitation_payload[..])
+        .map_err(|e| anyhow!("Invite DM carried an undecodable invitation: {}", e))?;
+    if invitation.room != payload.room_owner_vk {
+        return Err(anyhow!(
+            "Malformed invite DM: the embedded invitation targets a different room than the \
+             DM's advertised target. Refusing to act on it."
+        ));
+    }
+    Ok(invitation)
 }
 
 fn parse_room_id(room_id: &str) -> Result<VerifyingKey> {
@@ -696,6 +910,16 @@ fn hex_token(t: &PurgeToken) -> String {
 fn short_member_id(id: &MemberId) -> String {
     let s = id.to_string();
     s.chars().take(8).collect()
+}
+
+/// 8-char prefix of a room owner key's base58 form — the same abbreviation
+/// `dm list` shows for invite DMs, reused by `dm accept` diagnostics.
+fn short_room_key(vk: &VerifyingKey) -> String {
+    bs58::encode(vk.as_bytes())
+        .into_string()
+        .chars()
+        .take(8)
+        .collect()
 }
 
 /// Append a new outbound DM entry to the local cache, enforcing the
@@ -818,10 +1042,12 @@ fn unix_now() -> Result<u64> {
 /// * `Text` → the text itself.
 /// * `Invite` → a compact one-line summary so an inbound invite DM is
 ///   labelled distinctly from prose. The on-wire `invitation_payload`
-///   isn't decoded here — we just surface the room owner key (8-char
-///   prefix) so the recipient can `riverctl room accept` against the
-///   right target if they want to. Personal message (when present) is
-///   appended.
+///   isn't decoded here — we just surface the target room owner key (8-char
+///   prefix) so the recipient knows which room it's for. To actually join,
+///   run `riverctl dm accept <carrier room id>` (see [`execute_accept`]),
+///   which decodes the embedded invitation; `dm list` prints a tip pointing
+///   there whenever an invite DM is present. Personal message (when present)
+///   is appended.
 fn format_dm_body_for_cli(
     body: &DirectMessageBody,
     _nicknames: &HashMap<MemberId, String>,
@@ -829,11 +1055,7 @@ fn format_dm_body_for_cli(
     match body {
         DirectMessageBody::Text { text } => text.clone(),
         DirectMessageBody::Invite(payload) => {
-            let room_short: String = bs58::encode(payload.room_owner_vk.as_bytes())
-                .into_string()
-                .chars()
-                .take(8)
-                .collect();
+            let room_short = short_room_key(&payload.room_owner_vk);
             match &payload.personal_message {
                 Some(msg) if !msg.trim().is_empty() => {
                     format!("[Invitation to room {}…] {}", room_short, msg.trim())
@@ -1113,5 +1335,160 @@ mod tests {
         let bob_count = store.entries.iter().filter(|e| e.recipient == bob).count();
         assert_eq!(alice_count, MAX_DM_MESSAGES_PER_PAIR);
         assert_eq!(bob_count, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // `dm accept` selection logic (#252 CLI parity)
+    // -----------------------------------------------------------------
+
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::dm_body::encode_body;
+    use river_core::room_state::member::{AuthorizedMember, Member};
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Build a structurally-valid CBOR `Invitation` for `target_owner`,
+    /// signed by `target_owner` as the inviter. Content beyond `room` is
+    /// inert for these tests — we only exercise decode + room-match.
+    fn encode_invitation(target_owner: &SigningKey) -> Vec<u8> {
+        let target_vk = target_owner.verifying_key();
+        let owner_id = MemberId::from(&target_vk);
+        let invitee_sk = key(200);
+        let member = Member {
+            owner_member_id: owner_id,
+            member_vk: invitee_sk.verifying_key(),
+            invited_by: owner_id,
+        };
+        let invitation = Invitation {
+            room: target_vk,
+            invitee_signing_key: invitee_sk,
+            invitee: AuthorizedMember::new(member, target_owner),
+            room_secrets: vec![],
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&invitation, &mut bytes).unwrap();
+        bytes
+    }
+
+    /// Compose an inbound DM addressed to `me` from `sender` carrying the
+    /// given body bytes, anchored in carrier room `carrier_owner`.
+    fn dm_to_me(
+        sender: &SigningKey,
+        me: &SigningKey,
+        carrier_owner: &VerifyingKey,
+        body: &[u8],
+        ts: u64,
+    ) -> river_core::room_state::direct_messages::AuthorizedDirectMessage {
+        compose_direct_message(sender, &me.verifying_key(), carrier_owner, ts, ts, body).unwrap()
+    }
+
+    fn invite_body(target_owner_vk: VerifyingKey, payload_bytes: Vec<u8>) -> Vec<u8> {
+        encode_body(&DirectMessageBody::Invite(Box::new(InvitePayload {
+            room_owner_vk: target_owner_vk,
+            invitation_payload: payload_bytes,
+            personal_message: None,
+        })))
+        .unwrap()
+    }
+
+    /// `collect_inbound_invites` returns only inbound `Invite` DMs: it skips
+    /// plain text DMs, DMs addressed to someone else, and honours the
+    /// `--from` sender prefix filter.
+    #[test]
+    fn collect_inbound_invites_filters_correctly() {
+        let me = key(1);
+        let alice = key(2);
+        let bob = key(3);
+        let other = key(4);
+        let carrier = key(10).verifying_key();
+        let target_a = key(20).verifying_key();
+        let target_b = key(21).verifying_key();
+        let ts = unix_now().unwrap();
+
+        let mut state = ChatRoomStateV1::default();
+        // Invite DM to me from Alice (target room A).
+        state.direct_messages.messages.push(dm_to_me(
+            &alice,
+            &me,
+            &carrier,
+            &invite_body(target_a, vec![1, 2, 3]),
+            ts,
+        ));
+        // Plain text DM to me from Alice — must be ignored.
+        state
+            .direct_messages
+            .messages
+            .push(dm_to_me(&alice, &me, &carrier, b"just chatting", ts));
+        // Invite DM to me from Bob (target room B).
+        state.direct_messages.messages.push(dm_to_me(
+            &bob,
+            &me,
+            &carrier,
+            &invite_body(target_b, vec![4, 5, 6]),
+            ts,
+        ));
+        // Invite DM addressed to someone ELSE — must be ignored.
+        state.direct_messages.messages.push(dm_to_me(
+            &alice,
+            &other,
+            &carrier,
+            &invite_body(target_a, vec![7, 8, 9]),
+            ts,
+        ));
+
+        // No filter: both invites addressed to me, none of the noise.
+        let all = collect_inbound_invites(&state, &me, None);
+        assert_eq!(all.len(), 2, "should find Alice's and Bob's invites only");
+
+        // `--from` Alice's MemberId prefix: just her invite.
+        let alice_id = MemberId::from(&alice.verifying_key()).to_string();
+        let from_alice = collect_inbound_invites(&state, &me, Some(&alice_id[..8]));
+        assert_eq!(from_alice.len(), 1);
+        assert_eq!(
+            from_alice[0].payload.room_owner_vk, target_a,
+            "Alice's invite targets room A"
+        );
+
+        // `--from` a prefix matching nobody: empty.
+        assert!(collect_inbound_invites(&state, &me, Some("zzzzzzzz")).is_empty());
+    }
+
+    /// `decode_invitation_from_payload` round-trips a matching invitation and
+    /// rejects one whose embedded `room` disagrees with the payload's
+    /// advertised `room_owner_vk` (malformed / spoofed invite DM).
+    #[test]
+    fn decode_invitation_from_payload_validates_room_match() {
+        let target = key(30);
+        let target_vk = target.verifying_key();
+        let bytes = encode_invitation(&target);
+
+        // Matching room_owner_vk → decodes to an invitation for that room.
+        let good = InvitePayload {
+            room_owner_vk: target_vk,
+            invitation_payload: bytes.clone(),
+            personal_message: None,
+        };
+        let inv = decode_invitation_from_payload(&good).expect("matching invite should decode");
+        assert_eq!(inv.room, target_vk);
+
+        // Mismatched room_owner_vk → rejected as malformed.
+        let mismatched = InvitePayload {
+            room_owner_vk: key(31).verifying_key(),
+            invitation_payload: bytes,
+            personal_message: None,
+        };
+        let err = decode_invitation_from_payload(&mismatched)
+            .expect_err("room mismatch must be rejected");
+        assert!(err.to_string().contains("different room"), "got: {err}");
+
+        // Garbage payload → decode error, not a panic.
+        let garbage = InvitePayload {
+            room_owner_vk: target_vk,
+            invitation_payload: vec![0xff, 0x00, 0x13, 0x37],
+            personal_message: None,
+        };
+        assert!(decode_invitation_from_payload(&garbage).is_err());
     }
 }
