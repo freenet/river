@@ -28,6 +28,21 @@
 //! end-to-end on the host. Everything here is therefore written as pure
 //! functions over `Option<&[u8]>` (the stored bytes) so it has full unit
 //! coverage independent of the runtime.
+//!
+//! # Known limitation: generation resets on delete (ABA)
+//!
+//! `DeleteRequest` removes the secret, so a subsequently re-created key
+//! starts again at generation 0/1. A client still holding a pre-delete
+//! `expected_generation` could therefore match the re-created value and
+//! overwrite it — the per-key generation is monotonic only across a key's
+//! *lifetime*, not across delete/recreate cycles. This is harmless today:
+//! no CAS-tracked key is ever deleted (`rooms_data` and `outbound_dms` are
+//! only ever overwritten). PR2 introduces per-room keys with leave-room
+//! deletes; there, the authoritative leave marker is the `removed_rooms`
+//! tombstone in the meta key (carried through `Rooms::merge`), which guards
+//! the application layer independently of this counter. If a future caller
+//! needs delete-safe CAS, switch deletes to a generation-preserving
+//! tombstone envelope rather than `remove_secret`.
 
 /// Tag byte identifying a versioned-value envelope. Bumped only if the
 /// envelope layout ever changes.
@@ -52,6 +67,13 @@ pub(crate) fn encode_versioned(generation: u64, data: &[u8]) -> Vec<u8> {
 /// defensively as un-versioned raw data at generation `0`. In the current
 /// delegate every KV value is always enveloped, so the defensive branch is
 /// belt-and-suspenders for forward-compatibility, not a normal path.
+///
+/// This 1-byte tag is a heuristic, not a collision-resistant magic number —
+/// but it cannot misread real River data: every value stored via this path
+/// (`Rooms`, `OutboundDmStore`) is CBOR, whose top-level encoding is a map
+/// (major type 5: first byte `0xA0..=0xBF`) and never `ENVELOPE_TAG` (`0x01`).
+/// So a raw/legacy blob can never be mistaken for an envelope, and an
+/// envelope (always written with the tag) is never mistaken for raw data.
 pub(crate) fn decode_versioned(stored: &[u8]) -> (u64, Vec<u8>) {
     if stored.len() >= HEADER_LEN && stored[0] == ENVELOPE_TAG {
         let mut gen_bytes = [0u8; 8];

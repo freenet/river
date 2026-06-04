@@ -1850,6 +1850,58 @@ mod tests {
         }
     }
 
+    /// freenet/river#345 headline: when one tab adds room A and another adds a
+    /// DIFFERENT room B, merging the two snapshots must keep BOTH — the
+    /// additive-union path of `Rooms::merge` (vacant-entry insert) that the
+    /// chat-delegate CAS conflict-resolution relies on. Distinct from the
+    /// tombstone tests, which cover the leave/remove direction.
+    #[test]
+    fn merge_preserves_distinct_rooms_from_both_sides() {
+        let mut rng = rand::thread_rng();
+        let owner_a = SigningKey::generate(&mut rng);
+        let self_a = SigningKey::generate(&mut rng);
+        let owner_b = SigningKey::generate(&mut rng);
+        let self_b = SigningKey::generate(&mut rng);
+        let vk_a = owner_a.verifying_key();
+        let vk_b = owner_b.verifying_key();
+
+        let mut local = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            migrated_rooms: Vec::new(),
+        };
+        local
+            .map
+            .insert(vk_a, make_rejoin_test_room(&owner_a, &self_a, true));
+
+        let mut remote = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            migrated_rooms: Vec::new(),
+        };
+        remote
+            .map
+            .insert(vk_b, make_rejoin_test_room(&owner_b, &self_b, true));
+
+        local
+            .merge(remote)
+            .expect("merge of distinct rooms should succeed");
+
+        assert!(
+            local.map.contains_key(&vk_a),
+            "this tab's room A must survive"
+        );
+        assert!(
+            local.map.contains_key(&vk_b),
+            "the other tab's room B must be merged in, not clobbered"
+        );
+        assert_eq!(local.map.len(), 2);
+    }
+
     #[test]
     fn test_build_rejoin_delta_returns_none_when_member_present() {
         let mut rng = rand::thread_rng();

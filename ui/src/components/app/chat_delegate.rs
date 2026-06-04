@@ -161,10 +161,10 @@ where
     while state.dirty.swap(false, Ordering::AcqRel) {
         let result = do_save().await;
         if let Err(e) = &result {
-            warn!(
-                "{} save failed mid-coalesce, will retry latest snapshot: {}",
-                label, e
-            );
+            // The error is surfaced to the caller below. The loop re-runs only
+            // if another caller has since re-marked `dirty` (a newer snapshot
+            // is pending) — it does NOT auto-retry this same failed snapshot.
+            warn!("{} save failed mid-coalesce: {}", label, e);
         }
         // Publish this iteration's result so any caller whose own loop
         // observes dirty=false (drained by us) returns the real outcome
@@ -456,6 +456,123 @@ mod tests {
         };
         // Truncated/garbage CBOR.
         assert!(fold_conflicting_rooms(working, &[0xff, 0x00, 0x12, 0x34]).is_err());
+    }
+
+    fn empty_rooms() -> crate::room_data::Rooms {
+        use std::collections::{HashMap, HashSet};
+        crate::room_data::Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: HashSet::new(),
+            notification_modes: HashMap::new(),
+            migrated_rooms: Vec::new(),
+        }
+    }
+
+    /// CAS loop: stores on the first attempt when there's no conflict, and
+    /// reports `merged_remote == false` (no write-back needed).
+    #[test]
+    fn cas_loop_stores_on_first_attempt_without_merge() {
+        let calls = std::cell::RefCell::new(0u32);
+        let outcome = futures::executor::block_on(run_rooms_cas_loop(
+            empty_rooms(),
+            5,
+            |_value, expected| {
+                *calls.borrow_mut() += 1;
+                assert_eq!(expected, 5, "first attempt uses the supplied generation");
+                async move { Ok(CasStoreResult::Stored { generation: 6 }) }
+            },
+        ))
+        .unwrap_or_else(|e| panic!("cas loop failed: {e}"));
+        assert_eq!(*calls.borrow(), 1);
+        assert_eq!(outcome.generation, 6);
+        assert!(!outcome.merged_remote);
+    }
+
+    /// freenet/river#345 core: on a conflict the loop adopts the delegate's
+    /// generation, folds the remote snapshot into the working copy, and
+    /// retries — so the retried write carries BOTH writers' state and the
+    /// outcome flags `merged_remote` (driving the ROOMS write-back).
+    #[test]
+    fn cas_loop_folds_remote_on_conflict_then_stores() {
+        use ed25519_dalek::SigningKey;
+        use std::collections::HashSet;
+
+        let vk_x = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let vk_y = SigningKey::from_bytes(&[2u8; 32]).verifying_key();
+
+        let mut working = empty_rooms();
+        working.removed_rooms = HashSet::from([vk_x]); // this tab left X
+
+        let mut remote = empty_rooms();
+        remote.removed_rooms = HashSet::from([vk_y]); // other tab left Y
+        let mut remote_bytes = Vec::new();
+        ciborium::ser::into_writer(&remote, &mut remote_bytes).unwrap();
+
+        // Scripted responses popped from the end: conflict first, then stored.
+        let script = std::cell::RefCell::new(vec![
+            CasStoreResult::Stored { generation: 8 },
+            CasStoreResult::Conflict {
+                current_generation: 7,
+                current_value: Some(remote_bytes),
+            },
+        ]);
+        let seen_expected = std::cell::RefCell::new(Vec::new());
+
+        let outcome =
+            futures::executor::block_on(run_rooms_cas_loop(working, 0, |_value, expected| {
+                seen_expected.borrow_mut().push(expected);
+                let r = script.borrow_mut().pop().expect("scripted response");
+                async move { Ok(r) }
+            }))
+            .unwrap_or_else(|e| panic!("cas loop failed: {e}"));
+
+        // Second attempt retried at the adopted generation (7), not 0.
+        assert_eq!(*seen_expected.borrow(), vec![0, 7]);
+        assert_eq!(outcome.generation, 8);
+        assert!(outcome.merged_remote);
+        // Both writers' tombstones survive in the stored snapshot (no clobber).
+        assert!(outcome.stored.removed_rooms.contains(&vk_x));
+        assert!(outcome.stored.removed_rooms.contains(&vk_y));
+    }
+
+    /// CAS loop gives up with an error after `ROOMS_CAS_MAX_ATTEMPTS`
+    /// consecutive conflicts (pathological competing-writers case). In-memory
+    /// rooms are untouched; the caller surfaces the error.
+    #[test]
+    fn cas_loop_returns_err_on_exhaustion() {
+        let calls = std::cell::RefCell::new(0u32);
+        let result = futures::executor::block_on(run_rooms_cas_loop(
+            empty_rooms(),
+            0,
+            |_value, _expected| {
+                *calls.borrow_mut() += 1;
+                async move {
+                    Ok(CasStoreResult::Conflict {
+                        current_generation: 1,
+                        current_value: None,
+                    })
+                }
+            },
+        ));
+        assert!(result.is_err());
+        assert_eq!(*calls.borrow(), ROOMS_CAS_MAX_ATTEMPTS);
+    }
+
+    /// A delegate-side store failure propagates out of the loop immediately.
+    #[test]
+    fn cas_loop_propagates_failed() {
+        let result = futures::executor::block_on(run_rooms_cas_loop(
+            empty_rooms(),
+            0,
+            |_value, _expected| async move {
+                Ok(CasStoreResult::Failed("secret store error".to_string()))
+            },
+        ));
+        match result {
+            Err(e) => assert_eq!(e, "secret store error"),
+            Ok(_) => panic!("expected the Failed result to propagate as an error"),
+        }
     }
 
     /// Current delegate returned no `rooms_data` value at all — fire migration.
@@ -1589,6 +1706,12 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
 /// left — and preserves THIS tab's `current_room_key` (per-tab UI state,
 /// not shared truth). Extracted as a free function so the merge has unit
 /// coverage independent of the async/signal machinery.
+///
+/// Note: `Rooms::merge` intentionally does NOT take `current_room_key` or
+/// `migrated_rooms` from the remote. `current_room_key` is per-tab UI state;
+/// `migrated_rooms` is transient, locally-driven upgrade-pointer bookkeeping
+/// that `merge` re-derives via `regenerate_contract_key` for each folded
+/// room. Only `map`, `removed_rooms`, and `notification_modes` union.
 fn fold_conflicting_rooms(
     mut working: crate::room_data::Rooms,
     remote_bytes: &[u8],
@@ -1603,62 +1726,137 @@ fn fold_conflicting_rooms(
     Ok(working)
 }
 
-async fn do_save_rooms_to_delegate() -> Result<(), String> {
-    info!("Saving rooms to delegate storage (compare-and-swap)");
+/// Result of a successful rooms compare-and-swap save loop.
+struct CasSaveOutcome {
+    /// The snapshot that was actually stored (the working copy after any
+    /// conflict-merges). When `merged_remote` is true this is a superset of
+    /// the caller's original snapshot and must be reflected back into `ROOMS`.
+    stored: crate::room_data::Rooms,
+    /// Generation the value now has on the delegate.
+    generation: u64,
+    /// True iff at least one conflict was resolved by folding a remote
+    /// snapshot into the working copy (i.e. another writer's rooms were
+    /// merged in). Drives the post-save write-back into the `ROOMS` signal.
+    merged_remote: bool,
+}
 
-    // Snapshot the in-memory rooms once. On a CAS conflict we merge the
-    // conflicting remote snapshot into THIS working copy (we never mutate
-    // the ROOMS signal mid-loop — Dioxus signal-safety), then retry, so a
-    // concurrent tab's rooms are preserved rather than clobbered.
-    let mut working = {
-        let mut rooms_clone = ROOMS.read().clone();
-        rooms_clone.current_room_key = CURRENT_ROOM.read().owner_key;
-        rooms_clone
-    };
-
+/// Pure driver for the rooms compare-and-swap save loop (freenet/river#345).
+///
+/// `cas_store(value, expected_generation)` performs one CAS attempt. On a
+/// `Conflict` the loop adopts the delegate's true generation, folds the
+/// conflicting remote snapshot into `working` (so a concurrent tab's rooms
+/// survive), and retries — up to [`ROOMS_CAS_MAX_ATTEMPTS`]. Factored out of
+/// [`do_save_rooms_to_delegate`] so the convergence/retry/exhaustion logic
+/// is unit-testable with an injected closure, independent of the websocket
+/// and the Dioxus signals.
+async fn run_rooms_cas_loop<F, Fut>(
+    mut working: crate::room_data::Rooms,
+    mut expected_generation: u64,
+    mut cas_store: F,
+) -> Result<CasSaveOutcome, String>
+where
+    F: FnMut(Vec<u8>, u64) -> Fut,
+    Fut: std::future::Future<Output = Result<CasStoreResult, String>>,
+{
+    let mut merged_remote = false;
     for attempt in 1..=ROOMS_CAS_MAX_ATTEMPTS {
         let mut value = Vec::new();
         ciborium::ser::into_writer(&working, &mut value)
             .map_err(|e| format!("Failed to serialize rooms: {e}"))?;
 
-        let expected_generation = ROOMS_GENERATION.load(Ordering::Acquire);
-        let request = ChatDelegateRequestMsg::CasStoreRequest {
-            key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
-            value,
-            expected_generation,
-        };
-
-        match send_delegate_request(request).await {
-            Ok(ChatDelegateResponseMsg::CasStoreResponse { result, .. }) => match result {
-                CasStoreResult::Stored { generation } => {
-                    ROOMS_GENERATION.store(generation, Ordering::Release);
-                    return Ok(());
+        match cas_store(value, expected_generation).await? {
+            CasStoreResult::Stored { generation } => {
+                return Ok(CasSaveOutcome {
+                    stored: working,
+                    generation,
+                    merged_remote,
+                });
+            }
+            CasStoreResult::Conflict {
+                current_generation,
+                current_value,
+            } => {
+                // Another writer advanced the key first. Adopt the true
+                // generation and fold their snapshot into our working copy so
+                // their rooms survive, then retry. (A `None` current_value
+                // means the key is now absent — adopt its generation and
+                // retry; nothing to merge.)
+                expected_generation = current_generation;
+                if let Some(bytes) = current_value {
+                    // If the remote snapshot can't be parsed/merged, abort the
+                    // save (the `?`) rather than overwrite it — refusing to
+                    // clobber data we don't understand is the safe choice. In
+                    // practice this only happens for a corrupt/incompatible
+                    // remote blob; the user's in-memory rooms are untouched and
+                    // the next mutation re-attempts. (PR2's per-room keys make
+                    // this per-room rather than all-or-nothing.)
+                    working = fold_conflicting_rooms(working, &bytes)?;
+                    merged_remote = true;
                 }
-                CasStoreResult::Conflict {
-                    current_generation,
-                    current_value,
-                } => {
-                    // Another writer advanced the key first. Adopt the true
-                    // generation and fold their snapshot into our working
-                    // copy so their rooms survive, then retry.
-                    ROOMS_GENERATION.store(current_generation, Ordering::Release);
-                    if let Some(bytes) = current_value {
-                        working = fold_conflicting_rooms(working, &bytes)?;
-                    }
-                    info!(
-                        "rooms CAS conflict on attempt {attempt}; merged remote, retrying at generation {current_generation}"
-                    );
-                }
-                CasStoreResult::Failed(e) => return Err(e),
-            },
-            Ok(other) => return Err(format!("Unexpected response to CasStore: {other:?}")),
-            Err(e) => return Err(e),
+                info!(
+                    "rooms CAS conflict on attempt {attempt}; retrying at generation {current_generation}"
+                );
+            }
+            CasStoreResult::Failed(e) => return Err(e),
         }
     }
 
     Err(format!(
         "rooms CAS exceeded {ROOMS_CAS_MAX_ATTEMPTS} attempts under concurrent writers"
     ))
+}
+
+async fn do_save_rooms_to_delegate() -> Result<(), String> {
+    info!("Saving rooms to delegate storage (compare-and-swap)");
+
+    // Snapshot the in-memory rooms once. On a CAS conflict the loop merges the
+    // conflicting remote snapshot into THIS working copy (it never mutates the
+    // ROOMS signal mid-loop — Dioxus signal-safety), then retries, so a
+    // concurrent tab's rooms are preserved rather than clobbered.
+    let working = {
+        let mut rooms_clone = ROOMS.read().clone();
+        rooms_clone.current_room_key = CURRENT_ROOM.read().owner_key;
+        rooms_clone
+    };
+    let expected_generation = ROOMS_GENERATION.load(Ordering::Acquire);
+
+    let outcome = run_rooms_cas_loop(working, expected_generation, |value, expected| async move {
+        let request = ChatDelegateRequestMsg::CasStoreRequest {
+            key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
+            value,
+            expected_generation: expected,
+        };
+        match send_delegate_request(request).await {
+            Ok(ChatDelegateResponseMsg::CasStoreResponse { result, .. }) => Ok(result),
+            Ok(other) => Err(format!("Unexpected response to CasStore: {other:?}")),
+            Err(e) => Err(e),
+        }
+    })
+    .await?;
+
+    ROOMS_GENERATION.store(outcome.generation, Ordering::Release);
+
+    // freenet/river#345 (Codex P1): if we folded another tab's snapshot in to
+    // resolve a conflict, the merged rooms were persisted to the delegate but
+    // the in-memory ROOMS signal still lacks them. Without writing them back,
+    // the NEXT save would snapshot the stale ROOMS (correct generation, no
+    // conflict) and overwrite the delegate — silently DELETING the rooms we
+    // just merged. So reflect the merged result back into ROOMS, deferred for
+    // Dioxus signal-safety. Bonus: the other tab's room now appears in this tab
+    // without a reload. `Rooms::merge` is a union, so this never drops local
+    // rooms and CRDT-merges shared room state.
+    if outcome.merged_remote {
+        let merged = outcome.stored;
+        crate::util::defer(move || {
+            ROOMS.with_mut(|rooms| {
+                if let Err(e) = rooms.merge(merged) {
+                    warn!("post-CAS ROOMS write-back merge failed (keeping local state): {e}");
+                }
+            });
+        });
+    }
+
+    Ok(())
 }
 
 // =============================================================================
@@ -2296,6 +2494,26 @@ fn create_chat_delegate_container() -> DelegateContainer {
 }
 
 /// Extract the key from a request message for tracking purposes.
+/// Pending-request correlation keys for the compare-and-swap storage ops
+/// (freenet/river#345). These deliberately differ from the plain storage-key
+/// bytes so an in-flight CAS save's response slot cannot be stolen by a
+/// concurrent plain `GetResponse`/`StoreResponse` for the SAME storage key —
+/// e.g. the cold-start rooms load (a fire-and-forget `GetRequest{rooms_data}`)
+/// landing while a CAS save for `rooms_data` is awaiting. The delegate echoes
+/// the original `key` in its response, so the response handler rebuilds the
+/// same correlation key via these helpers.
+pub(crate) fn cas_store_correlation_key(key: &ChatDelegateKey) -> Vec<u8> {
+    let mut k = b"__cas_store__:".to_vec();
+    k.extend_from_slice(key.as_bytes());
+    k
+}
+
+pub(crate) fn get_versioned_correlation_key(key: &ChatDelegateKey) -> Vec<u8> {
+    let mut k = b"__get_versioned__:".to_vec();
+    k.extend_from_slice(key.as_bytes());
+    k
+}
+
 fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
     match request {
         // Key-value storage operations
@@ -2303,10 +2521,11 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
         ChatDelegateRequestMsg::GetRequest { key } => key.as_bytes().to_vec(),
         ChatDelegateRequestMsg::DeleteRequest { key } => key.as_bytes().to_vec(),
         ChatDelegateRequestMsg::ListRequest => b"__list_request__".to_vec(),
-        // CAS storage ops correlate on the same key bytes as plain Get/Store
-        // (freenet/river#345) — matching the response's `key` field.
-        ChatDelegateRequestMsg::GetVersionedRequest { key } => key.as_bytes().to_vec(),
-        ChatDelegateRequestMsg::CasStoreRequest { key, .. } => key.as_bytes().to_vec(),
+        // CAS storage ops use DISTINCT correlation keys (freenet/river#345)
+        // so a concurrent plain Get/Store response for the same storage key
+        // can't steal the awaiting save's slot. See the helper doc-comments.
+        ChatDelegateRequestMsg::GetVersionedRequest { key } => get_versioned_correlation_key(key),
+        ChatDelegateRequestMsg::CasStoreRequest { key, .. } => cas_store_correlation_key(key),
 
         // Signing key management
         ChatDelegateRequestMsg::StoreSigningKey { room_key, .. } => {

@@ -247,7 +247,12 @@ fn handle_get_request(
     Ok(vec![create_app_response(&response)?])
 }
 
-/// Handle a delete request - removes value and updates the index
+/// Handle a delete request - removes value and updates the index.
+///
+/// Note: this resets the key's CAS generation (a re-created key starts over
+/// at 0/1). That is safe today because no CAS-tracked key is ever deleted;
+/// see the "generation resets on delete" section in `versioning.rs` before
+/// wiring a delete for a key that uses compare-and-swap.
 fn handle_delete_request(
     ctx: &mut DelegateCtx,
     origin: &Origin,

@@ -9,12 +9,12 @@ mod update_response;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
-    complete_pending_signing_key_request, decide_legacy_migration_action,
-    fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
-    is_legacy_delegate_key, mark_legacy_migration_done, prune_outbound_dms_for_purges,
-    save_outbound_dms_to_delegate, save_rooms_to_delegate, LegacyMigrationAction,
-    OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
+    cas_store_correlation_key, complete_pending_public_key_request, complete_pending_request,
+    complete_pending_sign_request, complete_pending_signing_key_request,
+    decide_legacy_migration_action, fire_legacy_migration_request, get_versioned_correlation_key,
+    hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
+    mark_legacy_migration_done, prune_outbound_dms_for_purges, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, LegacyMigrationAction, OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -184,13 +184,22 @@ impl ResponseHandler {
                                     ChatDelegateResponseMsg::DeleteResponse { key, .. } => {
                                         complete_pending_request(key, response.clone())
                                     }
-                                    // CAS storage responses (freenet/river#345) correlate
-                                    // on the same key bytes as plain Get/Store.
+                                    // CAS storage responses (freenet/river#345) correlate on
+                                    // DISTINCT keys (prefix + storage key) so they can't be
+                                    // confused with a concurrent plain Get/Store for the same
+                                    // storage key. Rebuild the same correlation key the request
+                                    // registered under.
                                     ChatDelegateResponseMsg::GetVersionedResponse { key, .. } => {
-                                        complete_pending_request(key, response.clone())
+                                        let corr = river_core::chat_delegate::ChatDelegateKey::new(
+                                            get_versioned_correlation_key(key),
+                                        );
+                                        complete_pending_request(&corr, response.clone())
                                     }
                                     ChatDelegateResponseMsg::CasStoreResponse { key, .. } => {
-                                        complete_pending_request(key, response.clone())
+                                        let corr = river_core::chat_delegate::ChatDelegateKey::new(
+                                            cas_store_correlation_key(key),
+                                        );
+                                        complete_pending_request(&corr, response.clone())
                                     }
                                     ChatDelegateResponseMsg::ListResponse { .. } => {
                                         // Use the special list request key
