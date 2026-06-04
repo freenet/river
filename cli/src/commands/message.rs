@@ -239,11 +239,12 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let edited_indicator = if edited { " (edited)" } else { "" };
 
                             // Check for reply context (shared with the monitor
-                            // stream via crate::api::reply_context so the two
-                            // renderings can't drift).
+                            // stream via crate::api::reply_context_display so the
+                            // two renderings can't drift, including the truncation
+                            // marker appended by truncate_reply_preview).
                             let reply_prefix = crate::api::reply_context_display(&room_state, msg)
                                 .map(|(author, preview)| {
-                                    format!("[reply to {}: {}...] ", author, preview)
+                                    format!("[reply to {}: {}] ", author, preview)
                                 })
                                 .unwrap_or_default();
 

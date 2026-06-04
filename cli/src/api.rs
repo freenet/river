@@ -154,15 +154,37 @@ pub(crate) fn resolve_outgoing_mentions(room_state: &ChatRoomStateV1, text: &str
     })
 }
 
-/// If `msg` is a reply, return `(target_author_name, truncated_preview)` for
-/// display. Returns `None` for non-reply content (or content that fails to
-/// decode). Mirrors the reply rendering in `riverctl message list` so the
-/// monitor stream surfaces reply context too (it previously did not — a reply
-/// rendered as a plain message). freenet/river — Rogue Worm report.
+/// Truncate a reply preview to at most [`REPLY_PREVIEW_MAX_CHARS`] characters
+/// for display, appending `"..."` **only when characters were actually
+/// dropped**. A preview that fits is shown verbatim; a clipped one carries a
+/// visible marker so a reader (a terminal user or a JSON-consuming bridge) can
+/// tell the quoted text was cut rather than ending there. Operates on `char`s,
+/// not bytes, so a multi-byte / emoji preview never panics or splits a
+/// codepoint.
 ///
-/// Shared with `riverctl message list` (cli/src/commands/message.rs) so the two
-/// renderings can't drift.
-pub(crate) fn reply_context(
+/// Single source of truth for the truncation marker, so the human and JSON
+/// renderings of reply context can't drift on whether/how a preview is clipped.
+fn truncate_reply_preview(s: &str) -> String {
+    const REPLY_PREVIEW_MAX_CHARS: usize = 50;
+    let mut chars = s.chars();
+    let mut preview: String = chars.by_ref().take(REPLY_PREVIEW_MAX_CHARS).collect();
+    // `chars` is positioned just past the 50th char; a remaining char means we
+    // dropped content, so flag the truncation. No remaining char → exact fit,
+    // shown verbatim with no misleading ellipsis.
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+    preview
+}
+
+/// Test-only sibling of [`reply_context_display`] that returns the RAW reply
+/// preview (no `@[name](rv:id)` mention rendering). Production code never wants
+/// this — it would leak raw mention syntax into a preview — so it exists solely
+/// to unit-test the truncation boundary behaviour of [`truncate_reply_preview`]
+/// on un-rendered input. Returns `None` for non-reply content (or content that
+/// fails to decode).
+#[cfg(test)]
+fn reply_context(
     msg: &river_core::room_state::message::AuthorizedMessageV1,
 ) -> Option<(String, String)> {
     use river_core::room_state::content::{DecodedContent, CONTENT_TYPE_REPLY};
@@ -171,7 +193,7 @@ pub(crate) fn reply_context(
     }
     match msg.message.content.decode_content() {
         Some(DecodedContent::Reply(reply)) => {
-            let preview: String = reply.target_content_preview.chars().take(50).collect();
+            let preview = truncate_reply_preview(&reply.target_content_preview);
             Some((reply.target_author_name, preview))
         }
         _ => None,
@@ -198,7 +220,7 @@ pub(crate) fn reply_context_display(
     match msg.message.content.decode_content() {
         Some(DecodedContent::Reply(reply)) => {
             let rendered = render_mentions_for_terminal(room_state, &reply.target_content_preview);
-            let preview: String = rendered.chars().take(50).collect();
+            let preview = truncate_reply_preview(&rendered);
             Some((reply.target_author_name, preview))
         }
         _ => None,
@@ -3093,7 +3115,7 @@ impl ApiClient {
                 let edit_prefix = if is_edit { "[edit] " } else { "" };
                 let reply_prefix = reply
                     .as_ref()
-                    .map(|(author, preview)| format!("[reply to {}: {}...] ", author, preview))
+                    .map(|(author, preview)| format!("[reply to {}: {}] ", author, preview))
                     .unwrap_or_default();
                 let reactions_str = reactions
                     .map(|r| {
@@ -4365,6 +4387,8 @@ mod monitor_tests {
 
     /// A reply message yields its target author and a preview truncated to 50
     /// chars — the context the monitor stream now renders (it previously didn't).
+    /// A clipped preview keeps 50 chars of content and gains a trailing `"..."`
+    /// so a reader can tell it was cut.
     #[test]
     fn reply_context_extracts_author_and_truncated_preview() {
         let long_preview = "x".repeat(80);
@@ -4376,7 +4400,16 @@ mod monitor_tests {
         ));
         let (author, preview) = reply_context(&msg).expect("should detect a reply");
         assert_eq!(author, "Alice");
-        assert_eq!(preview.chars().count(), 50, "preview truncated to 50 chars");
+        assert!(
+            preview.ends_with("..."),
+            "clipped preview gets a truncation marker: {preview}"
+        );
+        assert_eq!(
+            preview.chars().count(),
+            53,
+            "50 content chars + 3-char ellipsis"
+        );
+        assert_eq!(&preview[..50], &"x".repeat(50), "50 chars of content kept");
     }
 
     /// A plain (non-reply) message has no reply context.
@@ -4402,31 +4435,43 @@ mod monitor_tests {
         ))
     }
 
-    /// Preview truncation boundaries: a short preview is returned whole, an
-    /// exactly-50 preview is untouched, and a multi-byte/emoji preview is
-    /// truncated by CHARACTERS (not bytes), so `.chars().take(50)` never panics
-    /// or splits a codepoint.
+    /// Preview truncation boundaries: a short preview is returned whole (no
+    /// ellipsis), an exactly-50 preview is untouched (no ellipsis — it wasn't
+    /// clipped), and a multi-byte/emoji preview is truncated by CHARACTERS (not
+    /// bytes), so `.chars().take(50)` never panics or splits a codepoint. The
+    /// `"..."` marker appears only when content was actually dropped.
     #[test]
     fn reply_context_preview_boundaries() {
-        // Shorter than 50 → returned whole.
+        // Shorter than 50 → returned whole, no truncation marker.
         let (_, short) = reply_context(&reply_with_preview("hi")).unwrap();
         assert_eq!(short, "hi");
 
-        // Empty preview → still a reply, empty body.
+        // Empty preview → still a reply, empty body, no marker.
         let (author, empty) = reply_context(&reply_with_preview("")).unwrap();
         assert_eq!(author, "Alice");
         assert_eq!(empty, "");
 
-        // Exactly 50 → unchanged.
+        // Exactly 50 → unchanged, NO ellipsis (nothing was dropped).
         let exactly = "a".repeat(50);
         let (_, p50) = reply_context(&reply_with_preview(&exactly)).unwrap();
         assert_eq!(p50.chars().count(), 50);
         assert_eq!(p50, exactly);
+        assert!(!p50.ends_with("..."), "exact fit gets no marker: {p50}");
 
-        // 60 emoji (multi-byte) → truncated to 50 chars, no panic / no split.
+        // 51 chars → clipped to 50 content chars + "...".
+        let just_over = "a".repeat(51);
+        let (_, p51) = reply_context(&reply_with_preview(&just_over)).unwrap();
+        assert_eq!(p51, format!("{}...", "a".repeat(50)));
+
+        // 60 emoji (multi-byte) → 50 content chars + "...", no panic / no split.
         let emojis = "🦀".repeat(60);
         let (_, pe) = reply_context(&reply_with_preview(&emojis)).unwrap();
-        assert_eq!(pe.chars().count(), 50);
+        assert!(
+            pe.ends_with("..."),
+            "clipped emoji preview gets a marker: {pe}"
+        );
+        assert_eq!(pe.chars().count(), 53, "50 emoji + 3-char ellipsis");
+        assert_eq!(&pe.chars().take(50).collect::<String>(), &"🦀".repeat(50));
     }
 
     /// Regression guard for PR #322 review finding #1: two DIFFERENT messages
@@ -5087,5 +5132,47 @@ mod mention_cli_tests {
             !rendered.contains("rv:") && !rendered.contains("@["),
             "no raw/partial token in boundary preview: {rendered}"
         );
+    }
+
+    /// The display path (which feeds both the `riverctl message list --format
+    /// json` and the monitor-stream JSON `reply_to.preview`) appends the
+    /// truncation marker when it clips, and omits it when the preview fits.
+    /// Pins the requested behaviour: a cut quoted message is visibly marked,
+    /// rather than silently ending mid-word. freenet/river XMPP-bridge request.
+    #[test]
+    fn reply_context_display_marks_truncation() {
+        use river_core::room_state::message::MessageId;
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
+        let sender = SigningKey::from_bytes(&[200u8; 32]);
+        let reply_with = |preview: &str| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(sender.verifying_key()),
+                    author: member_id(&sender),
+                    content: RoomMessageBody::reply(
+                        "ok".to_string(),
+                        MessageId(freenet_scaffold::util::FastHash(0)),
+                        "Bob".to_string(),
+                        preview.to_string(),
+                    ),
+                    time: SystemTime::UNIX_EPOCH,
+                },
+                &sender,
+            )
+        };
+
+        // Long preview (no mention tokens) → clipped + marked.
+        let long = "y".repeat(120);
+        let (_, clipped) = reply_context_display(&state, &reply_with(&long)).expect("is a reply");
+        assert!(
+            clipped.ends_with("..."),
+            "long preview is marked as truncated: {clipped}"
+        );
+        assert_eq!(clipped.chars().count(), 53, "50 content chars + ellipsis");
+
+        // Short preview → shown verbatim, no marker.
+        let (_, whole) = reply_context_display(&state, &reply_with("short")).expect("is a reply");
+        assert_eq!(whole, "short");
     }
 }
