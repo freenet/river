@@ -575,6 +575,74 @@ mod tests {
         }
     }
 
+    /// freenet/river#345 (M1): CAS/GetVersioned ops MUST register under a
+    /// different pending-request key than a plain Get/Store for the same
+    /// storage key, or a concurrent plain `GetResponse` (the cold-start load)
+    /// could steal an in-flight CAS save's response slot. A regression that
+    /// reverted to the bare key bytes would silently reintroduce slot-stealing
+    /// and no other test would fail.
+    #[test]
+    fn cas_correlation_keys_diverge_from_plain_storage_keys() {
+        let key = ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec());
+        let plain_get = get_request_key(&ChatDelegateRequestMsg::GetRequest { key: key.clone() });
+        let cas = get_request_key(&ChatDelegateRequestMsg::CasStoreRequest {
+            key: key.clone(),
+            value: vec![],
+            expected_generation: 0,
+        });
+        let getver =
+            get_request_key(&ChatDelegateRequestMsg::GetVersionedRequest { key: key.clone() });
+        assert_ne!(
+            cas, plain_get,
+            "CAS store must not share the plain Get slot"
+        );
+        assert_ne!(
+            getver, plain_get,
+            "GetVersioned must not share the plain Get slot"
+        );
+        assert_ne!(cas, getver, "CAS and GetVersioned must use distinct slots");
+    }
+
+    /// The request side (`get_request_key`) must produce the EXACT bytes the
+    /// response side rebuilds from the echoed key, or responses can't correlate
+    /// and the awaiting save hangs. Pins both sides to the shared helpers.
+    #[test]
+    fn cas_correlation_keys_round_trip_request_to_response() {
+        let key = ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec());
+        assert_eq!(
+            get_request_key(&ChatDelegateRequestMsg::CasStoreRequest {
+                key: key.clone(),
+                value: vec![1, 2, 3],
+                expected_generation: 9,
+            }),
+            cas_store_correlation_key(&key),
+        );
+        assert_eq!(
+            get_request_key(&ChatDelegateRequestMsg::GetVersionedRequest { key: key.clone() }),
+            get_versioned_correlation_key(&key),
+        );
+    }
+
+    /// Pins the delegate's envelope-tag invariant from the client side: a real
+    /// CBOR `Rooms` blob is a map (major type 5, first byte `0xA0..=0xBF`) and
+    /// never starts with the delegate's `ENVELOPE_TAG` (`0x01`), so the
+    /// defensive raw-vs-enveloped decode can never misread stored rooms.
+    #[test]
+    fn rooms_cbor_never_collides_with_envelope_tag() {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&empty_rooms(), &mut bytes).unwrap();
+        assert!(!bytes.is_empty());
+        assert_ne!(
+            bytes[0], 0x01,
+            "Rooms CBOR must not start with ENVELOPE_TAG"
+        );
+        assert!(
+            (0xA0..=0xBF).contains(&bytes[0]),
+            "Rooms serializes as a CBOR map (got first byte {:#x})",
+            bytes[0]
+        );
+    }
+
     /// Current delegate returned no `rooms_data` value at all — fire migration.
     #[test]
     fn decide_value_absent_fires_migration() {
@@ -1673,6 +1741,31 @@ static ROOMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 /// self-correcting round-trip.)
 static ROOMS_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    /// Rooms that a CAS conflict merged in from another tab but that the
+    /// `ROOMS` signal has not caught up to yet (freenet/river#345, Codex P1
+    /// round 2).
+    ///
+    /// The write-back into `ROOMS` is deferred for Dioxus signal-safety, so
+    /// it is NOT visible to a `coalesce_save` catch-up iteration that re-runs
+    /// `do_save` immediately after we return (the deferred closure only fires
+    /// on the next `setTimeout(0)` macrotask). That catch-up would otherwise
+    /// snapshot the still-stale `ROOMS` at the now-current generation and
+    /// overwrite the delegate, re-deleting the just-merged rooms.
+    ///
+    /// To close that window, every save folds this cell into its working
+    /// snapshot (synchronously — it is a plain `RefCell`, NOT a Dioxus
+    /// signal, so it is safe to set/read in the async save path). All
+    /// rooms-saves are serialized by the `ROOMS_SAVE_STATE` coalesce mutex,
+    /// so a value set here before one save returns is always visible to the
+    /// next. The deferred write-back drains it once `ROOMS` actually contains
+    /// the rooms, so it never grows unbounded; folding it is idempotent and
+    /// tombstone-safe (`Rooms::merge` honours `removed_rooms`), so a room the
+    /// user later leaves is not resurrected.
+    static PENDING_MERGED_ROOMS: std::cell::RefCell<Option<crate::room_data::Rooms>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Maximum compare-and-swap attempts for a single rooms save. Each retry
 /// merges the conflicting remote snapshot, so convergence normally takes
 /// 1–2 iterations even with several tabs writing; the cap only guards
@@ -1816,6 +1909,15 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
     let working = {
         let mut rooms_clone = ROOMS.read().clone();
         rooms_clone.current_room_key = CURRENT_ROOM.read().owner_key;
+        // Fold in rooms a previous conflict merged from another tab that the
+        // ROOMS signal hasn't caught up to yet (deferred write-back). Without
+        // this, a coalesce catch-up save would snapshot the stale ROOMS and
+        // re-delete them (freenet/river#345, Codex P1 round 2).
+        if let Some(pending) = PENDING_MERGED_ROOMS.with(|c| c.borrow().clone()) {
+            if let Err(e) = rooms_clone.merge(pending) {
+                warn!("folding pending merged rooms into save snapshot failed: {e}");
+            }
+        }
         rooms_clone
     };
     let expected_generation = ROOMS_GENERATION.load(Ordering::Acquire);
@@ -1838,21 +1940,40 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
 
     // freenet/river#345 (Codex P1): if we folded another tab's snapshot in to
     // resolve a conflict, the merged rooms were persisted to the delegate but
-    // the in-memory ROOMS signal still lacks them. Without writing them back,
-    // the NEXT save would snapshot the stale ROOMS (correct generation, no
-    // conflict) and overwrite the delegate — silently DELETING the rooms we
-    // just merged. So reflect the merged result back into ROOMS, deferred for
-    // Dioxus signal-safety. Bonus: the other tab's room now appears in this tab
-    // without a reload. `Rooms::merge` is a union, so this never drops local
-    // rooms and CRDT-merges shared room state.
+    // the in-memory ROOMS signal still lacks them. Two things must happen so a
+    // later save can't re-delete them:
+    //
+    // 1. Make them visible to the very next save SYNCHRONOUSLY via the
+    //    PENDING_MERGED_ROOMS holding cell (folded into every working snapshot
+    //    above). This is what closes the coalesce-catch-up window — the
+    //    deferred write-back below fires too late for that.
+    // 2. Reflect them into the ROOMS signal for the UI (so the other tab's
+    //    room appears without a reload) and drain the holding cell, deferred
+    //    for Dioxus signal-safety.
+    //
+    // `Rooms::merge` is a union, so neither step drops local rooms; it
+    // CRDT-merges shared room state and honours `removed_rooms` tombstones.
     if outcome.merged_remote {
-        let merged = outcome.stored;
+        // Step 1 (synchronous): the just-stored snapshot is the latest
+        // cumulative merge (each conflict folds in from a working copy that
+        // already includes any prior pending merge), so overwrite the cell.
+        PENDING_MERGED_ROOMS.with(|c| *c.borrow_mut() = Some(outcome.stored));
+        // Step 2 (deferred): drain the cell's CURRENT value (always the latest
+        // cumulative snapshot) into ROOMS. Reading the cell here rather than a
+        // captured value avoids a multi-conflict gap where an earlier defer
+        // would drain a newer pending snapshot after merging only its own
+        // older one. Take + merge run synchronously in this closure (no await),
+        // so ROOMS contains the rooms before the cell reads empty — no window
+        // where a save sees neither.
         crate::util::defer(move || {
-            ROOMS.with_mut(|rooms| {
-                if let Err(e) = rooms.merge(merged) {
-                    warn!("post-CAS ROOMS write-back merge failed (keeping local state): {e}");
-                }
-            });
+            let pending = PENDING_MERGED_ROOMS.with(|c| c.borrow_mut().take());
+            if let Some(rooms) = pending {
+                ROOMS.with_mut(|r| {
+                    if let Err(e) = r.merge(rooms) {
+                        warn!("post-CAS ROOMS write-back merge failed (keeping local state): {e}");
+                    }
+                });
+            }
         });
     }
 

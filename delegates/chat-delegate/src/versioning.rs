@@ -252,6 +252,20 @@ mod tests {
         }
     }
 
+    /// The plain Store/Get path wraps `OutboundDmStore` in the envelope. Pin
+    /// that a real CBOR blob never starts with `ENVELOPE_TAG` (it's a CBOR map,
+    /// first byte `0xA0..=0xBF`), so the defensive raw-vs-enveloped decode in
+    /// `decode_versioned` can never misread a stored value.
+    #[test]
+    fn outbound_dm_store_cbor_never_collides_with_envelope_tag() {
+        let store = river_core::chat_delegate::OutboundDmStore::default();
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&store, &mut bytes).unwrap();
+        assert!(!bytes.is_empty());
+        assert_ne!(bytes[0], ENVELOPE_TAG);
+        assert!((0xA0..=0xBF).contains(&bytes[0]));
+    }
+
     #[test]
     fn cas_first_write_with_nonzero_expected_conflicts() {
         // A client that thinks the key is at generation 3 but it's
