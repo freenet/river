@@ -30,7 +30,9 @@ use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 use freenet_stdlib::prelude::OutboundDelegateMsg;
 pub use get_response::handle_get_response;
 pub use put_response::handle_put_response;
-use river_core::chat_delegate::{ChatDelegateRequestMsg, ChatDelegateResponseMsg, OutboundDmStore};
+use river_core::chat_delegate::{
+    CasStoreResult, ChatDelegateRequestMsg, ChatDelegateResponseMsg, OutboundDmStore,
+};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::PrivacyMode;
@@ -180,6 +182,14 @@ impl ResponseHandler {
                                         complete_pending_request(key, response.clone())
                                     }
                                     ChatDelegateResponseMsg::DeleteResponse { key, .. } => {
+                                        complete_pending_request(key, response.clone())
+                                    }
+                                    // CAS storage responses (freenet/river#345) correlate
+                                    // on the same key bytes as plain Get/Store.
+                                    ChatDelegateResponseMsg::GetVersionedResponse { key, .. } => {
+                                        complete_pending_request(key, response.clone())
+                                    }
+                                    ChatDelegateResponseMsg::CasStoreResponse { key, .. } => {
                                         complete_pending_request(key, response.clone())
                                     }
                                     ChatDelegateResponseMsg::ListResponse { .. } => {
@@ -805,6 +815,43 @@ impl ResponseHandler {
                                     }
                                     ChatDelegateResponseMsg::ListResponse { keys } => {
                                         info!("Listed {} keys", keys.len());
+                                    }
+                                    // CAS storage responses (freenet/river#345). The
+                                    // awaiting save loop in `do_save_rooms_to_delegate`
+                                    // consumes these via the pending-request registry;
+                                    // here we only log for visibility.
+                                    ChatDelegateResponseMsg::GetVersionedResponse {
+                                        key,
+                                        value,
+                                        generation,
+                                    } => {
+                                        info!(
+                                            "GetVersioned key {:?}: present={}, generation={}",
+                                            String::from_utf8_lossy(key.as_bytes()),
+                                            value.is_some(),
+                                            generation
+                                        );
+                                    }
+                                    ChatDelegateResponseMsg::CasStoreResponse { key, result } => {
+                                        match &result {
+                                            CasStoreResult::Stored { generation } => info!(
+                                                "CAS stored key {:?} at generation {}",
+                                                String::from_utf8_lossy(key.as_bytes()),
+                                                generation
+                                            ),
+                                            CasStoreResult::Conflict {
+                                                current_generation, ..
+                                            } => info!(
+                                                "CAS conflict for key {:?}; current generation {}",
+                                                String::from_utf8_lossy(key.as_bytes()),
+                                                current_generation
+                                            ),
+                                            CasStoreResult::Failed(e) => warn!(
+                                                "CAS store failed for key {:?}: {}",
+                                                String::from_utf8_lossy(key.as_bytes()),
+                                                e
+                                            ),
+                                        }
                                     }
                                     ChatDelegateResponseMsg::StoreResponse {
                                         key,

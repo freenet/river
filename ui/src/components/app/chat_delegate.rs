@@ -10,8 +10,8 @@ use freenet_stdlib::prelude::{
 use futures::channel::oneshot;
 use futures::future::{select, Either};
 use river_core::chat_delegate::{
-    ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg, HiddenDmThreadEntry,
-    OutboundDmEntry, OutboundDmStore, RequestId, RoomKey,
+    CasStoreResult, ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg,
+    HiddenDmThreadEntry, OutboundDmEntry, OutboundDmStore, RequestId, RoomKey,
 };
 use river_core::room_state::direct_messages::{PurgeToken, MAX_DM_MESSAGES_PER_PAIR};
 use river_core::room_state::member::MemberId;
@@ -389,6 +389,74 @@ pub(crate) fn reset_ensure_subscription_dedup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// freenet/river#345 regression pin (client side): a compare-and-swap
+    /// conflict must MERGE the remote snapshot into our working copy, never
+    /// overwrite it — and tombstones from BOTH sides must survive (so a
+    /// room either tab left stays left, #247), while THIS tab keeps its own
+    /// current-room selection.
+    #[test]
+    fn fold_conflicting_rooms_merges_and_unions_tombstones() {
+        use crate::room_data::Rooms;
+        use ed25519_dalek::SigningKey;
+        use std::collections::{HashMap, HashSet};
+
+        let vk_x = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let vk_y = SigningKey::from_bytes(&[2u8; 32]).verifying_key();
+
+        // Remote snapshot (another tab) has left room Y and selected Y.
+        let remote = Rooms {
+            map: HashMap::new(),
+            current_room_key: Some(vk_y),
+            removed_rooms: HashSet::from([vk_y]),
+            notification_modes: HashMap::new(),
+            migrated_rooms: Vec::new(),
+        };
+        let mut remote_bytes = Vec::new();
+        ciborium::ser::into_writer(&remote, &mut remote_bytes).unwrap();
+
+        // Local working copy has left room X and selected X.
+        let working = Rooms {
+            map: HashMap::new(),
+            current_room_key: Some(vk_x),
+            removed_rooms: HashSet::from([vk_x]),
+            notification_modes: HashMap::new(),
+            migrated_rooms: Vec::new(),
+        };
+
+        let merged = fold_conflicting_rooms(working, &remote_bytes).unwrap();
+        assert!(
+            merged.removed_rooms.contains(&vk_x),
+            "local tombstone must survive the merge"
+        );
+        assert!(
+            merged.removed_rooms.contains(&vk_y),
+            "remote tombstone must survive the merge (no clobber)"
+        );
+        assert_eq!(
+            merged.current_room_key,
+            Some(vk_x),
+            "this tab's current-room selection must be preserved"
+        );
+    }
+
+    /// An unparseable remote snapshot must surface an error rather than
+    /// letting the caller proceed to overwrite data it could not read.
+    #[test]
+    fn fold_conflicting_rooms_rejects_unparseable_remote() {
+        use crate::room_data::Rooms;
+        use std::collections::{HashMap, HashSet};
+
+        let working = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: HashSet::new(),
+            notification_modes: HashMap::new(),
+            migrated_rooms: Vec::new(),
+        };
+        // Truncated/garbage CBOR.
+        assert!(fold_conflicting_rooms(working, &[0xff, 0x00, 0x12, 0x34]).is_err());
+    }
 
     /// Current delegate returned no `rooms_data` value at all — fire migration.
     #[test]
@@ -1475,6 +1543,25 @@ pub async fn load_rooms_from_delegate() -> Result<(), String> {
 /// for the shared pattern (also used by [`save_outbound_dms_to_delegate`]).
 static ROOMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 
+/// In-memory generation of the `rooms_data` value on the current chat
+/// delegate, used for compare-and-swap saves (freenet/river#345).
+///
+/// `0` means "not yet known / expect the key to be absent". It is learned
+/// lazily: a save sends its last-known generation as `expected_generation`;
+/// if that is stale the delegate rejects the write and returns the true
+/// current generation in a `Conflict`, which we adopt (and merge the
+/// conflicting snapshot) before retrying. Updated on every successful CAS
+/// store. (PR2 — the per-room key split — will also capture it at load
+/// time; until then the first save of a session may take one extra,
+/// self-correcting round-trip.)
+static ROOMS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum compare-and-swap attempts for a single rooms save. Each retry
+/// merges the conflicting remote snapshot, so convergence normally takes
+/// 1–2 iterations even with several tabs writing; the cap only guards
+/// against a pathological hot-loop of competing writers.
+const ROOMS_CAS_MAX_ATTEMPTS: u32 = 8;
+
 /// Save rooms to the delegate storage.
 ///
 /// Coalesced via [`coalesce_save`]: a chain of N rapid callers (e.g.
@@ -1493,32 +1580,85 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
     coalesce_save(&ROOMS_SAVE_STATE, "Rooms", do_save_rooms_to_delegate).await
 }
 
+/// Fold a conflicting remote `rooms_data` snapshot (as stored on the
+/// delegate) into our local working snapshot during a compare-and-swap
+/// retry. This is the heart of the anti-clobber fix (freenet/river#345):
+/// instead of overwriting whatever another tab wrote, we MERGE it in, so
+/// both tabs' rooms survive. Delegates to the tombstone-aware
+/// [`Rooms::merge`] (#247) — a room either side has explicitly left stays
+/// left — and preserves THIS tab's `current_room_key` (per-tab UI state,
+/// not shared truth). Extracted as a free function so the merge has unit
+/// coverage independent of the async/signal machinery.
+fn fold_conflicting_rooms(
+    mut working: crate::room_data::Rooms,
+    remote_bytes: &[u8],
+) -> Result<crate::room_data::Rooms, String> {
+    let local_current_room = working.current_room_key;
+    let remote: crate::room_data::Rooms = ciborium::from_reader(remote_bytes)
+        .map_err(|e| format!("unparseable remote rooms snapshot: {e}"))?;
+    working
+        .merge(remote)
+        .map_err(|e| format!("rooms merge failed: {e}"))?;
+    working.current_room_key = local_current_room;
+    Ok(working)
+}
+
 async fn do_save_rooms_to_delegate() -> Result<(), String> {
-    info!("Saving rooms to delegate storage");
+    info!("Saving rooms to delegate storage (compare-and-swap)");
 
-    // Get the current rooms data - clone the data to avoid holding the read lock
-    let rooms_data = {
+    // Snapshot the in-memory rooms once. On a CAS conflict we merge the
+    // conflicting remote snapshot into THIS working copy (we never mutate
+    // the ROOMS signal mid-loop — Dioxus signal-safety), then retry, so a
+    // concurrent tab's rooms are preserved rather than clobbered.
+    let mut working = {
         let mut rooms_clone = ROOMS.read().clone();
-        // Include the current room selection
         rooms_clone.current_room_key = CURRENT_ROOM.read().owner_key;
-        let mut buffer = Vec::new();
-        ciborium::ser::into_writer(&rooms_clone, &mut buffer)
-            .map_err(|e| format!("Failed to serialize rooms: {}", e))?;
-        buffer
+        rooms_clone
     };
 
-    // Create a store request for the rooms data
-    let request = ChatDelegateRequestMsg::StoreRequest {
-        key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
-        value: rooms_data,
-    };
+    for attempt in 1..=ROOMS_CAS_MAX_ATTEMPTS {
+        let mut value = Vec::new();
+        ciborium::ser::into_writer(&working, &mut value)
+            .map_err(|e| format!("Failed to serialize rooms: {e}"))?;
 
-    // Send the request to the delegate
-    match send_delegate_request(request).await {
-        Ok(ChatDelegateResponseMsg::StoreResponse { result, .. }) => result,
-        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
-        Err(e) => Err(e),
+        let expected_generation = ROOMS_GENERATION.load(Ordering::Acquire);
+        let request = ChatDelegateRequestMsg::CasStoreRequest {
+            key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
+            value,
+            expected_generation,
+        };
+
+        match send_delegate_request(request).await {
+            Ok(ChatDelegateResponseMsg::CasStoreResponse { result, .. }) => match result {
+                CasStoreResult::Stored { generation } => {
+                    ROOMS_GENERATION.store(generation, Ordering::Release);
+                    return Ok(());
+                }
+                CasStoreResult::Conflict {
+                    current_generation,
+                    current_value,
+                } => {
+                    // Another writer advanced the key first. Adopt the true
+                    // generation and fold their snapshot into our working
+                    // copy so their rooms survive, then retry.
+                    ROOMS_GENERATION.store(current_generation, Ordering::Release);
+                    if let Some(bytes) = current_value {
+                        working = fold_conflicting_rooms(working, &bytes)?;
+                    }
+                    info!(
+                        "rooms CAS conflict on attempt {attempt}; merged remote, retrying at generation {current_generation}"
+                    );
+                }
+                CasStoreResult::Failed(e) => return Err(e),
+            },
+            Ok(other) => return Err(format!("Unexpected response to CasStore: {other:?}")),
+            Err(e) => return Err(e),
+        }
     }
+
+    Err(format!(
+        "rooms CAS exceeded {ROOMS_CAS_MAX_ATTEMPTS} attempts under concurrent writers"
+    ))
 }
 
 // =============================================================================
@@ -2163,6 +2303,10 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
         ChatDelegateRequestMsg::GetRequest { key } => key.as_bytes().to_vec(),
         ChatDelegateRequestMsg::DeleteRequest { key } => key.as_bytes().to_vec(),
         ChatDelegateRequestMsg::ListRequest => b"__list_request__".to_vec(),
+        // CAS storage ops correlate on the same key bytes as plain Get/Store
+        // (freenet/river#345) — matching the response's `key` field.
+        ChatDelegateRequestMsg::GetVersionedRequest { key } => key.as_bytes().to_vec(),
+        ChatDelegateRequestMsg::CasStoreRequest { key, .. } => key.as_bytes().to_vec(),
 
         // Signing key management
         ChatDelegateRequestMsg::StoreSigningKey { room_key, .. } => {
