@@ -25,6 +25,10 @@ use river_core::room_state::privacy::PrivacyMode;
 // Access the build timestamp (ISO 8601 format) environment variable set by build.rs
 const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp not set");
 
+// Stable Dioxus key for the reorder tail drop zone (keys must be unique and
+// distinct from any room's `{room_key:?}`).
+const TAIL_DROP_ZONE_KEY: &str = "room-reorder-tail-drop-zone";
+
 /// Convert UTC ISO timestamp to local time string
 fn format_build_time_local() -> String {
     #[cfg(target_arch = "wasm32")]
@@ -67,9 +71,13 @@ pub fn RoomList() -> Element {
 
     // Drag-and-drop reorder state (a local view preference). `dragged_room`
     // is the row currently being dragged; `drag_over_room` is the row the
-    // cursor is hovering over, used only to draw the insertion indicator.
+    // cursor is hovering over, used to draw the insertion indicator;
+    // `drag_over_end` is the same for the tail (move-to-end) drop zone.
+    // All mutations to these are routed through `crate::util::defer()` per the
+    // Dioxus signal-safety rules (this component reads them during render).
     let mut dragged_room = use_signal(|| None::<VerifyingKey>);
     let mut drag_over_room = use_signal(|| None::<VerifyingKey>);
+    let mut drag_over_end = use_signal(|| false);
 
     // Memoize the room list to avoid reading signals during render.
     // Rooms render in the user's drag-chosen order first, then any
@@ -188,15 +196,20 @@ pub fn RoomList() -> Element {
                                 if is_drag_over && !is_dragged { "border-accent" } else { "border-transparent" },
                             ),
                             ondragstart: move |_| {
-                                dragged_room.set(Some(room_key));
+                                // Defer every drag-state mutation per the
+                                // signal-safety rules (this component reads
+                                // these signals during render).
+                                crate::util::defer(move || dragged_room.set(Some(room_key)));
                             },
                             ondragenter: move |_| {
                                 // Fires on entering a new row (unlike ondragover,
                                 // which fires continuously), so this won't churn
                                 // re-renders on every mouse move.
-                                if drag_over_room() != Some(room_key) {
-                                    drag_over_room.set(Some(room_key));
-                                }
+                                crate::util::defer(move || {
+                                    if *drag_over_room.peek() != Some(room_key) {
+                                        drag_over_room.set(Some(room_key));
+                                    }
+                                });
                             },
                             ondragover: move |evt| {
                                 // Required for the browser to treat this row as a
@@ -205,27 +218,32 @@ pub fn RoomList() -> Element {
                             },
                             ondrop: move |evt| {
                                 evt.prevent_default();
-                                drag_over_room.set(None);
-                                let Some(src) = dragged_room() else { return; };
-                                dragged_room.set(None);
-                                if src == room_key {
-                                    return;
-                                }
-                                // Defer the ROOMS mutation to a clean execution
-                                // context (re-entrant borrow safety), then persist
-                                // the new order to the delegate.
+                                // Read the dragged key up front (peek: no
+                                // subscription), then do all signal mutations
+                                // and the persisted reorder inside one deferred,
+                                // re-entrancy-safe closure.
+                                let src = *dragged_room.peek();
                                 crate::util::defer(move || {
-                                    ROOMS.with_mut(|rooms| rooms.move_room(src, room_key));
-                                    spawn(async move {
-                                        if let Err(e) = save_rooms_to_delegate().await {
-                                            error!("Failed to save room order: {}", e);
+                                    drag_over_room.set(None);
+                                    dragged_room.set(None);
+                                    if let Some(src) = src {
+                                        if src != room_key {
+                                            ROOMS.with_mut(|rooms| rooms.move_room(src, room_key));
+                                            spawn(async move {
+                                                if let Err(e) = save_rooms_to_delegate().await {
+                                                    error!("Failed to save room order: {}", e);
+                                                }
+                                            });
                                         }
-                                    });
+                                    }
                                 });
                             },
                             ondragend: move |_| {
-                                dragged_room.set(None);
-                                drag_over_room.set(None);
+                                crate::util::defer(move || {
+                                    dragged_room.set(None);
+                                    drag_over_room.set(None);
+                                    drag_over_end.set(false);
+                                });
                             },
                             button {
                                 class: format!(
@@ -286,6 +304,52 @@ pub fn RoomList() -> Element {
                         }
                     }
                 }).collect::<Vec<_>>().into_iter()}
+
+                // Tail drop zone: only present mid-drag. Every row drop inserts
+                // the dragged room BEFORE its target, so the final slot would be
+                // unreachable without a dedicated end target. Shown only while a
+                // drag is in progress so it never adds layout when idle.
+                if dragged_room().is_some() {
+                    li {
+                        key: "{TAIL_DROP_ZONE_KEY}",
+                        class: format!(
+                            "h-8 rounded-lg border-2 border-dashed transition-colors flex items-center justify-center text-xs text-text-muted {}",
+                            if drag_over_end() { "border-accent bg-accent/10" } else { "border-border/40" },
+                        ),
+                        "aria-label": "Move to end",
+                        ondragenter: move |_| {
+                            crate::util::defer(move || {
+                                if !*drag_over_end.peek() {
+                                    drag_over_end.set(true);
+                                }
+                            });
+                        },
+                        ondragover: move |evt| {
+                            evt.prevent_default();
+                        },
+                        ondragleave: move |_| {
+                            crate::util::defer(move || drag_over_end.set(false));
+                        },
+                        ondrop: move |evt| {
+                            evt.prevent_default();
+                            let src = *dragged_room.peek();
+                            crate::util::defer(move || {
+                                drag_over_end.set(false);
+                                drag_over_room.set(None);
+                                dragged_room.set(None);
+                                if let Some(src) = src {
+                                    ROOMS.with_mut(|rooms| rooms.move_room_to_end(src));
+                                    spawn(async move {
+                                        if let Err(e) = save_rooms_to_delegate().await {
+                                            error!("Failed to save room order: {}", e);
+                                        }
+                                    });
+                                }
+                            });
+                        },
+                        "Drop here to move to end"
+                    }
+                }
             }
 
             // Direct Messages section under the room list — surfaces DM

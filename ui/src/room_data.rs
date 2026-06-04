@@ -1295,7 +1295,11 @@ pub struct Rooms {
     ///   `leave_room`, so the list never grows without bound.
     /// * On `merge`, this device's order is authoritative; keys seen only in
     ///   the incoming order are appended (same local-wins rule as
-    ///   `notification_modes`).
+    ///   `notification_modes`). Cross-device consequence: reordering rooms on
+    ///   one device does NOT reorder the rooms another device already has —
+    ///   each device keeps its own arrangement and only adopts the *positions*
+    ///   of rooms it had not yet placed. This is intended for a local view
+    ///   preference; it is not a sync bug.
     #[serde(default)]
     pub room_order: Vec<VerifyingKey>,
     /// Rooms whose contract key changed due to WASM update.
@@ -1592,9 +1596,11 @@ impl Rooms {
     ///
     /// Operates on the current effective order (`ordered_room_keys`), so the
     /// first drag of an as-yet-unordered list materialises the full order
-    /// rather than just the two rooms involved. No-ops if either key is not a
-    /// current room or if they're equal. After this call `room_order` contains
-    /// exactly the current `map` keys (no stale entries).
+    /// rather than just the two rooms involved. No-ops if `dragged` is not a
+    /// current room or if the two keys are equal. If `target` is not a current
+    /// room (unreachable from the UI, where the target is always a rendered
+    /// row) the dragged room falls back to the end. After this call
+    /// `room_order` contains exactly the current `map` keys (no stale entries).
     pub fn move_room(&mut self, dragged: VerifyingKey, target: VerifyingKey) {
         if dragged == target {
             return;
@@ -1611,6 +1617,20 @@ impl Rooms {
             None => order.len(),
         };
         order.insert(insert_at, item);
+        self.room_order = order;
+    }
+
+    /// Move `dragged` to the very end of the display order, persisting the
+    /// resulting full order. Backs the rail's tail drop zone — every row drop
+    /// inserts *before* its target, so without this the last slot would be
+    /// unreachable. No-ops if `dragged` is not a current room.
+    pub fn move_room_to_end(&mut self, dragged: VerifyingKey) {
+        let mut order = self.ordered_room_keys();
+        let Some(from) = order.iter().position(|k| k == &dragged) else {
+            return;
+        };
+        let item = order.remove(from);
+        order.push(item);
         self.room_order = order;
     }
 }
@@ -3397,6 +3417,46 @@ mod tests {
         local.merge(incoming).expect("merge");
         // k3,k1 from local; k2 adopted from incoming; ghost pruned.
         assert_eq!(local.room_order, vec![keys[2], keys[0], keys[1]]);
+    }
+
+    /// The tail drop zone path: `move_room_to_end` puts a room last regardless
+    /// of where it started, materialising the full order.
+    #[test]
+    fn move_room_to_end_appends() {
+        let keys: Vec<VerifyingKey> = (1..=4).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        let base = rooms.ordered_room_keys();
+
+        rooms.move_room_to_end(base[0]);
+        let after = rooms.ordered_room_keys();
+        assert_eq!(after, vec![base[1], base[2], base[3], base[0]]);
+        assert_eq!(rooms.room_order, after);
+
+        // Already-last stays last; unknown key is a no-op.
+        rooms.move_room_to_end(base[0]);
+        assert_eq!(rooms.ordered_room_keys(), after);
+        rooms.move_room_to_end(vk_from_seed(99));
+        assert_eq!(rooms.ordered_room_keys(), after);
+    }
+
+    /// Persistence round-trip: a populated `room_order` must survive the same
+    /// ciborium encode/decode the delegate save/load path uses. `room_order`
+    /// is a `Vec<VerifyingKey>`, a serde shape this blob hadn't exercised
+    /// before — pin it so a future `VerifyingKey` serde change can't silently
+    /// drop the user's drag order.
+    #[test]
+    fn rooms_round_trip_preserves_room_order() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        // A non-trivial order (not the deterministic default).
+        rooms.room_order = vec![keys[2], keys[0], keys[1]];
+
+        let mut buf: Vec<u8> = Vec::new();
+        ciborium::ser::into_writer(&rooms, &mut buf).unwrap();
+        let decoded: Rooms = ciborium::de::from_reader(buf.as_slice()).unwrap();
+
+        assert_eq!(decoded.room_order, vec![keys[2], keys[0], keys[1]]);
+        assert_eq!(decoded.ordered_room_keys(), vec![keys[2], keys[0], keys[1]]);
     }
 
     /// Backward-compat: a `rooms_data` blob serialised before this PR
