@@ -410,6 +410,7 @@ mod tests {
             current_room_key: Some(vk_y),
             removed_rooms: HashSet::from([vk_y]),
             notification_modes: HashMap::new(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         };
         let mut remote_bytes = Vec::new();
@@ -421,6 +422,7 @@ mod tests {
             current_room_key: Some(vk_x),
             removed_rooms: HashSet::from([vk_x]),
             notification_modes: HashMap::new(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         };
 
@@ -452,6 +454,7 @@ mod tests {
             current_room_key: None,
             removed_rooms: HashSet::new(),
             notification_modes: HashMap::new(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         };
         // Truncated/garbage CBOR.
@@ -465,6 +468,7 @@ mod tests {
             current_room_key: None,
             removed_rooms: HashSet::new(),
             notification_modes: HashMap::new(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         }
     }

@@ -2019,6 +2019,7 @@ mod tests {
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         };
         local
@@ -2030,6 +2031,7 @@ mod tests {
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         };
         remote
@@ -2070,6 +2072,7 @@ mod tests {
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         };
         local
@@ -2082,6 +2085,7 @@ mod tests {
             current_room_key: None,
             removed_rooms: std::collections::HashSet::from([vk]),
             notification_modes: Default::default(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         };
 
@@ -2122,6 +2126,7 @@ mod tests {
             current_room_key: None,
             removed_rooms: std::collections::HashSet::from([vk]),
             notification_modes: Default::default(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         };
 
@@ -2131,6 +2136,7 @@ mod tests {
             current_room_key: None,
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
+            room_order: Vec::new(),
             migrated_rooms: Vec::new(),
         };
         remote
