@@ -470,7 +470,7 @@ mod tests {
     }
 
     /// CAS loop: stores on the first attempt when there's no conflict, and
-    /// reports `merged_remote == false` (no write-back needed).
+    /// reports `merged_remote == false` (no pending-merge to record).
     #[test]
     fn cas_loop_stores_on_first_attempt_without_merge() {
         let calls = std::cell::RefCell::new(0u32);
@@ -492,7 +492,7 @@ mod tests {
     /// freenet/river#345 core: on a conflict the loop adopts the delegate's
     /// generation, folds the remote snapshot into the working copy, and
     /// retries — so the retried write carries BOTH writers' state and the
-    /// outcome flags `merged_remote` (driving the ROOMS write-back).
+    /// outcome flags `merged_remote` (driving the pending-merge record).
     #[test]
     fn cas_loop_folds_remote_on_conflict_then_stores() {
         use ed25519_dalek::SigningKey;
@@ -1743,25 +1743,31 @@ static ROOMS_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// Rooms that a CAS conflict merged in from another tab but that the
-    /// `ROOMS` signal has not caught up to yet (freenet/river#345, Codex P1
-    /// round 2).
+    /// in-memory `ROOMS` signal does not contain (freenet/river#345).
     ///
-    /// The write-back into `ROOMS` is deferred for Dioxus signal-safety, so
-    /// it is NOT visible to a `coalesce_save` catch-up iteration that re-runs
-    /// `do_save` immediately after we return (the deferred closure only fires
-    /// on the next `setTimeout(0)` macrotask). That catch-up would otherwise
-    /// snapshot the still-stale `ROOMS` at the now-current generation and
-    /// overwrite the delegate, re-deleting the just-merged rooms.
+    /// These rooms must be persisted on every subsequent save or a later save
+    /// (which snapshots `ROOMS`, lacking them, at the now-current generation)
+    /// would overwrite the delegate and re-delete them — including a
+    /// `coalesce_save` catch-up iteration that re-runs `do_save` immediately.
     ///
-    /// To close that window, every save folds this cell into its working
-    /// snapshot (synchronously — it is a plain `RefCell`, NOT a Dioxus
-    /// signal, so it is safe to set/read in the async save path). All
-    /// rooms-saves are serialized by the `ROOMS_SAVE_STATE` coalesce mutex,
-    /// so a value set here before one save returns is always visible to the
-    /// next. The deferred write-back drains it once `ROOMS` actually contains
-    /// the rooms, so it never grows unbounded; folding it is idempotent and
-    /// tombstone-safe (`Rooms::merge` honours `removed_rooms`), so a room the
-    /// user later leaves is not resurrected.
+    /// So every save folds this cell into its working snapshot via
+    /// `Rooms::merge_reconciling`. It is a plain `RefCell` (NOT a Dioxus
+    /// signal), so set/read is safe and synchronous in the async save path,
+    /// and all rooms-saves are serialized by the `ROOMS_SAVE_STATE` coalesce
+    /// mutex, so a value set before one save returns is always visible to the
+    /// next. Folding is idempotent and tombstone-safe (`merge_reconciling`
+    /// keeps local map membership / tombstones authoritative), so a room the
+    /// user later leaves is not resurrected and a room the user rejoins is not
+    /// re-tombstoned.
+    ///
+    /// The cell is NOT written back into `ROOMS` (a delegate-deserialized room
+    /// lacks rehydrated secrets/actions_state and isn't subscribed — surfacing
+    /// it live is PR2's scope). It holds a single cumulative snapshot,
+    /// overwritten per conflict, and is per-session (thread_local): it resets
+    /// on reload, where the normal load path hydrates the rooms into `ROOMS`
+    /// properly. Within a session it stays set after a conflict, adding one
+    /// `merge_reconciling` per save — bounded and cheap; the per-room key
+    /// split (PR2) removes it entirely.
     static PENDING_MERGED_ROOMS: std::cell::RefCell<Option<crate::room_data::Rooms>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1829,7 +1835,8 @@ struct CasSaveOutcome {
     generation: u64,
     /// True iff at least one conflict was resolved by folding a remote
     /// snapshot into the working copy (i.e. another writer's rooms were
-    /// merged in). Drives the post-save write-back into the `ROOMS` signal.
+    /// merged in). Drives recording the merged snapshot in the
+    /// `PENDING_MERGED_ROOMS` holding cell so later saves don't drop it.
     merged_remote: bool,
 }
 
@@ -1910,11 +1917,11 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
         let mut rooms_clone = ROOMS.read().clone();
         rooms_clone.current_room_key = CURRENT_ROOM.read().owner_key;
         // Fold in rooms a previous conflict merged from another tab that the
-        // ROOMS signal hasn't caught up to yet (deferred write-back). Without
-        // this, a coalesce catch-up save would snapshot the stale ROOMS and
-        // re-delete them (freenet/river#345, Codex P1 round 2). Routed through
-        // merge_reconciling_remote so a tombstone the pending snapshot still
-        // carries can't undo a room the user has since rejoined (round 3).
+        // ROOMS signal doesn't contain. Without this, a coalesce catch-up save
+        // would snapshot the stale ROOMS and re-delete them (freenet/river#345,
+        // Codex P1 round 2). Routed through `merge_reconciling` so a tombstone
+        // the pending snapshot still carries can't undo a room the user has
+        // since rejoined (round 3).
         if let Some(pending) = PENDING_MERGED_ROOMS.with(|c| c.borrow().clone()) {
             if let Err(e) = rooms_clone.merge_reconciling(pending) {
                 warn!("folding pending merged rooms into save snapshot failed: {e}");
@@ -1940,43 +1947,26 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
 
     ROOMS_GENERATION.store(outcome.generation, Ordering::Release);
 
-    // freenet/river#345 (Codex P1): if we folded another tab's snapshot in to
-    // resolve a conflict, the merged rooms were persisted to the delegate but
-    // the in-memory ROOMS signal still lacks them. Two things must happen so a
-    // later save can't re-delete them:
-    //
-    // 1. Make them visible to the very next save SYNCHRONOUSLY via the
-    //    PENDING_MERGED_ROOMS holding cell (folded into every working snapshot
-    //    above). This is what closes the coalesce-catch-up window — the
-    //    deferred write-back below fires too late for that.
-    // 2. Reflect them into the ROOMS signal for the UI (so the other tab's
-    //    room appears without a reload) and drain the holding cell, deferred
-    //    for Dioxus signal-safety.
-    //
-    // `Rooms::merge` is a union, so neither step drops local rooms; it
-    // CRDT-merges shared room state and honours `removed_rooms` tombstones.
     if outcome.merged_remote {
-        // Step 1 (synchronous): the just-stored snapshot is the latest
-        // cumulative merge (each conflict folds in from a working copy that
-        // already includes any prior pending merge), so overwrite the cell.
+        // A conflict folded in rooms from another tab. Record the stored
+        // snapshot in the holding cell so EVERY subsequent save folds those
+        // rooms back in (via `merge_reconciling`) and can't drop them
+        // (freenet/river#345). This is the whole persistence-correctness
+        // mechanism; it is set SYNCHRONOUSLY (before this returns, under the
+        // coalesce mutex), so the next save — including a coalesce catch-up —
+        // sees it.
+        //
+        // We deliberately do NOT write these rooms into the in-memory `ROOMS`
+        // signal here. A room deserialized from the delegate blob has empty
+        // `#[serde(skip)]` runtime state (private-room `secrets`, message
+        // `actions_state`) and is not subscribed, so surfacing it live would
+        // show a broken, un-syncing room (Codex/skeptical round-4: P1/P2/H1).
+        // Surfacing the other tab's room live is PR2's scope; here the rooms
+        // are durably persisted and reappear FULLY HYDRATED via the normal
+        // load path on the next open/reload (the documented "fixed after
+        // refresh" behavior). The cell is per-session (thread_local), so it
+        // resets on reload once the load path has hydrated the rooms.
         PENDING_MERGED_ROOMS.with(|c| *c.borrow_mut() = Some(outcome.stored));
-        // Step 2 (deferred): drain the cell's CURRENT value (always the latest
-        // cumulative snapshot) into ROOMS. Reading the cell here rather than a
-        // captured value avoids a multi-conflict gap where an earlier defer
-        // would drain a newer pending snapshot after merging only its own
-        // older one. Take + merge run synchronously in this closure (no await),
-        // so ROOMS contains the rooms before the cell reads empty — no window
-        // where a save sees neither.
-        crate::util::defer(move || {
-            let pending = PENDING_MERGED_ROOMS.with(|c| c.borrow_mut().take());
-            if let Some(rooms) = pending {
-                ROOMS.with_mut(|r| {
-                    if let Err(e) = r.merge(rooms) {
-                        warn!("post-CAS ROOMS write-back merge failed (keeping local state): {e}");
-                    }
-                });
-            }
-        });
     }
 
     Ok(())
