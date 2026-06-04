@@ -130,6 +130,14 @@ pub fn RoomList() -> Element {
             .collect::<Vec<_>>()
     });
 
+    // Snapshot the drag-state signals once per render via `try_read` (fallible,
+    // per the Dioxus signal-safety rules — a concurrent write borrow returns
+    // Err here instead of panicking with "RefCell already borrowed" on
+    // Firefox). Reused for the per-row highlight and the tail-zone visibility.
+    let dragged_now: Option<VerifyingKey> = dragged_room.try_read().ok().and_then(|g| *g);
+    let drag_over_now: Option<VerifyingKey> = drag_over_room.try_read().ok().and_then(|g| *g);
+    let drag_over_end_now: bool = drag_over_end.try_read().map(|g| *g).unwrap_or(false);
+
     rsx! {
         aside { class: "w-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
             // Mobile back button (hidden on desktop)
@@ -180,8 +188,8 @@ pub fn RoomList() -> Element {
                     // The 2px top border is always reserved (transparent →
                     // accent) so highlighting it on drag-over causes no layout
                     // shift.
-                    let is_dragged = dragged_room() == Some(room_key);
-                    let is_drag_over = drag_over_room() == Some(room_key);
+                    let is_dragged = dragged_now == Some(room_key);
+                    let is_drag_over = drag_over_now == Some(room_key);
                     rsx! {
                         li {
                             key: "{room_key:?}",
@@ -309,12 +317,12 @@ pub fn RoomList() -> Element {
                 // the dragged room BEFORE its target, so the final slot would be
                 // unreachable without a dedicated end target. Shown only while a
                 // drag is in progress so it never adds layout when idle.
-                if dragged_room().is_some() {
+                if dragged_now.is_some() {
                     li {
                         key: "{TAIL_DROP_ZONE_KEY}",
                         class: format!(
                             "h-8 rounded-lg border-2 border-dashed transition-colors flex items-center justify-center text-xs text-text-muted {}",
-                            if drag_over_end() { "border-accent bg-accent/10" } else { "border-border/40" },
+                            if drag_over_end_now { "border-accent bg-accent/10" } else { "border-border/40" },
                         ),
                         "aria-label": "Move to end",
                         ondragenter: move |_| {
