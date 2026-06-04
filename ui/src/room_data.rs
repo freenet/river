@@ -1280,6 +1280,24 @@ pub struct Rooms {
     /// below is local-wins and never overwrites a kept value).
     #[serde(default)]
     pub notification_modes: HashMap<VerifyingKey, NotificationMode>,
+    /// User-chosen display order for the room rail, keyed by room owner key
+    /// (a local user setting, same persistence model as `notification_modes`
+    /// and `removed_rooms`: stored inside the `rooms_data` delegate blob with
+    /// `#[serde(default)]`, so it survives reloads and delegate migration and
+    /// needs no new delegate storage key).
+    ///
+    /// Invariants / semantics:
+    /// * Only rooms the user has explicitly dragged appear here. Rooms not in
+    ///   this list are appended after the ordered ones in a deterministic
+    ///   (key-byte) order — see [`Rooms::ordered_room_keys`]. So an absent
+    ///   entry just means "not yet manually positioned", never "hidden".
+    /// * Entries are pruned to keys present in `map` on `merge` and on
+    ///   `leave_room`, so the list never grows without bound.
+    /// * On `merge`, this device's order is authoritative; keys seen only in
+    ///   the incoming order are appended (same local-wins rule as
+    ///   `notification_modes`).
+    #[serde(default)]
+    pub room_order: Vec<VerifyingKey>,
     /// Rooms whose contract key changed due to WASM update.
     /// Each entry is (owner_vk, old_contract_key) for rooms where the owner
     /// should send an upgrade pointer to the old contract.
@@ -1292,6 +1310,7 @@ impl PartialEq for Rooms {
         self.map == other.map
             && self.removed_rooms == other.removed_rooms
             && self.notification_modes == other.notification_modes
+            && self.room_order == other.room_order
     }
 }
 
@@ -1513,6 +1532,18 @@ impl Rooms {
                 )?;
             }
         }
+
+        // Room display order: this device's order is authoritative (a local
+        // user setting, same rule as `notification_modes`). Adopt any keys the
+        // incoming order has that we don't, then prune to rooms actually in
+        // `map` so the list can't accumulate stale entries across merges.
+        for vk in other.room_order {
+            if !self.room_order.contains(&vk) {
+                self.room_order.push(vk);
+            }
+        }
+        self.room_order.retain(|vk| self.map.contains_key(vk));
+
         Ok(())
     }
 
@@ -1525,6 +1556,62 @@ impl Rooms {
         self.map.remove(&room_vk);
         self.migrated_rooms.retain(|(vk, _)| vk != &room_vk);
         self.removed_rooms.insert(room_vk);
+        // Drop the room from the manual order so the list never carries a
+        // stale entry for a room that's gone.
+        self.room_order.retain(|vk| vk != &room_vk);
+    }
+
+    /// Room owner keys in display order: manually-positioned rooms first (in
+    /// `room_order`, filtered to rooms still present in `map`), then any
+    /// not-yet-positioned rooms appended in a deterministic key-byte order.
+    ///
+    /// The deterministic tail matters because `map` is a `HashMap`: iterating
+    /// it directly would render rooms in an arbitrary, render-to-render
+    /// unstable order. Sorting the remainder gives a stable baseline before
+    /// the user has dragged anything.
+    pub fn ordered_room_keys(&self) -> Vec<VerifyingKey> {
+        let mut result: Vec<VerifyingKey> = self
+            .room_order
+            .iter()
+            .filter(|k| self.map.contains_key(k))
+            .copied()
+            .collect();
+        let mut remainder: Vec<VerifyingKey> = self
+            .map
+            .keys()
+            .filter(|k| !self.room_order.contains(k))
+            .copied()
+            .collect();
+        remainder.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        result.extend(remainder);
+        result
+    }
+
+    /// Move `dragged` so it sits immediately before `target` in the display
+    /// order, persisting the resulting full order into `room_order`.
+    ///
+    /// Operates on the current effective order (`ordered_room_keys`), so the
+    /// first drag of an as-yet-unordered list materialises the full order
+    /// rather than just the two rooms involved. No-ops if either key is not a
+    /// current room or if they're equal. After this call `room_order` contains
+    /// exactly the current `map` keys (no stale entries).
+    pub fn move_room(&mut self, dragged: VerifyingKey, target: VerifyingKey) {
+        if dragged == target {
+            return;
+        }
+        let mut order = self.ordered_room_keys();
+        let Some(from) = order.iter().position(|k| k == &dragged) else {
+            return;
+        };
+        let item = order.remove(from);
+        // Recompute the target index AFTER removing `dragged` — if `dragged`
+        // sat above `target`, removing it shifts `target` down by one.
+        let insert_at = match order.iter().position(|k| k == &target) {
+            Some(to) => to,
+            None => order.len(),
+        };
+        order.insert(insert_at, item);
+        self.room_order = order;
     }
 }
 
@@ -1551,6 +1638,7 @@ mod tests {
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: HashMap::new(),
             migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
         };
         local
             .notification_modes
@@ -1562,6 +1650,7 @@ mod tests {
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: HashMap::new(),
             migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
         };
         incoming
             .notification_modes
@@ -3109,6 +3198,7 @@ mod tests {
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
         };
         current.map.insert(owner_vk, room_data.clone());
 
@@ -3124,6 +3214,7 @@ mod tests {
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
         };
         legacy.map.insert(owner_vk, room_data);
 
@@ -3137,6 +3228,175 @@ mod tests {
             current.removed_rooms.contains(&owner_vk),
             "tombstone must survive the merge"
         );
+    }
+
+    // ---- Room display-order (drag-and-drop reorder) helpers ----
+
+    fn vk_from_seed(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    fn minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_key = ContractKey::from_params_and_code(
+            Parameters::from(params_bytes),
+            &ContractCode::from(ROOM_CONTRACT_WASM),
+        );
+        RoomData {
+            owner_vk,
+            room_state: ChatRoomStateV1::default(),
+            self_sk: SigningKey::from_bytes(&[1u8; 32]),
+            contract_key,
+            last_read_message_id: None,
+            secrets: HashMap::new(),
+            current_secret_version: None,
+            last_secret_rotation: None,
+            key_migrated_to_delegate: false,
+            self_authorized_member: None,
+            invite_chain: vec![],
+            self_member_info: None,
+            self_nickname: None,
+            previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
+        }
+    }
+
+    fn rooms_with_keys(keys: &[VerifyingKey]) -> Rooms {
+        let mut rooms = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
+        };
+        for vk in keys {
+            rooms.map.insert(*vk, minimal_room_data(*vk));
+        }
+        rooms
+    }
+
+    /// With no manual order, rooms render in a deterministic (key-byte) order
+    /// rather than arbitrary `HashMap` order — and a manually-positioned room
+    /// leads, with the rest following in the deterministic tail.
+    #[test]
+    fn ordered_room_keys_is_deterministic_with_positioned_lead() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+
+        // No manual order: pure deterministic key-byte sort.
+        let mut expected_sorted = keys.clone();
+        expected_sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(rooms.ordered_room_keys(), expected_sorted);
+
+        // Position the third key first; the other two follow sorted.
+        rooms.room_order = vec![keys[2]];
+        let ordered = rooms.ordered_room_keys();
+        assert_eq!(ordered[0], keys[2]);
+        let mut rest = vec![keys[0], keys[1]];
+        rest.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(&ordered[1..], &rest[..]);
+    }
+
+    /// A stale `room_order` entry for a room no longer in `map` is ignored,
+    /// not rendered as a phantom row.
+    #[test]
+    fn ordered_room_keys_ignores_stale_order_entries() {
+        let keys: Vec<VerifyingKey> = (1..=2).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        let ghost = vk_from_seed(99);
+        rooms.room_order = vec![ghost, keys[0]];
+        let ordered = rooms.ordered_room_keys();
+        assert!(!ordered.contains(&ghost));
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0], keys[0]);
+    }
+
+    /// Dragging the last room onto the first lands it immediately before the
+    /// first, materialising the full order, with the others' relative order
+    /// preserved.
+    #[test]
+    fn move_room_drops_before_target() {
+        let keys: Vec<VerifyingKey> = (1..=4).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        let base = rooms.ordered_room_keys();
+
+        rooms.move_room(base[3], base[0]);
+        let after = rooms.ordered_room_keys();
+        assert_eq!(after, vec![base[3], base[0], base[1], base[2]]);
+        // The full order is now persisted (every current room, no stale keys).
+        assert_eq!(rooms.room_order, after);
+    }
+
+    /// Dragging a room downward (above→below its target) also lands it
+    /// immediately before the target, accounting for the index shift caused
+    /// by removing the dragged item first.
+    #[test]
+    fn move_room_downward_inserts_before_target() {
+        let keys: Vec<VerifyingKey> = (1..=4).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        let base = rooms.ordered_room_keys();
+
+        // Move base[0] so it sits just before base[2].
+        rooms.move_room(base[0], base[2]);
+        let after = rooms.ordered_room_keys();
+        assert_eq!(after, vec![base[1], base[0], base[2], base[3]]);
+    }
+
+    /// `move_room` no-ops on a self-drop or an unknown key rather than
+    /// corrupting the order.
+    #[test]
+    fn move_room_noops_on_self_or_unknown() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+
+        rooms.move_room(keys[0], keys[0]);
+        assert!(rooms.room_order.is_empty(), "self-drop must not reorder");
+
+        let ghost = vk_from_seed(99);
+        rooms.move_room(ghost, keys[0]);
+        assert!(
+            rooms.room_order.is_empty(),
+            "unknown dragged key is a no-op"
+        );
+
+        rooms.move_room(keys[0], ghost);
+        // Unknown target falls back to appending dragged at the end; the order
+        // still contains exactly the live rooms.
+        assert_eq!(rooms.room_order.len(), keys.len());
+        for k in &keys {
+            assert!(rooms.room_order.contains(k));
+        }
+    }
+
+    /// Leaving a room drops it from the manual order.
+    #[test]
+    fn leave_room_prunes_room_order() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        rooms.room_order = vec![keys[0], keys[1], keys[2]];
+        rooms.leave_room(keys[1]);
+        assert_eq!(rooms.room_order, vec![keys[0], keys[2]]);
+    }
+
+    /// Merge keeps this device's order authoritative, adopts incoming-only
+    /// keys, and prunes any order entry not backed by a live room.
+    #[test]
+    fn merge_unions_and_prunes_room_order() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        // Local has all three rooms, ordered [k3, k1] (k2 unpositioned).
+        let mut local = rooms_with_keys(&keys);
+        local.room_order = vec![keys[2], keys[0]];
+
+        // Incoming order references k2 (live) and a ghost (not in any map).
+        let ghost = vk_from_seed(99);
+        let mut incoming = rooms_with_keys(&keys);
+        incoming.room_order = vec![keys[1], ghost];
+
+        local.merge(incoming).expect("merge");
+        // k3,k1 from local; k2 adopted from incoming; ghost pruned.
+        assert_eq!(local.room_order, vec![keys[2], keys[0], keys[1]]);
     }
 
     /// Backward-compat: a `rooms_data` blob serialised before this PR
@@ -3164,6 +3424,8 @@ mod tests {
         assert!(decoded.removed_rooms.is_empty());
         assert!(decoded.map.is_empty());
         assert!(decoded.current_room_key.is_none());
+        // The new drag-order field must also default cleanly for old blobs.
+        assert!(decoded.room_order.is_empty());
     }
 
     /// Round-trip: serialise a `Rooms` containing a tombstone, deserialise,
@@ -3180,6 +3442,7 @@ mod tests {
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
         };
         original.removed_rooms.insert(vk);
 
@@ -3236,6 +3499,7 @@ mod tests {
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
         };
         // Step 1: leave the room.
         current.leave_room(owner_vk);
@@ -3249,6 +3513,7 @@ mod tests {
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
         };
         incoming.map.insert(owner_vk, room_data);
         current.merge(incoming).expect("merge");
@@ -3306,6 +3571,7 @@ mod tests {
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
         };
         receiver.map.insert(owner_vk, room_data);
         let mut sender = Rooms {
@@ -3314,6 +3580,7 @@ mod tests {
             removed_rooms: std::collections::HashSet::new(),
             notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
+            room_order: Vec::new(),
         };
         sender.removed_rooms.insert(owner_vk);
 

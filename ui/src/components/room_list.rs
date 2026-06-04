@@ -19,6 +19,7 @@ use dioxus_free_icons::{
     icons::fa_solid_icons::{FaArrowLeft, FaComments, FaFileImport, FaLock, FaPlus},
     Icon,
 };
+use ed25519_dalek::VerifyingKey;
 use river_core::room_state::privacy::PrivacyMode;
 
 // Access the build timestamp (ISO 8601 format) environment variable set by build.rs
@@ -64,7 +65,16 @@ fn format_build_time_local() -> String {
 pub fn RoomList() -> Element {
     let mut import_modal_active = use_signal(|| false);
 
-    // Memoize the room list to avoid reading signals during render
+    // Drag-and-drop reorder state (a local view preference). `dragged_room`
+    // is the row currently being dragged; `drag_over_room` is the row the
+    // cursor is hovering over, used only to draw the insertion indicator.
+    let mut dragged_room = use_signal(|| None::<VerifyingKey>);
+    let mut drag_over_room = use_signal(|| None::<VerifyingKey>);
+
+    // Memoize the room list to avoid reading signals during render.
+    // Rooms render in the user's drag-chosen order first, then any
+    // not-yet-positioned rooms in a deterministic order — see
+    // `Rooms::ordered_room_keys` (raw `HashMap` order is unstable).
     let room_items = use_memo(move || {
         let Ok(rooms) = ROOMS.try_read() else {
             return Vec::new();
@@ -72,10 +82,10 @@ pub fn RoomList() -> Element {
         let current_room_key = CURRENT_ROOM.read().owner_key;
 
         rooms
-            .map
-            .iter()
-            .map(|(room_key, room_data)| {
-                let room_key = *room_key;
+            .ordered_room_keys()
+            .into_iter()
+            .filter_map(|room_key| {
+                let room_data = rooms.map.get(&room_key)?;
                 let awaiting_sync = room_data.is_awaiting_initial_sync();
                 // Decrypt room name if room is private and we have the secret
                 let sealed_name = &room_data
@@ -100,14 +110,14 @@ pub fn RoomList() -> Element {
                 // notifications (e.g. not on a localhost node) can still see
                 // which rooms have new messages.
                 let unread = count_unread_in_room_data(room_data);
-                (
+                Some((
                     room_key,
                     room_name,
                     is_current,
                     awaiting_sync,
                     is_private,
                     unread,
-                )
+                ))
             })
             .collect::<Vec<_>>()
     });
@@ -156,8 +166,67 @@ pub fn RoomList() -> Element {
                     let awaiting_sync = *awaiting_sync;
                     let is_private = *is_private;
                     let unread = *unread;
+                    // Drag feedback: dim the row being dragged, and draw a top
+                    // border on the row the cursor is over (drop lands the
+                    // dragged room immediately before it — see `move_room`).
+                    // The 2px top border is always reserved (transparent →
+                    // accent) so highlighting it on drag-over causes no layout
+                    // shift.
+                    let is_dragged = dragged_room() == Some(room_key);
+                    let is_drag_over = drag_over_room() == Some(room_key);
                     rsx! {
-                        li { key: "{room_key:?}",
+                        li {
+                            key: "{room_key:?}",
+                            // Rooms are reorderable by drag-and-drop. The whole
+                            // row is the drag handle; the inner button still
+                            // handles click-to-open (a click is distinct from a
+                            // drag gesture).
+                            draggable: "true",
+                            class: format!(
+                                "rounded-lg cursor-grab active:cursor-grabbing select-none transition-opacity border-t-2 {} {}",
+                                if is_dragged { "opacity-50" } else { "" },
+                                if is_drag_over && !is_dragged { "border-accent" } else { "border-transparent" },
+                            ),
+                            ondragstart: move |_| {
+                                dragged_room.set(Some(room_key));
+                            },
+                            ondragenter: move |_| {
+                                // Fires on entering a new row (unlike ondragover,
+                                // which fires continuously), so this won't churn
+                                // re-renders on every mouse move.
+                                if drag_over_room() != Some(room_key) {
+                                    drag_over_room.set(Some(room_key));
+                                }
+                            },
+                            ondragover: move |evt| {
+                                // Required for the browser to treat this row as a
+                                // valid drop target.
+                                evt.prevent_default();
+                            },
+                            ondrop: move |evt| {
+                                evt.prevent_default();
+                                drag_over_room.set(None);
+                                let Some(src) = dragged_room() else { return; };
+                                dragged_room.set(None);
+                                if src == room_key {
+                                    return;
+                                }
+                                // Defer the ROOMS mutation to a clean execution
+                                // context (re-entrant borrow safety), then persist
+                                // the new order to the delegate.
+                                crate::util::defer(move || {
+                                    ROOMS.with_mut(|rooms| rooms.move_room(src, room_key));
+                                    spawn(async move {
+                                        if let Err(e) = save_rooms_to_delegate().await {
+                                            error!("Failed to save room order: {}", e);
+                                        }
+                                    });
+                                });
+                            },
+                            ondragend: move |_| {
+                                dragged_room.set(None);
+                                drag_over_room.set(None);
+                            },
                             button {
                                 class: format!(
                                     "w-full text-left px-3 py-2 rounded-lg text-sm transition-colors {}",
@@ -183,6 +252,9 @@ pub fn RoomList() -> Element {
                                     });
                                 },
                                 div { class: "flex items-center gap-2",
+                                    span { class: "block truncate flex-1", "{room_name}" }
+                                    // Private-room lock — sits to the RIGHT of the
+                                    // room name (after it in the flex row).
                                     if is_private {
                                         span {
                                             class: "flex-shrink-0 text-text-muted",
@@ -191,7 +263,6 @@ pub fn RoomList() -> Element {
                                             Icon { width: 12, height: 12, icon: FaLock }
                                         }
                                     }
-                                    span { class: "block truncate flex-1", "{room_name}" }
                                     // Unread badge — hidden for the current
                                     // room (its messages are marked read on
                                     // open, so a badge there would only
