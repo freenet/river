@@ -1921,22 +1921,26 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
     // conflicting remote snapshot into THIS working copy (it never mutates the
     // ROOMS signal mid-loop — Dioxus signal-safety), then retries, so a
     // concurrent tab's rooms are preserved rather than clobbered.
-    let working = {
+    let mut working = {
         let mut rooms_clone = ROOMS.read().clone();
         rooms_clone.current_room_key = CURRENT_ROOM.read().owner_key;
-        // Fold in rooms a previous conflict merged from another tab that the
-        // ROOMS signal doesn't contain. Without this, a coalesce catch-up save
-        // would snapshot the stale ROOMS and re-delete them (freenet/river#345,
-        // Codex P1 round 2). Routed through `merge_reconciling` so a tombstone
-        // the pending snapshot still carries can't undo a room the user has
-        // since rejoined (round 3).
-        if let Some(pending) = PENDING_MERGED_ROOMS.with(|c| c.borrow().clone()) {
-            if let Err(e) = rooms_clone.merge_reconciling(pending) {
-                warn!("folding pending merged rooms into save snapshot failed: {e}");
-            }
-        }
         rooms_clone
     };
+    // Fold in rooms a previous conflict merged from another tab that the ROOMS
+    // signal doesn't contain. Without this, a coalesce catch-up save would
+    // snapshot the stale ROOMS and re-delete them (freenet/river#345, Codex P1
+    // round 2). Routed through `merge_reconciling` so a tombstone the pending
+    // snapshot still carries can't undo a room the user has since rejoined
+    // (round 3). On the (pathological) merge failure — e.g. the same room
+    // rejoined locally with a different self_sk — ABORT the save rather than
+    // persist a snapshot that drops the pending-only rooms (Codex P1 post-merge
+    // round): the cell stays set and the next save (or reload) retries, so the
+    // merged rooms are never silently deleted.
+    if let Some(pending) = PENDING_MERGED_ROOMS.with(|c| c.borrow().clone()) {
+        working
+            .merge_reconciling(pending)
+            .map_err(|e| format!("folding pending merged rooms into save snapshot failed: {e}"))?;
+    }
     let expected_generation = ROOMS_GENERATION.load(Ordering::Acquire);
 
     let outcome = run_rooms_cas_loop(working, expected_generation, |value, expected| async move {
