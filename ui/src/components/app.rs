@@ -502,6 +502,7 @@ fn initial_rooms() -> Rooms {
         removed_rooms: std::collections::HashSet::new(),
         notification_modes: Default::default(),
         migrated_rooms: Vec::new(),
+        room_order: Vec::new(),
     }
 }
 
