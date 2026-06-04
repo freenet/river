@@ -639,6 +639,7 @@ mod tests {
             notification_modes: Default::default(),
             migrated_rooms: Vec::new(),
             removed_rooms: std::collections::HashSet::new(),
+            room_order: Vec::new(),
         }
     }
 
