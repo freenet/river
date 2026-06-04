@@ -1516,6 +1516,35 @@ impl Rooms {
         Ok(())
     }
 
+    /// Like [`Rooms::merge`] but local map membership wins over a STALE
+    /// tombstone in `other` (freenet/river#345, Codex P1 round 3).
+    ///
+    /// `merge` unions `removed_rooms`, which is correct for the *leave*
+    /// direction (#247 — a room `self` has left stays left) but wrong for the
+    /// *rejoin* direction: when the user explicitly rejoins a room (clears its
+    /// tombstone and re-adds it to `map`), merging in an older snapshot that
+    /// still carries the tombstone would re-remove the just-rejoined room. The
+    /// classic trigger is the chat-delegate CAS first-save after a reload,
+    /// where lazy generation forces a conflict against the delegate's own
+    /// pre-rejoin blob.
+    ///
+    /// So before merging, drop from `other.removed_rooms` any room `self`
+    /// currently holds in its `map`: `self`'s explicit map membership is
+    /// authoritative over `other`'s tombstone. `self`'s own tombstones still
+    /// block re-adds (so #247 holds) and shared room state still CRDT-merges.
+    /// Net effect on conflict resolution is "keep my decisions, absorb the
+    /// rooms I'm missing" — strictly better than the old blind overwrite,
+    /// which kept local decisions but had no anti-clobber for additions.
+    ///
+    /// Trade-off: a room another tab left is not removed from a tab that still
+    /// holds it open. Acceptable — the room stays visible where it's in use;
+    /// genuine per-room leave/rejoin versioning belongs to the per-room key
+    /// split (PR2).
+    pub fn merge_reconciling(&mut self, mut other: Rooms) -> Result<(), String> {
+        other.removed_rooms.retain(|vk| !self.map.contains_key(vk));
+        self.merge(other)
+    }
+
     /// Mark a room as explicitly left. Removes from `map`, drops any
     /// pending upgrade-pointer entry in `migrated_rooms`, and adds the
     /// owner VK to `removed_rooms` so future merges don't re-add it.
@@ -1900,6 +1929,103 @@ mod tests {
             "the other tab's room B must be merged in, not clobbered"
         );
         assert_eq!(local.map.len(), 2);
+    }
+
+    /// freenet/river#345 (Codex P1 round 3): a user who explicitly REJOINS a
+    /// room (clears its tombstone, re-adds it) must not have it re-removed by a
+    /// CAS conflict merging an older snapshot that still carries the tombstone.
+    /// `merge_reconciling` makes local map membership win over a stale remote
+    /// tombstone — and a plain `merge` would (wrongly) drop the room, which we
+    /// assert to pin the difference.
+    #[test]
+    fn merge_reconciling_preserves_local_rejoin_over_stale_tombstone() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let self_sk = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+
+        // Local: user has just REJOINED R (R in map, no tombstone).
+        let mut local = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            migrated_rooms: Vec::new(),
+        };
+        local
+            .map
+            .insert(vk, make_rejoin_test_room(&owner, &self_sk, true));
+
+        // Remote (older delegate blob): still has R tombstoned, not in map.
+        let make_remote = || Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::from([vk]),
+            notification_modes: Default::default(),
+            migrated_rooms: Vec::new(),
+        };
+
+        // Plain merge WOULD discard the rejoin (tombstone union wins)...
+        let mut plain = local.clone();
+        plain.merge(make_remote()).unwrap();
+        assert!(
+            !plain.map.contains_key(&vk),
+            "precondition: plain merge re-removes the rejoined room"
+        );
+
+        // ...merge_reconciling preserves it.
+        local.merge_reconciling(make_remote()).unwrap();
+        assert!(
+            local.map.contains_key(&vk),
+            "rejoined room must survive a stale remote tombstone"
+        );
+        assert!(
+            !local.removed_rooms.contains(&vk),
+            "rejoined room must not be re-tombstoned"
+        );
+    }
+
+    /// `merge_reconciling` must NOT weaken #247: a room THIS side has left
+    /// (local tombstone, not in map) stays left even when `other` still has it
+    /// in `map`. Only the remote's tombstone for a room local *holds* is
+    /// dropped; local's own tombstones are untouched.
+    #[test]
+    fn merge_reconciling_keeps_local_leave_sticky() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let self_sk = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+
+        // Local: user LEFT R (tombstone, not in map).
+        let mut local = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::from([vk]),
+            notification_modes: Default::default(),
+            migrated_rooms: Vec::new(),
+        };
+
+        // Remote (e.g. legacy/other tab) still has R in map.
+        let mut remote = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            migrated_rooms: Vec::new(),
+        };
+        remote
+            .map
+            .insert(vk, make_rejoin_test_room(&owner, &self_sk, true));
+
+        local.merge_reconciling(remote).unwrap();
+        assert!(
+            !local.map.contains_key(&vk),
+            "a room this tab left must not be re-added (#247)"
+        );
+        assert!(
+            local.removed_rooms.contains(&vk),
+            "local tombstone preserved"
+        );
     }
 
     #[test]

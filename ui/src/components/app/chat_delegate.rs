@@ -1794,11 +1794,11 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
 /// delegate) into our local working snapshot during a compare-and-swap
 /// retry. This is the heart of the anti-clobber fix (freenet/river#345):
 /// instead of overwriting whatever another tab wrote, we MERGE it in, so
-/// both tabs' rooms survive. Delegates to the tombstone-aware
-/// [`Rooms::merge`] (#247) — a room either side has explicitly left stays
-/// left — and preserves THIS tab's `current_room_key` (per-tab UI state,
-/// not shared truth). Extracted as a free function so the merge has unit
-/// coverage independent of the async/signal machinery.
+/// both tabs' rooms survive. Goes through [`Rooms::merge_reconciling`] so a
+/// stale remote tombstone can't undo a local rejoin (#247 leave-direction
+/// still holds), and preserves THIS tab's `current_room_key` (per-tab UI
+/// state, not shared truth). Extracted as a free function so the merge has
+/// unit coverage independent of the async/signal machinery.
 ///
 /// Note: `Rooms::merge` intentionally does NOT take `current_room_key` or
 /// `migrated_rooms` from the remote. `current_room_key` is per-tab UI state;
@@ -1813,7 +1813,7 @@ fn fold_conflicting_rooms(
     let remote: crate::room_data::Rooms = ciborium::from_reader(remote_bytes)
         .map_err(|e| format!("unparseable remote rooms snapshot: {e}"))?;
     working
-        .merge(remote)
+        .merge_reconciling(remote)
         .map_err(|e| format!("rooms merge failed: {e}"))?;
     working.current_room_key = local_current_room;
     Ok(working)
@@ -1912,9 +1912,11 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
         // Fold in rooms a previous conflict merged from another tab that the
         // ROOMS signal hasn't caught up to yet (deferred write-back). Without
         // this, a coalesce catch-up save would snapshot the stale ROOMS and
-        // re-delete them (freenet/river#345, Codex P1 round 2).
+        // re-delete them (freenet/river#345, Codex P1 round 2). Routed through
+        // merge_reconciling_remote so a tombstone the pending snapshot still
+        // carries can't undo a room the user has since rejoined (round 3).
         if let Some(pending) = PENDING_MERGED_ROOMS.with(|c| c.borrow().clone()) {
-            if let Err(e) = rooms_clone.merge(pending) {
+            if let Err(e) = rooms_clone.merge_reconciling(pending) {
                 warn!("folding pending merged rooms into save snapshot failed: {e}");
             }
         }
