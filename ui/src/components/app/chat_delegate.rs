@@ -1829,7 +1829,11 @@ fn fold_conflicting_rooms(
 struct CasSaveOutcome {
     /// The snapshot that was actually stored (the working copy after any
     /// conflict-merges). When `merged_remote` is true this is a superset of
-    /// the caller's original snapshot and must be reflected back into `ROOMS`.
+    /// the caller's original snapshot; it is recorded in the
+    /// `PENDING_MERGED_ROOMS` holding cell so later saves re-fold it. It is
+    /// deliberately NOT written back into the `ROOMS` signal — doing so would
+    /// surface an under-hydrated, unsubscribed room (round-4 finding); the
+    /// merged room reappears fully hydrated via the load path on reload.
     stored: crate::room_data::Rooms,
     /// Generation the value now has on the delegate.
     generation: u64,

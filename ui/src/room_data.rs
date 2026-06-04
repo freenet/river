@@ -1540,6 +1540,17 @@ impl Rooms {
     /// holds it open. Acceptable — the room stays visible where it's in use;
     /// genuine per-room leave/rejoin versioning belongs to the per-room key
     /// split (PR2).
+    ///
+    /// Known limitation (not a regression — pre-dates CAS): for a room present
+    /// on BOTH sides, only `room_state` is CRDT-merged. Other persisted
+    /// per-room scalars (`last_read_message_id`, `self_nickname`,
+    /// `invitation_secrets`) keep `self`'s value, so a stale tab's save can
+    /// regress e.g. an unread marker for a room another tab just advanced. The
+    /// old blind overwrite had the same effect (a stale full-blob write
+    /// reverted every room's scalars), so CAS is no worse here and strictly
+    /// better elsewhere. Proper per-field reconciliation (last_read = max,
+    /// union invitation_secrets, …) lands with the per-room key split (PR2),
+    /// where each room is an independently CAS-versioned key. Tracked on #345.
     pub fn merge_reconciling(&mut self, mut other: Rooms) -> Result<(), String> {
         other.removed_rooms.retain(|vk| !self.map.contains_key(vk));
         self.merge(other)
