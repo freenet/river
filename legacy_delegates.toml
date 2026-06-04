@@ -169,3 +169,10 @@ description = "Before PR #276 follow-up: EnsureRoomSubscription gains request_id
 date = "2026-05-17"
 delegate_key = "25b738b62a214355d6208c62f0bf5d3039cc263401a8e87b1795e9d27318bb80"
 code_hash = "4642294dfc04f45f7f2a0a76c80a2c9ff507556606d58c6dbc69e868fada597d"
+
+[[entry]]
+version = "V24"
+description = "Before #345: chat-delegate gains generation + compare-and-swap (CAS) KV primitive"
+date = "2026-06-03"
+delegate_key = "1ec6b3d1d16f7a2d4ecd6e305c05bb9a49321a1043b1d28ae84e6c56c4959bb9"
+code_hash = "904f76ff053f0882a8a036de3eea2ff367dced8bc5b0cbdbadcea3e40a4688f6"
