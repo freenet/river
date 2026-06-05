@@ -1728,7 +1728,7 @@ mod tests {
         let resave_start = production
             .find("Migrating room data from legacy delegate to new delegate")
             .expect("legacy re-save block marker must exist");
-        let resave = &production[resave_start..resave_start + 1200];
+        let resave = &production[resave_start..(resave_start + 1200).min(production.len())];
         assert!(
             resave.contains("mark_legacy_migration_in_progress()"),
             "legacy re-save must mark migration in progress BEFORE saving"
@@ -1753,7 +1753,7 @@ mod tests {
         let recover_idx = production
             .find("if action.recover")
             .expect("per-room load must have an `if action.recover` recovery branch");
-        let recover_block = &production[recover_idx..recover_idx + 300];
+        let recover_block = &production[recover_idx..(recover_idx + 300).min(production.len())];
         assert!(
             recover_block.contains("migrate_current_blob_to_per_room().await;"),
             "the recovery branch must re-run the migration to recover stranded rooms"
