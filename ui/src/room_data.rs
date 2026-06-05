@@ -1318,6 +1318,91 @@ impl PartialEq for Rooms {
     }
 }
 
+/// Persisted per-room slot for the per-room chat-delegate key
+/// `room:<base58(owner_vk)>` (freenet/river#345 / #65).
+///
+/// Each room is its OWN delegate key, CAS-versioned independently, so the
+/// per-key generation is the version that resolves rejoin-vs-leave without a
+/// shared blob: leaving a room writes `Tombstone` at gen+1; rejoining reads
+/// the tombstone and writes `Present` at gen+1; a background content update
+/// that conflicts with a `Tombstone` adopts the leave (the room was left
+/// elsewhere) rather than resurrecting it. A `Tombstone` slot (not a deleted
+/// key) is what keeps a stale tab from re-creating a left room — and avoids
+/// the delete-resets-generation ABA.
+#[derive(Clone, Serialize, Deserialize)]
+pub enum RoomSlot {
+    /// The user is in this room; carries the full per-room data.
+    Present(Box<RoomData>),
+    /// The user has explicitly left this room (the per-room tombstone).
+    Tombstone,
+}
+
+/// List-level room state persisted under the single `rooms_meta` delegate key
+/// (everything in [`Rooms`] that is NOT per-room membership/data). Membership
+/// and tombstones live in the per-room [`RoomSlot`] keys; this holds only the
+/// local view preferences. CAS-versioned like any other key.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RoomsMeta {
+    #[serde(default)]
+    pub current_room_key: Option<VerifyingKey>,
+    #[serde(default)]
+    pub notification_modes: HashMap<VerifyingKey, NotificationMode>,
+    #[serde(default)]
+    pub room_order: Vec<VerifyingKey>,
+}
+
+impl Rooms {
+    /// Project the list-level view preferences into a [`RoomsMeta`] for the
+    /// `rooms_meta` delegate key.
+    pub fn to_meta(&self) -> RoomsMeta {
+        RoomsMeta {
+            current_room_key: self.current_room_key,
+            notification_modes: self.notification_modes.clone(),
+            room_order: self.room_order.clone(),
+        }
+    }
+
+    /// Apply a loaded [`RoomsMeta`] onto this in-memory `Rooms` (the per-room
+    /// slots populate `map`/`removed_rooms` separately). `room_order` is pruned
+    /// to rooms actually present.
+    pub fn apply_meta(&mut self, meta: RoomsMeta) {
+        self.current_room_key = meta.current_room_key;
+        self.notification_modes = meta.notification_modes;
+        self.room_order = meta.room_order;
+        self.room_order.retain(|vk| self.map.contains_key(vk));
+    }
+}
+
+/// Minimal `RoomData` for unit tests. Crate-visible (not confined to this
+/// file's `mod tests`) so the per-room load tests in `response_handler` can
+/// build `RoomSlot::Present` values too.
+#[cfg(test)]
+pub(crate) fn test_minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+    let params_bytes = to_cbor_vec(&params);
+    let contract_key = ContractKey::from_params_and_code(
+        Parameters::from(params_bytes),
+        &ContractCode::from(ROOM_CONTRACT_WASM),
+    );
+    RoomData {
+        owner_vk,
+        room_state: ChatRoomStateV1::default(),
+        self_sk: SigningKey::from_bytes(&[1u8; 32]),
+        contract_key,
+        last_read_message_id: None,
+        secrets: HashMap::new(),
+        current_secret_version: None,
+        last_secret_rotation: None,
+        key_migrated_to_delegate: false,
+        self_authorized_member: None,
+        invite_chain: vec![],
+        self_member_info: None,
+        self_nickname: None,
+        previous_contract_key: None,
+        invitation_secrets: HashMap::new(),
+    }
+}
+
 impl Rooms {
     pub fn create_new_room_with_name(
         &mut self,
@@ -1484,6 +1569,22 @@ impl Rooms {
     /// are filtered out of the merge — that prevents a legacy delegate's
     /// stale `rooms_data` from re-adding a room the user has already
     /// removed (see freenet/river#247).
+    ///
+    /// Known limitation (skeptical review, freenet/river#345): the per-room loop
+    /// below `return`s `Err` on the FIRST room whose `self_sk` diverges or whose
+    /// `room_state.merge` fails, so rooms not yet iterated are dropped from THIS
+    /// merge (they survive only if already present). The per-room SAVE path got
+    /// the M1 scoping fix (`reconcile_room_present` keeps local for the one
+    /// diverged room without wedging the others); the load-side merge did not.
+    /// The trigger is rare (it requires the SAME room to already be in memory
+    /// with a different identity than the loaded copy — not the cold-start case,
+    /// where memory is empty), and a re-load recovers the rest, so per-room
+    /// scoping here is left as follow-up rather than risking this broadly-used
+    /// path. Note the consequence is slightly broader than just dropping the
+    /// un-iterated rooms: when this returns `Err`, the caller
+    /// (`hydrate_loaded_rooms`) skips `repopulate_secrets_from_state` for the
+    /// rooms that DID merge in that pass, so a private room can render
+    /// "[Encrypted message - secret vN not available]" until a clean reload.
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
         // Tombstones first: take the union before anything else, so the
         // filter below sees the combined set.
@@ -1957,6 +2058,60 @@ mod tests {
             previous_contract_key: None,
             invitation_secrets: HashMap::new(),
         }
+    }
+
+    /// freenet/river#345 headline: when one tab adds room A and another adds a
+    /// DIFFERENT room B, merging the two snapshots must keep BOTH — the
+    /// additive-union path of `Rooms::merge` (vacant-entry insert) that the
+    /// chat-delegate CAS conflict-resolution relies on. Distinct from the
+    /// tombstone tests, which cover the leave/remove direction.
+    #[test]
+    fn merge_preserves_distinct_rooms_from_both_sides() {
+        let mut rng = rand::thread_rng();
+        let owner_a = SigningKey::generate(&mut rng);
+        let self_a = SigningKey::generate(&mut rng);
+        let owner_b = SigningKey::generate(&mut rng);
+        let self_b = SigningKey::generate(&mut rng);
+        let vk_a = owner_a.verifying_key();
+        let vk_b = owner_b.verifying_key();
+
+        let mut local = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        };
+        local
+            .map
+            .insert(vk_a, make_rejoin_test_room(&owner_a, &self_a, true));
+
+        let mut remote = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        };
+        remote
+            .map
+            .insert(vk_b, make_rejoin_test_room(&owner_b, &self_b, true));
+
+        local
+            .merge(remote)
+            .expect("merge of distinct rooms should succeed");
+
+        assert!(
+            local.map.contains_key(&vk_a),
+            "this tab's room A must survive"
+        );
+        assert!(
+            local.map.contains_key(&vk_b),
+            "the other tab's room B must be merged in, not clobbered"
+        );
+        assert_eq!(local.map.len(), 2);
     }
 
     #[test]
@@ -3257,29 +3412,7 @@ mod tests {
     }
 
     fn minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
-        let params = ChatRoomParametersV1 { owner: owner_vk };
-        let params_bytes = to_cbor_vec(&params);
-        let contract_key = ContractKey::from_params_and_code(
-            Parameters::from(params_bytes),
-            &ContractCode::from(ROOM_CONTRACT_WASM),
-        );
-        RoomData {
-            owner_vk,
-            room_state: ChatRoomStateV1::default(),
-            self_sk: SigningKey::from_bytes(&[1u8; 32]),
-            contract_key,
-            last_read_message_id: None,
-            secrets: HashMap::new(),
-            current_secret_version: None,
-            last_secret_rotation: None,
-            key_migrated_to_delegate: false,
-            self_authorized_member: None,
-            invite_chain: vec![],
-            self_member_info: None,
-            self_nickname: None,
-            previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
-        }
+        super::test_minimal_room_data(owner_vk)
     }
 
     fn rooms_with_keys(keys: &[VerifyingKey]) -> Rooms {
@@ -3457,6 +3590,66 @@ mod tests {
 
         assert_eq!(decoded.room_order, vec![keys[2], keys[0], keys[1]]);
         assert_eq!(decoded.ordered_room_keys(), vec![keys[2], keys[0], keys[1]]);
+    }
+
+    /// Per-room persistence (freenet/river#345 / #65): a `RoomSlot::Present`
+    /// must survive the same ciborium encode/decode the per-room save/load path
+    /// uses, carrying the full `RoomData`. Pins the on-disk slot format so a
+    /// future serde change to `RoomData` can't silently corrupt a stored room.
+    #[test]
+    fn room_slot_present_round_trips() {
+        let vk = vk_from_seed(7);
+        let slot = RoomSlot::Present(Box::new(minimal_room_data(vk)));
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&slot, &mut buf).unwrap();
+        let decoded: RoomSlot = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            RoomSlot::Present(room) => assert_eq!(room.owner_vk, vk),
+            RoomSlot::Tombstone => panic!("expected Present, got Tombstone"),
+        }
+    }
+
+    /// A `RoomSlot::Tombstone` round-trips (the per-room leave marker).
+    #[test]
+    fn room_slot_tombstone_round_trips() {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Tombstone, &mut buf).unwrap();
+        let decoded: RoomSlot = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert!(matches!(decoded, RoomSlot::Tombstone));
+    }
+
+    /// `to_meta` → ciborium → `apply_meta` round-trips the list-level view
+    /// preferences, and `apply_meta` prunes `room_order` to rooms present in the
+    /// reconstructed `map` (a stale entry for a no-longer-present room is
+    /// dropped, mirroring the per-room load where slots populate `map` first).
+    #[test]
+    fn rooms_meta_round_trips_and_apply_meta_prunes_order() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let ghost = vk_from_seed(88);
+        let mut source = rooms_with_keys(&keys);
+        source.current_room_key = Some(keys[1]);
+        source
+            .notification_modes
+            .insert(keys[0], NotificationMode::Muted);
+        // Include a ghost the reconstructed map won't have.
+        source.room_order = vec![keys[2], keys[0], ghost];
+
+        let meta = source.to_meta();
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&meta, &mut buf).unwrap();
+        let decoded: RoomsMeta = ciborium::de::from_reader(buf.as_slice()).unwrap();
+
+        // Reconstruct only the real rooms (per-room slots), then apply meta.
+        let mut reconstructed = rooms_with_keys(&keys);
+        reconstructed.apply_meta(decoded);
+
+        assert_eq!(reconstructed.current_room_key, Some(keys[1]));
+        assert_eq!(
+            reconstructed.notification_modes.get(&keys[0]),
+            Some(&NotificationMode::Muted)
+        );
+        // Ghost pruned; real order preserved.
+        assert_eq!(reconstructed.room_order, vec![keys[2], keys[0]]);
     }
 
     /// Backward-compat: a `rooms_data` blob serialised before this PR

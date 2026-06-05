@@ -5,6 +5,7 @@ mod handlers;
 mod models;
 mod subscription;
 mod utils;
+mod versioning;
 
 use context::*;
 use freenet_stdlib::prelude::{

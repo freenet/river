@@ -1,7 +1,8 @@
 use super::*;
+use crate::versioning::{apply_cas_store, apply_unconditional_store, read_versioned, CasOutcome};
 use ed25519_dalek::{Signer, SigningKey};
 use freenet_stdlib::prelude::DelegateCtx;
-use river_core::chat_delegate::{RequestId, RoomKey};
+use river_core::chat_delegate::{CasStoreResult, RequestId, RoomKey};
 
 /// Handle an application message using the host function API for direct secret access.
 pub(crate) fn handle_application_message(
@@ -36,6 +37,24 @@ pub(crate) fn handle_application_message(
         ChatDelegateRequestMsg::ListRequest => {
             logging::info("Delegate received ListRequest");
             handle_list_request(ctx, origin)
+        }
+        ChatDelegateRequestMsg::GetVersionedRequest { key } => {
+            logging::info(format!("Delegate received GetVersionedRequest key: {key:?}").as_str());
+            handle_get_versioned_request(ctx, origin, key)
+        }
+        ChatDelegateRequestMsg::CasStoreRequest {
+            key,
+            value,
+            expected_generation,
+        } => {
+            logging::info(
+                format!(
+                    "Delegate received CasStoreRequest key: {key:?}, value_len: {}, expected_generation: {expected_generation}",
+                    value.len()
+                )
+                .as_str(),
+            );
+            handle_cas_store_request(ctx, origin, key, value, expected_generation)
         }
 
         // Signing key management
@@ -162,16 +181,21 @@ fn handle_store_request(
     let secret_key = create_origin_key(origin, &key);
     let index_key = create_index_key(origin);
 
+    // Wrap the value in a versioned envelope, bumping the generation, so
+    // that plain (non-CAS) writers stay consistent with CAS readers and
+    // never leave an un-versioned value behind (freenet/river#345).
+    let enveloped = apply_unconditional_store(ctx.get_secret(&secret_key).as_deref(), &value);
+
     // Store the value directly via host function
     // Note: In WASM, set_secret returns true on success. In non-WASM tests, it always returns false.
     #[cfg(target_family = "wasm")]
-    if !ctx.set_secret(&secret_key, &value) {
+    if !ctx.set_secret(&secret_key, &enveloped) {
         return Err(DelegateError::Other(
             "Failed to store secret via host function".into(),
         ));
     }
     #[cfg(not(target_family = "wasm"))]
-    let _ = ctx.set_secret(&secret_key, &value);
+    let _ = ctx.set_secret(&secret_key, &enveloped);
 
     logging::info(&format!(
         "Stored secret with key length {}",
@@ -208,8 +232,10 @@ fn handle_get_request(
     // Create a unique key for this origin's data
     let secret_key = create_origin_key(origin, &key);
 
-    // Get the value directly via host function
-    let value = ctx.get_secret(&secret_key);
+    // Get the value directly via host function and strip the versioning
+    // envelope so plain `GetRequest` callers see the raw payload exactly
+    // as they stored it (back-compat with the outbound-DM cache etc.).
+    let (value, _generation) = read_versioned(ctx.get_secret(&secret_key).as_deref());
     logging::info(&format!(
         "Retrieved secret, value present: {}",
         value.is_some()
@@ -221,7 +247,12 @@ fn handle_get_request(
     Ok(vec![create_app_response(&response)?])
 }
 
-/// Handle a delete request - removes value and updates the index
+/// Handle a delete request - removes value and updates the index.
+///
+/// Note: this resets the key's CAS generation (a re-created key starts over
+/// at 0/1). That is safe today because no CAS-tracked key is ever deleted;
+/// see the "generation resets on delete" section in `versioning.rs` before
+/// wiring a delete for a key that uses compare-and-swap.
 fn handle_delete_request(
     ctx: &mut DelegateCtx,
     origin: &Origin,
@@ -272,6 +303,94 @@ fn handle_list_request(
         keys: key_index.keys,
     };
 
+    Ok(vec![create_app_response(&response)?])
+}
+
+/// Handle a versioned get - returns the value plus its current generation
+/// so the caller can subsequently issue a matching compare-and-swap store.
+fn handle_get_versioned_request(
+    ctx: &mut DelegateCtx,
+    origin: &Origin,
+    key: ChatDelegateKey,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    let secret_key = create_origin_key(origin, &key);
+
+    let (value, generation) = read_versioned(ctx.get_secret(&secret_key).as_deref());
+    logging::info(&format!(
+        "GetVersioned: value present: {}, generation: {generation}",
+        value.is_some()
+    ));
+
+    let response = ChatDelegateResponseMsg::GetVersionedResponse {
+        key,
+        value,
+        generation,
+    };
+
+    Ok(vec![create_app_response(&response)?])
+}
+
+/// Handle a compare-and-swap store - the anti-clobber primitive
+/// (freenet/river#345). Stores only if `expected_generation` matches the
+/// stored generation; otherwise returns the current generation + value so
+/// the caller can merge and retry. Concurrent tabs can therefore no longer
+/// silently overwrite each other's writes.
+fn handle_cas_store_request(
+    ctx: &mut DelegateCtx,
+    origin: &Origin,
+    key: ChatDelegateKey,
+    value: Vec<u8>,
+    expected_generation: u64,
+) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+    let secret_key = create_origin_key(origin, &key);
+    let index_key = create_index_key(origin);
+
+    let result = match apply_cas_store(
+        ctx.get_secret(&secret_key).as_deref(),
+        &value,
+        expected_generation,
+    ) {
+        CasOutcome::Stored { generation, bytes } => {
+            // Note: In WASM, set_secret returns true on success. In non-WASM
+            // tests, it always returns false (storage is a no-op there).
+            #[cfg(target_family = "wasm")]
+            if !ctx.set_secret(&secret_key, &bytes) {
+                let response = ChatDelegateResponseMsg::CasStoreResponse {
+                    key,
+                    result: CasStoreResult::Failed(
+                        "Failed to store secret via host function".into(),
+                    ),
+                };
+                return Ok(vec![create_app_response(&response)?]);
+            }
+            #[cfg(not(target_family = "wasm"))]
+            let _ = ctx.set_secret(&secret_key, &bytes);
+
+            // Update the key index (same as the plain store path).
+            let mut key_index = get_key_index(ctx, &index_key);
+            if !key_index.keys.contains(&key) {
+                key_index.keys.push(key.clone());
+                set_key_index(ctx, &index_key, &key_index)?;
+            }
+
+            logging::info(&format!("CasStore stored at generation {generation}"));
+            CasStoreResult::Stored { generation }
+        }
+        CasOutcome::Conflict {
+            current_generation,
+            current_value,
+        } => {
+            logging::info(&format!(
+                "CasStore conflict: expected {expected_generation}, current {current_generation}"
+            ));
+            CasStoreResult::Conflict {
+                current_generation,
+                current_value,
+            }
+        }
+    };
+
+    let response = ChatDelegateResponseMsg::CasStoreResponse { key, result };
     Ok(vec![create_app_response(&response)?])
 }
 
@@ -568,6 +687,92 @@ mod tests {
                 // Value will be None in test since we didn't store it first
             }
             _ => panic!("Expected GetResponse, got {:?}", response),
+        }
+    }
+
+    /// A first CAS write (`expected_generation = 0`) against an absent key
+    /// dispatches to the CAS handler and reports `Stored { generation: 1 }`.
+    /// (Native `set_secret` is a no-op, so this exercises dispatch + the
+    /// generation arithmetic, not persistence — the round-trip logic is
+    /// covered by the pure tests in `versioning`.)
+    #[test]
+    fn test_cas_store_first_write_returns_stored() {
+        let request = ChatDelegateRequestMsg::CasStoreRequest {
+            key: river_core::chat_delegate::ChatDelegateKey(b"rooms_data".to_vec()),
+            value: b"snapshot".to_vec(),
+            expected_generation: 0,
+        };
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(create_app_message(request));
+        let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
+            create_test_parameters(),
+            get_test_origin(),
+            inbound_msg,
+        )
+        .unwrap();
+        match extract_response(result).unwrap() {
+            ChatDelegateResponseMsg::CasStoreResponse { result, .. } => {
+                assert_eq!(result, CasStoreResult::Stored { generation: 1 });
+            }
+            other => panic!("Expected CasStoreResponse, got {other:?}"),
+        }
+    }
+
+    /// A CAS write whose `expected_generation` does not match the stored
+    /// generation (here: stale `5` vs absent/`0`) is rejected with a
+    /// `Conflict` carrying the true current state — the anti-clobber guard.
+    #[test]
+    fn test_cas_store_stale_generation_returns_conflict() {
+        let request = ChatDelegateRequestMsg::CasStoreRequest {
+            key: river_core::chat_delegate::ChatDelegateKey(b"rooms_data".to_vec()),
+            value: b"stale".to_vec(),
+            expected_generation: 5,
+        };
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(create_app_message(request));
+        let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
+            create_test_parameters(),
+            get_test_origin(),
+            inbound_msg,
+        )
+        .unwrap();
+        match extract_response(result).unwrap() {
+            ChatDelegateResponseMsg::CasStoreResponse { result, .. } => {
+                assert_eq!(
+                    result,
+                    CasStoreResult::Conflict {
+                        current_generation: 0,
+                        current_value: None,
+                    }
+                );
+            }
+            other => panic!("Expected CasStoreResponse, got {other:?}"),
+        }
+    }
+
+    /// `GetVersionedRequest` dispatches and reports generation `0` for an
+    /// absent key.
+    #[test]
+    fn test_get_versioned_absent_returns_generation_zero() {
+        let request = ChatDelegateRequestMsg::GetVersionedRequest {
+            key: river_core::chat_delegate::ChatDelegateKey(b"rooms_data".to_vec()),
+        };
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(create_app_message(request));
+        let result = crate::ChatDelegate::process(
+            &mut DelegateCtx::default(),
+            create_test_parameters(),
+            get_test_origin(),
+            inbound_msg,
+        )
+        .unwrap();
+        match extract_response(result).unwrap() {
+            ChatDelegateResponseMsg::GetVersionedResponse {
+                value, generation, ..
+            } => {
+                assert_eq!(value, None);
+                assert_eq!(generation, 0);
+            }
+            other => panic!("Expected GetVersionedResponse, got {other:?}"),
         }
     }
 

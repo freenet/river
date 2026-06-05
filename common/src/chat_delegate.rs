@@ -113,6 +113,40 @@ pub enum ChatDelegateRequestMsg {
     },
     ListRequest,
 
+    // -----------------------------------------------------------------
+    // Optimistic-concurrency (compare-and-swap) storage operations.
+    //
+    // These exist so that multiple concurrent clients (e.g. two browser
+    // tabs both editing the room list) cannot silently clobber each
+    // other. The plain `StoreRequest` above is a blind last-writer-wins
+    // overwrite; a stale tab's full-snapshot write would destroy a
+    // newer tab's additions (freenet/river#345). The delegate tracks a
+    // per-key generation counter; a `CasStoreRequest` only succeeds when
+    // the caller's `expected_generation` matches the stored generation,
+    // so a stale writer is rejected and forced to re-read + merge.
+    //
+    // Appended to the enum (never reordered): ciborium serializes these
+    // externally-tagged by variant *name*, and only the current delegate
+    // ever receives them, so old delegate WASM is unaffected.
+    // -----------------------------------------------------------------
+    /// Read a value together with its current generation, so the caller
+    /// can subsequently issue a [`CasStoreRequest`] with the matching
+    /// `expected_generation`. A missing key reports generation `0`.
+    GetVersionedRequest {
+        key: ChatDelegateKey,
+    },
+    /// Store `value` only if the key's current generation equals
+    /// `expected_generation` (`0` = expect absent / first write). On a
+    /// match the generation is incremented and the value stored; on a
+    /// mismatch the store is rejected and the current generation + value
+    /// are returned so the caller can merge and retry without an extra
+    /// round-trip.
+    CasStoreRequest {
+        key: ChatDelegateKey,
+        value: Vec<u8>,
+        expected_generation: u64,
+    },
+
     // Signing key management
     /// Store a signing key for a room (room_key = owner's verifying key bytes)
     StoreSigningKey {
@@ -233,6 +267,20 @@ pub enum ChatDelegateResponseMsg {
         result: Result<(), String>,
     },
 
+    // Compare-and-swap storage responses (see the request variants).
+    /// Response to [`ChatDelegateRequestMsg::GetVersionedRequest`].
+    GetVersionedResponse {
+        key: ChatDelegateKey,
+        value: Option<Vec<u8>>,
+        /// Current generation of the stored value (`0` if absent).
+        generation: u64,
+    },
+    /// Response to [`ChatDelegateRequestMsg::CasStoreRequest`].
+    CasStoreResponse {
+        key: ChatDelegateKey,
+        result: CasStoreResult,
+    },
+
     // Signing key management responses
     /// Response to StoreSigningKey
     StoreSigningKeyResponse {
@@ -271,6 +319,24 @@ pub enum ChatDelegateResponseMsg {
         request_id: RequestId,
         result: Result<(), String>,
     },
+}
+
+/// Outcome of a [`ChatDelegateRequestMsg::CasStoreRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CasStoreResult {
+    /// The compare-and-swap succeeded; carries the new generation after
+    /// the write (the caller should remember it for its next store).
+    Stored { generation: u64 },
+    /// Generation mismatch — the store was rejected because another
+    /// writer advanced the key first. Carries the current generation and
+    /// value so the caller can merge its pending changes and retry with
+    /// `expected_generation = current_generation`.
+    Conflict {
+        current_generation: u64,
+        current_value: Option<Vec<u8>>,
+    },
+    /// The host-function store failed (e.g. secret storage error).
+    Failed(String),
 }
 
 /// Pure helper: should a DM thread for `(room, peer)` currently be
@@ -522,5 +588,140 @@ mod tests {
             hidden_at_ts: 0,
         }];
         assert!(is_thread_hidden(&hidden, &[9u8; 32], peer, 0));
+    }
+
+    // ------------------------------------------------------------------
+    // CAS wire-format round-trips (freenet/river#345).
+    //
+    // The chat-delegate request/response enums had no dedicated wire test
+    // before this — they were only exercised end-to-end. These pin the
+    // new compare-and-swap variants so a future serde/ciborium change
+    // can't silently break the protocol between the UI and the delegate.
+    // ------------------------------------------------------------------
+
+    fn cbor_round_trip_request(msg: &ChatDelegateRequestMsg) -> ChatDelegateRequestMsg {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(msg, &mut buf).expect("serialize request");
+        ciborium::from_reader(buf.as_slice()).expect("deserialize request")
+    }
+
+    fn cbor_round_trip_response(msg: &ChatDelegateResponseMsg) -> ChatDelegateResponseMsg {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(msg, &mut buf).expect("serialize response");
+        ciborium::from_reader(buf.as_slice()).expect("deserialize response")
+    }
+
+    #[test]
+    fn cas_store_request_cbor_round_trips() {
+        let msg = ChatDelegateRequestMsg::CasStoreRequest {
+            key: ChatDelegateKey(b"rooms_data".to_vec()),
+            value: vec![1, 2, 3, 4, 5],
+            expected_generation: 7,
+        };
+        match cbor_round_trip_request(&msg) {
+            ChatDelegateRequestMsg::CasStoreRequest {
+                key,
+                value,
+                expected_generation,
+            } => {
+                assert_eq!(key.as_bytes(), b"rooms_data");
+                assert_eq!(value, vec![1, 2, 3, 4, 5]);
+                assert_eq!(expected_generation, 7);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_versioned_request_cbor_round_trips() {
+        let msg = ChatDelegateRequestMsg::GetVersionedRequest {
+            key: ChatDelegateKey(b"rooms_data".to_vec()),
+        };
+        assert!(matches!(
+            cbor_round_trip_request(&msg),
+            ChatDelegateRequestMsg::GetVersionedRequest { .. }
+        ));
+    }
+
+    #[test]
+    fn cas_store_result_stored_round_trips() {
+        let msg = ChatDelegateResponseMsg::CasStoreResponse {
+            key: ChatDelegateKey(b"rooms_data".to_vec()),
+            result: CasStoreResult::Stored { generation: 42 },
+        };
+        match cbor_round_trip_response(&msg) {
+            ChatDelegateResponseMsg::CasStoreResponse {
+                result: CasStoreResult::Stored { generation },
+                ..
+            } => assert_eq!(generation, 42),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cas_store_result_conflict_round_trips() {
+        let msg = ChatDelegateResponseMsg::CasStoreResponse {
+            key: ChatDelegateKey(b"rooms_data".to_vec()),
+            result: CasStoreResult::Conflict {
+                current_generation: 9,
+                current_value: Some(vec![0xaa, 0xbb]),
+            },
+        };
+        match cbor_round_trip_response(&msg) {
+            ChatDelegateResponseMsg::CasStoreResponse {
+                result:
+                    CasStoreResult::Conflict {
+                        current_generation,
+                        current_value,
+                    },
+                ..
+            } => {
+                assert_eq!(current_generation, 9);
+                assert_eq!(current_value, Some(vec![0xaa, 0xbb]));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_versioned_response_round_trips() {
+        let msg = ChatDelegateResponseMsg::GetVersionedResponse {
+            key: ChatDelegateKey(b"rooms_data".to_vec()),
+            value: Some(vec![1, 2, 3]),
+            generation: 5,
+        };
+        match cbor_round_trip_response(&msg) {
+            ChatDelegateResponseMsg::GetVersionedResponse {
+                value, generation, ..
+            } => {
+                assert_eq!(value, Some(vec![1, 2, 3]));
+                assert_eq!(generation, 5);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// Appending the CAS variants must not disturb the existing variants:
+    /// a plain `StoreRequest`/`GetResponse` still round-trips unchanged.
+    /// (ciborium tags externally by name, so this holds by construction —
+    /// the test pins it against an accidental `#[serde(...)]` change.)
+    #[test]
+    fn legacy_variants_still_round_trip_after_appending_cas() {
+        let store = ChatDelegateRequestMsg::StoreRequest {
+            key: ChatDelegateKey(b"outbound_dms".to_vec()),
+            value: vec![9, 9, 9],
+        };
+        assert!(matches!(
+            cbor_round_trip_request(&store),
+            ChatDelegateRequestMsg::StoreRequest { .. }
+        ));
+        let get = ChatDelegateResponseMsg::GetResponse {
+            key: ChatDelegateKey(b"outbound_dms".to_vec()),
+            value: Some(vec![9, 9, 9]),
+        };
+        assert!(matches!(
+            cbor_round_trip_response(&get),
+            ChatDelegateResponseMsg::GetResponse { .. }
+        ));
     }
 }
