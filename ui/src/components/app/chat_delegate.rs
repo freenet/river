@@ -701,6 +701,63 @@ mod tests {
         assert!(reconcile_room_present(Some(b"garbage"), &vk, &local, false).is_err());
     }
 
+    /// Matching-identity merge (the `MergeState` branch) UNIONS `invitation_secrets`:
+    /// a version only the remote (delegate-stored) copy carries is preserved, and
+    /// local wins on a version collision — so a concurrent tab's private-room
+    /// secret isn't dropped (skeptical review; this path was previously untested).
+    #[test]
+    fn reconcile_room_present_unions_invitation_secrets() {
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let mut local = crate::room_data::test_minimal_room_data(vk); // self_sk = [1;32]
+        local.invitation_secrets.insert(0, [10u8; 32]); // local-only v0
+        local.invitation_secrets.insert(1, [11u8; 32]); // collides with remote v1
+
+        let mut remote = crate::room_data::test_minimal_room_data(vk); // same self_sk
+        remote.invitation_secrets.insert(1, [99u8; 32]); // remote v1 (local must win)
+        remote.invitation_secrets.insert(2, [22u8; 32]); // remote-only v2 (must be kept)
+
+        let out = reconcile_room_present(Some(&present_slot_bytes(&remote)), &vk, &local, false)
+            .unwrap()
+            .expect("matching-identity merge stores");
+        let merged = match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => r,
+            RoomSlot::Tombstone => panic!("expected Present"),
+        };
+        assert_eq!(
+            merged.invitation_secrets.get(&0),
+            Some(&[10u8; 32]),
+            "local-only kept"
+        );
+        assert_eq!(
+            merged.invitation_secrets.get(&1),
+            Some(&[11u8; 32]),
+            "local wins on version collision"
+        );
+        assert_eq!(
+            merged.invitation_secrets.get(&2),
+            Some(&[22u8; 32]),
+            "remote-only version must be absorbed, not dropped"
+        );
+    }
+
+    /// `legacy_scoped_correlation` namespaces a read by the target delegate, so a
+    /// legacy read of `room:A` can't collide with a current/other-legacy read of
+    /// `room:A` on the single-waiter PENDING_REQUESTS slot (codex/skeptical
+    /// re-review). Distinct delegates → distinct keys; bare base stays distinct.
+    #[test]
+    fn legacy_scoped_correlation_is_per_delegate() {
+        use freenet_stdlib::prelude::CodeHash;
+        let base = room_storage_key(&SigningKey::from_bytes(&[7u8; 32]).verifying_key());
+        let d1 = DelegateKey::new([1u8; 32], CodeHash::new([1u8; 32]));
+        let d2 = DelegateKey::new([2u8; 32], CodeHash::new([2u8; 32]));
+        let s1 = legacy_scoped_correlation(&d1, &base);
+        let s2 = legacy_scoped_correlation(&d2, &base);
+        assert_ne!(s1, s2, "different delegates must scope to different keys");
+        assert_ne!(s1, base, "scoped key must differ from the bare storage key");
+        // stable: same inputs → same key (request and response sides must agree)
+        assert_eq!(s1, legacy_scoped_correlation(&d1, &base));
+    }
+
     /// `mark_room_rejoined` (set) / `clear_room_rejoined` (consume on leave) are
     /// the inputs to `present_action`'s rejoin override. A rejoin then a leave
     /// must NOT leave the flag set, or a later background update would resurrect
@@ -3127,32 +3184,51 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
     }
 }
 
+/// Build the pending-request correlation key for a request sent to a NON-current
+/// (legacy) delegate: the bare storage correlation prefixed with the target
+/// delegate's bytes. Without this, a legacy read of `room:A` and a current (or
+/// other-legacy) read of `room:A` register under the SAME bare key in the
+/// single-waiter `PENDING_REQUESTS` map, so one overwrites the other and a
+/// response is delivered to the wrong waiter — migrating stale per-room data
+/// across delegate generations (codex/skeptical re-review). The response side
+/// rebuilds this same key from the responding delegate (`is_legacy_delegate`).
+pub(crate) fn legacy_scoped_correlation(delegate_key: &DelegateKey, base: &[u8]) -> Vec<u8> {
+    let mut k = b"__delegate__:".to_vec();
+    k.extend_from_slice(delegate_key.bytes());
+    k.push(b':');
+    k.extend_from_slice(base);
+    k
+}
+
 pub async fn send_delegate_request(
     request: ChatDelegateRequestMsg,
 ) -> Result<ChatDelegateResponseMsg, String> {
-    // Reuse the session-cached delegate key (freenet/river#246) — re-hashing
-    // the 710 KB delegate WASM here on every call was a per-request fixed cost
-    // that, multiplied across the cold-open burst, contributed measurably to the
-    // memory peak. The delegate code is invariant for the session.
-    send_delegate_request_to(CHAT_DELEGATE_KEY.clone(), request).await
+    // Current delegate: bare correlation (unchanged — keeps the proven path,
+    // including signing ops, exactly as-is). Reuse the session-cached delegate
+    // key (freenet/river#246).
+    let key_bytes = get_request_key(&request);
+    send_delegate_request_inner(CHAT_DELEGATE_KEY.clone(), request, key_bytes).await
 }
 
 /// Like [`send_delegate_request`] but targets a SPECIFIC delegate key — used by
 /// the legacy-migration probe to read per-room keys from an old (legacy)
-/// delegate generation (freenet/river#345 / #65). The response correlation is
-/// keyed on the storage key (via `get_request_key`), NOT the delegate key, so a
-/// legacy read and a current read of the SAME storage key would collide on the
-/// single-waiter `PENDING_REQUESTS` slot — safe only because legacy migration
-/// runs exclusively when the current delegate is empty (the `ProbeLegacy` plan),
-/// so no current-delegate read for the same key is ever in flight.
+/// delegate generation (freenet/river#345 / #65). The correlation is scoped by
+/// the target delegate (see [`legacy_scoped_correlation`]) so concurrent reads
+/// of the same storage key against different delegates can't collide.
 pub async fn send_delegate_request_to(
     delegate_key: DelegateKey,
     request: ChatDelegateRequestMsg,
 ) -> Result<ChatDelegateResponseMsg, String> {
-    debug!("Sending delegate request: {:?}", request);
+    let key_bytes = legacy_scoped_correlation(&delegate_key, &get_request_key(&request));
+    send_delegate_request_inner(delegate_key, request, key_bytes).await
+}
 
-    // Get the key bytes for tracking this request
-    let key_bytes = get_request_key(&request);
+async fn send_delegate_request_inner(
+    delegate_key: DelegateKey,
+    request: ChatDelegateRequestMsg,
+    key_bytes: Vec<u8>,
+) -> Result<ChatDelegateResponseMsg, String> {
+    debug!("Sending delegate request: {:?}", request);
 
     // Create a oneshot channel to receive the response
     let (sender, receiver) = oneshot::channel();

@@ -1580,7 +1580,11 @@ impl Rooms {
     /// with a different identity than the loaded copy — not the cold-start case,
     /// where memory is empty), and a re-load recovers the rest, so per-room
     /// scoping here is left as follow-up rather than risking this broadly-used
-    /// path.
+    /// path. Note the consequence is slightly broader than just dropping the
+    /// un-iterated rooms: when this returns `Err`, the caller
+    /// (`hydrate_loaded_rooms`) skips `repopulate_secrets_from_state` for the
+    /// rooms that DID merge in that pass, so a private room can render
+    /// "[Encrypted message - secret vN not available]" until a clean reload.
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
         // Tombstones first: take the union before anything else, so the
         // filter below sees the combined set.

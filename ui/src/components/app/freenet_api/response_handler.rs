@@ -13,10 +13,10 @@ use crate::components::app::chat_delegate::{
     complete_pending_sign_request, complete_pending_signing_key_request,
     decide_legacy_migration_action, fire_legacy_migration_request, get_versioned_correlation_key,
     hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
-    mark_legacy_migration_done, parse_room_storage_key, prune_outbound_dms_for_purges,
-    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
-    send_delegate_request_to, LegacyMigrationAction, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY,
-    ROOMS_STORAGE_KEY,
+    legacy_scoped_correlation, mark_legacy_migration_done, parse_room_storage_key,
+    prune_outbound_dms_for_purges, room_storage_key, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, send_delegate_request, send_delegate_request_to, LegacyMigrationAction,
+    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -175,34 +175,60 @@ impl ResponseHandler {
                                     response
                                 );
 
+                                // For a response from a LEGACY delegate, the awaiting request
+                                // registered under a delegate-scoped correlation key (so a
+                                // legacy read of room:A can't collide with a current/other-legacy
+                                // read of room:A — codex/skeptical re-review). Rebuild that same
+                                // scoped key from the responding delegate. Current-delegate
+                                // responses use the bare correlation (unchanged).
+                                let scoped =
+                                    |base: Vec<u8>| -> river_core::chat_delegate::ChatDelegateKey {
+                                        river_core::chat_delegate::ChatDelegateKey::new(
+                                            if is_legacy_delegate {
+                                                legacy_scoped_correlation(&key, &base)
+                                            } else {
+                                                base
+                                            },
+                                        )
+                                    };
+
                                 // Try to complete any pending request waiting for this response
                                 let completed = match &response {
                                     // Key-value storage responses
-                                    ChatDelegateResponseMsg::GetResponse { key, .. } => {
-                                        complete_pending_request(key, response.clone())
+                                    ChatDelegateResponseMsg::GetResponse { key: skey, .. } => {
+                                        complete_pending_request(
+                                            &scoped(skey.as_bytes().to_vec()),
+                                            response.clone(),
+                                        )
                                     }
-                                    ChatDelegateResponseMsg::StoreResponse { key, .. } => {
-                                        complete_pending_request(key, response.clone())
+                                    ChatDelegateResponseMsg::StoreResponse { key: skey, .. } => {
+                                        complete_pending_request(
+                                            &scoped(skey.as_bytes().to_vec()),
+                                            response.clone(),
+                                        )
                                     }
-                                    ChatDelegateResponseMsg::DeleteResponse { key, .. } => {
-                                        complete_pending_request(key, response.clone())
+                                    ChatDelegateResponseMsg::DeleteResponse { key: skey, .. } => {
+                                        complete_pending_request(
+                                            &scoped(skey.as_bytes().to_vec()),
+                                            response.clone(),
+                                        )
                                     }
                                     // CAS storage responses (freenet/river#345) correlate on
                                     // DISTINCT keys (prefix + storage key) so they can't be
                                     // confused with a concurrent plain Get/Store for the same
                                     // storage key. Rebuild the same correlation key the request
-                                    // registered under.
-                                    ChatDelegateResponseMsg::GetVersionedResponse { key, .. } => {
-                                        let corr = river_core::chat_delegate::ChatDelegateKey::new(
-                                            get_versioned_correlation_key(key),
-                                        );
-                                        complete_pending_request(&corr, response.clone())
+                                    // registered under (delegate-scoped too, for legacy).
+                                    ChatDelegateResponseMsg::GetVersionedResponse { key: skey, .. } => {
+                                        complete_pending_request(
+                                            &scoped(get_versioned_correlation_key(skey)),
+                                            response.clone(),
+                                        )
                                     }
-                                    ChatDelegateResponseMsg::CasStoreResponse { key, .. } => {
-                                        let corr = river_core::chat_delegate::ChatDelegateKey::new(
-                                            cas_store_correlation_key(key),
-                                        );
-                                        complete_pending_request(&corr, response.clone())
+                                    ChatDelegateResponseMsg::CasStoreResponse { key: skey, .. } => {
+                                        complete_pending_request(
+                                            &scoped(cas_store_correlation_key(skey)),
+                                            response.clone(),
+                                        )
                                     }
                                     ChatDelegateResponseMsg::ListResponse { .. } => {
                                         // Use the special list request key
@@ -332,11 +358,25 @@ impl ResponseHandler {
                                                 }
                                             } else {
                                                 info!("No rooms data found in delegate");
-                                                // NOTE: legacy-delegate migration is permanent — every delegate-WASM bump
-                                                // If legacy delegate has no data, mark migration done so we don't keep trying
                                                 if is_legacy_delegate {
-                                                    info!("No rooms in legacy delegate - marking migration complete");
-                                                    mark_legacy_migration_done();
+                                                    // A legacy delegate with NO `rooms_data` blob is
+                                                    // NOT necessarily empty: since freenet/river#345
+                                                    // rooms are stored under dynamic `room:<vk>` keys,
+                                                    // which this blob response can't see. Do NOT mark
+                                                    // migration done here — that would permanently
+                                                    // strand the per-room keys if the List-driven
+                                                    // `migrate_legacy_per_room` then fails (the exact
+                                                    // V24→V25 data-loss the code-first/skeptical
+                                                    // re-review caught). Done-marking is owned by the
+                                                    // successful-migration paths: `hydrate_loaded_rooms`'s
+                                                    // legacy re-save (rooms_data-has-data and per-room
+                                                    // alike) and the current-delegate PerRoom load. A
+                                                    // genuinely-empty legacy delegate simply gets
+                                                    // re-probed next session (harmless, fire-and-forget,
+                                                    // guarded within-session by LEGACY_MIGRATION_ATTEMPTED).
+                                                    info!(
+                                                        "Legacy delegate has no rooms_data blob; per-room keys (if any) are handled by migrate_legacy_per_room"
+                                                    );
                                                 } else {
                                                     // Current delegate has no `rooms_data` record
                                                     // at all. Per `decide_legacy_migration_action`,
@@ -1572,6 +1612,34 @@ mod tests {
     /// rooms or GETs imported rooms with `return_contract_code = true` —
     /// both cache the contract WASM on the node BEFORE any subscribe.
     ///
+    /// Regression pin (code-first/skeptical re-review): a legacy delegate
+    /// returning NO `rooms_data` blob must NOT mark legacy migration done — its
+    /// dynamic `room:<vk>` keys may still need migrating via the List-driven
+    /// `migrate_legacy_per_room`, and an early mark-done would permanently strand
+    /// them on any transient migration failure (the V24→V25 data-loss). Pin: the
+    /// empty-`rooms_data` `is_legacy_delegate` branch (between the two stable
+    /// log markers) must contain no `mark_legacy_migration_done(` call.
+    #[test]
+    fn legacy_empty_rooms_data_does_not_mark_migration_done() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let start = production
+            .find("No rooms data found in delegate")
+            .expect("empty-rooms_data branch marker must exist");
+        let end = production[start..]
+            .find("Current delegate empty — firing legacy migration")
+            .expect("current-empty branch marker must exist")
+            + start;
+        assert!(
+            !production[start..end].contains("mark_legacy_migration_done("),
+            "the empty-rooms_data legacy branch must NOT mark migration done — \
+             per-room keys may still need migrating (code-first/skeptical re-review)"
+        );
+    }
+
     /// `handle_api_response` is too deeply coupled to the Dioxus signal
     /// runtime + WebSocket to drive in a unit test, so this is a
     /// source-text pin on this file's PRODUCTION code (same approach as
