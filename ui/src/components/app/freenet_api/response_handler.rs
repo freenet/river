@@ -15,7 +15,8 @@ use crate::components::app::chat_delegate::{
     hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
     mark_legacy_migration_done, parse_room_storage_key, prune_outbound_dms_for_purges,
     room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
-    LegacyMigrationAction, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    send_delegate_request_to, LegacyMigrationAction, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY,
+    ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -28,7 +29,7 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::ReadableExt;
 
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
-use freenet_stdlib::prelude::OutboundDelegateMsg;
+use freenet_stdlib::prelude::{DelegateKey, OutboundDelegateMsg};
 pub use get_response::handle_get_response;
 pub use put_response::handle_put_response;
 use river_core::chat_delegate::{
@@ -280,7 +281,8 @@ impl ResponseHandler {
                                                 // Deserialize the rooms data
                                                 match from_reader::<Rooms, _>(&rooms_data[..]) {
                                                     Ok(loaded_rooms) => {
-                                                        // TODO: Remove legacy migration code after 2026-03-01
+                                                        // NOTE: legacy-delegate migration is permanent infrastructure
+                                                        // (every delegate-WASM bump needs it — freenet/river#345).
                                                         if is_legacy_delegate {
                                                             info!("Successfully loaded rooms from LEGACY delegate - migrating to new delegate");
                                                         } else {
@@ -330,7 +332,7 @@ impl ResponseHandler {
                                                 }
                                             } else {
                                                 info!("No rooms data found in delegate");
-                                                // TODO: Remove legacy migration code after 2026-03-01
+                                                // NOTE: legacy-delegate migration is permanent — every delegate-WASM bump
                                                 // If legacy delegate has no data, mark migration done so we don't keep trying
                                                 if is_legacy_delegate {
                                                     info!("No rooms in legacy delegate - marking migration complete");
@@ -385,17 +387,22 @@ impl ResponseHandler {
                                     }
                                     ChatDelegateResponseMsg::ListResponse { keys } => {
                                         info!("Listed {} delegate keys", keys.len());
-                                        // Per-room room load (freenet/river#345 / #65):
-                                        // the current delegate's stored keys drive which
-                                        // room:<vk> slots (+ rooms_meta) to fetch. Only
-                                        // the CURRENT delegate's List reaches here — the
-                                        // legacy-delegate migration path probes fixed
-                                        // keys directly, so its responses never carry a
-                                        // ListResponse. Spawn the orchestration so the
-                                        // per-key GETs can be awaited without blocking
-                                        // the message loop (the responses arrive through
-                                        // this same loop).
-                                        if !is_legacy_delegate {
+                                        // Per-room room load (freenet/river#345 / #65).
+                                        // The CURRENT delegate's List drives which
+                                        // room:<vk> slots (+ rooms_meta) to fetch and
+                                        // hydrate. A LEGACY delegate's List (fired by
+                                        // fire_legacy_migration_request to discover the
+                                        // dynamic per-room keys it holds) drives a
+                                        // migration that re-saves those rooms to the
+                                        // current delegate. Both spawn so the per-key
+                                        // GETs can be awaited without blocking the message
+                                        // loop (the responses arrive through this loop).
+                                        if is_legacy_delegate {
+                                            let legacy_key = key.clone();
+                                            crate::util::safe_spawn_local(async move {
+                                                migrate_legacy_per_room(legacy_key, keys).await;
+                                            });
+                                        } else {
                                             crate::util::safe_spawn_local(async move {
                                                 load_rooms_per_room(keys).await;
                                             });
@@ -582,6 +589,15 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // state).
             mark_legacy_migration_done();
 
+            // Concurrency note: a WebSocket reconnect re-fires `ListRequest`, so
+            // two `load_rooms_per_room` tasks can briefly overlap. The per-room
+            // GETs register under bare-key correlation in the single-waiter
+            // `PENDING_REQUESTS` map, so the second load's GET for a shared key
+            // orphans the first's oneshot (that room logs an error and is skipped
+            // in THAT pass). No permanent loss: each response is delivered to one
+            // load and `Rooms::merge` is a union, so across the overlapping
+            // passes every room still lands in ROOMS. (Load-vs-SAVE never
+            // collides — those use distinct prefixed correlation keys.)
             info!("Loading {} per-room slot(s) from delegate", room_vks.len());
             let mut slots: Vec<(ed25519_dalek::VerifyingKey, RoomSlot)> = Vec::new();
             for vk in room_vks {
@@ -751,6 +767,82 @@ async fn migrate_current_blob_to_per_room() {
             fire_legacy_migration_request().await;
         }
         Err(e) => warn!("Failed to read current-delegate rooms blob: {}", e),
+    }
+}
+
+/// Migrate the per-room slots a LEGACY delegate holds onto the current delegate
+/// (freenet/river#345 / #65). Driven by a legacy delegate's `ListResponse`
+/// (fired fire-and-forget by `fire_legacy_migration_request`): the per-room keys
+/// are dynamic, so the fixed `rooms_data`/`outbound_dms` probes can't discover
+/// them. Without this, the first delegate-WASM bump AFTER per-room storage ships
+/// would strand every room under the (now-legacy) per-room delegate key.
+///
+/// Reads each `room:<vk>` slot (+ `rooms_meta`) FROM the legacy delegate, then
+/// hydrates with `is_legacy_delegate = true` so the cursor isn't restored from
+/// the stale snapshot and the rooms are re-saved to the current delegate
+/// (hydrate's legacy branch). The legacy delegate's data is left untouched. The
+/// single-blob legacy format + `outbound_dms` are still handled by the fixed
+/// probes, so this only acts when the legacy delegate actually has per-room keys.
+async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegateKey>) {
+    let (room_vks, has_meta) = match plan_load_from_keys(&keys) {
+        LoadPlan::PerRoom { room_vks, has_meta } => (room_vks, has_meta),
+        // No per-room keys on this legacy delegate — its single blob (if any) is
+        // handled by the fixed rooms_data probe. Nothing per-room to migrate.
+        LoadPlan::MigrateCurrentBlob | LoadPlan::ProbeLegacy => return,
+    };
+
+    info!(
+        "Migrating {} per-room slot(s) from legacy delegate",
+        room_vks.len()
+    );
+    let mut slots: Vec<(ed25519_dalek::VerifyingKey, RoomSlot)> = Vec::new();
+    for vk in room_vks {
+        match send_delegate_request_to(
+            legacy_key.clone(),
+            ChatDelegateRequestMsg::GetRequest {
+                key: ChatDelegateKey::new(room_storage_key(&vk)),
+            },
+        )
+        .await
+        {
+            Ok(ChatDelegateResponseMsg::GetResponse {
+                value: Some(bytes), ..
+            }) => match from_reader::<RoomSlot, _>(&bytes[..]) {
+                Ok(slot) => slots.push((vk, slot)),
+                Err(e) => error!("Unparseable legacy room slot for {:?}: {}", vk, e),
+            },
+            Ok(_) => warn!("Legacy room key {:?} listed but value missing", vk),
+            Err(e) => error!("Failed to load legacy room {:?}: {}", vk, e),
+        }
+    }
+
+    let meta = if has_meta {
+        match send_delegate_request_to(
+            legacy_key.clone(),
+            ChatDelegateRequestMsg::GetRequest {
+                key: ChatDelegateKey::new(ROOMS_META_KEY.to_vec()),
+            },
+        )
+        .await
+        {
+            Ok(ChatDelegateResponseMsg::GetResponse {
+                value: Some(bytes), ..
+            }) => from_reader::<RoomsMeta, _>(&bytes[..]).ok(),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if slots.is_empty() {
+        return;
+    }
+
+    // is_legacy_delegate = true: skip legacy cursor restore, and trigger the
+    // re-save to the CURRENT delegate (which also marks legacy migration done).
+    let loaded = reconstruct_rooms(slots, meta);
+    if hydrate_loaded_rooms(loaded, true) {
+        schedule_subscription_timeout_check();
     }
 }
 
@@ -1199,7 +1291,7 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool) -> bool {
     // The caller schedules the subscription-timeout backstop (formerly
     // `flags.subscriptions_initiated`) based on our `had_loaded_rooms` return.
 
-    // TODO: Remove legacy migration code after 2026-03-01
+    // NOTE: legacy-delegate migration is permanent — every delegate-WASM bump
     // If this was from the legacy delegate, save to the new delegate
     if is_legacy_delegate {
         info!("Migrating room data from legacy delegate to new delegate");
@@ -1639,5 +1731,62 @@ mod tests {
         assert!(rooms.map.contains_key(&a));
         assert_eq!(rooms.current_room_key, None);
         assert!(rooms.room_order.is_empty());
+    }
+
+    /// Single-blob → per-room migration round-trip (the on-node upgrade
+    /// contract): a legacy `Rooms` value, when EXPLODED into per-room slots the
+    /// way the save path serializes them (`RoomSlot::Present` per room +
+    /// `Tombstone` per removed + `to_meta`) and then RECONSTRUCTED the way the
+    /// load path does, recovers the same rooms, tombstones, and view prefs — no
+    /// room lost across the explosion. Exercises the real CBOR encode/decode at
+    /// each per-key boundary (the websocket-driven `migrate_current_blob_to_per_room`
+    /// itself isn't unit-testable, but this pins the format it relies on).
+    #[test]
+    fn single_blob_explodes_and_reconstructs_without_loss() {
+        let present_a = vk(11);
+        let present_b = vk(12);
+        let left = vk(13);
+
+        // A legacy single-blob Rooms with 2 present rooms, 1 tombstone, and prefs.
+        let mut blob = empty_rooms();
+        blob.map.insert(
+            present_a,
+            crate::room_data::test_minimal_room_data(present_a),
+        );
+        blob.map.insert(
+            present_b,
+            crate::room_data::test_minimal_room_data(present_b),
+        );
+        blob.removed_rooms.insert(left);
+        blob.current_room_key = Some(present_b);
+        blob.room_order = vec![present_b, present_a];
+
+        // Explode exactly as do_save_rooms_to_delegate serializes each key, then
+        // decode each back exactly as the load path does.
+        let mut slots: Vec<(ed25519_dalek::VerifyingKey, RoomSlot)> = Vec::new();
+        for (vk, room) in blob.map.iter() {
+            let mut b = Vec::new();
+            ciborium::ser::into_writer(&RoomSlot::Present(Box::new(room.clone())), &mut b).unwrap();
+            let decoded: RoomSlot = from_reader(b.as_slice()).unwrap();
+            slots.push((*vk, decoded));
+        }
+        for vk in blob.removed_rooms.iter() {
+            let mut b = Vec::new();
+            ciborium::ser::into_writer(&RoomSlot::Tombstone, &mut b).unwrap();
+            let decoded: RoomSlot = from_reader(b.as_slice()).unwrap();
+            slots.push((*vk, decoded));
+        }
+        let mut mb = Vec::new();
+        ciborium::ser::into_writer(&blob.to_meta(), &mut mb).unwrap();
+        let meta: RoomsMeta = from_reader(mb.as_slice()).unwrap();
+
+        let recovered = reconstruct_rooms(slots, Some(meta));
+
+        assert!(recovered.map.contains_key(&present_a));
+        assert!(recovered.map.contains_key(&present_b));
+        assert!(!recovered.map.contains_key(&left));
+        assert!(recovered.removed_rooms.contains(&left));
+        assert_eq!(recovered.current_room_key, Some(present_b));
+        assert_eq!(recovered.room_order, vec![present_b, present_a]);
     }
 }

@@ -125,9 +125,13 @@ plaintext in the chat delegate.
   destroys the cache on cold-start when `outbound_dms` hydrates before
   `direct_messages` state has caught up.
 - **Legacy migration**: see `.claude/rules/river-publish.md` "How
-  Delegate Migration Works". Adding any new top-level storage key
-  requires extending the probe loop in `fire_legacy_migration_request`
-  AND the routing in `response_handler.rs`.
+  Delegate Migration Works". `outbound_dms` is a FIXED single key, so it
+  must stay in the `storage_keys` probe array in
+  `fire_legacy_migration_request` AND keep its routing in
+  `response_handler.rs`. (Dynamic key families like `room:<vk>` are
+  instead discovered via the legacy `ListRequest` path — see river-publish.md
+  for that carve-out. `outbound_dms` is NOT dynamic, so the fixed probe
+  is the right mechanism for it.)
 - **CLI side**: persists the same `OutboundDmStore` shape into
   `outbound_dms.json` in the riverctl data dir (consistent with
   `rooms.json`'s plaintext-on-disk threat model).

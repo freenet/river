@@ -1569,6 +1569,18 @@ impl Rooms {
     /// are filtered out of the merge — that prevents a legacy delegate's
     /// stale `rooms_data` from re-adding a room the user has already
     /// removed (see freenet/river#247).
+    ///
+    /// Known limitation (skeptical review, freenet/river#345): the per-room loop
+    /// below `return`s `Err` on the FIRST room whose `self_sk` diverges or whose
+    /// `room_state.merge` fails, so rooms not yet iterated are dropped from THIS
+    /// merge (they survive only if already present). The per-room SAVE path got
+    /// the M1 scoping fix (`reconcile_room_present` keeps local for the one
+    /// diverged room without wedging the others); the load-side merge did not.
+    /// The trigger is rare (it requires the SAME room to already be in memory
+    /// with a different identity than the loaded copy — not the cold-start case,
+    /// where memory is empty), and a re-load recovers the rest, so per-room
+    /// scoping here is left as follow-up rather than risking this broadly-used
+    /// path.
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
         // Tombstones first: take the union before anything else, so the
         // filter below sees the combined set.

@@ -424,6 +424,7 @@ pub(crate) fn reset_ensure_subscription_dedup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
 
     /// freenet/river#345 round-9 (pure decision): a `Present` save overwrites a
     /// remote tombstone ONLY when the user explicitly rejoined this session; a
@@ -473,11 +474,12 @@ mod tests {
         }
     }
 
-    /// `cas_write_key` stores the reconciled bytes at the generation just read.
+    /// `cas_write_key` stores the reconciled bytes at the generation just read,
+    /// and reports `Ok(true)` (a write happened).
     #[test]
     fn cas_write_key_stores_reconciled_value() {
         let stored = std::cell::RefCell::new(None);
-        futures::executor::block_on(cas_write_key(
+        let wrote = futures::executor::block_on(cas_write_key(
             |_current| Ok(Some(b"v1".to_vec())),
             || async { Ok::<_, String>((None, 0u64)) },
             |value, expected| {
@@ -487,15 +489,17 @@ mod tests {
             },
         ))
         .unwrap_or_else(|e| panic!("cas_write_key failed: {e}"));
+        assert!(wrote, "a store must report wrote=true");
         assert_eq!(*stored.borrow(), Some(b"v1".to_vec()));
     }
 
-    /// `reconcile` returning `None` aborts the write — nothing is stored. This
-    /// is how a room save adopts a remote leave instead of resurrecting it.
+    /// `reconcile` returning `None` aborts the write — nothing is stored, and
+    /// the call reports `Ok(false)` so the caller records the delegate's actual
+    /// (un-overwritten) state rather than a phantom `Present` (code-first review).
     #[test]
     fn cas_write_key_abort_does_not_store() {
         let stores = std::cell::RefCell::new(0u32);
-        futures::executor::block_on(cas_write_key(
+        let wrote = futures::executor::block_on(cas_write_key(
             |_current| Ok(None),
             || async { Ok::<_, String>((Some(b"remote".to_vec()), 5u64)) },
             |_value, _expected| {
@@ -504,6 +508,7 @@ mod tests {
             },
         ))
         .unwrap_or_else(|e| panic!("cas_write_key failed: {e}"));
+        assert!(!wrote, "abort (None) must report wrote=false");
         assert_eq!(*stores.borrow(), 0, "abort (None) must not store");
     }
 
@@ -604,12 +609,167 @@ mod tests {
         );
     }
 
+    fn present_slot_bytes(room: &RoomData) -> Vec<u8> {
+        let mut b = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Present(Box::new(room.clone())), &mut b).unwrap();
+        b
+    }
+
+    fn tombstone_slot_bytes() -> Vec<u8> {
+        let mut b = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Tombstone, &mut b).unwrap();
+        b
+    }
+
+    /// `reconcile_room_present` against an ABSENT slot stores the local room
+    /// fresh (round-9 `present_action(Absent, _) = StoreFresh`), exercised at the
+    /// byte level (not just the pure `present_action`).
+    #[test]
+    fn reconcile_room_present_absent_stores_fresh() {
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let local = crate::room_data::test_minimal_room_data(vk);
+        let out = reconcile_room_present(None, &vk, &local, false)
+            .unwrap()
+            .expect("absent slot must store fresh");
+        match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => assert_eq!(r.owner_vk, vk),
+            RoomSlot::Tombstone => panic!("expected Present"),
+        }
+    }
+
+    /// The round-9 crux at byte level: a BACKGROUND content update (not an
+    /// explicit rejoin) against a remote `Tombstone` ABORTS (adopt the leave),
+    /// returning `None` so the delegate's tombstone is never overwritten.
+    #[test]
+    fn reconcile_room_present_tombstone_background_adopts_leave() {
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let local = crate::room_data::test_minimal_room_data(vk);
+        let current = tombstone_slot_bytes();
+        assert!(
+            reconcile_room_present(Some(&current), &vk, &local, false)
+                .unwrap()
+                .is_none(),
+            "background update to a remotely-left room must adopt the leave"
+        );
+    }
+
+    /// An EXPLICIT rejoin against a remote `Tombstone` overwrites it with
+    /// `Present` (round-9 `present_action(Tombstone, rejoined=true) = StoreFresh`).
+    #[test]
+    fn reconcile_room_present_tombstone_explicit_rejoin_overwrites() {
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let local = crate::room_data::test_minimal_room_data(vk);
+        let current = tombstone_slot_bytes();
+        let out = reconcile_room_present(Some(&current), &vk, &local, true)
+            .unwrap()
+            .expect("explicit rejoin must overwrite the tombstone");
+        assert!(matches!(
+            ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap(),
+            RoomSlot::Present(_)
+        ));
+    }
+
+    /// M1: a remote `Present` slot with a DIFFERENT `self_sk` (diverged identity
+    /// for the same room) keeps the local room — it does NOT merge the other
+    /// identity's state and does NOT error (so it can't wedge the whole save).
+    #[test]
+    fn reconcile_room_present_diverged_identity_keeps_local() {
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let local = crate::room_data::test_minimal_room_data(vk); // self_sk = [1u8;32]
+        let mut remote = crate::room_data::test_minimal_room_data(vk);
+        remote.self_sk = SigningKey::from_bytes(&[2u8; 32]); // diverged identity
+        let current = present_slot_bytes(&remote);
+        let out = reconcile_room_present(Some(&current), &vk, &local, false)
+            .unwrap()
+            .expect("diverged identity keeps local, must still store");
+        match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => assert_eq!(
+                r.self_sk.to_bytes(),
+                local.self_sk.to_bytes(),
+                "must keep local's identity, not adopt the remote's"
+            ),
+            RoomSlot::Tombstone => panic!("expected Present"),
+        }
+    }
+
+    /// An unparseable current slot is a hard error (surfaced, not silently
+    /// treated as absent — which could clobber a slot the delegate holds).
+    #[test]
+    fn reconcile_room_present_unparseable_slot_errs() {
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let local = crate::room_data::test_minimal_room_data(vk);
+        assert!(reconcile_room_present(Some(b"garbage"), &vk, &local, false).is_err());
+    }
+
+    /// `mark_room_rejoined` (set) / `clear_room_rejoined` (consume on leave) are
+    /// the inputs to `present_action`'s rejoin override. A rejoin then a leave
+    /// must NOT leave the flag set, or a later background update would resurrect
+    /// a room left elsewhere (skeptical/big-picture review).
+    #[test]
+    fn rejoin_flag_set_and_cleared() {
+        let vk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        clear_room_rejoined(&vk); // ensure clean (thread-local may persist across tests)
+        assert!(!REJOINED_THIS_SESSION.with(|s| s.borrow().contains(&vk)));
+        mark_room_rejoined(vk);
+        assert!(REJOINED_THIS_SESSION.with(|s| s.borrow().contains(&vk)));
+        clear_room_rejoined(&vk);
+        assert!(
+            !REJOINED_THIS_SESSION.with(|s| s.borrow().contains(&vk)),
+            "leaving a room must consume any earlier same-session rejoin intent"
+        );
+    }
+
+    /// Pin the round-9 rejoin wiring (testing review): the two explicit-rejoin
+    /// sites must call `mark_room_rejoined`, and the leave site must call
+    /// `clear_room_rejoined`. If a future refactor drops any of these, an
+    /// explicit rejoin would silently adopt a remote tombstone (rejoin lost) or
+    /// a stale flag would resurrect a room left elsewhere — re-introducing the
+    /// #345 symptom with no other failing test.
+    #[test]
+    fn rejoin_flag_wiring_pinned() {
+        let members = include_str!("../members.rs");
+        assert!(
+            members.contains("mark_room_rejoined("),
+            "members.rs import-identity rejoin must call mark_room_rejoined"
+        );
+        let get_response = include_str!("freenet_api/response_handler/get_response.rs");
+        assert!(
+            get_response.contains("mark_room_rejoined("),
+            "get_response.rs invitation-accept rejoin must call mark_room_rejoined"
+        );
+        let edit_modal = include_str!("../room_list/edit_room_modal.rs");
+        assert!(
+            edit_modal.contains("clear_room_rejoined("),
+            "edit_room_modal.rs leave must call clear_room_rejoined"
+        );
+    }
+
+    /// `room_storage_key` round-trips through `parse_room_storage_key`, and the
+    /// parser rejects malformed keys (so a corrupt key is ignored, never
+    /// mis-classified as a room).
+    #[test]
+    fn room_storage_key_round_trips_and_rejects_malformed() {
+        let vk = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        assert_eq!(parse_room_storage_key(&room_storage_key(&vk)), Some(vk));
+        assert_eq!(parse_room_storage_key(ROOMS_META_KEY), None);
+        assert_eq!(parse_room_storage_key(ROOMS_STORAGE_KEY), None);
+        assert_eq!(parse_room_storage_key(b"room:not-base58!!!"), None);
+        assert_eq!(parse_room_storage_key(b"room:"), None);
+        assert_eq!(parse_room_storage_key(b"nope:abc"), None);
+        // valid base58 but wrong length (not 32 bytes)
+        assert_eq!(
+            parse_room_storage_key(
+                format!("room:{}", bs58::encode([1u8; 16]).into_string()).as_bytes()
+            ),
+            None
+        );
+    }
+
     /// `reconcile_meta`: this tab's prefs win, but a remote notification-mode
     /// for a room we don't track is absorbed (not lost on a concurrent write).
     #[test]
     fn reconcile_meta_absorbs_remote_notification_modes() {
         use crate::room_data::NotificationMode;
-        use ed25519_dalek::SigningKey;
 
         let vk_local = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
         let vk_remote = SigningKey::from_bytes(&[2u8; 32]).verifying_key();
@@ -1855,9 +2015,30 @@ thread_local! {
 /// Record that the user explicitly rejoined `owner_vk` this session. Called
 /// from the invitation-accept and identity-import rejoin paths (the sites that
 /// clear the room's tombstone). See [`REJOINED_THIS_SESSION`].
+///
+/// Also drops any `ROOM_SLOT_STATE` content-hash entry for the room so the next
+/// save re-evaluates it unconditionally — without this, a content-hash that
+/// happens to match a previously-skipped/aborted save could `continue` past the
+/// room and never overwrite a remote `Tombstone` with the rejoin (code-first
+/// review).
 pub fn mark_room_rejoined(owner_vk: VerifyingKey) {
     REJOINED_THIS_SESSION.with(|s| {
         s.borrow_mut().insert(owner_vk);
+    });
+    ROOM_SLOT_STATE.with(|c| {
+        c.borrow_mut().remove(&owner_vk);
+    });
+}
+
+/// Forget that `owner_vk` was rejoined this session. Called when the user leaves
+/// the room, so a later background content update doesn't resurrect a room left
+/// elsewhere on the strength of a stale rejoin flag (skeptical/big-picture
+/// review: `REJOINED_THIS_SESSION` must mean "rejoined more recently than the
+/// last leave", not "rejoined at some point this session"). The save loop also
+/// clears the flag once the rejoin has actually been persisted as `Present`.
+pub fn clear_room_rejoined(owner_vk: &VerifyingKey) {
+    REJOINED_THIS_SESSION.with(|s| {
+        s.borrow_mut().remove(owner_vk);
     });
 }
 
@@ -1876,11 +2057,17 @@ fn content_hash(bytes: &[u8]) -> u64 {
 /// `Conflict` (another writer advanced the key between our read and store) it
 /// re-reads and re-reconciles. `get_versioned`/`cas_store` are injected so the
 /// loop is unit-testable without the websocket.
+///
+/// Returns `Ok(true)` if a value was actually stored, `Ok(false)` if the
+/// reconcile aborted the write (no store happened). The caller needs this to
+/// avoid recording a "we persisted Present" cache entry for a key the delegate
+/// still holds as a `Tombstone` (code-first review: abort poisoned
+/// `ROOM_SLOT_STATE` and could later skip a needed rejoin write).
 async fn cas_write_key<R, G, GFut, S, SFut>(
     mut reconcile: R,
     get_versioned: G,
     mut cas_store: S,
-) -> Result<(), String>
+) -> Result<bool, String>
 where
     R: FnMut(Option<&[u8]>) -> Result<Option<Vec<u8>>, String>,
     G: Fn() -> GFut,
@@ -1892,10 +2079,10 @@ where
         let (current, generation) = get_versioned().await?;
         let to_store = match reconcile(current.as_deref())? {
             Some(bytes) => bytes,
-            None => return Ok(()),
+            None => return Ok(false),
         };
         match cas_store(to_store, generation).await? {
-            CasStoreResult::Stored { .. } => return Ok(()),
+            CasStoreResult::Stored { .. } => return Ok(true),
             CasStoreResult::Conflict { .. } => continue,
             CasStoreResult::Failed(e) => return Err(e),
         }
@@ -1905,8 +2092,9 @@ where
     ))
 }
 
-/// [`cas_write_key`] bound to a real delegate key over the websocket.
-async fn cas_write_delegate_key<R>(key: Vec<u8>, reconcile: R) -> Result<(), String>
+/// [`cas_write_key`] bound to a real delegate key over the websocket. Returns
+/// `Ok(true)` if a value was stored, `Ok(false)` if the reconcile aborted.
+async fn cas_write_delegate_key<R>(key: Vec<u8>, reconcile: R) -> Result<bool, String>
 where
     R: FnMut(Option<&[u8]>) -> Result<Option<Vec<u8>>, String>,
 {
@@ -2015,6 +2203,15 @@ fn reconcile_room_present(
                         &remote.room_state,
                     )
                     .map_err(|e| format!("room_state merge failed: {e}"))?;
+                // Union the invitation-carried secrets: a concurrent tab may hold
+                // a version this tab lacks, and these are persisted-only recovery
+                // state for a private-room invitee before the owner's contract
+                // back-fill arrives — local-wins would silently drop the remote's
+                // copy (skeptical review). The owner-signed contract blob remains
+                // authoritative and supersedes either on next state ingestion.
+                for (version, secret) in remote.invitation_secrets {
+                    m.invitation_secrets.entry(version).or_insert(secret);
+                }
                 m
             }
         }
@@ -2076,14 +2273,22 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
         (rooms, meta)
     };
 
+    // Per-room isolation extends to failures: one room's CAS exhaustion must not
+    // skip persisting the others (skeptical review). Accumulate per-key errors
+    // and keep going; surface an aggregate at the end so the coalesce caller
+    // still sees the failure.
+    let mut errors: Vec<String> = Vec::new();
+
     // 1. Present rooms — write only those whose serialized RoomData changed
     //    since the last save. Per-room isolation: an unchanged room is never
     //    rewritten, so a save can't touch (and thus can't resurrect) another
     //    room's tombstone (freenet/river#345 round-9).
     for (vk, room_data) in rooms.map.iter() {
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(room_data, &mut buf)
-            .map_err(|e| format!("serialize room {vk:?}: {e}"))?;
+        if let Err(e) = ciborium::ser::into_writer(room_data, &mut buf) {
+            errors.push(format!("serialize room {vk:?}: {e}"));
+            continue;
+        }
         let h = content_hash(&buf);
         if ROOM_SLOT_STATE.with(|c| c.borrow().get(vk) == Some(&SavedSlot::Present(h))) {
             continue;
@@ -2091,13 +2296,39 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
         let rejoined = REJOINED_THIS_SESSION.with(|s| s.borrow().contains(vk));
         let rd = room_data.clone();
         let owner = *vk;
-        cas_write_delegate_key(room_storage_key(vk), move |current| {
+        match cas_write_delegate_key(room_storage_key(vk), move |current| {
             reconcile_room_present(current, &owner, &rd, rejoined)
         })
-        .await?;
-        ROOM_SLOT_STATE.with(|c| {
-            c.borrow_mut().insert(*vk, SavedSlot::Present(h));
-        });
+        .await
+        {
+            Ok(wrote) => {
+                // `wrote == false` means the reconcile aborted to adopt a remote
+                // Tombstone (round-9). The delegate then still holds a Tombstone,
+                // so record THAT — recording `Present(h)` would be a lie that
+                // could later content-hash-skip a genuine rejoin write
+                // (code-first review).
+                ROOM_SLOT_STATE.with(|c| {
+                    c.borrow_mut().insert(
+                        *vk,
+                        if wrote {
+                            SavedSlot::Present(h)
+                        } else {
+                            SavedSlot::Tombstone
+                        },
+                    );
+                });
+                // Once a rejoin has actually been persisted as Present, consume
+                // the rejoin intent: a LATER cross-tab leave + background update
+                // must then adopt the leave, not resurrect on a stale flag
+                // (skeptical/big-picture review).
+                if wrote {
+                    REJOINED_THIS_SESSION.with(|s| {
+                        s.borrow_mut().remove(vk);
+                    });
+                }
+            }
+            Err(e) => errors.push(format!("save room {vk:?}: {e}")),
+        }
     }
 
     // 2. Tombstones — rooms the user has left.
@@ -2105,27 +2336,48 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
         if ROOM_SLOT_STATE.with(|c| c.borrow().get(vk) == Some(&SavedSlot::Tombstone)) {
             continue;
         }
-        cas_write_delegate_key(room_storage_key(vk), reconcile_room_tombstone).await?;
-        ROOM_SLOT_STATE.with(|c| {
-            c.borrow_mut().insert(*vk, SavedSlot::Tombstone);
-        });
+        match cas_write_delegate_key(room_storage_key(vk), reconcile_room_tombstone).await {
+            Ok(_) => {
+                ROOM_SLOT_STATE.with(|c| {
+                    c.borrow_mut().insert(*vk, SavedSlot::Tombstone);
+                });
+            }
+            Err(e) => errors.push(format!("tombstone room {vk:?}: {e}")),
+        }
     }
 
     // 3. List-level view preferences (current room, notification modes, order).
     let mut meta_buf = Vec::new();
-    ciborium::ser::into_writer(&meta, &mut meta_buf).map_err(|e| format!("serialize meta: {e}"))?;
-    let mh = content_hash(&meta_buf);
-    if META_SLOT_HASH.with(|c| *c.borrow()) != Some(mh) {
-        cas_write_delegate_key(ROOMS_META_KEY.to_vec(), move |current| {
-            reconcile_meta(current, &meta)
-        })
-        .await?;
-        META_SLOT_HASH.with(|c| {
-            *c.borrow_mut() = Some(mh);
-        });
+    match ciborium::ser::into_writer(&meta, &mut meta_buf) {
+        Ok(()) => {
+            let mh = content_hash(&meta_buf);
+            if META_SLOT_HASH.with(|c| *c.borrow()) != Some(mh) {
+                match cas_write_delegate_key(ROOMS_META_KEY.to_vec(), move |current| {
+                    reconcile_meta(current, &meta)
+                })
+                .await
+                {
+                    Ok(_) => {
+                        META_SLOT_HASH.with(|c| {
+                            *c.borrow_mut() = Some(mh);
+                        });
+                    }
+                    Err(e) => errors.push(format!("save rooms_meta: {e}")),
+                }
+            }
+        }
+        Err(e) => errors.push(format!("serialize meta: {e}")),
     }
 
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} per-room save error(s); first: {}",
+            errors.len(),
+            errors[0]
+        ))
+    }
 }
 
 // =============================================================================
@@ -2878,6 +3130,25 @@ fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
 pub async fn send_delegate_request(
     request: ChatDelegateRequestMsg,
 ) -> Result<ChatDelegateResponseMsg, String> {
+    // Reuse the session-cached delegate key (freenet/river#246) — re-hashing
+    // the 710 KB delegate WASM here on every call was a per-request fixed cost
+    // that, multiplied across the cold-open burst, contributed measurably to the
+    // memory peak. The delegate code is invariant for the session.
+    send_delegate_request_to(CHAT_DELEGATE_KEY.clone(), request).await
+}
+
+/// Like [`send_delegate_request`] but targets a SPECIFIC delegate key — used by
+/// the legacy-migration probe to read per-room keys from an old (legacy)
+/// delegate generation (freenet/river#345 / #65). The response correlation is
+/// keyed on the storage key (via `get_request_key`), NOT the delegate key, so a
+/// legacy read and a current read of the SAME storage key would collide on the
+/// single-waiter `PENDING_REQUESTS` slot — safe only because legacy migration
+/// runs exclusively when the current delegate is empty (the `ProbeLegacy` plan),
+/// so no current-delegate read for the same key is ever in flight.
+pub async fn send_delegate_request_to(
+    delegate_key: DelegateKey,
+    request: ChatDelegateRequestMsg,
+) -> Result<ChatDelegateResponseMsg, String> {
     debug!("Sending delegate request: {:?}", request);
 
     // Get the key bytes for tracking this request
@@ -2900,13 +3171,6 @@ pub async fn send_delegate_request(
         .map_err(|e| format!("Failed to serialize request: {}", e))?;
 
     info!("Serialized request payload size: {} bytes", payload.len());
-
-    // Reuse the session-cached delegate key (freenet/river#246) — re-hashing
-    // the 710 KB delegate WASM here on every call was a per-request fixed
-    // cost that, multiplied across the cold-open burst, contributed
-    // measurably to the memory peak. The delegate code is invariant for
-    // the session, so the key only needs to be computed once.
-    let delegate_key = CHAT_DELEGATE_KEY.clone(); // Get the delegate key for targeting the delegate request
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
@@ -3177,6 +3441,45 @@ pub(crate) async fn fire_legacy_migration_request() {
                     );
                 }
             }
+        }
+
+        // Per-room keys (room:<vk>, rooms_meta) are DYNAMIC, so the fixed
+        // GetRequests above can't discover them. Probe the legacy delegate's key
+        // index with a ListRequest; the ListResponse (is_legacy) is routed in
+        // response_handler.rs to a per-room migration that reconstructs those
+        // slots from THIS legacy delegate and re-saves them to the current one
+        // (freenet/river#345 / #65). Without this, the NEXT delegate-WASM bump
+        // after per-room storage ships would strand every room under the old key.
+        // Fire-and-forget (not awaited): a ListResponse only arrives if the
+        // legacy delegate is present, so an absent delegate costs nothing rather
+        // than a 10s per-delegate timeout for fresh users.
+        let list_request = ChatDelegateRequestMsg::ListRequest;
+        let mut list_payload = Vec::new();
+        if let Err(e) = ciborium::ser::into_writer(&list_request, &mut list_payload) {
+            error!("Failed to serialize legacy ListRequest #{i}: {e}");
+            continue;
+        }
+        let list_app_msg = freenet_stdlib::prelude::ApplicationMessage::new(list_payload);
+        let list_delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
+            key: legacy_delegate_key.clone(),
+            params: Parameters::from(Vec::<u8>::new()),
+            inbound: vec![
+                freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(list_app_msg),
+            ],
+        });
+        let list_result = {
+            let mut web_api = WEB_API.write();
+            if let Some(api) = web_api.as_mut() {
+                api.send(list_delegate_request).await
+            } else {
+                Err(freenet_stdlib::client_api::Error::ConnectionClosed)
+            }
+        };
+        match list_result {
+            Ok(_) => info!("Legacy ListRequest #{i} sent for per-room key discovery"),
+            Err(e) => info!(
+                "Could not send legacy ListRequest #{i} (expected if delegate not present): {e}"
+            ),
         }
     }
 }

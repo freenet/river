@@ -298,6 +298,13 @@ pub fn EditRoomModal() -> Element {
                                                     // legacy-delegate merges (freenet/river#247).
                                                     ROOMS.write().leave_room(room_vk);
 
+                                                    // Leaving cancels any earlier same-session
+                                                    // rejoin intent, so a later background content
+                                                    // update can't resurrect this room on a stale
+                                                    // rejoin flag (freenet/river#345 round-9,
+                                                    // skeptical/big-picture review).
+                                                    crate::components::app::chat_delegate::clear_room_rejoined(&room_vk);
+
                                                     // Check and potentially clear CURRENT_ROOM
                                                     if CURRENT_ROOM.read().owner_key == Some(room_vk) {
                                                         CURRENT_ROOM.write().owner_key = None;
