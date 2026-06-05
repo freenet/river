@@ -994,6 +994,23 @@ mod tests {
         assert!(key.ends_with(&fp));
     }
 
+    /// The "migration in progress" and "migration done" localStorage keys MUST
+    /// be distinct — they're set/cleared independently, and a shared key would
+    /// make clearing one corrupt the other (freenet/river#345 follow-up: the
+    /// in-progress flag drives interrupted-migration recovery).
+    #[test]
+    fn migration_in_progress_key_distinct_from_done_key() {
+        let fp = legacy_set_fingerprint();
+        let in_progress = legacy_migration_in_progress_key();
+        let done = legacy_migration_flag_key();
+        assert_ne!(in_progress, done);
+        assert!(in_progress.starts_with(LEGACY_MIGRATION_IN_PROGRESS_PREFIX));
+        assert!(
+            in_progress.ends_with(&fp),
+            "in-progress flag must be per-set too"
+        );
+    }
+
     // ===== resolve_hidden_thread_hydration tests (#261 Codex P3) =====
     use freenet_scaffold::util::FastHash;
 
@@ -3417,6 +3434,75 @@ pub fn mark_legacy_migration_done() {
                 } else {
                     info!("Legacy migration marked as done (key={})", key);
                 }
+            }
+        }
+    }
+}
+
+/// localStorage key prefix for the "legacy migration in progress" flag — set
+/// BEFORE a migration's per-room re-save and cleared only on full success. If a
+/// migration is interrupted (a per-room CAS write fails, or the tab is closed
+/// mid-migration), this flag stays set, so the next load's per-room path knows
+/// the per-room key set may be INCOMPLETE and re-runs the legacy fill to recover
+/// any stranded room (freenet/river#345 follow-up — Nacho's "Freenet Devs"
+/// disappeared-after-update report). New users never set it (no legacy data → no
+/// migration), so they incur no extra probing.
+#[allow(dead_code)]
+const LEGACY_MIGRATION_IN_PROGRESS_PREFIX: &str = "river_legacy_migration_in_progress:";
+
+#[allow(dead_code)]
+fn legacy_migration_in_progress_key() -> String {
+    format!(
+        "{}{}",
+        LEGACY_MIGRATION_IN_PROGRESS_PREFIX,
+        legacy_set_fingerprint()
+    )
+}
+
+/// True if a legacy migration was started but not confirmed complete (see
+/// [`LEGACY_MIGRATION_IN_PROGRESS_PREFIX`]).
+pub fn is_legacy_migration_in_progress() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                let key = legacy_migration_in_progress_key();
+                return storage.get_item(&key).ok().flatten().is_some();
+            }
+        }
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Non-WASM (tests): no migration is ever in progress.
+        false
+    }
+}
+
+/// Mark a legacy migration as in progress (call BEFORE the re-save).
+pub fn mark_legacy_migration_in_progress() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                let key = legacy_migration_in_progress_key();
+                if let Err(e) = storage.set_item(&key, "true") {
+                    warn!("Failed to set legacy-migration-in-progress flag: {:?}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Clear the "legacy migration in progress" flag (call only after a FULL,
+/// successful re-save — alongside [`mark_legacy_migration_done`]).
+pub fn clear_legacy_migration_in_progress() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                let key = legacy_migration_in_progress_key();
+                let _ = storage.remove_item(&key);
             }
         }
     }
