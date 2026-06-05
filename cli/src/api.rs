@@ -2036,11 +2036,35 @@ impl ApiClient {
         // Resolve any bare @nickname mentions to full mention tokens.
         let message_content = resolve_outgoing_mentions(&room_state, &message_content);
 
+        // Build the body — plaintext for a public room, AES-256-GCM sealed
+        // for a private room. Any persisted invitation-carried secrets (when
+        // a config dir holds this room) supplement the contract's per-member
+        // `encrypted_secrets` blob.
+        //
+        // This is the explicit-key / stateless path (bots, CI/CD), documented
+        // as NOT requiring local storage, so a missing/corrupt/read-only
+        // `rooms.json` must NOT fail the send: `.unwrap_or_default()` degrades
+        // to "no invitation secrets", and `build_message_body` then relies on
+        // the contract `encrypted_secrets` blob (public sends need no secret at
+        // all). Only erroring if NO secret is available anywhere — never on a
+        // storage hiccup the send doesn't depend on.
+        let invitation_secrets = self
+            .storage
+            .get_invitation_secrets(room_owner_key)
+            .unwrap_or_default();
+        let content = crate::private_room::build_message_body(
+            &room_state,
+            signing_key,
+            &invitation_secrets,
+            message_content,
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Create the message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: sender_member_id,
-            content: river_core::room_state::message::RoomMessageBody::public(message_content),
+            content,
             time: std::time::SystemTime::now(),
         };
 
@@ -2146,11 +2170,27 @@ impl ApiClient {
         // Resolve any bare @nickname mentions to full mention tokens.
         let message_content = resolve_outgoing_mentions(&room_state, &message_content);
 
+        // Build the body — plaintext for a public room, AES-256-GCM sealed for
+        // a private room (secret resolved from the contract's per-member
+        // `encrypted_secrets` blob, or this room's persisted invitation
+        // secrets). Unlike `send_message_with_key`, this path already requires
+        // local storage (it loaded the signing key from `rooms.json` above), so
+        // a `?` here surfaces a corrupt store as a clear error rather than a
+        // misleading "no secret available".
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        let content = crate::private_room::build_message_body(
+            &room_state,
+            &signing_key,
+            &invitation_secrets,
+            message_content,
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Create the message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: river_core::room_state::member::MemberId::from(*room_owner_key),
             author: river_core::room_state::member::MemberId::from(&signing_key.verifying_key()),
-            content: river_core::room_state::message::RoomMessageBody::public(message_content),
+            content,
             time: std::time::SystemTime::now(),
         };
 
