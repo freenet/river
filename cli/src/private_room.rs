@@ -198,32 +198,62 @@ fn current_secret_from_state(
 /// messages in private room") when no secret is available for the current
 /// version — the room owner must re-provision this member's secret, or the
 /// member must rejoin via a fresh invitation that carries the current version.
+///
+/// Also errors if the resulting body exceeds the room's `max_message_size`.
+/// The contract enforces that limit by *silently dropping* the message in
+/// `MessagesV1::apply_delta` (a `retain`, not an `Err`), so without this
+/// guard a too-long message would report success while never being
+/// delivered. The limit is measured against the body's `content_len()` —
+/// for a private room that is the AES-256-GCM **ciphertext** length (raw
+/// text + a 16-byte authentication tag + CBOR framing), so a message that
+/// fits as public can exceed the limit once sealed. Mirrors the UI's
+/// pre-send guard in `ui/src/components/conversation.rs`.
 pub fn build_message_body(
     state: &ChatRoomStateV1,
     self_sk: &SigningKey,
     invitation_secrets: &HashMap<u32, [u8; 32]>,
     text: String,
 ) -> Result<RoomMessageBody, String> {
-    if state.configuration.configuration.privacy_mode != PrivacyMode::Private {
-        return Ok(RoomMessageBody::public(text));
+    let content = if state.configuration.configuration.privacy_mode != PrivacyMode::Private {
+        RoomMessageBody::public(text)
+    } else {
+        let version = state.secrets.current_version;
+        let secrets = collect_secrets_for_room(state, self_sk, invitation_secrets);
+        let secret = secrets.get(&version).ok_or_else(|| {
+            format!(
+                "private room: no secret available for the current version (v{version}). \
+                 Sealing the message would be impossible. The room owner must share the \
+                 current room secret with this member (re-key / re-provision), or this \
+                 member must rejoin via a fresh invitation carrying v{version}."
+            )
+        })?;
+
+        // Mirror the UI: CBOR-encode the text content, then AES-256-GCM seal
+        // it under the current room secret with a fresh random nonce.
+        let content_bytes = TextContentV1::new(text).encode();
+        let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, &content_bytes);
+        RoomMessageBody::private_text(ciphertext, nonce, version)
+    };
+
+    // Fail loudly on an over-size body instead of letting the contract drop it
+    // silently (see the doc comment above). Covers both public and private
+    // bodies via the same `content_len()` the contract checks.
+    let max = state.configuration.configuration.max_message_size;
+    let len = content.content_len();
+    if len > max {
+        return Err(format!(
+            "message too large: {len} encoded bytes exceeds the room's \
+             max_message_size of {max} bytes.{}",
+            if content.is_private() {
+                " Private-room messages are AES-256-GCM sealed, which adds a \
+                 16-byte authentication tag plus CBOR framing over the raw text."
+            } else {
+                ""
+            }
+        ));
     }
 
-    let version = state.secrets.current_version;
-    let secrets = collect_secrets_for_room(state, self_sk, invitation_secrets);
-    let secret = secrets.get(&version).ok_or_else(|| {
-        format!(
-            "private room: no secret available for the current version (v{version}). \
-             Sealing the message would be impossible. The room owner must share the \
-             current room secret with this member (re-key / re-provision), or this \
-             member must rejoin via a fresh invitation carrying v{version}."
-        )
-    })?;
-
-    // Mirror the UI: CBOR-encode the text content, then AES-256-GCM seal it
-    // under the current room secret with a fresh random nonce.
-    let content_bytes = TextContentV1::new(text).encode();
-    let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, &content_bytes);
-    Ok(RoomMessageBody::private_text(ciphertext, nonce, version))
+    Ok(content)
 }
 
 #[cfg(test)]
@@ -560,6 +590,106 @@ mod tests {
         assert!(
             err.contains("v1"),
             "error should name the current version: {err}"
+        );
+    }
+
+    #[test]
+    fn build_message_body_errors_when_body_exceeds_max_message_size() {
+        // The contract silently DROPS an over-size message (a `retain` in
+        // `MessagesV1::apply_delta`), so the helper must refuse loudly rather
+        // than let a send report success while delivering nothing.
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        // Tiny limit so a normal-length message overflows once sealed.
+        let mut config = state.configuration.configuration.clone();
+        config.max_message_size = 4;
+        state.configuration = AuthorizedConfigurationV1::new(config, &owner);
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0x42u8; 32]);
+
+        let err = build_message_body(
+            &state,
+            &owner,
+            &inv,
+            "this is definitely longer than four bytes".to_string(),
+        )
+        .expect_err("over-size body must be rejected, not silently dropped");
+        assert!(
+            err.contains("too large") && err.contains("max_message_size"),
+            "error should explain the size limit, got: {err}"
+        );
+    }
+
+    /// End-to-end contract acceptance: a body produced by `build_message_body`
+    /// must be accepted by the room contract's own `apply_delta` — the same
+    /// validation `send_message` runs locally before transmitting. This closes
+    /// the gap the unit tests above leave open (they only check the sealing
+    /// math against a state whose `secrets.versions` is empty, which the
+    /// contract would reject). Requires no node.
+    #[test]
+    fn build_message_body_output_is_accepted_by_contract_apply_delta() {
+        use freenet_scaffold::ComposableState;
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1};
+        use river_core::room_state::privacy::RoomCipherSpec;
+        use river_core::room_state::secret::{
+            AuthorizedSecretVersionRecord, RoomSecretsV1, SecretVersionRecordV1,
+        };
+        use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+
+        let owner = fresh_signing_key();
+        let owner_vk = owner.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+
+        // Provision a genuine v0 secret: an owner-signed version record (so the
+        // contract's `secret_version ∈ versions` check passes) plus the
+        // owner's own owner-signed `encrypted_secrets` blob.
+        let secret = [0x33u8; 32];
+        state.secrets = RoomSecretsV1 {
+            current_version: 0,
+            versions: vec![AuthorizedSecretVersionRecord::new(
+                SecretVersionRecordV1 {
+                    version: 0,
+                    cipher_spec: RoomCipherSpec::Aes256Gcm,
+                    created_at: std::time::SystemTime::now(),
+                },
+                &owner,
+            )],
+            encrypted_secrets: vec![owner_blob(&owner, &owner_vk, 0, secret)],
+        };
+
+        let content = build_message_body(&state, &owner, &HashMap::new(), "ci ping".to_string())
+            .expect("seals under v0");
+
+        // The owner is always an accepted author, so no member entry is needed.
+        let message = MessageV1 {
+            room_owner: owner_id,
+            author: owner_id,
+            content,
+            time: std::time::SystemTime::now(),
+        };
+        let auth = AuthorizedMessageV1::new(message, &owner);
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth]),
+            ..Default::default()
+        };
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let mut applied = state.clone();
+        applied
+            .apply_delta(&state, &params, &Some(delta))
+            .expect("the contract accepts the sealed private message");
+        assert_eq!(
+            applied.recent_messages.messages.len(),
+            1,
+            "the sealed message must be retained, not silently dropped"
+        );
+        assert!(
+            applied.recent_messages.messages[0]
+                .message
+                .content
+                .is_private(),
+            "the accepted body must be the sealed (private) form"
         );
     }
 

@@ -147,10 +147,28 @@ version (and prunes it from `invitation_secrets`).
 
 riverctl carries the same `Invitation::room_secrets` wire shape as the UI,
 with `cli::private_room::{collect_secrets_for_room, collect_invitation_secrets,
-seal_invitee_nickname, current_secret_from_state}` as the byte-identical
-CLI counterparts. `StoredRoomInfo::invitation_secrets` (a
+seal_invitee_nickname, current_secret_from_state, build_message_body}` as the
+byte-identical CLI counterparts. `StoredRoomInfo::invitation_secrets` (a
 `HashMap<u32, [u8; 32]>` in `rooms.json`) persists the invitation-carried
 secrets across CLI invocations.
+
+**Sending (issue #350).** `cli::private_room::build_message_body` is the CLI
+analog of the UI's text-send path in `ui/src/components/conversation.rs`:
+for a private room it CBOR-encodes the text, seals it under the
+current-version secret with `encrypt_with_symmetric_key`, and emits
+`RoomMessageBody::private_text`. Wired into both `ApiClient::send_message`
+(storage identity) and `send_message_with_key` (explicit `--signing-key`,
+the stateless CI-runner path), so `riverctl message send` now works in a
+private room. **Deliberate divergence from the UI:** when no secret is
+available for the current version the UI logs a warning and falls back to a
+**public** body (`conversation.rs`, which the contract then rejects);
+`build_message_body` instead **errors** — never sending a public body into a
+private room, and never sealing under a stale (non-current) version. It also
+errors on an over-`max_message_size` body, which the contract would otherwise
+silently drop. Only plain `message send` is sealed; `message reply` / `edit`
+/ `delete` / reactions still emit public bodies and therefore still fail in a
+private room (they were never functional there — tracked separately for
+sealed action/reply bodies).
 
 **Critical**: `collect_secrets_for_room` does NOT derive owner secrets via
 `derive_room_secret` — the initial random v0 from `generate_room_secret()`

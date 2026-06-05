@@ -2040,10 +2040,7 @@ impl ApiClient {
         // for a private room. Any persisted invitation-carried secrets (when
         // a config dir holds this room) supplement the contract's per-member
         // `encrypted_secrets` blob.
-        let invitation_secrets = self
-            .storage
-            .get_invitation_secrets(room_owner_key)
-            .unwrap_or_default();
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
         let content = crate::private_room::build_message_body(
             &room_state,
             signing_key,
@@ -2166,10 +2163,7 @@ impl ApiClient {
         // a private room (secret resolved from the contract's per-member
         // `encrypted_secrets` blob, or this room's persisted invitation
         // secrets).
-        let invitation_secrets = self
-            .storage
-            .get_invitation_secrets(room_owner_key)
-            .unwrap_or_default();
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
         let content = crate::private_room::build_message_body(
             &room_state,
             &signing_key,
