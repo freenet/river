@@ -108,13 +108,31 @@ where stale legacy data overwrites newer state on the current delegate
 2. `LEGACY_DELEGATES` is generated at compile time from `legacy_delegates.toml`
    by `ui/build.rs`.
 3. The current delegate's `ListResponse` is classified by `plan_load_from_keys`:
-   - **Has `room:<vk>` keys** → current is authoritative: `load_rooms_per_room`
-     plain-GETs each slot (+ `rooms_meta`), reconstructs `Rooms`, hydrates, and
-     calls `mark_legacy_migration_done()`. Legacy probes never fire.
+   - **Has `room:<vk>` keys** → `load_rooms_per_room` plain-GETs each slot
+     (+ `rooms_meta`), reconstructs `Rooms`, and hydrates. What it does about
+     legacy migration is gated by `decide_per_room_load_action` on the
+     **interrupted-migration flag** (`is_legacy_migration_in_progress()`):
+     - *Not interrupted* (the common case) → the per-room set is authoritative:
+       call `mark_legacy_migration_done()`; legacy probes never fire (#253).
+     - *Interrupted* (a prior legacy→per-room migration was cut short before it
+       wrote every key — freenet/river#345 follow-up, Nacho's "Freenet Devs"
+       disappeared-after-update) → do NOT mark done; after loading the partial
+       set, re-run `migrate_current_blob_to_per_room()` once (armed via
+       `arm_legacy_migration_recovery()`, which also clears the per-session
+       attempt guard so same-session recovery isn't a no-op) to recover any
+       stranded room. The re-save is per-room CAS read-merge-write, so an
+       already-present room merges rather than being clobbered.
    - **No per-room keys, only a legacy `rooms_data` blob** →
      `migrate_current_blob_to_per_room` reads it and re-saves as per-room keys
      (non-destructive — the blob is left as a rollback fallback).
    - **Nothing** → `fire_legacy_migration_request()`.
+
+   The **interrupted-migration flag** is a per-legacy-set localStorage marker
+   (`river_legacy_migration_in_progress:<fingerprint>`, parallel to the
+   `…_done:` flag): set BEFORE any migration re-save (`hydrate_loaded_rooms`'s
+   legacy branch and the current-blob explosion alike) and cleared ONLY on a
+   FULL successful re-save. A partial/aborted re-save therefore leaves it set,
+   which is what drives the recovery above.
 4. `fire_legacy_migration_request` probes each legacy delegate TWO ways:
    (a) fixed `GetRequest` for `[ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY]`
    (the pre-#345 single-blob format + DM cache), and (b) a `ListRequest` to
