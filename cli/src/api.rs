@@ -2040,7 +2040,18 @@ impl ApiClient {
         // for a private room. Any persisted invitation-carried secrets (when
         // a config dir holds this room) supplement the contract's per-member
         // `encrypted_secrets` blob.
-        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        //
+        // This is the explicit-key / stateless path (bots, CI/CD), documented
+        // as NOT requiring local storage, so a missing/corrupt/read-only
+        // `rooms.json` must NOT fail the send: `.unwrap_or_default()` degrades
+        // to "no invitation secrets", and `build_message_body` then relies on
+        // the contract `encrypted_secrets` blob (public sends need no secret at
+        // all). Only erroring if NO secret is available anywhere — never on a
+        // storage hiccup the send doesn't depend on.
+        let invitation_secrets = self
+            .storage
+            .get_invitation_secrets(room_owner_key)
+            .unwrap_or_default();
         let content = crate::private_room::build_message_body(
             &room_state,
             signing_key,
@@ -2162,7 +2173,10 @@ impl ApiClient {
         // Build the body — plaintext for a public room, AES-256-GCM sealed for
         // a private room (secret resolved from the contract's per-member
         // `encrypted_secrets` blob, or this room's persisted invitation
-        // secrets).
+        // secrets). Unlike `send_message_with_key`, this path already requires
+        // local storage (it loaded the signing key from `rooms.json` above), so
+        // a `?` here surfaces a corrupt store as a clear error rather than a
+        // misleading "no secret available".
         let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
         let content = crate::private_room::build_message_body(
             &room_state,
