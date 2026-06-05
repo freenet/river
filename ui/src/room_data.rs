@@ -1318,6 +1318,91 @@ impl PartialEq for Rooms {
     }
 }
 
+/// Persisted per-room slot for the per-room chat-delegate key
+/// `room:<base58(owner_vk)>` (freenet/river#345 / #65).
+///
+/// Each room is its OWN delegate key, CAS-versioned independently, so the
+/// per-key generation is the version that resolves rejoin-vs-leave without a
+/// shared blob: leaving a room writes `Tombstone` at gen+1; rejoining reads
+/// the tombstone and writes `Present` at gen+1; a background content update
+/// that conflicts with a `Tombstone` adopts the leave (the room was left
+/// elsewhere) rather than resurrecting it. A `Tombstone` slot (not a deleted
+/// key) is what keeps a stale tab from re-creating a left room — and avoids
+/// the delete-resets-generation ABA.
+#[derive(Clone, Serialize, Deserialize)]
+pub enum RoomSlot {
+    /// The user is in this room; carries the full per-room data.
+    Present(Box<RoomData>),
+    /// The user has explicitly left this room (the per-room tombstone).
+    Tombstone,
+}
+
+/// List-level room state persisted under the single `rooms_meta` delegate key
+/// (everything in [`Rooms`] that is NOT per-room membership/data). Membership
+/// and tombstones live in the per-room [`RoomSlot`] keys; this holds only the
+/// local view preferences. CAS-versioned like any other key.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RoomsMeta {
+    #[serde(default)]
+    pub current_room_key: Option<VerifyingKey>,
+    #[serde(default)]
+    pub notification_modes: HashMap<VerifyingKey, NotificationMode>,
+    #[serde(default)]
+    pub room_order: Vec<VerifyingKey>,
+}
+
+impl Rooms {
+    /// Project the list-level view preferences into a [`RoomsMeta`] for the
+    /// `rooms_meta` delegate key.
+    pub fn to_meta(&self) -> RoomsMeta {
+        RoomsMeta {
+            current_room_key: self.current_room_key,
+            notification_modes: self.notification_modes.clone(),
+            room_order: self.room_order.clone(),
+        }
+    }
+
+    /// Apply a loaded [`RoomsMeta`] onto this in-memory `Rooms` (the per-room
+    /// slots populate `map`/`removed_rooms` separately). `room_order` is pruned
+    /// to rooms actually present.
+    pub fn apply_meta(&mut self, meta: RoomsMeta) {
+        self.current_room_key = meta.current_room_key;
+        self.notification_modes = meta.notification_modes;
+        self.room_order = meta.room_order;
+        self.room_order.retain(|vk| self.map.contains_key(vk));
+    }
+}
+
+/// Minimal `RoomData` for unit tests. Crate-visible (not confined to this
+/// file's `mod tests`) so the per-room load tests in `response_handler` can
+/// build `RoomSlot::Present` values too.
+#[cfg(test)]
+pub(crate) fn test_minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+    let params_bytes = to_cbor_vec(&params);
+    let contract_key = ContractKey::from_params_and_code(
+        Parameters::from(params_bytes),
+        &ContractCode::from(ROOM_CONTRACT_WASM),
+    );
+    RoomData {
+        owner_vk,
+        room_state: ChatRoomStateV1::default(),
+        self_sk: SigningKey::from_bytes(&[1u8; 32]),
+        contract_key,
+        last_read_message_id: None,
+        secrets: HashMap::new(),
+        current_secret_version: None,
+        last_secret_rotation: None,
+        key_migrated_to_delegate: false,
+        self_authorized_member: None,
+        invite_chain: vec![],
+        self_member_info: None,
+        self_nickname: None,
+        previous_contract_key: None,
+        invitation_secrets: HashMap::new(),
+    }
+}
+
 impl Rooms {
     pub fn create_new_room_with_name(
         &mut self,
@@ -1549,46 +1634,6 @@ impl Rooms {
         self.room_order.retain(|vk| self.map.contains_key(vk));
 
         Ok(())
-    }
-
-    /// Like [`Rooms::merge`] but local map membership wins over a STALE
-    /// tombstone in `other` (freenet/river#345, Codex P1 round 3).
-    ///
-    /// `merge` unions `removed_rooms`, which is correct for the *leave*
-    /// direction (#247 — a room `self` has left stays left) but wrong for the
-    /// *rejoin* direction: when the user explicitly rejoins a room (clears its
-    /// tombstone and re-adds it to `map`), merging in an older snapshot that
-    /// still carries the tombstone would re-remove the just-rejoined room. The
-    /// classic trigger is the chat-delegate CAS first-save after a reload,
-    /// where lazy generation forces a conflict against the delegate's own
-    /// pre-rejoin blob.
-    ///
-    /// So before merging, drop from `other.removed_rooms` any room `self`
-    /// currently holds in its `map`: `self`'s explicit map membership is
-    /// authoritative over `other`'s tombstone. `self`'s own tombstones still
-    /// block re-adds (so #247 holds) and shared room state still CRDT-merges.
-    /// Net effect on conflict resolution is "keep my decisions, absorb the
-    /// rooms I'm missing" — strictly better than the old blind overwrite,
-    /// which kept local decisions but had no anti-clobber for additions.
-    ///
-    /// Trade-off: a room another tab left is not removed from a tab that still
-    /// holds it open. Acceptable — the room stays visible where it's in use;
-    /// genuine per-room leave/rejoin versioning belongs to the per-room key
-    /// split (PR2).
-    ///
-    /// Known limitation (not a regression — pre-dates CAS): for a room present
-    /// on BOTH sides, only `room_state` is CRDT-merged. Other persisted
-    /// per-room scalars (`last_read_message_id`, `self_nickname`,
-    /// `invitation_secrets`) keep `self`'s value, so a stale tab's save can
-    /// regress e.g. an unread marker for a room another tab just advanced. The
-    /// old blind overwrite had the same effect (a stale full-blob write
-    /// reverted every room's scalars), so CAS is no worse here and strictly
-    /// better elsewhere. Proper per-field reconciliation (last_read = max,
-    /// union invitation_secrets, …) lands with the per-room key split (PR2),
-    /// where each room is an independently CAS-versioned key. Tracked on #345.
-    pub fn merge_reconciling(&mut self, mut other: Rooms) -> Result<(), String> {
-        other.removed_rooms.retain(|vk| !self.map.contains_key(vk));
-        self.merge(other)
     }
 
     /// Mark a room as explicitly left. Removes from `map`, drops any
@@ -2051,107 +2096,6 @@ mod tests {
             "the other tab's room B must be merged in, not clobbered"
         );
         assert_eq!(local.map.len(), 2);
-    }
-
-    /// freenet/river#345 (Codex P1 round 3): a user who explicitly REJOINS a
-    /// room (clears its tombstone, re-adds it) must not have it re-removed by a
-    /// CAS conflict merging an older snapshot that still carries the tombstone.
-    /// `merge_reconciling` makes local map membership win over a stale remote
-    /// tombstone — and a plain `merge` would (wrongly) drop the room, which we
-    /// assert to pin the difference.
-    #[test]
-    fn merge_reconciling_preserves_local_rejoin_over_stale_tombstone() {
-        let mut rng = rand::thread_rng();
-        let owner = SigningKey::generate(&mut rng);
-        let self_sk = SigningKey::generate(&mut rng);
-        let vk = owner.verifying_key();
-
-        // Local: user has just REJOINED R (R in map, no tombstone).
-        let mut local = Rooms {
-            map: HashMap::new(),
-            current_room_key: None,
-            removed_rooms: std::collections::HashSet::new(),
-            notification_modes: Default::default(),
-            room_order: Vec::new(),
-            migrated_rooms: Vec::new(),
-        };
-        local
-            .map
-            .insert(vk, make_rejoin_test_room(&owner, &self_sk, true));
-
-        // Remote (older delegate blob): still has R tombstoned, not in map.
-        let make_remote = || Rooms {
-            map: HashMap::new(),
-            current_room_key: None,
-            removed_rooms: std::collections::HashSet::from([vk]),
-            notification_modes: Default::default(),
-            room_order: Vec::new(),
-            migrated_rooms: Vec::new(),
-        };
-
-        // Plain merge WOULD discard the rejoin (tombstone union wins)...
-        let mut plain = local.clone();
-        plain.merge(make_remote()).unwrap();
-        assert!(
-            !plain.map.contains_key(&vk),
-            "precondition: plain merge re-removes the rejoined room"
-        );
-
-        // ...merge_reconciling preserves it.
-        local.merge_reconciling(make_remote()).unwrap();
-        assert!(
-            local.map.contains_key(&vk),
-            "rejoined room must survive a stale remote tombstone"
-        );
-        assert!(
-            !local.removed_rooms.contains(&vk),
-            "rejoined room must not be re-tombstoned"
-        );
-    }
-
-    /// `merge_reconciling` must NOT weaken #247: a room THIS side has left
-    /// (local tombstone, not in map) stays left even when `other` still has it
-    /// in `map`. Only the remote's tombstone for a room local *holds* is
-    /// dropped; local's own tombstones are untouched.
-    #[test]
-    fn merge_reconciling_keeps_local_leave_sticky() {
-        let mut rng = rand::thread_rng();
-        let owner = SigningKey::generate(&mut rng);
-        let self_sk = SigningKey::generate(&mut rng);
-        let vk = owner.verifying_key();
-
-        // Local: user LEFT R (tombstone, not in map).
-        let mut local = Rooms {
-            map: HashMap::new(),
-            current_room_key: None,
-            removed_rooms: std::collections::HashSet::from([vk]),
-            notification_modes: Default::default(),
-            room_order: Vec::new(),
-            migrated_rooms: Vec::new(),
-        };
-
-        // Remote (e.g. legacy/other tab) still has R in map.
-        let mut remote = Rooms {
-            map: HashMap::new(),
-            current_room_key: None,
-            removed_rooms: std::collections::HashSet::new(),
-            notification_modes: Default::default(),
-            room_order: Vec::new(),
-            migrated_rooms: Vec::new(),
-        };
-        remote
-            .map
-            .insert(vk, make_rejoin_test_room(&owner, &self_sk, true));
-
-        local.merge_reconciling(remote).unwrap();
-        assert!(
-            !local.map.contains_key(&vk),
-            "a room this tab left must not be re-added (#247)"
-        );
-        assert!(
-            local.removed_rooms.contains(&vk),
-            "local tombstone preserved"
-        );
     }
 
     #[test]
@@ -3452,29 +3396,7 @@ mod tests {
     }
 
     fn minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
-        let params = ChatRoomParametersV1 { owner: owner_vk };
-        let params_bytes = to_cbor_vec(&params);
-        let contract_key = ContractKey::from_params_and_code(
-            Parameters::from(params_bytes),
-            &ContractCode::from(ROOM_CONTRACT_WASM),
-        );
-        RoomData {
-            owner_vk,
-            room_state: ChatRoomStateV1::default(),
-            self_sk: SigningKey::from_bytes(&[1u8; 32]),
-            contract_key,
-            last_read_message_id: None,
-            secrets: HashMap::new(),
-            current_secret_version: None,
-            last_secret_rotation: None,
-            key_migrated_to_delegate: false,
-            self_authorized_member: None,
-            invite_chain: vec![],
-            self_member_info: None,
-            self_nickname: None,
-            previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
-        }
+        super::test_minimal_room_data(owner_vk)
     }
 
     fn rooms_with_keys(keys: &[VerifyingKey]) -> Rooms {
@@ -3652,6 +3574,66 @@ mod tests {
 
         assert_eq!(decoded.room_order, vec![keys[2], keys[0], keys[1]]);
         assert_eq!(decoded.ordered_room_keys(), vec![keys[2], keys[0], keys[1]]);
+    }
+
+    /// Per-room persistence (freenet/river#345 / #65): a `RoomSlot::Present`
+    /// must survive the same ciborium encode/decode the per-room save/load path
+    /// uses, carrying the full `RoomData`. Pins the on-disk slot format so a
+    /// future serde change to `RoomData` can't silently corrupt a stored room.
+    #[test]
+    fn room_slot_present_round_trips() {
+        let vk = vk_from_seed(7);
+        let slot = RoomSlot::Present(Box::new(minimal_room_data(vk)));
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&slot, &mut buf).unwrap();
+        let decoded: RoomSlot = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            RoomSlot::Present(room) => assert_eq!(room.owner_vk, vk),
+            RoomSlot::Tombstone => panic!("expected Present, got Tombstone"),
+        }
+    }
+
+    /// A `RoomSlot::Tombstone` round-trips (the per-room leave marker).
+    #[test]
+    fn room_slot_tombstone_round_trips() {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Tombstone, &mut buf).unwrap();
+        let decoded: RoomSlot = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert!(matches!(decoded, RoomSlot::Tombstone));
+    }
+
+    /// `to_meta` → ciborium → `apply_meta` round-trips the list-level view
+    /// preferences, and `apply_meta` prunes `room_order` to rooms present in the
+    /// reconstructed `map` (a stale entry for a no-longer-present room is
+    /// dropped, mirroring the per-room load where slots populate `map` first).
+    #[test]
+    fn rooms_meta_round_trips_and_apply_meta_prunes_order() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let ghost = vk_from_seed(88);
+        let mut source = rooms_with_keys(&keys);
+        source.current_room_key = Some(keys[1]);
+        source
+            .notification_modes
+            .insert(keys[0], NotificationMode::Muted);
+        // Include a ghost the reconstructed map won't have.
+        source.room_order = vec![keys[2], keys[0], ghost];
+
+        let meta = source.to_meta();
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&meta, &mut buf).unwrap();
+        let decoded: RoomsMeta = ciborium::de::from_reader(buf.as_slice()).unwrap();
+
+        // Reconstruct only the real rooms (per-room slots), then apply meta.
+        let mut reconstructed = rooms_with_keys(&keys);
+        reconstructed.apply_meta(decoded);
+
+        assert_eq!(reconstructed.current_room_key, Some(keys[1]));
+        assert_eq!(
+            reconstructed.notification_modes.get(&keys[0]),
+            Some(&NotificationMode::Muted)
+        );
+        // Ghost pruned; real order preserved.
+        assert_eq!(reconstructed.room_order, vec![keys[2], keys[0]]);
     }
 
     /// Backward-compat: a `rooms_data` blob serialised before this PR

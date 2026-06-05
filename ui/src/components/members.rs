@@ -701,8 +701,12 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                         // Importing a room is an explicit rejoin — clear any
                         // prior leave tombstone for this owner_key so the
                         // merge path doesn't silently filter the room out
-                        // on next reload (freenet/river#247).
+                        // on next reload (freenet/river#247). Also record the
+                        // explicit rejoin so the per-room save overwrites a
+                        // remote `Tombstone` slot with `Present` rather than
+                        // adopting the leave (freenet/river#345 round-9).
                         rooms.removed_rooms.remove(&owner_key);
+                        crate::components::app::chat_delegate::mark_room_rejoined(owner_key);
                         rooms.map.insert(owner_key, room_data);
                     });
 

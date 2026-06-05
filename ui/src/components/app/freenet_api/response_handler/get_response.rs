@@ -287,8 +287,12 @@ pub async fn handle_get_response(
                     // Accepting an invitation is an explicit rejoin — clear any
                     // prior leave tombstone for this room so the merge path
                     // doesn't silently filter the room out again later. See
-                    // freenet/river#247.
+                    // freenet/river#247. Also record the explicit rejoin so the
+                    // per-room save overwrites a remote `Tombstone` slot with
+                    // `Present` rather than adopting the leave
+                    // (freenet/river#345 round-9).
                     rooms.removed_rooms.remove(&owner_vk);
+                    crate::components::app::chat_delegate::mark_room_rejoined(owner_vk);
 
                     // Get the entry for this room
                     let entry = rooms.map.entry(owner_vk);
