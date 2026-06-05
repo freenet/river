@@ -2036,11 +2036,27 @@ impl ApiClient {
         // Resolve any bare @nickname mentions to full mention tokens.
         let message_content = resolve_outgoing_mentions(&room_state, &message_content);
 
+        // Build the body — plaintext for a public room, AES-256-GCM sealed
+        // for a private room. Any persisted invitation-carried secrets (when
+        // a config dir holds this room) supplement the contract's per-member
+        // `encrypted_secrets` blob.
+        let invitation_secrets = self
+            .storage
+            .get_invitation_secrets(room_owner_key)
+            .unwrap_or_default();
+        let content = crate::private_room::build_message_body(
+            &room_state,
+            signing_key,
+            &invitation_secrets,
+            message_content,
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Create the message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: sender_member_id,
-            content: river_core::room_state::message::RoomMessageBody::public(message_content),
+            content,
             time: std::time::SystemTime::now(),
         };
 
@@ -2146,11 +2162,27 @@ impl ApiClient {
         // Resolve any bare @nickname mentions to full mention tokens.
         let message_content = resolve_outgoing_mentions(&room_state, &message_content);
 
+        // Build the body — plaintext for a public room, AES-256-GCM sealed for
+        // a private room (secret resolved from the contract's per-member
+        // `encrypted_secrets` blob, or this room's persisted invitation
+        // secrets).
+        let invitation_secrets = self
+            .storage
+            .get_invitation_secrets(room_owner_key)
+            .unwrap_or_default();
+        let content = crate::private_room::build_message_body(
+            &room_state,
+            &signing_key,
+            &invitation_secrets,
+            message_content,
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Create the message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: river_core::room_state::member::MemberId::from(*room_owner_key),
             author: river_core::room_state::member::MemberId::from(&signing_key.verifying_key()),
-            content: river_core::room_state::message::RoomMessageBody::public(message_content),
+            content,
             time: std::time::SystemTime::now(),
         };
 

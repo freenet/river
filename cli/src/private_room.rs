@@ -8,8 +8,12 @@
 //! invitation are wire-interchangeable.
 
 use ed25519_dalek::SigningKey;
-use river_core::ecies::{decrypt_secret_from_member_blob_raw, seal_bytes};
+use river_core::ecies::{
+    decrypt_secret_from_member_blob_raw, encrypt_with_symmetric_key, seal_bytes,
+};
+use river_core::room_state::content::TextContentV1;
 use river_core::room_state::member::MemberId;
+use river_core::room_state::message::RoomMessageBody;
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::ChatRoomStateV1;
 use std::collections::HashMap;
@@ -177,11 +181,58 @@ fn current_secret_from_state(
     Some((secret, version))
 }
 
+/// Build the `RoomMessageBody` for an outgoing chat message.
+///
+/// For a **public** room this is the plaintext body (unchanged behaviour).
+/// For a **private** room the plaintext is encrypted under the room's
+/// current-version secret with AES-256-GCM, mirroring the UI's send path in
+/// `ui/src/components/conversation.rs` (`TextContentV1::encode` →
+/// `encrypt_with_symmetric_key` → `RoomMessageBody::private`). The secret is
+/// resolved exactly like [`seal_invitee_nickname`]: from the member's own
+/// owner-signed `encrypted_secrets` blob in contract state, falling back to
+/// the secret carried in the `Invitation` this member joined with
+/// (`invitation_secrets`). [`collect_secrets_for_room`] folds both sources.
+///
+/// Returns an error (rather than silently falling back to a public body,
+/// which the contract rejects in a private room with "Cannot send public
+/// messages in private room") when no secret is available for the current
+/// version — the room owner must re-provision this member's secret, or the
+/// member must rejoin via a fresh invitation that carries the current version.
+pub fn build_message_body(
+    state: &ChatRoomStateV1,
+    self_sk: &SigningKey,
+    invitation_secrets: &HashMap<u32, [u8; 32]>,
+    text: String,
+) -> Result<RoomMessageBody, String> {
+    if state.configuration.configuration.privacy_mode != PrivacyMode::Private {
+        return Ok(RoomMessageBody::public(text));
+    }
+
+    let version = state.secrets.current_version;
+    let secrets = collect_secrets_for_room(state, self_sk, invitation_secrets);
+    let secret = secrets.get(&version).ok_or_else(|| {
+        format!(
+            "private room: no secret available for the current version (v{version}). \
+             Sealing the message would be impossible. The room owner must share the \
+             current room secret with this member (re-key / re-provision), or this \
+             member must rejoin via a fresh invitation carrying v{version}."
+        )
+    })?;
+
+    // Mirror the UI: CBOR-encode the text content, then AES-256-GCM seal it
+    // under the current room secret with a fresh random nonce.
+    let content_bytes = TextContentV1::new(text).encode();
+    let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, &content_bytes);
+    Ok(RoomMessageBody::private_text(ciphertext, nonce, version))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use river_core::ecies::{encrypt_secret_for_member, generate_room_secret};
+    use river_core::ecies::{
+        decrypt_with_symmetric_key, encrypt_secret_for_member, generate_room_secret,
+    };
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::privacy::PrivacyMode;
     use river_core::room_state::secret::{
@@ -397,6 +448,118 @@ mod tests {
             sealed.is_none(),
             "must defer when invitation_secrets lacks current_version — \
              sealing under v0 when room is at v1 yields a SealedBytes nobody can unseal"
+        );
+    }
+
+    #[test]
+    fn build_message_body_public_room_is_plaintext() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Public);
+        let body = build_message_body(&state, &owner, &HashMap::new(), "hello".to_string())
+            .expect("public room always builds a body");
+        match body {
+            RoomMessageBody::Public { data, .. } => {
+                let decoded = TextContentV1::decode(&data).expect("valid text content");
+                assert_eq!(decoded.text, "hello");
+            }
+            RoomMessageBody::Private { .. } => panic!("public room must not seal the body"),
+        }
+    }
+
+    #[test]
+    fn build_message_body_private_room_seals_and_roundtrips_via_invitation_secret() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Private); // current_version = 0
+        let secret = [0x42u8; 32];
+        let mut inv = HashMap::new();
+        inv.insert(0u32, secret);
+
+        let body = build_message_body(&state, &owner, &inv, "secret hi".to_string())
+            .expect("invitation-carried secret seals the body");
+
+        match body {
+            RoomMessageBody::Private {
+                ciphertext,
+                nonce,
+                secret_version,
+                ..
+            } => {
+                assert_eq!(secret_version, 0, "must seal under the current version");
+                let plaintext = decrypt_with_symmetric_key(&secret, &ciphertext, &nonce)
+                    .expect("the sealed body decrypts under the room secret");
+                let decoded = TextContentV1::decode(&plaintext).expect("valid text content");
+                assert_eq!(decoded.text, "secret hi");
+            }
+            RoomMessageBody::Public { .. } => panic!("private room must seal the body"),
+        }
+    }
+
+    #[test]
+    fn build_message_body_private_room_seals_via_contract_blob() {
+        // The member's secret lives only in an owner-signed contract blob
+        // (the steady-state path, once the owner has provisioned the member).
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        let secret = [0x7eu8; 32];
+        state
+            .secrets
+            .encrypted_secrets
+            .push(owner_blob(&owner, &owner.verifying_key(), 0, secret));
+
+        let body = build_message_body(&state, &owner, &HashMap::new(), "from blob".to_string())
+            .expect("contract-blob secret seals the body");
+
+        match body {
+            RoomMessageBody::Private {
+                ciphertext,
+                nonce,
+                secret_version,
+                ..
+            } => {
+                assert_eq!(secret_version, 0);
+                let plaintext = decrypt_with_symmetric_key(&secret, &ciphertext, &nonce)
+                    .expect("decrypts under the blob-carried secret");
+                assert_eq!(TextContentV1::decode(&plaintext).unwrap().text, "from blob");
+            }
+            RoomMessageBody::Public { .. } => panic!("private room must seal the body"),
+        }
+    }
+
+    #[test]
+    fn build_message_body_private_room_errors_without_secret() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Private);
+        // A member with neither a contract blob nor an invitation secret for
+        // the current version must error — never silently send a public body
+        // that the contract would reject ("Cannot send public messages...").
+        let err = build_message_body(
+            &state,
+            &fresh_signing_key(),
+            &HashMap::new(),
+            "nope".to_string(),
+        )
+        .expect_err("must refuse to send when no secret is available");
+        assert!(
+            err.contains("no secret available"),
+            "error should explain the missing secret, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_message_body_private_room_errors_when_secret_lacks_current_version() {
+        // Room rotated to v1 but the member only holds v0 — sealing under v0
+        // would be unreadable by members at v1, so refuse (mirrors the
+        // nickname-sealing guard).
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        state.secrets.current_version = 1;
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0x42u8; 32]);
+        let err = build_message_body(&state, &fresh_signing_key(), &inv, "stale".to_string())
+            .expect_err("must refuse to seal under a non-current version");
+        assert!(
+            err.contains("v1"),
+            "error should name the current version: {err}"
         );
     }
 
