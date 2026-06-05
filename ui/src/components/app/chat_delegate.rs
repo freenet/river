@@ -974,6 +974,33 @@ mod tests {
         );
     }
 
+    /// Per-room load gating (freenet/river#345 follow-up — interrupted-migration
+    /// recovery). A clean per-room set is authoritative: seal migration, never
+    /// probe legacy. An interrupted one must NOT be sealed and must re-run the
+    /// migration to recover rooms a partial migration failed to write.
+    #[test]
+    fn per_room_load_action_gates_on_interrupted_flag() {
+        let clean = decide_per_room_load_action(false);
+        assert!(
+            clean.mark_done,
+            "a clean per-room set must seal migration (#253)"
+        );
+        assert!(
+            !clean.recover,
+            "a clean per-room set must not re-probe legacy"
+        );
+
+        let interrupted = decide_per_room_load_action(true);
+        assert!(
+            !interrupted.mark_done,
+            "an interrupted migration must NOT be sealed, or stranded rooms are lost forever"
+        );
+        assert!(
+            interrupted.recover,
+            "an interrupted migration must re-run to recover stranded rooms"
+        );
+    }
+
     /// Codex P1 finding on PR #259: the legacy-migration-done
     /// localStorage flag MUST be scoped to the current
     /// `LEGACY_DELEGATES` set, otherwise every WASM bump that adds
@@ -3365,6 +3392,44 @@ pub(crate) fn decide_legacy_migration_action(
     }
 }
 
+/// What a current-delegate `LoadPlan::PerRoom` load should do (freenet/river#345
+/// follow-up). Extracted as a pure value so the gating logic is unit-testable
+/// off-WASM — the load path itself is too coupled to the Dioxus/WebSocket
+/// runtime to drive in a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PerRoomLoadAction {
+    /// Seal legacy migration as permanently done (the per-room set is
+    /// authoritative; legacy must never be probed again — freenet/river#253).
+    pub mark_done: bool,
+    /// Re-run the migration to recover any room a prior interrupted migration
+    /// failed to write before it was cut short.
+    pub recover: bool,
+}
+
+/// Decide what a current-delegate per-room load should do, given whether a
+/// prior legacy migration was left in progress (interrupted).
+///
+/// - **Not interrupted** → the per-room set is authoritative: `mark_done` so
+///   legacy is never probed (freenet/river#253 — a stale legacy response could
+///   clobber newer state), and do not `recover`.
+/// - **Interrupted** → the set may be missing rooms a partial migration never
+///   wrote: do NOT seal it (`mark_done == false`) and `recover` (re-run the
+///   migration). The recovery re-save is a per-room CAS read-merge-write, so a
+///   room already present merges rather than being overwritten.
+pub(crate) fn decide_per_room_load_action(migration_interrupted: bool) -> PerRoomLoadAction {
+    if migration_interrupted {
+        PerRoomLoadAction {
+            mark_done: false,
+            recover: true,
+        }
+    } else {
+        PerRoomLoadAction {
+            mark_done: true,
+            recover: false,
+        }
+    }
+}
+
 /// localStorage key PREFIX to track whether legacy migration has been
 /// attempted. The actual key is suffixed with the fingerprint of the
 /// current [`LEGACY_DELEGATES`] set so that adding a new legacy entry
@@ -3515,6 +3580,32 @@ pub fn clear_legacy_migration_in_progress() {
 /// every WebSocket reconnect would re-fire all 3 legacy delegate requests, creating a
 /// tight error spam loop (~9 errors every 3 seconds).
 static LEGACY_MIGRATION_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
+/// Per-session guard so interrupted-migration recovery re-fires the legacy
+/// probe at most ONCE per session. Without it, every WebSocket reconnect that
+/// re-runs the per-room load would reset [`LEGACY_MIGRATION_ATTEMPTED`] and
+/// re-probe, reintroducing the very error-spam that guard prevents.
+static RECOVERY_REFIRE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Arm one interrupted-migration recovery probe for this session
+/// (freenet/river#345 follow-up; codex review of #352).
+///
+/// Returns `true` the FIRST time it is called in a session — and, as a side
+/// effect, clears the per-session [`LEGACY_MIGRATION_ATTEMPTED`] guard so the
+/// recovery's `fire_legacy_migration_request` actually fires. Returns `false`
+/// on every subsequent call. This is needed because the initial migration this
+/// session may already have set `LEGACY_MIGRATION_ATTEMPTED`; without clearing
+/// it, a same-session reconnect's recovery probe would be a silent no-op and
+/// stranded rooms wouldn't be recovered until a full page reload. The
+/// once-per-session bound means at most one extra legacy probe, only for users
+/// whose migration was interrupted — never reconnect spam.
+pub(crate) fn arm_legacy_migration_recovery() -> bool {
+    if RECOVERY_REFIRE_DONE.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+    true
+}
 
 /// Fire requests to load rooms from all known legacy delegates (fire and forget).
 /// If any legacy delegate has room data, the response handler will migrate it.
