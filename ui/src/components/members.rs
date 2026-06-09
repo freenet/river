@@ -553,6 +553,13 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                             // sealed `member_info` doesn't lose it on
                             // re-import (freenet/river#298).
                             self_nickname: room_data.self_nickname.clone(),
+                            // Carry the invitation-carried room secrets so a
+                            // non-owner of a private room keeps the secret
+                            // across a device migration and can still forward
+                            // useful `room_secrets` via new invitations
+                            // (freenet/river#306). Empty for public rooms and
+                            // for owners.
+                            invitation_secrets: room_data.invitation_secrets.clone(),
                         };
                         token_text.set(export.to_armored_string());
                     } else {
@@ -684,7 +691,13 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     // instead of minting a generated default (freenet/river#298).
                     self_nickname: export.self_nickname,
                     previous_contract_key: None,
-                    invitation_secrets: std::collections::HashMap::new(),
+                    // Restore the invitation-carried room secrets so a
+                    // non-owner of a private room keeps the secret across a
+                    // device migration (freenet/river#306). Folded into the
+                    // `#[serde(skip)]` `secrets` map by
+                    // `repopulate_secrets_from_state` on the next sync. Empty
+                    // for public rooms, owners, and pre-#306 exports.
+                    invitation_secrets: export.invitation_secrets,
                 };
 
                 // Migrate the imported signing key to the delegate immediately.

@@ -154,6 +154,11 @@ async fn export_identity(
         // the private-room join-heal sealed `member_info` doesn't lose it on
         // re-import (freenet/river#298).
         self_nickname: room_info.self_nickname.clone(),
+        // Carry the invitation-carried room secrets so a non-owner of a
+        // private room can still forward useful `room_secrets` via
+        // `invitation create` after re-importing on another device
+        // (freenet/river#306). Empty for public rooms and for owners.
+        invitation_secrets: room_info.invitation_secrets.clone(),
     };
 
     let armored = export.to_armored_string();
@@ -224,13 +229,18 @@ async fn import_identity(
             )
         })?;
 
-    // Store the room with the imported identity
+    // Store the room with the imported identity, seeding the persisted
+    // `invitation_secrets` from the export so a non-owner of a private room
+    // keeps the secret across a device migration (freenet/river#306). For a
+    // public room or an export taken before this field existed, the map is
+    // empty and this behaves exactly like the previous `add_room` call.
     let contract_key = api_client.owner_vk_to_contract_key(&export.room_owner);
-    api_client.storage().add_room(
+    api_client.storage().add_room_with_invitation_secrets(
         &export.room_owner,
         &export.signing_key,
         room_state,
         &contract_key,
+        export.invitation_secrets.clone(),
     )?;
 
     // Store the authorized member and invite chain for rejoin support
@@ -358,10 +368,142 @@ fn check_export_coherence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::compute_contract_key;
+    use crate::storage::Storage;
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::{Member, MemberId};
+    use river_core::room_state::ChatRoomStateV1;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
 
     fn signing_key_from_seed(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Minimal valid room state owned by `owner_sk` (matches the helper in
+    /// `storage.rs` tests).
+    fn create_test_state(owner_sk: &SigningKey) -> ChatRoomStateV1 {
+        let owner_vk = owner_sk.verifying_key();
+        let mut state = ChatRoomStateV1::default();
+        let config = Configuration {
+            owner_member_id: owner_vk.into(),
+            ..Default::default()
+        };
+        state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
+        state
+    }
+
+    /// End-to-end round-trip for freenet/river#306: a non-owner export that
+    /// carries `invitation_secrets` must, after armor → decode → the
+    /// storage-seeding step `import_identity` performs, leave the secrets
+    /// retrievable via `get_invitation_secrets`. This is the exact wiring the
+    /// issue asks for (export populates the field, import seeds storage via
+    /// `add_room_with_invitation_secrets`), exercised without a live node by
+    /// driving the same `Storage` call the import path uses.
+    #[test]
+    fn invitation_secrets_survive_export_armor_import_persist() {
+        let owner_sk = signing_key_from_seed(7);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        // A non-owner member invited by the owner.
+        let member_sk = signing_key_from_seed(8);
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+
+        let mut invitation_secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+        invitation_secrets.insert(0, [0xABu8; 32]);
+        invitation_secrets.insert(2, [0xCDu8; 32]);
+
+        let export = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: member_sk.clone(),
+            authorized_member,
+            invite_chain: vec![],
+            member_info: None,
+            room_name: None,
+            self_nickname: None,
+            invitation_secrets: invitation_secrets.clone(),
+        };
+
+        // Export → armor → wipe → decode, exactly as a device migration would.
+        let armored = export.to_armored_string();
+        let decoded = IdentityExport::from_armored_string(&armored).unwrap();
+
+        // Import-persist step: a fresh storage (the "new device") seeds the
+        // room from the decoded export, mirroring `import_identity`.
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        let contract_key = compute_contract_key(&decoded.room_owner);
+        storage
+            .add_room_with_invitation_secrets(
+                &decoded.room_owner,
+                &decoded.signing_key,
+                create_test_state(&owner_sk),
+                &contract_key,
+                decoded.invitation_secrets.clone(),
+            )
+            .unwrap();
+
+        // The persisted secrets must match the originals byte-for-byte. Before
+        // the #306 fix the export dropped the field and this returned empty.
+        let retrieved = storage.get_invitation_secrets(&owner_vk).unwrap();
+        assert_eq!(
+            retrieved, invitation_secrets,
+            "invitation_secrets must survive export → import → persist"
+        );
+    }
+
+    /// A public-room (or pre-#306) export carries no secrets; the import path
+    /// must persist an empty map, not panic or invent entries.
+    #[test]
+    fn empty_invitation_secrets_round_trip_to_empty() {
+        let owner_sk = signing_key_from_seed(9);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: owner_vk,
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+
+        let export = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: owner_sk.clone(),
+            authorized_member,
+            invite_chain: vec![],
+            member_info: None,
+            room_name: None,
+            self_nickname: None,
+            invitation_secrets: HashMap::new(),
+        };
+
+        let armored = export.to_armored_string();
+        let decoded = IdentityExport::from_armored_string(&armored).unwrap();
+        assert!(decoded.invitation_secrets.is_empty());
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        let contract_key = compute_contract_key(&decoded.room_owner);
+        storage
+            .add_room_with_invitation_secrets(
+                &decoded.room_owner,
+                &decoded.signing_key,
+                create_test_state(&owner_sk),
+                &contract_key,
+                decoded.invitation_secrets.clone(),
+            )
+            .unwrap();
+
+        assert!(storage
+            .get_invitation_secrets(&owner_vk)
+            .unwrap()
+            .is_empty());
     }
 
     /// Build an `AuthorizedMember` signed by `key` (the member is `key`'s own
