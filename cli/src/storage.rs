@@ -605,6 +605,40 @@ mod tests {
         );
     }
 
+    /// Source-grep pin for the #306 import wiring, in storage.rs so the pinned
+    /// strings aren't self-satisfied by the scanned file (commands/identity.rs).
+    /// Guards the exact regression #306 fixed: `import_identity` calling the
+    /// no-secrets `add_room`, which silently drops a private-room invitee's
+    /// invitation-carried secrets on a device migration (making their later
+    /// `invitation create` emit `room_secrets: []`).
+    #[test]
+    fn import_identity_seeds_invitation_secrets_wiring_pinned() {
+        // NOTE: these two pinned substrings appear ONLY in the production
+        // export/import paths, never in `commands/identity.rs`'s own test
+        // module — so the assertions can't be self-satisfied by test code in
+        // the scanned file. (A bare `add_room_with_invitation_secrets(` would
+        // be, since that module's tests also call it; we deliberately don't
+        // pin that.)
+        let identity_src = include_str!("commands/identity.rs");
+        // The export side must populate the field from the stored room info,
+        // not leave it empty.
+        assert!(
+            identity_src.contains("invitation_secrets: room_info.invitation_secrets.clone()"),
+            "export_identity must populate IdentityExport.invitation_secrets from \
+             the room's StoredRoomInfo.invitation_secrets (freenet/river#306)."
+        );
+        // The import side must seed storage with the export's carried secrets
+        // (via add_room_with_invitation_secrets), NOT the no-secrets add_room —
+        // otherwise a private-room invitee loses their secret on a device
+        // migration, making their later `invitation create` emit
+        // `room_secrets: []`.
+        assert!(
+            identity_src.contains("export.invitation_secrets.clone()"),
+            "import_identity must pass export.invitation_secrets into \
+             Storage::add_room_with_invitation_secrets (freenet/river#306)."
+        );
+    }
+
     /// Source-grep pins for the monitor edit/reply wiring (PR #322), in
     /// storage.rs so the pinned strings aren't self-satisfied by the scanned
     /// file (api.rs). Guards the exact regressions the PR fixed: a refactor

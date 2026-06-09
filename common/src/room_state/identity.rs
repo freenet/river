@@ -1,5 +1,6 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use super::member::{AuthorizedMember, MemberId};
 use super::member_info::AuthorizedMemberInfo;
@@ -41,6 +42,30 @@ pub struct IdentityExport {
     /// more sensitive secret.
     #[serde(default)]
     pub self_nickname: Option<String>,
+    /// Invitation-carried room secrets, keyed by `secret_version`
+    /// (32-byte symmetric key per version). See freenet/river#306.
+    ///
+    /// For a non-owner of a PRIVATE room, the only copy of the room
+    /// secret a CLI invitee holds may be the one carried in their
+    /// `Invitation` artifact and persisted in
+    /// `cli::storage::StoredRoomInfo::invitation_secrets`. Without
+    /// carrying it through the export, importing the identity on another
+    /// device loses that secret: `riverctl invitation create` would emit
+    /// an invitation with `room_secrets: []` (replicating the #303 bug
+    /// for any downstream invitee) whenever the network state does not
+    /// yet contain an owner-signed `encrypted_secrets` blob for the
+    /// imported member.
+    ///
+    /// Empty for public rooms and for owners (the owner's secret is in
+    /// the owner-addressed contract blob, confirmed at
+    /// `common/src/room_state/secret.rs:450-451`).
+    ///
+    /// `#[serde(default)]` keeps old tokens (which lack the field)
+    /// decoding cleanly as an empty map. Plaintext here adds no new
+    /// exposure class: the export already carries the private signing
+    /// key, a far more sensitive secret.
+    #[serde(default)]
+    pub invitation_secrets: HashMap<u32, [u8; 32]>,
 }
 
 impl IdentityExport {
@@ -164,6 +189,7 @@ mod tests {
             member_info: None,
             room_name: None,
             self_nickname: None,
+            invitation_secrets: HashMap::new(),
         };
 
         let armored = export.to_armored_string();
@@ -218,6 +244,7 @@ mod tests {
             member_info: None,
             room_name: None,
             self_nickname: None,
+            invitation_secrets: HashMap::new(),
         };
 
         let armored = export.to_armored_string();
@@ -265,6 +292,7 @@ mod tests {
             member_info: Some(auth_member_info.clone()),
             room_name: Some("Test Room".to_string()),
             self_nickname: Some("TestUser".to_string()),
+            invitation_secrets: HashMap::new(),
         };
 
         let armored = export.to_armored_string();
@@ -310,6 +338,7 @@ mod tests {
             member_info: None,
             room_name: None,
             self_nickname: None,
+            invitation_secrets: HashMap::new(),
         };
 
         let armored = export.to_armored_string();
@@ -353,6 +382,7 @@ mod tests {
             member_info: None,
             room_name: None,
             self_nickname: None,
+            invitation_secrets: HashMap::new(),
         };
 
         let armored = export.to_armored_string();
@@ -383,6 +413,7 @@ mod tests {
             member_info: None,
             room_name: None,
             self_nickname: None,
+            invitation_secrets: HashMap::new(),
         };
 
         let armored = export.to_armored_string();
@@ -434,6 +465,7 @@ mod tests {
             member_info: None,
             room_name: None,
             self_nickname: None,
+            invitation_secrets: HashMap::new(),
         };
 
         let armored = export.to_armored_string();
@@ -489,6 +521,9 @@ mod tests {
         // The same old token also predates `self_nickname`; it must decode
         // cleanly with the field defaulting to `None`.
         assert!(decoded.self_nickname.is_none());
+        // It also predates `invitation_secrets` (freenet/river#306); that
+        // field must default to an empty map, not fail to decode.
+        assert!(decoded.invitation_secrets.is_empty());
     }
 
     #[test]
@@ -518,6 +553,7 @@ mod tests {
             member_info: None,
             room_name: None,
             self_nickname: Some("ChosenName".to_string()),
+            invitation_secrets: HashMap::new(),
         };
 
         let armored = export.to_armored_string();
@@ -553,6 +589,7 @@ mod tests {
             member_info: None,
             room_name: Some("My Room".to_string()),
             self_nickname: None,
+            invitation_secrets: HashMap::new(),
         };
 
         let armored = export.to_armored_string();
@@ -573,5 +610,48 @@ mod tests {
             .member_vk
             .verify_strict(message, &signature)
             .is_ok());
+    }
+
+    #[test]
+    fn test_invitation_secrets_survive_roundtrip() {
+        // Regression for freenet/river#306: a non-owner of a PRIVATE room
+        // may hold the room secret only via the secrets carried in their
+        // `Invitation` artifact. The export must carry that map so importing
+        // on another device does not silently drop it (which would make
+        // `riverctl invitation create` emit `room_secrets: []`).
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+
+        let mut invitation_secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+        invitation_secrets.insert(0, [0x11u8; 32]);
+        invitation_secrets.insert(3, [0x22u8; 32]);
+
+        let export = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: member_sk,
+            authorized_member,
+            invite_chain: vec![],
+            member_info: None,
+            room_name: None,
+            self_nickname: None,
+            invitation_secrets: invitation_secrets.clone(),
+        };
+
+        let armored = export.to_armored_string();
+        let decoded = IdentityExport::from_armored_string(&armored).unwrap();
+
+        assert_eq!(
+            decoded.invitation_secrets, invitation_secrets,
+            "invitation_secrets must survive the armored round-trip byte-for-byte"
+        );
     }
 }
