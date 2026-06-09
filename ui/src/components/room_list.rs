@@ -139,7 +139,14 @@ pub fn RoomList() -> Element {
     let drag_over_end_now: bool = drag_over_end.try_read().map(|g| *g).unwrap_or(false);
 
     rsx! {
-        aside { class: "w-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
+        aside {
+            // Stable hook for the connection-indicator regression tests
+            // (freenet/river#274): the rooms rail is the always-rendered
+            // left column that carries the persistent connection pill, so
+            // tests anchor on this testid instead of the brittle visible
+            // text "Rooms".
+            "data-testid": "rooms-rail",
+            class: "w-full md:w-64 flex-shrink-0 bg-panel border-r border-border flex flex-col overflow-y-auto",
             // Mobile back button (hidden on desktop)
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
                 button {
