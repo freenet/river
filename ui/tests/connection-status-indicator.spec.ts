@@ -62,6 +62,10 @@ const STATUS_STATES = [
 async function expectCoherentState(visiblePill: Locator) {
   const dot = visiblePill.locator("div").first();
   await expect(dot).toBeVisible({ timeout: 5_000 });
+  // The label span always renders some status text; wait for it via a
+  // retrying assertion before the non-retrying getAttribute/textContent
+  // reads below, so a mid-render empty read can't make this flaky.
+  await expect(visiblePill).toContainText(/\S/, { timeout: 5_000 });
 
   const dotClass = (await dot.getAttribute("class")) ?? "";
   const labelText = ((await visiblePill.textContent()) ?? "").trim();
@@ -172,6 +176,32 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
     });
 
     await expect(page.locator(VISIBLE_PILL)).toHaveCount(1);
+  });
+
+  test("still exactly one indicator when a room IS selected", async ({
+    page,
+  }) => {
+    // The no-room Welcome screen was Bug #5's trigger, but the
+    // "exactly one pill" invariant must also hold with a room selected —
+    // otherwise re-introducing the indicator into the now-rendered
+    // MemberList (its pre-fix home) would add a SECOND desktop pill and go
+    // unnoticed. Selecting a room mounts the Members rail; assert the pill
+    // count stays at one and stays in the Rooms rail.
+    await page.goto("/");
+    await waitForApp(page);
+
+    await page.getByRole("button", { name: "Team Chat Room" }).click();
+    await expect(
+      page.getByRole("heading", { name: "Team Chat Room" })
+    ).toBeVisible({ timeout: 5_000 });
+
+    // The Members rail is now mounted (it returns empty only when no room
+    // is selected — that was the Bug #5 root cause).
+    await expect(page.locator(MEMBERS_RAIL)).toHaveCount(1);
+
+    await expect(page.locator(VISIBLE_PILL)).toHaveCount(1);
+    await expect(page.locator(ROOMS_RAIL).locator(VISIBLE_PILL)).toHaveCount(1);
+    await expect(page.locator(MEMBERS_RAIL).locator(PILL)).toHaveCount(0);
   });
 });
 
