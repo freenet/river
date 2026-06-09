@@ -2335,14 +2335,26 @@ impl ApiClient {
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
 
+        // Build the action body — plaintext for a public room, AES-256-GCM
+        // sealed for a private room (secret resolved from the contract's
+        // per-member `encrypted_secrets` blob, or this room's persisted
+        // invitation secrets). This path already requires local storage (it
+        // loaded the signing key from `rooms.json` above), so `?` surfaces a
+        // corrupt store as a clear error rather than a misleading "no secret".
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        let content = crate::private_room::build_action_body(
+            &room_state,
+            &signing_key,
+            &invitation_secrets,
+            river_core::room_state::content::ActionContentV1::edit(target_message_id, new_content),
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Create the edit action message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: MemberId::from(&signing_key.verifying_key()),
-            content: river_core::room_state::message::RoomMessageBody::edit(
-                target_message_id,
-                new_content,
-            ),
+            content,
             time: std::time::SystemTime::now(),
         };
 
@@ -2397,11 +2409,22 @@ impl ApiClient {
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
 
+        // Build the action body — plaintext (public) or AES-256-GCM sealed
+        // (private). See `edit_message` for the storage / secret rationale.
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        let content = crate::private_room::build_action_body(
+            &room_state,
+            &signing_key,
+            &invitation_secrets,
+            river_core::room_state::content::ActionContentV1::delete(target_message_id),
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Create the delete action message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: MemberId::from(&signing_key.verifying_key()),
-            content: river_core::room_state::message::RoomMessageBody::delete(target_message_id),
+            content,
             time: std::time::SystemTime::now(),
         };
 
@@ -2458,14 +2481,22 @@ impl ApiClient {
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
 
+        // Build the action body — plaintext (public) or AES-256-GCM sealed
+        // (private). See `edit_message` for the storage / secret rationale.
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        let content = crate::private_room::build_action_body(
+            &room_state,
+            &signing_key,
+            &invitation_secrets,
+            river_core::room_state::content::ActionContentV1::reaction(target_message_id, emoji),
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Create the reaction action message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: MemberId::from(&signing_key.verifying_key()),
-            content: river_core::room_state::message::RoomMessageBody::reaction(
-                target_message_id,
-                emoji,
-            ),
+            content,
             time: std::time::SystemTime::now(),
         };
 
@@ -2522,14 +2553,25 @@ impl ApiClient {
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
 
+        // Build the action body — plaintext (public) or AES-256-GCM sealed
+        // (private). See `edit_message` for the storage / secret rationale.
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        let content = crate::private_room::build_action_body(
+            &room_state,
+            &signing_key,
+            &invitation_secrets,
+            river_core::room_state::content::ActionContentV1::remove_reaction(
+                target_message_id,
+                emoji,
+            ),
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Create the remove_reaction action message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: MemberId::from(&signing_key.verifying_key()),
-            content: river_core::room_state::message::RoomMessageBody::remove_reaction(
-                target_message_id,
-                emoji,
-            ),
+            content,
             time: std::time::SystemTime::now(),
         };
 
@@ -2610,16 +2652,28 @@ impl ApiClient {
         // Resolve any bare @nickname mentions in the reply body.
         let reply_text = resolve_outgoing_mentions(&room_state, &reply_text);
 
+        // Build the reply body — plaintext (public) or AES-256-GCM sealed
+        // (private). See `edit_message` for the storage / secret rationale. The
+        // target author name and content preview are sealed alongside the reply
+        // text in a private room (they are part of `ReplyContentV1`), so the
+        // reply context is not leaked in the clear.
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        let content = crate::private_room::build_reply_body(
+            &room_state,
+            &signing_key,
+            &invitation_secrets,
+            reply_text,
+            target_message_id,
+            target_author_name,
+            target_content_preview,
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Create the reply message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: MemberId::from(&signing_key.verifying_key()),
-            content: river_core::room_state::message::RoomMessageBody::reply(
-                reply_text,
-                target_message_id,
-                target_author_name,
-                target_content_preview,
-            ),
+            content,
             time: std::time::SystemTime::now(),
         };
 

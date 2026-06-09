@@ -11,9 +11,11 @@ use ed25519_dalek::SigningKey;
 use river_core::ecies::{
     decrypt_secret_from_member_blob_raw, encrypt_with_symmetric_key, seal_bytes,
 };
-use river_core::room_state::content::TextContentV1;
+use river_core::room_state::content::{
+    ActionContentV1, ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, REPLY_CONTENT_VERSION,
+};
 use river_core::room_state::member::MemberId;
-use river_core::room_state::message::RoomMessageBody;
+use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::ChatRoomStateV1;
 use std::collections::HashMap;
@@ -196,18 +198,8 @@ fn current_secret_from_state(
 /// Returns an error (rather than silently falling back to a public body,
 /// which the contract rejects in a private room with "Cannot send public
 /// messages in private room") when no secret is available for the current
-/// version — the room owner must re-provision this member's secret, or the
-/// member must rejoin via a fresh invitation that carries the current version.
-///
-/// Also errors if the resulting body exceeds the room's `max_message_size`.
-/// The contract enforces that limit by *silently dropping* the message in
-/// `MessagesV1::apply_delta` (a `retain`, not an `Err`), so without this
-/// guard a too-long message would report success while never being
-/// delivered. The limit is measured against the body's `content_len()` —
-/// for a private room that is the AES-256-GCM **ciphertext** length (raw
-/// text + a 16-byte authentication tag + CBOR framing), so a message that
-/// fits as public can exceed the limit once sealed. Mirrors the UI's
-/// pre-send guard in `ui/src/components/conversation.rs`.
+/// version — see [`resolve_current_secret`]. Also errors if the resulting
+/// body exceeds the room's `max_message_size` — see [`guard_message_size`].
 pub fn build_message_body(
     state: &ChatRoomStateV1,
     self_sk: &SigningKey,
@@ -217,27 +209,158 @@ pub fn build_message_body(
     let content = if state.configuration.configuration.privacy_mode != PrivacyMode::Private {
         RoomMessageBody::public(text)
     } else {
-        let version = state.secrets.current_version;
-        let secrets = collect_secrets_for_room(state, self_sk, invitation_secrets);
-        let secret = secrets.get(&version).ok_or_else(|| {
-            format!(
-                "private room: no secret available for the current version (v{version}). \
-                 Sealing the message would be impossible. The room owner must share the \
-                 current room secret with this member (re-key / re-provision), or this \
-                 member must rejoin via a fresh invitation carrying v{version}."
-            )
-        })?;
-
+        let (secret, version) = resolve_current_secret(state, self_sk, invitation_secrets)?;
         // Mirror the UI: CBOR-encode the text content, then AES-256-GCM seal
         // it under the current room secret with a fresh random nonce.
         let content_bytes = TextContentV1::new(text).encode();
-        let (ciphertext, nonce) = encrypt_with_symmetric_key(secret, &content_bytes);
+        let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &content_bytes);
         RoomMessageBody::private_text(ciphertext, nonce, version)
     };
 
-    // Fail loudly on an over-size body instead of letting the contract drop it
-    // silently (see the doc comment above). Covers both public and private
-    // bodies via the same `content_len()` the contract checks.
+    guard_message_size(state, content)
+}
+
+/// Build the `RoomMessageBody` for an outgoing **action** (edit / delete /
+/// reaction / remove_reaction).
+///
+/// For a **public** room this is the plaintext action body (unchanged
+/// behaviour, identical to `RoomMessageBody::{edit,delete,reaction,…}`). For a
+/// **private** room the CBOR-encoded `ActionContentV1` is encrypted under the
+/// room's current-version secret with AES-256-GCM and emitted as
+/// `RoomMessageBody::private_action`, mirroring the UI's action paths in
+/// `ui/src/components/conversation.rs`.
+///
+/// Secret resolution, the no-secret error (never a silent public fallback the
+/// contract would reject in a private room), the stale-version guard, and the
+/// over-`max_message_size` guard are all identical to [`build_message_body`] —
+/// they share [`resolve_current_secret`] and [`guard_message_size`]. The
+/// caller builds the `ActionContentV1` (e.g. `ActionContentV1::edit(target,
+/// new_text)`); this helper owns the sealing and the public/private decision so
+/// every action call site routes through the same privacy logic.
+pub fn build_action_body(
+    state: &ChatRoomStateV1,
+    self_sk: &SigningKey,
+    invitation_secrets: &HashMap<u32, [u8; 32]>,
+    action: ActionContentV1,
+) -> Result<RoomMessageBody, String> {
+    let content = if state.configuration.configuration.privacy_mode != PrivacyMode::Private {
+        // Public action body — byte-identical to the dedicated constructors
+        // (`RoomMessageBody::edit/delete/reaction/remove_reaction`), which all
+        // wrap `ActionContentV1::encode()` in a `Public` body.
+        use river_core::room_state::content::{ACTION_CONTENT_VERSION, CONTENT_TYPE_ACTION};
+        RoomMessageBody::public_raw(CONTENT_TYPE_ACTION, ACTION_CONTENT_VERSION, action.encode())
+    } else {
+        let (secret, version) = resolve_current_secret(state, self_sk, invitation_secrets)?;
+        let content_bytes = action.encode();
+        let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &content_bytes);
+        RoomMessageBody::private_action(ciphertext, nonce, version)
+    };
+
+    guard_message_size(state, content)
+}
+
+/// Build the `RoomMessageBody` for an outgoing **reply**.
+///
+/// For a **public** room this is the plaintext reply body (unchanged
+/// behaviour, identical to `RoomMessageBody::reply`). For a **private** room
+/// the CBOR-encoded `ReplyContentV1` is encrypted under the room's
+/// current-version secret with AES-256-GCM and emitted as a private body with
+/// `content_type = CONTENT_TYPE_REPLY`, mirroring the UI's reply path in
+/// `ui/src/components/conversation.rs` (which uses
+/// `RoomMessageBody::private(CONTENT_TYPE_REPLY, REPLY_CONTENT_VERSION, …)` —
+/// there is no `private_reply` convenience constructor).
+///
+/// Secret resolution, the no-secret error, the stale-version guard, and the
+/// over-`max_message_size` guard are identical to [`build_message_body`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_reply_body(
+    state: &ChatRoomStateV1,
+    self_sk: &SigningKey,
+    invitation_secrets: &HashMap<u32, [u8; 32]>,
+    text: String,
+    target_message_id: MessageId,
+    target_author_name: String,
+    target_content_preview: String,
+) -> Result<RoomMessageBody, String> {
+    let content = if state.configuration.configuration.privacy_mode != PrivacyMode::Private {
+        RoomMessageBody::reply(
+            text,
+            target_message_id,
+            target_author_name,
+            target_content_preview,
+        )
+    } else {
+        let (secret, version) = resolve_current_secret(state, self_sk, invitation_secrets)?;
+        let reply = ReplyContentV1::new(
+            text,
+            target_message_id,
+            target_author_name,
+            target_content_preview,
+        );
+        let content_bytes = reply.encode();
+        let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &content_bytes);
+        RoomMessageBody::private(
+            CONTENT_TYPE_REPLY,
+            REPLY_CONTENT_VERSION,
+            ciphertext,
+            nonce,
+            version,
+        )
+    };
+
+    guard_message_size(state, content)
+}
+
+/// Resolve the room's **current-version** secret for the member holding
+/// `self_sk`, for sealing an outgoing private-room body.
+///
+/// Returns `(secret, current_version)` or an error (rather than silently
+/// falling back to a public body, which the contract rejects in a private room
+/// with "Cannot send public messages in private room") when no secret is
+/// available for the current version — the room owner must re-provision this
+/// member's secret, or the member must rejoin via a fresh invitation that
+/// carries the current version. Sealing only ever under `current_version`
+/// (never a stale version other members can't read) mirrors the
+/// nickname-sealing guard in [`seal_invitee_nickname`].
+///
+/// Shared by [`build_message_body`], [`build_action_body`], and
+/// [`build_reply_body`] so all four message kinds (text / action / reply) make
+/// the identical secret-resolution decision — a divergence here would leak one
+/// kind of private content as an unsealed public body.
+fn resolve_current_secret(
+    state: &ChatRoomStateV1,
+    self_sk: &SigningKey,
+    invitation_secrets: &HashMap<u32, [u8; 32]>,
+) -> Result<([u8; 32], u32), String> {
+    let version = state.secrets.current_version;
+    let secrets = collect_secrets_for_room(state, self_sk, invitation_secrets);
+    let secret = secrets.get(&version).copied().ok_or_else(|| {
+        format!(
+            "private room: no secret available for the current version (v{version}). \
+             Sealing the message would be impossible. The room owner must share the \
+             current room secret with this member (re-key / re-provision), or this \
+             member must rejoin via a fresh invitation carrying v{version}."
+        )
+    })?;
+    Ok((secret, version))
+}
+
+/// Fail loudly on an over-`max_message_size` body instead of letting the
+/// contract drop it silently.
+///
+/// The contract enforces `max_message_size` by *silently dropping* the message
+/// in `MessagesV1::apply_delta` (a `retain`, not an `Err`), so without this
+/// guard a too-long message would report success while never being delivered.
+/// The limit is measured against the body's `content_len()` — for a private
+/// room that is the AES-256-GCM **ciphertext** length (raw content + a 16-byte
+/// authentication tag + CBOR framing), so content that fits as public can
+/// exceed the limit once sealed. Mirrors the UI's pre-send guard in
+/// `ui/src/components/conversation.rs`. Shared by every `build_*` helper so the
+/// guard can never drift between message kinds.
+fn guard_message_size(
+    state: &ChatRoomStateV1,
+    content: RoomMessageBody,
+) -> Result<RoomMessageBody, String> {
     let max = state.configuration.configuration.max_message_size;
     let len = content.content_len();
     if len > max {
@@ -246,13 +369,12 @@ pub fn build_message_body(
              max_message_size of {max} bytes.{}",
             if content.is_private() {
                 " Private-room messages are AES-256-GCM sealed, which adds a \
-                 16-byte authentication tag plus CBOR framing over the raw text."
+                 16-byte authentication tag plus CBOR framing over the raw content."
             } else {
                 ""
             }
         ));
     }
-
     Ok(content)
 }
 
@@ -264,6 +386,8 @@ mod tests {
         decrypt_with_symmetric_key, encrypt_secret_for_member, generate_room_secret,
     };
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use river_core::room_state::content::{ActionContentV1, ReplyContentV1, CONTENT_TYPE_REPLY};
+    use river_core::room_state::message::MessageId;
     use river_core::room_state::privacy::PrivacyMode;
     use river_core::room_state::secret::{
         AuthorizedEncryptedSecretForMember, EncryptedSecretForMemberV1,
@@ -690,6 +814,513 @@ mod tests {
                 .content
                 .is_private(),
             "the accepted body must be the sealed (private) form"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // build_action_body — edit / delete / reaction / remove_reaction (#351)
+    // ------------------------------------------------------------------
+
+    /// A fresh MessageId to target with an action/reply in tests.
+    fn target_id() -> MessageId {
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1};
+        let owner = fresh_signing_key();
+        let msg = MessageV1 {
+            room_owner: MemberId::from(&owner.verifying_key()),
+            author: MemberId::from(&owner.verifying_key()),
+            content: RoomMessageBody::public("target".to_string()),
+            time: std::time::SystemTime::now(),
+        };
+        AuthorizedMessageV1::new(msg, &owner).id()
+    }
+
+    /// Public room → the action body is the plaintext form, byte-identical to
+    /// the dedicated `RoomMessageBody::edit` constructor. Pins that routing
+    /// `edit` through `build_action_body` does not change the public wire
+    /// bytes (so existing public-room behaviour is unaffected).
+    #[test]
+    fn build_action_body_public_room_matches_dedicated_constructor() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Public);
+        let tgt = target_id();
+
+        let via_helper = build_action_body(
+            &state,
+            &owner,
+            &HashMap::new(),
+            ActionContentV1::edit(tgt.clone(), "new text".to_string()),
+        )
+        .expect("public room always builds a body");
+        let direct = RoomMessageBody::edit(tgt, "new text".to_string());
+        assert_eq!(
+            via_helper, direct,
+            "public action body must be byte-identical to the dedicated constructor"
+        );
+        assert!(via_helper.is_public(), "public room must not seal the body");
+    }
+
+    /// Private room → each of the four action kinds seals under the current
+    /// version and round-trips back to the original `ActionContentV1`. This is
+    /// the core #351 guarantee: action content is never emitted in the clear
+    /// in a private room.
+    #[test]
+    fn build_action_body_private_room_seals_and_roundtrips_all_action_kinds() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Private); // current_version = 0
+        let secret = [0x42u8; 32];
+        let mut inv = HashMap::new();
+        inv.insert(0u32, secret);
+        let tgt = target_id();
+
+        let cases = vec![
+            ActionContentV1::edit(tgt.clone(), "edited".to_string()),
+            ActionContentV1::delete(tgt.clone()),
+            ActionContentV1::reaction(tgt.clone(), "👍".to_string()),
+            ActionContentV1::remove_reaction(tgt.clone(), "👍".to_string()),
+        ];
+
+        for action in cases {
+            let expected = action.clone();
+            let body = build_action_body(&state, &owner, &inv, action)
+                .expect("invitation-carried secret seals the action body");
+            match body {
+                RoomMessageBody::Private {
+                    content_type,
+                    ciphertext,
+                    nonce,
+                    secret_version,
+                    ..
+                } => {
+                    use river_core::room_state::content::CONTENT_TYPE_ACTION;
+                    assert_eq!(
+                        content_type, CONTENT_TYPE_ACTION,
+                        "sealed action keeps its content_type"
+                    );
+                    assert_eq!(secret_version, 0, "must seal under the current version");
+                    let plaintext = decrypt_with_symmetric_key(&secret, &ciphertext, &nonce)
+                        .expect("the sealed action decrypts under the room secret");
+                    let decoded =
+                        ActionContentV1::decode(&plaintext).expect("valid action content");
+                    assert_eq!(
+                        decoded, expected,
+                        "decrypted action must equal the original (kind {})",
+                        expected.action_type
+                    );
+                }
+                RoomMessageBody::Public { .. } => {
+                    panic!("private room must seal the action body")
+                }
+            }
+        }
+    }
+
+    /// Private room, secret only in the owner-signed contract blob → still
+    /// seals (the steady-state path once the owner has provisioned the member).
+    #[test]
+    fn build_action_body_private_room_seals_via_contract_blob() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        let secret = [0x7eu8; 32];
+        state
+            .secrets
+            .encrypted_secrets
+            .push(owner_blob(&owner, &owner.verifying_key(), 0, secret));
+        let tgt = target_id();
+
+        let body = build_action_body(
+            &state,
+            &owner,
+            &HashMap::new(),
+            ActionContentV1::reaction(tgt, "🎉".to_string()),
+        )
+        .expect("contract-blob secret seals the action body");
+
+        match body {
+            RoomMessageBody::Private {
+                ciphertext,
+                nonce,
+                secret_version,
+                ..
+            } => {
+                assert_eq!(secret_version, 0);
+                let plaintext = decrypt_with_symmetric_key(&secret, &ciphertext, &nonce)
+                    .expect("decrypts under the blob-carried secret");
+                let decoded = ActionContentV1::decode(&plaintext).unwrap();
+                assert_eq!(decoded.reaction_payload().unwrap().emoji, "🎉");
+            }
+            RoomMessageBody::Public { .. } => panic!("private room must seal the body"),
+        }
+    }
+
+    /// Private room, no secret anywhere → error, never a silent public body
+    /// (which the contract rejects with "Cannot send public messages...").
+    #[test]
+    fn build_action_body_private_room_errors_without_secret() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Private);
+        let tgt = target_id();
+        let err = build_action_body(
+            &state,
+            &fresh_signing_key(),
+            &HashMap::new(),
+            ActionContentV1::delete(tgt),
+        )
+        .expect_err("must refuse to send an action when no secret is available");
+        assert!(
+            err.contains("no secret available"),
+            "error should explain the missing secret, got: {err}"
+        );
+    }
+
+    /// Private room rotated past the held version → error (won't seal under a
+    /// non-current version other members can't read).
+    #[test]
+    fn build_action_body_private_room_errors_when_secret_lacks_current_version() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        state.secrets.current_version = 1;
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0x42u8; 32]);
+        let tgt = target_id();
+        let err = build_action_body(
+            &state,
+            &fresh_signing_key(),
+            &inv,
+            ActionContentV1::edit(tgt, "stale".to_string()),
+        )
+        .expect_err("must refuse to seal under a non-current version");
+        assert!(
+            err.contains("v1"),
+            "error should name the current version: {err}"
+        );
+    }
+
+    /// Over-`max_message_size` sealed action body → error, not silent drop.
+    #[test]
+    fn build_action_body_errors_when_body_exceeds_max_message_size() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        let mut config = state.configuration.configuration.clone();
+        config.max_message_size = 4;
+        state.configuration = AuthorizedConfigurationV1::new(config, &owner);
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0x42u8; 32]);
+        let tgt = target_id();
+
+        let err = build_action_body(
+            &state,
+            &owner,
+            &inv,
+            ActionContentV1::edit(tgt, "this is definitely longer than four bytes".to_string()),
+        )
+        .expect_err("over-size action body must be rejected, not silently dropped");
+        assert!(
+            err.contains("too large") && err.contains("max_message_size"),
+            "error should explain the size limit, got: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // build_reply_body (#351)
+    // ------------------------------------------------------------------
+
+    /// Public room → the reply body is byte-identical to the dedicated
+    /// `RoomMessageBody::reply` constructor.
+    #[test]
+    fn build_reply_body_public_room_matches_dedicated_constructor() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Public);
+        let tgt = target_id();
+
+        let via_helper = build_reply_body(
+            &state,
+            &owner,
+            &HashMap::new(),
+            "my reply".to_string(),
+            tgt.clone(),
+            "Alice".to_string(),
+            "original".to_string(),
+        )
+        .expect("public room always builds a body");
+        let direct = RoomMessageBody::reply(
+            "my reply".to_string(),
+            tgt,
+            "Alice".to_string(),
+            "original".to_string(),
+        );
+        assert_eq!(
+            via_helper, direct,
+            "public reply body must be byte-identical to the dedicated constructor"
+        );
+    }
+
+    /// Private room → the reply seals under the current version (content_type
+    /// = CONTENT_TYPE_REPLY) and round-trips back, INCLUDING the target author
+    /// name and content preview, which must not leak in the clear.
+    #[test]
+    fn build_reply_body_private_room_seals_and_roundtrips() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Private);
+        let secret = [0x42u8; 32];
+        let mut inv = HashMap::new();
+        inv.insert(0u32, secret);
+        let tgt = target_id();
+
+        let body = build_reply_body(
+            &state,
+            &owner,
+            &inv,
+            "secret reply".to_string(),
+            tgt.clone(),
+            "Sensitive Name".to_string(),
+            "sensitive preview".to_string(),
+        )
+        .expect("invitation-carried secret seals the reply body");
+
+        match body {
+            RoomMessageBody::Private {
+                content_type,
+                ciphertext,
+                nonce,
+                secret_version,
+                ..
+            } => {
+                assert_eq!(
+                    content_type, CONTENT_TYPE_REPLY,
+                    "sealed reply must carry CONTENT_TYPE_REPLY"
+                );
+                assert_eq!(secret_version, 0, "must seal under the current version");
+                let plaintext = decrypt_with_symmetric_key(&secret, &ciphertext, &nonce)
+                    .expect("the sealed reply decrypts under the room secret");
+                let decoded = ReplyContentV1::decode(&plaintext).expect("valid reply content");
+                assert_eq!(decoded.text, "secret reply");
+                assert_eq!(decoded.target_message_id, tgt);
+                assert_eq!(
+                    decoded.target_author_name, "Sensitive Name",
+                    "the target author name must be sealed, not leaked"
+                );
+                assert_eq!(
+                    decoded.target_content_preview, "sensitive preview",
+                    "the target content preview must be sealed, not leaked"
+                );
+            }
+            RoomMessageBody::Public { .. } => panic!("private room must seal the reply body"),
+        }
+    }
+
+    /// Private room, no secret → error (never a public reply body).
+    #[test]
+    fn build_reply_body_private_room_errors_without_secret() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Private);
+        let tgt = target_id();
+        let err = build_reply_body(
+            &state,
+            &fresh_signing_key(),
+            &HashMap::new(),
+            "nope".to_string(),
+            tgt,
+            "Alice".to_string(),
+            "original".to_string(),
+        )
+        .expect_err("must refuse to send a reply when no secret is available");
+        assert!(
+            err.contains("no secret available"),
+            "error should explain the missing secret, got: {err}"
+        );
+    }
+
+    /// Private room rotated past the held version → reply errors.
+    #[test]
+    fn build_reply_body_private_room_errors_when_secret_lacks_current_version() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        state.secrets.current_version = 1;
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0x42u8; 32]);
+        let tgt = target_id();
+        let err = build_reply_body(
+            &state,
+            &fresh_signing_key(),
+            &inv,
+            "stale".to_string(),
+            tgt,
+            "Alice".to_string(),
+            "original".to_string(),
+        )
+        .expect_err("must refuse to seal a reply under a non-current version");
+        assert!(
+            err.contains("v1"),
+            "error should name the current version: {err}"
+        );
+    }
+
+    /// Over-`max_message_size` sealed reply body → error, not silent drop.
+    #[test]
+    fn build_reply_body_errors_when_body_exceeds_max_message_size() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        let mut config = state.configuration.configuration.clone();
+        config.max_message_size = 4;
+        state.configuration = AuthorizedConfigurationV1::new(config, &owner);
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0x42u8; 32]);
+        let tgt = target_id();
+
+        let err = build_reply_body(
+            &state,
+            &owner,
+            &inv,
+            "this is definitely longer than four bytes".to_string(),
+            tgt,
+            "Alice".to_string(),
+            "original".to_string(),
+        )
+        .expect_err("over-size reply body must be rejected, not silently dropped");
+        assert!(
+            err.contains("too large") && err.contains("max_message_size"),
+            "error should explain the size limit, got: {err}"
+        );
+    }
+
+    /// End-to-end contract acceptance: action and reply bodies produced by the
+    /// new helpers must be accepted by the room contract's own `apply_delta`
+    /// (the same validation the action/reply send paths run locally before
+    /// transmitting). Closes the gap the sealing-math unit tests leave open —
+    /// they seal against a state with an empty `secrets.versions`, which the
+    /// contract would reject. Requires no node. Mirrors
+    /// `build_message_body_output_is_accepted_by_contract_apply_delta`.
+    #[test]
+    fn build_action_and_reply_bodies_accepted_by_contract_apply_delta() {
+        use freenet_scaffold::ComposableState;
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1};
+        use river_core::room_state::privacy::RoomCipherSpec;
+        use river_core::room_state::secret::{
+            AuthorizedSecretVersionRecord, RoomSecretsV1, SecretVersionRecordV1,
+        };
+        use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+
+        let owner = fresh_signing_key();
+        let owner_vk = owner.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+
+        // Provision a genuine v0 secret (owner-signed version record + owner's
+        // own owner-signed encrypted_secrets blob).
+        let secret = [0x33u8; 32];
+        state.secrets = RoomSecretsV1 {
+            current_version: 0,
+            versions: vec![AuthorizedSecretVersionRecord::new(
+                SecretVersionRecordV1 {
+                    version: 0,
+                    cipher_spec: RoomCipherSpec::Aes256Gcm,
+                    created_at: std::time::SystemTime::now(),
+                },
+                &owner,
+            )],
+            encrypted_secrets: vec![owner_blob(&owner, &owner_vk, 0, secret)],
+        };
+
+        // First seal & apply a plain text message so it exists as a reply/edit
+        // target inside the recent window.
+        let text_body = build_message_body(&state, &owner, &HashMap::new(), "original".to_string())
+            .expect("seals the text body under v0");
+        let text_msg = MessageV1 {
+            room_owner: owner_id,
+            author: owner_id,
+            content: text_body,
+            time: std::time::SystemTime::now(),
+        };
+        let text_auth = AuthorizedMessageV1::new(text_msg, &owner);
+        let target_msg_id = text_auth.id();
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let mut applied = state.clone();
+        applied
+            .apply_delta(
+                &state,
+                &params,
+                &Some(ChatRoomStateV1Delta {
+                    recent_messages: Some(vec![text_auth]),
+                    ..Default::default()
+                }),
+            )
+            .expect("contract accepts the sealed text message");
+
+        // Now seal an action (reaction) and a reply targeting that message and
+        // confirm both are accepted and retained as private bodies.
+        let action_body = build_action_body(
+            &applied,
+            &owner,
+            &HashMap::new(),
+            ActionContentV1::reaction(target_msg_id.clone(), "👍".to_string()),
+        )
+        .expect("seals the action body under v0");
+        let reply_body = build_reply_body(
+            &applied,
+            &owner,
+            &HashMap::new(),
+            "a sealed reply".to_string(),
+            target_msg_id,
+            "owner".to_string(),
+            "original".to_string(),
+        )
+        .expect("seals the reply body under v0");
+
+        let action_auth = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: owner_id,
+                content: action_body,
+                time: std::time::SystemTime::now(),
+            },
+            &owner,
+        );
+        let reply_auth = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: owner_id,
+                content: reply_body,
+                time: std::time::SystemTime::now(),
+            },
+            &owner,
+        );
+
+        let before = applied.clone();
+        applied
+            .apply_delta(
+                &before,
+                &params,
+                &Some(ChatRoomStateV1Delta {
+                    recent_messages: Some(vec![action_auth, reply_auth]),
+                    ..Default::default()
+                }),
+            )
+            .expect("the contract accepts the sealed action and reply");
+
+        // Both the action message and the reply message are retained in
+        // recent_messages (the contract keeps action messages alongside
+        // computing `actions_state` on top of them), each as a sealed private
+        // body — never silently dropped, never downgraded to public.
+        use river_core::room_state::content::CONTENT_TYPE_ACTION;
+        let reply = applied
+            .recent_messages
+            .messages
+            .iter()
+            .find(|m| m.message.content.content_type() == CONTENT_TYPE_REPLY)
+            .expect("the sealed reply must be retained, not silently dropped");
+        assert!(
+            reply.message.content.is_private(),
+            "the accepted reply body must be the sealed (private) form"
+        );
+        let action = applied
+            .recent_messages
+            .messages
+            .iter()
+            .find(|m| m.message.content.content_type() == CONTENT_TYPE_ACTION)
+            .expect("the sealed action must be retained, not silently dropped");
+        assert!(
+            action.message.content.is_private(),
+            "the accepted action body must be the sealed (private) form"
         );
     }
 
