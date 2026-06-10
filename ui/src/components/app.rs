@@ -317,12 +317,13 @@ pub fn App() -> Element {
     //   1. A nickname is ALSO saved → the user already clicked Accept and the
     //      subscription was still in flight at reload. Auto-resume with that
     //      nickname (#218) so the "Subscribing…" indicator returns instead of
-    //      a blank UI / re-prompt. This MUST take precedence over the
-    //      processed-fingerprint check below, because `accept_invitation`
-    //      marks the invitation processed up front — so a mid-flight reload
-    //      always sees `is_invitation_processed == true`. Storage-still-present
-    //      + nickname-present is the authoritative "join not yet finished"
-    //      signal here.
+    //      a blank UI / re-prompt. The saved-nickname signal — not the
+    //      processed flag — is what drives this: `accept_invitation` does NOT
+    //      mark the invitation processed (the mark happens only at terminal
+    //      success in `render_subscribed_state`, or on dismiss), so a
+    //      mid-flight reload sees `is_invitation_processed == false`.
+    //      Storage-still-present + nickname-present is the authoritative
+    //      "accepted but join not yet finished" signal here.
     //   2. No nickname, but the invitation was already acted on in this
     //      browser → discard (the user accepted-then-left, or dismissed).
     //   3. No nickname, not yet processed → the user reloaded before deciding;
