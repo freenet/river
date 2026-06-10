@@ -5,7 +5,6 @@ use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
-use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
 use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
@@ -529,7 +528,7 @@ fn render_invitation_content(inv: Invitation, invitation: Signal<Option<Invitati
         Some(PendingRoomStatus::Error(e)) => render_error_state(&e, &inv, invitation),
         Some(PendingRoomStatus::Subscribed) => {
             // Room subscribed and retrieved successfully, close modal
-            render_subscribed_state(&inv.room, invitation)
+            render_subscribed_state(&inv, invitation)
         }
         None => render_invitation_options(inv, invitation),
     }
@@ -610,10 +609,29 @@ fn render_error_state(
 /// Renders the state when room is successfully subscribed and retrieved.
 /// Cleans up the invitation and returns empty to dismiss the modal.
 fn render_subscribed_state(
-    room_key: &VerifyingKey,
+    inv: &Invitation,
     mut invitation: Signal<Option<Invitation>>,
 ) -> Element {
-    let room_key = *room_key;
+    let room_key = inv.room;
+    // Mark the invitation processed NOW — at terminal success — rather than up
+    // front in `accept_invitation`. This is the gravestone fix: marking on
+    // accept meant a join that never completed (e.g. the room-contract GET
+    // failing intermittently, freenet-core #4345) was suppressed forever on
+    // reload, with no way to retry inside the sandboxed gateway iframe where
+    // the localStorage auto-resume (#218) is dead (`window.localStorage` throws
+    // `SecurityError` in the opaque origin, #219). Marking here means:
+    //   * a SUCCESSFUL join is suppressed on reload (the URL still carries
+    //     `?invitation=...` because the iframe can't `replaceState`; the hash
+    //     fingerprint stops it re-prompting — #215 / #216), and
+    //   * an accepted-then-LEFT room stays suppressed too (this success mark
+    //     was written before the user left, and leaving never clears it —
+    //     #279), while
+    //   * an accept whose join never finished is NEVER marked, so it
+    //     re-surfaces on reload and the user can retry.
+    // The mark goes straight onto the durable, iframe-safe top-level URL hash,
+    // so it works synchronously on the next load with no dependency on the
+    // chat-delegate ROOMS hydration finishing first.
+    mark_invitation_processed(&inv.to_encoded_string());
     // Defer signal mutations to avoid RefCell panics during render.
     // The modal renders one empty frame before cleanup runs — acceptable
     // since we return rsx! {} immediately.
@@ -822,12 +840,25 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
 /// subscription that was in flight when the page was reloaded (#218), reusing
 /// the exact same accept flow the Accept button uses.
 pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
-    // Mark this invitation processed up front. The user has now made a choice
-    // for this URL parameter; even if subscription fails or the page is
-    // reloaded mid-flow, we should not re-prompt for a nickname on every
-    // refresh just because the URL still carries `?invitation=...`.
-    mark_invitation_processed(&inv.to_encoded_string());
-
+    // NOTE: we deliberately do NOT mark this invitation processed here.
+    //
+    // Marking on accept (the old behaviour) turned the processed-set into a
+    // permanent gravestone: an accept whose room-contract GET never completed
+    // (intermittently, e.g. freenet-core #4345's large multi-fragment GET) was
+    // suppressed forever on reload, and the localStorage auto-resume (#218) is
+    // dead inside the sandboxed gateway iframe (`window.localStorage` throws
+    // `SecurityError` in the opaque origin, #219) — so the user was stuck
+    // unless they hand-edited the top-level URL hash. Real users hit exactly
+    // this on the official Freenet River room.
+    //
+    // The invitation is instead marked processed at TERMINAL SUCCESS, in
+    // `render_subscribed_state` (and on any dismiss, via
+    // `dismiss_invitation_persistently`). A join that never finishes is never
+    // marked, so it re-surfaces on the next load and the user can retry. We
+    // still persist the invitation + chosen nickname to localStorage below so
+    // a mid-flight reload auto-resumes WHERE localStorage is available (#218,
+    // dev mode); in the iframe that persistence is a no-op and the re-surfaced
+    // modal (the URL still carries `?invitation=...`) is the retry path.
     let room_owner = inv.room;
     let authorized_member = inv.invitee.clone();
     let invitee_signing_key = inv.invitee_signing_key.clone();
@@ -1209,5 +1240,127 @@ mod tests {
             hash.len()
         );
         assert!(hash.len() > PROCESSED_HASH_PREFIX.len());
+    }
+
+    // ---- invite-gravestone fix: mark on terminal success, not on accept ----
+    //
+    // The fix moves `mark_invitation_processed` out of `accept_invitation`
+    // (up front) and into `render_subscribed_state` (terminal success).
+    // `dismiss_invitation_persistently` still marks on any dismiss. The
+    // processed-set lives in the durable, iframe-safe top-level URL hash and is
+    // host-testable via `PROCESSED_CACHE`, so we drive it directly to assert
+    // the four required outcomes. The actual call-site relocation is pinned by
+    // the two source-grep tests below (the rsx-returning render fns can't run
+    // without a Dioxus runtime).
+
+    /// (a) Accepted but the join never completed → the invitation was NEVER
+    /// marked processed, so the gate re-surfaces it and the user can retry.
+    /// This is the bug the fix repairs (the old code marked it up front, which
+    /// permanently suppressed it on reload in the sandboxed iframe).
+    #[test]
+    fn accepted_but_incomplete_join_is_not_suppressed() {
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        // accept_invitation no longer marks; render_subscribed_state never ran.
+        assert!(
+            !is_invitation_processed("invitation-incomplete"),
+            "an accepted-but-incomplete join must remain retryable on reload"
+        );
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// (b) Accepted and the join COMPLETED → `render_subscribed_state` marks it
+    /// processed, so a reload (URL still carries `?invitation=...`, which the
+    /// iframe can't strip) is suppressed synchronously without re-prompting for
+    /// a nickname (#215 / #216). We exercise the mark the success path makes.
+    #[test]
+    fn successful_join_suppresses_on_reload() {
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        // The load-bearing op render_subscribed_state performs at success:
+        mark_invitation_processed("invitation-joined");
+        assert!(
+            is_invitation_processed("invitation-joined"),
+            "a successfully joined invite must be suppressed on reload (#215/#216)"
+        );
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// (c) Declined / Cancelled / Closed → `dismiss_invitation_persistently`
+    /// marks it processed → suppressed on reload (#279).
+    #[test]
+    fn dismissed_invite_suppresses_on_reload() {
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        // The load-bearing op dismiss_invitation_persistently performs:
+        mark_invitation_processed("invitation-declined");
+        assert!(
+            is_invitation_processed("invitation-declined"),
+            "a dismissed invite must be suppressed on reload (#279)"
+        );
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// (d) Accepted, joined, then LEFT → the success mark was written before
+    /// the user left, and leaving never clears it, so the invite stays
+    /// suppressed on reload (#279). Leaving a room does NOT touch the
+    /// processed-set, so the already-present success mark is what suppresses.
+    #[test]
+    fn accepted_then_left_stays_suppressed_on_reload() {
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        // Success path marked it when the join completed:
+        mark_invitation_processed("invitation-left");
+        // ... user later leaves the room (leave_room touches ROOMS only, NOT
+        // the processed-set), so the mark survives:
+        assert!(
+            is_invitation_processed("invitation-left"),
+            "an accepted-then-left room must stay suppressed on reload (#279)"
+        );
+        PROCESSED_CACHE.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// Source-grep pin: `accept_invitation` must NOT mark the invitation
+    /// processed (that was the gravestone). A future refactor that re-adds the
+    /// up-front mark would reintroduce the bug and must update this test.
+    #[test]
+    fn accept_invitation_does_not_mark_processed_up_front() {
+        let src = include_str!("receive_invitation_modal.rs");
+        let accept_fn = src
+            .split_once("pub(crate) fn accept_invitation(")
+            .expect("accept_invitation must exist")
+            .1;
+        // Bound the search to the function body (up to the next top-level fn /
+        // test module). The body ends before `#[cfg(test)]`.
+        let accept_body = accept_fn
+            .split_once("#[cfg(test)]")
+            .map(|(body, _)| body)
+            .unwrap_or(accept_fn);
+        assert!(
+            !accept_body.contains("mark_invitation_processed("),
+            "accept_invitation must NOT call mark_invitation_processed — marking \
+             on accept is the gravestone that suppresses a failed join forever \
+             in the sandboxed iframe. Mark on terminal success instead."
+        );
+    }
+
+    /// Source-grep pin: the terminal-success render (`render_subscribed_state`)
+    /// MUST mark the invitation processed, so a successful join is suppressed
+    /// on reload (#215/#216) and the accepted-then-left case stays suppressed
+    /// (#279). This is the relocation target for the mark removed from
+    /// `accept_invitation`.
+    #[test]
+    fn render_subscribed_state_marks_processed() {
+        let src = include_str!("receive_invitation_modal.rs");
+        let sub_fn = src
+            .split_once("fn render_subscribed_state(")
+            .expect("render_subscribed_state must exist")
+            .1;
+        // Body ends at the start of the next fn.
+        let sub_body = sub_fn
+            .split_once("\nfn ")
+            .map(|(body, _)| body)
+            .unwrap_or(sub_fn);
+        assert!(
+            sub_body.contains("mark_invitation_processed(&inv.to_encoded_string())"),
+            "render_subscribed_state must mark the invitation processed at \
+             terminal success (the relocation target of the gravestone fix)."
+        );
     }
 }
