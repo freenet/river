@@ -204,12 +204,18 @@ pub enum RecoveredInvitationAction {
 /// clicked Accept), and whether the invitation's fingerprint is already in the
 /// processed set.
 ///
-/// A saved nickname takes precedence over the processed flag, because
-/// `accept_invitation` marks the invitation processed *up front* — so a reload
-/// mid-subscription always sees `already_processed == true`. The invitation
-/// artifact only stays in storage until the room subscribes or the user
-/// dismisses (both clear the nickname too), so "nickname present" is the
-/// authoritative "join not yet finished, resume it" signal.
+/// A saved nickname takes precedence over the processed flag: a nickname is
+/// only persisted once the user has clicked Accept, and the invitation +
+/// nickname stay in storage until the room subscribes or the user dismisses
+/// (both clear them together). So "invitation still in storage + nickname
+/// present" is the authoritative "accepted but join not yet finished, resume
+/// it" signal. Note the processed flag is NOT a reliable mid-flight signal:
+/// `accept_invitation` does NOT mark the invitation processed (the mark now
+/// happens only at terminal success, in `render_subscribed_state`, or on
+/// dismiss), so a reload mid-subscription sees `already_processed == false`.
+/// The `None if already_processed => Discard` arm therefore only fires for an
+/// invitation that reached a terminal state in a prior session yet somehow
+/// still has its artifact in storage — defense-in-depth, not the common path.
 pub fn decide_recovered_invitation(
     saved_nickname: Option<String>,
     already_processed: bool,
@@ -631,6 +637,11 @@ fn render_subscribed_state(
     // The mark goes straight onto the durable, iframe-safe top-level URL hash,
     // so it works synchronously on the next load with no dependency on the
     // chat-delegate ROOMS hydration finishing first.
+    //
+    // Idempotent across the several renders this state may produce before the
+    // deferred `invitation.set(None)` below closes the modal:
+    // `mark_invitation_processed` -> `append_fingerprint` dedups, so a repeat
+    // mark is a no-op (no hash spam, no redundant postMessage).
     mark_invitation_processed(&inv.to_encoded_string());
     // Defer signal mutations to avoid RefCell panics during render.
     // The modal renders one empty frame before cleanup runs — acceptable
