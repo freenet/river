@@ -11,6 +11,7 @@ use crate::util::{
     get_current_system_time, local_message_date, local_today,
 };
 mod emoji_picker;
+mod mention;
 mod message_actions;
 mod message_input;
 mod not_member_notification;
@@ -2145,6 +2146,24 @@ fn MessageGroupComponent(
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
     let mut edit_text: Signal<String> = use_signal(String::new);
+    // @mention autocomplete state for the inline edit form (mirrors the
+    // composer in message_input.rs). One signal suffices: at most one message
+    // in this group is edited at a time.
+    let mut edit_mention = use_signal(|| None as Option<mention::MentionAutocomplete>);
+
+    // Mentionable members for the edit form's @ autocomplete: every member with
+    // a (decrypted) nickname except self, sorted by name — the same shape the
+    // composer receives, derived from `member_names` so no extra prop plumbing.
+    let edit_mention_members: Vec<(MemberId, String)> = {
+        let mut v: Vec<(MemberId, String)> = member_names
+            .iter()
+            .filter(|(id, _)| **id != self_member_id)
+            .filter(|(_, name)| !name.trim().is_empty())
+            .map(|(id, name)| (*id, name.clone()))
+            .collect();
+        v.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        v
+    };
 
     // Watch for external edit requests (e.g. up-arrow in empty input)
     let message_ids: Vec<String> = group.messages.iter().map(|m| m.id.clone()).collect();
@@ -2229,6 +2248,13 @@ fn MessageGroupComponent(
                                         if is_editing {
                                             let save_msg_id = msg_id_for_save.clone();
                                             let save_original = original_text.clone();
+                                            // Unique DOM id so the @mention caret math targets THIS
+                                            // edit textarea (multiple groups can theoretically edit).
+                                            let edit_id = format!("edit-msg-{}", msg.id);
+                                            let pick_id = edit_id.clone();
+                                            let kd_id = edit_id.clone();
+                                            let input_id = edit_id.clone();
+                                            let input_members = edit_mention_members.clone();
                                             rsx! {
                                                 div {
                                                     class: format!(
@@ -2244,7 +2270,12 @@ fn MessageGroupComponent(
                                                             let _ = el.scroll_to(ScrollBehavior::Smooth).await;
                                                         });
                                                     },
-                                                    // Global key bindings on the container (#94)
+                                                    // Global key bindings on the container (#94): Esc cancels,
+                                                    // Enter saves. Kept here (not solely on the textarea) so the
+                                                    // "(Esc)"/"(Enter)" button shortcuts work when keyboard focus
+                                                    // is on a button. The textarea's @mention handler calls
+                                                    // stop_propagation when it consumes a key, so these never
+                                                    // double-fire with mention navigation.
                                                     onkeydown: {
                                                         let msg_id = msg_id_for_save.clone();
                                                         let original = original_text.clone();
@@ -2261,19 +2292,61 @@ fn MessageGroupComponent(
                                                             }
                                                         }
                                                     },
-                                                    textarea {
-                                                        class: format!(
-                                                            "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none {}",
-                                                            if is_self { "bg-white/10 text-white placeholder-white/50 border border-white/20" } else { "bg-bg text-text border border-border" }
-                                                        ),
-                                                        value: "{edit_text}",
-                                                        onmounted: move |cx| {
-                                                            let element = cx.data();
-                                                            wasm_bindgen_futures::spawn_local(async move {
-                                                                let _ = element.set_focus(true).await;
-                                                            });
-                                                        },
-                                                        oninput: move |e| edit_text.set(e.value().clone()),
+                                                    // `relative` anchors the @mention autocomplete
+                                                    // dropdown to the textarea.
+                                                    div { class: "relative",
+                                                        // @mention autocomplete dropdown (floats above the textarea)
+                                                        mention::MentionDropdown {
+                                                            mention: edit_mention,
+                                                            on_pick: move |i| mention::apply_mention_selection(
+                                                                pick_id.clone(),
+                                                                edit_text,
+                                                                edit_mention,
+                                                                i,
+                                                                || {},
+                                                            ),
+                                                        }
+                                                        textarea {
+                                                            id: "{edit_id}",
+                                                            class: format!(
+                                                                "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none {}",
+                                                                if is_self { "bg-white/10 text-white placeholder-white/50 border border-white/20" } else { "bg-bg text-text border border-border" }
+                                                            ),
+                                                            value: "{edit_text}",
+                                                            onmounted: move |cx| {
+                                                                let element = cx.data();
+                                                                wasm_bindgen_futures::spawn_local(async move {
+                                                                    let _ = element.set_focus(true).await;
+                                                                });
+                                                            },
+                                                            oninput: move |e| {
+                                                                let value = e.value().to_string();
+                                                                edit_text.set(value.clone());
+                                                                // Detect / update the @mention autocomplete.
+                                                                mention::update_mention_from_input(
+                                                                    &input_id, &value, &input_members, edit_mention,
+                                                                );
+                                                            },
+                                                            // @mention navigation (Arrow/Enter/Tab/Esc) takes
+                                                            // precedence while the dropdown is open. When it
+                                                            // consumes the key, stop_propagation keeps the
+                                                            // container's Esc-cancel / Enter-save (above) from
+                                                            // also firing for that same key. Non-mention keys
+                                                            // bubble up to the container handler unchanged.
+                                                            onkeydown: move |e: KeyboardEvent| {
+                                                                if mention::handle_mention_keydown(
+                                                                    &kd_id, &e, edit_text, edit_mention, || {},
+                                                                ) {
+                                                                    e.stop_propagation();
+                                                                }
+                                                            },
+                                                            // Dismiss the dropdown when focus leaves the textarea
+                                                            // (click elsewhere). Dropdown rows use mousedown +
+                                                            // preventDefault, so picking one does not blur first.
+                                                            onfocusout: move |_| {
+                                                                crate::util::defer(move || edit_mention.set(None));
+                                                            },
+                                                        }
                                                     }
                                                     div { class: "flex justify-end gap-3 mt-3",
                                                         style: "overflow: visible;",
