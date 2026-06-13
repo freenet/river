@@ -2270,6 +2270,28 @@ fn MessageGroupComponent(
                                                             let _ = el.scroll_to(ScrollBehavior::Smooth).await;
                                                         });
                                                     },
+                                                    // Global key bindings on the container (#94): Esc cancels,
+                                                    // Enter saves. Kept here (not solely on the textarea) so the
+                                                    // "(Esc)"/"(Enter)" button shortcuts work when keyboard focus
+                                                    // is on a button. The textarea's @mention handler calls
+                                                    // stop_propagation when it consumes a key, so these never
+                                                    // double-fire with mention navigation.
+                                                    onkeydown: {
+                                                        let msg_id = msg_id_for_save.clone();
+                                                        let original = original_text.clone();
+                                                        move |e: KeyboardEvent| {
+                                                            if e.key() == Key::Escape {
+                                                                editing_message.set(None);
+                                                            } else if e.key() == Key::Enter && !e.modifiers().shift() {
+                                                                e.prevent_default();
+                                                                let new_text = edit_text.read().clone();
+                                                                if !new_text.is_empty() && new_text != original {
+                                                                    on_edit.call((msg_id.clone(), new_text));
+                                                                }
+                                                                editing_message.set(None);
+                                                            }
+                                                        }
+                                                    },
                                                     // `relative` anchors the @mention autocomplete
                                                     // dropdown to the textarea.
                                                     div { class: "relative",
@@ -2306,27 +2328,16 @@ fn MessageGroupComponent(
                                                                 );
                                                             },
                                                             // @mention navigation (Arrow/Enter/Tab/Esc) takes
-                                                            // precedence while the dropdown is open; otherwise
-                                                            // Esc cancels the edit and Enter saves it (#94).
-                                                            onkeydown: {
-                                                                let msg_id = msg_id_for_save.clone();
-                                                                let original = original_text.clone();
-                                                                move |e: KeyboardEvent| {
-                                                                    if mention::handle_mention_keydown(
-                                                                        &kd_id, &e, edit_text, edit_mention, || {},
-                                                                    ) {
-                                                                        return;
-                                                                    }
-                                                                    if e.key() == Key::Escape {
-                                                                        editing_message.set(None);
-                                                                    } else if e.key() == Key::Enter && !e.modifiers().shift() {
-                                                                        e.prevent_default();
-                                                                        let new_text = edit_text.read().clone();
-                                                                        if !new_text.is_empty() && new_text != original {
-                                                                            on_edit.call((msg_id.clone(), new_text));
-                                                                        }
-                                                                        editing_message.set(None);
-                                                                    }
+                                                            // precedence while the dropdown is open. When it
+                                                            // consumes the key, stop_propagation keeps the
+                                                            // container's Esc-cancel / Enter-save (above) from
+                                                            // also firing for that same key. Non-mention keys
+                                                            // bubble up to the container handler unchanged.
+                                                            onkeydown: move |e: KeyboardEvent| {
+                                                                if mention::handle_mention_keydown(
+                                                                    &kd_id, &e, edit_text, edit_mention, || {},
+                                                                ) {
+                                                                    e.stop_propagation();
                                                                 }
                                                             },
                                                             // Dismiss the dropdown when focus leaves the textarea
