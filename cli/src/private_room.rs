@@ -1023,6 +1023,94 @@ mod tests {
         );
     }
 
+    /// Regression for Codex review round 3 on PR #358: the local heal MUST NOT
+    /// be folded into state via a full-state `ChatRoomStateV1::apply_delta`.
+    ///
+    /// This documents the trap. A stranded member (in `members`, no
+    /// `member_info`) who has authored no message and has no current-version
+    /// secret blob is NOT anchored against `post_apply_cleanup`. Running a
+    /// `member_info`-only delta through full-state `apply_delta` therefore
+    /// PRUNES that member from `members` AND drops the just-added member_info —
+    /// turning "in members but Unknown" into "not a member" locally. That is
+    /// exactly why `ApiClient::heal_member_info` folds the entry into the
+    /// `member_info` sub-state directly instead. (The standalone network UPDATE
+    /// is safe: it carries no MembersDelta and the member is anchored on the
+    /// network by their join event.)
+    #[test]
+    fn full_state_apply_delta_would_prune_unanchored_healed_member() {
+        use freenet_scaffold::ComposableState;
+        use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+
+        let owner = fresh_signing_key();
+        let owner_vk = owner.verifying_key();
+        let member = fresh_signing_key();
+        let member_id = MemberId::from(&member.verifying_key());
+
+        // Public room, member in `members`, no member_info, no message authored,
+        // no secret blob → unanchored against post_apply_cleanup.
+        let mut state = state_with_privacy(&owner, PrivacyMode::Public);
+        add_member(&mut state, &owner, &member);
+
+        let healed =
+            build_member_info_heal(&state, &member, &owner_vk, &HashMap::new(), Some("Alice"))
+                .expect("self in members, no member_info → heal");
+
+        // The TRAP: full-state apply_delta runs post_apply_cleanup and prunes
+        // the unanchored member, dropping the heal. We assert this is what would
+        // happen, so the direct-insert in heal_member_info is justified and a
+        // future refactor back to apply_delta is caught.
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let mut via_apply_delta = state.clone();
+        via_apply_delta
+            .apply_delta(
+                &state,
+                &params,
+                &Some(ChatRoomStateV1Delta {
+                    member_info: Some(vec![healed.clone()]),
+                    ..Default::default()
+                }),
+            )
+            .expect("apply_delta itself succeeds — it just prunes");
+        assert!(
+            !via_apply_delta
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == member.verifying_key()),
+            "full-state apply_delta prunes the unanchored member (the trap) — \
+             heal_member_info must NOT use it"
+        );
+        assert!(
+            !via_apply_delta
+                .member_info
+                .member_info
+                .iter()
+                .any(|i| i.member_info.member_id == member_id),
+            "and drops the member_info too (cleanup removes info for pruned members)"
+        );
+
+        // The direct insert that heal_member_info actually performs PRESERVES
+        // both the member and the healed entry.
+        let mut via_direct_insert = state.clone();
+        via_direct_insert.member_info.member_info.push(healed);
+        assert!(
+            via_direct_insert
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == member.verifying_key()),
+            "direct insert keeps the member"
+        );
+        assert!(
+            via_direct_insert
+                .member_info
+                .member_info
+                .iter()
+                .any(|i| i.member_info.member_id == member_id),
+            "direct insert keeps the healed member_info entry"
+        );
+    }
+
     #[test]
     fn build_message_body_public_room_is_plaintext() {
         let owner = fresh_signing_key();

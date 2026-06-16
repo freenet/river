@@ -942,23 +942,37 @@ impl ApiClient {
              (was in members but absent from member_info — rendered as \"Unknown\" to peers)"
         );
 
-        let delta = ChatRoomStateV1Delta {
-            member_info: Some(vec![authorized_info]),
-            ..Default::default()
-        };
-
-        // Apply locally first (validates the delta and produces the healed
-        // state we both store and return), then publish to the network.
-        let params = ChatRoomParametersV1 {
-            owner: *room_owner_key,
-        };
+        // Produce the locally-healed state by folding ONLY the new member_info
+        // entry in — deliberately NOT via `ChatRoomStateV1::apply_delta`.
+        //
+        // A full-state `apply_delta` runs `post_apply_cleanup`, which inactivity-
+        // prunes any member not anchored by a recent message / active DM /
+        // current-version secret blob — and the heal adds NO message. If our
+        // local `state` has aged the member's join event out of
+        // `recent_messages`, cleanup would prune the very member we are healing
+        // AND drop the member_info we just added, turning "in members but
+        // Unknown" into "not a member" locally (Codex review on PR #358).
+        //
+        // That destructive cleanup is purely a LOCAL concern: the standalone
+        // `member_info`-only UPDATE we publish carries no `MembersDelta`, so it
+        // never removes the member from the network — and on the network the
+        // member is anchored by the join event that put them in `state.members`
+        // (the heal precondition), so the network's own cleanup keeps them.
+        //
+        // The entry is already validated (self-signed, length-clamped; the
+        // contract's `MemberInfoV1::apply_delta` acceptance is pinned by
+        // `heal_output_is_accepted_by_member_info_apply_delta`), so inserting it
+        // directly into the `member_info` sub-state is correct and avoids the
+        // cleanup that the heal-only delta must not trigger.
         let mut healed_state = state.clone();
-        if let Err(e) = healed_state.apply_delta(&state, &params, &Some(delta.clone())) {
-            return Err((
-                state,
-                anyhow!("Failed to apply member_info heal delta: {:?}", e),
-            ));
-        }
+        healed_state
+            .member_info
+            .member_info
+            .push(authorized_info.clone());
+        healed_state
+            .member_info
+            .member_info
+            .sort_by_key(|i| i.member_info.member_id);
         if let Err(e) = self
             .storage
             .update_room_state(room_owner_key, healed_state.clone())
@@ -969,6 +983,10 @@ impl ApiClient {
         // The network publish is best-effort: the local state is already
         // repaired and stored, so a send failure must not discard the healed
         // state the caller will operate on. Log and return the healed state.
+        let delta = ChatRoomStateV1Delta {
+            member_info: Some(vec![authorized_info]),
+            ..Default::default()
+        };
         if let Err(e) = self.send_delta(room_owner_key, delta).await {
             warn!(
                 "member_info self-heal (issue #304): local state repaired and stored, \

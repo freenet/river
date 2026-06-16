@@ -649,6 +649,25 @@ mod tests {
              — otherwise it would republish the stored member's nickname/secrets \
              under the override key. Do NOT drop this guard."
         );
+        // The local heal must fold the member_info in DIRECTLY (push onto
+        // `healed_state.member_info.member_info`), NOT via a full-state
+        // `ChatRoomStateV1::apply_delta` — the latter runs `post_apply_cleanup`,
+        // which would inactivity-prune the very (unanchored) member being healed
+        // and drop the new member_info, since the heal adds no anchoring message
+        // (Codex review round 3 on PR #358). We assert the direct-push exists and
+        // that heal_member_info does not reach for full-state apply_delta.
+        //
+        // Whitespace-insensitive: collapse runs of whitespace before matching so
+        // a future rustfmt line-rewrap can't silently void the pin.
+        let api_collapsed: String = api_src.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            api_collapsed
+                .contains("healed_state .member_info .member_info .push(authorized_info.clone());"),
+            "heal_member_info must build the local healed state by directly \
+             pushing the member_info entry, NOT by calling full-state \
+             apply_delta (which runs post_apply_cleanup and would prune the \
+             unanchored member it is trying to heal)."
+        );
     }
 
     /// Source-grep pin for the #306 import wiring, in storage.rs so the pinned
