@@ -217,6 +217,26 @@ counterpart is **`.claude/rules/river-publish.md`**.
 - Run `cd common && cargo test private_room` when modifying encryption or secret distribution.
 - Use `cargo make test` before every PR to ensure all components still build and pass tests.
 
+## UI Test IDs (`data-testid`)
+
+Stable hooks for automation (Playwright, debugging, external tools). Dioxus'
+`data-dioxus-id` attributes are render-order indices that change between
+renders, so automation MUST target `data-testid` instead (freenet/river#25).
+
+Naming convention:
+- **kebab-case**, scoped by surface: `<surface>-<role>` (e.g.
+  `create-room-name-input`, `send-message-button`, `member-info-modal`).
+- **List containers** get a plain id: `room-list`, `member-list`.
+- **List items** use the entity-ID pattern `<entity>-item-{id}` so a specific
+  row is addressable: `room-item-{base58(owner_vk)}`,
+  `member-item-{member_id}`. Selecting any item: `[data-testid^="room-item-"]`.
+
+Test IDs are additive markup only — never change rendering or logic. When
+adding a new interactive surface, give it a `data-testid` following the above.
+Existing coverage spans the room list + items, member list + items, the
+create-room / edit-room / invite-member / member-info / receive-invitation
+modals and their primary inputs/buttons, and the message input + send button.
+
 ## State Authorization Rule
 
 **Every piece of data in contract state must be cryptographically authorized. Never accept

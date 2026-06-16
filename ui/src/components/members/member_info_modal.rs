@@ -199,6 +199,7 @@ pub fn MemberInfoModal() -> Element {
                 }
                 // Modal content
                 div {
+                    "data-testid": "member-info-modal",
                     class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
                     div {
                         class: "p-6",
@@ -243,6 +244,7 @@ pub fn MemberInfoModal() -> Element {
                             class: "mb-4",
                             label { class: "block text-sm font-medium text-text-muted mb-2", "Member ID" }
                             input {
+                                "data-testid": "member-info-id-input",
                                 class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text font-mono text-sm",
                                 value: "{member_id_str}",
                                 readonly: true
@@ -265,6 +267,7 @@ pub fn MemberInfoModal() -> Element {
                                 rsx! {
                                     div { class: "mb-4 flex gap-2",
                                         button {
+                                            "data-testid": "member-info-dm-button",
                                             class: "flex-1 px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-sm font-medium rounded-lg transition-colors border border-border",
                                             "aria-label": "Send direct message",
                                             onclick: move |_| {
@@ -278,6 +281,7 @@ pub fn MemberInfoModal() -> Element {
                                             "DM"
                                         }
                                         button {
+                                            "data-testid": "member-info-share-invite-button",
                                             class: format!(
                                                 "flex-1 px-3 py-1.5 text-sm font-medium rounded-lg transition-colors border border-border {}",
                                                 if share_button_enabled {
@@ -337,6 +341,7 @@ pub fn MemberInfoModal() -> Element {
                     }
                     // Close button
                     button {
+                        "data-testid": "member-info-close-button",
                         class: "absolute top-3 right-3 p-1 text-text-muted hover:text-text transition-colors",
                         onclick: handle_close_modal,
                         "✕"

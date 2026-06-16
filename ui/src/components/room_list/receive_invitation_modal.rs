@@ -506,6 +506,7 @@ pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element
             }
             // Modal content
             div {
+                "data-testid": "receive-invitation-modal",
                 class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
                 div {
                     class: "p-6",
@@ -800,6 +801,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
 
         div { class: "mb-4",
             input {
+                "data-testid": "receive-invitation-nickname-input",
                 class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
                 r#type: "text",
                 value: "{nickname}",
@@ -824,6 +826,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
         div {
             class: "flex gap-3",
             button {
+                "data-testid": "receive-invitation-accept-button",
                 class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                 disabled: nickname.read().trim().is_empty(),
                 onclick: move |_| {
@@ -832,6 +835,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
                 "Accept"
             }
             button {
+                "data-testid": "receive-invitation-decline-button",
                 class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
                 onclick: {
                     let inv_for_decline = inv.clone();

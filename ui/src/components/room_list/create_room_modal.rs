@@ -136,6 +136,7 @@ pub fn CreateRoomModal() -> Element {
         // Modal
         div { class: "fixed inset-0 z-50 flex items-center justify-center p-4",
             div {
+                "data-testid": "create-room-modal",
                 class: "bg-panel rounded-xl shadow-xl max-w-md w-full",
                 onclick: move |e| e.stop_propagation(),
 
@@ -149,6 +150,7 @@ pub fn CreateRoomModal() -> Element {
                     div {
                         label { class: "block text-sm font-medium text-text mb-1", "Room Name" }
                         input {
+                            "data-testid": "create-room-name-input",
                             class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent",
                             value: "{room_name}",
                             placeholder: "Enter room name",
@@ -159,6 +161,7 @@ pub fn CreateRoomModal() -> Element {
                     div {
                         label { class: "block text-sm font-medium text-text mb-1", "Your Nickname" }
                         input {
+                            "data-testid": "create-room-nickname-input",
                             class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent",
                             value: "{nickname}",
                             placeholder: "Enter your nickname",
@@ -168,6 +171,7 @@ pub fn CreateRoomModal() -> Element {
 
                     label { class: "flex items-center gap-3 cursor-pointer",
                         input {
+                            "data-testid": "create-room-private-checkbox",
                             r#type: "checkbox",
                             class: "w-4 h-4 rounded border-border text-accent focus:ring-accent/50",
                             checked: "{is_private}",
@@ -182,6 +186,7 @@ pub fn CreateRoomModal() -> Element {
                 // Footer
                 div { class: "px-6 py-4 border-t border-border flex justify-end gap-3",
                     button {
+                        "data-testid": "create-room-cancel-button",
                         class: "px-4 py-2 text-sm text-text-muted hover:text-text hover:bg-surface rounded-lg transition-colors",
                         onclick: move |_| {
                             CREATE_ROOM_MODAL.with_mut(|modal| {
@@ -191,6 +196,7 @@ pub fn CreateRoomModal() -> Element {
                         "Cancel"
                     }
                     button {
+                        "data-testid": "create-room-submit-button",
                         class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
                         onclick: create_room,
                         "Create Room"

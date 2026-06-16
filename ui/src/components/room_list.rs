@@ -198,6 +198,7 @@ pub fn RoomList() -> Element {
                     span { "Rooms" }
                 }
                 button {
+                    "data-testid": "create-room-button",
                     class: "p-1.5 rounded-md text-text-muted hover:text-accent hover:bg-surface transition-colors",
                     title: "Create Room",
                     onclick: move |_| {
@@ -208,7 +209,9 @@ pub fn RoomList() -> Element {
             }
 
             // Room list
-            ul { class: "flex-1 px-2 py-1 space-y-0.5",
+            ul {
+                "data-testid": "room-list",
+                class: "flex-1 px-2 py-1 space-y-0.5",
                 {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync, is_private, unread, sync_error_msg)| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
@@ -225,9 +228,14 @@ pub fn RoomList() -> Element {
                     // shift.
                     let is_dragged = dragged_now == Some(room_key);
                     let is_drag_over = drag_over_now == Some(room_key);
+                    let room_testid =
+                        format!("room-item-{}", bs58::encode(room_key.to_bytes()).into_string());
                     rsx! {
                         li {
                             key: "{room_key:?}",
+                            // Stable per-room hook for automation (freenet/river#25).
+                            // Entity-ID pattern: `room-item-{base58(owner_vk)}`.
+                            "data-testid": "{room_testid}",
                             // Rooms are reorderable by drag-and-drop. The whole
                             // row is the drag handle; the inner button still
                             // handles click-to-open (a click is distinct from a

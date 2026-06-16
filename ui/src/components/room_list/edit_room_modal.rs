@@ -68,6 +68,7 @@ pub fn EditRoomModal() -> Element {
                 }
                 // Modal content
                 div {
+                    "data-testid": "edit-room-modal",
                     class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border max-h-[90vh] overflow-y-auto",
                     div {
                         class: "p-6",
@@ -340,6 +341,7 @@ pub fn EditRoomModal() -> Element {
                             div {
                                 class: "mt-4",
                                 button {
+                                    "data-testid": "edit-room-leave-button",
                                     class: "px-4 py-2 border border-red-500 text-red-500 hover:bg-red-500/10 rounded-lg transition-colors",
                                     onclick: move |_| show_leave_confirmation.set(true),
                                     "Leave Room"
@@ -349,6 +351,7 @@ pub fn EditRoomModal() -> Element {
                     }
                     // Close button
                     button {
+                        "data-testid": "edit-room-close-button",
                         class: "absolute top-3 right-3 p-1 text-text-muted hover:text-text transition-colors",
                         onclick: move |_| {
                             EDIT_ROOM_MODAL.write().room = None;
