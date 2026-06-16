@@ -18,7 +18,7 @@ use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
-use river_core::room_state::ChatRoomStateV1;
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -168,13 +168,21 @@ pub fn seal_invitee_nickname(
 /// re-publish so the entry is restored; the caller emits it as a standalone
 /// `member_info`-only UPDATE delta.
 ///
-/// Returns `None` when there is nothing to heal:
+/// Returns `None` when there is nothing to heal (or healing would do harm):
 /// - the member is the room **owner** (their `member_info` is managed
 ///   separately, exactly as the UI skips the owner);
 /// - the member is **not in `state.members`** (not stranded — nothing to
 ///   re-publish; `ApiClient::build_rejoin_delta` handles the pruned-member
 ///   case where they need re-adding to `members`);
-/// - the member **already has a `member_info` entry** (not stranded).
+/// - the member **already has a `member_info` entry** (not stranded);
+/// - the member would **not survive `post_apply_cleanup`** (not anchored by a
+///   recent message / active DM / current-version secret). Publishing a
+///   `member_info`-only UPDATE for such a member makes the contract run its
+///   cleanup and PRUNE them from `members` — removing rather than healing. The
+///   check simulates the contract's own `post_apply_cleanup` so it can't drift.
+///   Such a member becomes anchored once they author a message (a normal
+///   `riverctl message send` re-adds + anchors them via `build_rejoin_delta`),
+///   and a later GET then heals.
 ///
 /// A non-owner's `member_info` is only valid on the contract when self-signed
 /// by that member's own key, so this heal can ONLY be produced client-side by
@@ -230,6 +238,34 @@ pub fn build_member_info_heal(
         .any(|i| i.member_info.member_id == member_id);
     if has_member_info {
         return None; // already present — not stranded
+    }
+
+    // Defer if this member is NOT anchored against inactivity-prune.
+    //
+    // A `member_info`-only UPDATE carries no `MembersDelta`, but the contract
+    // runs `ChatRoomStateV1::post_apply_cleanup` on every apply. That prunes any
+    // member not anchored by a recent message / active DM / current-version
+    // `encrypted_secrets` recipient (or an ancestor of one in the invite chain).
+    // If we publish a heal for an UNanchored member, the cleanup the UPDATE
+    // triggers would prune that very member from `members` and drop the new
+    // `member_info` — turning "in members but Unknown" into "removed" (Codex
+    // review on PR #358). Healing is also futile in that case: the next cleanup
+    // would prune them regardless. So: simulate the cleanup on a clone and only
+    // heal if self survives it. Using the contract's own `post_apply_cleanup`
+    // (rather than re-deriving the anchor set) keeps this faithful and drift-
+    // proof. The member becomes anchored once they author a message (a normal
+    // `riverctl message send` already re-adds + anchors via `build_rejoin_delta`),
+    // and a later GET then heals.
+    let params = ChatRoomParametersV1 { owner: *owner_vk };
+    let mut after_cleanup = state.clone();
+    if after_cleanup.post_apply_cleanup(&params).is_err()
+        || !after_cleanup
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == self_vk)
+    {
+        return None; // unanchored — a heal UPDATE would prune, not repair
     }
 
     // Stranded — re-publish our own member_info. The nickname the member
@@ -725,10 +761,36 @@ mod tests {
 
     use river_core::room_state::member::{AuthorizedMember, Member};
     use river_core::room_state::member_info::AuthorizedMemberInfo as AuthInfo;
+    use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 
-    /// Push `member_sk` into `state.members`, invited directly by the owner
-    /// (so the member is a valid, authorized entry the heal recognises).
+    /// Push `member_sk` into `state.members` (invited directly by the owner) AND
+    /// anchor them with a join-event message, so they survive
+    /// `post_apply_cleanup` — mirroring the real accept flow, which always
+    /// publishes a join event alongside the membership. This is the realistic
+    /// "stranded member who has a join event but no member_info" the heal
+    /// targets. Use [`add_member_no_anchor`] for the unanchored case.
     fn add_member(state: &mut ChatRoomStateV1, owner_sk: &SigningKey, member_sk: &SigningKey) {
+        add_member_no_anchor(state, owner_sk, member_sk);
+        let join = MessageV1 {
+            room_owner: owner_sk.verifying_key().into(),
+            author: MemberId::from(&member_sk.verifying_key()),
+            content: RoomMessageBody::join_event(),
+            time: std::time::SystemTime::now(),
+        };
+        state
+            .recent_messages
+            .messages
+            .push(AuthorizedMessageV1::new(join, member_sk));
+    }
+
+    /// Push `member_sk` into `state.members` WITHOUT anchoring them — no
+    /// message, no DM, no current-version secret blob. Such a member is pruned
+    /// by `post_apply_cleanup`, so the heal must defer for them.
+    fn add_member_no_anchor(
+        state: &mut ChatRoomStateV1,
+        owner_sk: &SigningKey,
+        member_sk: &SigningKey,
+    ) {
         let member = Member {
             owner_member_id: owner_sk.verifying_key().into(),
             invited_by: owner_sk.verifying_key().into(),
@@ -1086,91 +1148,67 @@ mod tests {
         );
     }
 
-    /// Regression for Codex review round 3 on PR #358: the local heal MUST NOT
-    /// be folded into state via a full-state `ChatRoomStateV1::apply_delta`.
+    /// Regression for Codex review on PR #358 (rounds 3 & 5): an UNanchored
+    /// stranded member must NOT be healed.
     ///
-    /// This documents the trap. A stranded member (in `members`, no
-    /// `member_info`) who has authored no message and has no current-version
-    /// secret blob is NOT anchored against `post_apply_cleanup`. Running a
-    /// `member_info`-only delta through full-state `apply_delta` therefore
-    /// PRUNES that member from `members` AND drops the just-added member_info —
-    /// turning "in members but Unknown" into "not a member" locally. That is
-    /// exactly why `ApiClient::heal_member_info` folds the entry into the
-    /// `member_info` sub-state directly instead. (The standalone network UPDATE
-    /// is safe: it carries no MembersDelta and the member is anchored on the
-    /// network by their join event.)
+    /// A member in `members` with no `member_info`, who has authored no
+    /// message and holds no current-version secret blob, is not anchored
+    /// against `post_apply_cleanup`. Publishing a `member_info`-only UPDATE for
+    /// them makes the contract run `post_apply_cleanup`, which PRUNES that very
+    /// member from `members` and drops the new `member_info` — turning "in
+    /// members but Unknown" into "removed" instead of healing. Healing is also
+    /// futile (the next cleanup prunes them regardless). So the heal must defer
+    /// for an unanchored member.
     #[test]
-    fn full_state_apply_delta_would_prune_unanchored_healed_member() {
-        use freenet_scaffold::ComposableState;
-        use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+    fn heal_defers_for_unanchored_member() {
+        use river_core::room_state::ChatRoomParametersV1;
 
         let owner = fresh_signing_key();
         let owner_vk = owner.verifying_key();
         let member = fresh_signing_key();
-        let member_id = MemberId::from(&member.verifying_key());
 
-        // Public room, member in `members`, no member_info, no message authored,
-        // no secret blob → unanchored against post_apply_cleanup.
+        // Public room, member in `members`, no member_info, NO anchoring
+        // message/DM/secret → unanchored against post_apply_cleanup.
         let mut state = state_with_privacy(&owner, PrivacyMode::Public);
-        add_member(&mut state, &owner, &member);
+        add_member_no_anchor(&mut state, &owner, &member);
 
-        let healed =
-            build_member_info_heal(&state, &member, &owner_vk, &HashMap::new(), Some("Alice"))
-                .expect("self in members, no member_info → heal");
-
-        // The TRAP: full-state apply_delta runs post_apply_cleanup and prunes
-        // the unanchored member, dropping the heal. We assert this is what would
-        // happen, so the direct-insert in heal_member_info is justified and a
-        // future refactor back to apply_delta is caught.
+        // Sanity: the member really is unanchored — post_apply_cleanup prunes
+        // them. (This is the "trap" the deferral avoids triggering on-network.)
         let params = ChatRoomParametersV1 { owner: owner_vk };
-        let mut via_apply_delta = state.clone();
-        via_apply_delta
-            .apply_delta(
-                &state,
-                &params,
-                &Some(ChatRoomStateV1Delta {
-                    member_info: Some(vec![healed.clone()]),
-                    ..Default::default()
-                }),
-            )
-            .expect("apply_delta itself succeeds — it just prunes");
+        let mut after_cleanup = state.clone();
+        after_cleanup.post_apply_cleanup(&params).unwrap();
         assert!(
-            !via_apply_delta
+            !after_cleanup
                 .members
                 .members
                 .iter()
                 .any(|m| m.member.member_vk == member.verifying_key()),
-            "full-state apply_delta prunes the unanchored member (the trap) — \
-             heal_member_info must NOT use it"
-        );
-        assert!(
-            !via_apply_delta
-                .member_info
-                .member_info
-                .iter()
-                .any(|i| i.member_info.member_id == member_id),
-            "and drops the member_info too (cleanup removes info for pruned members)"
+            "test premise: an unanchored member is pruned by post_apply_cleanup"
         );
 
-        // The direct insert that heal_member_info actually performs PRESERVES
-        // both the member and the healed entry.
-        let mut via_direct_insert = state.clone();
-        via_direct_insert.member_info.member_info.push(healed);
+        // The heal MUST defer for this member rather than publish an UPDATE that
+        // would prune them.
         assert!(
-            via_direct_insert
-                .members
-                .members
-                .iter()
-                .any(|m| m.member.member_vk == member.verifying_key()),
-            "direct insert keeps the member"
+            build_member_info_heal(&state, &member, &owner_vk, &HashMap::new(), Some("Alice"))
+                .is_none(),
+            "heal must defer for an unanchored member — a heal UPDATE would prune, \
+             not repair"
         );
+
+        // And once the member is anchored (e.g. a join event, as the real accept
+        // flow always sends), the heal fires.
+        let mut anchored = state_with_privacy(&owner, PrivacyMode::Public);
+        add_member(&mut anchored, &owner, &member); // adds the join-event anchor
         assert!(
-            via_direct_insert
-                .member_info
-                .member_info
-                .iter()
-                .any(|i| i.member_info.member_id == member_id),
-            "direct insert keeps the healed member_info entry"
+            build_member_info_heal(
+                &anchored,
+                &member,
+                &owner_vk,
+                &HashMap::new(),
+                Some("Alice")
+            )
+            .is_some(),
+            "an anchored stranded member is healed"
         );
     }
 

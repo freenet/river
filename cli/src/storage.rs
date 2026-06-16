@@ -668,6 +668,20 @@ mod tests {
              apply_delta (which runs post_apply_cleanup and would prune the \
              unanchored member it is trying to heal)."
         );
+
+        // build_member_info_heal must defer for a member who would NOT survive
+        // post_apply_cleanup — otherwise the standalone member_info UPDATE
+        // triggers the contract's cleanup and PRUNES that member from `members`
+        // instead of healing them (Codex review round 5 on PR #358). Pinned from
+        // storage.rs so the asserted string is not self-satisfied by
+        // private_room.rs's own test source.
+        let private_room_src = include_str!("private_room.rs");
+        assert!(
+            private_room_src.contains("post_apply_cleanup(&params)"),
+            "build_member_info_heal must simulate post_apply_cleanup and defer when \
+             the member would be pruned — a heal UPDATE for an unanchored member \
+             removes them instead of repairing. Do NOT drop this anchor guard."
+        );
     }
 
     /// Source-grep pin for the #306 import wiring, in storage.rs so the pinned

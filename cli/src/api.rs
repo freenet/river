@@ -942,28 +942,20 @@ impl ApiClient {
              (was in members but absent from member_info — rendered as \"Unknown\" to peers)"
         );
 
-        // Produce the locally-healed state by folding ONLY the new member_info
-        // entry in — deliberately NOT via `ChatRoomStateV1::apply_delta`.
+        // `build_member_info_heal` only returns `Some` for a member who SURVIVES
+        // `post_apply_cleanup` (it simulates the cleanup and defers otherwise),
+        // so both the network publish and the local fold below are safe from the
+        // "heal prunes the member it is repairing" trap (Codex review on PR
+        // #358): the standalone `member_info`-only UPDATE carries no
+        // `MembersDelta`, and the member is anchored, so neither the network's
+        // nor a local cleanup would drop them.
         //
-        // A full-state `apply_delta` runs `post_apply_cleanup`, which inactivity-
-        // prunes any member not anchored by a recent message / active DM /
-        // current-version secret blob — and the heal adds NO message. If our
-        // local `state` has aged the member's join event out of
-        // `recent_messages`, cleanup would prune the very member we are healing
-        // AND drop the member_info we just added, turning "in members but
-        // Unknown" into "not a member" locally (Codex review on PR #358).
-        //
-        // That destructive cleanup is purely a LOCAL concern: the standalone
-        // `member_info`-only UPDATE we publish carries no `MembersDelta`, so it
-        // never removes the member from the network — and on the network the
-        // member is anchored by the join event that put them in `state.members`
-        // (the heal precondition), so the network's own cleanup keeps them.
-        //
-        // The entry is already validated (self-signed, length-clamped; the
-        // contract's `MemberInfoV1::apply_delta` acceptance is pinned by
-        // `heal_output_is_accepted_by_member_info_apply_delta`), so inserting it
-        // directly into the `member_info` sub-state is correct and avoids the
-        // cleanup that the heal-only delta must not trigger.
+        // We still fold the entry into the local `member_info` sub-state DIRECTLY
+        // rather than via a full-state `ChatRoomStateV1::apply_delta`: the entry
+        // is already validated (self-signed, length-clamped; contract acceptance
+        // pinned by `heal_output_is_accepted_by_member_info_apply_delta`), so a
+        // direct insert is correct and avoids re-running cleanup locally for no
+        // reason.
         let mut healed_state = state.clone();
         healed_state
             .member_info
