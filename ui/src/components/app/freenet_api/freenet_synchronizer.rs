@@ -4,7 +4,9 @@ use super::connection_manager::ConnectionManager;
 use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
-use crate::components::app::chat_delegate::{mark_legacy_migration_done, set_up_chat_delegate};
+use crate::components::app::chat_delegate::{
+    mark_legacy_migration_done, reset_ensure_subscription_dedup, set_up_chat_delegate,
+};
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
 use crate::util::{owner_vk_to_contract_key, sleep};
@@ -270,6 +272,24 @@ impl FreenetSynchronizer {
                             }
                             continue;
                         }
+                        // This is the sleep/wake path where the WebSocket *appears* alive
+                        // (SYNC_STATUS == Connected) so we refresh rather than reconnect —
+                        // but the node-side contract subscriptions may have been dropped
+                        // while suspended. Re-arm the per-session EnsureRoomSubscription
+                        // dedup and re-run the load-rooms pass so owned private rooms are
+                        // re-subscribed; otherwise an entry left "done" before suspension
+                        // would never re-fire on this refresh-only wake path, leaving the
+                        // delegate unsubscribed (freenet/river#277). Same reasoning as the
+                        // Connect handler — this path does not route through Connect.
+                        reset_ensure_subscription_dedup();
+                        if WEB_API.read().is_some() {
+                            if let Err(e) = set_up_chat_delegate().await {
+                                error!(
+                                    "Failed to set up chat delegate on refresh wake path: {}",
+                                    e
+                                );
+                            }
+                        }
                         if let Err(e) = response_handler
                             .get_room_synchronizer_mut()
                             .refresh_all_rooms()
@@ -305,6 +325,32 @@ impl FreenetSynchronizer {
                                 // during process_rooms() call
                                 let api_available = WEB_API.read().is_some();
                                 if api_available {
+                                    // Re-arm the per-session EnsureRoomSubscription dedup
+                                    // before the load-rooms pass below re-subscribes owned
+                                    // private rooms. The dedup set is process-global and
+                                    // survives a session, but the node-level contract
+                                    // subscriptions it tracks die with the WebSocket. Without
+                                    // this, a room whose EnsureRoomSubscription succeeded
+                                    // before a transport blip stays marked "done", so
+                                    // set_up_chat_delegate's load-rooms pass returns
+                                    // Ok(false) (dedup hit) and the delegate is never
+                                    // re-subscribed — silently disabling delegate-driven
+                                    // secret rotation until tab reload (freenet/river#277).
+                                    // Clearing here (rather than in ConnectionLost) covers
+                                    // every reconnect that routes through Connect: a real
+                                    // transport drop (ConnectionLost -> Connect) and the
+                                    // sleep/wake PageBecameVisible health check when the
+                                    // connection is found dead (-> Connect). The OTHER wake
+                                    // path — PageBecameVisible with an apparently-live
+                                    // connection -> RefreshAllRooms — re-arms separately in
+                                    // the RefreshAllRooms handler, since it does not route
+                                    // through Connect. It is a no-op on the first connection
+                                    // (the set is already empty), and only re-arms retry — it
+                                    // does not re-introduce the retry storm PR #276 fixed (the
+                                    // re-subscribe still flows through the once-per-reconnect
+                                    // load-rooms path, gated on a non-Failed signing-key
+                                    // migration).
+                                    reset_ensure_subscription_dedup();
                                     // Set up the chat delegate to load rooms from storage
                                     if let Err(e) = set_up_chat_delegate().await {
                                         error!("Failed to set up chat delegate: {}", e);

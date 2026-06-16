@@ -405,16 +405,56 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     }
 }
 
-/// Per-session dedup set for `EnsureRoomSubscription` calls. The UI may
+/// Per-session dedup map for `EnsureRoomSubscription` calls. The UI may
 /// re-fire its load-rooms path on every `rooms_data` reload, but we only
 /// need to ask the delegate to (re-)subscribe each room once per session —
 /// the delegate's secret store keeps the sub_index across `process()`
 /// invocations.
-static ENSURE_SUBSCRIPTION_SENT: std::sync::LazyLock<Mutex<HashSet<RoomKey>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+///
+/// The value is the `request_id` of the call that currently owns the slot.
+/// It makes the failure-path clear (`clear_ensure_subscription_sent`)
+/// epoch-aware: a clear only removes the entry if it still belongs to the
+/// caller doing the clearing. Without this, a slow in-flight call that
+/// times out AFTER a reconnect re-armed the dedup (freenet/river#277) and a
+/// newer call re-claimed and succeeded would wrongly erase the newer call's
+/// success marker, causing avoidable repeat `EnsureRoomSubscription` calls
+/// on later reloads (codex review on PR #364). Same epoch-correlation shape
+/// as the `request_id` mix-in already used for `PENDING_REQUESTS`.
+static ENSURE_SUBSCRIPTION_SENT: std::sync::LazyLock<Mutex<HashMap<RoomKey, RequestId>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Reset the per-session dedup set. Used in tests; not called in production.
-#[cfg(test)]
+/// Clear the entire per-session ensure-subscription dedup set so the next
+/// load-rooms pass re-fires `ensure_room_subscription_once` for every owned
+/// private room.
+///
+/// Called from the synchronizer before each load-rooms pass on a
+/// reconnect/wake (freenet/river#277), at the two entry points that re-run
+/// `set_up_chat_delegate()`:
+///  - the `Connect` handler (a real transport drop, or the sleep/wake
+///    `PageBecameVisible` check finding the connection dead);
+///  - the `RefreshAllRooms` handler (the sleep/wake `PageBecameVisible` check
+///    with an apparently-live connection, which refreshes instead of
+///    reconnecting — yet the node-side subscription may have died while
+///    suspended). This path does NOT route through `Connect`, so it re-arms
+///    on its own.
+/// Clearing here rather than in `ConnectionLost` covers both, including the
+/// refresh-only wake path that never emits a `ConnectionLost`.
+///
+/// The dedup set is process-global and survives a transport reconnect, but the
+/// node-level subscriptions it tracks do NOT — a WebSocket drop tears down the
+/// underlying contract subscription on the node. Without this clear, a room
+/// whose `EnsureRoomSubscription` succeeded before the blip stays marked
+/// "done", so the reconnect's load-rooms pass returns `Ok(false)` (dedup hit)
+/// and the delegate is never re-subscribed; delegate-driven secret rotation
+/// then stays silently disabled until the user reloads the tab. It also covers
+/// the issue's stated case where a transient blip made `migrate_signing_key`
+/// return `Failed` and the chained `EnsureRoomSubscription` was skipped.
+///
+/// This does NOT re-introduce the retry storm PR #276 fixed: clearing only
+/// re-arms the dedup; the actual re-subscribe still flows through the existing
+/// once-per-reconnect load-rooms path (gated on a non-`Failed` signing-key
+/// migration), not a tight retry loop. It is a no-op on the first connection
+/// (the set is already empty).
 pub(crate) fn reset_ensure_subscription_dedup() {
     if let Ok(mut s) = ENSURE_SUBSCRIPTION_SENT.lock() {
         s.clear();
@@ -1469,7 +1509,7 @@ mod tests {
     //
     // These tests pin the contract that the per-session dedup must NOT
     // hold across a failed `EnsureRoomSubscription`. Before the Bug #6
-    // fix, the dedup set was populated up-front and never cleared, so a
+    // fix, the dedup map was populated up-front and never cleared, so a
     // single transient failure (transport error, signing-key-not-on-file
     // race after a delegate-WASM migration) permanently disabled
     // delegate-side rotation for the affected room until the user
@@ -1482,8 +1522,21 @@ mod tests {
     // instantiate. The dedup logic is the only piece that needed
     // changing for Bug #6 and is fully exercised here.
 
-    /// Baseline: inserting a new VK returns true (lock guard's
-    /// `insert` returns true on a fresh entry), and a second insert of
+    /// Mirror `ensure_room_subscription_once`'s dedup-claim: claim the slot
+    /// for `vk` under `request_id`, returning `true` iff it was newly claimed
+    /// (vacant before). A second claim for an occupied slot returns `false`
+    /// (the `Ok(false)` dedup hit). Kept in lockstep with the production
+    /// `contains_key` + `insert` sequence so the tests model real behaviour.
+    fn try_claim_dedup(vk: RoomKey, request_id: RequestId) -> bool {
+        let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
+        if sent.contains_key(&vk) {
+            return false;
+        }
+        sent.insert(vk, request_id);
+        true
+    }
+
+    /// Baseline: claiming a new VK returns true, and a second claim of
     /// the same VK in the same "session" returns false (dedup hit). This
     /// is the property `ensure_room_subscription_once` relies on for its
     /// `Ok(false)` no-op return.
@@ -1493,20 +1546,14 @@ mod tests {
         reset_ensure_subscription_dedup();
         let vk = sk(7).verifying_key().to_bytes();
 
-        let inserted_first = {
-            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
-            sent.insert(vk)
-        };
-        let inserted_second = {
-            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
-            sent.insert(vk)
-        };
-        assert!(inserted_first, "first insert must succeed");
-        assert!(!inserted_second, "second insert must be a dedup hit");
+        let inserted_first = try_claim_dedup(vk, 1);
+        let inserted_second = try_claim_dedup(vk, 2);
+        assert!(inserted_first, "first claim must succeed");
+        assert!(!inserted_second, "second claim must be a dedup hit");
     }
 
     /// Bug #6 regression: after `clear_ensure_subscription_sent` runs,
-    /// a subsequent insert MUST succeed. Without this property the
+    /// a subsequent claim MUST succeed. Without this property the
     /// owner's delegate stayed permanently unsubscribed on every cold
     /// load that lost the signing-key/EnsureRoomSubscription race.
     #[test]
@@ -1515,26 +1562,18 @@ mod tests {
         reset_ensure_subscription_dedup();
         let vk = sk(8).verifying_key().to_bytes();
 
-        // First "send" — claims the dedup slot.
-        let first = {
-            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
-            sent.insert(vk)
-        };
-        assert!(first, "first insert must succeed");
+        // First "send" — claims the dedup slot under request_id 1.
+        assert!(try_claim_dedup(vk, 1), "first claim must succeed");
 
         // Simulate the failure path in `ensure_room_subscription_once`:
         // delegate rejected (or transport failed) → clear the dedup so a
-        // future call can retry.
-        clear_ensure_subscription_sent(&vk);
+        // future call can retry. The clearer owns the slot (request_id 1).
+        clear_ensure_subscription_sent(&vk, 1);
 
         // Retry — must be allowed.
-        let retry = {
-            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
-            sent.insert(vk)
-        };
         assert!(
-            retry,
-            "after clear_ensure_subscription_sent the same VK must be insertable again \
+            try_claim_dedup(vk, 2),
+            "after clear_ensure_subscription_sent the same VK must be claimable again \
              (Bug #6 regression — the owner's delegate stayed unsubscribed on \
              EnsureRoomSubscription failure because the dedup was never cleared)"
         );
@@ -1550,30 +1589,157 @@ mod tests {
         let vk_a = sk(9).verifying_key().to_bytes();
         let vk_b = sk(10).verifying_key().to_bytes();
 
-        {
-            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
-            sent.insert(vk_a);
-            sent.insert(vk_b);
-        }
+        assert!(try_claim_dedup(vk_a, 1));
+        assert!(try_claim_dedup(vk_b, 2));
 
-        clear_ensure_subscription_sent(&vk_a);
+        clear_ensure_subscription_sent(&vk_a, 1);
 
         // vk_b must still be marked as sent — clear was scoped to vk_a.
-        let b_retry = {
-            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
-            sent.insert(vk_b)
-        };
         assert!(
-            !b_retry,
+            !try_claim_dedup(vk_b, 3),
             "clearing one VK must not clear an unrelated VK's dedup entry"
         );
 
-        // And vk_a must now be insertable again.
-        let a_retry = {
-            let mut sent = ENSURE_SUBSCRIPTION_SENT.lock().unwrap();
-            sent.insert(vk_a)
+        // And vk_a must now be claimable again.
+        assert!(try_claim_dedup(vk_a, 4), "cleared VK must be re-claimable");
+    }
+
+    /// codex PR #364 finding: the failure-path clear is epoch-aware — a slow
+    /// in-flight call that loses the slot to a newer call (after a reconnect
+    /// dedup-reset re-armed it) must NOT erase the newer call's success
+    /// marker when it finally times out. Models the exact ordering:
+    /// claim(req 1) → reset (reconnect) → claim(req 2, the new successful
+    /// call) → req 1's late failure clear must be a no-op, leaving req 2's
+    /// marker intact so later reloads stay deduped.
+    #[test]
+    fn clear_ensure_subscription_sent_is_epoch_scoped() {
+        let _dedup_guard = DEDUP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ensure_subscription_dedup();
+        let vk = sk(14).verifying_key().to_bytes();
+
+        // Call A claims the slot under request_id 1, then a reconnect resets
+        // the whole map, and call B re-claims under request_id 2 and succeeds.
+        assert!(try_claim_dedup(vk, 1), "call A claims the slot");
+        reset_ensure_subscription_dedup();
+        assert!(
+            try_claim_dedup(vk, 2),
+            "call B re-claims after reconnect reset"
+        );
+
+        // Call A's stale failure path now fires — it must NOT remove call B's
+        // marker, because A no longer owns the slot.
+        clear_ensure_subscription_sent(&vk, 1);
+
+        assert!(
+            !try_claim_dedup(vk, 3),
+            "a stale loser's clear must not erase the newer call's success marker — \
+             otherwise later reloads reissue redundant EnsureRoomSubscription calls"
+        );
+    }
+
+    /// freenet/river#277 regression: the reconnect path clears the WHOLE dedup
+    /// set (via `reset_ensure_subscription_dedup` in the `Connect` handler),
+    /// so on reconnect the load-rooms pass re-fires `ensure_room_subscription_once`
+    /// for an already-subscribed room. Models the bug exactly: a room marked
+    /// "sent" before a transport blip would otherwise stay a dedup hit forever
+    /// and the delegate would never re-subscribe after the underlying node-level
+    /// subscription died with the WebSocket.
+    ///
+    /// The two halves are the heart of the fix:
+    ///  - WITHOUT the reconnect clear, the key stays a dedup hit on reconnect →
+    ///    `ensure_room_subscription_once` returns `Ok(false)` → the delegate is
+    ///    never re-subscribed (the #277 symptom).
+    ///  - WITH the clear, the same key is re-insertable → the reconnect's pass
+    ///    re-fires the subscription.
+    #[test]
+    fn ensure_subscription_dedup_reset_on_reconnect_allows_resubscribe() {
+        let _dedup_guard = DEDUP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ensure_subscription_dedup();
+        let vk = sk(13).verifying_key().to_bytes();
+
+        // First connection: the room subscribed successfully, so the key is
+        // recorded in the per-session dedup map and stays there.
+        assert!(
+            try_claim_dedup(vk, 1),
+            "first subscribe claims the dedup slot"
+        );
+
+        // Control: a reconnect WITHOUT the clear sees the key still present →
+        // dedup hit → no re-subscribe (this is the #277 bug).
+        assert!(
+            !try_claim_dedup(vk, 2),
+            "without the reconnect clear the key stays a dedup hit — the \
+             delegate would never re-subscribe after a transport blip (#277)"
+        );
+
+        // The Connect handler clears the whole map before the load-rooms pass...
+        reset_ensure_subscription_dedup();
+
+        // ...so the reconnect's load-rooms pass re-fires the subscription.
+        assert!(
+            try_claim_dedup(vk, 3),
+            "after reset_ensure_subscription_dedup (on reconnect) the room \
+             must be re-subscribable"
+        );
+    }
+
+    /// Pins the wiring on BOTH reconnect/wake entry points that re-subscribe
+    /// (freenet/river#277). The two distinct paths a wake/reconnect can take:
+    ///  - `Connect` (real transport drop, or PageBecameVisible finding the
+    ///    connection dead) — re-arms then loads rooms.
+    ///  - `RefreshAllRooms` (PageBecameVisible with an apparently-live
+    ///    connection) — does NOT route through Connect, so it re-arms + loads
+    ///    rooms itself; the node-side subscription may have died while
+    ///    suspended even though SYNC_STATUS still says Connected.
+    ///
+    /// Each arm MUST call `reset_ensure_subscription_dedup()` BEFORE
+    /// `set_up_chat_delegate()` (the load-rooms pass) — a clear that ran AFTER
+    /// would re-arm too late to affect that pass, re-introducing the bug. If a
+    /// future refactor drops either call or reorders it, the #277 fix silently
+    /// regresses with no behavioural unit test failing — so we assert the
+    /// source links directly, the same shape as `rejoin_flag_wiring_pinned`.
+    #[test]
+    fn reconnect_resets_ensure_subscription_dedup_before_load_rooms_wiring_pinned() {
+        let synchronizer = include_str!("freenet_api/freenet_synchronizer.rs");
+
+        // Returns the body of a `SynchronizerMessage::<variant> =>` match arm,
+        // bounded by the NEXT arm header so unrelated calls elsewhere can't
+        // satisfy the assertions. Arm headers sit at a fixed 20-space indent;
+        // we split on that exact marker so an inner
+        // `unbounded_send(SynchronizerMessage::Connect)` (mid-line, not an arm
+        // header) does NOT prematurely truncate the body — the RefreshAllRooms
+        // arm contains exactly such a send before the lines we assert on.
+        const ARM_HEADER: &str = "\n                    SynchronizerMessage::";
+        let arm_body = |variant: &str| -> String {
+            let header = format!("{ARM_HEADER}{variant} =>");
+            let after = synchronizer
+                .split(&header)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{variant} arm must exist in freenet_synchronizer.rs"));
+            // Stop at the next arm header (same 20-space-indent marker).
+            after.split(ARM_HEADER).next().unwrap_or(after).to_string()
         };
-        assert!(a_retry, "cleared VK must be re-insertable");
+
+        for variant in ["Connect", "RefreshAllRooms"] {
+            let body = arm_body(variant);
+            let reset_at = body
+                .find("reset_ensure_subscription_dedup(")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the {variant} handler must clear the ensure-subscription dedup so \
+                     rooms re-subscribe on reconnect/wake (freenet/river#277)"
+                    )
+                });
+            let setup_at = body.find("set_up_chat_delegate(").unwrap_or_else(|| {
+                panic!("the {variant} handler must call set_up_chat_delegate to load rooms")
+            });
+            assert!(
+                reset_at < setup_at,
+                "in the {variant} handler reset_ensure_subscription_dedup() must run \
+                 BEFORE set_up_chat_delegate() — clearing after the load-rooms pass would \
+                 re-arm the dedup too late to re-subscribe (freenet/river#277)"
+            );
+        }
     }
 
     /// `complete_pending_room_subscription_request` must use the same
@@ -1895,14 +2061,24 @@ mod tests {
 }
 
 /// Remove a `room_owner_vk` from the per-session ensure-subscription dedup
-/// set so a future caller can retry. Used when the previous attempt failed
+/// map so a future caller can retry. Used when the previous attempt failed
 /// (transport error or delegate-side rejection) — without this, a single
-/// transient failure poisoned the in-memory set for the rest of the
+/// transient failure poisoned the in-memory map for the rest of the
 /// session and the owner's delegate stayed unsubscribed, which was the
 /// owner-side root cause of Bug #6.
-fn clear_ensure_subscription_sent(room_owner_vk: &RoomKey) {
+///
+/// The clear is EPOCH-AWARE: it only removes the entry when the slot is
+/// still owned by `owner_request_id`, i.e. the call doing the clearing is
+/// the one that last claimed the slot. If a newer call (e.g. one armed by
+/// the reconnect dedup-reset, freenet/river#277) has since re-claimed and
+/// succeeded, this slow loser's clear is a no-op and the newer success
+/// marker survives — preventing the redundant repeat `EnsureRoomSubscription`
+/// calls codex flagged on PR #364.
+fn clear_ensure_subscription_sent(room_owner_vk: &RoomKey, owner_request_id: RequestId) {
     if let Ok(mut sent) = ENSURE_SUBSCRIPTION_SENT.lock() {
-        sent.remove(room_owner_vk);
+        if sent.get(room_owner_vk) == Some(&owner_request_id) {
+            sent.remove(room_owner_vk);
+        }
     }
 }
 
@@ -1920,21 +2096,25 @@ pub(crate) async fn ensure_room_subscription_once(
     room_owner_vk: RoomKey,
     contract_id: [u8; 32],
 ) -> Result<bool, String> {
+    // Fresh per-call request_id, generated BEFORE claiming the slot so it can
+    // be recorded as the slot's owner. It serves two purposes: (1) the
+    // pending-request registry doesn't collide if the dedup gets cleared
+    // mid-flight (a previous call timed out, the slot was reclaimed, and a
+    // late-arriving response for the previous epoch would otherwise resolve
+    // the new call with stale bytes — PR #276 review feedback); (2) it makes
+    // the failure-path clear epoch-aware so a slow loser can't erase a newer
+    // call's success marker (codex review on PR #364).
+    let request_id = generate_request_id();
     {
         let mut sent = ENSURE_SUBSCRIPTION_SENT
             .lock()
             .map_err(|e| format!("Failed to lock ensure-subscription dedup set: {e}"))?;
-        if !sent.insert(room_owner_vk) {
+        if sent.contains_key(&room_owner_vk) {
             return Ok(false);
         }
+        sent.insert(room_owner_vk, request_id);
     }
 
-    // Fresh per-call request_id so the pending-request registry doesn't
-    // collide if the dedup gets cleared mid-flight (e.g. a previous call
-    // timed out, the slot was reclaimed, and a late-arriving response for
-    // the previous epoch would otherwise resolve the new call with stale
-    // bytes — see PR #276 review feedback).
-    let request_id = generate_request_id();
     let req = ChatDelegateRequestMsg::EnsureRoomSubscription {
         room_owner_vk,
         request_id,
@@ -1947,7 +2127,7 @@ pub(crate) async fn ensure_room_subscription_once(
     let response = match send_delegate_request(req).await {
         Ok(resp) => resp,
         Err(e) => {
-            clear_ensure_subscription_sent(&room_owner_vk);
+            clear_ensure_subscription_sent(&room_owner_vk, request_id);
             return Err(e);
         }
     };
@@ -1956,12 +2136,12 @@ pub(crate) async fn ensure_room_subscription_once(
         ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse { result, .. } => match result {
             Ok(()) => Ok(true),
             Err(e) => {
-                clear_ensure_subscription_sent(&room_owner_vk);
+                clear_ensure_subscription_sent(&room_owner_vk, request_id);
                 Err(format!("Delegate refused EnsureRoomSubscription: {e}"))
             }
         },
         other => {
-            clear_ensure_subscription_sent(&room_owner_vk);
+            clear_ensure_subscription_sent(&room_owner_vk, request_id);
             Err(format!(
                 "Unexpected response for EnsureRoomSubscription: {other:?}"
             ))
