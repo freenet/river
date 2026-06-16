@@ -486,9 +486,20 @@ impl FreenetSynchronizer {
                                             // promoted to a terminal Error and we stop retrying it.
                                             let mut any_room_still_retrying = false;
                                             for room_key in &matching_rooms {
-                                                let should_retry = SYNC_INFO
-                                                    .write()
-                                                    .record_failed_sync_attempt(room_key);
+                                                // The retry bound only applies to a room still
+                                                // awaiting its initial sync (placeholder state —
+                                                // the #290 case). A room with valid synced state is
+                                                // never given up on, so a transient contract-not-found
+                                                // can't strand it.
+                                                let awaiting_initial_sync =
+                                                    ROOMS.read().map.get(room_key).is_some_and(
+                                                        |rd| rd.is_awaiting_initial_sync(),
+                                                    );
+                                                let should_retry =
+                                                    SYNC_INFO.write().record_failed_sync_attempt(
+                                                        room_key,
+                                                        awaiting_initial_sync,
+                                                    );
                                                 if should_retry {
                                                     any_room_still_retrying = true;
                                                     info!(
