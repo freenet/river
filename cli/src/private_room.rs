@@ -233,25 +233,32 @@ pub fn build_member_info_heal(
     }
 
     // Stranded — re-publish our own member_info. The nickname the member
-    // chose at join time (kept in `self_nickname`) if we still have it, else
-    // the generic "Member" placeholder (the same fallback build_rejoin_delta
-    // uses). A stored nickname longer than the room's current
-    // `max_nickname_size` is dropped to the placeholder: the contract's
-    // `MemberInfoV1::apply_delta` rejects an entry whose `declared_len()`
-    // exceeds the limit, which would make the whole heal UPDATE fail — same
-    // clamp `rejoin_preferred_nickname` applies. `declared_len()` is the
-    // plaintext byte length for both public and sealed values, so comparing
-    // `nick.len()` here matches the contract check exactly.
+    // chose at join time (kept in `self_nickname`) if we still have it AND it
+    // fits the room's current `max_nickname_size`, else the generic "Member"
+    // placeholder.
+    //
+    // Both candidates must satisfy the contract: `MemberInfoV1::apply_delta`
+    // rejects an entry whose `declared_len()` exceeds `max_nickname_size`,
+    // which would make the whole heal UPDATE fail — and `heal_member_info`
+    // persists the entry locally BEFORE sending, so an over-limit entry would
+    // leave the CLI holding a member_info the contract refuses. `declared_len()`
+    // is the plaintext byte length for both public and sealed values, so
+    // comparing `nick.len()` here matches the contract check exactly. If even
+    // the "Member" placeholder is over the limit (a room configured with
+    // `max_nickname_size < 6`), DEFER the heal entirely (`None`) rather than
+    // mint an entry the contract rejects (Codex review on PR #358).
     let max_nickname_size = state.configuration.configuration.max_nickname_size;
     let nickname = self_nickname
         .filter(|nick| nick.len() <= max_nickname_size)
-        .unwrap_or("Member")
-        .to_owned();
+        .unwrap_or("Member");
+    if nickname.len() > max_nickname_size {
+        return None; // not even the placeholder fits — defer
+    }
 
     // Seal (public bytes for a public room; AES-256-GCM under the current
     // secret for a private room). `None` for a private room with no secret →
     // defer the heal rather than leak a plaintext nickname.
-    let sealed = seal_invitee_nickname(state, self_sk, invitation_secrets, &nickname)?;
+    let sealed = seal_invitee_nickname(state, self_sk, invitation_secrets, nickname)?;
 
     // version: 0 is safe — the heal only fires when no `member_info` entry
     // exists in `state` (the `has_member_info` check above), so this is never
@@ -971,6 +978,62 @@ mod tests {
             healed.member_info.preferred_nickname.to_string_lossy(),
             "Member",
             "an over-long stored nickname must not block the heal — clamp to placeholder"
+        );
+    }
+
+    /// A room whose `max_nickname_size` is below the 6-byte "Member"
+    /// placeholder length → defer the heal entirely rather than mint a
+    /// member_info the contract's `MemberInfoV1::apply_delta` would reject for
+    /// exceeding the limit (which `heal_member_info` would otherwise persist
+    /// locally before the rejected network UPDATE). Codex review on PR #358.
+    #[test]
+    fn heal_defers_when_placeholder_exceeds_max_nickname_size() {
+        let owner = fresh_signing_key();
+        let member = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Public);
+        // max 5: smaller than "Member" (6 bytes); a valid nonzero limit.
+        let mut config = state.configuration.configuration.clone();
+        config.max_nickname_size = 5;
+        state.configuration =
+            river_core::room_state::configuration::AuthorizedConfigurationV1::new(config, &owner);
+        add_member(&mut state, &owner, &member);
+
+        // No stored nickname → would fall back to "Member" (6 > 5) → defer.
+        assert!(
+            build_member_info_heal(
+                &state,
+                &member,
+                &owner.verifying_key(),
+                &HashMap::new(),
+                None
+            )
+            .is_none(),
+            "must defer when even the \"Member\" placeholder exceeds max_nickname_size"
+        );
+        // An over-long stored nickname → also falls back to "Member" → defer.
+        assert!(
+            build_member_info_heal(
+                &state,
+                &member,
+                &owner.verifying_key(),
+                &HashMap::new(),
+                Some("way too long"),
+            )
+            .is_none(),
+            "an over-long stored nickname with an over-limit placeholder also defers"
+        );
+        // A stored nickname that DOES fit the tiny limit still heals.
+        let healed = build_member_info_heal(
+            &state,
+            &member,
+            &owner.verifying_key(),
+            &HashMap::new(),
+            Some("Ann"),
+        )
+        .expect("a fitting stored nickname heals even under a tiny limit");
+        assert_eq!(
+            healed.member_info.preferred_nickname.to_string_lossy(),
+            "Ann"
         );
     }
 
