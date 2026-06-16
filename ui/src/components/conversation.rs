@@ -1,6 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::receive_times::{format_delay, get_delay_secs};
+use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{
     MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS,
 };
@@ -21,7 +22,9 @@ use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaBars, FaCircleInfo, FaUsers};
+use dioxus_free_icons::icons::fa_solid_icons::{
+    FaBars, FaCircleInfo, FaTriangleExclamation, FaUsers,
+};
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::member::{MemberId, MembersDelta};
@@ -1956,7 +1959,45 @@ pub fn Conversation() -> Element {
                     }
                 };
 
+                // A room still awaiting its initial sync can reach a terminal
+                // `RoomSyncStatus::Error` — most importantly the bounded
+                // contract-absent case (freenet/river#290), but also a failed
+                // GET/PUT send (WebSocket/API error). The spinner below is gated
+                // on `is_awaiting_initial_sync()`, which stays true while the
+                // room holds placeholder state — so without this check it would
+                // spin forever. Surface the STORED error message (not a
+                // hardcoded "not found") so WebSocket/API failures are not
+                // misreported as the room being removed.
+                //
+                // Scoped to rooms that are STILL awaiting initial sync: a room
+                // that already synced real state and later hit some other
+                // `Error` (e.g. a transient PUT failure) is handled by the
+                // normal `Some(room_data)` arm below.
+                let initial_sync_error_msg: Option<String> =
+                    current_room_data.as_ref().and_then(|room_data| {
+                        if !room_data.is_awaiting_initial_sync() {
+                            return None;
+                        }
+                        match SYNC_INFO
+                            .try_read()
+                            .ok()
+                            .and_then(|si| si.get_sync_status(&room_data.owner_vk).cloned())
+                        {
+                            Some(RoomSyncStatus::Error(msg)) => Some(msg),
+                            _ => None,
+                        }
+                    });
+
                 match current_room_data.as_ref() {
+                    Some(_) if initial_sync_error_msg.is_some() => {
+                        let msg = initial_sync_error_msg.unwrap_or_default();
+                        rsx! {
+                            div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg rounded-lg text-sm text-red-700 dark:text-red-400 flex items-center gap-3",
+                                Icon { width: 16, height: 16, icon: FaTriangleExclamation }
+                                span { "{msg}" }
+                            }
+                        }
+                    },
                     Some(room_data) if room_data.is_awaiting_initial_sync() => {
                         rsx! {
                             div { class: "px-4 py-3 mx-4 mb-4 bg-surface rounded-lg text-sm text-text-muted flex items-center gap-3",

@@ -5,7 +5,7 @@ use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{mark_legacy_migration_done, set_up_chat_delegate};
-use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
+use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
 use crate::util::{owner_vk_to_contract_key, sleep};
 use dioxus::logger::tracing::{debug, error, info, warn};
@@ -474,36 +474,66 @@ impl FreenetSynchronizer {
                                         }
 
                                         if found {
-                                            // This is likely a race condition where the contract creation
-                                            // hasn't completed before we try to access it
-                                            // see: https://github.com/freenet/freenet-core/issues/1470
-                                            info!("Detected race condition with contract creation. Scheduling retry...");
-
-                                            // Reset the room's sync status to Disconnected so it will be retried
+                                            // A "contract not found" error here is usually the
+                                            // freenet-core#1470 contract-creation race (a freshly-PUT
+                                            // contract briefly not found while creation completes),
+                                            // so we retry. But a restored/imported room whose contract
+                                            // is genuinely absent from the network fails every time —
+                                            // without a bound it re-GETs forever and the
+                                            // "Syncing room state…" spinner spins forever
+                                            // (freenet/river#290). Bound the retries: after
+                                            // MAX_SYNC_ATTEMPTS_BEFORE_ERROR failures the room is
+                                            // promoted to a terminal Error and we stop retrying it.
+                                            let mut any_room_still_retrying = false;
                                             for room_key in &matching_rooms {
-                                                info!("Resetting sync status for room {:?} to Disconnected for retry", 
-                                                      MemberId::from(*room_key));
-                                                SYNC_INFO.write().update_sync_status(
-                                                    room_key,
-                                                    RoomSyncStatus::Disconnected,
-                                                );
+                                                // The retry bound only applies to a room still
+                                                // awaiting its initial sync (placeholder state —
+                                                // the #290 case). A room with valid synced state is
+                                                // never given up on, so a transient contract-not-found
+                                                // can't strand it.
+                                                let awaiting_initial_sync =
+                                                    ROOMS.read().map.get(room_key).is_some_and(
+                                                        |rd| rd.is_awaiting_initial_sync(),
+                                                    );
+                                                let should_retry =
+                                                    SYNC_INFO.write().record_failed_sync_attempt(
+                                                        room_key,
+                                                        awaiting_initial_sync,
+                                                    );
+                                                if should_retry {
+                                                    any_room_still_retrying = true;
+                                                    info!(
+                                                        "Contract not found for room {:?} (likely #1470 race) — retrying",
+                                                        MemberId::from(*room_key)
+                                                    );
+                                                } else {
+                                                    warn!(
+                                                        "Contract not found for room {:?} after retry bound — giving up (room absent from network)",
+                                                        MemberId::from(*room_key)
+                                                    );
+                                                }
                                             }
 
-                                            // Schedule a retry after a delay
-                                            let tx = message_tx.clone();
-                                            spawn_local(async move {
-                                                info!("Waiting before retrying room processing...");
-                                                sleep(Duration::from_millis(
-                                                    super::constants::POST_PUT_DELAY_MS,
-                                                ))
-                                                .await;
-                                                info!("Retrying room processing after contract not found error");
-                                                if let Err(e) = tx.unbounded_send(
-                                                    SynchronizerMessage::ProcessRooms,
-                                                ) {
-                                                    error!("Failed to schedule retry: {}", e);
-                                                }
-                                            });
+                                            // Only schedule a retry if at least one matching room is
+                                            // still within its retry budget. Otherwise every matching
+                                            // room is now terminal Error and another ProcessRooms would
+                                            // just no-op for them.
+                                            if any_room_still_retrying {
+                                                let tx = message_tx.clone();
+                                                spawn_local(async move {
+                                                    info!("Waiting before retrying room processing...");
+                                                    sleep(Duration::from_millis(
+                                                        super::constants::POST_PUT_DELAY_MS,
+                                                    ))
+                                                    .await;
+                                                    info!("Retrying room processing after contract not found error");
+                                                    if let Err(e) = tx.unbounded_send(
+                                                        SynchronizerMessage::ProcessRooms,
+                                                    ) {
+                                                        error!("Failed to schedule retry: {}", e);
+                                                    }
+                                                });
+                                            }
                                         } else {
                                             info!(
                                                 "Contract ID {} not found in any of our rooms",

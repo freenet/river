@@ -28,6 +28,28 @@ pub(crate) fn now_ms() -> f64 {
 
 pub static SYNC_INFO: GlobalSignal<SyncInfo> = Global::new(SyncInfo::new);
 
+/// How many times a room's initial sync may fail before it is promoted to a
+/// terminal [`RoomSyncStatus::Error`] instead of being retried forever
+/// (freenet/river#290).
+///
+/// A restored/imported room whose contract is genuinely absent from the
+/// network never settles: each GET fails, the room is reset to
+/// `Disconnected` (or its `Subscribing` times out), and the next
+/// `ProcessRooms` cycle re-GETs it — spinning the "Syncing room state…"
+/// indicator forever. Bounding the retries lets the UI surface a terminal
+/// error instead.
+///
+/// The bound is deliberately generous so it does NOT regress the
+/// freenet-core#1470 contract-creation race (a freshly-PUT contract that is
+/// briefly "not found" while creation completes), which resolves within a
+/// couple of retries.
+pub const MAX_SYNC_ATTEMPTS_BEFORE_ERROR: u32 = 10;
+
+/// Message shown (and stored in [`RoomSyncStatus::Error`]) when a room's
+/// contract could not be found on the network after the retry bound.
+pub const CONTRACT_NOT_FOUND_ERROR: &str =
+    "This room could not be found on the network — it may have been removed.";
+
 pub struct SyncInfo {
     map: HashMap<VerifyingKey, RoomSyncInfo>,
     instances: HashMap<ContractInstanceId, VerifyingKey>,
@@ -40,6 +62,13 @@ pub struct RoomSyncInfo {
     pub last_synced_state: Option<ChatRoomStateV1>,
     /// Timestamp (in ms) when subscription was initiated, used for timeout detection
     pub subscribing_since: Option<f64>,
+    /// How many sync attempts have failed for this room. Reset to 0 once the
+    /// room reaches [`RoomSyncStatus::Subscribed`]. Used to bound the
+    /// otherwise-infinite retry loop for a room STILL awaiting its initial sync
+    /// whose contract is absent from the network (freenet/river#290); for a
+    /// room that already holds valid synced state the counter is tracked but
+    /// never trips the bound (see `record_failed_sync_attempt`).
+    pub failed_sync_attempts: u32,
 }
 
 impl SyncInfo {
@@ -65,6 +94,7 @@ impl SyncInfo {
                 sync_status: RoomSyncStatus::Disconnected,
                 last_synced_state: None,
                 subscribing_since: None,
+                failed_sync_attempts: 0,
             });
 
             self.instances.insert(*contract_id, owner_key);
@@ -89,7 +119,60 @@ impl SyncInfo {
             } else {
                 sync_info.subscribing_since = None;
             }
+            // A successful subscription clears the failed-attempt budget so a
+            // later transient outage doesn't inherit a near-exhausted counter
+            // and give up prematurely (freenet/river#290).
+            if status == RoomSyncStatus::Subscribed {
+                sync_info.failed_sync_attempts = 0;
+            }
             sync_info.sync_status = status;
+        }
+    }
+
+    /// Record a failed sync attempt for a room and decide whether to keep
+    /// retrying or give up (freenet/river#290).
+    ///
+    /// Increments the room's `failed_sync_attempts` and always clears
+    /// `subscribing_since`. The retry bound applies **only** to a room that is
+    /// still awaiting its initial sync (`awaiting_initial_sync == true`) — i.e.
+    /// a restored/imported room holding placeholder state whose contract may be
+    /// absent from the network. For such a room, once the count reaches
+    /// [`MAX_SYNC_ATTEMPTS_BEFORE_ERROR`] it is promoted to the terminal
+    /// [`RoomSyncStatus::Error`] and `false` is returned (stop retrying);
+    /// before that it is reset to [`RoomSyncStatus::Disconnected`] to retry.
+    ///
+    /// A room that already holds **valid synced state**
+    /// (`awaiting_initial_sync == false`) is NEVER given up on: a transient
+    /// outage must not strand a working room. It is always reset to
+    /// `Disconnected` so the existing self-healing re-PUT behaviour continues
+    /// indefinitely. (The counter is still incremented so logs reflect the
+    /// failure streak, but it never trips the bound for these rooms.)
+    ///
+    /// Returns `true` if the caller should schedule a retry, `false` if the
+    /// room has been given up on. A room not present in the map (already
+    /// removed) returns `false`.
+    pub fn record_failed_sync_attempt(
+        &mut self,
+        owner_key: &VerifyingKey,
+        awaiting_initial_sync: bool,
+    ) -> bool {
+        let Some(sync_info) = self.map.get_mut(owner_key) else {
+            return false;
+        };
+        sync_info.failed_sync_attempts = sync_info.failed_sync_attempts.saturating_add(1);
+        sync_info.subscribing_since = None;
+        if awaiting_initial_sync && sync_info.failed_sync_attempts >= MAX_SYNC_ATTEMPTS_BEFORE_ERROR
+        {
+            warn!(
+                "Room {:?} failed initial sync {} times — giving up (contract absent from network)",
+                MemberId::from(*owner_key),
+                sync_info.failed_sync_attempts
+            );
+            sync_info.sync_status = RoomSyncStatus::Error(CONTRACT_NOT_FOUND_ERROR.to_string());
+            false
+        } else {
+            sync_info.sync_status = RoomSyncStatus::Disconnected;
+            true
         }
     }
 
@@ -152,6 +235,11 @@ impl SyncInfo {
         };
         let current_time = now_ms();
 
+        // Rooms whose `Subscribing` status has timed out. Collected here
+        // because we can't mutate `self.map` while iterating it below; the
+        // timeout counts as a failed sync attempt (freenet/river#290).
+        let mut timed_out: Vec<VerifyingKey> = Vec::new();
+
         for (key, room_data) in rooms.map.iter() {
             // Register new rooms automatically
             if !self.map.contains_key(key) {
@@ -167,7 +255,7 @@ impl SyncInfo {
             }
 
             // Check for subscription timeout - if subscribing for longer than REPUT_DELAY_MS,
-            // reset to Disconnected to trigger a re-PUT
+            // count a failed attempt and (unless the retry bound is reached) re-PUT.
             if sync_info.sync_status == RoomSyncStatus::Subscribing {
                 if let Some(started_at) = sync_info.subscribing_since {
                     let elapsed_ms = current_time - started_at;
@@ -177,20 +265,27 @@ impl SyncInfo {
                             MemberId::from(*key),
                             elapsed_ms / 1000.0
                         );
-                        // Reset to disconnected to trigger re-PUT
-                        // We can't modify the map while iterating, so collect for later
-                        rooms_awaiting_subscription.insert(*key, room_data.room_state.clone());
+                        timed_out.push(*key);
                     }
                 }
             }
         }
 
-        // Now update the status for timed-out rooms
-        for key in rooms_awaiting_subscription.keys() {
-            if let Some(sync_info) = self.map.get_mut(key) {
-                if sync_info.sync_status == RoomSyncStatus::Subscribing {
-                    sync_info.sync_status = RoomSyncStatus::Disconnected;
-                    sync_info.subscribing_since = None;
+        // Now record the failure for timed-out rooms. `record_failed_sync_attempt`
+        // resets the room to `Disconnected` (retry) or, once the bound is hit
+        // for a room STILL awaiting its initial sync, promotes it to terminal
+        // `Error` — in which case it must NOT be re-added to the awaiting set,
+        // so the spinner can stop (freenet/river#290). A room that already holds
+        // valid synced state is never given up on; it keeps retrying.
+        for key in timed_out {
+            let awaiting_initial_sync = rooms
+                .map
+                .get(&key)
+                .is_some_and(|rd| rd.is_awaiting_initial_sync());
+            let should_retry = self.record_failed_sync_attempt(&key, awaiting_initial_sync);
+            if should_retry {
+                if let Some(room_data) = rooms.map.get(&key) {
+                    rooms_awaiting_subscription.insert(key, room_data.room_state.clone());
                 }
             }
         }
@@ -366,5 +461,118 @@ mod tests {
             RoomSyncStatus::Subscribed,
             "touch must never change the status"
         );
+    }
+
+    /// freenet/river#290: a room STILL awaiting its initial sync (placeholder
+    /// state, contract possibly absent from the network) must NOT retry forever.
+    /// After `MAX_SYNC_ATTEMPTS_BEFORE_ERROR` failed attempts it is promoted to a
+    /// terminal `Error` and `record_failed_sync_attempt` returns `false` (stop
+    /// retrying). Up to that point it stays `Disconnected` (retry) so the
+    /// generous bound preserves the freenet-core#1470 race handling.
+    #[test]
+    fn record_failed_sync_attempt_bounds_initial_sync_then_errors() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(7);
+        si.register_new_room(owner);
+
+        // All but the last attempt: keep retrying, status stays Disconnected.
+        for attempt in 1..MAX_SYNC_ATTEMPTS_BEFORE_ERROR {
+            let should_retry = si.record_failed_sync_attempt(&owner, true);
+            assert!(should_retry, "attempt {attempt} (< bound) must still retry");
+            assert_eq!(
+                si.map.get(&owner).unwrap().sync_status,
+                RoomSyncStatus::Disconnected,
+                "attempt {attempt} must reset to Disconnected for retry"
+            );
+            assert_eq!(si.map.get(&owner).unwrap().failed_sync_attempts, attempt);
+        }
+
+        // The bound-th attempt gives up: terminal Error, stop retrying.
+        let should_retry = si.record_failed_sync_attempt(&owner, true);
+        assert!(!should_retry, "reaching the bound must stop retrying");
+        assert!(
+            matches!(si.get_sync_status(&owner), Some(RoomSyncStatus::Error(_))),
+            "reaching the bound must promote the room to terminal Error"
+        );
+        assert!(
+            si.map.get(&owner).unwrap().subscribing_since.is_none(),
+            "giving up must clear the subscribing timestamp"
+        );
+
+        // Further failures keep the room terminal and never re-arm a retry.
+        assert!(!si.record_failed_sync_attempt(&owner, true));
+        assert!(matches!(
+            si.get_sync_status(&owner),
+            Some(RoomSyncStatus::Error(_))
+        ));
+    }
+
+    /// A room that already holds valid synced state (`awaiting_initial_sync ==
+    /// false`) must NEVER be given up on — a transient outage must not strand a
+    /// working room (codex review of PR #360). It keeps resetting to
+    /// `Disconnected` so the existing self-healing re-PUT continues, no matter
+    /// how many times it fails.
+    #[test]
+    fn record_failed_sync_attempt_never_errors_a_synced_room() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(13);
+        si.register_new_room(owner);
+
+        for _ in 0..(MAX_SYNC_ATTEMPTS_BEFORE_ERROR * 3) {
+            let should_retry = si.record_failed_sync_attempt(&owner, false);
+            assert!(
+                should_retry,
+                "a synced room must always keep retrying, never give up"
+            );
+            assert_eq!(
+                si.map.get(&owner).unwrap().sync_status,
+                RoomSyncStatus::Disconnected,
+                "a synced room must stay Disconnected, never reach Error"
+            );
+        }
+        assert!(
+            !matches!(si.get_sync_status(&owner), Some(RoomSyncStatus::Error(_))),
+            "a synced room must never be promoted to terminal Error"
+        );
+    }
+
+    /// A successful subscription clears the failed-attempt budget so a later
+    /// transient failure starts counting from zero again rather than tipping a
+    /// long-lived room straight into the terminal Error state.
+    #[test]
+    fn successful_subscription_resets_failure_budget() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(9);
+        si.register_new_room(owner);
+
+        // Burn most of the budget without reaching the bound.
+        for _ in 1..MAX_SYNC_ATTEMPTS_BEFORE_ERROR {
+            assert!(si.record_failed_sync_attempt(&owner, true));
+        }
+        assert_eq!(
+            si.map.get(&owner).unwrap().failed_sync_attempts,
+            MAX_SYNC_ATTEMPTS_BEFORE_ERROR - 1
+        );
+
+        // A successful sync resets the counter.
+        si.update_sync_status(&owner, RoomSyncStatus::Subscribed);
+        assert_eq!(si.map.get(&owner).unwrap().failed_sync_attempts, 0);
+
+        // So the next failure starts over and does NOT immediately error.
+        assert!(si.record_failed_sync_attempt(&owner, true));
+        assert_eq!(
+            si.map.get(&owner).unwrap().sync_status,
+            RoomSyncStatus::Disconnected
+        );
+    }
+
+    /// `record_failed_sync_attempt` on an unknown room is a no-op that reports
+    /// "do not retry" rather than panicking.
+    #[test]
+    fn record_failed_sync_attempt_on_unknown_room_is_noop() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(11);
+        assert!(!si.record_failed_sync_attempt(&owner, true));
+        assert!(si.get_sync_status(&owner).is_none());
     }
 }
