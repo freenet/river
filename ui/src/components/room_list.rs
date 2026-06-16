@@ -8,6 +8,7 @@ use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::{
     count_unread_in_room_data, mark_current_room_as_read,
 };
+use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
@@ -16,7 +17,9 @@ use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
-    icons::fa_solid_icons::{FaArrowLeft, FaComments, FaFileImport, FaLock, FaPlus},
+    icons::fa_solid_icons::{
+        FaArrowLeft, FaComments, FaFileImport, FaLock, FaPlus, FaTriangleExclamation,
+    },
     Icon,
 };
 use ed25519_dalek::VerifyingKey;
@@ -94,7 +97,23 @@ pub fn RoomList() -> Element {
             .into_iter()
             .filter_map(|room_key| {
                 let room_data = rooms.map.get(&room_key)?;
-                let awaiting_sync = room_data.is_awaiting_initial_sync();
+                // A room is "awaiting sync" only while it has placeholder state
+                // AND has not been given up on. Once sync is bounded out to a
+                // terminal Error (freenet/river#290) the spinner must stop, so
+                // we surface an error marker instead of a perpetual spinner.
+                //
+                // Scoped to placeholder-state rooms: a fully-synced room that
+                // later hits some other transient `Error` should not show the
+                // "could not be found on the network" marker.
+                let sync_error = room_data.is_awaiting_initial_sync()
+                    && matches!(
+                        SYNC_INFO
+                            .try_read()
+                            .ok()
+                            .and_then(|si| si.get_sync_status(&room_key).cloned()),
+                        Some(RoomSyncStatus::Error(_))
+                    );
+                let awaiting_sync = room_data.is_awaiting_initial_sync() && !sync_error;
                 // Decrypt room name if room is private and we have the secret
                 let sealed_name = &room_data
                     .room_state
@@ -125,6 +144,7 @@ pub fn RoomList() -> Element {
                     awaiting_sync,
                     is_private,
                     unread,
+                    sync_error,
                 ))
             })
             .collect::<Vec<_>>()
@@ -182,13 +202,14 @@ pub fn RoomList() -> Element {
 
             // Room list
             ul { class: "flex-1 px-2 py-1 space-y-0.5",
-                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync, is_private, unread)| {
+                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync, is_private, unread, sync_error)| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
                     let is_current = *is_current;
                     let awaiting_sync = *awaiting_sync;
                     let is_private = *is_private;
                     let unread = *unread;
+                    let sync_error = *sync_error;
                     // Drag feedback: dim the row being dragged, and draw a top
                     // border on the row the cursor is over (drop lands the
                     // dragged room immediately before it — see `move_room`).
@@ -313,6 +334,16 @@ pub fn RoomList() -> Element {
                                     }
                                     if awaiting_sync {
                                         div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
+                                    } else if sync_error {
+                                        // Terminal sync failure (freenet/river#290): the room's
+                                        // contract could not be found on the network after the
+                                        // retry bound. Show a warning marker instead of a spinner.
+                                        span {
+                                            class: "flex-shrink-0 text-red-600 dark:text-red-400",
+                                            title: "This room could not be found on the network — it may have been removed.",
+                                            "aria-label": "Room sync failed",
+                                            Icon { width: 12, height: 12, icon: FaTriangleExclamation }
+                                        }
                                     }
                                 }
                             }
