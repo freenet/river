@@ -1046,20 +1046,21 @@ fn persist_outbound_plaintext(
     timestamp: u64,
     plaintext: String,
 ) -> Result<()> {
-    let mut store = api.storage().load_outbound_dms()?;
+    // Single locked load→mutate→save so a concurrent DM-send / room-leave can't
+    // clobber this append (issue freenet/river#307).
     let room_bytes = room_owner_vk.to_bytes();
-    store.entries.push(OutboundDmEntry {
-        room_owner_vk: room_bytes,
-        sender,
-        recipient,
-        purge_token,
-        timestamp,
-        plaintext,
-    });
-
-    apply_per_pair_cap(&mut store);
-    api.storage().save_outbound_dms(&store)?;
-    Ok(())
+    api.storage().mutate_outbound_dms(|store| {
+        store.entries.push(OutboundDmEntry {
+            room_owner_vk: room_bytes,
+            sender,
+            recipient,
+            purge_token,
+            timestamp,
+            plaintext,
+        });
+        apply_per_pair_cap(store);
+        Ok(())
+    })
 }
 
 /// Pure helper: drop the oldest entries from each `(room, sender,
@@ -1113,9 +1114,11 @@ fn prune_outbound_cache_for_room(
     room_owner_vk: &VerifyingKey,
     room_state: &river_core::ChatRoomStateV1,
 ) -> Result<()> {
-    let mut store = api.storage().load_outbound_dms()?;
     let room_bytes = room_owner_vk.to_bytes();
 
+    // The purge set is derived from `room_state`, not the cache, so compute it
+    // (and short-circuit when empty) BEFORE taking the storage lock — no point
+    // serializing on an empty prune.
     let purged: HashSet<(MemberId, PurgeToken)> = room_state
         .direct_messages
         .purges
@@ -1132,14 +1135,14 @@ fn prune_outbound_cache_for_room(
         return Ok(());
     }
 
-    let before = store.entries.len();
-    store.entries.retain(|e| {
-        e.room_owner_vk != room_bytes || !purged.contains(&(e.recipient, e.purge_token))
-    });
-    if store.entries.len() != before {
-        api.storage().save_outbound_dms(&store)?;
-    }
-    Ok(())
+    // Single locked load→mutate→save so a concurrent DM-send can't clobber this
+    // prune (issue freenet/river#307).
+    api.storage().mutate_outbound_dms(|store| {
+        store.entries.retain(|e| {
+            e.room_owner_vk != room_bytes || !purged.contains(&(e.recipient, e.purge_token))
+        });
+        Ok(())
+    })
 }
 
 fn unix_now() -> Result<u64> {

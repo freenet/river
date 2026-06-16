@@ -1802,13 +1802,15 @@ impl ApiClient {
 
     /// Clear the previous_contract_key after successful migration.
     fn clear_previous_contract_key(&self, owner_vk: &VerifyingKey) -> Result<()> {
-        let mut storage = self.storage.load_rooms()?;
+        // Single locked load→mutate→save so a concurrent invocation can't
+        // clobber this clear (issue freenet/river#307).
         let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
-        if let Some(room_info) = storage.rooms.get_mut(&owner_key_str) {
-            room_info.previous_contract_key = None;
-            self.storage.save_rooms(&storage)?;
-        }
-        Ok(())
+        self.storage.mutate_rooms(|storage| {
+            if let Some(room_info) = storage.rooms.get_mut(&owner_key_str) {
+                room_info.previous_contract_key = None;
+            }
+            Ok(())
+        })
     }
 
     /// Migrate a room to a new contract by PUTting the state

@@ -78,6 +78,11 @@ chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 directories = "5.0"
 
+# Advisory file locking — serializes concurrent riverctl invocations'
+# load→mutate→save sequences against rooms.json / outbound_dms.json so a
+# racing writer can't clobber another's freshly-merged update (issue #307).
+fs2 = "0.4"
+
 [dev-dependencies]
 freenet-test-network = "0.1.23"
 tempfile = "3"
