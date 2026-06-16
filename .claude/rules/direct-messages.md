@@ -75,6 +75,17 @@ and joins via the shared `ApiClient::accept_invitation_struct` — the same
 core the base58 `invite accept` path uses, so the #308 re-accept guard and
 `room_secrets` persistence are identical across both entry points.
 
+The UI has its OWN, separate re-accept guard
+(`receive_invitation_modal::accept_invitation`, freenet/river#365) that is
+NOT the same as the CLI's #308 guard — do not assume they are
+interchangeable. The CLI's #308 guard refuses re-accept whenever it has any
+stored room credentials; the UI guard is identity-aware, refusing only when
+the per-room key the user already holds (`RoomData.self_sk`) is itself a
+member, which deliberately preserves the UI's restore-access branch. The UI
+guard is best-effort (it falls through on an unreadable `ROOMS`); making the
+invitation-accept GET handler structurally re-accept-proof is tracked as
+freenet/river#367.
+
 ## Placeholder render
 
 `BodyKind::{Plaintext, Placeholder}` in `dm_thread_modal.rs` routes

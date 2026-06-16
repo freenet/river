@@ -5,7 +5,8 @@ use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
-use river_core::room_state::member::MemberId;
+use ed25519_dalek::VerifyingKey;
+use river_core::room_state::member::{AuthorizedMember, MemberId};
 use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsValue;
@@ -678,24 +679,61 @@ fn render_invitation_options(inv: Invitation, invitation: Signal<Option<Invitati
     }
 }
 
+/// True if `vk` is the room owner or already present in `members`.
+fn vk_is_room_member(
+    owner_vk: &VerifyingKey,
+    members: &[AuthorizedMember],
+    vk: &VerifyingKey,
+) -> bool {
+    vk == owner_vk || members.iter().any(|m| &m.member.member_vk == vk)
+}
+
+/// Pure core of [`check_membership_status`], split out so it can be unit-tested
+/// without constructing a full `RoomData` (whose `contract_key` needs the
+/// room-contract WASM).
+///
+/// `current_key_is_member` is true when the user is ALREADY in this room —
+/// either under the invitation's embedded key, OR (the case that matters for a
+/// re-accept) under the per-room identity `self_vk` they already hold for this
+/// room. Every accepted invitation carries a freshly generated
+/// `invitee_signing_key`, so that key is never itself a member yet; checking
+/// only it let a user re-accept an invite to a room they were already in and
+/// join a SECOND time under a new key — orphaning their original membership and
+/// making the original impossible to remove (freenet/river#365).
+///
+/// Note `current_key_is_member` takes precedence over `invited_member_exists`
+/// in the dispatcher: a user who already holds a working `self_vk` membership
+/// routes to "already a member" even if the invitation re-invites a DIFFERENT
+/// existing member's key (the restore-access trigger). That is intentional — a
+/// user with a working identity has no need to claim another member's slot. The
+/// restore-access branch still fires for the case it is meant for: a lost
+/// `self_vk` that is not itself a member (see
+/// `restore_access_invitation_still_detected`).
+fn membership_status(
+    owner_vk: &VerifyingKey,
+    members: &[AuthorizedMember],
+    self_vk: &VerifyingKey,
+    invitation_key_vk: &VerifyingKey,
+    invitation_invitee_vk: &VerifyingKey,
+) -> (bool, bool) {
+    let current_key_is_member = vk_is_room_member(owner_vk, members, invitation_key_vk)
+        || vk_is_room_member(owner_vk, members, self_vk);
+    let invited_member_exists = members
+        .iter()
+        .any(|m| &m.member.member_vk == invitation_invitee_vk);
+    (current_key_is_member, invited_member_exists)
+}
+
 /// Checks the membership status of the user in the room
 fn check_membership_status(inv: &Invitation, current_rooms: &Rooms) -> (bool, bool) {
     if let Some(room_data) = current_rooms.map.get(&inv.room) {
-        let user_vk = inv.invitee_signing_key.verifying_key();
-        let current_key_is_member = user_vk == room_data.owner_vk
-            || room_data
-                .room_state
-                .members
-                .members
-                .iter()
-                .any(|m| m.member.member_vk == user_vk);
-        let invited_member_exists = room_data
-            .room_state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.member_vk == inv.invitee.member.member_vk);
-        (current_key_is_member, invited_member_exists)
+        membership_status(
+            &room_data.owner_vk,
+            &room_data.room_state.members.members,
+            &room_data.self_sk.verifying_key(),
+            &inv.invitee_signing_key.verifying_key(),
+            &inv.invitee.member.member_vk,
+        )
     } else {
         (false, false)
     }
@@ -855,6 +893,50 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
 /// subscription that was in flight when the page was reloaded (#218), reusing
 /// the exact same accept flow the Accept button uses.
 pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
+    // Guard against re-accepting an invite to a room the user is ALREADY in.
+    // Each invitation carries a freshly generated `invitee_signing_key`, so a
+    // second accept would add another member entry (a new MemberId) for the
+    // same human AND overwrite the user's existing per-room `self_sk` on the
+    // GET response — orphaning the original membership, which the user could
+    // then never remove (freenet/river#365). This guard covers BOTH the modal
+    // Accept button and the #218 localStorage auto-resume, the two paths that
+    // reach `accept_invitation`. It is best-effort by design — it only fires
+    // when `ROOMS` is readable AND already holds this room; on a cold/locked
+    // `ROOMS` it falls through to the normal join (reverting to the prior
+    // behavior for that rare case — a deeper structural backstop in the
+    // GET handler is tracked as freenet/river#367). The modal dispatcher
+    // (`render_invitation_options` → `check_membership_status`) is a
+    // complementary gate that routes an already-member to the "already a
+    // member" branch whenever the modal is shown. A genuine rejoin after
+    // leaving is unaffected: `leave_room` drops the room from `ROOMS`, so
+    // `self_sk` is no longer a member and this guard does not fire.
+    if let Ok(rooms) = ROOMS.try_read() {
+        if let Some(room_data) = rooms.map.get(&inv.room) {
+            let already_member = vk_is_room_member(
+                &room_data.owner_vk,
+                &room_data.room_state.members.members,
+                &room_data.self_sk.verifying_key(),
+            );
+            if already_member {
+                drop(rooms);
+                info!(
+                    "Ignoring invitation accept for room {:?}: already a member under existing key",
+                    MemberId::from(inv.room)
+                );
+                // Drop the stale pending invitation so the #218 auto-resume
+                // doesn't keep re-firing a join that is moot (the user is
+                // already in). We deliberately do NOT mark the invitation
+                // processed here: that is the up-front gravestone the #356 fix
+                // removed (and the `accept_invitation_does_not_mark_processed_up_front`
+                // pin test forbids). The URL-driven modal still shows the
+                // "already a member" branch and its dismiss is the terminal
+                // path; clearing storage only stops the silent auto-resume.
+                clear_invitation_from_storage();
+                return;
+            }
+        }
+    }
+
     // NOTE: we deliberately do NOT mark this invitation processed here.
     //
     // Marking on accept (the old behaviour) turned the processed-set into a
@@ -952,6 +1034,150 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member::Member;
+
+    /// Build an `AuthorizedMember` invited directly by the owner.
+    fn owner_invited_member(owner_sk: &SigningKey, member_vk: VerifyingKey) -> AuthorizedMember {
+        let owner_vk = owner_sk.verifying_key();
+        let member = Member {
+            owner_member_id: owner_vk.into(),
+            invited_by: owner_vk.into(),
+            member_vk,
+        };
+        AuthorizedMember::new(member, owner_sk)
+    }
+
+    #[test]
+    fn vk_is_room_member_matches_owner_and_members() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let member_sk = SigningKey::generate(&mut rng);
+        let stranger_sk = SigningKey::generate(&mut rng);
+        let members = vec![owner_invited_member(&owner_sk, member_sk.verifying_key())];
+
+        assert!(
+            vk_is_room_member(&owner_vk, &members, &owner_vk),
+            "owner counts as a member"
+        );
+        assert!(
+            vk_is_room_member(&owner_vk, &members, &member_sk.verifying_key()),
+            "listed member is a member"
+        );
+        assert!(
+            !vk_is_room_member(&owner_vk, &members, &stranger_sk.verifying_key()),
+            "unrelated key is not a member"
+        );
+    }
+
+    #[test]
+    fn reaccept_while_already_member_reports_already_member() {
+        // The exact bug (freenet/river#365): the user is already in the room
+        // under their existing per-room identity (`self_sk`). A NEW invitation
+        // to the same room carries a freshly generated key that is not yet a
+        // member. The old check looked only at the invitation key and so fell
+        // through to a full second join. `membership_status` must instead see
+        // the existing identity and report "already a member".
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        let self_sk = SigningKey::generate(&mut rng);
+        let members = vec![owner_invited_member(&owner_sk, self_sk.verifying_key())];
+
+        // Fresh invitation key — never yet a member.
+        let fresh_invite_sk = SigningKey::generate(&mut rng);
+        let invited_vk = fresh_invite_sk.verifying_key();
+
+        let (current_key_is_member, invited_member_exists) = membership_status(
+            &owner_vk,
+            &members,
+            &self_sk.verifying_key(),
+            &fresh_invite_sk.verifying_key(),
+            &invited_vk,
+        );
+
+        assert!(
+            current_key_is_member,
+            "user already in the room (via self_sk) must be reported as already a member"
+        );
+        assert!(
+            !invited_member_exists,
+            "the fresh invitation key is not yet a member, so this is not a restore-access case"
+        );
+    }
+
+    #[test]
+    fn genuine_new_join_is_not_reported_as_member() {
+        // The room exists locally but the user's existing identity is NOT a
+        // member (e.g. a room they can see but have not joined). A fresh invite
+        // must still flow to the normal new-join path.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        // Existing self_sk that is not in the (empty) member list.
+        let self_sk = SigningKey::generate(&mut rng);
+        let members: Vec<AuthorizedMember> = vec![];
+
+        let fresh_invite_sk = SigningKey::generate(&mut rng);
+        let invited_vk = fresh_invite_sk.verifying_key();
+
+        let (current_key_is_member, invited_member_exists) = membership_status(
+            &owner_vk,
+            &members,
+            &self_sk.verifying_key(),
+            &fresh_invite_sk.verifying_key(),
+            &invited_vk,
+        );
+
+        assert!(
+            !current_key_is_member,
+            "a user who is not yet a member must not be treated as already joined"
+        );
+        assert!(!invited_member_exists);
+    }
+
+    #[test]
+    fn restore_access_invitation_still_detected() {
+        // An invitation whose invitee key already exists in the room (the user
+        // lost their key and wants to restore access) must still report
+        // `invited_member_exists`, and — because the local `self_sk` is some
+        // unrelated/lost key not in the room — NOT `current_key_is_member`,
+        // so the dispatcher routes to the restore-access branch.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+
+        let existing_member_sk = SigningKey::generate(&mut rng);
+        let members = vec![owner_invited_member(
+            &owner_sk,
+            existing_member_sk.verifying_key(),
+        )];
+
+        // The invitation re-invites that same existing member key, but the
+        // user's currently-held key is a different (lost) one not in the room.
+        let lost_self_sk = SigningKey::generate(&mut rng);
+        let invitation_key_sk = SigningKey::generate(&mut rng);
+
+        let (current_key_is_member, invited_member_exists) = membership_status(
+            &owner_vk,
+            &members,
+            &lost_self_sk.verifying_key(),
+            &invitation_key_sk.verifying_key(),
+            &existing_member_sk.verifying_key(),
+        );
+
+        assert!(
+            !current_key_is_member,
+            "the user's currently-held key is not in the room"
+        );
+        assert!(
+            invited_member_exists,
+            "the invitation's invitee key is an existing member → restore-access case"
+        );
+    }
 
     #[test]
     fn fingerprint_is_deterministic() {
@@ -1352,6 +1578,49 @@ mod tests {
             "accept_invitation must NOT call mark_invitation_processed — marking \
              on accept is the gravestone that suppresses a failed join forever \
              in the sandboxed iframe. Mark on terminal success instead."
+        );
+    }
+
+    /// Source-grep pin: `accept_invitation` must guard against re-accepting an
+    /// invite to a room the user is already in, BEFORE it creates the pending
+    /// join. The #218 auto-resume calls `accept_invitation` directly, bypassing
+    /// the modal's `check_membership_status` routing, so without this early-bail
+    /// it would add a duplicate membership and clobber `self_sk`
+    /// (freenet/river#365). A refactor that drops the guard or moves it after
+    /// the `PENDING_INVITES` insert would re-regress #365 for the auto-resume
+    /// path. (The pure decision is covered by
+    /// `reaccept_while_already_member_reports_already_member`; this pins that
+    /// the accept path actually USES it, since the guard reads the `ROOMS`
+    /// signal and can't run under a host unit test.)
+    #[test]
+    fn accept_invitation_guards_against_reaccept_before_join() {
+        let src = include_str!("receive_invitation_modal.rs");
+        let accept_fn = src
+            .split_once("pub(crate) fn accept_invitation(")
+            .expect("accept_invitation must exist")
+            .1;
+        let accept_body = accept_fn
+            .split_once("#[cfg(test)]")
+            .map(|(body, _)| body)
+            .unwrap_or(accept_fn);
+
+        let guard_at = accept_body.find("vk_is_room_member(").expect(
+            "accept_invitation must call vk_is_room_member to detect an existing \
+             membership (freenet/river#365)",
+        );
+        let join_at = accept_body
+            .find("PENDING_INVITES.with_mut(")
+            .expect("accept_invitation must create the pending join via PENDING_INVITES");
+        assert!(
+            guard_at < join_at,
+            "the already-member guard must run BEFORE the pending-join insert so \
+             a re-accept early-bails instead of creating a duplicate membership \
+             (freenet/river#365)."
+        );
+        assert!(
+            accept_body[..join_at].contains("return;"),
+            "the already-member guard must early-`return` before the join \
+             (freenet/river#365)."
         );
     }
 
