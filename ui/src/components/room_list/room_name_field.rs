@@ -1,13 +1,24 @@
-use crate::components::app::{CURRENT_ROOM, ROOMS};
+use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::util::ecies::{seal_for_room, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use dioxus_core::Event;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::privacy::RoomDisplayMetadata;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use wasm_bindgen_futures::spawn_local;
+
+/// Whether a keydown in the room-name input should commit the value and close
+/// the edit-room dialog (freenet/river#21).
+///
+/// Only the plain `Enter` key triggers it. In particular this returns `false`
+/// for `Key::Process`, which is what browsers report for the `Enter` keystroke
+/// that *confirms an IME composition* (e.g. selecting a CJK candidate) — we must
+/// not close the dialog on that keystroke. Extracted as a pure function so the
+/// IME-vs-submit decision is unit-testable without a Dioxus runtime.
+fn enter_commits_and_closes(key: &Key) -> bool {
+    key == &Key::Enter
+}
 
 #[component]
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
@@ -31,13 +42,18 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
     let initial_name_for_revert = initial_name.clone();
     let mut room_name = use_signal(|| initial_name);
 
-    let update_room_name = move |evt: Event<FormData>| {
+    // Save the room name. Takes the value as a `String` (rather than a raw
+    // form event) so the same logic can be driven from both `onchange` (commit
+    // on blur / native Enter) and the explicit `onkeydown` Enter handler below,
+    // which needs to commit the current value *before* closing the modal —
+    // closing unmounts the input, so a deferred `onchange` would never fire and
+    // the edit would be lost.
+    let mut save_room_name = move |new_name: String| {
         if !is_owner {
             return;
         }
 
         info!("Updating room name");
-        let new_name = evt.value().to_string();
         if !new_name.is_empty() {
             room_name.set(new_name.clone());
 
@@ -161,8 +177,69 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                 value: "{room_name}",
                 readonly: !is_owner,
                 disabled: !is_owner,
-                onchange: update_room_name,
+                // Track the live value so the Enter handler can commit it
+                // before the modal (and this input) unmount.
+                oninput: move |evt: dioxus_core::Event<FormData>| room_name.set(evt.value().to_string()),
+                onchange: {
+                    let mut save_room_name = save_room_name.clone();
+                    move |evt: dioxus_core::Event<FormData>| save_room_name(evt.value().to_string())
+                },
+                onkeydown: move |evt: dioxus_core::Event<KeyboardData>| {
+                    // Commit + close the dialog on Enter (freenet/river#21).
+                    // The dialog auto-saves on change, so this just makes Enter
+                    // a one-keystroke "done" for a rename. IME composition
+                    // reports `Key::Process` (not `Key::Enter`) for the confirm
+                    // keystroke, so this does not fire mid-composition.
+                    // Non-owners can't edit, so closing on Enter for them is
+                    // just a quick dismiss.
+                    if enter_commits_and_closes(&evt.key()) {
+                        evt.prevent_default();
+                        let value = room_name.read().clone();
+                        save_room_name(value);
+                        crate::util::defer(move || {
+                            EDIT_ROOM_MODAL.write().room = None;
+                        });
+                    }
+                },
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pin the Enter-commits-and-closes semantics for the edit-room dialog
+    //! (freenet/river#21), including the IME-composition carve-out: the
+    //! `Enter` keystroke that confirms an IME candidate is reported by the
+    //! browser as `Key::Process`, and must NOT close the dialog.
+    use super::*;
+
+    #[test]
+    fn enter_commits_and_closes_the_dialog() {
+        assert!(enter_commits_and_closes(&Key::Enter));
+    }
+
+    #[test]
+    fn ime_composition_confirm_does_not_close() {
+        // Browsers report `Process` (DOM `keyCode` 229) for the Enter that
+        // confirms an IME composition. Closing on it would discard a
+        // half-composed name, so it must be a no-op here.
+        assert!(!enter_commits_and_closes(&Key::Process));
+    }
+
+    #[test]
+    fn other_keys_do_not_close() {
+        for key in [
+            Key::Escape,
+            Key::Tab,
+            Key::Backspace,
+            Key::Character("a".to_string()),
+            Key::ArrowDown,
+        ] {
+            assert!(
+                !enter_commits_and_closes(&key),
+                "{key:?} should not commit-and-close"
+            );
         }
     }
 }
