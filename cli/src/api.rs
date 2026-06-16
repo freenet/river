@@ -840,7 +840,88 @@ impl ApiClient {
             self.subscribe_to_contract(found_id).await?;
         }
 
+        // Self-heal the "Unknown member" condition (issue freenet/river#304):
+        // if this member is in `members` but absent from `member_info`, they
+        // render as "Unknown" to every other peer. This is the CLI counterpart
+        // of the UI's GET-path `build_member_info_heal` trigger. Best-effort —
+        // a heal failure must not fail the read/send command that fetched the
+        // state, so we only warn.
+        if let Err(e) = self.heal_member_info(room_owner_key, &room_state).await {
+            warn!("member_info self-heal (issue #304) did not complete: {e}");
+        }
+
         Ok(room_state)
+    }
+
+    /// Detect and remediate the "Unknown member" condition for the current
+    /// member (issue freenet/river#304): self present in `state.members` but
+    /// absent from `state.member_info`. When detected, publish a standalone
+    /// `member_info`-only UPDATE so other peers stop rendering this member as
+    /// "Unknown", and fold the same entry into the locally-stored state.
+    ///
+    /// The CLI counterpart of the UI's `RoomData::build_member_info_heal`
+    /// (`ui/src/room_data.rs`), driven from the same place: every GET of an
+    /// existing room (see [`Self::get_room`]). The heal-decision logic lives in
+    /// the pure [`crate::private_room::build_member_info_heal`] so it is
+    /// unit-testable without a node; this method owns the storage lookup and
+    /// the network publish.
+    ///
+    /// No-op (returns `Ok(())` without sending anything) when there is nothing
+    /// to heal — the member is the owner, is not in `members`, already has a
+    /// `member_info` entry, or is a private-room member with no secret yet
+    /// available to seal their nickname (in which case the heal defers rather
+    /// than leak a plaintext nickname; a later GET retries once the secret has
+    /// arrived). Also a no-op when the room has no local credentials (a
+    /// stateless `--signing-key`-only path can't know its own nickname).
+    async fn heal_member_info(
+        &self,
+        room_owner_key: &VerifyingKey,
+        state: &ChatRoomStateV1,
+    ) -> Result<()> {
+        // Load this room's stored identity + nickname + invitation secrets.
+        // If the room isn't stored locally we have nothing to heal with.
+        let storage = self.storage.load_rooms()?;
+        let key_str = bs58::encode(room_owner_key.as_bytes()).into_string();
+        let Some(info) = storage.rooms.get(&key_str) else {
+            return Ok(());
+        };
+        let signing_key = self.storage.resolve_signing_key(&info.signing_key_bytes);
+        let self_nickname = info.self_nickname.clone();
+        let invitation_secrets = info.invitation_secrets.clone();
+
+        let Some(authorized_info) = crate::private_room::build_member_info_heal(
+            state,
+            &signing_key,
+            room_owner_key,
+            &invitation_secrets,
+            self_nickname.as_deref(),
+        ) else {
+            return Ok(());
+        };
+
+        info!(
+            "member_info self-heal (issue #304): republishing member_info for self in room {key_str} \
+             (was in members but absent from member_info — rendered as \"Unknown\" to peers)"
+        );
+
+        let delta = ChatRoomStateV1Delta {
+            member_info: Some(vec![authorized_info]),
+            ..Default::default()
+        };
+
+        // Apply locally first (validates the delta and keeps the stored copy
+        // consistent with what we publish), then send to the network.
+        let params = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+        let mut local_state = state.clone();
+        local_state
+            .apply_delta(state, &params, &Some(delta.clone()))
+            .map_err(|e| anyhow!("Failed to apply member_info heal delta: {:?}", e))?;
+        self.storage
+            .update_room_state(room_owner_key, local_state)?;
+
+        self.send_delta(room_owner_key, delta).await
     }
 
     /// Fetch a room's state, recovering it across contract-WASM generations.

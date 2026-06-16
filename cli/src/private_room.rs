@@ -7,7 +7,7 @@
 //! byte-identical results so a UI-issued invitation and a CLI-issued
 //! invitation are wire-interchangeable.
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::ecies::{
     decrypt_secret_from_member_blob_raw, encrypt_with_symmetric_key, seal_bytes,
 };
@@ -15,6 +15,7 @@ use river_core::room_state::content::{
     ActionContentV1, ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, REPLY_CONTENT_VERSION,
 };
 use river_core::room_state::member::MemberId;
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::ChatRoomStateV1;
@@ -155,6 +156,112 @@ pub fn seal_invitee_nickname(
             .map(|secret| (*secret, version))
     })?;
     Some(seal_bytes(preferred_nickname.as_bytes(), &secret, version))
+}
+
+/// Self-heal for the "Unknown member" condition (issue freenet/river#304),
+/// the CLI counterpart of the UI's `RoomData::build_member_info_heal` in
+/// `ui/src/room_data.rs`.
+///
+/// When the network's canonical `state` shows this member in `members` but
+/// with no matching `member_info` entry, they render as **"Unknown"** to
+/// every other peer. This builds a self-signed `AuthorizedMemberInfo` to
+/// re-publish so the entry is restored; the caller emits it as a standalone
+/// `member_info`-only UPDATE delta.
+///
+/// Returns `None` when there is nothing to heal:
+/// - the member is the room **owner** (their `member_info` is managed
+///   separately, exactly as the UI skips the owner);
+/// - the member is **not in `state.members`** (not stranded — nothing to
+///   re-publish; `ApiClient::build_rejoin_delta` handles the pruned-member
+///   case where they need re-adding to `members`);
+/// - the member **already has a `member_info` entry** (not stranded).
+///
+/// A non-owner's `member_info` is only valid on the contract when self-signed
+/// by that member's own key, so this heal can ONLY be produced client-side by
+/// the affected member — never owner-side. That is exactly what this returns,
+/// signed with `self_sk`.
+///
+/// The nickname is the persisted `self_nickname` (the handle the member chose
+/// at join time, kept for exactly this case) when present, else the generic
+/// `"Member"` placeholder — the same fallback `ApiClient::build_rejoin_delta`
+/// uses, so the CLI stays self-consistent. (`self_nickname` is `None` only for
+/// a room joined before that field existed, or the room owner, who is skipped
+/// above.) The CLI deliberately does NOT mirror the UI's deterministic
+/// "hacker-handle" default: that 30x30 word table lives in `ui/src/nickname.rs`
+/// and is not shared via `river-core`, and duplicating it here would be a
+/// drift hazard for no functional benefit.
+///
+/// For a **public** room the nickname is published as public bytes. For a
+/// **private** room it must be encrypted: it is sealed under the room's
+/// current-version secret (resolved from the owner-signed contract blob or the
+/// invitation-carried `invitation_secrets`, via [`seal_invitee_nickname`]). If
+/// no secret is available at the current version this returns `None` (deferring
+/// the heal) rather than leak a plaintext nickname — the member stays "Unknown"
+/// until a later GET once the secret has arrived.
+///
+/// Privacy mode and the secret are read entirely from the supplied network
+/// `state` / `invitation_secrets`; the nickname's plaintext is never published
+/// in a private room without a secret to seal it.
+pub fn build_member_info_heal(
+    state: &ChatRoomStateV1,
+    self_sk: &SigningKey,
+    owner_vk: &VerifyingKey,
+    invitation_secrets: &HashMap<u32, [u8; 32]>,
+    self_nickname: Option<&str>,
+) -> Option<AuthorizedMemberInfo> {
+    let self_vk = self_sk.verifying_key();
+    if self_vk == *owner_vk {
+        return None; // the owner's member_info is managed separately
+    }
+    let member_id = MemberId::from(&self_vk);
+
+    let in_members = state
+        .members
+        .members
+        .iter()
+        .any(|m| m.member.member_vk == self_vk);
+    if !in_members {
+        return None; // not a member on the network — nothing to heal here
+    }
+    let has_member_info = state
+        .member_info
+        .member_info
+        .iter()
+        .any(|i| i.member_info.member_id == member_id);
+    if has_member_info {
+        return None; // already present — not stranded
+    }
+
+    // Stranded — re-publish our own member_info. The nickname the member
+    // chose at join time (kept in `self_nickname`) if we still have it, else
+    // the generic "Member" placeholder (the same fallback build_rejoin_delta
+    // uses). A stored nickname longer than the room's current
+    // `max_nickname_size` is dropped to the placeholder: the contract's
+    // `MemberInfoV1::apply_delta` rejects an entry whose `declared_len()`
+    // exceeds the limit, which would make the whole heal UPDATE fail — same
+    // clamp `rejoin_preferred_nickname` applies. `declared_len()` is the
+    // plaintext byte length for both public and sealed values, so comparing
+    // `nick.len()` here matches the contract check exactly.
+    let max_nickname_size = state.configuration.configuration.max_nickname_size;
+    let nickname = self_nickname
+        .filter(|nick| nick.len() <= max_nickname_size)
+        .unwrap_or("Member")
+        .to_owned();
+
+    // Seal (public bytes for a public room; AES-256-GCM under the current
+    // secret for a private room). `None` for a private room with no secret →
+    // defer the heal rather than leak a plaintext nickname.
+    let sealed = seal_invitee_nickname(state, self_sk, invitation_secrets, &nickname)?;
+
+    // version: 0 is safe — the heal only fires when no `member_info` entry
+    // exists in `state` (the `has_member_info` check above), so this is never
+    // version-compared against an existing entry.
+    let info = MemberInfo {
+        member_id,
+        version: 0,
+        preferred_nickname: sealed,
+    };
+    Some(AuthorizedMemberInfo::new_with_member_key(info, self_sk))
 }
 
 /// Decrypt the room's current-version secret out of a raw network
@@ -602,6 +709,317 @@ mod tests {
             sealed.is_none(),
             "must defer when invitation_secrets lacks current_version — \
              sealing under v0 when room is at v1 yields a SealedBytes nobody can unseal"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // build_member_info_heal — issue freenet/river#304
+    // ------------------------------------------------------------------
+
+    use river_core::room_state::member::{AuthorizedMember, Member};
+    use river_core::room_state::member_info::AuthorizedMemberInfo as AuthInfo;
+
+    /// Push `member_sk` into `state.members`, invited directly by the owner
+    /// (so the member is a valid, authorized entry the heal recognises).
+    fn add_member(state: &mut ChatRoomStateV1, owner_sk: &SigningKey, member_sk: &SigningKey) {
+        let member = Member {
+            owner_member_id: owner_sk.verifying_key().into(),
+            invited_by: owner_sk.verifying_key().into(),
+            member_vk: member_sk.verifying_key(),
+        };
+        state
+            .members
+            .members
+            .push(AuthorizedMember::new(member, owner_sk));
+    }
+
+    /// Push a self-signed `member_info` entry for `member_sk`.
+    fn add_member_info(state: &mut ChatRoomStateV1, member_sk: &SigningKey, sealed: SealedBytes) {
+        let info = MemberInfo {
+            member_id: MemberId::from(&member_sk.verifying_key()),
+            version: 0,
+            preferred_nickname: sealed,
+        };
+        state
+            .member_info
+            .member_info
+            .push(AuthInfo::new_with_member_key(info, member_sk));
+    }
+
+    /// Public room, self in `members` but absent from `member_info` → heal
+    /// produces a self-signed public `member_info` carrying the stored
+    /// nickname. (The core "missing → healed" case from the issue.)
+    #[test]
+    fn heal_public_room_missing_member_info_is_healed() {
+        let owner = fresh_signing_key();
+        let member = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Public);
+        add_member(&mut state, &owner, &member);
+
+        let healed = build_member_info_heal(
+            &state,
+            &member,
+            &owner.verifying_key(),
+            &HashMap::new(),
+            Some("Alice"),
+        )
+        .expect("public room with self in members but no member_info must heal");
+
+        assert_eq!(
+            healed.member_info.member_id,
+            MemberId::from(&member.verifying_key())
+        );
+        assert!(
+            healed.member_info.preferred_nickname.is_public(),
+            "public-room heal publishes a public nickname"
+        );
+        assert_eq!(
+            healed.member_info.preferred_nickname.to_string_lossy(),
+            "Alice"
+        );
+        // The entry is self-signed by the member's own key, so the contract
+        // accepts a non-owner member_info — verified end-to-end against the
+        // contract's own `apply_delta` in
+        // `heal_output_is_accepted_by_contract_apply_delta`.
+    }
+
+    /// Private room with a secret available → heal seals the nickname under the
+    /// current version, never leaking plaintext.
+    #[test]
+    fn heal_private_room_with_secret_seals_nickname() {
+        let owner = fresh_signing_key();
+        let member = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private); // current_version = 0
+        add_member(&mut state, &owner, &member);
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0x42u8; 32]);
+
+        let healed =
+            build_member_info_heal(&state, &member, &owner.verifying_key(), &inv, Some("Alice"))
+                .expect("private room with a current-version secret must heal");
+        assert!(
+            healed.member_info.preferred_nickname.is_private(),
+            "private-room heal must seal the nickname, never publish plaintext"
+        );
+        assert_eq!(
+            healed.member_info.preferred_nickname.secret_version(),
+            Some(0)
+        );
+        assert_eq!(
+            healed.member_info.preferred_nickname.declared_len(),
+            "Alice".len()
+        );
+    }
+
+    /// Self already has a `member_info` entry → nothing to heal (returns
+    /// `None`, leaving the existing entry untouched). (The "present → unchanged"
+    /// case from the issue.)
+    #[test]
+    fn heal_returns_none_when_member_info_already_present() {
+        let owner = fresh_signing_key();
+        let member = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Public);
+        add_member(&mut state, &owner, &member);
+        add_member_info(&mut state, &member, SealedBytes::public(b"Alice".to_vec()));
+
+        assert!(
+            build_member_info_heal(
+                &state,
+                &member,
+                &owner.verifying_key(),
+                &HashMap::new(),
+                Some("Alice"),
+            )
+            .is_none(),
+            "a member who already has a member_info entry is not stranded — no heal"
+        );
+    }
+
+    /// Self not in `members` → nothing to heal here (the pruned-member case is
+    /// handled by `ApiClient::build_rejoin_delta`, which re-adds to `members`).
+    #[test]
+    fn heal_returns_none_when_self_not_in_members() {
+        let owner = fresh_signing_key();
+        let member = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Public); // member not added
+
+        assert!(
+            build_member_info_heal(
+                &state,
+                &member,
+                &owner.verifying_key(),
+                &HashMap::new(),
+                Some("Alice"),
+            )
+            .is_none(),
+            "a member not in the network members list has nothing to heal"
+        );
+    }
+
+    /// Owner → never healed (the owner's member_info is managed separately,
+    /// mirroring the UI's owner skip).
+    #[test]
+    fn heal_returns_none_for_owner() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Public);
+        // Even if the owner were (oddly) listed in members with no member_info.
+        add_member(&mut state, &owner, &owner);
+
+        assert!(
+            build_member_info_heal(
+                &state,
+                &owner,
+                &owner.verifying_key(),
+                &HashMap::new(),
+                Some("Owner"),
+            )
+            .is_none(),
+            "the owner is skipped — their member_info is managed separately"
+        );
+    }
+
+    /// Private room with NO secret at the current version → defer (return
+    /// `None`) rather than leak a plaintext nickname. The member stays "Unknown"
+    /// until a later GET once the secret arrives.
+    #[test]
+    fn heal_private_room_without_secret_defers() {
+        let owner = fresh_signing_key();
+        let member = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        add_member(&mut state, &owner, &member);
+
+        assert!(
+            build_member_info_heal(
+                &state,
+                &member,
+                &owner.verifying_key(),
+                &HashMap::new(), // no invitation secret, no contract blob
+                Some("Alice"),
+            )
+            .is_none(),
+            "private room with no secret must defer the heal, never leak plaintext"
+        );
+    }
+
+    /// Private room rotated past the held version → defer (sealing under a
+    /// stale version would be unreadable to members at the current version).
+    #[test]
+    fn heal_private_room_defers_when_secret_lacks_current_version() {
+        let owner = fresh_signing_key();
+        let member = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        state.secrets.current_version = 1; // room rotated to v1
+        add_member(&mut state, &owner, &member);
+        let mut inv = HashMap::new();
+        inv.insert(0u32, [0x42u8; 32]); // member only holds v0
+
+        assert!(
+            build_member_info_heal(&state, &member, &owner.verifying_key(), &inv, Some("Alice"))
+                .is_none(),
+            "must defer when the held secret is not the current version"
+        );
+    }
+
+    /// No persisted nickname → fall back to the generic public "Member"
+    /// placeholder (public room), the same fallback build_rejoin_delta uses.
+    #[test]
+    fn heal_falls_back_to_member_placeholder_when_no_nickname() {
+        let owner = fresh_signing_key();
+        let member = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Public);
+        add_member(&mut state, &owner, &member);
+
+        let healed = build_member_info_heal(
+            &state,
+            &member,
+            &owner.verifying_key(),
+            &HashMap::new(),
+            None,
+        )
+        .expect("public room heals even with no stored nickname");
+        assert_eq!(
+            healed.member_info.preferred_nickname.to_string_lossy(),
+            "Member"
+        );
+    }
+
+    /// A stored nickname longer than the room's current `max_nickname_size`
+    /// must be dropped to "Member" — publishing an over-long entry would make
+    /// the contract reject the whole heal UPDATE (same clamp as
+    /// `rejoin_preferred_nickname`).
+    #[test]
+    fn heal_clamps_over_long_nickname_to_member_placeholder() {
+        let owner = fresh_signing_key();
+        let member = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Public);
+        // max 8: "Member" (6) fits, the stored nickname (20) does not.
+        let mut config = state.configuration.configuration.clone();
+        config.max_nickname_size = 8;
+        state.configuration =
+            river_core::room_state::configuration::AuthorizedConfigurationV1::new(config, &owner);
+        add_member(&mut state, &owner, &member);
+
+        let healed = build_member_info_heal(
+            &state,
+            &member,
+            &owner.verifying_key(),
+            &HashMap::new(),
+            Some("this_is_way_too_long"),
+        )
+        .expect("heals with the placeholder when the stored nickname is over-long");
+        assert_eq!(
+            healed.member_info.preferred_nickname.to_string_lossy(),
+            "Member",
+            "an over-long stored nickname must not block the heal — clamp to placeholder"
+        );
+    }
+
+    /// End-to-end: the healed member_info must be accepted by the room
+    /// contract's own `MemberInfoV1::apply_delta` — the sub-state that
+    /// validates a member_info entry (signature + nickname-length + membership
+    /// retention). A non-owner's member_info is only valid when self-signed by
+    /// that member's own key (the contract calls `verify_signature_with_key`
+    /// against `member.member_vk`), which is exactly what the heal produces.
+    ///
+    /// We exercise `MemberInfoV1::apply_delta` directly rather than the full
+    /// `ChatRoomStateV1::apply_delta` because the latter runs
+    /// `post_apply_cleanup`, which inactivity-prunes a member who has authored
+    /// no message — and the heal deliberately sends ONLY member_info (no
+    /// message). In the real flow the member is kept alive by their join event;
+    /// here we validate the precise contract logic the heal output must
+    /// satisfy. Requires no node.
+    #[test]
+    fn heal_output_is_accepted_by_member_info_apply_delta() {
+        use freenet_scaffold::ComposableState;
+        use river_core::room_state::ChatRoomParametersV1;
+
+        let owner = fresh_signing_key();
+        let owner_vk = owner.verifying_key();
+        let member = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Public);
+        add_member(&mut state, &owner, &member);
+
+        let healed =
+            build_member_info_heal(&state, &member, &owner_vk, &HashMap::new(), Some("Alice"))
+                .expect("self in members, no member_info → heal");
+
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        // Apply the heal's member_info delta against `state` (the parent that
+        // carries `members` and `configuration`) onto a fresh MemberInfoV1.
+        let mut member_info = state.member_info.clone();
+        member_info
+            .apply_delta(&state, &params, &Some(vec![healed]))
+            .expect("the contract accepts the self-signed member_info heal");
+
+        let member_id = MemberId::from(&member.verifying_key());
+        let entry = member_info
+            .member_info
+            .iter()
+            .find(|i| i.member_info.member_id == member_id)
+            .expect("the healed member_info entry must be retained, not dropped");
+        assert_eq!(
+            entry.member_info.preferred_nickname.to_string_lossy(),
+            "Alice"
         );
     }
 

@@ -605,6 +605,31 @@ mod tests {
         );
     }
 
+    /// Source-grep pin for the #304 member_info self-heal wiring, in storage.rs
+    /// so the pinned strings are not self-satisfied by the scanned file
+    /// (api.rs). Guards the exact gap #304 fixed: a CLI member stranded in
+    /// `members` but absent from `member_info` (rendering as "Unknown")
+    /// with no remediation path. The heal MUST stay wired into the central
+    /// GET path so every read/send command re-attempts it once a secret
+    /// arrives.
+    #[test]
+    fn member_info_heal_wiring_pinned() {
+        let api_src = include_str!("api.rs");
+        assert!(
+            api_src.contains("self.heal_member_info(room_owner_key, &room_state)"),
+            "get_room must invoke the member_info self-heal (issue #304) so a \
+             member stranded in `members` but absent from `member_info` is \
+             remediated on every GET. Do NOT drop this call."
+        );
+        assert!(
+            api_src.contains("crate::private_room::build_member_info_heal("),
+            "heal_member_info must route the heal decision through the pure \
+             `crate::private_room::build_member_info_heal` (which defers a \
+             private-room heal when no secret is available, never leaking a \
+             plaintext nickname). Do NOT inline an unconditional Some(...)."
+        );
+    }
+
     /// Source-grep pin for the #306 import wiring, in storage.rs so the pinned
     /// strings aren't self-satisfied by the scanned file (commands/identity.rs).
     /// Guards the exact regression #306 fixed: `import_identity` calling the
