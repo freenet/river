@@ -605,6 +605,85 @@ mod tests {
         );
     }
 
+    /// Source-grep pin for the #304 member_info self-heal wiring, in storage.rs
+    /// so the pinned strings are not self-satisfied by the scanned file
+    /// (api.rs). Guards the exact gap #304 fixed: a CLI member stranded in
+    /// `members` but absent from `member_info` (rendering as "Unknown")
+    /// with no remediation path. The heal MUST stay wired into the central
+    /// GET path so every read/send command re-attempts it once a secret
+    /// arrives.
+    #[test]
+    fn member_info_heal_wiring_pinned() {
+        let api_src = include_str!("api.rs");
+        assert!(
+            api_src.contains("self.heal_member_info(room_owner_key, room_state)"),
+            "get_room must invoke the member_info self-heal (issue #304) so a \
+             member stranded in `members` but absent from `member_info` is \
+             remediated on every GET. Do NOT drop this call."
+        );
+        // get_room must REBIND room_state to the heal's return value, so callers
+        // operate on the repaired state — otherwise a follow-up delta is applied
+        // to the pre-heal state and written back, dropping the healed entry
+        // locally (Codex review on PR #358).
+        assert!(
+            api_src.contains("let room_state = match self.heal_member_info("),
+            "get_room must rebind `room_state` to the healed state returned by \
+             heal_member_info; do NOT discard the heal result and return the \
+             pre-heal state."
+        );
+        assert!(
+            api_src.contains("crate::private_room::build_member_info_heal("),
+            "heal_member_info must route the heal decision through the pure \
+             `crate::private_room::build_member_info_heal` (which defers a \
+             private-room heal when no secret is available, never leaking a \
+             plaintext nickname). Do NOT inline an unconditional Some(...)."
+        );
+        // The persisted nickname/secrets belong to the STORED identity; under a
+        // `--signing-key` override selecting a different key they are not this
+        // member's, so heal_member_info must skip rather than republish another
+        // member's nickname under the override key (Codex review on PR #358).
+        assert!(
+            api_src.contains("signing_key.to_bytes() != info.signing_key_bytes"),
+            "heal_member_info must skip the heal when the resolved signing key \
+             differs from the room's stored identity (signing-key override case) \
+             — otherwise it would republish the stored member's nickname/secrets \
+             under the override key. Do NOT drop this guard."
+        );
+        // The local heal must fold the member_info in DIRECTLY (push onto
+        // `healed_state.member_info.member_info`), NOT via a full-state
+        // `ChatRoomStateV1::apply_delta` — the latter runs `post_apply_cleanup`,
+        // which would inactivity-prune the very (unanchored) member being healed
+        // and drop the new member_info, since the heal adds no anchoring message
+        // (Codex review round 3 on PR #358). We assert the direct-push exists and
+        // that heal_member_info does not reach for full-state apply_delta.
+        //
+        // Whitespace-insensitive: collapse runs of whitespace before matching so
+        // a future rustfmt line-rewrap can't silently void the pin.
+        let api_collapsed: String = api_src.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            api_collapsed
+                .contains("healed_state .member_info .member_info .push(authorized_info.clone());"),
+            "heal_member_info must build the local healed state by directly \
+             pushing the member_info entry, NOT by calling full-state \
+             apply_delta (which runs post_apply_cleanup and would prune the \
+             unanchored member it is trying to heal)."
+        );
+
+        // build_member_info_heal must defer for a member who would NOT survive
+        // post_apply_cleanup — otherwise the standalone member_info UPDATE
+        // triggers the contract's cleanup and PRUNES that member from `members`
+        // instead of healing them (Codex review round 5 on PR #358). Pinned from
+        // storage.rs so the asserted string is not self-satisfied by
+        // private_room.rs's own test source.
+        let private_room_src = include_str!("private_room.rs");
+        assert!(
+            private_room_src.contains("post_apply_cleanup(&params)"),
+            "build_member_info_heal must simulate post_apply_cleanup and defer when \
+             the member would be pruned — a heal UPDATE for an unanchored member \
+             removes them instead of repairing. Do NOT drop this anchor guard."
+        );
+    }
+
     /// Source-grep pin for the #306 import wiring, in storage.rs so the pinned
     /// strings aren't self-satisfied by the scanned file (commands/identity.rs).
     /// Guards the exact regression #306 fixed: `import_identity` calling the

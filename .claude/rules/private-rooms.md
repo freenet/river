@@ -183,12 +183,22 @@ cannot be re-derived, so the owner-as-inviter path always decrypts the
 owner-addressed contract blob from `state.secrets.encrypted_secrets` like
 any other member.
 
-The CLI does NOT currently have a `build_member_info_heal` counterpart: a
-private-room invitee whose invitation lacks `current_version`'s secret
-will defer `member_info` and surface as **"Unknown"** to other peers
-indefinitely (filed as freenet/river#304). The CLI also does NOT prune
-superseded `invitation_secrets` entries the way the UI does — storage
-waste only; the heal path is the natural place to hook the prune.
+The CLI has a `build_member_info_heal` counterpart (issue freenet/river#304),
+in `cli/src/private_room.rs`, mirroring the UI's `RoomData::build_member_info_heal`:
+it detects "self in `members`, absent from `member_info`" and returns a
+self-signed `AuthorizedMemberInfo` to re-publish. A private-room heal seals
+the nickname under the current secret and **defers** (returns `None`) when no
+current-version secret is available, so it never leaks a plaintext nickname.
+`ApiClient::heal_member_info` drives it from the central GET path
+(`get_room`) — every read/send command re-attempts the heal once a secret
+arrives — and emits a standalone `member_info`-only UPDATE delta. The heal is
+skipped under a `--signing-key` override that selects an identity other than
+the room's stored one (the persisted nickname/secrets are not that identity's).
+Wiring is pinned by `member_info_heal_wiring_pinned` in `cli/src/storage.rs`;
+behaviour by the `heal_*` tests in `cli/src/private_room.rs`.
+
+The CLI still does NOT prune superseded `invitation_secrets` entries the way
+the UI does — storage waste only.
 
 ### Rejoin nickname restoration (`StoredRoomInfo.self_nickname`)
 

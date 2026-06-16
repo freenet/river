@@ -840,7 +840,153 @@ impl ApiClient {
             self.subscribe_to_contract(found_id).await?;
         }
 
+        // Self-heal the "Unknown member" condition (issue freenet/river#304):
+        // if this member is in `members` but absent from `member_info`, they
+        // render as "Unknown" to every other peer. This is the CLI counterpart
+        // of the UI's GET-path `build_member_info_heal` trigger. Best-effort —
+        // a heal failure must not fail the read/send command that fetched the
+        // state, so on error we warn and fall back to the un-healed state.
+        //
+        // CRUCIAL: we REBIND `room_state` to the healed state the heal returns,
+        // so callers (`send_message`, read commands, etc.) operate on the
+        // repaired state. Otherwise a follow-up delta would be applied to the
+        // pre-heal state and written back, dropping the just-healed entry
+        // locally (Codex review on PR #358).
+        let room_state = match self.heal_member_info(room_owner_key, room_state).await {
+            Ok(healed) => healed,
+            Err((unhealed, e)) => {
+                warn!("member_info self-heal (issue #304) did not complete: {e}");
+                unhealed
+            }
+        };
+
         Ok(room_state)
+    }
+
+    /// Detect and remediate the "Unknown member" condition for the current
+    /// member (issue freenet/river#304): self present in `state.members` but
+    /// absent from `state.member_info`. When detected, publish a standalone
+    /// `member_info`-only UPDATE so other peers stop rendering this member as
+    /// "Unknown", fold the same entry into the locally-stored state, AND return
+    /// the healed state so the caller operates on the repaired copy.
+    ///
+    /// The CLI counterpart of the UI's `RoomData::build_member_info_heal`
+    /// (`ui/src/room_data.rs`), driven from the same place: every GET of an
+    /// existing room (see [`Self::get_room`]). The heal-decision logic lives in
+    /// the pure [`crate::private_room::build_member_info_heal`] so it is
+    /// unit-testable without a node; this method owns the storage lookup and
+    /// the network publish.
+    ///
+    /// Takes `state` by value and returns it (possibly healed). Returns the
+    /// state UNCHANGED when there is nothing to heal — the member is the owner,
+    /// is not in `members`, already has a `member_info` entry, is a private-room
+    /// member with no secret yet available to seal their nickname (in which case
+    /// the heal defers rather than leak a plaintext nickname; a later GET retries
+    /// once the secret has arrived), the room has no local credentials, or an
+    /// active signing-key override selects a different identity than the stored
+    /// one. On the success path the returned state already carries the healed
+    /// `member_info` entry.
+    ///
+    /// On error returns `Err((state, error))` — handing the original state back
+    /// so the caller can still use it (the heal is best-effort). A network-send
+    /// failure is NOT an error here: the local state was already repaired and
+    /// stored, so it is logged and the healed state is returned as `Ok`.
+    async fn heal_member_info(
+        &self,
+        room_owner_key: &VerifyingKey,
+        state: ChatRoomStateV1,
+    ) -> std::result::Result<ChatRoomStateV1, (ChatRoomStateV1, anyhow::Error)> {
+        // Load this room's stored identity + nickname + invitation secrets.
+        // If the room isn't stored locally we have nothing to heal with.
+        let storage = match self.storage.load_rooms() {
+            Ok(s) => s,
+            Err(e) => return Err((state, e)),
+        };
+        let key_str = bs58::encode(room_owner_key.as_bytes()).into_string();
+        let Some(info) = storage.rooms.get(&key_str) else {
+            return Ok(state);
+        };
+        let signing_key = self.storage.resolve_signing_key(&info.signing_key_bytes);
+        let self_nickname = info.self_nickname.clone();
+        let invitation_secrets = info.invitation_secrets.clone();
+
+        // The persisted `self_nickname` and `invitation_secrets` belong to the
+        // room's STORED identity (`info.signing_key_bytes`). When a
+        // `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` override selects a
+        // DIFFERENT identity, those fields are not this member's — healing with
+        // them would republish another member's nickname / private metadata
+        // under the override key (Codex review on PR #358). We have no nickname
+        // or secrets for the override identity, so skip the heal in that case.
+        // (No override, or an override that matches the stored key, is fine.)
+        if signing_key.to_bytes() != info.signing_key_bytes {
+            debug!(
+                "member_info self-heal (issue #304): skipping for room {key_str} — \
+                 active signing-key override does not match the stored identity, so \
+                 the persisted nickname/secrets are not this member's"
+            );
+            return Ok(state);
+        }
+
+        let Some(authorized_info) = crate::private_room::build_member_info_heal(
+            &state,
+            &signing_key,
+            room_owner_key,
+            &invitation_secrets,
+            self_nickname.as_deref(),
+        ) else {
+            return Ok(state);
+        };
+
+        info!(
+            "member_info self-heal (issue #304): republishing member_info for self in room {key_str} \
+             (was in members but absent from member_info — rendered as \"Unknown\" to peers)"
+        );
+
+        // `build_member_info_heal` only returns `Some` for a member who SURVIVES
+        // `post_apply_cleanup` (it simulates the cleanup and defers otherwise),
+        // so both the network publish and the local fold below are safe from the
+        // "heal prunes the member it is repairing" trap (Codex review on PR
+        // #358): the standalone `member_info`-only UPDATE carries no
+        // `MembersDelta`, and the member is anchored, so neither the network's
+        // nor a local cleanup would drop them.
+        //
+        // We still fold the entry into the local `member_info` sub-state DIRECTLY
+        // rather than via a full-state `ChatRoomStateV1::apply_delta`: the entry
+        // is already validated (self-signed, length-clamped; contract acceptance
+        // pinned by `heal_output_is_accepted_by_member_info_apply_delta`), so a
+        // direct insert is correct and avoids re-running cleanup locally for no
+        // reason.
+        let mut healed_state = state.clone();
+        healed_state
+            .member_info
+            .member_info
+            .push(authorized_info.clone());
+        healed_state
+            .member_info
+            .member_info
+            .sort_by_key(|i| i.member_info.member_id);
+        if let Err(e) = self
+            .storage
+            .update_room_state(room_owner_key, healed_state.clone())
+        {
+            return Err((state, e));
+        }
+
+        // The network publish is best-effort: the local state is already
+        // repaired and stored, so a send failure must not discard the healed
+        // state the caller will operate on. Log and return the healed state.
+        let delta = ChatRoomStateV1Delta {
+            member_info: Some(vec![authorized_info]),
+            ..Default::default()
+        };
+        if let Err(e) = self.send_delta(room_owner_key, delta).await {
+            warn!(
+                "member_info self-heal (issue #304): local state repaired and stored, \
+                 but publishing the member_info UPDATE failed (a later GET will retry): {e}"
+            );
+        }
+
+        Ok(healed_state)
     }
 
     /// Fetch a room's state, recovering it across contract-WASM generations.
