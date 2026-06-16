@@ -616,10 +616,20 @@ mod tests {
     fn member_info_heal_wiring_pinned() {
         let api_src = include_str!("api.rs");
         assert!(
-            api_src.contains("self.heal_member_info(room_owner_key, &room_state)"),
+            api_src.contains("self.heal_member_info(room_owner_key, room_state)"),
             "get_room must invoke the member_info self-heal (issue #304) so a \
              member stranded in `members` but absent from `member_info` is \
              remediated on every GET. Do NOT drop this call."
+        );
+        // get_room must REBIND room_state to the heal's return value, so callers
+        // operate on the repaired state — otherwise a follow-up delta is applied
+        // to the pre-heal state and written back, dropping the healed entry
+        // locally (Codex review on PR #358).
+        assert!(
+            api_src.contains("let room_state = match self.heal_member_info("),
+            "get_room must rebind `room_state` to the healed state returned by \
+             heal_member_info; do NOT discard the heal result and return the \
+             pre-heal state."
         );
         assert!(
             api_src.contains("crate::private_room::build_member_info_heal("),

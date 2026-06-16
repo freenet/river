@@ -845,10 +845,20 @@ impl ApiClient {
         // render as "Unknown" to every other peer. This is the CLI counterpart
         // of the UI's GET-path `build_member_info_heal` trigger. Best-effort —
         // a heal failure must not fail the read/send command that fetched the
-        // state, so we only warn.
-        if let Err(e) = self.heal_member_info(room_owner_key, &room_state).await {
-            warn!("member_info self-heal (issue #304) did not complete: {e}");
-        }
+        // state, so on error we warn and fall back to the un-healed state.
+        //
+        // CRUCIAL: we REBIND `room_state` to the healed state the heal returns,
+        // so callers (`send_message`, read commands, etc.) operate on the
+        // repaired state. Otherwise a follow-up delta would be applied to the
+        // pre-heal state and written back, dropping the just-healed entry
+        // locally (Codex review on PR #358).
+        let room_state = match self.heal_member_info(room_owner_key, room_state).await {
+            Ok(healed) => healed,
+            Err((unhealed, e)) => {
+                warn!("member_info self-heal (issue #304) did not complete: {e}");
+                unhealed
+            }
+        };
 
         Ok(room_state)
     }
@@ -857,7 +867,8 @@ impl ApiClient {
     /// member (issue freenet/river#304): self present in `state.members` but
     /// absent from `state.member_info`. When detected, publish a standalone
     /// `member_info`-only UPDATE so other peers stop rendering this member as
-    /// "Unknown", and fold the same entry into the locally-stored state.
+    /// "Unknown", fold the same entry into the locally-stored state, AND return
+    /// the healed state so the caller operates on the repaired copy.
     ///
     /// The CLI counterpart of the UI's `RoomData::build_member_info_heal`
     /// (`ui/src/room_data.rs`), driven from the same place: every GET of an
@@ -866,24 +877,34 @@ impl ApiClient {
     /// unit-testable without a node; this method owns the storage lookup and
     /// the network publish.
     ///
-    /// No-op (returns `Ok(())` without sending anything) when there is nothing
-    /// to heal — the member is the owner, is not in `members`, already has a
-    /// `member_info` entry, or is a private-room member with no secret yet
-    /// available to seal their nickname (in which case the heal defers rather
-    /// than leak a plaintext nickname; a later GET retries once the secret has
-    /// arrived). Also a no-op when the room has no local credentials (a
-    /// stateless `--signing-key`-only path can't know its own nickname).
+    /// Takes `state` by value and returns it (possibly healed). Returns the
+    /// state UNCHANGED when there is nothing to heal — the member is the owner,
+    /// is not in `members`, already has a `member_info` entry, is a private-room
+    /// member with no secret yet available to seal their nickname (in which case
+    /// the heal defers rather than leak a plaintext nickname; a later GET retries
+    /// once the secret has arrived), the room has no local credentials, or an
+    /// active signing-key override selects a different identity than the stored
+    /// one. On the success path the returned state already carries the healed
+    /// `member_info` entry.
+    ///
+    /// On error returns `Err((state, error))` — handing the original state back
+    /// so the caller can still use it (the heal is best-effort). A network-send
+    /// failure is NOT an error here: the local state was already repaired and
+    /// stored, so it is logged and the healed state is returned as `Ok`.
     async fn heal_member_info(
         &self,
         room_owner_key: &VerifyingKey,
-        state: &ChatRoomStateV1,
-    ) -> Result<()> {
+        state: ChatRoomStateV1,
+    ) -> std::result::Result<ChatRoomStateV1, (ChatRoomStateV1, anyhow::Error)> {
         // Load this room's stored identity + nickname + invitation secrets.
         // If the room isn't stored locally we have nothing to heal with.
-        let storage = self.storage.load_rooms()?;
+        let storage = match self.storage.load_rooms() {
+            Ok(s) => s,
+            Err(e) => return Err((state, e)),
+        };
         let key_str = bs58::encode(room_owner_key.as_bytes()).into_string();
         let Some(info) = storage.rooms.get(&key_str) else {
-            return Ok(());
+            return Ok(state);
         };
         let signing_key = self.storage.resolve_signing_key(&info.signing_key_bytes);
         let self_nickname = info.self_nickname.clone();
@@ -903,17 +924,17 @@ impl ApiClient {
                  active signing-key override does not match the stored identity, so \
                  the persisted nickname/secrets are not this member's"
             );
-            return Ok(());
+            return Ok(state);
         }
 
         let Some(authorized_info) = crate::private_room::build_member_info_heal(
-            state,
+            &state,
             &signing_key,
             room_owner_key,
             &invitation_secrets,
             self_nickname.as_deref(),
         ) else {
-            return Ok(());
+            return Ok(state);
         };
 
         info!(
@@ -926,19 +947,36 @@ impl ApiClient {
             ..Default::default()
         };
 
-        // Apply locally first (validates the delta and keeps the stored copy
-        // consistent with what we publish), then send to the network.
+        // Apply locally first (validates the delta and produces the healed
+        // state we both store and return), then publish to the network.
         let params = ChatRoomParametersV1 {
             owner: *room_owner_key,
         };
-        let mut local_state = state.clone();
-        local_state
-            .apply_delta(state, &params, &Some(delta.clone()))
-            .map_err(|e| anyhow!("Failed to apply member_info heal delta: {:?}", e))?;
-        self.storage
-            .update_room_state(room_owner_key, local_state)?;
+        let mut healed_state = state.clone();
+        if let Err(e) = healed_state.apply_delta(&state, &params, &Some(delta.clone())) {
+            return Err((
+                state,
+                anyhow!("Failed to apply member_info heal delta: {:?}", e),
+            ));
+        }
+        if let Err(e) = self
+            .storage
+            .update_room_state(room_owner_key, healed_state.clone())
+        {
+            return Err((state, e));
+        }
 
-        self.send_delta(room_owner_key, delta).await
+        // The network publish is best-effort: the local state is already
+        // repaired and stored, so a send failure must not discard the healed
+        // state the caller will operate on. Log and return the healed state.
+        if let Err(e) = self.send_delta(room_owner_key, delta).await {
+            warn!(
+                "member_info self-heal (issue #304): local state repaired and stored, \
+                 but publishing the member_info UPDATE failed (a later GET will retry): {e}"
+            );
+        }
+
+        Ok(healed_state)
     }
 
     /// Fetch a room's state, recovering it across contract-WASM generations.
