@@ -140,6 +140,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
         // Modal
         div { class: "fixed inset-0 z-50 flex items-center justify-center p-4",
             div {
+                "data-testid": "invite-member-modal",
                 class: "bg-panel rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto",
                 onclick: move |e| e.stop_propagation(),
 
@@ -147,6 +148,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                 div { class: "px-6 py-4 border-b border-border flex items-center justify-between",
                     h2 { class: "text-lg font-semibold text-text", "Invite Member" }
                     button {
+                        "data-testid": "invite-member-close-button",
                         class: "p-1 text-text-muted hover:text-text transition-colors",
                         onclick: move |_| is_active.set(false),
                         Icon { icon: FaXmark, width: 14, height: 14 }
@@ -265,12 +267,14 @@ fn InvitationContent(
             label { class: "block text-sm font-medium text-text mb-1", "Invitation link:" }
             div { class: "flex gap-2",
                 input {
+                    "data-testid": "invite-link-input",
                     class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text font-mono truncate",
                     r#type: "text",
                     value: invitation_url,
                     readonly: true
                 }
                 button {
+                    "data-testid": "invite-copy-link-button",
                     class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors flex items-center gap-2",
                     onclick: copy_link_to_clipboard,
                     Icon { icon: FaCopy, width: 14, height: 14 }
@@ -291,12 +295,14 @@ fn InvitationContent(
         // Action buttons
         div { class: "flex flex-wrap gap-2",
             button {
+                "data-testid": "invite-copy-message-button",
                 class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2",
                 onclick: copy_message_to_clipboard,
                 Icon { icon: FaCopy, width: 14, height: 14 }
                 span { "{copy_msg_text}" }
             }
             button {
+                "data-testid": "invite-new-invitation-button",
                 class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors flex items-center gap-2",
                 onclick: move |_| {
                     copy_msg_text.set("Copy Message".to_string());
@@ -308,6 +314,7 @@ fn InvitationContent(
                 span { "New Invitation" }
             }
             button {
+                "data-testid": "invite-member-close-footer-button",
                 class: "px-4 py-2 text-text-muted hover:text-text text-sm rounded-lg transition-colors",
                 onclick: move |_| is_active.set(false),
                 "Close"

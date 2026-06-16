@@ -399,9 +399,15 @@ pub fn MemberList() -> Element {
             }
 
             // Member list - scrollable independently
-            ul { class: "flex-1 px-2 py-2 space-y-0.5 overflow-y-auto min-h-0",
+            ul {
+                "data-testid": "member-list",
+                class: "flex-1 px-2 py-2 space-y-0.5 overflow-y-auto min-h-0",
                 for (parts, member_id) in members {
-                    li { key: "{member_id}",
+                    li {
+                        key: "{member_id}",
+                        // Stable per-member hook for automation (freenet/river#25).
+                        // Entity-ID pattern: `member-item-{member_id}`.
+                        "data-testid": "member-item-{member_id}",
                         button {
                             class: "w-full text-left px-3 py-1.5 rounded-lg text-sm text-text hover:bg-surface transition-colors truncate",
                             title: "Member ID: {member_id}",
@@ -425,6 +431,7 @@ pub fn MemberList() -> Element {
             // Action buttons - fixed at bottom
             div { class: "p-3 border-t border-border flex-shrink-0 space-y-2",
                 button {
+                    "data-testid": "invite-member-button",
                     class: "w-full flex items-center justify-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
                     onclick: move |_| invite_modal_active.set(true),
                     Icon { icon: FaUserPlus, width: 14, height: 14 }
@@ -436,6 +443,7 @@ pub fn MemberList() -> Element {
                 // it now lives via `DmRailSection`. Per-room and
                 // cross-room DM discovery are both surfaced there.
                 button {
+                    "data-testid": "export-id-button",
                     class: "w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
                     onclick: move |_| export_modal_active.set(true),
                     Icon { icon: FaFileExport, width: 12, height: 12 }

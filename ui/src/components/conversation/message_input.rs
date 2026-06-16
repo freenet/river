@@ -160,6 +160,7 @@ pub fn MessageInput(
                         }
                         textarea {
                             id: "message-input",
+                            "data-testid": "message-input",
                             class: "w-full px-4 py-2.5 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] overflow-y-auto",
                             style: "max-height: 168px;",
                             placeholder: "Type your message...",
@@ -237,6 +238,7 @@ pub fn MessageInput(
                         rsx! {
                             button {
                                 r#type: "button",
+                                "data-testid": "send-message-button",
                                 class: "{btn_class}",
                                 disabled: over_limit,
                                 title: "{tooltip}",
