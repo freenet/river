@@ -889,6 +889,23 @@ impl ApiClient {
         let self_nickname = info.self_nickname.clone();
         let invitation_secrets = info.invitation_secrets.clone();
 
+        // The persisted `self_nickname` and `invitation_secrets` belong to the
+        // room's STORED identity (`info.signing_key_bytes`). When a
+        // `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` override selects a
+        // DIFFERENT identity, those fields are not this member's — healing with
+        // them would republish another member's nickname / private metadata
+        // under the override key (Codex review on PR #358). We have no nickname
+        // or secrets for the override identity, so skip the heal in that case.
+        // (No override, or an override that matches the stored key, is fine.)
+        if signing_key.to_bytes() != info.signing_key_bytes {
+            debug!(
+                "member_info self-heal (issue #304): skipping for room {key_str} — \
+                 active signing-key override does not match the stored identity, so \
+                 the persisted nickname/secrets are not this member's"
+            );
+            return Ok(());
+        }
+
         let Some(authorized_info) = crate::private_room::build_member_info_heal(
             state,
             &signing_key,

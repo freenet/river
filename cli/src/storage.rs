@@ -628,6 +628,17 @@ mod tests {
              private-room heal when no secret is available, never leaking a \
              plaintext nickname). Do NOT inline an unconditional Some(...)."
         );
+        // The persisted nickname/secrets belong to the STORED identity; under a
+        // `--signing-key` override selecting a different key they are not this
+        // member's, so heal_member_info must skip rather than republish another
+        // member's nickname under the override key (Codex review on PR #358).
+        assert!(
+            api_src.contains("signing_key.to_bytes() != info.signing_key_bytes"),
+            "heal_member_info must skip the heal when the resolved signing key \
+             differs from the room's stored identity (signing-key override case) \
+             — otherwise it would republish the stored member's nickname/secrets \
+             under the override key. Do NOT drop this guard."
+        );
     }
 
     /// Source-grep pin for the #306 import wiring, in storage.rs so the pinned
