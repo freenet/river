@@ -1959,36 +1959,42 @@ pub fn Conversation() -> Element {
                     }
                 };
 
-                // A restored/imported room whose contract is absent from the
-                // network is bounded out to a terminal `RoomSyncStatus::Error`
-                // after a few failed sync attempts (freenet/river#290). The
-                // spinner below is gated on `is_awaiting_initial_sync()`, which
-                // stays true while the room holds placeholder state — so without
-                // this check it would spin forever. Surface the terminal error
-                // instead.
+                // A room still awaiting its initial sync can reach a terminal
+                // `RoomSyncStatus::Error` — most importantly the bounded
+                // contract-absent case (freenet/river#290), but also a failed
+                // GET/PUT send (WebSocket/API error). The spinner below is gated
+                // on `is_awaiting_initial_sync()`, which stays true while the
+                // room holds placeholder state — so without this check it would
+                // spin forever. Surface the STORED error message (not a
+                // hardcoded "not found") so WebSocket/API failures are not
+                // misreported as the room being removed.
                 //
                 // Scoped to rooms that are STILL awaiting initial sync: a room
                 // that already synced real state and later hit some other
                 // `Error` (e.g. a transient PUT failure) is handled by the
-                // normal `Some(room_data)` arm below, not by the "could not be
-                // found on the network" message.
-                let initial_sync_errored = current_room_data.as_ref().is_some_and(|room_data| {
-                    room_data.is_awaiting_initial_sync()
-                        && matches!(
-                            SYNC_INFO
-                                .try_read()
-                                .ok()
-                                .and_then(|si| si.get_sync_status(&room_data.owner_vk).cloned()),
-                            Some(RoomSyncStatus::Error(_))
-                        )
-                });
+                // normal `Some(room_data)` arm below.
+                let initial_sync_error_msg: Option<String> =
+                    current_room_data.as_ref().and_then(|room_data| {
+                        if !room_data.is_awaiting_initial_sync() {
+                            return None;
+                        }
+                        match SYNC_INFO
+                            .try_read()
+                            .ok()
+                            .and_then(|si| si.get_sync_status(&room_data.owner_vk).cloned())
+                        {
+                            Some(RoomSyncStatus::Error(msg)) => Some(msg),
+                            _ => None,
+                        }
+                    });
 
                 match current_room_data.as_ref() {
-                    Some(_) if initial_sync_errored => {
+                    Some(_) if initial_sync_error_msg.is_some() => {
+                        let msg = initial_sync_error_msg.unwrap_or_default();
                         rsx! {
                             div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg rounded-lg text-sm text-red-700 dark:text-red-400 flex items-center gap-3",
                                 Icon { width: 16, height: 16, icon: FaTriangleExclamation }
-                                span { "This room could not be found on the network — it may have been removed." }
+                                span { "{msg}" }
                             }
                         }
                     },

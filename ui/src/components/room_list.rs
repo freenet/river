@@ -98,22 +98,29 @@ pub fn RoomList() -> Element {
             .filter_map(|room_key| {
                 let room_data = rooms.map.get(&room_key)?;
                 // A room is "awaiting sync" only while it has placeholder state
-                // AND has not been given up on. Once sync is bounded out to a
-                // terminal Error (freenet/river#290) the spinner must stop, so
-                // we surface an error marker instead of a perpetual spinner.
+                // AND has not been given up on. Once a placeholder room reaches
+                // a terminal Error (the bounded contract-absent case,
+                // freenet/river#290, or a failed GET/PUT send) the spinner must
+                // stop, so we surface an error marker (tooltip = the stored
+                // error message) instead of a perpetual spinner.
                 //
                 // Scoped to placeholder-state rooms: a fully-synced room that
                 // later hits some other transient `Error` should not show the
-                // "could not be found on the network" marker.
-                let sync_error = room_data.is_awaiting_initial_sync()
-                    && matches!(
-                        SYNC_INFO
-                            .try_read()
-                            .ok()
-                            .and_then(|si| si.get_sync_status(&room_key).cloned()),
-                        Some(RoomSyncStatus::Error(_))
-                    );
-                let awaiting_sync = room_data.is_awaiting_initial_sync() && !sync_error;
+                // marker here.
+                let sync_error_msg: Option<String> = if room_data.is_awaiting_initial_sync() {
+                    match SYNC_INFO
+                        .try_read()
+                        .ok()
+                        .and_then(|si| si.get_sync_status(&room_key).cloned())
+                    {
+                        Some(RoomSyncStatus::Error(msg)) => Some(msg),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let awaiting_sync =
+                    room_data.is_awaiting_initial_sync() && sync_error_msg.is_none();
                 // Decrypt room name if room is private and we have the secret
                 let sealed_name = &room_data
                     .room_state
@@ -144,7 +151,7 @@ pub fn RoomList() -> Element {
                     awaiting_sync,
                     is_private,
                     unread,
-                    sync_error,
+                    sync_error_msg,
                 ))
             })
             .collect::<Vec<_>>()
@@ -202,14 +209,14 @@ pub fn RoomList() -> Element {
 
             // Room list
             ul { class: "flex-1 px-2 py-1 space-y-0.5",
-                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync, is_private, unread, sync_error)| {
+                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync, is_private, unread, sync_error_msg)| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
                     let is_current = *is_current;
                     let awaiting_sync = *awaiting_sync;
                     let is_private = *is_private;
                     let unread = *unread;
-                    let sync_error = *sync_error;
+                    let sync_error_msg = sync_error_msg.clone();
                     // Drag feedback: dim the row being dragged, and draw a top
                     // border on the row the cursor is over (drop lands the
                     // dragged room immediately before it — see `move_room`).
@@ -334,13 +341,14 @@ pub fn RoomList() -> Element {
                                     }
                                     if awaiting_sync {
                                         div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
-                                    } else if sync_error {
-                                        // Terminal sync failure (freenet/river#290): the room's
-                                        // contract could not be found on the network after the
-                                        // retry bound. Show a warning marker instead of a spinner.
+                                    } else if let Some(err_msg) = sync_error_msg {
+                                        // Terminal sync failure for a placeholder room: the
+                                        // bounded contract-absent case (freenet/river#290) or a
+                                        // failed GET/PUT send. Show a warning marker (tooltip = the
+                                        // stored error message) instead of a perpetual spinner.
                                         span {
                                             class: "flex-shrink-0 text-red-600 dark:text-red-400",
-                                            title: "This room could not be found on the network — it may have been removed.",
+                                            title: "{err_msg}",
                                             "aria-label": "Room sync failed",
                                             Icon { width: 12, height: 12, icon: FaTriangleExclamation }
                                         }
