@@ -330,9 +330,30 @@ pub async fn handle_get_response(
 
                     // If the room already existed, update self_sk and merge state
                     if !is_new_entry {
-                        // Only update self_sk if the user is NOT the room owner,
-                        // to avoid stripping owner privileges
-                        if room_data.self_sk.verifying_key() != owner_vk {
+                        // Adopt the invitation's signing key as our per-room
+                        // identity ONLY when the key we currently hold is not
+                        // already a valid member of this room. Blindly
+                        // overwriting `self_sk` orphans a live membership: the
+                        // original member entry stays in the room, but the local
+                        // user no longer holds its key, so they can never act as
+                        // — or remove — it. That is the freenet/river#365
+                        // mechanism. The accept-time guard in
+                        // `receive_invitation_modal::accept_invitation` already
+                        // blocks the user-facing re-accept path; this is the
+                        // structural backstop that makes the orphaning impossible
+                        // regardless of how this GET was triggered. The owner is
+                        // implicitly covered (the owner is always a member of
+                        // their own room), preserving the previous "never strip
+                        // owner privileges" behavior.
+                        let existing_vk = room_data.self_sk.verifying_key();
+                        let existing_is_member = existing_vk == owner_vk
+                            || room_data
+                                .room_state
+                                .members
+                                .members
+                                .iter()
+                                .any(|m| m.member.member_vk == existing_vk);
+                        if !existing_is_member {
                             room_data.self_sk = self_sk.clone();
                             // Reset migration flag so the new key gets migrated
                             room_data.key_migrated_to_delegate = false;
@@ -1985,6 +2006,37 @@ mod tests {
             src.contains("is_probe_instance(key.id())"),
             "handle_get_response must route legacy-key GET responses into the \
              probe handler via is_probe_instance (freenet/river#292)."
+        );
+    }
+
+    /// freenet/river#365 — source-grep pin: the invitation-accept GET handler
+    /// must NOT overwrite an existing per-room `self_sk` that is already a valid
+    /// member. Doing so orphans the original membership — the user keeps a
+    /// duplicate member entry they can never remove. The accept-time guard in
+    /// `receive_invitation_modal::accept_invitation` blocks the user-facing
+    /// path, but this reassignment is the structural mechanism, so it must stay
+    /// gated on a membership check. A refactor that re-introduces the old
+    /// unconditional owner-only overwrite would re-regress #365 for any future
+    /// caller; this pin fails CI if it does.
+    #[test]
+    fn self_sk_overwrite_is_gated_on_existing_membership() {
+        // Search only the PRODUCTION half of the file — slice off `mod tests`
+        // so this pin can't be satisfied by its own assertion-message text.
+        let full = include_str!("get_response.rs");
+        let src = full
+            .split("mod tests {")
+            .next()
+            .expect("get_response.rs must have production code before `mod tests`");
+        assert!(
+            src.contains("if !existing_is_member {"),
+            "the existing-room self_sk reassignment must be gated on \
+             `!existing_is_member` so it never clobbers a live membership \
+             (freenet/river#365)."
+        );
+        assert!(
+            !src.contains("if room_data.self_sk.verifying_key() != owner_vk {"),
+            "the old owner-only self_sk overwrite condition must be gone — it let \
+             a re-accept orphan an existing membership (freenet/river#365)."
         );
     }
 
