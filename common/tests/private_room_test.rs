@@ -894,6 +894,146 @@ fn delegate_driven_rotation_round_trip() {
     }
 }
 
+/// freenet/river#318 contract-level invariant pin.
+///
+/// The UI nickname-save flow (`ui/.../nickname_field.rs`) is the privacy gate
+/// that keeps a plaintext `SealedBytes::Public` nickname out of a private
+/// room: it reads `is_private` and seals the nickname atomically with
+/// `apply_delta` so a public→private reconfiguration can't slip a stale
+/// plaintext delta through. That UI guard is load-bearing *because the
+/// contract does NOT enforce the same rule for `member_info`*.
+///
+/// This test pins both halves of that assumption so a future change can't
+/// silently invalidate it:
+///
+/// 1. `MemberInfoV1::apply_delta` ACCEPTS a `SealedBytes::Public`
+///    `preferred_nickname` even when the room is `PrivacyMode::Private`
+///    (there is no contract-level privacy guard for member_info — only
+///    nickname length + signature + membership are checked). If someone
+///    adds such a guard here, this assertion fails first and forces them
+///    to treat it as the coordinated room-contract WASM migration it is
+///    (the guard would move the contract key AND, because composed
+///    `apply_delta` propagates a sub-delta `Err` via `?`, reject the WHOLE
+///    delta from any existing room that already carries a public nickname —
+///    a CRDT-divergence / backwards-compat break per AGENTS.md). The robust
+///    place to enforce this without a migration is the UI, which #318 does.
+///
+/// 2. The analogous `Configuration` write IS rejected at the contract level
+///    (`configuration.rs::apply_delta`), which is why the leak window only
+///    ever affected member_info — room name / description writes fail to
+///    apply locally and never reach `mark_needs_sync`. This is the existing
+///    guard #318's UI fix mirrors in spirit.
+#[test]
+fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
+    use river_core::room_state::member::MembersDelta;
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+    use river_core::room_state::ChatRoomStateV1Delta;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let params = ChatRoomParametersV1 { owner: owner_vk };
+
+    // A private room with one non-owner member.
+    let member_sk = SigningKey::generate(&mut OsRng);
+    let member_vk = member_sk.verifying_key();
+    let member_id = MemberId::from(&member_vk);
+
+    let mut state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                privacy_mode: PrivacyMode::Private,
+                owner_member_id: owner_id,
+                ..Default::default()
+            },
+            &owner_sk,
+        ),
+        ..Default::default()
+    };
+    state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk,
+        },
+        &owner_sk,
+    ));
+
+    // Part 1: a PUBLIC (plaintext) nickname delta is accepted by the
+    // member_info contract path even though the room is private. This is the
+    // gap #318's UI fix closes; it is NOT closed at the contract level.
+    let public_nickname = MemberInfo {
+        member_id,
+        version: 1,
+        preferred_nickname: SealedBytes::public(b"PlaintextNick".to_vec()),
+    };
+    let authorized = AuthorizedMemberInfo::new_with_member_key(public_nickname, &member_sk);
+
+    let mut member_info_state = MemberInfoV1::default();
+    let apply_result =
+        member_info_state.apply_delta(&state, &params, &Some(vec![authorized.clone()]));
+    assert!(
+        apply_result.is_ok(),
+        "member_info::apply_delta currently accepts a public nickname in a \
+         private room (no contract guard). If this now errors, a contract-level \
+         privacy guard was added — see this test's doc comment: that is a \
+         room-contract WASM migration with CRDT-divergence implications, not a \
+         drop-in fix. Update legacy_room_contracts.toml and reconsider whether \
+         the UI-level guard (#318) is the intended enforcement point.",
+    );
+    assert_eq!(
+        member_info_state.member_info.len(),
+        1,
+        "the public nickname entry should have been stored as-is"
+    );
+    assert!(
+        member_info_state.member_info[0]
+            .member_info
+            .preferred_nickname
+            .is_public(),
+        "stored nickname is the plaintext public variant the UI must prevent reaching here"
+    );
+
+    // Part 2: the analogous Configuration write (public display metadata into
+    // a private room) IS rejected at the contract level. This is why the leak
+    // only ever affected member_info, and is the guard the UI fix mirrors.
+    let bad_config = Configuration {
+        privacy_mode: PrivacyMode::Private,
+        owner_member_id: owner_id,
+        // Public (plaintext) display name in a private room — illegal.
+        display: RoomDisplayMetadata {
+            name: SealedBytes::public(b"Plaintext Room Name".to_vec()),
+            description: None,
+        },
+        configuration_version: state.configuration.configuration.configuration_version + 1,
+        ..Default::default()
+    };
+    let config_delta = ChatRoomStateV1Delta {
+        configuration: Some(AuthorizedConfigurationV1::new(bad_config, &owner_sk)),
+        // include an unrelated member delta to prove it's the config that's rejected
+        members: Some(MembersDelta::new(vec![])),
+        ..Default::default()
+    };
+    let mut state_for_config = state.clone();
+    let old = state_for_config.clone();
+    let config_result = state_for_config.apply_delta(&old, &params, &Some(config_delta));
+    // Assert the SPECIFIC rejection reason, not just `is_err()`: the version
+    // bump, signature, and non-zero `max_*` all pass, so the privacy guard at
+    // `configuration.rs` is the only thing that should reject this delta. If
+    // some unrelated future validation starts erroring first, a bare
+    // `is_err()` would keep passing while silently no longer testing the
+    // privacy guard. Pinning the message keeps the test honest.
+    let config_err = config_result.expect_err(
+        "Configuration::apply_delta MUST reject public display metadata in a private room",
+    );
+    assert!(
+        config_err.contains("encrypted display metadata"),
+        "expected the configuration privacy guard to reject this delta, but got \
+         a different error ({config_err:?}). The existing contract-level guard \
+         (#318's UI fix mirrors it) may have regressed or moved.",
+    );
+}
+
 // =============================================================================
 // Bug #3 regression tests (Ivvor's 2026-05-17 Matrix report)
 //
