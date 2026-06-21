@@ -168,14 +168,26 @@ pub async fn handle_get_response(
             // behavior for that rare case). A genuine rejoin after leaving is
             // unaffected — `leave_room` drops the room from `ROOMS`, so the
             // held `self_sk` is no longer a member and this guard does not fire.
-            let already_member_under_held_key = ROOMS.try_read().ok().is_some_and(|rooms| {
-                rooms.map.get(&owner_vk).is_some_and(|rd| {
-                    held_key_is_member(
-                        &owner_vk,
-                        &rd.room_state.members.members,
-                        &rd.self_sk.verifying_key(),
-                    )
-                })
+            //
+            // Membership is judged against the freshly-fetched CANONICAL
+            // `retrieved_state`, not the local ROOMS snapshot. The local
+            // snapshot only supplies WHICH key we hold (`self_sk`); whether
+            // that key is currently a member is decided by the authoritative
+            // network state. Judging it from the local snapshot alone would
+            // wrongly suppress a legitimate rejoin when that snapshot is STALE:
+            // if the user was pruned for inactivity or removed/banned remotely,
+            // local ROOMS may still list their held key while the canonical
+            // state no longer does. In that case the user genuinely needs to
+            // publish the invitation's fresh key, so we must fall through to
+            // the normal accept. (Codex review of this PR.)
+            let held_self_vk = ROOMS.try_read().ok().and_then(|rooms| {
+                rooms
+                    .map
+                    .get(&owner_vk)
+                    .map(|rd| rd.self_sk.verifying_key())
+            });
+            let already_member_under_held_key = held_self_vk.is_some_and(|self_vk| {
+                held_key_is_member(&owner_vk, &retrieved_state.members.members, &self_vk)
             });
             if already_member_under_held_key {
                 info!(
@@ -2277,6 +2289,17 @@ mod tests {
             src.contains("held_key_is_member("),
             "the short-circuit must gate on `held_key_is_member` so it agrees with the \
              accept-time guard's membership predicate (freenet/river#367)."
+        );
+        // The membership decision must be made against the freshly-fetched
+        // CANONICAL state (`retrieved_state`), not the local ROOMS snapshot —
+        // otherwise a stale local snapshot (member pruned/banned remotely)
+        // would wrongly suppress a legitimate rejoin. (Codex review of this
+        // PR.) Pin that the predicate is applied to retrieved_state.members.
+        assert!(
+            src.contains("held_key_is_member(&owner_vk, &retrieved_state.members.members,"),
+            "the re-accept short-circuit must judge membership against the canonical \
+             `retrieved_state`, not the local ROOMS snapshot, so a stale local \
+             membership can't suppress a legitimate rejoin (freenet/river#367)."
         );
     }
 }
