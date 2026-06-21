@@ -1017,11 +1017,20 @@ fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
     let mut state_for_config = state.clone();
     let old = state_for_config.clone();
     let config_result = state_for_config.apply_delta(&old, &params, &Some(config_delta));
+    // Assert the SPECIFIC rejection reason, not just `is_err()`: the version
+    // bump, signature, and non-zero `max_*` all pass, so the privacy guard at
+    // `configuration.rs` is the only thing that should reject this delta. If
+    // some unrelated future validation starts erroring first, a bare
+    // `is_err()` would keep passing while silently no longer testing the
+    // privacy guard. Pinning the message keeps the test honest.
+    let config_err = config_result.expect_err(
+        "Configuration::apply_delta MUST reject public display metadata in a private room",
+    );
     assert!(
-        config_result.is_err(),
-        "Configuration::apply_delta MUST reject public display metadata in a \
-         private room (the existing contract-level guard #318's UI fix mirrors). \
-         If this no longer errors, the configuration privacy guard regressed.",
+        config_err.contains("encrypted display metadata"),
+        "expected the configuration privacy guard to reject this delta, but got \
+         a different error ({config_err:?}). The existing contract-level guard \
+         (#318's UI fix mirrors it) may have regressed or moved.",
     );
 }
 
