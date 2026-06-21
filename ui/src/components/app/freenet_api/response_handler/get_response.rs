@@ -229,11 +229,24 @@ pub async fn handle_get_response(
                     });
                 });
 
+                // Mark the room Subscribed in SYNC_INFO. `process_rooms()`
+                // moved the room to `RoomSyncStatus::Subscribing` before
+                // sending this GET; because the refresh path neither PUTs nor
+                // re-subscribes (an already-member room is already subscribed),
+                // nothing else would clear that state and the room would sit in
+                // `Subscribing` until the retry/timeout machinery fired. Mirror
+                // the existing-room refresh path, which sets `Subscribed` once
+                // the refresh GET is processed. (Codex review of this PR.)
+                crate::util::defer(move || {
+                    SYNC_INFO.with_mut(|sync_info| {
+                        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                    });
+                });
+
                 // Clear the now-moot pending invite. Mark it Subscribed so the
                 // modal's terminal-success path (`render_subscribed_state`)
                 // closes it and persistently dismisses the invitation, matching
-                // a normal completed accept. We do NOT re-PUT or re-subscribe:
-                // an already-member room is already subscribed.
+                // a normal completed accept.
                 crate::util::defer(move || {
                     PENDING_INVITES.with_mut(|pending| {
                         if let Some(join) = pending.map.get_mut(&owner_vk) {
@@ -440,8 +453,25 @@ pub async fn handle_get_response(
                         room_data.previous_contract_key = None;
                     }
 
-                    // If the room already existed, update self_sk and merge state
+                    // If the room already existed, merge state and then decide
+                    // whether to adopt the invitation's signing key.
                     if !is_new_entry {
+                        // Create parameters for merge
+                        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+                        // Clone current state to avoid borrow issues during merge
+                        let current_state = room_data.room_state.clone();
+
+                        // Merge the retrieved state into the existing state
+                        // FIRST, so the membership decision below sees the
+                        // CANONICAL members (the merge folds in any remote
+                        // removal/ban). Judging it from the pre-merge local
+                        // snapshot would be stale.
+                        room_data
+                            .room_state
+                            .merge(&current_state, &params, &retrieved_state)
+                            .expect("Failed to merge room states");
+
                         // Adopt the invitation's signing key as our per-room
                         // identity ONLY when the key we currently hold is not
                         // already a valid member of this room. Blindly
@@ -451,12 +481,24 @@ pub async fn handle_get_response(
                         // — or remove — it. That is the freenet/river#365
                         // mechanism. The accept-time guard in
                         // `receive_invitation_modal::accept_invitation` already
-                        // blocks the user-facing re-accept path; this is the
-                        // structural backstop that makes the orphaning impossible
-                        // regardless of how this GET was triggered. The owner is
-                        // implicitly covered (the owner is always a member of
-                        // their own room), preserving the previous "never strip
-                        // owner privileges" behavior.
+                        // blocks the user-facing re-accept path; the early
+                        // short-circuit at the top of this branch is the
+                        // structural backstop that makes the orphaning
+                        // impossible regardless of how this GET was triggered.
+                        // The owner is implicitly covered (the owner is always a
+                        // member of their own room), preserving the previous
+                        // "never strip owner privileges" behavior.
+                        //
+                        // This is judged against the MERGED state (canonical
+                        // members), not the stale pre-merge local snapshot: if
+                        // the held key was pruned/banned remotely, the merge has
+                        // dropped it, so `existing_is_member` is correctly false
+                        // and we adopt the fresh invitation key — a genuine
+                        // rejoin. Keeping the old `self_sk` while the PUT
+                        // publishes the fresh member and `record_invite_credentials`
+                        // records the fresh key's credentials would split the
+                        // local identity (self_sk vs credentials at different
+                        // keys). (Codex review of this PR.)
                         let existing_vk = room_data.self_sk.verifying_key();
                         let existing_is_member = existing_vk == owner_vk
                             || room_data
@@ -470,18 +512,6 @@ pub async fn handle_get_response(
                             // Reset migration flag so the new key gets migrated
                             room_data.key_migrated_to_delegate = false;
                         }
-
-                        // Create parameters for merge
-                        let params = ChatRoomParametersV1 { owner: owner_vk };
-
-                        // Clone current state to avoid borrow issues during merge
-                        let current_state = room_data.room_state.clone();
-
-                        // Merge the retrieved state into the existing state
-                        room_data
-                            .room_state
-                            .merge(&current_state, &params, &retrieved_state)
-                            .expect("Failed to merge room states");
                     }
 
                     // Seed the secrets recovered from the invitation so a
