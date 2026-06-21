@@ -4272,14 +4272,19 @@ mod tests {
             ),
             (
                 "ui/src/components/app/freenet_api/response_handler/get_response.rs",
-                // pending-invite branch + existing-room (replace) + existing-room (merge)
+                // re-accept refresh (freenet/river#367) + pending-invite branch
+                // + existing-room (replace) + existing-room (merge)
                 // + backward-probe handler (replace) + backward-probe handler (merge).
+                // The #367 path is the structural re-accept backstop: when a GET
+                // for a pending invite arrives for a room the user is ALREADY in
+                // under their held self_sk, the handler short-circuits to a no-op
+                // refresh (merge + repopulate secrets) instead of a duplicate join.
                 // The last two are the freenet/river#292 recovery path: when a
                 // backward probe recovers stranded state from a legacy contract
                 // generation, the recovered state is adopted into RoomData and
                 // its private-room secrets must be repopulated, exactly like the
                 // normal existing-room GET path.
-                5,
+                6,
                 include_str!("components/app/freenet_api/response_handler/get_response.rs"),
             ),
         ];

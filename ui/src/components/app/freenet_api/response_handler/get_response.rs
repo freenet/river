@@ -133,6 +133,141 @@ pub async fn handle_get_response(
             info!("This is a subscription for a pending invitation, adding state");
             let retrieved_state: ChatRoomStateV1 = from_cbor_slice::<ChatRoomStateV1>(&state);
 
+            // Structural backstop for freenet/river#365 (this issue, #367):
+            // short-circuit the full new-member accept when the user is
+            // ALREADY a member of this room under the per-room identity they
+            // already hold (`RoomData.self_sk`).
+            //
+            // Every invitation carries a freshly generated
+            // `invitee_signing_key`, so accepting one always introduces a NEW
+            // key/MemberId. If we reach here for a room the user is already in
+            // — e.g. the accept-time guard in
+            // `receive_invitation_modal::accept_invitation` fell through
+            // because `ROOMS.try_read()` was momentarily unreadable, or some
+            // future caller populated `PENDING_INVITES` for an existing room —
+            // running the full accept would:
+            //   * PUT a DUPLICATE member entry (`build_state_for_put`),
+            //   * overwrite `self_sk` with the fresh key, ORPHANING the
+            //     original membership (the original #365 mechanism), and
+            //   * record the fresh key's `self_authorized_member` /
+            //     `self_member_info` (`record_invite_credentials`).
+            //
+            // A partial backstop that guarded ONLY the `self_sk` overwrite was
+            // rejected by external review on PR #366: it left `self_sk` and the
+            // recorded self-credentials pointing at DIFFERENT keys — a split,
+            // internally inconsistent local state. The correct fix is to
+            // short-circuit the ENTIRE accept here, BEFORE `build_state_for_put`:
+            // treat it as a no-op refresh (merge the retrieved state,
+            // repopulate secrets, clear the pending invite) so nothing —
+            // membership, credentials, or `self_sk` — is mutated toward the
+            // fresh key.
+            //
+            // This is best-effort in the same sense as the accept-time guard:
+            // it only fires when `ROOMS` is readable. If `ROOMS` is genuinely
+            // unreadable we fall through to the normal accept (the prior
+            // behavior for that rare case). A genuine rejoin after leaving is
+            // unaffected — `leave_room` drops the room from `ROOMS`, so the
+            // held `self_sk` is no longer a member and this guard does not fire.
+            //
+            // Membership is judged against the freshly-fetched CANONICAL
+            // `retrieved_state`, not the local ROOMS snapshot. The local
+            // snapshot only supplies WHICH key we hold (`self_sk`); whether
+            // that key is currently a member is decided by the authoritative
+            // network state. Judging it from the local snapshot alone would
+            // wrongly suppress a legitimate rejoin when that snapshot is STALE:
+            // if the user was pruned for inactivity or removed/banned remotely,
+            // local ROOMS may still list their held key while the canonical
+            // state no longer does. In that case the user genuinely needs to
+            // publish the invitation's fresh key, so we must fall through to
+            // the normal accept. (Codex review of this PR.)
+            let held_self_vk = ROOMS.try_read().ok().and_then(|rooms| {
+                rooms
+                    .map
+                    .get(&owner_vk)
+                    .map(|rd| rd.self_sk.verifying_key())
+            });
+            let already_member_under_held_key = held_self_vk.is_some_and(|self_vk| {
+                held_key_is_member(&owner_vk, &retrieved_state.members.members, &self_vk)
+            });
+            if already_member_under_held_key {
+                info!(
+                    "GET response for pending invite to room {:?}: already a member under \
+                     the held self_sk — refreshing instead of re-joining (freenet/river#367)",
+                    MemberId::from(owner_vk)
+                );
+
+                // Refresh-only: merge the retrieved network state into the
+                // existing RoomData and repopulate secrets, exactly as the
+                // existing-room refresh path does. Do NOT touch `self_sk`,
+                // membership, or self-credentials. Deferred (like every other
+                // ROOMS mutation in this handler) to avoid a borrow conflict
+                // with the synchronous signal reads above.
+                crate::util::defer(move || {
+                    ROOMS.with_mut(|rooms| {
+                        if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                            let params = ChatRoomParametersV1 { owner: owner_vk };
+                            let current_state = room_data.room_state.clone();
+                            match room_data.room_state.merge(
+                                &current_state,
+                                &params,
+                                &retrieved_state,
+                            ) {
+                                Ok(_) => {
+                                    room_data.capture_self_membership_data(&params);
+                                    let _ = room_data.repopulate_secrets_from_state();
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Re-accept refresh: failed to merge state for room \
+                                         {:?}: {}",
+                                        MemberId::from(owner_vk),
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    });
+                });
+
+                // Move the room out of `Subscribing` in SYNC_INFO.
+                // `process_rooms()` set `RoomSyncStatus::Subscribing` before
+                // sending this pending-invite GET (with `subscribe: false`);
+                // the refresh path neither PUTs nor subscribes, so without
+                // intervention the room would sit in `Subscribing` until the
+                // retry/timeout machinery fired.
+                //
+                // We reset to `Disconnected`, NOT `Subscribed`: this GET never
+                // established a subscription, and the room may genuinely not be
+                // subscribed yet (e.g. a stale pending invite surviving a
+                // reload/reconnect, or an imported room). `Disconnected` is the
+                // status `rooms_awaiting_subscription` keys on, so
+                // `process_rooms`'s existing-room path will establish a real
+                // PUT+subscribe if needed; that re-PUT is idempotent and
+                // self-healing if the room was in fact already subscribed.
+                // Marking `Subscribed` here would instead suppress that path
+                // and could leave an unsubscribed room silently not receiving
+                // updates. (Codex review of this PR.)
+                crate::util::defer(move || {
+                    SYNC_INFO.with_mut(|sync_info| {
+                        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Disconnected);
+                    });
+                });
+
+                // Clear the now-moot pending invite. Mark it Subscribed so the
+                // modal's terminal-success path (`render_subscribed_state`)
+                // closes it and persistently dismisses the invitation, matching
+                // a normal completed accept.
+                crate::util::defer(move || {
+                    PENDING_INVITES.with_mut(|pending| {
+                        if let Some(join) = pending.map.get_mut(&owner_vk) {
+                            join.status = PendingRoomStatus::Subscribed;
+                        }
+                    });
+                });
+
+                return Ok(());
+            }
+
             // Get the pending invite data once to avoid multiple reads
             let (self_sk, authorized_member, preferred_nickname, room_secrets) = {
                 let pending_invites = PENDING_INVITES.read();
@@ -328,8 +463,25 @@ pub async fn handle_get_response(
                         room_data.previous_contract_key = None;
                     }
 
-                    // If the room already existed, update self_sk and merge state
+                    // If the room already existed, merge state and then decide
+                    // whether to adopt the invitation's signing key.
                     if !is_new_entry {
+                        // Create parameters for merge
+                        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+                        // Clone current state to avoid borrow issues during merge
+                        let current_state = room_data.room_state.clone();
+
+                        // Merge the retrieved state into the existing state
+                        // FIRST, so the membership decision below sees the
+                        // CANONICAL members (the merge folds in any remote
+                        // removal/ban). Judging it from the pre-merge local
+                        // snapshot would be stale.
+                        room_data
+                            .room_state
+                            .merge(&current_state, &params, &retrieved_state)
+                            .expect("Failed to merge room states");
+
                         // Adopt the invitation's signing key as our per-room
                         // identity ONLY when the key we currently hold is not
                         // already a valid member of this room. Blindly
@@ -339,12 +491,24 @@ pub async fn handle_get_response(
                         // — or remove — it. That is the freenet/river#365
                         // mechanism. The accept-time guard in
                         // `receive_invitation_modal::accept_invitation` already
-                        // blocks the user-facing re-accept path; this is the
-                        // structural backstop that makes the orphaning impossible
-                        // regardless of how this GET was triggered. The owner is
-                        // implicitly covered (the owner is always a member of
-                        // their own room), preserving the previous "never strip
-                        // owner privileges" behavior.
+                        // blocks the user-facing re-accept path; the early
+                        // short-circuit at the top of this branch is the
+                        // structural backstop that makes the orphaning
+                        // impossible regardless of how this GET was triggered.
+                        // The owner is implicitly covered (the owner is always a
+                        // member of their own room), preserving the previous
+                        // "never strip owner privileges" behavior.
+                        //
+                        // This is judged against the MERGED state (canonical
+                        // members), not the stale pre-merge local snapshot: if
+                        // the held key was pruned/banned remotely, the merge has
+                        // dropped it, so `existing_is_member` is correctly false
+                        // and we adopt the fresh invitation key — a genuine
+                        // rejoin. Keeping the old `self_sk` while the PUT
+                        // publishes the fresh member and `record_invite_credentials`
+                        // records the fresh key's credentials would split the
+                        // local identity (self_sk vs credentials at different
+                        // keys). (Codex review of this PR.)
                         let existing_vk = room_data.self_sk.verifying_key();
                         let existing_is_member = existing_vk == owner_vk
                             || room_data
@@ -358,18 +522,6 @@ pub async fn handle_get_response(
                             // Reset migration flag so the new key gets migrated
                             room_data.key_migrated_to_delegate = false;
                         }
-
-                        // Create parameters for merge
-                        let params = ChatRoomParametersV1 { owner: owner_vk };
-
-                        // Clone current state to avoid borrow issues during merge
-                        let current_state = room_data.room_state.clone();
-
-                        // Merge the retrieved state into the existing state
-                        room_data
-                            .room_state
-                            .merge(&current_state, &params, &retrieved_state)
-                            .expect("Failed to merge room states");
                     }
 
                     // Seed the secrets recovered from the invitation so a
@@ -1224,6 +1376,33 @@ async fn put_state_to_current_key(
     }
 }
 
+/// Is the per-room identity the user already holds (`self_vk`, the
+/// verifying key of `RoomData.self_sk`) already a member of this room —
+/// either as the owner, or present in the member list?
+///
+/// This is the predicate the freenet/river#367 short-circuit in
+/// `handle_get_response` uses to decide a re-accept should be a no-op
+/// refresh rather than a second join. It mirrors `vk_is_room_member` in
+/// `receive_invitation_modal` (the accept-time guard's predicate) so the
+/// two layers agree on what "already a member" means: the structural
+/// backstop must recognize exactly the rooms the entry-level guard would
+/// have caught, regardless of how the GET was triggered.
+///
+/// Note this checks the HELD `self_vk`, never the invitation's freshly
+/// generated `invitee_signing_key` (which is never a member yet) — checking
+/// only the latter is the original #365 mistake.
+///
+/// Pure (no signal access, no WASM) so it is unit-testable without
+/// constructing a full `RoomData`, whose `contract_key` needs the
+/// room-contract WASM — the same split `vk_is_room_member` uses.
+pub(crate) fn held_key_is_member(
+    owner_vk: &ed25519_dalek::VerifyingKey,
+    members: &[river_core::room_state::member::AuthorizedMember],
+    self_vk: &ed25519_dalek::VerifyingKey,
+) -> bool {
+    self_vk == owner_vk || members.iter().any(|m| &m.member.member_vk == self_vk)
+}
+
 /// Error returned by [`build_state_for_put`] when the invitation cannot
 /// complete cleanly.
 ///
@@ -2064,6 +2243,103 @@ mod tests {
         assert!(
             merged.configuration.verify_signature(&owner_vk).is_ok(),
             "merge_room_states must preserve the recovered state's owner-signed configuration"
+        );
+    }
+
+    /// freenet/river#367 — the `held_key_is_member` predicate that gates the
+    /// re-accept short-circuit. It must report "already a member" for:
+    /// * the owner (always a member of their own room), and
+    /// * a held `self_vk` that is in the member list,
+    /// and must NOT report a fresh, non-member key (the case a genuine new
+    /// join hits). This is the same shape as the accept-time guard's
+    /// `vk_is_room_member`; if the two ever diverge, the structural backstop
+    /// would stop matching the rooms the entry-level guard catches.
+    #[test]
+    fn held_key_is_member_matches_owner_and_members() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let member_sk = SigningKey::generate(&mut rng);
+        let member_vk = member_sk.verifying_key();
+        let stranger_vk = SigningKey::generate(&mut rng).verifying_key();
+
+        let members = vec![AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk,
+            },
+            &owner_sk,
+        )];
+
+        // Owner is always a member of their own room.
+        assert!(
+            held_key_is_member(&owner_vk, &members, &owner_vk),
+            "owner's held key must be reported as a member"
+        );
+        // A held key present in the member list is a member.
+        assert!(
+            held_key_is_member(&owner_vk, &members, &member_vk),
+            "a held self_vk in the member list must be reported as a member"
+        );
+        // A fresh / unrelated key (the genuine-new-join case) is NOT.
+        assert!(
+            !held_key_is_member(&owner_vk, &members, &stranger_vk),
+            "a key that is neither owner nor in the member list must NOT be reported \
+             as a member — otherwise a genuine first join would be wrongly short-circuited"
+        );
+    }
+
+    /// freenet/river#367 — source-grep pin: the invitation-accept GET handler
+    /// MUST short-circuit to a no-op refresh, BEFORE `build_state_for_put`,
+    /// when the user is already a member under their held `self_sk`. The full
+    /// handler reads the `ROOMS`/`PENDING_INVITES` signals and PUTs over the
+    /// WebApi, so it can't be exercised by a host unit test; this pin locks in
+    /// the structural backstop instead.
+    ///
+    /// A refactor that removed the short-circuit — or moved it AFTER
+    /// `build_state_for_put` — would re-regress #365 for any path that reaches
+    /// this handler with `PENDING_INVITES` populated for an already-member
+    /// room (e.g. the accept-time guard falling through on an unreadable
+    /// `ROOMS`). This pin fails CI if it does.
+    #[test]
+    fn reaccept_get_short_circuits_before_build_state_for_put() {
+        // Search only the PRODUCTION half of the file — slice off `mod tests`
+        // so this pin can't be satisfied by its own assertion-message text.
+        let full = include_str!("get_response.rs");
+        let src = full
+            .split("mod tests {")
+            .next()
+            .expect("get_response.rs must have production code before `mod tests`");
+
+        let guard_idx = src.find("let already_member_under_held_key").expect(
+            "handle_get_response must compute `already_member_under_held_key` from the \
+                 held self_sk to short-circuit a re-accept (freenet/river#367).",
+        );
+        let build_idx = src
+            .find("build_state_for_put(")
+            .expect("handle_get_response must still call build_state_for_put on the new-join path");
+        assert!(
+            guard_idx < build_idx,
+            "the re-accept short-circuit must be evaluated BEFORE build_state_for_put — \
+             otherwise a duplicate member is PUT before the no-op refresh can intervene \
+             (freenet/river#367)."
+        );
+        assert!(
+            src.contains("held_key_is_member("),
+            "the short-circuit must gate on `held_key_is_member` so it agrees with the \
+             accept-time guard's membership predicate (freenet/river#367)."
+        );
+        // The membership decision must be made against the freshly-fetched
+        // CANONICAL state (`retrieved_state`), not the local ROOMS snapshot —
+        // otherwise a stale local snapshot (member pruned/banned remotely)
+        // would wrongly suppress a legitimate rejoin. (Codex review of this
+        // PR.) Pin that the predicate is applied to retrieved_state.members.
+        assert!(
+            src.contains("held_key_is_member(&owner_vk, &retrieved_state.members.members,"),
+            "the re-accept short-circuit must judge membership against the canonical \
+             `retrieved_state`, not the local ROOMS snapshot, so a stale local \
+             membership can't suppress a legitimate rejoin (freenet/river#367)."
         );
     }
 }
