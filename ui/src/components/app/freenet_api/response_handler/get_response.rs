@@ -229,17 +229,27 @@ pub async fn handle_get_response(
                     });
                 });
 
-                // Mark the room Subscribed in SYNC_INFO. `process_rooms()`
-                // moved the room to `RoomSyncStatus::Subscribing` before
-                // sending this GET; because the refresh path neither PUTs nor
-                // re-subscribes (an already-member room is already subscribed),
-                // nothing else would clear that state and the room would sit in
-                // `Subscribing` until the retry/timeout machinery fired. Mirror
-                // the existing-room refresh path, which sets `Subscribed` once
-                // the refresh GET is processed. (Codex review of this PR.)
+                // Move the room out of `Subscribing` in SYNC_INFO.
+                // `process_rooms()` set `RoomSyncStatus::Subscribing` before
+                // sending this pending-invite GET (with `subscribe: false`);
+                // the refresh path neither PUTs nor subscribes, so without
+                // intervention the room would sit in `Subscribing` until the
+                // retry/timeout machinery fired.
+                //
+                // We reset to `Disconnected`, NOT `Subscribed`: this GET never
+                // established a subscription, and the room may genuinely not be
+                // subscribed yet (e.g. a stale pending invite surviving a
+                // reload/reconnect, or an imported room). `Disconnected` is the
+                // status `rooms_awaiting_subscription` keys on, so
+                // `process_rooms`'s existing-room path will establish a real
+                // PUT+subscribe if needed; that re-PUT is idempotent and
+                // self-healing if the room was in fact already subscribed.
+                // Marking `Subscribed` here would instead suppress that path
+                // and could leave an unsubscribed room silently not receiving
+                // updates. (Codex review of this PR.)
                 crate::util::defer(move || {
                     SYNC_INFO.with_mut(|sync_info| {
-                        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Disconnected);
                     });
                 });
 
