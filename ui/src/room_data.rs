@@ -1734,6 +1734,41 @@ impl Rooms {
         order.push(item);
         self.room_order = order;
     }
+
+    /// Move `room` one position earlier in the display order, persisting the
+    /// resulting full order. Backs the touch-friendly "move up" control in the
+    /// rail's reorder mode (drag-and-drop is pointer-only — see
+    /// freenet/river#348). Like [`Rooms::move_room`], it operates on the
+    /// current effective order so the first reorder of an as-yet-unordered list
+    /// materialises the full order. No-ops if `room` is not a current room or
+    /// is already first.
+    pub fn move_room_up(&mut self, room: VerifyingKey) {
+        let mut order = self.ordered_room_keys();
+        let Some(pos) = order.iter().position(|k| k == &room) else {
+            return;
+        };
+        if pos == 0 {
+            return;
+        }
+        order.swap(pos, pos - 1);
+        self.room_order = order;
+    }
+
+    /// Move `room` one position later in the display order, persisting the
+    /// resulting full order. Backs the touch-friendly "move down" control in
+    /// the rail's reorder mode (see freenet/river#348). No-ops if `room` is not
+    /// a current room or is already last.
+    pub fn move_room_down(&mut self, room: VerifyingKey) {
+        let mut order = self.ordered_room_keys();
+        let Some(pos) = order.iter().position(|k| k == &room) else {
+            return;
+        };
+        if pos + 1 >= order.len() {
+            return;
+        }
+        order.swap(pos, pos + 1);
+        self.room_order = order;
+    }
 }
 
 #[cfg(test)]
@@ -3521,6 +3556,76 @@ mod tests {
         for k in &keys {
             assert!(rooms.room_order.contains(k));
         }
+    }
+
+    /// `move_room_up` swaps a room with the one above it, materialising the
+    /// full order from the deterministic baseline (the touch-friendly analog of
+    /// dragging a row up one slot — freenet/river#348).
+    #[test]
+    fn move_room_up_swaps_with_previous() {
+        let keys: Vec<VerifyingKey> = (1..=4).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        let base = rooms.ordered_room_keys();
+
+        rooms.move_room_up(base[2]);
+        let after = rooms.ordered_room_keys();
+        assert_eq!(after, vec![base[0], base[2], base[1], base[3]]);
+        // The full order is now persisted (every current room, no stale keys).
+        assert_eq!(rooms.room_order, after);
+    }
+
+    /// `move_room_down` swaps a room with the one below it.
+    #[test]
+    fn move_room_down_swaps_with_next() {
+        let keys: Vec<VerifyingKey> = (1..=4).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        let base = rooms.ordered_room_keys();
+
+        rooms.move_room_down(base[1]);
+        let after = rooms.ordered_room_keys();
+        assert_eq!(after, vec![base[0], base[2], base[1], base[3]]);
+        assert_eq!(rooms.room_order, after);
+    }
+
+    /// Moving up the first room (or down the last room) is a no-op — the
+    /// boundary controls are disabled in the UI, but the helper must not
+    /// corrupt the order even if called.
+    #[test]
+    fn move_room_up_down_noop_at_boundaries() {
+        let keys: Vec<VerifyingKey> = (1..=3).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        let base = rooms.ordered_room_keys();
+
+        rooms.move_room_up(base[0]);
+        assert!(
+            rooms.room_order.is_empty(),
+            "moving the first room up must not reorder or materialise"
+        );
+
+        rooms.move_room_down(base[2]);
+        assert!(
+            rooms.room_order.is_empty(),
+            "moving the last room down must not reorder or materialise"
+        );
+
+        // Unknown key is also a no-op.
+        let ghost = vk_from_seed(99);
+        rooms.move_room_up(ghost);
+        rooms.move_room_down(ghost);
+        assert!(rooms.room_order.is_empty(), "unknown key is a no-op");
+    }
+
+    /// Repeated up/down moves round-trip back to the starting order — the
+    /// swap-adjacent helpers are exact inverses of each other.
+    #[test]
+    fn move_room_up_then_down_round_trips() {
+        let keys: Vec<VerifyingKey> = (1..=4).map(vk_from_seed).collect();
+        let mut rooms = rooms_with_keys(&keys);
+        let base = rooms.ordered_room_keys();
+
+        rooms.move_room_down(base[1]);
+        rooms.move_room_up(base[1]);
+        assert_eq!(rooms.ordered_room_keys(), base);
     }
 
     /// Leaving a room drops it from the manual order.
