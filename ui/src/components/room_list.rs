@@ -18,7 +18,8 @@ use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
     icons::fa_solid_icons::{
-        FaArrowLeft, FaComments, FaFileImport, FaLock, FaPlus, FaTriangleExclamation,
+        FaArrowLeft, FaArrowsUpDown, FaChevronDown, FaChevronUp, FaComments, FaFileImport, FaLock,
+        FaPlus, FaTriangleExclamation,
     },
     Icon,
 };
@@ -81,6 +82,13 @@ pub fn RoomList() -> Element {
     let mut dragged_room = use_signal(|| None::<VerifyingKey>);
     let mut drag_over_room = use_signal(|| None::<VerifyingKey>);
     let mut drag_over_end = use_signal(|| false);
+
+    // Touch-friendly reorder mode (freenet/river#348). HTML5 drag-and-drop is
+    // pointer-only — browsers don't emit drag events for touch gestures — so a
+    // toggle reveals per-row up/down controls that call the same input-agnostic
+    // `move_room_up`/`move_room_down` persistence helpers. Read via `try_read`
+    // and mutated through `crate::util::defer()` like the drag signals above.
+    let mut reorder_mode = use_signal(|| false);
 
     // Memoize the room list to avoid reading signals during render.
     // Rooms render in the user's drag-chosen order first, then any
@@ -164,6 +172,11 @@ pub fn RoomList() -> Element {
     let dragged_now: Option<VerifyingKey> = dragged_room.try_read().ok().and_then(|g| *g);
     let drag_over_now: Option<VerifyingKey> = drag_over_room.try_read().ok().and_then(|g| *g);
     let drag_over_end_now: bool = drag_over_end.try_read().map(|g| *g).unwrap_or(false);
+    let reorder_now: bool = reorder_mode.try_read().map(|g| *g).unwrap_or(false);
+    // Total rooms, used to disable the up control on the first row and the down
+    // control on the last. Also gates the reorder toggle's visibility: with one
+    // room there is nothing to reorder.
+    let room_count: usize = room_items.read().len();
 
     rsx! {
         aside {
@@ -197,14 +210,48 @@ pub fn RoomList() -> Element {
                     Icon { width: 16, height: 16, icon: FaComments }
                     span { "Rooms" }
                 }
-                button {
-                    "data-testid": "create-room-button",
-                    class: "p-1.5 rounded-md text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                    title: "Create Room",
-                    onclick: move |_| {
-                        CREATE_ROOM_MODAL.write().show = true;
-                    },
-                    Icon { width: 14, height: 14, icon: FaPlus }
+                div { class: "flex items-center gap-1",
+                    // Reorder-mode toggle — the touch-friendly path to room
+                    // reordering (freenet/river#348). Only meaningful with at
+                    // least two rooms, so it's hidden below that to keep the
+                    // header uncluttered on first load — but stays visible while
+                    // reorder mode is on (even if rooms drop to one) so the user
+                    // can always toggle back out rather than getting stuck.
+                    if room_count > 1 || reorder_now {
+                        button {
+                            class: format!(
+                                "p-1.5 rounded-md transition-colors {}",
+                                if reorder_now {
+                                    "text-accent bg-accent/10"
+                                } else {
+                                    "text-text-muted hover:text-accent hover:bg-surface"
+                                },
+                            ),
+                            title: if reorder_now { "Done reordering" } else { "Reorder rooms" },
+                            "aria-label": "Reorder rooms",
+                            "aria-pressed": "{reorder_now}",
+                            "data-testid": "reorder-rooms-toggle",
+                            onclick: move |_| {
+                                // Defer the toggle per the Dioxus signal-safety
+                                // rules — this component reads `reorder_mode`
+                                // during render.
+                                crate::util::defer(move || {
+                                    let next = !*reorder_mode.peek();
+                                    reorder_mode.set(next);
+                                });
+                            },
+                            Icon { width: 14, height: 14, icon: FaArrowsUpDown }
+                        }
+                    }
+                    button {
+                        "data-testid": "create-room-button",
+                        class: "p-1.5 rounded-md text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                        title: "Create Room",
+                        onclick: move |_| {
+                            CREATE_ROOM_MODAL.write().show = true;
+                        },
+                        Icon { width: 14, height: 14, icon: FaPlus }
+                    }
                 }
             }
 
@@ -212,7 +259,7 @@ pub fn RoomList() -> Element {
             ul {
                 "data-testid": "room-list",
                 class: "flex-1 px-2 py-1 space-y-0.5",
-                {room_items.read().iter().map(|(room_key, room_name, is_current, awaiting_sync, is_private, unread, sync_error_msg)| {
+                {room_items.read().iter().enumerate().map(|(idx, (room_key, room_name, is_current, awaiting_sync, is_private, unread, sync_error_msg))| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
                     let is_current = *is_current;
@@ -220,6 +267,10 @@ pub fn RoomList() -> Element {
                     let is_private = *is_private;
                     let unread = *unread;
                     let sync_error_msg = sync_error_msg.clone();
+                    // Row position, for disabling the up control on the first
+                    // row and the down control on the last (reorder mode).
+                    let is_first = idx == 0;
+                    let is_last = idx + 1 == room_count;
                     // Drag feedback: dim the row being dragged, and draw a top
                     // border on the row the cursor is over (drop lands the
                     // dragged room immediately before it — see `move_room`).
@@ -296,9 +347,10 @@ pub fn RoomList() -> Element {
                                     drag_over_end.set(false);
                                 });
                             },
+                            div { class: "flex items-center",
                             button {
                                 class: format!(
-                                    "w-full text-left px-3 py-2 rounded-lg text-sm transition-colors {}",
+                                    "flex-1 min-w-0 text-left px-3 py-2 rounded-lg text-sm transition-colors {}",
                                     if is_current {
                                         "bg-accent/10 text-accent font-medium"
                                     } else {
@@ -362,6 +414,75 @@ pub fn RoomList() -> Element {
                                         }
                                     }
                                 }
+                            }
+                            // Touch-friendly reorder controls (freenet/river#348):
+                            // up/down move the room one slot, calling the same
+                            // input-agnostic persistence helpers the drag path
+                            // uses. Disabled at the list boundaries (first row
+                            // can't go up; last can't go down). Only rendered in
+                            // reorder mode so the rail stays clean by default.
+                            if reorder_now {
+                                div { class: "flex items-center flex-shrink-0 pr-1 gap-0.5",
+                                    button {
+                                        r#type: "button",
+                                        class: format!(
+                                            "p-2 rounded-md transition-colors {}",
+                                            if is_first {
+                                                "text-text-muted/30 cursor-not-allowed"
+                                            } else {
+                                                "text-text-muted hover:text-accent hover:bg-surface"
+                                            },
+                                        ),
+                                        disabled: is_first,
+                                        title: "Move up",
+                                        "aria-label": "Move room up",
+                                        "data-testid": "reorder-room-up",
+                                        onclick: move |evt| {
+                                            // Sibling of the room-open button, so a tap
+                                            // here must not bubble into row selection.
+                                            evt.stop_propagation();
+                                            // `move_room_up` is a no-op at the top, but
+                                            // the button is also `disabled` there.
+                                            crate::util::defer(move || {
+                                                ROOMS.with_mut(|rooms| rooms.move_room_up(room_key));
+                                                spawn(async move {
+                                                    if let Err(e) = save_rooms_to_delegate().await {
+                                                        error!("Failed to save room order: {}", e);
+                                                    }
+                                                });
+                                            });
+                                        },
+                                        Icon { width: 14, height: 14, icon: FaChevronUp }
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: format!(
+                                            "p-2 rounded-md transition-colors {}",
+                                            if is_last {
+                                                "text-text-muted/30 cursor-not-allowed"
+                                            } else {
+                                                "text-text-muted hover:text-accent hover:bg-surface"
+                                            },
+                                        ),
+                                        disabled: is_last,
+                                        title: "Move down",
+                                        "aria-label": "Move room down",
+                                        "data-testid": "reorder-room-down",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            crate::util::defer(move || {
+                                                ROOMS.with_mut(|rooms| rooms.move_room_down(room_key));
+                                                spawn(async move {
+                                                    if let Err(e) = save_rooms_to_delegate().await {
+                                                        error!("Failed to save room order: {}", e);
+                                                    }
+                                                });
+                                            });
+                                        },
+                                        Icon { width: 14, height: 14, icon: FaChevronDown }
+                                    }
+                                }
+                            }
                             }
                         }
                     }
