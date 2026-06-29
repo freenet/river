@@ -8,6 +8,20 @@ gets more popular, the opposite of the server model where traffic is a bill some
 
 ![Screenshot of chat interface](screenshot.png)
 
+## Contents
+
+- [Wait, no backend?](#wait-no-backend)
+- [How it works](#how-it-works)
+- [Why not Matrix, Discord, or Signal?](#why-not-matrix-discord-or-signal)
+- [What you can do today](#what-you-can-do-today)
+- [Getting Started](#getting-started)
+- [Command-line client (optional)](#command-line-client-optional)
+- [Building from source](#building-from-source)
+- [Access Control](#access-control)
+- [Privacy Model](#privacy-model)
+- [Architecture](#architecture)
+- [License](#license)
+
 ## Wait, no backend?
 
 Most apps you use are shaped like this:
@@ -76,19 +90,23 @@ homeserver to choose or operate, and rooms that persist when their creator is of
 
 ## Getting Started
 
-### Join the Official River Room
+The only thing you need to use River is Freenet. There is no River server to sign up for and no
+account to create.
 
-The easiest way to try River is to join the official Freenet chat room:
+1. Install Freenet by following the [quickstart guide](https://freenet.org/quickstart/).
+2. Click the invite link on that page to join the official River room.
 
-1. Install Freenet by following the [quickstart guide](https://freenet.org/quickstart/)
-2. Click the invite link on that page to join the official River room
+River opens in your browser and works on both desktop and mobile. From there you can create your
+own rooms and share their invite links; to join someone else's room you need an invitation from a
+current member.
 
-### Command Line Interface
+## Command-Line Client (optional)
 
-River includes `riverctl`, a CLI tool for interacting with River rooms from the command line.
-This is particularly useful for automation and AI agents.
+`riverctl` is a command-line client for driving River rooms from a terminal or script, handy for
+automation, bots, and AI agents. It is an alternative to the browser UI, not a requirement for
+using River.
 
-First, install the [Rust toolchain](https://rustup.rs/) if you haven't already, then:
+It is a Rust crate, so install the [Rust toolchain](https://rustup.rs/) first, then:
 
 ```bash
 cargo install riverctl
@@ -102,9 +120,10 @@ Commands include:
 
 Use `--format json` for machine-readable output. Run `riverctl --help` for full documentation.
 
-### Building and Running the UI
+## Building from Source
 
-To build and run the River UI locally for development:
+You only need this to hack on River itself; using River needs nothing but Freenet (above). To build
+and run the UI locally:
 
 1. Install dependencies:
 
@@ -151,15 +170,13 @@ To build and run the River UI locally for development:
 
 3. Open http://localhost:8080 in your browser
 
-The UI will run with example data and without attempting to sync with Freenet, making it ideal for
-testing and development.
+The UI runs with example data and without syncing to Freenet, which is ideal for development. Two
+feature flags control that behavior:
 
-### Key Development Features
+- **example-data**: populates the UI with sample rooms and messages
+- **no-sync**: disables Freenet synchronization for local testing
 
-- **example-data**: Populates the UI with sample rooms and messages
-- **no-sync**: Disables Freenet synchronization for local testing
-
-These features can be combined when building:
+They can be combined when building:
 
 ```bash
 # Build with example data
@@ -171,21 +188,6 @@ cargo make build-ui-no-sync
 # Build with both features
 cargo make build-ui-example-no-sync
 ```
-
-### Joining a Real Room
-
-To join a River chat room on Freenet, you'll need:
-
-1. The room's contract address (derived from its public key)
-2. An invitation from an existing member
-
-River runs in your browser, and is built to work both on mobile phones and desktop computers.
-
-1. Install Freenet
-2. Click a link to launch River in your browser
-3. Create or join a room using its contract address
-   - To join an existing room you need an invitation from a current member
-4. Choose your nickname and start chatting
 
 ## Access Control
 
