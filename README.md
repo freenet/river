@@ -1,8 +1,8 @@
 # River: group chat with no backend
 
 River is a group chat app whose backend is a global peer-to-peer network instead of cloud servers.
-Nobody runs a server for River, and nobody self-hosts: every room lives on Freenet, a peer-to-peer
-runtime you install once and then use the way a web app uses your browser. Because the network
+Nobody runs a server for River, and nobody self-hosts: every room lives on Freenet, a network
+made up of the computers of the people who run it. Because the network
 caches and serves each room from nodes near whoever's asking, a busy room gets *more* capacity as it
 gets more popular, the opposite of the server model where traffic is a bill someone has to pay.
 
