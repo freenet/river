@@ -111,12 +111,12 @@ pub(crate) fn message_display_text(
 /// unknown or their nickname is encrypted (riverctl does not decrypt
 /// private-room nicknames). Plain text without tokens is returned unchanged.
 pub(crate) fn render_mentions_for_terminal(room_state: &ChatRoomStateV1, text: &str) -> String {
-    river_core::mention::render_plaintext(text, |id| {
+    river_core::mention::render_plaintext(text, |r| {
         room_state
             .member_info
             .member_info
             .iter()
-            .find(|info| info.member_info.member_id == id)
+            .find(|info| r.matches(info.member_info.member_id))
             .and_then(|info| info.member_info.preferred_nickname.as_public_bytes())
             .map(|bytes| String::from_utf8_lossy(bytes).to_string())
     })
@@ -5243,6 +5243,27 @@ mod mention_cli_tests {
         assert_eq!(
             out,
             format!("hi {}!", encode_mention(member_id(&alice), "alice"))
+        );
+    }
+
+    #[test]
+    fn resolved_outgoing_mention_uses_base32_ref_not_hex() {
+        // The CLI send path must emit the truncated-base32 ref, never hex —
+        // this pins the property directly (not transitively via encode_mention).
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"alice".to_vec()))]);
+        let out = resolve_outgoing_mentions(&state, "hi @alice!");
+        let id = member_id(&alice);
+        assert!(
+            out.contains(&format!(
+                "rv:{}",
+                river_core::mention::member_id_to_short(id)
+            )),
+            "CLI send path emits the base32 ref: {out}"
+        );
+        assert!(
+            !out.contains(&river_core::mention::member_id_to_hex(id)),
+            "CLI send path must not emit hex: {out}"
         );
     }
 

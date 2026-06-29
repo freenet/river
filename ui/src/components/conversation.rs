@@ -430,8 +430,12 @@ pub(crate) fn decrypt_message_content(
 /// the token snapshot as fallback) and strip markdown formatting, so the preview
 /// reads as plain text. Caller truncates the result.
 fn clean_reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> String {
-    let with_mentions =
-        river_core::mention::render_plaintext(text, |id| member_names.get(&id).cloned());
+    let with_mentions = river_core::mention::render_plaintext(text, |r| {
+        member_names
+            .iter()
+            .find(|(id, _)| r.matches(**id))
+            .map(|(_, name)| name.clone())
+    });
     strip_markdown(&with_mentions)
 }
 
@@ -589,14 +593,18 @@ pub(crate) fn message_to_html_with_mentions(
             }
             MentionSegment::Mention(m) => {
                 let idx = chips.len();
-                let name = member_names
-                    .get(&m.member_id)
-                    .cloned()
+                // The token's reference is the member's short (truncated-base32)
+                // label; recover the full id by matching it against the room's
+                // known members so the chip stays clickable and self-highlighted.
+                // An unknown member yields `None` -> non-clickable snapshot chip.
+                let resolved = m.member_ref.resolve(member_names.keys().copied());
+                let name = resolved
+                    .and_then(|id| member_names.get(&id).cloned())
                     .unwrap_or(m.display_name);
                 chips.push(render_mention_chip_html(
-                    m.member_id,
+                    resolved,
                     &name,
-                    m.member_id == self_member_id,
+                    resolved == Some(self_member_id),
                 ));
                 working.push(OPEN);
                 working.push_str(&idx.to_string());
@@ -617,18 +625,30 @@ pub(crate) fn message_to_html_with_mentions(
 /// Build the inline chip markup for one mention. `name` is the resolved current
 /// nickname (or snapshot fallback) and is HTML-escaped — nicknames are
 /// attacker-controlled and this string goes through `dangerous_inner_html`
-/// (freenet/river#227). The `data-member-id` carries the lossless hex id so the
-/// document-level click interceptor can open the member-info modal.
-fn render_mention_chip_html(id: MemberId, name: &str, is_self: bool) -> String {
+/// (freenet/river#227).
+///
+/// `id` is the resolved member id, or `None` when the token's short reference
+/// names a member this client doesn't know. When present, `data-member-id`
+/// carries the lossless hex id (an in-session, full-precision handoff — NOT the
+/// wire token) so the document-level click interceptor can open the member-info
+/// modal. When absent the chip still renders the `@name` but is inert (nothing
+/// to open), which is the correct degradation for an unknown member.
+fn render_mention_chip_html(id: Option<MemberId>, name: &str, is_self: bool) -> String {
     let class = if is_self {
         "river-mention river-mention-self"
     } else {
         "river-mention"
     };
+    let data_member_id = match id {
+        Some(id) => format!(
+            " data-member-id=\"{}\"",
+            river_core::mention::member_id_to_hex(id)
+        ),
+        None => String::new(),
+    };
     format!(
-        "<span class=\"{class}\" data-river-mention=\"1\" data-member-id=\"{hex}\" \
+        "<span class=\"{class}\" data-river-mention=\"1\"{data_member_id} \
          role=\"button\" tabindex=\"0\" title=\"@{title}\">@{label}</span>",
-        hex = river_core::mention::member_id_to_hex(id),
         title = escape_html_attr(name),
         label = escape_html(name),
     )
@@ -3556,6 +3576,86 @@ mod tests {
         assert!(
             html.contains("data-member-id=\"000000000000000b\""),
             "{html}"
+        );
+    }
+
+    #[test]
+    fn current_token_chip_carries_full_id_resolved_from_short_ref() {
+        // The wire token now carries only the 8-char short ref; the chip must
+        // still recover the FULL id (for the click interceptor) by matching the
+        // short ref against the known members.
+        let id = mid_from("00000000000000aa");
+        let mut names = HashMap::new();
+        names.insert(id, "Alice".to_string());
+        let token = river_core::mention::encode_mention(id, "Alice");
+        assert!(
+            token.contains(&format!(
+                "rv:{}",
+                river_core::mention::member_id_to_short(id)
+            )),
+            "token uses the short base32 ref: {token}"
+        );
+        let html = message_to_html_with_mentions(&token, &names, mid_from("00000000000000ff"));
+        assert!(
+            html.contains("data-member-id=\"00000000000000aa\""),
+            "chip recovers the lossless id from the short ref: {html}"
+        );
+    }
+
+    #[test]
+    fn legacy_hex_mention_chip_is_clickable_even_when_member_unknown() {
+        // A legacy `rv:<hex>` token carries the full id, so its chip stays
+        // clickable (data-member-id present) even for a member we can't name.
+        let id = mid_from("0000000000000abc");
+        let names = HashMap::new(); // member not resolvable by name
+        let legacy = format!(
+            "hi @[Bob]({}{})!",
+            river_core::mention::REF_SCHEME,
+            river_core::mention::member_id_to_hex(id)
+        );
+        let html = message_to_html_with_mentions(&legacy, &names, mid_from("0000000000000001"));
+        assert!(
+            html.contains("data-member-id=\"0000000000000abc\""),
+            "legacy chip keeps the full id: {html}"
+        );
+        assert!(html.contains(">@Bob</span>"), "snapshot name used: {html}");
+    }
+
+    #[test]
+    fn unknown_short_mention_renders_inert_chip_without_member_id() {
+        // A current (short) token naming a member this client doesn't know
+        // cannot recover a full id, so the chip renders the snapshot name but
+        // carries no data-member-id (nothing for the interceptor to open).
+        let id = mid_from("0000000000000abc");
+        let names = HashMap::new();
+        let token = river_core::mention::encode_mention(id, "Ghost");
+        let html = message_to_html_with_mentions(&token, &names, mid_from("0000000000000001"));
+        assert!(
+            html.contains(">@Ghost</span>"),
+            "snapshot name shown: {html}"
+        );
+        assert!(
+            !html.contains("data-member-id"),
+            "unknown short ref must not fabricate a member id: {html}"
+        );
+    }
+
+    #[test]
+    fn legacy_hex_self_mention_gets_highlight() {
+        // A self-mention in an OLD (hex) message must still resolve to self and
+        // get the self-highlight class, just like the current short form.
+        let me = mid_from("0000000000000007");
+        let mut names = HashMap::new();
+        names.insert(me, "Me".to_string());
+        let legacy = format!(
+            "@[Me]({}{})",
+            river_core::mention::REF_SCHEME,
+            river_core::mention::member_id_to_hex(me)
+        );
+        let html = message_to_html_with_mentions(&legacy, &names, me);
+        assert!(
+            html.contains("river-mention-self"),
+            "legacy self-mention must get the self class: {html}"
         );
     }
 }
