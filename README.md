@@ -1,26 +1,78 @@
-# River - Decentralized Chat on Freenet
+# River: group chat with no backend
 
-River is a decentralized group chat system built on Freenet, designed to provide a secure and
-upgradeable alternative to traditional chat platforms. It features a web-based interface built with
-[Dioxus](https://dioxuslabs.com) and a modular contract architecture using the freenet-scaffold
-framework.
+River is a group chat app whose backend is a global peer-to-peer network instead of cloud servers.
+Nobody runs a server for River, and nobody self-hosts: every room lives on Freenet, a peer-to-peer
+runtime you install once and then use the way a web app uses your browser. Because the network
+caches and serves each room from nodes near whoever's asking, a busy room gets *more* capacity as it
+gets more popular, the opposite of the server model where traffic is a bill someone has to pay.
 
 ![Screenshot of chat interface](screenshot.png)
 
-## Roadmap
+## Wait, no backend?
 
-- [x] [Scaffold library](https://github.com/freenet/freenet-scaffold) to simplify contract
-      development
-- [x] Basic
-      [chat room contract](https://github.com/freenet/river/blob/main/common/src/room_state.rs)
-  - [x] Invite-only rooms
-  - [x] Private rooms with end-to-end encryption
-  - [x] One-click invite links and other access-control mechanisms
-  - [ ] [GhostKey](https://freenet.org/ghostkey) support as alternative to invite-only rooms
-- [x] Web-based [user interface](https://github.com/freenet/river/tree/main/ui) implemented in
-      Dioxus allowing viewing and modifying the chat room state
-- [x] Integration with Freenet to synchronize room contracts over the network
-- [ ] Message search and filtering
+Most apps you use are shaped like this:
+
+```
+your browser  ──▶  servers you operate  ──▶  a database you operate
+```
+
+River is shaped like this:
+
+```
+your browser  ──▶  Freenet, a global peer-to-peer network
+                   (that nobody operates for River)
+```
+
+There is no backend behind River that anyone runs or pays for. River is the chat app, but the thing
+it demonstrates is bigger: an application built this way doesn't need a backend at all. You install
+Freenet once, and any number of apps can run on it the same way.
+
+River is decentralized in the original sense of the word: no servers, no company, and no blockchain,
+token, or coins anywhere. It is just code running on a shared network.
+
+## How it works
+
+On Freenet, the unit of deployment is a *contract*: a small piece of WebAssembly that defines what
+valid state looks like and how it is allowed to change. A River room is one such contract. Its state
+(members, messages, bans, encryption keys) lives on the network, replicated across the nodes that
+care about it, and every change is cryptographically signed so any node can verify it without
+trusting anyone.
+
+That design has a few consequences worth calling out:
+
+- **A room outlives its creator's session.** It stays available on the network whether or not the
+  person who made it is online.
+- **Popularity adds capacity.** A room in demand is cached on more nodes, so it gets faster and more
+  resilient as it grows, not slower.
+- **State is self-validating.** Because every message and membership change carries its own
+  signature, anyone can host or migrate a room's data without being able to forge it.
+
+Global scalability is the property Freenet is designed around, using small-world routing so any
+node can locate any contract in a logarithmic number of hops. River inherits it for free.
+
+## Why not Matrix, Discord, or Signal?
+
+Those systems decentralize to different degrees, but each keeps servers somewhere:
+
+- **Discord, Slack, Signal:** central servers operated by a company.
+- **Matrix:** federated homeservers, each one run by someone.
+- **Nostr:** relays, which are servers.
+- **Briar, Tox:** genuinely serverless, but device-to-device, so both parties have to be online and
+  there is no persistent shared room hosted by the network.
+
+River keeps each room as state hosted by the Freenet network itself: no company server, no
+homeserver to choose or operate, and rooms that persist when their creator is offline.
+
+## What you can do today
+
+- ✅ Real-time group chat
+- ✅ Public rooms and private rooms (end-to-end encrypted)
+- ✅ One-click invite links
+- ✅ Invitation-tree moderation (manage or ban anyone you invited, or anyone downstream)
+- ✅ Runs in the browser, on desktop and mobile
+- ✅ Scriptable from the command line with `riverctl` (useful for bots and AI agents)
+- 🚧 Message search and filtering
+- 🚧 [GhostKey](https://freenet.org/ghostkey)-based anonymous joins
 
 ## Getting Started
 
@@ -70,7 +122,7 @@ To build and run the River UI locally for development:
    # Install Node.js (v20+) and npm
    # See https://nodejs.org/en/download for installation instructions.
    # Note: system packages (e.g. `apt-get install npm`) may ship outdated
-   # versions that don't work — install from the official site instead.
+   # versions that don't work. Install from the official site instead.
 
    # Install build tools
    cargo install dioxus-cli
@@ -135,31 +187,54 @@ River runs in your browser, and is built to work both on mobile phones and deskt
    - To join an existing room you need an invitation from a current member
 4. Choose your nickname and start chatting
 
-The interface provides tools for:
+## Access Control
 
-- **Member Management**: Invite, manage, and moderate members through an intuitive UI
-- **Room Settings**: Configure room parameters and permissions
+River manages room membership with an **invitation tree**:
 
-## Technical Details
+- The room owner sits at the root.
+- Any member can invite others, creating branches.
+- A member can manage or ban anyone they invited, or anyone further down their branch.
 
-### Project Structure
+```
+Room: freenet (Owner: owner)
+│
+├─── User: alice
+│    │
+│    ├─── User: bob
+│    │    │
+│    │    └─── User: charlie
+│    │
+│    ├─── User: dave
+│    │
+│    └─── User: eve
+│
+└─── User: frank
+```
 
-- [common](common/): Shared code for contracts and UI
-- [ui](ui/): Web-based user interface
-- [contracts](contracts/): River chat room contract implementation
+For example, if alice invited bob, who then invited charlie, alice can ban charlie directly, because
+charlie is downstream of her in the tree:
 
-### Access Control
+```
+Room: freenet (Owner: owner)
+│
+├─── User: alice
+│    │
+│    ├─── User: bob
+│    │    │
+│    │    └─── Banned User: charlie
+│    │
+│    ├─── User: dave
+│    │
+│    └─── User: eve
+│
+└─── User: frank
+```
 
-River uses an **invitation tree** model for managing room membership:
+Permissioning cascades down the tree: anyone higher in the chain has authority over those beneath
+them. [GhostKey](https://freenet.org/ghostkey)-based anonymous joins are planned as an alternative
+to invitation-only membership.
 
-- The room owner sits at the root of the tree
-- Each member can invite others, creating branches
-- Members can ban users they invited or anyone downstream
-- Future versions will support alternative mechanisms like:
-  - [GhostKeys](https://freenet.org/ghostkey) for anonymous participation
-  - One-click invite links for easier onboarding
-
-### Privacy Model
+## Privacy Model
 
 - **Public Rooms**: Readable by anyone with the contract address
 - **Private Rooms**: End-to-end encrypted using symmetric AES-256-GCM keys
@@ -169,11 +244,11 @@ River uses an **invitation tree** model for managing room membership:
   - Manual rotation available to room owners
   - Encrypted room names, member nicknames, and messages
 
-### What Private Rooms Hide — and What They Don't
+### What Private Rooms Hide, and What They Don't
 
 Private rooms encrypt every message body, every member nickname, and
 the room's name and description using a member-only AES-256-GCM
-secret. Without that secret, none of that content is readable — not
+secret. Without that secret, none of that content is readable: not
 by the network, not by Freenet nodes, not by anyone who happens to be
 storing the contract. The secret is rotated weekly, immediately when
 a member is banned, and on demand by the owner.
@@ -194,116 +269,33 @@ room's contract from the network can still observe:
 - The size of each message and roughly when it was sent
 - Overall activity volume and patterns
 
-Each member is identified by a per-room key, not a global identity —
+Each member is identified by a per-room key, not a global identity, so
 those keys don't by themselves link a member to anything outside the
-room. If your threat model requires unobservability — not just
-confidentiality — River alone is not sufficient today.
+room. If your threat model requires unobservability, not just
+confidentiality, River alone is not sufficient today.
 
-### Architecture
+## Architecture
 
-The system is built using:
+### Project Structure
 
-- **freenet-scaffold**: A Rust macro/crate for composable contract development
-- **Elliptic Curve Cryptography**: For authentication and message signing
-- **CBOR Serialization**: Efficient binary format for state storage
-- **Dioxus**: Rust framework for building reactive web UIs
+- [common](common/): Shared code for contracts and UI
+- [ui](ui/): Web-based user interface, built with [Dioxus](https://dioxuslabs.com) and compiled to
+  WebAssembly
+- [contracts](contracts/): River chat room contract implementation
 
-## Membership Management
+River is built with:
 
-River uses a flexible system for controlling room membership, starting with invitations but designed
-to support multiple mechanisms. This helps prevent spam while allowing room owners to maintain
-healthy communities.
+- **[freenet-scaffold](https://github.com/freenet/freenet-scaffold)**: a Rust macro/crate for
+  composable contract development
+- **Elliptic-curve cryptography**: for authentication and message signing
+- **CBOR serialization** (via [ciborium](https://crates.io/crates/ciborium)): an efficient binary
+  format for state storage
+- **[Dioxus](https://dioxuslabs.com)**: a Rust framework for building reactive web UIs
 
-### Current Mechanism: Invitation Tree
+### Contract State
 
-The initial implementation uses an invitation tree where:
-
-- Each room has an owner who forms the root
-- Members can invite others, creating branches
-- Members can manage users they invited or anyone downstream
-- This creates a hierarchical structure for managing permissions
-
-### Current Features
-
-River supports multiple room types and access controls:
-
-- **Invite-only Rooms**: Hierarchical invitation tree for membership management
-- **Private Rooms**: End-to-end encrypted with automatic secret rotation
-- **One-click Links**: Easy onboarding for new members
-
-### Future Mechanisms
-
-We're developing additional membership options:
-
-- **GhostKeys**: Anonymous participation using temporary identities
-- **Public Rooms**: Open participation with moderation tools
-
-```
-Room: freenet (Owner: owner)
-│
-├─── User: alice
-│    │
-│    ├─── User: bob
-│    │    │
-│    │    └─── User: charlie
-│    │
-│    ├─── User: dave
-│    │
-│    └─── User: eve
-│
-└─── User: frank
-```
-
-## Permissioning Example
-
-Consider the scenario where "alice" invites "bob", who subsequently invites "charlie". If "alice"
-decides to ban "charlie" from the room, she can directly enforce this action, exercising authority
-over users invited by her or those invited further down the chain.
-
-```
-Room: freenet (Owner: owner)
-│
-├─── User: alice
-│    │
-│    ├─── User: bob
-│    │    │
-│    │    └─── Banned User: charlie
-│    │
-│    ├─── User: dave
-│    │
-│    └─── User: eve
-│
-└─── User: frank
-```
-
-In this example:
-
-- "alice", being higher in the invite chain, has the authority to ban "charlie" directly,
-  irrespective of "bob" inviting "charlie" to the room.
-- This illustrates how permissioning cascades down the invitation tree, enabling users higher in the
-  hierarchy to enforce rules and manage the behavior of users beneath them.
-
-## Web Interface
-
-River provides a modern web-based interface built with [Dioxus](https://dioxuslabs.com), making it
-accessible from any device with a web browser.
-
-### Best Practices
-
-1. **Intuitive UI**: The web interface provides clear visual feedback and guidance for all actions
-2. **Error Handling**: The UI gracefully handles common scenarios like:
-   - Attempting to join a room without an invitation
-   - Managing duplicate nicknames
-   - Handling invalid room addresses
-   - Preventing duplicate invitations
-3. **Accessibility**: The interface follows web accessibility standards for inclusive use
-4. **Responsive Design**: Works seamlessly across desktop and mobile devices
-5. **Progressive Enhancement**: Core functionality works even with limited browser features
-
-## Contract Architecture
-
-The chat room contract is implemented using Freenet's composable state pattern. The core state
-structure is defined in [common/src/room_state.rs](common/src/room_state.rs):
+The chat room contract uses Freenet's composable state pattern. The core state structure is defined
+in [common/src/room_state.rs](common/src/room_state.rs):
 
 ```rust
 pub struct ChatRoomStateV1 {
@@ -317,7 +309,7 @@ pub struct ChatRoomStateV1 {
 }
 ```
 
-Each component is implemented as a separate module with its own state management:
+Each component is a separate module with its own state management:
 
 - [Configuration](common/src/room_state/configuration.rs): Room settings, privacy mode, and display metadata
 - [Bans](common/src/room_state/ban.rs): User banning and moderation
@@ -328,9 +320,8 @@ Each component is implemented as a separate module with its own state management
 - [Privacy](common/src/room_state/privacy.rs): Encryption primitives and sealed data types
 - [Upgrades](common/src/room_state/upgrade.rs): Contract upgrade mechanism
 
-The contract uses CBOR serialization via [ciborium](https://crates.io/crates/ciborium) for efficient
-storage and transmission. All state changes are signed using elliptic curve cryptography to ensure
-authenticity.
+All state changes are signed using elliptic-curve cryptography. That is what makes a room's data
+self-validating: any node can host or migrate it without being able to forge it.
 
 ## License
 
