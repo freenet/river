@@ -13,7 +13,7 @@ gets more popular, the opposite of the server model where traffic is a bill some
 - [Wait, no backend?](#wait-no-backend)
 - [How it works](#how-it-works)
 - [Why not Matrix, Discord, or Signal?](#why-not-matrix-discord-or-signal)
-- [What you can do today](#what-you-can-do-today)
+- [Features](#features)
 - [Getting Started](#getting-started)
 - [Command-line client (optional)](#command-line-client-optional)
 - [Building from source](#building-from-source)
@@ -77,16 +77,14 @@ Those systems decentralize to different degrees, but each keeps servers somewher
 River keeps each room as state hosted by the Freenet network itself: no company server, no
 homeserver to choose or operate, and rooms that persist when their creator is offline.
 
-## What you can do today
+## Features
 
-- ✅ Real-time group chat
-- ✅ Public rooms and private rooms (end-to-end encrypted)
-- ✅ One-click invite links
-- ✅ Invitation-tree moderation (manage or ban anyone you invited, or anyone downstream)
-- ✅ Runs in the browser, on desktop and mobile
-- ✅ Scriptable from the command line with `riverctl` (useful for bots and AI agents)
-- 🚧 Message search and filtering
-- 🚧 [GhostKey](https://freenet.org/ghostkey)-based anonymous joins
+- Real-time group chat
+- Public rooms and private rooms (end-to-end encrypted)
+- One-click invite links
+- Invitation-tree moderation (manage or ban anyone you invited, or anyone downstream)
+- Runs in the browser, on desktop and mobile
+- Scriptable from the command line with `riverctl` (useful for bots and AI agents)
 
 ## Getting Started
 
@@ -233,8 +231,7 @@ Room: freenet (Owner: owner)
 ```
 
 Permissioning cascades down the tree: anyone higher in the chain has authority over those beneath
-them. [GhostKey](https://freenet.org/ghostkey)-based anonymous joins are planned as an alternative
-to invitation-only membership.
+them.
 
 ## Privacy Model
 
