@@ -5247,6 +5247,27 @@ mod mention_cli_tests {
     }
 
     #[test]
+    fn resolved_outgoing_mention_uses_base32_ref_not_hex() {
+        // The CLI send path must emit the truncated-base32 ref, never hex —
+        // this pins the property directly (not transitively via encode_mention).
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"alice".to_vec()))]);
+        let out = resolve_outgoing_mentions(&state, "hi @alice!");
+        let id = member_id(&alice);
+        assert!(
+            out.contains(&format!(
+                "rv:{}",
+                river_core::mention::member_id_to_short(id)
+            )),
+            "CLI send path emits the base32 ref: {out}"
+        );
+        assert!(
+            !out.contains(&river_core::mention::member_id_to_hex(id)),
+            "CLI send path must not emit hex: {out}"
+        );
+    }
+
+    #[test]
     fn leaves_ambiguous_nickname_as_plain_text() {
         // Two members share the nickname "alice" → cannot disambiguate.
         let a = SigningKey::from_bytes(&[1u8; 32]);

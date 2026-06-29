@@ -3639,4 +3639,23 @@ mod tests {
             "unknown short ref must not fabricate a member id: {html}"
         );
     }
+
+    #[test]
+    fn legacy_hex_self_mention_gets_highlight() {
+        // A self-mention in an OLD (hex) message must still resolve to self and
+        // get the self-highlight class, just like the current short form.
+        let me = mid_from("0000000000000007");
+        let mut names = HashMap::new();
+        names.insert(me, "Me".to_string());
+        let legacy = format!(
+            "@[Me]({}{})",
+            river_core::mention::REF_SCHEME,
+            river_core::mention::member_id_to_hex(me)
+        );
+        let html = message_to_html_with_mentions(&legacy, &names, me);
+        assert!(
+            html.contains("river-mention-self"),
+            "legacy self-mention must get the self class: {html}"
+        );
+    }
 }

@@ -49,7 +49,7 @@
 use crate::room_state::member::MemberId;
 use freenet_scaffold::util::FastHash;
 
-/// Scheme prefix inside the mention token's reference, e.g. `rv:8f3a…`.
+/// Scheme prefix inside the mention token's reference, e.g. `rv:FPVN6PUN`.
 pub const REF_SCHEME: &str = "rv:";
 
 /// Maximum number of characters retained from the snapshot display name. The
@@ -96,10 +96,18 @@ impl MemberRef {
     /// ref carries it directly; a short ref is matched against `candidates` (the
     /// room's known members) and yields `None` when this client doesn't know the
     /// named member — in which case the mention degrades to its snapshot name.
+    ///
+    /// If two members in `candidates` share the same 8-char label (a ~2⁻⁴⁰
+    /// truncation collision — astronomically rare, and the same limit the rest
+    /// of the app already accepts when naming a member by short id), the lowest
+    /// id wins, so resolution is deterministic and reproducible rather than
+    /// dependent on candidate iteration order.
     pub fn resolve(&self, candidates: impl IntoIterator<Item = MemberId>) -> Option<MemberId> {
         match self {
             MemberRef::Legacy(full) => Some(*full),
-            MemberRef::Short(_) => candidates.into_iter().find(|id| self.matches(*id)),
+            // `min()` (not `find()`) so a short-label collision resolves to one
+            // well-defined member regardless of candidate iteration order.
+            MemberRef::Short(_) => candidates.into_iter().filter(|id| self.matches(*id)).min(),
         }
     }
 }
@@ -470,6 +478,84 @@ mod tests {
         assert_eq!(short.resolve([other]), None);
         // Legacy ref carries the id directly, no candidates needed.
         assert_eq!(MemberRef::Legacy(id).resolve(std::iter::empty()), Some(id));
+    }
+
+    #[test]
+    fn resolve_is_deterministic_on_truncated_label_collision() {
+        // The short label encodes the low 40 bits of the id, so two ids that
+        // share those bits collide. `resolve` must pick one well-defined member
+        // (lowest id) regardless of candidate order — not whatever iterates
+        // first. (~2⁻⁴⁰ event; this asserts the behaviour is at least defined.)
+        let low = mid(0x42);
+        let high = mid(0x42 + (1i64 << 40));
+        assert_eq!(
+            member_id_to_short(low),
+            member_id_to_short(high),
+            "low-40-bit-equal ids must share a label"
+        );
+        let r = MemberRef::Short(member_id_to_short(low));
+        assert_eq!(r.resolve([low, high]), Some(low));
+        assert_eq!(r.resolve([high, low]), Some(low), "order-independent");
+    }
+
+    #[test]
+    fn parses_mixed_legacy_and_current_tokens_in_one_body() {
+        // A single message may interleave an old hex token and a new base32 one
+        // (e.g. an edit, or a quote of an old message). Each parses to the right
+        // form independently and segment ordering is preserved.
+        let a = mid(0x0a);
+        let b = mid(0x0b);
+        let text = format!(
+            "x @[A](rv:{}) y {} z",
+            member_id_to_hex(a),    // legacy hex form
+            encode_mention(b, "B")  // current base32 form
+        );
+        let segs = parse_segments(&text);
+        assert_eq!(
+            segs,
+            vec![
+                MentionSegment::Text("x ".to_string()),
+                MentionSegment::Mention(Mention {
+                    member_ref: MemberRef::Legacy(a),
+                    display_name: "A".to_string()
+                }),
+                MentionSegment::Text(" y ".to_string()),
+                MentionSegment::Mention(Mention {
+                    member_ref: MemberRef::Short(member_id_to_short(b)),
+                    display_name: "B".to_string()
+                }),
+                MentionSegment::Text(" z".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn contains_mention_of_matches_legacy_hex_token() {
+        // A self-mention arriving in an OLD (hex) message must still be detected
+        // so it drives a notification. Hand-build the legacy form.
+        let me = mid(0x8f3a_2b1c_0000_d4e5u64 as i64);
+        let other = mid(7);
+        let text = format!("ping @[Me](rv:{})", member_id_to_hex(me));
+        assert!(contains_mention_of(&text, me));
+        assert!(!contains_mention_of(&text, other));
+    }
+
+    #[test]
+    fn multibyte_snapshot_name_round_trips_around_base32_ref() {
+        // The byte-scanning parser must handle multibyte text around a token and
+        // a multibyte snapshot name without splitting a codepoint.
+        let id = mid(0x1234_5678_9abc_def0u64 as i64);
+        let token = encode_mention(id, "名前🎉");
+        let segs = parse_segments(&format!("こんにちは {token}!"));
+        let m = segs
+            .iter()
+            .find_map(|s| match s {
+                MentionSegment::Mention(m) => Some(m),
+                MentionSegment::Text(_) => None,
+            })
+            .expect("exactly one mention");
+        assert!(m.member_ref.matches(id));
+        assert_eq!(m.display_name, "名前🎉");
     }
 
     #[test]
