@@ -6,18 +6,33 @@
 //! A mention is stored inline in the plaintext message `text` field as:
 //!
 //! ```text
-//! @[Display Name](rv:8f3a2b1c0000d4e5)
+//! @[Display Name](rv:FPVN6PUN)
 //! ```
 //!
-//! - `rv:<hex>` is the **authoritative** reference: 16 lowercase hex digits
-//!   encoding the member's [`MemberId`] (a 64-bit value). Clients re-resolve
-//!   the member's *current* nickname from `member_info` by this id, so the
-//!   rendered chip follows renames.
+//! - `rv:<ref>` is the **authoritative** reference. The current form is the
+//!   member's 8-char truncated-base32 [`MemberId`] `Display` string (e.g.
+//!   `FPVN6PUN`) — the *same* short label used everywhere else in the UI and
+//!   CLI to name a member, so mentions read consistently with the rest of the
+//!   app. Clients re-resolve the member's *current* nickname from `member_info`
+//!   by matching this label, so the rendered chip follows renames. The label is
+//!   *lossy* (40 of the id's 64 bits), so callers resolve it against the room's
+//!   known members rather than decoding it back to a [`MemberId`] directly.
 //! - `Display Name` is a **fallback snapshot** captured at send time, used only
 //!   when re-resolution is impossible (member not in `member_info`, an
 //!   undecryptable private-room nickname, or a client too old to parse the
 //!   token). Old clients render the raw token via markdown as a plain
 //!   `@Display Name` link — acceptable graceful degradation.
+//!
+//! ### Legacy reference form (compat — remove eventually)
+//!
+//! Messages sent before this change carry the reference as 16 lowercase hex
+//! digits (the *lossless* full 64-bit id), e.g. `@[Name](rv:8f3a2b1c0000d4e5)`.
+//! The parser still accepts that form so old messages keep resolving. New
+//! tokens are never emitted in hex. **TODO(mentions): once no message in
+//! circulation still carries a legacy `rv:<hex>` token, drop the hex branch of
+//! [`member_ref_from_str`] and the [`MemberRef::Legacy`] variant.** The two
+//! forms are unambiguous: the current form is exactly 8 base32 chars, the
+//! legacy form is up to 16 hex chars, and the parser tries base32 first.
 //!
 //! The token rides inside the existing `text` field, so it needs **no** change
 //! to `RoomMessageBody` / the contract, works in both public and private rooms
@@ -44,11 +59,49 @@ pub const MAX_SNAPSHOT_NAME_LEN: usize = 64;
 
 /// A parsed mention: the authoritative member reference plus the snapshot name
 /// carried in the token (which may be empty, or stale relative to the member's
-/// current nickname — callers should prefer a fresh lookup by `member_id`).
+/// current nickname — callers should prefer a fresh lookup by `member_ref`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Mention {
-    pub member_id: MemberId,
+    pub member_ref: MemberRef,
     pub display_name: String,
+}
+
+/// The member a mention token points at. The current wire form carries the
+/// member's truncated-base32 `Display` label, which is *lossy* and so cannot be
+/// turned back into a full [`MemberId`] on its own — it is matched against the
+/// room's known members. The legacy hex form carries the full id directly.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MemberRef {
+    /// Current form: the member's 8-char truncated-base32 `Display` label
+    /// (e.g. `FPVN6PUN`). Resolve it against the room via [`MemberRef::resolve`].
+    Short(String),
+    /// Legacy form: a full 64-bit id recovered from a 16-hex-digit token.
+    /// TODO(mentions): remove once no legacy `rv:<hex>` token remains in
+    /// circulation (see the module-level note).
+    Legacy(MemberId),
+}
+
+impl MemberRef {
+    /// Whether this reference names `id`. The current (short) form compares the
+    /// truncated-base32 label the rest of the app uses to identify a member
+    /// (`MemberId`'s `Display`); the legacy form compares the full 64-bit id.
+    pub fn matches(&self, id: MemberId) -> bool {
+        match self {
+            MemberRef::Short(label) => id.to_string() == *label,
+            MemberRef::Legacy(full) => *full == id,
+        }
+    }
+
+    /// The full [`MemberId`] this reference denotes, if recoverable. A legacy
+    /// ref carries it directly; a short ref is matched against `candidates` (the
+    /// room's known members) and yields `None` when this client doesn't know the
+    /// named member — in which case the mention degrades to its snapshot name.
+    pub fn resolve(&self, candidates: impl IntoIterator<Item = MemberId>) -> Option<MemberId> {
+        match self {
+            MemberRef::Legacy(full) => Some(*full),
+            MemberRef::Short(_) => candidates.into_iter().find(|id| self.matches(*id)),
+        }
+    }
 }
 
 /// One piece of a message body: either a run of plain text or a mention token.
@@ -58,21 +111,58 @@ pub enum MentionSegment {
     Mention(Mention),
 }
 
-/// Encode a [`MemberId`] as the 16-char lowercase-hex reference body (no scheme
-/// prefix). Lossless — unlike `MemberId`'s `Display`, which is *truncated*.
+/// Encode a [`MemberId`] as the 16-char lowercase-hex form. This is the
+/// *lossless* full-id encoding. It is NOT the wire-token reference (that is the
+/// truncated-base32 [`member_id_to_short`]); it is used only for in-session,
+/// full-precision handoffs that never persist — e.g. the rendered chip's
+/// `data-member-id` DOM attribute, read straight back by the click interceptor.
 pub fn member_id_to_hex(id: MemberId) -> String {
     // MemberId(FastHash(i64)); encode the raw 64 bits.
     format!("{:016x}", id.0 .0 as u64)
 }
 
-/// Parse a 1..=16 digit hex reference body back into a [`MemberId`]. Returns
-/// `None` for empty input, over-long input, or non-hex characters.
+/// Parse a 1..=16 digit hex string back into a [`MemberId`]. Returns `None` for
+/// empty input, over-long input, or non-hex characters. Counterpart of
+/// [`member_id_to_hex`] (the lossless full-id encoding), and also the decoder
+/// for the legacy `rv:<hex>` wire-token form (see [`member_ref_from_str`]).
 pub fn member_id_from_hex(s: &str) -> Option<MemberId> {
     if s.is_empty() || s.len() > 16 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let raw = u64::from_str_radix(s, 16).ok()?;
     Some(MemberId(FastHash(raw as i64)))
+}
+
+/// Encode a [`MemberId`] as its canonical short reference: the 8-char
+/// truncated-base32 `Display` label (e.g. `FPVN6PUN`) used everywhere else to
+/// name a member. This is the current wire-token reference form. It is *lossy*
+/// (40 of 64 bits), so it round-trips through [`MemberRef`] (resolved against
+/// the room's members), not back into a [`MemberId`] directly.
+pub fn member_id_to_short(id: MemberId) -> String {
+    id.to_string()
+}
+
+/// Parse a mention reference body (the part after `rv:`) into a [`MemberRef`].
+///
+/// Accepts both wire forms, current first: an 8-char truncated-base32 label
+/// (the [`member_id_to_short`] form) becomes [`MemberRef::Short`]; otherwise a
+/// 1..=16 hex-digit legacy id becomes [`MemberRef::Legacy`]. Returns `None` for
+/// anything else. The two forms can't collide — the current form is exactly 8
+/// base32 chars and is tried first, the legacy form is up to 16 hex chars.
+pub fn member_ref_from_str(s: &str) -> Option<MemberRef> {
+    if is_short_ref(s) {
+        return Some(MemberRef::Short(s.to_string()));
+    }
+    // TODO(mentions): remove this legacy hex fallback once no message in
+    // circulation still carries an `rv:<hex>` token (see module-level note).
+    member_id_from_hex(s).map(MemberRef::Legacy)
+}
+
+/// Whether `s` is a current-form short reference: exactly 8 characters from the
+/// RFC4648 base32 alphabet (uppercase `A`–`Z` and digits `2`–`7`), matching the
+/// `truncated_base32` output that backs `MemberId`'s `Display`.
+fn is_short_ref(s: &str) -> bool {
+    s.len() == 8 && s.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'))
 }
 
 /// Strip characters that would break token parsing (the bracket/paren
@@ -86,13 +176,14 @@ pub fn sanitize_name(name: &str) -> String {
     cleaned.trim().chars().take(MAX_SNAPSHOT_NAME_LEN).collect()
 }
 
-/// Build the wire token `@[name](rv:hex)` for a mention. The name is sanitized.
+/// Build the wire token `@[name](rv:FPVN6PUN)` for a mention, using the
+/// member's short (truncated-base32) reference. The name is sanitized.
 pub fn encode_mention(id: MemberId, display_name: &str) -> String {
     format!(
         "@[{}]({}{})",
         sanitize_name(display_name),
         REF_SCHEME,
-        member_id_to_hex(id)
+        member_id_to_short(id)
     )
 }
 
@@ -154,7 +245,7 @@ fn try_parse_token_at(text: &str, at: usize) -> Option<(Mention, usize)> {
     {
         return None;
     }
-    // Hex id runs to the closing `)`.
+    // The reference body runs to the closing `)`.
     let id_start = after + prefix_len;
     let mut k = id_start;
     while k < bytes.len() && bytes[k] != b')' {
@@ -163,10 +254,10 @@ fn try_parse_token_at(text: &str, at: usize) -> Option<(Mention, usize)> {
     if k >= bytes.len() {
         return None; // unterminated `(`
     }
-    let member_id = member_id_from_hex(&text[id_start..k])?;
+    let member_ref = member_ref_from_str(&text[id_start..k])?;
     Some((
         Mention {
-            member_id,
+            member_ref,
             display_name: name.to_string(),
         },
         k + 1,
@@ -186,22 +277,26 @@ pub fn parse_mentions(text: &str) -> Vec<Mention> {
 
 /// Whether `text` mentions the member with the given id.
 pub fn contains_mention_of(text: &str, id: MemberId) -> bool {
-    parse_mentions(text).iter().any(|m| m.member_id == id)
+    parse_mentions(text)
+        .iter()
+        .any(|m| m.member_ref.matches(id))
 }
 
 /// Render the text for a plain-text surface (e.g. the CLI), replacing each
-/// mention token with `@<name>`. `resolve` supplies the member's *current*
-/// display name; when it returns `None` the snapshot name in the token is used.
+/// mention token with `@<name>`. `resolve` maps the token's [`MemberRef`] to the
+/// member's *current* display name (typically by scanning the room's members
+/// with [`MemberRef::matches`]); when it returns `None` the snapshot name in the
+/// token is used.
 pub fn render_plaintext<F>(text: &str, mut resolve: F) -> String
 where
-    F: FnMut(MemberId) -> Option<String>,
+    F: FnMut(&MemberRef) -> Option<String>,
 {
     let mut out = String::with_capacity(text.len());
     for seg in parse_segments(text) {
         match seg {
             MentionSegment::Text(t) => out.push_str(&t),
             MentionSegment::Mention(m) => {
-                let name = resolve(m.member_id).unwrap_or(m.display_name);
+                let name = resolve(&m.member_ref).unwrap_or(m.display_name);
                 out.push('@');
                 out.push_str(&name);
             }
@@ -300,11 +395,81 @@ mod tests {
     fn encode_parse_round_trip() {
         let id = mid(0x8f3a_2b1c_0000_d4e5u64 as i64);
         let token = encode_mention(id, "Alice");
-        assert_eq!(token, "@[Alice](rv:8f3a2b1c0000d4e5)");
+        // The current form is the member's truncated-base32 Display label, not
+        // hex — consistent with how members are named everywhere else.
+        assert_eq!(token, format!("@[Alice](rv:{})", member_id_to_short(id)));
+        assert!(!token.contains(&member_id_to_hex(id)), "must not emit hex");
         let mentions = parse_mentions(&token);
         assert_eq!(mentions.len(), 1);
-        assert_eq!(mentions[0].member_id, id);
+        assert_eq!(
+            mentions[0].member_ref,
+            MemberRef::Short(member_id_to_short(id))
+        );
+        assert!(mentions[0].member_ref.matches(id));
         assert_eq!(mentions[0].display_name, "Alice");
+    }
+
+    #[test]
+    fn current_token_uses_truncated_base32_matching_display() {
+        // The token reference is byte-identical to the member's Display label
+        // (`MemberId`'s `Display`), which is exactly what the rest of the app
+        // shows. 8 base32 chars, no lowercase hex.
+        let id = mid(0x422a_2a8d_3edf_ea2bu64 as i64);
+        let short = member_id_to_short(id);
+        assert_eq!(short, id.to_string());
+        assert_eq!(short.len(), 8);
+        let token = encode_mention(id, "Ivvor");
+        assert!(token.contains(&format!("(rv:{short})")), "token: {token}");
+    }
+
+    #[test]
+    fn legacy_hex_token_still_parses_and_matches() {
+        // A token sent by an old client carries the lossless 16-hex-digit id.
+        let id = mid(0x8f3a_2b1c_0000_d4e5u64 as i64);
+        let legacy = format!("@[Name](rv:{})", member_id_to_hex(id));
+        let mentions = parse_mentions(&legacy);
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].member_ref, MemberRef::Legacy(id));
+        assert!(
+            mentions[0].member_ref.matches(id),
+            "legacy ref resolves to its id"
+        );
+    }
+
+    #[test]
+    fn member_ref_from_str_disambiguates_base32_from_hex() {
+        let id = mid(0x422a_2a8d_3edf_ea2bu64 as i64);
+        // 8-char base32 -> Short (tried first).
+        assert_eq!(
+            member_ref_from_str(&member_id_to_short(id)),
+            Some(MemberRef::Short(member_id_to_short(id)))
+        );
+        // 16-char hex -> Legacy.
+        assert_eq!(
+            member_ref_from_str(&member_id_to_hex(id)),
+            Some(MemberRef::Legacy(id))
+        );
+        // An 8-char body of only base32 digits (2-7) is the current form, NOT
+        // mis-read as hex — base32 is tried first and these are valid base32.
+        assert_eq!(
+            member_ref_from_str("23456723"),
+            Some(MemberRef::Short("23456723".to_string()))
+        );
+        // Garbage / empty / wrong length -> no ref.
+        assert_eq!(member_ref_from_str(""), None);
+        assert_eq!(member_ref_from_str("zz"), None);
+    }
+
+    #[test]
+    fn member_ref_resolve_recovers_member_id() {
+        let id = mid(0x1234_5678_9abc_def0u64 as i64);
+        let other = mid(99);
+        // Short ref recovers the full id only when the member is among candidates.
+        let short = MemberRef::Short(member_id_to_short(id));
+        assert_eq!(short.resolve([other, id]), Some(id));
+        assert_eq!(short.resolve([other]), None);
+        // Legacy ref carries the id directly, no candidates needed.
+        assert_eq!(MemberRef::Legacy(id).resolve(std::iter::empty()), Some(id));
     }
 
     #[test]
@@ -320,7 +485,7 @@ mod tests {
         let token = encode_mention(id, "ev)il](rv:dead)");
         let parsed = parse_mentions(&token);
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].member_id, id);
+        assert!(parsed[0].member_ref.matches(id));
         assert!(!parsed[0].display_name.contains([']', '(', ')']));
     }
 
@@ -339,12 +504,12 @@ mod tests {
             vec![
                 MentionSegment::Text("hi ".to_string()),
                 MentionSegment::Mention(Mention {
-                    member_id: a,
+                    member_ref: MemberRef::Short(member_id_to_short(a)),
                     display_name: "Ann".to_string()
                 }),
                 MentionSegment::Text(" and ".to_string()),
                 MentionSegment::Mention(Mention {
-                    member_id: b,
+                    member_ref: MemberRef::Short(member_id_to_short(b)),
                     display_name: "Bob".to_string()
                 }),
                 MentionSegment::Text("!".to_string()),
@@ -355,12 +520,12 @@ mod tests {
     #[test]
     fn empty_snapshot_name_is_valid() {
         let id = mid(42);
-        let token = format!("@[](rv:{})", member_id_to_hex(id));
+        let token = format!("@[](rv:{})", member_id_to_short(id));
         let mentions = parse_mentions(&token);
         assert_eq!(
             mentions,
             vec![Mention {
-                member_id: id,
+                member_ref: MemberRef::Short(member_id_to_short(id)),
                 display_name: String::new()
             }]
         );
@@ -419,8 +584,8 @@ mod tests {
             encode_mention(known, "OldName"),
             encode_mention(unknown, "Ghost")
         );
-        let rendered = render_plaintext(&text, |id| {
-            if id == known {
+        let rendered = render_plaintext(&text, |r| {
+            if r.matches(known) {
                 Some("NewName".to_string()) // current nickname overrides snapshot
             } else {
                 None // unknown member -> fall back to snapshot
@@ -452,7 +617,7 @@ mod tests {
         assert_eq!(
             parse_mentions(&out),
             vec![Mention {
-                member_id: alice,
+                member_ref: MemberRef::Short(member_id_to_short(alice)),
                 display_name: "Alice".to_string()
             }]
         );

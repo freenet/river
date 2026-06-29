@@ -111,12 +111,12 @@ pub(crate) fn message_display_text(
 /// unknown or their nickname is encrypted (riverctl does not decrypt
 /// private-room nicknames). Plain text without tokens is returned unchanged.
 pub(crate) fn render_mentions_for_terminal(room_state: &ChatRoomStateV1, text: &str) -> String {
-    river_core::mention::render_plaintext(text, |id| {
+    river_core::mention::render_plaintext(text, |r| {
         room_state
             .member_info
             .member_info
             .iter()
-            .find(|info| info.member_info.member_id == id)
+            .find(|info| r.matches(info.member_info.member_id))
             .and_then(|info| info.member_info.preferred_nickname.as_public_bytes())
             .map(|bytes| String::from_utf8_lossy(bytes).to_string())
     })
