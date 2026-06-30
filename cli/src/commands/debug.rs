@@ -58,6 +58,10 @@ struct RoomStateSummary {
 #[derive(Serialize)]
 struct RoomConfig {
     room_name: String,
+    /// Room description. `None` when unset; for a private room this is the
+    /// sealed bytes rendered lossily (riverctl does not unseal here), mirroring
+    /// `riverctl room config`'s no-flags display.
+    description: Option<String>,
     privacy_mode: String,
     configuration_version: u32,
     max_recent_messages: usize,
@@ -67,6 +71,33 @@ struct RoomConfig {
     max_members: usize,
     max_room_name: usize,
     max_room_description: usize,
+}
+
+impl RoomConfig {
+    /// Build the human/JSON view of a room's configuration. Mirrors the fields
+    /// `riverctl room config` prints with no flags — including the description,
+    /// which the dedicated `debug config` command previously omitted. The
+    /// description is rendered lossily and is NOT unsealed for a private room
+    /// (debug-only view), matching the no-flags `room config` path.
+    fn from_configuration(config: &river_core::room_state::configuration::Configuration) -> Self {
+        Self {
+            room_name: config.display.name.to_string_lossy(),
+            description: config
+                .display
+                .description
+                .as_ref()
+                .map(|d| d.to_string_lossy()),
+            privacy_mode: format!("{:?}", config.privacy_mode),
+            configuration_version: config.configuration_version,
+            max_recent_messages: config.max_recent_messages,
+            max_user_bans: config.max_user_bans,
+            max_message_size: config.max_message_size,
+            max_nickname_size: config.max_nickname_size,
+            max_members: config.max_members,
+            max_room_name: config.max_room_name,
+            max_room_description: config.max_room_description,
+        }
+    }
 }
 
 /// Build the JSON summary emitted by `debug contract-get --format json`.
@@ -330,24 +361,17 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
             let room_state = api.get_room(&owner_vk, false).await?;
 
             let config = &room_state.configuration.configuration;
-            let room_config = RoomConfig {
-                room_name: config.display.name.to_string_lossy(),
-                privacy_mode: format!("{:?}", config.privacy_mode),
-                configuration_version: config.configuration_version,
-                max_recent_messages: config.max_recent_messages,
-                max_user_bans: config.max_user_bans,
-                max_message_size: config.max_message_size,
-                max_nickname_size: config.max_nickname_size,
-                max_members: config.max_members,
-                max_room_name: config.max_room_name,
-                max_room_description: config.max_room_description,
-            };
+            let room_config = RoomConfig::from_configuration(config);
 
             match format {
                 OutputFormat::Human => {
                     println!("Room Configuration");
                     println!("==================");
                     println!("Room name: {}", room_config.room_name);
+                    println!(
+                        "Description: {}",
+                        room_config.description.as_deref().unwrap_or("(none)")
+                    );
                     println!("Privacy mode: {}", room_config.privacy_mode);
                     println!("Config version: {}", room_config.configuration_version);
                     println!();
@@ -407,6 +431,42 @@ mod tests {
         assert_eq!(json["room_name"], "My Room");
         assert_eq!(json["member_count"], 3);
         assert_eq!(json["message_count"], 42);
+    }
+
+    #[test]
+    fn room_config_includes_description() {
+        // Regression guard: `debug config` used to print the room name and
+        // every limit but silently drop the description, even though it is the
+        // command literally named "Show room configuration". Ensure the
+        // description survives both the struct and the JSON projection.
+        use river_core::room_state::configuration::Configuration;
+        use river_core::room_state::privacy::RoomDisplayMetadata;
+
+        let mut config = Configuration::default();
+        config.display =
+            RoomDisplayMetadata::public("My Room".to_string(), Some("Hello **world**".to_string()));
+
+        let rc = RoomConfig::from_configuration(&config);
+        assert_eq!(rc.room_name, "My Room");
+        assert_eq!(rc.description.as_deref(), Some("Hello **world**"));
+
+        let json = serde_json::to_value(&rc).unwrap();
+        assert_eq!(json["description"], "Hello **world**");
+    }
+
+    #[test]
+    fn room_config_description_none_when_unset() {
+        // A room with no description must serialize `description: null` (and
+        // render "(none)" in the human branch via `unwrap_or`), not panic or
+        // omit the field.
+        use river_core::room_state::configuration::Configuration;
+
+        let config = Configuration::default();
+        let rc = RoomConfig::from_configuration(&config);
+        assert_eq!(rc.description, None);
+
+        let json = serde_json::to_value(&rc).unwrap();
+        assert!(json["description"].is_null());
     }
 
     #[test]
