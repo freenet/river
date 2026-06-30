@@ -92,8 +92,18 @@ jobs:
     # Pin constant_time_eq to a version compatible with the pinned rustc
     # in rust-toolchain.toml. Newer versions require rustc ≥ 1.95 but we
     # pin rustc to keep WASM hashes deterministic; see rust-toolchain.toml.
+    #
+    # Pin `time` to 0.3.51: this repo has no committed Cargo.lock, so CI
+    # re-resolves dependencies on every run. time 0.3.52 changed the
+    # `Parsable::parse` signature, which cookie 0.18.1 (pulled in as a
+    # dev-dependency of room-contract via the `freenet` crate, exercised by
+    # `cargo test --package room-contract --features net`) cannot compile
+    # against. 0.3.51 still satisfies serde_with 3.x's `~0.3.47` floor.
+    # Remove once cookie ships a time-0.3.52-compatible release.
     - name: Pin dependencies compatible with pinned rustc
-      run: cargo update -p constant_time_eq --precise 0.4.2
+      run: |
+        cargo update -p constant_time_eq --precise 0.4.2
+        cargo update -p time --precise 0.3.51
 
     - name: Build Project
       run: cargo make build
@@ -254,11 +264,12 @@ jobs:
       run: npx playwright install --with-deps chromium firefox webkit
       working-directory: ./ui/tests
 
-    # Pin constant_time_eq — see comment in the build job.
+    # Pin constant_time_eq and time — see comment in the build job.
     - name: Pin dependencies compatible with pinned rustc
       run: |
         cargo generate-lockfile
         cargo update -p constant_time_eq --precise 0.4.2
+        cargo update -p time --precise 0.3.51
 
     - name: Build UI with example data
       run: cargo make build-ui-example-no-sync
