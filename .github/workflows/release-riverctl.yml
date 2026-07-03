@@ -1,0 +1,189 @@
+name: Release riverctl
+
+# Tag-triggered release for the `riverctl` CLI.
+#
+# This is riverctl ONLY. The River UI (Dioxus webapp) is published to Freenet
+# via `cargo make publish-river` and releases on its own cadence — do NOT wire
+# UI publishing into this workflow (see .claude/rules/river-publish.md).
+#
+# Release flow:
+#   1. Bump `version` in cli/Cargo.toml via a normal PR, merge to main.
+#      (CI's check-cli-wasm already guards the embedded room_contract.wasm.)
+#   2. git tag riverctl-v<version> && git push origin riverctl-v<version>
+#   3. This workflow publishes to crates.io AND cuts the GitHub release
+#      (with prebuilt binaries + auto-generated notes).
+#
+# The tag is both the trigger and the source of truth for the version: the
+# `verify` job refuses to run if the tag version != cli/Cargo.toml version, or
+# if the tagged commit is not on origin/main (publish-from-main gate).
+#
+# Requires repo secret CARGO_REGISTRY_TOKEN (crates.io publish-update token
+# scoped to river-core + riverctl).
+
+on:
+  push:
+    tags:
+      - 'riverctl-v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify tag matches cli/Cargo.toml and commit is on main
+        id: check
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          tag_version="${tag#riverctl-v}"
+          cargo_version="$(grep -m1 '^version' cli/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "tag version:   $tag_version"
+          echo "Cargo version: $cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Tag ($tag_version) does not match cli/Cargo.toml ($cargo_version). Bump the manifest, merge, then re-tag."
+            exit 1
+          fi
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tagged commit $GITHUB_SHA is not on origin/main. riverctl is published only from main."
+            exit 1
+          fi
+          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+
+  publish-crates:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show   # installs the channel pinned in rust-toolchain.toml
+      - name: Publish river-core then riverctl (skip if already on crates.io)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not set. Add it with: gh secret set CARGO_REGISTRY_TOKEN --repo freenet/river"
+            exit 1
+          fi
+          ua="river-release-ci (https://github.com/freenet/river)"
+
+          # Resolve a package's version via cargo metadata — robust to
+          # workspace inheritance (common/ uses `version.workspace = true`,
+          # so grepping its Cargo.toml would yield the literal string, not
+          # the resolved version).
+          pkg_version() {
+            cargo metadata --no-deps --format-version 1 \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(p['version'] for p in d['packages'] if p['name']=='$1'))"
+          }
+
+          # crates.io reports a specific version as present when the versions
+          # array contains "num":"<ver>". Uses the exact-match crate endpoint.
+          version_on_crates_io() {
+            local pkg="$1" ver="$2"
+            curl -fsSL -H "User-Agent: $ua" "https://crates.io/api/v1/crates/$pkg" \
+              | grep -q "\"num\":\"$ver\""
+          }
+
+          publish_if_needed() {
+            local pkg="$1"
+            local ver
+            ver="$(pkg_version "$pkg")"
+            if version_on_crates_io "$pkg" "$ver"; then
+              echo "==> $pkg $ver already on crates.io — skipping"
+              return 0
+            fi
+            echo "==> Publishing $pkg $ver"
+            cargo publish -p "$pkg"
+            # Wait for the sparse index to catch up so a dependent crate's
+            # verification build can resolve the just-published version.
+            for i in $(seq 1 30); do
+              if version_on_crates_io "$pkg" "$ver"; then
+                echo "==> $pkg $ver visible on crates.io"
+                return 0
+              fi
+              echo "    waiting for $pkg $ver to appear on crates.io ($i/30)..."
+              sleep 10
+            done
+            echo "::error::$pkg $ver did not appear on crates.io within timeout"
+            exit 1
+          }
+
+          # river-core (the common/ crate) is riverctl's only workspace
+          # dependency that must exist on crates.io before riverctl publishes.
+          publish_if_needed river-core
+          publish_if_needed riverctl
+
+  build-binaries:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain + target
+        shell: bash
+        run: |
+          rustup show                      # installs channel from rust-toolchain.toml
+          rustup target add ${{ matrix.target }}
+      - name: Build riverctl
+        run: cargo build --release -p riverctl --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="riverctl-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          tar -czf "$name.tar.gz" -C "target/${{ matrix.target }}/release" riverctl
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "riverctl-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/riverctl.exe" -DestinationPath "$name.zip"
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: riverctl-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  github-release:
+    needs: [verify, publish-crates, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create the GitHub release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "riverctl v${{ needs.verify.outputs.version }}" \
+            --generate-notes \
+            dist/*

@@ -80,13 +80,68 @@ git push origin main
 
 **Version policy:** the canonical source is `published-contract/contract-version.txt`, which `cargo make sign-webapp` increments and writes back each publish. NEVER base the version on wall-clock time (`date +%s / 60`) — the previous scheme bit us 2026-05-16 when the on-network version had drifted ahead of the timestamp-derived value. The counter file makes the version a strict monotonic local invariant; gaps are fine (the contract enforces monotonicity, not contiguity).
 
-## Publishing River UI + riverctl Together
+## Two independent release surfaces
 
-**CRITICAL:** When room contract WASM changes, both UI and riverctl must be republished — they embed the WASM and derive the contract key from it.
+The river repo publishes **two things on independent cadences** — do not conflate them:
+
+| Artifact | Where it goes | How it's released |
+|----------|---------------|-------------------|
+| **riverctl** (the CLI) | crates.io (`river-core` + `riverctl`) + GitHub release with prebuilt binaries | **tag-triggered CI** — see below |
+| **River UI** (Dioxus webapp) | Freenet (contract key `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`) | `cargo make publish-river` (the checklist above) |
+
+They are NOT 1:1 — a CLI-only fix ships riverctl without touching the UI, and a UI-only change publishes to Freenet without a new riverctl. The one coupling is room-contract WASM: when it changes, BOTH must be republished (they embed the WASM and derive the contract key from it).
+
+## Releasing riverctl (crates.io + GitHub release) — tag-triggered
+
+**Canonical path since 2026-07.** riverctl is released by pushing a git tag; the
+`.github/workflows/release-riverctl.yml` workflow then publishes to crates.io
+AND cuts the GitHub release (with prebuilt Linux/macOS/Windows binaries and
+auto-generated notes). This is why the GitHub releases page previously rotted at
+v0.1.22 while crates.io marched on — publishing used to be a laptop-only
+`cargo publish` that never touched GitHub.
 
 ```bash
-cargo make publish-all
+# 1. Bump the version in cli/Cargo.toml (via a normal PR), and — if the
+#    common/ crate (river-core) also changed — bump [workspace.package] version
+#    and riverctl's `river-core = { version = "..." }` requirement to match.
+#    Merge to main. (CI's check-cli-wasm guards the embedded room_contract.wasm.)
+
+# 2. From main, tag with the riverctl version and push the tag:
+git checkout main && git pull
+git tag riverctl-v$(grep -m1 '^version' cli/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+git push origin riverctl-v<version>
 ```
+
+The workflow then:
+1. **verify** — refuses to run unless the tag version == `cli/Cargo.toml` version
+   AND the tagged commit is on `origin/main` (publish-from-main gate).
+2. **publish-crates** — publishes `river-core` (only if that version isn't already
+   on crates.io, waiting for index propagation) then `riverctl`. Idempotent, so a
+   CLI-only release skips the unchanged river-core.
+3. **build-binaries** — cross-builds `riverctl` for x86_64 Linux, x86_64 + aarch64
+   macOS, and x86_64 Windows.
+4. **github-release** — creates the GitHub release with those binaries + notes.
+
+**Requires repo secret `CARGO_REGISTRY_TOKEN`** (a crates.io publish-update token
+scoped to `river-core` + `riverctl`):
+```bash
+gh secret set CARGO_REGISTRY_TOKEN --repo freenet/river
+```
+
+**Tag scheme:** `riverctl-v<version>` (the `riverctl-` prefix disambiguates from
+the historical bare `v*` tags and leaves room for a future `ui-v*` scheme). The
+version is riverctl's own (`cli/Cargo.toml`), independent of `river-core`'s
+workspace version.
+
+### Local `cargo make publish-all` (legacy / fallback)
+
+`cargo make publish-all` still exists and publishes UI + bumps + `cargo publish`
+riverctl from your laptop. Prefer the tag-triggered CI path above for riverctl —
+it publishes from main under review and keeps crates.io and GitHub in sync. Use
+`publish-all` only for the coupled UI+riverctl WASM-change case when you
+specifically need to drive the Freenet publish and the CLI publish together
+locally; even then, consider publishing the UI locally and releasing riverctl via
+the tag.
 
 ## How Delegate Migration Works
 
