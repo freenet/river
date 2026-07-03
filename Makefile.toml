@@ -592,7 +592,13 @@ echo "Bumped riverctl: $CURRENT → $NEW_VERSION"
 '''
 
 [tasks.publish-all]
-description = "Publish both River UI and riverctl together (keeps WASM in sync)"
+# NOTE: the canonical way to release riverctl is now the tag-triggered CI
+# workflow (.github/workflows/release-riverctl.yml) — push a `riverctl-v<ver>`
+# tag and CI publishes to crates.io AND cuts the GitHub release with binaries.
+# See .claude/rules/river-publish.md "Releasing riverctl". This local task
+# remains for the coupled UI+riverctl WASM-change case / as a fallback; it
+# publishes from your laptop and does NOT create a GitHub release.
+description = "Publish River UI + riverctl locally (legacy; prefer tag-triggered CI for riverctl)"
 dependencies = ["sync-cli-wasm"]
 script = '''
 #!/bin/bash

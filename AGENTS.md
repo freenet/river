@@ -143,8 +143,17 @@ cargo fmt
 
 ### Publishing & Verification
 
+There are **two independent release surfaces** (see `.claude/rules/river-publish.md`):
+- **River UI** (Dioxus webapp → Freenet): `cargo make publish-river`.
+- **riverctl** (CLI → crates.io + GitHub release): **tag-triggered CI**. Bump
+  `cli/Cargo.toml`, merge, then `git tag riverctl-v<version> && git push origin
+  riverctl-v<version>`. The `release-riverctl.yml` workflow publishes to crates.io
+  and cuts the GitHub release with prebuilt binaries. (Requires the
+  `CARGO_REGISTRY_TOKEN` repo secret.) Do NOT wire UI publishing into that
+  workflow — they release on independent cadences.
+
 ```bash
-cargo make publish-river                    # Publish release build to Freenet
+cargo make publish-river                    # Publish UI release build to Freenet
 ```
 
 The web container contract requires signed metadata with a version
