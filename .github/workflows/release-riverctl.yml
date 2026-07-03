@@ -17,13 +17,20 @@ name: Release riverctl
 # `verify` job refuses to run if the tag version != cli/Cargo.toml version, or
 # if the tagged commit is not on origin/main (publish-from-main gate).
 #
-# Requires repo secret CARGO_REGISTRY_TOKEN (crates.io publish-update token
-# scoped to river-core + riverctl).
+# Requires repo secret CARGO_REGISTRY_TOKEN — a crates.io token that can publish
+# river-core + riverctl. Least-privilege: prefer a token SCOPED to just those
+# two crates with the publish-update scope; a broader (all-crates) token widens
+# the blast radius if the secret ever leaks.
 
 on:
   push:
     tags:
       - 'riverctl-v*'
+
+# Least-privilege default: jobs get read-only GITHUB_TOKEN. github-release
+# elevates to `contents: write` for itself only (see that job).
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,7 +41,7 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
       - name: Verify tag matches cli/Cargo.toml and commit is on main
@@ -50,20 +57,72 @@ jobs:
             echo "::error::Tag ($tag_version) does not match cli/Cargo.toml ($cargo_version). Bump the manifest, merge, then re-tag."
             exit 1
           fi
-          git fetch origin main --quiet
+          # actions/checkout with fetch-depth:0 already populates
+          # refs/remotes/origin/*; refresh origin/main explicitly to the latest
+          # so the ancestry check runs against current main.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "::error::Tagged commit $GITHUB_SHA is not on origin/main. riverctl is published only from main."
             exit 1
           fi
           echo "version=$tag_version" >> "$GITHUB_OUTPUT"
 
-  publish-crates:
+  # Build the (recoverable) binaries BEFORE the irreversible crates.io publish,
+  # so an un-buildable target never leaves crates.io published-but-releaseless.
+  build-binaries:
     needs: verify
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install pinned Rust toolchain + target
+        shell: bash
+        run: |
+          rustup toolchain install       # installs the channel from rust-toolchain.toml
+          rustup target add "${{ matrix.target }}"
+      - name: Build riverctl
+        run: cargo build --release -p riverctl --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="riverctl-${VERSION}-${{ matrix.target }}"
+          tar -czf "$name.tar.gz" -C "target/${{ matrix.target }}/release" riverctl
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "riverctl-$env:VERSION-${{ matrix.target }}"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/riverctl.exe" -DestinationPath "$name.zip"
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: riverctl-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  publish-crates:
+    # Gate on the binary builds: don't run the irreversible crates.io publish
+    # unless every target compiled.
+    needs: [verify, build-binaries]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install pinned Rust toolchain
-        run: rustup show   # installs the channel pinned in rust-toolchain.toml
+        run: rustup toolchain install   # installs the channel from rust-toolchain.toml
       - name: Publish river-core then riverctl (skip if already on crates.io)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -84,12 +143,23 @@ jobs:
               | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(p['version'] for p in d['packages'] if p['name']=='$1'))"
           }
 
-          # crates.io reports a specific version as present when the versions
-          # array contains "num":"<ver>". Uses the exact-match crate endpoint.
+          # Is <pkg> <ver> already published? Read the SPARSE INDEX
+          # (index.crates.io) — the same source `cargo publish` resolves
+          # dependencies against, and one not subject to the crates.io JSON
+          # API's crawler/rate-limit blocking. Fetch into a variable first so a
+          # `curl | grep` SIGPIPE under `pipefail` can't misreport the result.
+          # A crate/version that doesn't exist yet 404s -> treated as absent.
           version_on_crates_io() {
-            local pkg="$1" ver="$2"
-            curl -fsSL -H "User-Agent: $ua" "https://crates.io/api/v1/crates/$pkg" \
-              | grep -q "\"num\":\"$ver\""
+            local pkg="$1" ver="$2" path body
+            case ${#pkg} in
+              1) path="1/$pkg" ;;
+              2) path="2/$pkg" ;;
+              3) path="3/${pkg:0:1}/$pkg" ;;
+              *) path="${pkg:0:2}/${pkg:2:2}/$pkg" ;;
+            esac
+            body="$(curl -fsSL --retry 3 --retry-delay 2 -H "User-Agent: $ua" \
+              "https://index.crates.io/$path" 2>/dev/null)" || return 1
+            grep -qF "\"vers\":\"$ver\"" <<<"$body"
           }
 
           publish_if_needed() {
@@ -106,13 +176,13 @@ jobs:
             # verification build can resolve the just-published version.
             for i in $(seq 1 30); do
               if version_on_crates_io "$pkg" "$ver"; then
-                echo "==> $pkg $ver visible on crates.io"
+                echo "==> $pkg $ver visible on the sparse index"
                 return 0
               fi
-              echo "    waiting for $pkg $ver to appear on crates.io ($i/30)..."
+              echo "    waiting for $pkg $ver to appear on the sparse index ($i/30)..."
               sleep 10
             done
-            echo "::error::$pkg $ver did not appear on crates.io within timeout"
+            echo "::error::$pkg $ver did not appear on the sparse index within timeout"
             exit 1
           }
 
@@ -121,69 +191,31 @@ jobs:
           publish_if_needed river-core
           publish_if_needed riverctl
 
-  build-binaries:
-    needs: verify
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-13
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install pinned Rust toolchain + target
-        shell: bash
-        run: |
-          rustup show                      # installs channel from rust-toolchain.toml
-          rustup target add ${{ matrix.target }}
-      - name: Build riverctl
-        run: cargo build --release -p riverctl --target ${{ matrix.target }}
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          name="riverctl-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
-          tar -czf "$name.tar.gz" -C "target/${{ matrix.target }}/release" riverctl
-          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $name = "riverctl-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/riverctl.exe" -DestinationPath "$name.zip"
-          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - uses: actions/upload-artifact@v4
-        with:
-          name: riverctl-${{ matrix.target }}
-          path: ${{ env.ASSET }}
-
   github-release:
     needs: [verify, publish-crates, build-binaries]
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # required to create the GitHub release
+      contents: write   # elevate above the top-level read-only floor to create the release
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Download binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Create or update GitHub release
         run: |
           set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "riverctl v${{ needs.verify.outputs.version }}" \
-            --generate-notes \
-            dist/*
+          # Idempotent: if the release already exists (e.g. a re-run after a
+          # transient failure), upload/replace the assets instead of aborting.
+          if ! gh release create "$TAG" \
+                --title "riverctl v${VERSION}" \
+                --generate-notes \
+                dist/*; then
+            echo "Release $TAG already exists — uploading assets with --clobber"
+            gh release upload "$TAG" dist/* --clobber
+          fi
