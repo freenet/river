@@ -79,8 +79,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # Both macOS targets build on Apple Silicon (macos-latest): the
+          # Intel `macos-13` runner is being retired by GitHub and no longer
+          # gets allocated, so x86_64-apple-darwin is cross-compiled from arm64
+          # (the `rustup target add` + `cargo build --target` step handles it).
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
