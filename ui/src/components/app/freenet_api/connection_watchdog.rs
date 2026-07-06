@@ -56,8 +56,19 @@
 //! * At most **one** probe is outstanding per idle period. A healthy idle room
 //!   costs one local GET per [`LIVENESS_IDLE_PROBE_MS`]; any inbound traffic
 //!   (the probe's own reply, or a real update) clears the probe.
-//! * Declaring death raises `ConnectionLost` exactly once; `SYNC_STATUS` then
-//!   flips to `Disconnected` and the watchdog goes dormant until reconnected.
+//! * Declaring death raises `ConnectionLost` **exactly once per stall episode**.
+//!   On declaring death the watchdog latches into
+//!   [`WatchdogState::ReconnectRequested`] and refuses to raise a second
+//!   `ConnectionLost` until it observes the reconnect actually happen — either
+//!   `SYNC_STATUS` leaving `Connected`, or fresh inbound WS activity (a
+//!   reconnect's `onopen` records activity, as does any message). This latch is
+//!   load-bearing because `SYNC_STATUS` flips to `Disconnected`
+//!   *asynchronously* in the synchronizer message loop: if that loop lags
+//!   longer than a probe tick plus [`LIVENESS_PROBE_TIMEOUT_MS`], a naive
+//!   watchdog would re-probe and fire a SECOND `ConnectionLost`, and each one
+//!   independently schedules a reconnect and bumps `consecutive_failures`,
+//!   producing overlapping reconnects and inflated backoff. The latch makes the
+//!   "exactly once" guarantee hold even under message-loop lag.
 //! * The probe timeout ([`LIVENESS_PROBE_TIMEOUT_MS`]) is far larger than a
 //!   local GET's real latency, so a momentarily slow node does not trigger a
 //!   false reconnect. If no room exists to probe, the watchdog never declares
@@ -148,6 +159,19 @@ pub enum WatchdogState {
         probe_sent_ms: u64,
         activity_seq_at_probe: u64,
     },
+    /// Death has been declared and a single `ConnectionLost` raised; the
+    /// watchdog is latched dormant until the reconnect is actually observed, so
+    /// it cannot raise a second `ConnectionLost` for the same stall episode
+    /// while the synchronizer message loop is still lagging in flipping
+    /// `SYNC_STATUS` to `Disconnected`. `activity_seq_at_reconnect` snapshots
+    /// the inbound-message counter at the moment death was declared — any later
+    /// increment (a reconnect's `onopen` records activity, as does any inbound
+    /// message) means the socket is live again and the latch releases back to
+    /// `Monitoring`. The connection leaving `Connected` also releases the latch
+    /// (handled at the top of `watchdog_tick`), so a genuinely-dead-then-
+    /// reconnected socket is never permanently suppressed. See the "Anti-storm
+    /// design" note (freenet/river#382).
+    ReconnectRequested { activity_seq_at_reconnect: u64 },
 }
 
 /// What the async loop should do this tick.
@@ -169,7 +193,15 @@ pub enum WatchdogAction {
 ///   (recording the current `activity_seq`).
 /// * `Probing` and any message arrived since the probe (`activity_seq` moved) →
 ///   healthy, back to `Monitoring`.
-/// * `Probing` and probe unanswered ≥ `probe_timeout_ms` → `Reconnect`.
+/// * `Probing` and probe unanswered ≥ `probe_timeout_ms` → `Reconnect`, and
+///   latch into `ReconnectRequested` (snapshotting `activity_seq`) so this same
+///   stall can't fire a second `ConnectionLost`.
+/// * `ReconnectRequested` → `Wait`, holding the latch until the reconnect is
+///   observed: `activity_seq` moving (a reconnect's `onopen`, or any inbound
+///   message) returns to `Monitoring`; the connection dropping (`!connected`,
+///   handled above) also returns to `Monitoring`. This guarantees at most one
+///   `ConnectionLost` per stall episode even while the synchronizer message
+///   loop lags in flipping `SYNC_STATUS` to `Disconnected`.
 /// * Otherwise → keep waiting.
 pub fn watchdog_tick(
     state: WatchdogState,
@@ -211,10 +243,48 @@ pub fn watchdog_tick(
                 // so a coarse clock can't hide the reply.
                 (WatchdogState::Monitoring, WatchdogAction::Wait)
             } else if now_ms.saturating_sub(probe_sent_ms) >= cfg.probe_timeout_ms {
-                // Probe unanswered past the timeout — treat as dead.
-                (WatchdogState::Monitoring, WatchdogAction::Reconnect)
+                // Probe unanswered past the timeout — treat as dead. Latch into
+                // `ReconnectRequested` (snapshotting `activity_seq`) rather than
+                // returning to `Monitoring`, so that a lagging synchronizer
+                // message loop — which flips `SYNC_STATUS` to `Disconnected`
+                // only asynchronously — can't drive us to re-probe and fire a
+                // SECOND `ConnectionLost` for this same stall episode.
+                //
+                // NOTE (LOW, #382 review): inbound decode is async
+                // (`onmessage` → `FileReader` → `onloadend` → result callback →
+                // `record_ws_activity`), so a main-thread stall longer than
+                // `probe_timeout_ms` while `Probing` could reach this arm even
+                // though a probe reply was already in flight, yielding a
+                // spurious reconnect. We accept that: the resulting reconnect is
+                // recoverable and CRDT-safe (the probe GET's resync merges
+                // idempotently), so adding timing complexity to avoid it isn't
+                // worth it — recorded here so the next reader knows it's
+                // understood, not overlooked.
+                (
+                    WatchdogState::ReconnectRequested {
+                        activity_seq_at_reconnect: activity_seq,
+                    },
+                    WatchdogAction::Reconnect,
+                )
             } else {
                 // Still within the probe window.
+                (state, WatchdogAction::Wait)
+            }
+        }
+        WatchdogState::ReconnectRequested {
+            activity_seq_at_reconnect,
+        } => {
+            if activity_seq != activity_seq_at_reconnect {
+                // Fresh inbound activity since death was declared — a
+                // reconnect's `onopen` (or any message) proves the socket is
+                // live again. Release the latch and monitor the new connection,
+                // so a genuine later stall is still caught.
+                (WatchdogState::Monitoring, WatchdogAction::Wait)
+            } else {
+                // No fresh activity yet and `SYNC_STATUS` hasn't flipped to
+                // `Disconnected` yet (message-loop lag). Hold the latch — do NOT
+                // fire another `ConnectionLost`. The `!connected` branch above
+                // is the other release path once the loop catches up.
                 (state, WatchdogAction::Wait)
             }
         }
@@ -483,7 +553,9 @@ mod tests {
 
     #[test]
     fn probing_timeout_without_reply_reconnects() {
-        // Probe unanswered (seq unchanged) for >= 20s → declare dead.
+        // Probe unanswered (seq unchanged) for >= 20s → declare dead AND latch
+        // into ReconnectRequested (snapshotting the current activity_seq) so the
+        // same stall can't fire a second ConnectionLost.
         let probe_sent = 100_000;
         let (state, action) = watchdog_tick(
             WatchdogState::Probing {
@@ -496,7 +568,12 @@ mod tests {
             3,
             CFG,
         );
-        assert_eq!(state, WatchdogState::Monitoring);
+        assert_eq!(
+            state,
+            WatchdogState::ReconnectRequested {
+                activity_seq_at_reconnect: 3,
+            }
+        );
         assert_eq!(action, WatchdogAction::Reconnect);
     }
 
@@ -552,10 +629,183 @@ mod tests {
         state = s;
         assert_eq!(a, WatchdogAction::Wait);
 
-        // t=80s: 20s into the probe, still no reply → reconnect.
+        // t=80s: 20s into the probe, still no reply → reconnect, latching into
+        // ReconnectRequested rather than bare Monitoring.
         let (s, a) = watchdog_tick(state, true, 80_000, last_activity, seq, CFG);
         state = s;
         assert_eq!(a, WatchdogAction::Reconnect);
+        assert_eq!(
+            state,
+            WatchdogState::ReconnectRequested {
+                activity_seq_at_reconnect: seq,
+            }
+        );
+    }
+
+    // --- ReconnectRequested latch: at most one ConnectionLost per stall ---
+
+    #[test]
+    fn reconnect_requested_holds_latch_and_does_not_refire() {
+        // Core anti-refire guard: while latched (SYNC_STATUS still Connected,
+        // still no inbound activity), even a wildly-idle tick must NOT declare a
+        // second death. This is the failure the guard exists to prevent.
+        let (state, action) = watchdog_tick(
+            WatchdogState::ReconnectRequested {
+                activity_seq_at_reconnect: 7,
+            },
+            true,
+            10_000_000, // absurdly idle
+            0,
+            7, // no new activity since death was declared
+            CFG,
+        );
+        assert_eq!(
+            state,
+            WatchdogState::ReconnectRequested {
+                activity_seq_at_reconnect: 7,
+            }
+        );
+        assert_eq!(action, WatchdogAction::Wait);
+    }
+
+    #[test]
+    fn reconnect_requested_releases_on_fresh_activity() {
+        // A reconnect's onopen (or any inbound message) bumps activity_seq past
+        // the snapshot → the latch releases back to Monitoring so a genuine
+        // later stall is still caught. This is what prevents permanent
+        // suppression of recovery.
+        let (state, action) = watchdog_tick(
+            WatchdogState::ReconnectRequested {
+                activity_seq_at_reconnect: 7,
+            },
+            true,
+            10_000_000,
+            0,
+            8, // one message (e.g. reconnect onopen) recorded since death
+            CFG,
+        );
         assert_eq!(state, WatchdogState::Monitoring);
+        assert_eq!(action, WatchdogAction::Wait);
+    }
+
+    #[test]
+    fn reconnect_requested_releases_when_disconnected() {
+        // The other release path: once the message loop flips SYNC_STATUS to
+        // Disconnected (connected == false), the latch clears to Monitoring via
+        // the top-of-function dormant branch, even if activity never moved.
+        let (state, action) = watchdog_tick(
+            WatchdogState::ReconnectRequested {
+                activity_seq_at_reconnect: 7,
+            },
+            false,
+            10_000_000,
+            0,
+            7,
+            CFG,
+        );
+        assert_eq!(state, WatchdogState::Monitoring);
+        assert_eq!(action, WatchdogAction::Wait);
+    }
+
+    /// Drive the pure machine across ticks the way the async loop does
+    /// (`state = next_state`), holding `connected` / `last_activity` /
+    /// `activity_seq` fixed across the window — i.e. the exact conditions of a
+    /// dead socket with a lagging message loop. Returns the final state and the
+    /// number of `Reconnect` actions observed.
+    fn drive_ticks(
+        mut state: WatchdogState,
+        connected: bool,
+        last_activity_ms: u64,
+        activity_seq: u64,
+        start_now: u64,
+        end_now: u64,
+        step: u64,
+        cfg: WatchdogConfig,
+    ) -> (WatchdogState, usize) {
+        let mut reconnects = 0usize;
+        let mut now = start_now;
+        while now <= end_now {
+            let (next, action) =
+                watchdog_tick(state, connected, now, last_activity_ms, activity_seq, cfg);
+            state = next;
+            if action == WatchdogAction::Reconnect {
+                reconnects += 1;
+            }
+            now += step;
+        }
+        (state, reconnects)
+    }
+
+    #[test]
+    fn at_most_one_connection_lost_per_stall_then_recovers() {
+        // This is the regression test for the #382 follow-up MEDIUM. Without the
+        // ReconnectRequested latch (i.e. if the timeout arm returned
+        // `Monitoring` like the pre-fix code), the lagged window in phase 1
+        // fires MULTIPLE Reconnects — the timeline is: probe at t=60s, death at
+        // t=80s (Reconnect #1, back to Monitoring), immediate re-probe at t=90s
+        // (already past the idle threshold), death again at t=110s (Reconnect
+        // #2), and so on every 30s. So the pre-fix code yields >= 3 reconnects
+        // across 10s..150s; the guard yields exactly 1. Phase 2 then proves the
+        // latch is not a permanent gag: after a real reconnect a fresh stall is
+        // still caught.
+        let seq_dead = 1u64; // frozen — nothing inbound on the dead socket
+
+        // Phase 1: dead socket, message loop LAGGED (connected stays true), no
+        // inbound activity. Expect EXACTLY ONE ConnectionLost.
+        let (state, reconnects) = drive_ticks(
+            WatchdogState::Monitoring,
+            true,
+            0,        // last activity at epoch
+            seq_dead, // frozen
+            10_000,
+            150_000,
+            10_000,
+            CFG,
+        );
+        assert_eq!(
+            reconnects, 1,
+            "a single stall episode must raise ConnectionLost exactly once, \
+             even while the message loop lags with SYNC_STATUS still Connected"
+        );
+        assert_eq!(
+            state,
+            WatchdogState::ReconnectRequested {
+                activity_seq_at_reconnect: seq_dead,
+            },
+            "should still be latched after the single fire"
+        );
+
+        // The reconnect finally lands: onopen records activity (seq moves) and
+        // SYNC_STATUS returns to Connected. The latch must release.
+        let seq_after_reconnect = seq_dead + 1;
+        let reconnect_at = 200_000u64;
+        let (state, action) = watchdog_tick(
+            state,
+            true,
+            reconnect_at,
+            reconnect_at,        // fresh activity timestamp
+            seq_after_reconnect, // onopen bumped the counter
+            CFG,
+        );
+        assert_eq!(state, WatchdogState::Monitoring);
+        assert_eq!(action, WatchdogAction::Wait);
+
+        // Phase 2: a SECOND, independent stall on the new connection (seq frozen
+        // again at its post-reconnect value). Recovery must still fire.
+        let (_state, reconnects2) = drive_ticks(
+            WatchdogState::Monitoring,
+            true,
+            reconnect_at,        // last activity = the reconnect
+            seq_after_reconnect, // frozen again — new socket also dead
+            reconnect_at + 10_000,
+            reconnect_at + 100_000,
+            10_000,
+            CFG,
+        );
+        assert_eq!(
+            reconnects2, 1,
+            "after a genuine reconnect, a fresh stall episode must be caught \
+             again — the latch must not permanently suppress recovery"
+        );
     }
 }
