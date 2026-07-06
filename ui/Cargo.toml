@@ -7,7 +7,9 @@ authors = ["Ian Clarke <ian@freenet.org>"]
 [features]
 default = [] # Add a default feature set if needed, often empty
 delegate = [] # Define the delegate feature
-example-data = []
+# `lipsum` is only used by the (feature-gated) example_data module, so it is an
+# optional dependency pulled in only when example-data is enabled.
+example-data = ["dep:lipsum"]
 no-sync = []
 
 [dependencies]
@@ -27,7 +29,9 @@ getrandom = { version = "0.2.15", features = ["js", "wasm-bindgen", "js-sys"], d
 
 # UI Framework
 dioxus = { version = "0.7.3", features = ["web"] }
-dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
+# Only `fa_solid_icons` are referenced in the UI (verified by grep). Dropping
+# the brands/regular feature sets trims their icon modules from the build.
+dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-solid"] }
 
 # Web-related
 web-sys = { workspace = true, features = [
@@ -58,7 +62,7 @@ web-sys = { workspace = true, features = [
 ] }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
-lipsum = "0.9.1"
+lipsum = { version = "0.9.1", optional = true }
 
 # Utilities
 blake3.workspace = true
