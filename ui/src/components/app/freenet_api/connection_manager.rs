@@ -200,10 +200,15 @@ mod imp {
                 {
                     move || {
                         info!("WebSocket connected successfully");
-                        // Reset the liveness clock on (re)connect so the
-                        // watchdog doesn't treat a freshly-opened, still-idle
-                        // socket as long-silent (freenet/river#382).
-                        crate::components::app::freenet_api::connection_watchdog::record_ws_activity();
+                        // Record a new socket generation on (re)connect. This
+                        // both resets the liveness clock (so the watchdog doesn't
+                        // treat a freshly-opened, still-idle socket as
+                        // long-silent) AND advances the connection-generation
+                        // counter that releases the watchdog's ReconnectRequested
+                        // latch — proof that a reconnect actually landed, as
+                        // opposed to a straggler message on the old condemned
+                        // socket (freenet/river#382; Codex #384 review).
+                        crate::components::app::freenet_api::connection_watchdog::record_ws_connected();
                         // Clear the reload-loop guard so a future node restart can
                         // trigger a fresh reload without being falsely detected as a loop.
                         if let Some(window) = web_sys::window() {
