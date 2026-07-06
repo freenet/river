@@ -481,3 +481,64 @@ test.describe("Auto-scroll to bottom on refresh", () => {
     expect(sentinelInView).toBe(true);
   });
 });
+
+// Mobile self-message overflow: a SELF (right-aligned) bubble must stay fully
+// within a narrow viewport. Regression: a self reply whose reply-strip preview
+// held a long unbreakable URL rendered nowrap, driving the bubble to its full
+// `max-w-prose` (65ch) width. As a non-stretched flex item under the self
+// bubbles wrapper's `items-end`, that wrapper sized to the bubble's content and
+// escaped the `max-w-[75%]` column, so the bubble spilled off BOTH edges of a
+// 375px screen (clipped, message text cut off left and right), exactly the
+// "text going off the edge" report. Received (left-aligned) bubbles were fine
+// because their wrapper is a plain block that already fills the column. Fixed
+// by `min-w-0 max-w-full` on the per-message wrapper (conversation.rs). The
+// example data carries a self reply to the long-URL message so this reproduces.
+test.describe("Self message bubble mobile overflow", () => {
+  test.use({ viewport: { width: 375, height: 667 } });
+
+  test("no message bubble overflows either edge of a 375px viewport", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    // The specific reproducer must be present: a reply strip quoting the long
+    // URL. (Its textContent keeps the full preview even though CSS ellipsizes
+    // it, so this also proves the strip rendered rather than being absent.)
+    const longReplyStrip = page
+      .locator(".reply-strip")
+      .filter({ hasText: "longlongurl" })
+      .first();
+    await expect(longReplyStrip).toBeVisible({ timeout: 10_000 });
+
+    // Horizontal position is independent of vertical scroll, so every rendered
+    // bubble can be checked at once: each must lie within [0, viewportWidth].
+    // Before the fix the self reply bubble sat at left ≈ -169 / right ≈ 359 in
+    // a 375px viewport (width 528). After the fix it is clamped to the column.
+    const overflow = await page.evaluate(() => {
+      const vw = window.innerWidth;
+      const bad: Array<{ left: number; right: number; width: number; text: string }> = [];
+      for (const b of Array.from(document.querySelectorAll(".max-w-prose"))) {
+        const r = b.getBoundingClientRect();
+        if (r.width === 0) continue;
+        if (r.left < -1 || r.right > vw + 1) {
+          bad.push({
+            left: Math.round(r.left),
+            right: Math.round(r.right),
+            width: Math.round(r.width),
+            text: (b.textContent || "").trim().replace(/\s+/g, " ").slice(0, 40),
+          });
+        }
+      }
+      return { vw, bad };
+    });
+
+    expect(
+      overflow.bad,
+      `message bubbles overflowing the ${overflow.vw}px viewport: ${JSON.stringify(
+        overflow.bad
+      )}`
+    ).toEqual([]);
+  });
+});
