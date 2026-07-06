@@ -2294,10 +2294,20 @@ fn MessageGroupComponent(
                         let reply_target_id_val = msg.reply_to_message_id.clone();
 
                         rsx! {
+                            // `min-w-0 max-w-full` clamps this per-message wrapper to
+                            // its column (`max-w-[75%]`) width. For a SELF message the
+                            // enclosing bubbles wrapper is `flex flex-col items-end`, so
+                            // without this the wrapper is a non-stretched flex item that
+                            // sizes to the bubble's `max-w-prose` (65ch) content width and
+                            // escapes the column. A self reply whose nowrap reply-strip
+                            // preview holds a long URL then overflows both edges of a
+                            // narrow mobile viewport (clipped, text cut off). `min-w-0`
+                            // lets the flex item shrink below its content's min-size so
+                            // `max-w-full` can actually take effect.
                             div {
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
-                                class: "flex flex-col group",
+                                class: "flex flex-col group min-w-0 max-w-full",
                                 // Container for message bubble + hover actions
                                 div {
                                     class: "relative",

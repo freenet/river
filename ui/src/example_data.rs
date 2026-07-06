@@ -403,6 +403,49 @@ fn add_example_messages(
         messages.messages.push(long_url_msg);
     }
 
+    // A SELF (owner-authored) reply whose quoted preview is the long URL above.
+    // The reply strip renders its preview with `white-space: nowrap`, so an
+    // unbreakable long URL in the preview drives the bubble to its full
+    // `max-w-prose` width. On a self (right-aligned) message that used to
+    // overflow the viewport on narrow mobile screens, clipping the bubble off
+    // both edges. Kept in example data so the mobile-overflow Playwright
+    // regression test has a self bubble that WOULD overflow without the
+    // per-message width clamp.
+    if let Some(long_url_msg) = messages.messages.last().cloned() {
+        let target_id = long_url_msg.id();
+        let target_author_id = long_url_msg.message.author;
+        let target_author_name = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|m| m.member_info.member_id == target_author_id)
+            .map(|m| m.member_info.preferred_nickname.to_string_lossy())
+            .unwrap_or_else(|| "someone".to_string());
+        let target_preview = match &long_url_msg.message.content {
+            RoomMessageBody::Public { data, .. } => {
+                let preview_len = data.len().min(120);
+                String::from_utf8_lossy(&data[..preview_len]).to_string()
+            }
+            _ => String::new(),
+        };
+        current_time_ms += 30_000;
+        let self_reply_to_long_url = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: *owner_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::reply(
+                    "yep, seen that one".to_string(),
+                    target_id,
+                    target_author_name,
+                    target_preview,
+                ),
+            },
+            owner_key,
+        );
+        messages.messages.push(self_reply_to_long_url);
+    }
+
     // Add reactions to messages from OTHER members (not owner)
     // Rule: One reaction per user per message
     // In "Your Private Room" the owner IS self, so this shows self reacting to others
