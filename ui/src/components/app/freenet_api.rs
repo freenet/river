@@ -5,6 +5,7 @@
 
 pub mod backward_probe;
 pub mod connection_manager;
+pub mod connection_watchdog;
 pub mod constants;
 pub mod error;
 pub mod freenet_synchronizer;

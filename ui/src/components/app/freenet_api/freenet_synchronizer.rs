@@ -168,6 +168,14 @@ impl FreenetSynchronizer {
                 }
             }
 
+            // Start the WebSocket liveness watchdog (freenet/river#382). It
+            // detects a half-open / silently-dead socket — one the browser
+            // never reports as closed/errored — and raises ConnectionLost so
+            // the normal reconnect + re-subscribe + re-GET path recovers the
+            // frozen live-update stream. Dormant unless SYNC_STATUS==Connected,
+            // so it can't add reconnect pressure while already reconnecting.
+            super::connection_watchdog::spawn_liveness_watchdog(message_tx.clone());
+
             info!("Sending initial Connect message");
             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect) {
                 error!("Failed to send Connect message: {}", e);

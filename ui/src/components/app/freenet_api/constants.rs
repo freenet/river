@@ -50,3 +50,22 @@ pub const REPUT_DELAY_MS: u64 = 20000;
 /// Timeout for pending invitation GET requests (ms).
 /// Must be > Freenet's OPERATION_TTL (60s) to avoid premature retry.
 pub const INVITATION_TIMEOUT_MS: u64 = 90_000;
+
+// --- WebSocket liveness watchdog (freenet/river#382) ---
+
+/// How often the liveness watchdog wakes to evaluate connection health (ms).
+/// Finer than the probe timeout so the timeout is checked promptly once armed.
+pub const WATCHDOG_TICK_MS: u64 = 10_000;
+
+/// Silence window (ms with no inbound WS traffic) before the watchdog sends a
+/// liveness probe. A healthy but idle room receives no updates, so silence
+/// alone is not proof of death — this only decides *when to actively probe*.
+/// Kept comfortably above normal update cadence so an active room never probes.
+pub const LIVENESS_IDLE_PROBE_MS: u64 = 60_000;
+
+/// How long (ms) the watchdog waits for a liveness probe to be answered before
+/// treating the socket as dead. The probe is a `Get` of an already-subscribed
+/// room, which the node answers from its local fresh copy, so this is far
+/// larger than the real round-trip and a momentarily slow node can't trigger a
+/// false reconnect.
+pub const LIVENESS_PROBE_TIMEOUT_MS: u64 = 20_000;

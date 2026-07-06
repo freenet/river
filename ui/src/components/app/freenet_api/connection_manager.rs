@@ -79,6 +79,11 @@ mod imp {
             let web_api = WebApi::start(
                 websocket.clone(),
                 move |result: Result<HostResponse, ClientError>| {
+                    // Every inbound message — success OR error — proves the
+                    // socket delivered bytes, so it feeds the liveness watchdog
+                    // (freenet/river#382). Recorded before any early return.
+                    crate::components::app::freenet_api::connection_watchdog::record_ws_activity();
+
                     // Check for AUTH_TOKEN_INVALID error - this means the node was restarted
                     // and we need to refresh the page to get a new valid token
                     if let Err(ref e) = result {
@@ -195,6 +200,10 @@ mod imp {
                 {
                     move || {
                         info!("WebSocket connected successfully");
+                        // Reset the liveness clock on (re)connect so the
+                        // watchdog doesn't treat a freshly-opened, still-idle
+                        // socket as long-silent (freenet/river#382).
+                        crate::components::app::freenet_api::connection_watchdog::record_ws_activity();
                         // Clear the reload-loop guard so a future node restart can
                         // trigger a fresh reload without being falsely detected as a loop.
                         if let Some(window) = web_sys::window() {
