@@ -78,6 +78,22 @@ strip = true        # Strip symbols from binary
 [profile.release.package."*"]
 opt-level = 'z'     # Optimize all dependencies for size as well
 
+# Profile used by `dx build --release` for the web/WASM UI target.
+#
+# The Dioxus CLI (dx) builds the web app under a profile named `wasm-release`.
+# If we do NOT define it here, dx synthesises an ad-hoc one that inherits
+# `release` but overrides `opt-level` to "s". By defining it ourselves, dx
+# uses THIS profile verbatim (it only force-disables `strip`, applying strip
+# later via wasm-opt), so we get `opt-level = "z"` (size) for the UI crate and
+# all its wasm deps instead of dx's "s".
+#
+# This profile is UI-only: the room-contract and chat-delegate WASMs are built
+# with `--profile release` (see Makefile.toml), so their bytes (and therefore
+# the delegate/contract keys) are unaffected by anything here.
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+
 [profile.wasm-dev]
 inherits = "dev"
 opt-level = 1
