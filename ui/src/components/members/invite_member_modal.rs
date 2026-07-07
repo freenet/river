@@ -197,6 +197,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 InvitationContent {
                                     invitation_text: default_msg,
                                     invitation_url: invite_url.clone(),
+                                    invitation_code: invite_code.clone(),
                                     invitation: Rc::new(invitation.clone()),
                                     is_active: is_active,
                                     regenerate_trigger: regenerate_trigger
@@ -236,27 +237,41 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 fn InvitationContent(
     invitation_text: String,
     invitation_url: String,
+    invitation_code: String,
     invitation: Rc<Invitation>,
     is_active: Signal<bool>,
     regenerate_trigger: Signal<i32>,
 ) -> Element {
     let mut copy_msg_text = use_signal(|| "Copy Message".to_string());
     let mut copy_link_text = use_signal(|| "Copy Link".to_string());
+    let mut copy_code_text = use_signal(|| "Copy Code".to_string());
 
     // Clone the texts for use in the closures
     let invitation_text_for_clipboard = invitation_text.clone();
     let invitation_url_for_clipboard = invitation_url.clone();
+    let invitation_code_for_clipboard = invitation_code.clone();
 
     let copy_message_to_clipboard = move |_| {
         crate::util::copy_to_clipboard(&invitation_text_for_clipboard);
         copy_msg_text.set("Copied!".to_string());
         copy_link_text.set("Copy Link".to_string());
+        copy_code_text.set("Copy Code".to_string());
     };
 
     let copy_link_to_clipboard = {
         move |_| {
             crate::util::copy_to_clipboard(&invitation_url_for_clipboard);
             copy_link_text.set("Copied!".to_string());
+            copy_msg_text.set("Copy Message".to_string());
+            copy_code_text.set("Copy Code".to_string());
+        }
+    };
+
+    let copy_code_to_clipboard = {
+        move |_| {
+            crate::util::copy_to_clipboard(&invitation_code_for_clipboard);
+            copy_code_text.set("Copied!".to_string());
+            copy_link_text.set("Copy Link".to_string());
             copy_msg_text.set("Copy Message".to_string());
         }
     };
@@ -279,6 +294,39 @@ fn InvitationContent(
                     onclick: copy_link_to_clipboard,
                     Icon { icon: FaCopy, width: 14, height: 14 }
                     span { "{copy_link_text}" }
+                }
+            }
+        }
+
+        // Portable invite-code section. The link above bakes in the current
+        // host (e.g. a localhost node or the production gateway); a user on a
+        // different host (try.freenet.org, another peer) would otherwise have
+        // to hand-edit the host out of the link. This bare code is
+        // host-independent — the recipient pastes it into River's
+        // "Enter Invite Code" box on ANY host/peer (freenet/river#381). It is
+        // the exact same bearer credential the link carries in its
+        // `?invitation=` parameter, so it is no more sensitive to share than
+        // the link, and the same "share privately with one person" warning
+        // above applies.
+        div { class: "mb-4",
+            label { class: "block text-sm font-medium text-text mb-1", "Portable invite code:" }
+            p { class: "text-xs text-text-muted mb-1",
+                "Works on any host or peer. The recipient pastes this into River's \u{201c}Enter Invite Code\u{201d} box."
+            }
+            div { class: "flex gap-2",
+                input {
+                    "data-testid": "invite-code-input",
+                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text font-mono truncate",
+                    r#type: "text",
+                    value: invitation_code,
+                    readonly: true
+                }
+                button {
+                    "data-testid": "invite-copy-code-button",
+                    class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors flex items-center gap-2",
+                    onclick: copy_code_to_clipboard,
+                    Icon { icon: FaCopy, width: 14, height: 14 }
+                    span { "{copy_code_text}" }
                 }
             }
         }
@@ -307,6 +355,7 @@ fn InvitationContent(
                 onclick: move |_| {
                     copy_msg_text.set("Copy Message".to_string());
                     copy_link_text.set("Copy Link".to_string());
+                    copy_code_text.set("Copy Code".to_string());
                     let current_value = *regenerate_trigger.read();
                     regenerate_trigger.set(current_value + 1);
                 },
