@@ -1,6 +1,7 @@
 pub(crate) mod create_room_modal;
 pub(crate) mod dm_rail_section;
 pub(crate) mod edit_room_modal;
+pub(crate) mod join_with_code_modal;
 pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
@@ -12,6 +13,7 @@ use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
+use crate::components::room_list::join_with_code_modal::JoinWithCodeModal;
 use crate::room_data::CurrentRoom;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::error;
@@ -19,7 +21,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::{
     icons::fa_solid_icons::{
         FaArrowLeft, FaArrowsUpDown, FaChevronDown, FaChevronUp, FaComments, FaFileImport, FaLock,
-        FaPlus, FaTriangleExclamation,
+        FaPlus, FaRightToBracket, FaTriangleExclamation,
     },
     Icon,
 };
@@ -72,6 +74,7 @@ fn format_build_time_local() -> String {
 #[component]
 pub fn RoomList() -> Element {
     let mut import_modal_active = use_signal(|| false);
+    let mut join_code_modal_active = use_signal(|| false);
 
     // Drag-and-drop reorder state (a local view preference). `dragged_room`
     // is the row currently being dragged; `drag_over_room` is the row the
@@ -544,6 +547,16 @@ pub fn RoomList() -> Element {
 
             // Bottom actions
             div { class: "p-3 border-t border-border space-y-2",
+                // Enter a portable invite code (freenet/river#381). Lets a user
+                // join a room from a bare code — no host-baked link needed —
+                // which is the only practical path on hosts like try.freenet.org.
+                button {
+                    "data-testid": "join-with-code-button",
+                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
+                    onclick: move |_| join_code_modal_active.set(true),
+                    Icon { width: 14, height: 14, icon: FaRightToBracket }
+                    span { "Enter Invite Code" }
+                }
                 button {
                     class: "w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
                     onclick: move |_| import_modal_active.set(true),
@@ -566,6 +579,9 @@ pub fn RoomList() -> Element {
         }
         ImportIdentityModal {
             is_active: import_modal_active
+        }
+        JoinWithCodeModal {
+            is_active: join_code_modal_active
         }
     }
 }
