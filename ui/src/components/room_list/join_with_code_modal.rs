@@ -29,16 +29,32 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
         return rsx! {};
     }
 
-    // Reset-and-close is inlined at each call site rather than shared through a
-    // single closure: Dioxus `Signal`s are `Copy`, and each `onclick` closure
-    // must own its captures, so a single `FnMut` can't be moved into all three
-    // handlers. This mirrors `ImportIdentityModal`.
+    // Signal-safety (see `.claude/rules/dioxus-signal-safety.md` and the
+    // deferred local-signal writes in `room_list.rs`): this component reads
+    // `is_active`, `code_input`, and `error_msg` during render, so mutations to
+    // them from event handlers are wrapped in `crate::util::defer()` to run in a
+    // clean Dioxus context (no re-entrant `RefCell` borrow, root scope present).
+    // The one exception is the controlled `<textarea>`'s `oninput` below: a
+    // deferred write to a controlled input's bound value lags the DOM and drops
+    // keystrokes, which is why every text-input handler in the codebase
+    // (`ImportIdentityModal`, `receive_invitation_modal`) sets its value signal
+    // synchronously.
+    let reset_and_close = move || {
+        crate::util::defer(move || {
+            is_active.set(false);
+            error_msg.set(None);
+            code_input.set(String::new());
+        });
+    };
+
     let handle_join = move |_| {
         // Codes are typically copy/pasted, so tolerate surrounding whitespace
         // and stray newlines that would otherwise break base58 decoding.
         let input = code_input.read().trim().to_string();
         if input.is_empty() {
-            error_msg.set(Some("Please paste an invite code.".to_string()));
+            crate::util::defer(move || {
+                error_msg.set(Some("Please paste an invite code.".to_string()));
+            });
             return;
         }
         match Invitation::from_encoded_string(&input) {
@@ -48,15 +64,13 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                 // global-signal write that opens `ReceiveInvitationModal`, so
                 // there is nothing further to do here but close.
                 present_invitation(invitation);
-                is_active.set(false);
-                error_msg.set(None);
-                code_input.set(String::new());
+                reset_and_close();
             }
             Err(e) => {
-                error_msg.set(Some(format!(
-                    "That doesn't look like a valid invite code: {}",
-                    e
-                )));
+                let msg = format!("That doesn't look like a valid invite code: {}", e);
+                crate::util::defer(move || {
+                    error_msg.set(Some(msg));
+                });
             }
         }
     };
@@ -64,11 +78,7 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
     rsx! {
         div {
             class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
-            onclick: move |_| {
-                is_active.set(false);
-                error_msg.set(None);
-                code_input.set(String::new());
-            },
+            onclick: move |_| reset_and_close(),
             div {
                 "data-testid": "join-with-code-modal",
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
@@ -98,11 +108,7 @@ pub fn JoinWithCodeModal(is_active: Signal<bool>) -> Element {
                 div { class: "flex justify-end gap-3 mt-4",
                     button {
                         class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
-                        onclick: move |_| {
-                            is_active.set(false);
-                            error_msg.set(None);
-                            code_input.set(String::new());
-                        },
+                        onclick: move |_| reset_and_close(),
                         "Cancel"
                     }
                     button {
