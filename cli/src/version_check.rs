@@ -53,15 +53,22 @@ pub fn start_check(current: &str) -> Option<String> {
         .as_ref()
         .is_some_and(|(checked_at, _)| now.saturating_sub(*checked_at) < CHECK_INTERVAL.as_secs());
     if !fresh {
-        // Detached, best-effort refresh for the NEXT invocation. Records the
-        // attempt time on success OR failure (carrying the previous value
-        // forward) so the once/day backoff holds even offline. Killed if the
-        // process exits first; a torn write is handled by read_cache -> None.
         if let Some(path) = cache {
             let prev = existing.as_ref().and_then(|(_, l)| l.clone());
+            // Record the attempt time SYNCHRONOUSLY (carrying the previous known
+            // value forward) so the once/day backoff holds even if this fast
+            // command exits before the detached refresh writes. Without this,
+            // every invocation would re-spawn a crates.io request and the cache
+            // might never populate (Codex review on PR #391).
+            write_cache(&path, now, prev.as_deref());
+            // Detached, best-effort: update `latest` if the fetch succeeds. On
+            // failure the synchronous write above already recorded the backoff.
+            // Killed if the process exits first; a torn write is handled by
+            // read_cache -> None.
             std::thread::spawn(move || {
-                let latest = fetch_latest_from_index().or(prev);
-                write_cache(&path, unix_now(), latest.as_deref());
+                if let Some(latest) = fetch_latest_from_index() {
+                    write_cache(&path, unix_now(), Some(&latest));
+                }
             });
         }
     }
