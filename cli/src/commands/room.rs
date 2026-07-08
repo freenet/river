@@ -16,6 +16,12 @@ pub enum RoomCommands {
         /// Your nickname in the room
         #[arg(short = 'N', long)]
         nickname: Option<String>,
+
+        /// Create an encrypted (private) room: the name, your nickname, and all
+        /// messages are AES-256-GCM encrypted with a room secret. Members join
+        /// via invitation only.
+        #[arg(short = 'p', long)]
+        private: bool,
     },
     /// List all rooms
     List,
@@ -43,11 +49,11 @@ pub enum RoomCommands {
         /// Room owner key (base58)
         room_id: String,
 
-        /// Set room name (public rooms only)
+        /// Set room name (sealed automatically in a private room)
         #[arg(long)]
         name: Option<String>,
 
-        /// Set room description (public rooms only)
+        /// Set room description (sealed automatically in a private room)
         #[arg(long)]
         description: Option<String>,
 
@@ -97,7 +103,11 @@ fn join_requires_invitation_json(room_id: &str) -> serde_json::Value {
 
 pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
     match command {
-        RoomCommands::Create { name, nickname } => {
+        RoomCommands::Create {
+            name,
+            nickname,
+            private,
+        } => {
             // Ask for nickname if not provided
             let nickname = match nickname {
                 Some(n) => n,
@@ -114,10 +124,15 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             };
 
             if !matches!(format, OutputFormat::Json) {
-                eprintln!("Creating room '{}' with nickname '{}'...", name, nickname);
+                eprintln!(
+                    "Creating {} room '{}' with nickname '{}'...",
+                    if private { "private" } else { "public" },
+                    name,
+                    nickname
+                );
             }
 
-            match api.create_room(name.clone(), nickname).await {
+            match api.create_room(name.clone(), nickname, private).await {
                 Ok((owner_key, contract_key)) => {
                     let result = CreateRoomResult {
                         room_name: name,

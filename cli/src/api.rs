@@ -16,7 +16,7 @@ use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersDelta};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_core::room_state::privacy::{RoomDisplayMetadata, SealedBytes};
+use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata, SealedBytes};
 use river_core::room_state::ChatRoomStateV1Delta;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde::{Deserialize, Serialize};
@@ -597,6 +597,119 @@ fn rejoin_preferred_nickname(
         .unwrap_or_else(|| SealedBytes::public("Member".to_string().into_bytes()))
 }
 
+/// Build the initial `ChatRoomStateV1` for a brand-new room: the owner-signed
+/// configuration and the owner's `member_info`, plus — for a **private** room —
+/// the v0 room secret, its version record, and the owner-addressed ECIES secret
+/// blob written into contract state so the owner can decrypt later. Returns the
+/// state and `Some(secret)` for a private room (`None` for public).
+///
+/// Pure (no network / no `self`) so the private-room creation crypto is
+/// unit-testable. Mirrors the UI's `create_new_room_with_name`
+/// (`ui/src/room_data.rs`) field-for-field: `generate_room_secret` (a RANDOM
+/// v0, never derived) → `encrypt_secret_for_member` for the owner →
+/// `AuthorizedSecretVersionRecord` + `AuthorizedEncryptedSecretForMember`, then
+/// name + nickname sealed with `encrypt_with_symmetric_key` under that secret.
+fn build_new_room_state(
+    signing_key: &SigningKey,
+    name: &str,
+    nickname: &str,
+    private: bool,
+) -> (ChatRoomStateV1, Option<[u8; 32]>) {
+    let owner_vk = signing_key.verifying_key();
+    let mut room_state = ChatRoomStateV1::default();
+
+    let room_secret: Option<[u8; 32]> = if private {
+        use river_core::ecies::{encrypt_secret_for_member, generate_room_secret};
+        use river_core::room_state::privacy::RoomCipherSpec;
+        use river_core::room_state::secret::{
+            AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord,
+            EncryptedSecretForMemberV1, SecretVersionRecordV1,
+        };
+
+        let secret = generate_room_secret();
+        let (ciphertext, nonce, ephemeral) = encrypt_secret_for_member(&secret, &owner_vk);
+
+        let version_record = SecretVersionRecordV1 {
+            version: 0,
+            cipher_spec: RoomCipherSpec::Aes256Gcm,
+            created_at: std::time::SystemTime::now(),
+        };
+        room_state
+            .secrets
+            .versions
+            .push(AuthorizedSecretVersionRecord::new(
+                version_record,
+                signing_key,
+            ));
+
+        let owner_secret = EncryptedSecretForMemberV1 {
+            member_id: owner_vk.into(),
+            secret_version: 0,
+            ciphertext,
+            nonce,
+            sender_ephemeral_public_key: ephemeral.to_bytes(),
+            provider: owner_vk.into(),
+        };
+        room_state
+            .secrets
+            .encrypted_secrets
+            .push(AuthorizedEncryptedSecretForMember::new(
+                owner_secret,
+                signing_key,
+            ));
+        room_state.secrets.current_version = 0;
+
+        Some(secret)
+    } else {
+        None
+    };
+
+    // Seal a metadata/identity field: AES-256-GCM under the v0 room secret for a
+    // private room, plaintext-public for a public room.
+    let seal = |plaintext: &[u8]| -> SealedBytes {
+        match room_secret {
+            Some(secret) => {
+                use river_core::ecies::encrypt_with_symmetric_key;
+                let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, plaintext);
+                SealedBytes::Private {
+                    ciphertext,
+                    nonce,
+                    secret_version: 0,
+                    declared_len_bytes: plaintext.len() as u32,
+                }
+            }
+            None => SealedBytes::public(plaintext.to_vec()),
+        }
+    };
+
+    let config = Configuration {
+        owner_member_id: owner_vk.into(),
+        privacy_mode: if private {
+            PrivacyMode::Private
+        } else {
+            PrivacyMode::Public
+        },
+        display: RoomDisplayMetadata {
+            name: seal(name.as_bytes()),
+            description: None,
+        },
+        ..Configuration::default()
+    };
+    room_state.configuration = AuthorizedConfigurationV1::new(config, signing_key);
+
+    let owner_info = MemberInfo {
+        member_id: owner_vk.into(),
+        version: 0,
+        preferred_nickname: seal(nickname.as_bytes()),
+    };
+    room_state
+        .member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new(owner_info, signing_key));
+
+    (room_state, room_secret)
+}
+
 /// Error returned when `accept_invitation` is asked to join a room the CLI
 /// already has stored credentials for (issue freenet/river#308).
 ///
@@ -734,39 +847,32 @@ impl ApiClient {
         &self,
         name: String,
         nickname: String,
+        private: bool,
     ) -> Result<(VerifyingKey, ContractKey)> {
-        info!("Creating room: {}", name);
+        info!(
+            "Creating {} room: {}",
+            if private { "private" } else { "public" },
+            name
+        );
 
         // Generate signing key for the room owner
         let signing_key =
             SigningKey::from_bytes(&rand::Rng::gen::<[u8; 32]>(&mut rand::thread_rng()));
         let owner_vk = signing_key.verifying_key();
 
-        // Create initial room state
-        let mut room_state = ChatRoomStateV1::default();
+        // Build the initial room state (owner config + member_info), plus the v0
+        // secret for a private room. Extracted as a pure helper so the
+        // private-room creation crypto is unit-testable without a live node.
+        let (room_state, room_secret) =
+            build_new_room_state(&signing_key, &name, &nickname, private);
 
-        // Set initial configuration
-        let config = Configuration {
-            owner_member_id: owner_vk.into(),
-            display: RoomDisplayMetadata {
-                name: SealedBytes::public(name.clone().into_bytes()),
-                description: None,
-            },
-            ..Configuration::default()
+        // Persist the v0 secret locally (as an invitation secret) so the CLI can
+        // decrypt this room's own content immediately, without a round-trip to
+        // re-fetch and decrypt the owner blob.
+        let created_invitation_secrets: HashMap<u32, [u8; 32]> = match room_secret {
+            Some(secret) => HashMap::from([(0u32, secret)]),
+            None => HashMap::new(),
         };
-        room_state.configuration = AuthorizedConfigurationV1::new(config, &signing_key);
-
-        // Add owner to member_info
-        let owner_info = MemberInfo {
-            member_id: owner_vk.into(),
-            version: 0,
-            preferred_nickname: SealedBytes::public(nickname.into_bytes()),
-        };
-        let authorized_owner_info = AuthorizedMemberInfo::new(owner_info, &signing_key);
-        room_state
-            .member_info
-            .member_info
-            .push(authorized_owner_info);
 
         // Generate contract key using ciborium for serialization (matching UI code)
         let parameters = ChatRoomParametersV1 { owner: owner_vk };
@@ -838,12 +944,14 @@ impl ApiClient {
                             ));
                         }
 
-                        // Store room info persistently
-                        self.storage.add_room(
+                        // Store room info persistently (with the v0 secret for a
+                        // private room so we can decrypt our own room immediately)
+                        self.storage.add_room_with_invitation_secrets(
                             &owner_vk,
                             &signing_key,
                             room_state,
                             &contract_key,
+                            created_invitation_secrets,
                         )?;
 
                         Ok((owner_vk, contract_key))
@@ -865,12 +973,14 @@ impl ApiClient {
                             ));
                         }
 
-                        // Store room info persistently
-                        self.storage.add_room(
+                        // Store room info persistently (with the v0 secret for a
+                        // private room so we can decrypt our own room immediately)
+                        self.storage.add_room_with_invitation_secrets(
                             &owner_vk,
                             &signing_key,
                             room_state,
                             &contract_key,
+                            created_invitation_secrets,
                         )?;
 
                         Ok((owner_vk, contract_key))
@@ -4666,6 +4776,85 @@ mod migration_recovery_tests {
             next_upgrade_hop(&state_pointing_at(target), &mut visited).is_none(),
             "a pointer back to an already-visited contract must stop the walk"
         );
+    }
+}
+
+#[cfg(test)]
+mod create_room_tests {
+    use super::*;
+
+    /// Creating a PRIVATE room seals its name + owner nickname under a v0 room
+    /// secret, records the version, and writes an owner-addressed secret blob so
+    /// the OWNER can decrypt their own room from contract state alone (the
+    /// load-bearing property). The sealed metadata must decrypt back to
+    /// plaintext — and must NOT be stored as plaintext.
+    #[test]
+    fn build_new_room_state_private_is_encrypted_and_owner_decryptable() {
+        let owner = SigningKey::from_bytes(&[13u8; 32]);
+        let (state, secret) = build_new_room_state(&owner, "Secret Room", "Alice", true);
+        let secret = secret.expect("private room yields a secret");
+
+        assert_eq!(
+            state.configuration.configuration.privacy_mode,
+            PrivacyMode::Private
+        );
+        assert_eq!(state.secrets.current_version, 0);
+        assert_eq!(state.secrets.versions.len(), 1);
+        assert_eq!(state.secrets.encrypted_secrets.len(), 1);
+
+        let name_field = &state.configuration.configuration.display.name;
+        let nick_field = &state.member_info.member_info[0]
+            .member_info
+            .preferred_nickname;
+        assert!(name_field.is_private(), "private room name must be sealed");
+        assert!(nick_field.is_private(), "owner nickname must be sealed");
+
+        // The owner recovers v0 from its own contract blob — no local secret.
+        let recovered =
+            crate::private_room::collect_secrets_for_room(&state, &owner, &HashMap::new());
+        assert_eq!(
+            recovered.get(&0),
+            Some(&secret),
+            "owner must recover v0 from its own contract blob"
+        );
+
+        // Sealed metadata decrypts back to the plaintext.
+        let secrets = HashMap::from([(0u32, secret)]);
+        assert_eq!(
+            river_core::ecies::unseal_bytes_with_secrets(name_field, &secrets).unwrap(),
+            b"Secret Room"
+        );
+        assert_eq!(
+            river_core::ecies::unseal_bytes_with_secrets(nick_field, &secrets).unwrap(),
+            b"Alice"
+        );
+    }
+
+    /// Creating a PUBLIC room is unchanged: no secret, public metadata.
+    #[test]
+    fn build_new_room_state_public_has_no_secret_and_public_metadata() {
+        let owner = SigningKey::from_bytes(&[14u8; 32]);
+        let (state, secret) = build_new_room_state(&owner, "Open Room", "Bob", false);
+
+        assert!(secret.is_none());
+        assert_eq!(
+            state.configuration.configuration.privacy_mode,
+            PrivacyMode::Public
+        );
+        assert!(state.secrets.encrypted_secrets.is_empty());
+        assert_eq!(
+            state
+                .configuration
+                .configuration
+                .display
+                .name
+                .as_public_bytes(),
+            Some(b"Open Room".as_ref())
+        );
+        assert!(state.member_info.member_info[0]
+            .member_info
+            .preferred_nickname
+            .is_public());
     }
 }
 
