@@ -5,3 +5,4 @@ pub mod error;
 pub mod output;
 pub mod private_room;
 pub mod storage;
+pub mod version_check;

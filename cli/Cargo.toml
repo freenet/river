@@ -83,6 +83,10 @@ directories = "5.0"
 # racing writer can't clobber another's freshly-merged update (issue #307).
 fs2 = "0.4"
 
+# Lightweight blocking HTTP client (rustls) for the once/day crates.io
+# version check. Blocking, so it runs on a spawn_blocking thread.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
 [dev-dependencies]
 freenet-test-network = "0.1.23"
 tempfile = "3"
