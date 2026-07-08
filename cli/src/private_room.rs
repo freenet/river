@@ -111,8 +111,9 @@ pub fn collect_secrets_for_room(
 ///   silently leaks plaintext into a private room.
 ///
 /// The write-side counterpart of [`crate::api::unseal_nickname_display`]: the
-/// single sealing decision behind `member set-nickname`, `room config
-/// --name/--description`, and the owner-metadata path of `room create`.
+/// single sealing decision behind `member set-nickname` and `room config
+/// --name/--description`. (`room create` seals its owner metadata inline under a
+/// freshly-generated secret rather than through this state-derived helper.)
 pub fn seal_field_for_room(
     state: &ChatRoomStateV1,
     secrets: &HashMap<u32, [u8; 32]>,
