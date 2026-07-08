@@ -49,30 +49,35 @@ pub fn update_message(current: &str, latest: &str) -> String {
     )
 }
 
-/// Read the cached latest version if the cache is fresh (< 24h); otherwise hit
-/// the network, refresh the cache, and return the fetched value. On a network
-/// failure, fall back to a stale cached value if one exists.
+/// Return the newest published version, using a once-per-day on-disk cache.
+///
+/// The cache records the timestamp of the last *attempt* — success OR failure —
+/// so the once-per-day limit holds even when offline or during a crates.io
+/// outage. Without caching failures, every invocation while offline would retry
+/// the network and pay the full timeout (Codex review on PR #391). A failed
+/// attempt carries the previous known value forward (so a nudge still shows)
+/// and backs off for a full interval before retrying.
 fn cached_or_fetch_latest() -> Option<String> {
     let now = unix_now();
     let cache = cache_path();
+    let existing = cache.as_ref().and_then(read_cache);
 
-    if let Some((checked_at, latest)) = cache.as_ref().and_then(read_cache) {
-        if now.saturating_sub(checked_at) < CHECK_INTERVAL.as_secs() {
-            return Some(latest);
+    // Fresh cache (from a successful fetch OR a recent failed attempt) →
+    // short-circuit the network entirely.
+    if let Some((checked_at, latest)) = &existing {
+        if now.saturating_sub(*checked_at) < CHECK_INTERVAL.as_secs() {
+            return latest.clone();
         }
     }
 
-    match fetch_latest_from_index() {
-        Some(latest) => {
-            if let Some(p) = cache.as_ref() {
-                write_cache(p, now, &latest);
-            }
-            Some(latest)
-        }
-        // Network failed: better a possibly-stale nag than none. Reuse whatever
-        // the cache holds (even if past the interval).
-        None => cache.as_ref().and_then(read_cache).map(|(_, v)| v),
+    // Stale or absent: attempt a fetch and record the attempt time regardless of
+    // outcome. On failure, carry the previous known value forward.
+    let fetched = fetch_latest_from_index();
+    let latest = fetched.or_else(|| existing.and_then(|(_, l)| l));
+    if let Some(p) = cache.as_ref() {
+        write_cache(p, now, latest.as_deref());
     }
+    latest
 }
 
 /// GET the sparse-index file and return the highest non-yanked `vers`.
@@ -133,16 +138,17 @@ fn cache_path() -> Option<PathBuf> {
         .map(|d| d.cache_dir().join("version-check.json"))
 }
 
-/// Cache shape: `{"checked_at": <unix secs>, "latest": "x.y.z"}`.
-fn read_cache(path: &PathBuf) -> Option<(u64, String)> {
+/// Cache shape: `{"checked_at": <unix secs>, "latest": "x.y.z" | null}`.
+/// `latest` is `null` when the last attempt failed and no prior value is known.
+fn read_cache(path: &PathBuf) -> Option<(u64, Option<String>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let checked_at = v.get("checked_at")?.as_u64()?;
-    let latest = v.get("latest")?.as_str()?.to_owned();
+    let latest = v.get("latest").and_then(|s| s.as_str()).map(str::to_owned);
     Some((checked_at, latest))
 }
 
-fn write_cache(path: &PathBuf, checked_at: u64, latest: &str) {
+fn write_cache(path: &PathBuf, checked_at: u64, latest: Option<&str>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -160,6 +166,26 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_round_trips_including_failed_attempt_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("version-check.json");
+
+        // Successful fetch: latest = Some, timestamp recorded.
+        write_cache(&path, 1_000, Some("0.1.73"));
+        assert_eq!(read_cache(&path), Some((1_000, Some("0.1.73".to_string()))));
+
+        // Failed attempt with no prior value: latest = null, but the timestamp
+        // is still recorded so the once/day backoff holds offline (the #391
+        // Codex fix). read_cache must round-trip the null as None.
+        write_cache(&path, 2_000, None);
+        assert_eq!(read_cache(&path), Some((2_000, None)));
+
+        // A corrupt cache file reads as None (re-fetch), never panics.
+        std::fs::write(&path, "{not valid json").unwrap();
+        assert_eq!(read_cache(&path), None);
+    }
 
     #[test]
     fn parse_semver_basic_and_suffixes() {
