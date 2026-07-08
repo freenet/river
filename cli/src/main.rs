@@ -41,6 +41,13 @@ struct Cli {
     #[arg(short, long, global = true)]
     debug: bool,
 
+    /// Skip the once-per-day check for a newer riverctl on crates.io.
+    /// Also disabled by setting the `RIVERCTL_NO_VERSION_CHECK` env var to any
+    /// value. (The env var is read manually rather than via clap so that a
+    /// common value like `=1` opts out instead of hard-erroring the command.)
+    #[arg(long, global = true)]
+    no_version_check: bool,
+
     /// Optional path to write log output (stdout remains reserved for command output/JSON)
     #[arg(long, global = true, value_name = "PATH", env = "RIVERCTL_LOG_FILE")]
     log_file: Option<PathBuf>,
@@ -121,6 +128,14 @@ async fn main() -> Result<()> {
 
     info!("River starting...");
 
+    // Whether to run the best-effort "newer riverctl available?" check (below,
+    // AFTER the command). Opt out with --no-version-check, or by setting
+    // RIVERCTL_NO_VERSION_CHECK to ANY value — read manually (not via clap's
+    // bool env parser) so a common value like `=1` opts out rather than
+    // hard-erroring the whole command.
+    let version_disabled =
+        cli.no_version_check || std::env::var_os("RIVERCTL_NO_VERSION_CHECK").is_some();
+
     // Load configuration
     let config = config::Config::load()?;
 
@@ -151,6 +166,16 @@ async fn main() -> Result<()> {
         }
         Commands::Debug { command } => debug::execute(command, api_client, cli.format).await?,
         Commands::Dm { command } => dm::execute(command, api_client, cli.format).await?,
+    }
+
+    // Best-effort "newer riverctl available?" nudge — crates.io, once/day
+    // cached, stderr only, fail-silent. Runs HERE (after the command, on the
+    // success path) so its once/day bounded network call never precedes the
+    // command's own work and a failing command is never delayed.
+    if !version_disabled {
+        if let Some(msg) = riverctl::version_check::check(env!("CARGO_PKG_VERSION")) {
+            eprintln!("\n{msg}");
+        }
     }
 
     Ok(())
