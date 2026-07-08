@@ -333,17 +333,49 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             let name_clone = name.clone();
             let description_clone = description.clone();
 
+            // Pre-seal name / description for the room's privacy mode BEFORE the
+            // update. In a PRIVATE room these are AES-256-GCM sealed under the
+            // room secret — the previous unconditional `SealedBytes::public` got
+            // a private-room name REJECTED by the contract's config guard
+            // ("Private room must have encrypted display metadata") and silently
+            // published a private-room description as PLAINTEXT. Only fetch state
+            // when a metadata field is actually changing. `sealed_description`'s
+            // outer Option is "was --description passed", the inner is the value
+            // (None clears it).
+            #[allow(clippy::type_complexity)]
+            let (sealed_name, sealed_description): (
+                Option<SealedBytes>,
+                Option<Option<SealedBytes>>,
+            ) = if name_clone.is_some() || description_clone.is_some() {
+                let mut state = api.get_room(&owner_key, false).await?;
+                let secrets = api.room_display_secrets(&owner_key, &mut state);
+                let sn = match &name_clone {
+                    Some(n) => Some(
+                        crate::private_room::seal_field_for_room(&state, &secrets, n.as_bytes())
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                    ),
+                    None => None,
+                };
+                let sd = match &description_clone {
+                    Some(d) if d.is_empty() => Some(None),
+                    Some(d) => Some(Some(
+                        crate::private_room::seal_field_for_room(&state, &secrets, d.as_bytes())
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                    )),
+                    None => None,
+                };
+                (sn, sd)
+            } else {
+                (None, None)
+            };
+
             match api
                 .update_config(&owner_key, |cfg| {
-                    if let Some(ref n) = name_clone {
-                        cfg.display.name = SealedBytes::public(n.as_bytes().to_vec());
+                    if let Some(ref n) = sealed_name {
+                        cfg.display.name = n.clone();
                     }
-                    if let Some(ref d) = description_clone {
-                        cfg.display.description = if d.is_empty() {
-                            None
-                        } else {
-                            Some(SealedBytes::public(d.as_bytes().to_vec()))
-                        };
+                    if let Some(ref d) = sealed_description {
+                        cfg.display.description = d.clone();
                     }
                     if let Some(v) = max_bans {
                         cfg.max_user_bans = v;
