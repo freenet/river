@@ -8,13 +8,14 @@
 //!   riverctl`, so crates.io is the authoritative "is my binary current?"
 //!   source. A Freenet-hosted version record would be dogfood-nice but could
 //!   disagree with the actual install channel.
-//! - **Never blocks the command / never fails loudly.** The nudge is decided
-//!   from the on-disk cache (an instant read); the network refresh runs on a
-//!   detached thread, so the command's critical path and its exit never wait on
-//!   crates.io. All errors are swallowed to "no nudge". A bounded network
-//!   timeout still caps the detached refresh.
-//! - **Once per day.** The cache stores the last-attempt timestamp (success OR
-//!   failure), so the refresh runs at most once per 24h even offline.
+//! - **Bounded, once per day, never fails loudly.** Runs AFTER the command and
+//!   only on success (so it never delays the command's own work or a failing
+//!   command). A fresh cache (< 24h) does zero network; only the first
+//!   invocation in a 24h window does a single crates.io fetch, capped by a short
+//!   timeout. All errors are swallowed to "no nudge". (A detached background
+//!   refresh was tried but a short-lived CLI kills it on exit, so it can't
+//!   reliably populate the cache — a bounded synchronous fetch once/day is the
+//!   honest tradeoff.)
 //! - **Opt-out.** `--no-version-check`, or `RIVERCTL_NO_VERSION_CHECK` set to
 //!   any value.
 //! - **stderr only.** The caller prints the nudge to stderr so `--format json`
@@ -27,57 +28,52 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const SPARSE_INDEX_URL: &str = "https://index.crates.io/ri/ve/riverctl";
 /// Re-check the network at most once per this window.
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Hard cap on the network call so a slow/hung crates.io never stalls the CLI.
-const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
+/// Hard cap on the network call. Short because it runs synchronously (at most
+/// once per 24h, after the command) — a slow/hung crates.io must not stall the
+/// CLI for long. A normal sparse-index fetch is well under this.
+const NETWORK_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Decide the update nudge from the **cached** latest version (an instant file
-/// read — never any network on the caller's thread), and, if the cache is stale
-/// or absent, kick off a **detached** background thread to refresh it for next
-/// time. Returns the nudge string if the cached latest is newer than `current`,
-/// else `None`.
+/// Return the update nudge if a newer `riverctl` is published on crates.io, else
+/// `None`. Synchronous and bounded: at most **one** crates.io request per 24h (a
+/// short, capped fetch); every other invocation is an instant cache read with no
+/// network at all.
 ///
-/// Because the network refresh is fully detached, this adds no measurable
-/// latency to the command and can never delay process exit — the two review
-/// findings on PR #391 (a fast command waiting up to the network timeout, on
-/// both the success `await` and the error-path runtime-drop join). The tradeoff
-/// is that the nudge reflects the cache, so a brand-new install shows nothing on
-/// its first run and nags from the second onward — fine for a passive notice.
-///
-/// Never panics; every failure degrades to `None` / no nudge.
-pub fn start_check(current: &str) -> Option<String> {
-    let now = unix_now();
-    let cache = cache_path();
-    let existing = cache.as_ref().and_then(read_cache);
-
-    let fresh = existing
-        .as_ref()
-        .is_some_and(|(checked_at, _)| now.saturating_sub(*checked_at) < CHECK_INTERVAL.as_secs());
-    if !fresh {
-        if let Some(path) = cache {
-            let prev = existing.as_ref().and_then(|(_, l)| l.clone());
-            // Record the attempt time SYNCHRONOUSLY (carrying the previous known
-            // value forward) so the once/day backoff holds even if this fast
-            // command exits before the detached refresh writes. Without this,
-            // every invocation would re-spawn a crates.io request and the cache
-            // might never populate (Codex review on PR #391).
-            write_cache(&path, now, prev.as_deref());
-            // Detached, best-effort: update `latest` if the fetch succeeds. On
-            // failure the synchronous write above already recorded the backoff.
-            // Killed if the process exits first; a torn write is handled by
-            // read_cache -> None.
-            std::thread::spawn(move || {
-                if let Some(latest) = fetch_latest_from_index() {
-                    write_cache(&path, unix_now(), Some(&latest));
-                }
-            });
-        }
-    }
-
-    let latest = existing.and_then(|(_, l)| l)?;
+/// Call this AFTER the command and only on its success path (see `main`), so the
+/// once/day network latency never precedes the command's own work and a failing
+/// command is never delayed. A short-lived CLI process can't reliably refresh a
+/// cache from a *detached* thread (the process exits and kills it), so a bounded
+/// synchronous fetch once per day is the honest tradeoff — it both honors the
+/// backoff and reliably populates the cache. Never panics; any failure degrades
+/// to no nudge.
+pub fn check(current: &str) -> Option<String> {
+    let latest = cached_or_fetch_latest()?;
     match (parse_semver(current), parse_semver(&latest)) {
         (Some(cur), Some(new)) if new > cur => Some(update_message(current, &latest)),
         _ => None,
     }
+}
+
+/// Newest published version via the once/day cache. A fresh cache (< 24h) does
+/// no network; a stale/absent one does a single bounded synchronous fetch and
+/// writes the result back — success OR failure — so the once/day backoff always
+/// holds AND a successful value always populates (no detached-thread race). On
+/// failure the previous known value is carried forward so a nudge still shows.
+fn cached_or_fetch_latest() -> Option<String> {
+    let now = unix_now();
+    let cache = cache_path();
+    let existing = cache.as_ref().and_then(read_cache);
+
+    if let Some((checked_at, latest)) = &existing {
+        if now.saturating_sub(*checked_at) < CHECK_INTERVAL.as_secs() {
+            return latest.clone();
+        }
+    }
+
+    let latest = fetch_latest_from_index().or_else(|| existing.and_then(|(_, l)| l));
+    if let Some(p) = cache.as_ref() {
+        write_cache(p, now, latest.as_deref());
+    }
+    latest
 }
 
 /// Format the user-facing nudge (stderr). Kept here so the wording has one home.

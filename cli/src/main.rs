@@ -128,19 +128,13 @@ async fn main() -> Result<()> {
 
     info!("River starting...");
 
-    // Best-effort "newer riverctl available?" nudge (crates.io, once/day cached,
-    // fail-silent, stderr-only). Decided synchronously from the cache — an
-    // instant file read with NO network on this path — while a detached thread
-    // refreshes the cache for next time, so the command is never delayed. Opt
-    // out with --no-version-check, or by setting RIVERCTL_NO_VERSION_CHECK to
-    // ANY value (read manually so `=1` opts out rather than hard-erroring).
+    // Whether to run the best-effort "newer riverctl available?" check (below,
+    // AFTER the command). Opt out with --no-version-check, or by setting
+    // RIVERCTL_NO_VERSION_CHECK to ANY value — read manually (not via clap's
+    // bool env parser) so a common value like `=1` opts out rather than
+    // hard-erroring the whole command.
     let version_disabled =
         cli.no_version_check || std::env::var_os("RIVERCTL_NO_VERSION_CHECK").is_some();
-    let version_nudge = if version_disabled {
-        None
-    } else {
-        riverctl::version_check::start_check(env!("CARGO_PKG_VERSION"))
-    };
 
     // Load configuration
     let config = config::Config::load()?;
@@ -174,9 +168,14 @@ async fn main() -> Result<()> {
         Commands::Dm { command } => dm::execute(command, api_client, cli.format).await?,
     }
 
-    // Surface the update nudge on stderr (only reached on command success).
-    if let Some(msg) = version_nudge {
-        eprintln!("\n{msg}");
+    // Best-effort "newer riverctl available?" nudge — crates.io, once/day
+    // cached, stderr only, fail-silent. Runs HERE (after the command, on the
+    // success path) so its once/day bounded network call never precedes the
+    // command's own work and a failing command is never delayed.
+    if !version_disabled {
+        if let Some(msg) = riverctl::version_check::check(env!("CARGO_PKG_VERSION")) {
+            eprintln!("\n{msg}");
+        }
     }
 
     Ok(())
