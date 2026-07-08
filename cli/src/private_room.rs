@@ -95,6 +95,44 @@ pub fn collect_secrets_for_room(
     secrets
 }
 
+/// Seal a room display / identity field (room name, description, or member
+/// nickname) according to the room's privacy mode, using a **secrets map**
+/// already collected via [`collect_secrets_for_room`].
+///
+/// - **Public room** → `SealedBytes::public(plaintext)` (unchanged behaviour).
+/// - **Private room** → AES-256-GCM sealed under the room's CURRENT-version
+///   secret, mirroring the UI's `seal_bytes` metadata paths
+///   (`ui/src/room_data.rs`, `ui/src/components/room_list/edit_room_modal.rs`).
+///   **Errors** when that secret is unavailable rather than emitting a public
+///   value: a plaintext name / nickname / description in a private room is both
+///   a privacy leak (it deanonymises the member / room to every peer) AND, for
+///   the name, rejected by the contract's config guard (`configuration.rs`:
+///   "Private room must have encrypted display metadata"). riverctl never
+///   silently leaks plaintext into a private room.
+///
+/// The write-side counterpart of [`crate::api::unseal_nickname_display`]: the
+/// single sealing decision behind `member set-nickname` and `room config
+/// --name/--description`. (`room create` seals its owner metadata inline under a
+/// freshly-generated secret rather than through this state-derived helper.)
+pub fn seal_field_for_room(
+    state: &ChatRoomStateV1,
+    secrets: &HashMap<u32, [u8; 32]>,
+    plaintext: &[u8],
+) -> Result<SealedBytes, String> {
+    if state.configuration.configuration.privacy_mode != PrivacyMode::Private {
+        return Ok(SealedBytes::public(plaintext.to_vec()));
+    }
+    let version = state.secrets.current_version;
+    let secret = secrets.get(&version).ok_or_else(|| {
+        format!(
+            "Private room secret v{version} is not available yet, so this value \
+             cannot be sealed. riverctl will not send plaintext into a private \
+             room. Try again once the room has finished syncing."
+        )
+    })?;
+    Ok(seal_bytes(plaintext, secret, version))
+}
+
 /// Collect a secrets map into the wire-format `Vec<(version, secret)>` carried
 /// by `Invitation::room_secrets`, sorted ascending by version so the encoded
 /// invitation is deterministic — the encoded string is fingerprinted for
@@ -588,6 +626,54 @@ mod tests {
         let state = state_with_privacy(&owner, PrivacyMode::Public);
         let secrets = collect_secrets_for_room(&state, &owner, &HashMap::new());
         assert!(secrets.is_empty(), "public room should yield no secrets");
+    }
+
+    /// A public room seals metadata as-is (plaintext bytes), unchanged from the
+    /// pre-fix behaviour.
+    #[test]
+    fn seal_field_public_room_stays_public() {
+        let owner = fresh_signing_key();
+        let state = state_with_privacy(&owner, PrivacyMode::Public);
+        let sealed = seal_field_for_room(&state, &HashMap::new(), b"Public Room").unwrap();
+        assert!(sealed.is_public());
+        assert_eq!(sealed.as_public_bytes(), Some(b"Public Room".as_ref()));
+    }
+
+    /// A private room seals metadata under the current-version secret, and the
+    /// result round-trips back to the plaintext via `unseal_bytes_with_secrets`.
+    /// This is the fix for the `member set-nickname` / `room config` plaintext
+    /// leak — the sealed value is NOT the plaintext.
+    #[test]
+    fn seal_field_private_room_seals_and_roundtrips() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        state.secrets.current_version = 0;
+        let secret = generate_room_secret();
+        let secrets = HashMap::from([(0u32, secret)]);
+
+        let sealed = seal_field_for_room(&state, &secrets, b"Alice").expect("seals");
+        assert!(sealed.is_private(), "private-room metadata must be sealed");
+        assert_ne!(
+            sealed.as_public_bytes(),
+            Some(b"Alice".as_ref()),
+            "sealed value must not expose the plaintext"
+        );
+        let plaintext = river_core::ecies::unseal_bytes_with_secrets(&sealed, &secrets).unwrap();
+        assert_eq!(plaintext, b"Alice");
+    }
+
+    /// A private room with NO available secret errors rather than leaking a
+    /// public value into private state — the core of the privacy fix.
+    #[test]
+    fn seal_field_private_room_without_secret_errors() {
+        let owner = fresh_signing_key();
+        let mut state = state_with_privacy(&owner, PrivacyMode::Private);
+        state.secrets.current_version = 3;
+        let err = seal_field_for_room(&state, &HashMap::new(), b"Alice").unwrap_err();
+        assert!(
+            err.contains("v3") && err.contains("not available"),
+            "error should name the missing version, got: {err}"
+        );
     }
 
     /// Owner decrypts the OWNER-ADDRESSED contract blob even though the

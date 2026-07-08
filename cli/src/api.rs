@@ -3713,6 +3713,27 @@ impl ApiClient {
 
         let my_member_id = signing_key.verifying_key().into();
 
+        // Seal the nickname for the room's privacy mode. In a PRIVATE room the
+        // nickname MUST be AES-256-GCM sealed under the room secret — sending
+        // it as plaintext (the previous unconditional `SealedBytes::public`)
+        // silently deanonymised the member: the contract's `member_info`
+        // validation only checks signature + declared length, so the plaintext
+        // was accepted and published into the private room's state for every
+        // peer to read. Errors (rather than leaks) if the secret isn't available
+        // yet.
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        let secrets = crate::private_room::collect_secrets_for_room(
+            &room_state,
+            &signing_key,
+            &invitation_secrets,
+        );
+        let sealed_nickname = crate::private_room::seal_field_for_room(
+            &room_state,
+            &secrets,
+            new_nickname.as_bytes(),
+        )
+        .map_err(|e| anyhow!(e))?;
+
         // Find our current member info to get the version
         let current_version = room_state
             .member_info
@@ -3726,7 +3747,7 @@ impl ApiClient {
         let new_member_info = MemberInfo {
             member_id: my_member_id,
             version: current_version + 1,
-            preferred_nickname: SealedBytes::public(new_nickname.clone().into_bytes()),
+            preferred_nickname: sealed_nickname,
         };
 
         // Sign with our member key
