@@ -88,13 +88,43 @@ pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
 /// Before this helper, riverctl rendered join events as
 /// `[nickname]: <encrypted>` because the display path conflated "no text
 /// content" with "encrypted".
+/// Public-only convenience wrapper (no decryption). Production display paths
+/// always thread the room `secrets` via [`message_display_text_with_secrets`];
+/// this 2-arg form is retained for the tests that exercise public content and
+/// the genuine `<encrypted>` fallback (empty secrets).
+#[cfg(test)]
 pub(crate) fn message_display_text(
     room_state: &ChatRoomStateV1,
     msg: &river_core::room_state::message::AuthorizedMessageV1,
 ) -> String {
+    message_display_text_with_secrets(room_state, msg, &HashMap::new())
+}
+
+/// Like [`message_display_text`], but able to decrypt a **private** (encrypted)
+/// message body when the caller supplies the room's `secrets` map
+/// (version → 32-byte AES-256-GCM key), as collected by
+/// [`crate::private_room::collect_secrets_for_room`].
+///
+/// riverctl previously rendered every private-room message body as
+/// `<encrypted>` because the display path only decoded *public* content — the
+/// CLI could send into a private room but not read it back (a river↔XMPP bridge
+/// saw `"content":"<encrypted>"` for every message). This mirrors the UI's
+/// `decrypt_message_content`: public bodies decode directly; a private
+/// Text/Reply body is decrypted with the secret matching its `secret_version`
+/// and its plaintext returned. A body whose secret is unavailable (not a
+/// member, or an older rotated-past version) still falls back to `<encrypted>`.
+///
+/// `secrets` is empty for a public room or a room not in local storage, in
+/// which case behaviour is identical to the public-only path.
+pub(crate) fn message_display_text_with_secrets(
+    room_state: &ChatRoomStateV1,
+    msg: &river_core::room_state::message::AuthorizedMessageV1,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> String {
     let raw = room_state
         .recent_messages
         .effective_text(msg)
+        .or_else(|| decrypt_private_body_text(&msg.message.content, secrets))
         .unwrap_or_else(|| {
             msg.message
                 .content
@@ -103,6 +133,48 @@ pub(crate) fn message_display_text(
                 .unwrap_or_else(|| "<encrypted>".to_string())
         });
     render_mentions_for_terminal(room_state, &raw)
+}
+
+/// Decrypt a **private** message body to its display text, mirroring the UI's
+/// `decrypt_message_content` private branch. Returns `None` for a public body
+/// (the caller decodes those directly), for a body whose `secret_version` has
+/// no key in `secrets`, or on any decrypt/decode failure — so the caller falls
+/// back to the public decode path / `<encrypted>`.
+fn decrypt_private_body_text(
+    content: &river_core::room_state::message::RoomMessageBody,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> Option<String> {
+    use river_core::room_state::content::{
+        ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
+    };
+    use river_core::room_state::message::RoomMessageBody;
+
+    let RoomMessageBody::Private {
+        content_type,
+        ciphertext,
+        nonce,
+        secret_version,
+        ..
+    } = content
+    else {
+        return None;
+    };
+    let secret = secrets.get(secret_version)?;
+    let plaintext =
+        river_core::ecies::decrypt_with_symmetric_key(secret, ciphertext, nonce).ok()?;
+    if *content_type == CONTENT_TYPE_TEXT {
+        if let Ok(text) = TextContentV1::decode(&plaintext) {
+            return Some(text.text);
+        }
+    }
+    if *content_type == CONTENT_TYPE_REPLY {
+        if let Ok(reply) = ReplyContentV1::decode(&plaintext) {
+            return Some(reply.text);
+        }
+    }
+    // Decrypted but not a known text-bearing content type: show the raw
+    // plaintext rather than falling back to "<encrypted>" (matches the UI).
+    Some(String::from_utf8_lossy(&plaintext).to_string())
 }
 
 /// Replace `@[name](rv:id)` mention tokens with `@<name>` for terminal display.
@@ -209,22 +281,104 @@ fn reply_context(
 /// Mentions are resolved on the FULL stored preview *before* the display-length
 /// truncation, so a mention token sitting near the cutoff isn't sliced into
 /// raw `@[name](rv:..` syntax.
+/// Public-only convenience wrapper (no decryption); test counterpart of
+/// [`reply_context_display_with_secrets`]. Production paths thread the room
+/// `secrets` so a private reply's sealed context decrypts.
+#[cfg(test)]
 pub(crate) fn reply_context_display(
     room_state: &ChatRoomStateV1,
     msg: &river_core::room_state::message::AuthorizedMessageV1,
 ) -> Option<(String, String)> {
-    use river_core::room_state::content::{DecodedContent, CONTENT_TYPE_REPLY};
+    reply_context_display_with_secrets(room_state, msg, &HashMap::new())
+}
+
+/// Like [`reply_context_display`], but able to decrypt the reply context of a
+/// **private** reply when the caller supplies the room's `secrets` map. A
+/// private reply seals its `ReplyContentV1` (target author name + quoted
+/// preview) alongside the reply text, so without the secret the whole reply
+/// context is opaque and no `[reply to …]` prefix could be shown. Public
+/// replies decode directly, exactly as before. Returns `None` for a non-reply,
+/// or when a private reply's secret is unavailable / undecodable.
+pub(crate) fn reply_context_display_with_secrets(
+    room_state: &ChatRoomStateV1,
+    msg: &river_core::room_state::message::AuthorizedMessageV1,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> Option<(String, String)> {
+    use river_core::room_state::content::{DecodedContent, ReplyContentV1, CONTENT_TYPE_REPLY};
+    use river_core::room_state::message::RoomMessageBody;
     if msg.message.content.content_type() != CONTENT_TYPE_REPLY {
         return None;
     }
-    match msg.message.content.decode_content() {
-        Some(DecodedContent::Reply(reply)) => {
-            let rendered = render_mentions_for_terminal(room_state, &reply.target_content_preview);
-            let preview = truncate_reply_preview(&rendered);
-            Some((reply.target_author_name, preview))
+    let reply = match msg.message.content.decode_content() {
+        // Public reply — decoded directly.
+        Some(DecodedContent::Reply(reply)) => reply,
+        // Private reply — decrypt then decode the sealed ReplyContentV1.
+        _ => {
+            let RoomMessageBody::Private {
+                ciphertext,
+                nonce,
+                secret_version,
+                ..
+            } = &msg.message.content
+            else {
+                return None;
+            };
+            let secret = secrets.get(secret_version)?;
+            let plaintext =
+                river_core::ecies::decrypt_with_symmetric_key(secret, ciphertext, nonce).ok()?;
+            ReplyContentV1::decode(&plaintext).ok()?
         }
-        _ => None,
+    };
+    let rendered = render_mentions_for_terminal(room_state, &reply.target_content_preview);
+    let preview = truncate_reply_preview(&rendered);
+    Some((reply.target_author_name, preview))
+}
+
+/// Rebuild a room's message `actions_state` (edits / deletes / reactions) using
+/// decrypted content for **private** action messages.
+///
+/// `ChatRoomStateV1`'s `apply_delta`/`merge` end with the *non-decrypting*
+/// `rebuild_actions_state()`, which can only decode PUBLIC action messages —
+/// every edit / delete / reaction carried by a PRIVATE action message is
+/// dropped. So without this, a private-room edit shows the message's ORIGINAL
+/// text and a private-room deletion never hides the message. This is the CLI
+/// counterpart of the UI's `RoomData::rebuild_private_actions_state`
+/// (`ui/src/room_data.rs`): it decrypts each private action body with the
+/// version-matched room secret and re-derives `actions_state` from the
+/// decrypted actions. No-op for a public room (its public rebuild is already
+/// correct) or when `secrets` is empty.
+fn rebuild_private_actions_state(
+    room_state: &mut ChatRoomStateV1,
+    secrets: &HashMap<u32, [u8; 32]>,
+) {
+    use river_core::room_state::message::{MessageId, RoomMessageBody};
+
+    if secrets.is_empty() {
+        return;
     }
+    let decrypted: HashMap<MessageId, Vec<u8>> = room_state
+        .recent_messages
+        .messages
+        .iter()
+        .filter(|m| m.message.content.is_action())
+        .filter_map(|m| match &m.message.content {
+            RoomMessageBody::Private {
+                ciphertext,
+                nonce,
+                secret_version,
+                ..
+            } => secrets
+                .get(secret_version)
+                .and_then(|s| {
+                    river_core::ecies::decrypt_with_symmetric_key(s, ciphertext, nonce).ok()
+                })
+                .map(|plaintext| (m.id(), plaintext)),
+            _ => None,
+        })
+        .collect();
+    room_state
+        .recent_messages
+        .rebuild_actions_state_with_decrypted(&decrypted);
 }
 
 /// Whether a message seen by a monitor stream is brand new, an edit of one
@@ -812,6 +966,46 @@ impl ApiClient {
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }
+    }
+
+    /// Prepare a freshly-fetched `room_state` for **display** in a private
+    /// room: collect the local member's decryption secrets and, in place,
+    /// rebuild the message `actions_state` (edits/deletes/reactions) from the
+    /// decrypted private action messages. Returns the secrets map so the caller
+    /// can decrypt message *bodies* at render time via
+    /// [`message_display_text_with_secrets`] / [`reply_context_display_with_secrets`].
+    ///
+    /// Returns an empty map (and leaves `room_state` untouched) for a public
+    /// room or a room not in local storage — a non-member cannot decrypt, and
+    /// the display path then behaves exactly as the pre-existing public-only
+    /// path. Secret collection needs the fetched `room_state` (it decrypts the
+    /// owner-signed `encrypted_secrets` blobs), so this is called per fetch.
+    pub(crate) fn room_display_secrets(
+        &self,
+        room_owner_key: &VerifyingKey,
+        room_state: &mut ChatRoomStateV1,
+    ) -> HashMap<u32, [u8; 32]> {
+        use river_core::room_state::privacy::PrivacyMode;
+
+        if room_state.configuration.configuration.privacy_mode != PrivacyMode::Private {
+            return HashMap::new();
+        }
+        // The signing key of the identity we joined this room as, from local
+        // storage. Absent → we are not a stored member → we cannot decrypt.
+        let Some((self_sk, _, _)) = self.storage.get_room(room_owner_key).ok().flatten() else {
+            return HashMap::new();
+        };
+        let invitation_secrets = self
+            .storage
+            .get_invitation_secrets(room_owner_key)
+            .unwrap_or_default();
+        let secrets = crate::private_room::collect_secrets_for_room(
+            room_state,
+            &self_sk,
+            &invitation_secrets,
+        );
+        rebuild_private_actions_state(room_state, &secrets);
+        secrets
     }
 
     pub async fn get_room(
@@ -2792,10 +2986,24 @@ impl ApiClient {
             .map(|info| info.member_info.preferred_nickname.to_string_lossy())
             .unwrap_or_else(|| target_msg.message.author.to_string());
 
-        let target_content_preview: String = message_display_text(&room_state, target_msg)
-            .chars()
-            .take(100)
-            .collect();
+        // Collect the room's decryption secrets so the quoted preview of a
+        // PRIVATE target message is its plaintext, not "<encrypted>". Without
+        // this, the CLI sealed "<encrypted>" into the reply's `ReplyContentV1`,
+        // so the quoted context showed "<encrypted>" to every reader forever.
+        // (Reused below to seal the reply body itself — a public room yields an
+        // empty map and unchanged behaviour.)
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
+        let secrets = crate::private_room::collect_secrets_for_room(
+            &room_state,
+            &signing_key,
+            &invitation_secrets,
+        );
+
+        let target_content_preview: String =
+            message_display_text_with_secrets(&room_state, target_msg, &secrets)
+                .chars()
+                .take(100)
+                .collect();
 
         // Resolve any bare @nickname mentions in the reply body.
         let reply_text = resolve_outgoing_mentions(&room_state, &reply_text);
@@ -2805,7 +3013,6 @@ impl ApiClient {
         // target author name and content preview are sealed alongside the reply
         // text in a private room (they are part of `ReplyContentV1`), so the
         // reply context is not leaked in the clear.
-        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
         let content = crate::private_room::build_reply_body(
             &room_state,
             &signing_key,
@@ -2957,7 +3164,9 @@ impl ApiClient {
 
         // Show initial messages if requested
         if initial_messages > 0 {
-            let room_state = self.get_room(room_owner_key, false).await?;
+            let mut room_state = self.get_room(room_owner_key, false).await?;
+            // Decrypt private-room content for display (no-op for public rooms).
+            let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
 
             // Use display_messages() to filter out action/deleted messages (matches `message list`)
             let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
@@ -2965,7 +3174,10 @@ impl ApiClient {
 
             for msg in &all_msgs[start..] {
                 let key = monitor_seen_key(msg);
-                seen_messages.insert(key.clone(), message_display_text(&room_state, msg));
+                seen_messages.insert(
+                    key.clone(),
+                    message_display_text_with_secrets(&room_state, msg, &secrets),
+                );
                 // Seed the reactions fingerprint for shown messages so reactions
                 // already present at startup aren't re-emitted as a live change;
                 // only later changes to them surface.
@@ -2974,7 +3186,7 @@ impl ApiClient {
                     reactions_fingerprint(room_state.recent_messages.reactions(&msg.id())),
                 );
 
-                Self::output_message(&room_state, msg, room_owner_key, &format, false)?;
+                Self::output_message(&room_state, msg, room_owner_key, &format, false, &secrets)?;
             }
         }
 
@@ -3013,7 +3225,9 @@ impl ApiClient {
             // message whose effective content changed (an edit) and emits ones
             // not seen before; it respects max_messages for NEW messages.
             match self.get_room(room_owner_key, false).await {
-                Ok(room_state) => {
+                Ok(mut room_state) => {
+                    // Decrypt private-room content for display (no-op for public rooms).
+                    let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
                     Self::emit_new_and_edited(
                         &room_state,
                         &mut seen_messages,
@@ -3023,6 +3237,7 @@ impl ApiClient {
                         &format,
                         max_messages,
                         &mut new_message_count,
+                        &secrets,
                     )?;
                     Self::emit_deletions(
                         &room_state,
@@ -3080,16 +3295,17 @@ impl ApiClient {
         format: &OutputFormat,
         max_new: usize,
         new_count: &mut usize,
+        secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
         for msg in room_state.recent_messages.display_messages() {
             let key = monitor_seen_key(msg);
-            let content = message_display_text(room_state, msg);
+            let content = message_display_text_with_secrets(room_state, msg, secrets);
             let is_edit = match classify_seen(seen, &key, &content) {
                 EmitKind::Unchanged => continue,
                 EmitKind::Edited => true,
                 EmitKind::New => false,
             };
-            Self::output_message(room_state, msg, room_owner_key, format, is_edit)?;
+            Self::output_message(room_state, msg, room_owner_key, format, is_edit, secrets)?;
             // Surfacing a message (showing it new OR as an edit) lifts any
             // start-time delete-suppression: a now-surfaced message's later
             // deletion MUST be reportable. Without this, an unshown pre-existing
@@ -3323,16 +3539,18 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
         is_edit: bool,
+        secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
         // Get display content (handles edits and non-text public content like
-        // join events; only genuinely encrypted bodies render as "<encrypted>")
-        let content = message_display_text(room_state, msg);
+        // join events; `secrets` decrypts private-room bodies — only a body
+        // whose secret is unavailable renders as "<encrypted>")
+        let content = message_display_text_with_secrets(room_state, msg, secrets);
 
         // Get message ID for checking edited status and reactions
         let msg_id = msg.id();
         let edited = room_state.recent_messages.is_edited(&msg_id);
         let reactions = room_state.recent_messages.reactions(&msg_id);
-        let reply = reply_context_display(room_state, msg);
+        let reply = reply_context_display_with_secrets(room_state, msg, secrets);
 
         match format {
             OutputFormat::Human => {
@@ -3847,7 +4065,10 @@ impl ApiClient {
         let contract_key = self.owner_vk_to_contract_key(room_owner_key);
         let contract_instance_id = *contract_key.id();
         {
-            let room_state = self.get_room(room_owner_key, false).await?;
+            let mut room_state = self.get_room(room_owner_key, false).await?;
+            // Decrypt private-room content for display (no-op for public rooms).
+            // Must run before the immutable `display_msgs` borrow below.
+            let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
 
             // Determine which messages will be displayed initially (the last N
             // non-deleted). Only these count as "shown" for deletion purposes.
@@ -3870,7 +4091,7 @@ impl ApiClient {
                 if !msg.message.content.is_action() {
                     seen_messages.insert(
                         monitor_seen_key(msg),
-                        message_display_text(&room_state, msg),
+                        message_display_text_with_secrets(&room_state, msg, &secrets),
                     );
                 }
             }
@@ -3895,7 +4116,14 @@ impl ApiClient {
                         monitor_seen_key(msg),
                         reactions_fingerprint(room_state.recent_messages.reactions(&msg.id())),
                     );
-                    Self::output_message(&room_state, msg, room_owner_key, &format, false)?;
+                    Self::output_message(
+                        &room_state,
+                        msg,
+                        room_owner_key,
+                        &format,
+                        false,
+                        &secrets,
+                    )?;
                 }
             }
         }
@@ -3997,7 +4225,10 @@ impl ApiClient {
                     let _ = update;
                     drop(web_api); // get_room needs the web_api lock
                     match self.get_room(room_owner_key, false).await {
-                        Ok(room_state) => {
+                        Ok(mut room_state) => {
+                            // Decrypt private-room content for display (no-op for public rooms).
+                            let secrets =
+                                self.room_display_secrets(room_owner_key, &mut room_state);
                             Self::emit_new_and_edited(
                                 &room_state,
                                 &mut seen_messages,
@@ -4007,6 +4238,7 @@ impl ApiClient {
                                 &format,
                                 max_messages,
                                 &mut new_message_count,
+                                &secrets,
                             )?;
                             Self::emit_deletions(
                                 &room_state,
@@ -4377,7 +4609,9 @@ mod migration_recovery_tests {
 #[cfg(test)]
 mod display_text_tests {
     use super::*;
-    use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    use river_core::room_state::message::{
+        AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody,
+    };
     use std::time::SystemTime;
 
     /// Build a `ChatRoomStateV1` whose `recent_messages` holds a single
@@ -4434,6 +4668,148 @@ mod display_text_tests {
         assert_eq!(
             message_display_text(&state, &msg),
             "[Unsupported message type 99.1 - please upgrade]"
+        );
+    }
+
+    /// Seal `text` as a private (AES-256-GCM) `TextContentV1` body under
+    /// `secret`/`version`, mirroring the wire bytes the UI and
+    /// `private_room::build_message_body` produce.
+    fn private_text_body(secret: &[u8; 32], version: u32, text: &str) -> RoomMessageBody {
+        use river_core::room_state::content::TextContentV1;
+        let bytes = TextContentV1::new(text.to_string()).encode();
+        let (ciphertext, nonce) = river_core::ecies::encrypt_with_symmetric_key(secret, &bytes);
+        RoomMessageBody::private_text(ciphertext, nonce, version)
+    }
+
+    /// Core regression for the reported bug (riverctl `message list` on an
+    /// encrypted room showed `"content":"<encrypted>"`): a private text body
+    /// must decrypt to its plaintext when the room secret is supplied, while
+    /// still falling back to "<encrypted>" when it is not.
+    #[test]
+    fn private_text_decrypts_with_secret() {
+        let secret = [7u8; 32];
+        let (state, msg) = state_with_message(private_text_body(&secret, 0, "secret hello"));
+
+        // No secrets (non-member / pre-fix behaviour) → still "<encrypted>".
+        assert_eq!(message_display_text(&state, &msg), "<encrypted>");
+
+        // Correct secret for the body's version → plaintext.
+        let secrets = HashMap::from([(0u32, secret)]);
+        assert_eq!(
+            message_display_text_with_secrets(&state, &msg, &secrets),
+            "secret hello"
+        );
+
+        // A secrets map lacking this body's version (e.g. rotated past) →
+        // "<encrypted>", never a panic or a wrong-key garble.
+        let other_version = HashMap::from([(1u32, secret)]);
+        assert_eq!(
+            message_display_text_with_secrets(&state, &msg, &other_version),
+            "<encrypted>"
+        );
+
+        // Wrong key at the right version → decrypt fails → "<encrypted>".
+        let wrong_key = HashMap::from([(0u32, [8u8; 32])]);
+        assert_eq!(
+            message_display_text_with_secrets(&state, &msg, &wrong_key),
+            "<encrypted>"
+        );
+    }
+
+    /// A private reply seals its whole `ReplyContentV1` (target author + quoted
+    /// preview + reply text). Without the secret the reply context is opaque
+    /// (no `[reply to …]` prefix); with it, both the context and the body
+    /// decrypt.
+    #[test]
+    fn private_reply_context_decrypts_with_secret() {
+        use river_core::room_state::content::{
+            ReplyContentV1, CONTENT_TYPE_REPLY, REPLY_CONTENT_VERSION,
+        };
+        let secret = [9u8; 32];
+        let reply = ReplyContentV1::new(
+            "my reply".to_string(),
+            MessageId(freenet_scaffold::util::FastHash(0)),
+            "Alice".to_string(),
+            "quoted original".to_string(),
+        );
+        let (ciphertext, nonce) =
+            river_core::ecies::encrypt_with_symmetric_key(&secret, &reply.encode());
+        let body = RoomMessageBody::private(
+            CONTENT_TYPE_REPLY,
+            REPLY_CONTENT_VERSION,
+            ciphertext,
+            nonce,
+            0,
+        );
+        let (state, msg) = state_with_message(body);
+
+        // Opaque without the secret.
+        assert_eq!(reply_context_display(&state, &msg), None);
+
+        // Author + quoted preview decrypt with the secret.
+        let secrets = HashMap::from([(0u32, secret)]);
+        let (author, preview) = reply_context_display_with_secrets(&state, &msg, &secrets)
+            .expect("private reply context decrypts");
+        assert_eq!(author, "Alice");
+        assert_eq!(preview, "quoted original");
+
+        // And the reply body itself decrypts to the reply text.
+        assert_eq!(
+            message_display_text_with_secrets(&state, &msg, &secrets),
+            "my reply"
+        );
+    }
+
+    /// A private-room EDIT is an encrypted action message. The public-only
+    /// `rebuild_actions_state` that `apply_delta` runs drops it, so the body
+    /// decrypts to its ORIGINAL text; only after
+    /// [`rebuild_private_actions_state`] (which the display paths now run) does
+    /// the edited text surface.
+    #[test]
+    fn private_edit_shows_edited_text_after_rebuild() {
+        use river_core::room_state::content::ActionContentV1;
+        let author_sk = SigningKey::from_bytes(&[11u8; 32]);
+        let owner_vk = SigningKey::from_bytes(&[12u8; 32]).verifying_key();
+        let secret = [5u8; 32];
+
+        let author = |content: RoomMessageBody, secs: u64| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(owner_vk),
+                    author: MemberId::from(&author_sk.verifying_key()),
+                    content,
+                    time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                },
+                &author_sk,
+            )
+        };
+
+        let orig = author(private_text_body(&secret, 0, "before edit"), 0);
+        let action = ActionContentV1::edit(orig.id(), "after edit".to_string());
+        let (ciphertext, nonce) =
+            river_core::ecies::encrypt_with_symmetric_key(&secret, &action.encode());
+        let edit = author(RoomMessageBody::private_action(ciphertext, nonce, 0), 1);
+
+        let mut state = ChatRoomStateV1::default();
+        state.recent_messages.messages.push(orig.clone());
+        state.recent_messages.messages.push(edit);
+
+        let secrets = HashMap::from([(0u32, secret)]);
+
+        // Before the decrypt-aware rebuild: original text (the private edit
+        // action was dropped by the public-only rebuild).
+        assert!(!state.recent_messages.is_edited(&orig.id()));
+        assert_eq!(
+            message_display_text_with_secrets(&state, &orig, &secrets),
+            "before edit"
+        );
+
+        // After it: the edit applies.
+        rebuild_private_actions_state(&mut state, &secrets);
+        assert!(state.recent_messages.is_edited(&orig.id()));
+        assert_eq!(
+            message_display_text_with_secrets(&state, &orig, &secrets),
+            "after edit"
         );
     }
 }
@@ -5171,6 +5547,7 @@ mod monitor_tests {
             &OutputFormat::Json,
             0,
             &mut new_count,
+            &HashMap::new(),
         )
         .unwrap();
 
