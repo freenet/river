@@ -49,11 +49,11 @@ pub enum RoomCommands {
         /// Room owner key (base58)
         room_id: String,
 
-        /// Set room name (public rooms only)
+        /// Set room name (sealed automatically in a private room)
         #[arg(long)]
         name: Option<String>,
 
-        /// Set room description (public rooms only)
+        /// Set room description (sealed automatically in a private room)
         #[arg(long)]
         description: Option<String>,
 
