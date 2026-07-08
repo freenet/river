@@ -194,6 +194,30 @@ pub(crate) fn render_mentions_for_terminal(room_state: &ChatRoomStateV1, text: &
     })
 }
 
+/// Resolve a member's `preferred_nickname` [`SealedBytes`] to its display
+/// string, decrypting a **private**-room sealed nickname with `secrets`.
+///
+/// Mirrors the UI (`unseal_bytes_with_secrets` at
+/// `ui/src/components/members.rs`): a public nickname yields its plaintext; a
+/// private one is decrypted with the version-matched room secret; when the
+/// secret is unavailable it falls back to the sealed placeholder
+/// (`[Encrypted: N bytes, vN]`) rather than showing raw ciphertext. `secrets`
+/// is empty for a public room / a room not in local storage, so public
+/// nicknames are unaffected.
+///
+/// Without this, riverctl rendered every private-room member as
+/// `[Encrypted: N bytes, vN]` — and, worse, `send_reply` sealed that
+/// placeholder into `ReplyContentV1.target_author_name`, persisting it to
+/// contract state for every reader (including the UI).
+pub(crate) fn unseal_nickname_display(
+    nickname: &river_core::room_state::privacy::SealedBytes,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> String {
+    river_core::ecies::unseal_bytes_with_secrets(nickname, secrets)
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .unwrap_or_else(|_| nickname.to_string_lossy())
+}
+
 /// Convert bare `@nickname` mentions in an outgoing message into full mention
 /// tokens, resolving each against the room's current members. Only **public**
 /// nicknames are matched (riverctl does not decrypt private-room nicknames) and
@@ -2987,12 +3011,17 @@ impl ApiClient {
                 anyhow!("Target message not found in recent messages. Cannot reply to expired messages via CLI.")
             })?;
 
+        // Decrypt the target author's nickname with the room secrets — in a
+        // private room this is sealed, and `build_reply_body` seals it into
+        // `ReplyContentV1.target_author_name` and PERSISTS it to contract state.
+        // Without decrypting here, the reply's quoted author would read
+        // "[Encrypted: N bytes, vN]" to every reader (including the UI) forever.
         let target_author_name = room_state
             .member_info
             .member_info
             .iter()
             .find(|info| info.member_info.member_id == target_msg.message.author)
-            .map(|info| info.member_info.preferred_nickname.to_string_lossy())
+            .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, &secrets))
             .unwrap_or_else(|| target_msg.message.author.to_string());
 
         // Quote the target's plaintext. A PRIVATE target body is decrypted via
@@ -3246,6 +3275,7 @@ impl ApiClient {
                         &mut deleted_emitted,
                         room_owner_key,
                         &format,
+                        &secrets,
                     )?;
                     // Surface reactions added/removed since a message was already
                     // streamed. Runs AFTER emit_new_and_edited so a brand-new
@@ -3255,6 +3285,7 @@ impl ApiClient {
                         &mut seen_reactions,
                         room_owner_key,
                         &format,
+                        &secrets,
                     )?;
                     if max_messages > 0 && new_message_count >= max_messages {
                         return Ok(());
@@ -3351,6 +3382,7 @@ impl ApiClient {
         deleted_emitted: &mut HashSet<String>,
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
+        secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
         // We can only report a deletion while the original message is still in
         // the recent-messages window. If a message is pruned out of the window
@@ -3362,7 +3394,7 @@ impl ApiClient {
             }
             let key = monitor_seen_key(msg);
             if should_emit_deletion(seen, deleted_emitted, &key) {
-                Self::output_deletion(room_state, msg, room_owner_key, format)?;
+                Self::output_deletion(room_state, msg, room_owner_key, format, secrets)?;
                 deleted_emitted.insert(key);
             }
         }
@@ -3389,6 +3421,7 @@ impl ApiClient {
         seen_reactions: &mut HashMap<String, String>,
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
+        secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
         for msg in room_state.recent_messages.display_messages() {
             let key = monitor_seen_key(msg);
@@ -3399,7 +3432,7 @@ impl ApiClient {
                 ReactionEmit::NotSurfaced => continue,
                 ReactionEmit::Unchanged => continue,
                 ReactionEmit::Changed => {
-                    Self::output_reaction_change(room_state, msg, room_owner_key, format)?;
+                    Self::output_reaction_change(room_state, msg, room_owner_key, format, secrets)?;
                 }
             }
             seen_reactions.insert(key, fingerprint);
@@ -3417,6 +3450,7 @@ impl ApiClient {
         msg: &river_core::room_state::message::AuthorizedMessageV1,
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
+        secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
         let msg_id = msg.id();
         let reactions = room_state.recent_messages.reactions(&msg_id);
@@ -3426,7 +3460,7 @@ impl ApiClient {
             .member_info
             .iter()
             .find(|info| info.member_info.member_id == msg.message.author)
-            .map(|info| info.member_info.preferred_nickname.to_string_lossy());
+            .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
         let datetime: DateTime<Utc> = msg.message.time.into();
 
         match format {
@@ -3483,6 +3517,7 @@ impl ApiClient {
         msg: &river_core::room_state::message::AuthorizedMessageV1,
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
+        secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
         let msg_id = msg.id();
         let author_str = msg.message.author.to_string();
@@ -3491,7 +3526,7 @@ impl ApiClient {
             .member_info
             .iter()
             .find(|info| info.member_info.member_id == msg.message.author)
-            .map(|info| info.member_info.preferred_nickname.to_string_lossy());
+            .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
         let datetime: DateTime<Utc> = msg.message.time.into();
 
         match format {
@@ -3558,13 +3593,15 @@ impl ApiClient {
                 let author_str = msg.message.author.to_string();
                 let author_short = author_str.chars().take(8).collect::<String>();
 
-                // Get nickname if available
+                // Get nickname if available (decrypted for a private room)
                 let nickname = room_state
                     .member_info
                     .member_info
                     .iter()
                     .find(|info| info.member_info.member_id == msg.message.author)
-                    .map(|info| info.member_info.preferred_nickname.to_string_lossy())
+                    .map(|info| {
+                        unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
+                    })
                     .unwrap_or(author_short);
 
                 let datetime: DateTime<Utc> = msg.message.time.into();
@@ -3611,7 +3648,9 @@ impl ApiClient {
                     .member_info
                     .iter()
                     .find(|info| info.member_info.member_id == msg.message.author)
-                    .map(|info| info.member_info.preferred_nickname.to_string_lossy());
+                    .map(|info| {
+                        unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
+                    });
 
                 let datetime: DateTime<Utc> = msg.message.time.into();
 
@@ -4247,6 +4286,7 @@ impl ApiClient {
                                 &mut deleted_emitted,
                                 room_owner_key,
                                 &format,
+                                &secrets,
                             )?;
                             // Surface reactions added/removed since a message was
                             // already streamed. Runs AFTER emit_new_and_edited so a
@@ -4256,6 +4296,7 @@ impl ApiClient {
                                 &mut seen_reactions,
                                 room_owner_key,
                                 &format,
+                                &secrets,
                             )?;
                         }
                         Err(e) => {
@@ -4759,6 +4800,43 @@ mod display_text_tests {
             message_display_text_with_secrets(&state, &msg, &secrets),
             "my reply"
         );
+    }
+
+    /// A member nickname is `SealedBytes`: public in a public room, AES-256-GCM
+    /// sealed in a private room. `unseal_nickname_display` must decrypt the
+    /// private case with the room secret and fall back to the placeholder (never
+    /// raw ciphertext) when the secret is unavailable — this is what stops
+    /// `message list` / `member list` / `send_reply` from showing (and, for
+    /// replies, persisting) "[Encrypted: N bytes, vN]" as the author.
+    #[test]
+    fn unseal_nickname_display_decrypts_private_and_falls_back() {
+        use river_core::ecies::seal_bytes;
+        use river_core::room_state::privacy::SealedBytes;
+
+        let secret = [4u8; 32];
+        let sealed = seal_bytes(b"Alice", &secret, 0);
+
+        // With the matching secret → plaintext nickname.
+        let secrets = HashMap::from([(0u32, secret)]);
+        assert_eq!(unseal_nickname_display(&sealed, &secrets), "Alice");
+
+        // Without the secret → the "[Encrypted: …]" placeholder, never raw
+        // ciphertext.
+        assert_eq!(
+            unseal_nickname_display(&sealed, &HashMap::new()),
+            "[Encrypted: 5 bytes, v0]"
+        );
+
+        // Wrong key at the right version → placeholder (decrypt fails cleanly).
+        let wrong = HashMap::from([(0u32, [9u8; 32])]);
+        assert_eq!(
+            unseal_nickname_display(&sealed, &wrong),
+            "[Encrypted: 5 bytes, v0]"
+        );
+
+        // A public nickname is unaffected (public room / empty secrets).
+        let public = SealedBytes::public(b"Bob".to_vec());
+        assert_eq!(unseal_nickname_display(&public, &HashMap::new()), "Bob");
     }
 
     /// A private-room EDIT is an encrypted action message. The public-only
@@ -5408,6 +5486,7 @@ mod monitor_tests {
             &mut seen_reactions,
             &owner_vk,
             &OutputFormat::Json,
+            &HashMap::new(),
         )
         .unwrap();
         let after = seen_reactions.get(&key).cloned();
@@ -5443,8 +5522,14 @@ mod monitor_tests {
 
         // emit_reaction_changes must NOT seed it (which would let a *later*
         // reaction flip-flop to Changed and emit — the codex-found bug).
-        ApiClient::emit_reaction_changes(&state, &mut seen, &owner_vk, &OutputFormat::Json)
-            .unwrap();
+        ApiClient::emit_reaction_changes(
+            &state,
+            &mut seen,
+            &owner_vk,
+            &OutputFormat::Json,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert!(
             !seen.contains_key(&key),
             "an unsurfaced message must not be seeded by emit_reaction_changes; \
@@ -5478,8 +5563,14 @@ mod monitor_tests {
             ReactionEmit::Unchanged,
             "an unchanged reaction set must not re-emit on every poll"
         );
-        ApiClient::emit_reaction_changes(&state, &mut seen, &owner_vk, &OutputFormat::Json)
-            .unwrap();
+        ApiClient::emit_reaction_changes(
+            &state,
+            &mut seen,
+            &owner_vk,
+            &OutputFormat::Json,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             seen.get(&key).cloned(),
             Some(fp),

@@ -47,7 +47,13 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                 .map_err(|e| anyhow!("Invalid room ID: {}", e))?;
 
             // Get the room state
-            let room_state = api.get_room(&owner_vk, false).await?;
+            let mut room_state = api.get_room(&owner_vk, false).await?;
+
+            // For a private room, collect the local member's secrets so member
+            // nicknames (which are AES-256-GCM sealed) decrypt instead of
+            // rendering as "[Encrypted: N bytes, vN]". Empty / no-op for a
+            // public room or a room not in local storage.
+            let secrets = api.room_display_secrets(&owner_vk, &mut room_state);
 
             // Collect member info
             let members: Vec<_> = room_state
@@ -55,7 +61,10 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                 .member_info
                 .iter()
                 .map(|info| {
-                    let nickname = info.member_info.preferred_nickname.to_string_lossy();
+                    let nickname = crate::api::unseal_nickname_display(
+                        &info.member_info.preferred_nickname,
+                        &secrets,
+                    );
                     let member_id = info.member_info.member_id.to_string();
                     (member_id, nickname)
                 })

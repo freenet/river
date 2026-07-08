@@ -225,13 +225,18 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let author_str = msg.message.author.to_string();
                             let author_short = author_str.chars().take(8).collect::<String>();
 
-                            // Get nickname if available
+                            // Get nickname if available (decrypted for a private room)
                             let nickname = room_state
                                 .member_info
                                 .member_info
                                 .iter()
                                 .find(|info| info.member_info.member_id == msg.message.author)
-                                .map(|info| info.member_info.preferred_nickname.to_string_lossy())
+                                .map(|info| {
+                                    crate::api::unseal_nickname_display(
+                                        &info.member_info.preferred_nickname,
+                                        &secrets,
+                                    )
+                                })
                                 .unwrap_or(author_short);
 
                             let datetime: DateTime<Utc> = msg.message.time.into();
@@ -308,7 +313,12 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                                 .member_info
                                 .iter()
                                 .find(|info| info.member_info.member_id == msg.message.author)
-                                .map(|info| info.member_info.preferred_nickname.to_string_lossy());
+                                .map(|info| {
+                                    crate::api::unseal_nickname_display(
+                                        &info.member_info.preferred_nickname,
+                                        &secrets,
+                                    )
+                                });
 
                             let datetime: DateTime<Utc> = msg.message.time.into();
 

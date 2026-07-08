@@ -351,7 +351,13 @@ async fn execute_list(
     let self_vk = signing_key.verifying_key();
     let self_id = MemberId::from(&self_vk);
 
-    let room_state = api.get_room(&room_owner_key, false).await?;
+    let mut room_state = api.get_room(&room_owner_key, false).await?;
+
+    // For a private room, collect the local member's secrets so DM
+    // counterparty nicknames (AES-256-GCM sealed) decrypt instead of showing
+    // "[Encrypted: N bytes, vN]". Empty / no-op for a public room. Must run
+    // before the immutable borrows below.
+    let secrets = api.room_display_secrets(&room_owner_key, &mut room_state);
 
     let with_filter = with
         .map(|s| resolve_recipient_id(&room_state, &room_owner_key, s))
@@ -363,7 +369,8 @@ async fn execute_list(
             .unwrap_or(0)
     });
 
-    // Build a nickname lookup so output is human-readable.
+    // Build a nickname lookup so output is human-readable (decrypted for a
+    // private room).
     let nicknames: HashMap<MemberId, String> = room_state
         .member_info
         .member_info
@@ -371,7 +378,7 @@ async fn execute_list(
         .map(|info| {
             (
                 info.member_info.member_id,
-                info.member_info.preferred_nickname.to_string_lossy(),
+                crate::api::unseal_nickname_display(&info.member_info.preferred_nickname, &secrets),
             )
         })
         .collect();
