@@ -188,7 +188,16 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                     .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
 
             // Get room state
-            let room_state = api.get_room(&room_owner_key, false).await?;
+            let mut room_state = api.get_room(&room_owner_key, false).await?;
+
+            // For a private room, collect the local member's decryption secrets
+            // and rebuild the message actions_state (edits/deletes/reactions)
+            // from the decrypted private actions. Empty map / no-op for a public
+            // room or a room not in local storage — private bodies then still
+            // render as "<encrypted>", exactly as before. Must run before
+            // display_messages() so a decrypted private *deletion* hides its
+            // message.
+            let secrets = api.room_display_secrets(&room_owner_key, &mut room_state);
 
             // Get only display messages (non-deleted, non-action)
             let mut messages: Vec<_> = room_state.recent_messages.display_messages().collect();
@@ -216,22 +225,33 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let author_str = msg.message.author.to_string();
                             let author_short = author_str.chars().take(8).collect::<String>();
 
-                            // Get nickname if available
+                            // Get nickname if available (decrypted for a private room)
                             let nickname = room_state
                                 .member_info
                                 .member_info
                                 .iter()
                                 .find(|info| info.member_info.member_id == msg.message.author)
-                                .map(|info| info.member_info.preferred_nickname.to_string_lossy())
+                                .map(|info| {
+                                    crate::api::unseal_nickname_display(
+                                        &info.member_info.preferred_nickname,
+                                        &secrets,
+                                    )
+                                })
                                 .unwrap_or(author_short);
 
                             let datetime: DateTime<Utc> = msg.message.time.into();
                             let local_time: DateTime<Local> = datetime.into();
 
-                            // Get display content (handles edits and non-text
-                            // public content like join events; only genuinely
-                            // encrypted bodies render as "<encrypted>")
-                            let content = crate::api::message_display_text(&room_state, msg);
+                            // Get display content (handles edits, non-text
+                            // public content like join events, and — via
+                            // `secrets` — decrypted private-room bodies; only a
+                            // body whose secret is unavailable renders as
+                            // "<encrypted>")
+                            let content = crate::api::message_display_text_with_secrets(
+                                &room_state,
+                                msg,
+                                &secrets,
+                            );
 
                             // Check if message is edited
                             let msg_id = msg.id();
@@ -242,11 +262,13 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // stream via crate::api::reply_context_display so the
                             // two renderings can't drift, including the truncation
                             // marker appended by truncate_reply_preview).
-                            let reply_prefix = crate::api::reply_context_display(&room_state, msg)
-                                .map(|(author, preview)| {
-                                    format!("[reply to {}: {}] ", author, preview)
-                                })
-                                .unwrap_or_default();
+                            let reply_prefix = crate::api::reply_context_display_with_secrets(
+                                &room_state,
+                                msg,
+                                &secrets,
+                            )
+                            .map(|(author, preview)| format!("[reply to {}: {}] ", author, preview))
+                            .unwrap_or_default();
 
                             // Get reactions
                             let reactions_str = room_state
@@ -291,14 +313,25 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                                 .member_info
                                 .iter()
                                 .find(|info| info.member_info.member_id == msg.message.author)
-                                .map(|info| info.member_info.preferred_nickname.to_string_lossy());
+                                .map(|info| {
+                                    crate::api::unseal_nickname_display(
+                                        &info.member_info.preferred_nickname,
+                                        &secrets,
+                                    )
+                                });
 
                             let datetime: DateTime<Utc> = msg.message.time.into();
 
-                            // Get display content (handles edits and non-text
-                            // public content like join events; only genuinely
-                            // encrypted bodies render as "<encrypted>")
-                            let content = crate::api::message_display_text(&room_state, msg);
+                            // Get display content (handles edits, non-text
+                            // public content like join events, and — via
+                            // `secrets` — decrypted private-room bodies; only a
+                            // body whose secret is unavailable renders as
+                            // "<encrypted>")
+                            let content = crate::api::message_display_text_with_secrets(
+                                &room_state,
+                                msg,
+                                &secrets,
+                            );
 
                             // Check edited status
                             let edited = room_state.recent_messages.is_edited(&msg_id);
@@ -316,7 +349,12 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // Reply context (null for non-replies) — same shape
                             // as the monitor stream's JSON, so a bridge sees
                             // reply_to on both the backfill and the live feed.
-                            let reply_to = crate::api::reply_context_display(&room_state, msg).map(
+                            let reply_to = crate::api::reply_context_display_with_secrets(
+                                &room_state,
+                                msg,
+                                &secrets,
+                            )
+                            .map(
                                 |(author, preview)| json!({ "author": author, "preview": preview }),
                             );
 
