@@ -8,12 +8,15 @@
 //!   riverctl`, so crates.io is the authoritative "is my binary current?"
 //!   source. A Freenet-hosted version record would be dogfood-nice but could
 //!   disagree with the actual install channel.
-//! - **Never blocks meaningfully / never fails loudly.** Bounded network
-//!   timeout, all errors swallowed to `None`. A down crates.io, no network, or
-//!   a parse hiccup must never break a command.
-//! - **Once per day.** The result is cached in the user's cache dir with a
-//!   timestamp; only the first invocation in a 24h window touches the network.
-//! - **Opt-out.** `--no-version-check` / `RIVERCTL_NO_VERSION_CHECK=true`.
+//! - **Never blocks the command / never fails loudly.** The nudge is decided
+//!   from the on-disk cache (an instant read); the network refresh runs on a
+//!   detached thread, so the command's critical path and its exit never wait on
+//!   crates.io. All errors are swallowed to "no nudge". A bounded network
+//!   timeout still caps the detached refresh.
+//! - **Once per day.** The cache stores the last-attempt timestamp (success OR
+//!   failure), so the refresh runs at most once per 24h even offline.
+//! - **Opt-out.** `--no-version-check`, or `RIVERCTL_NO_VERSION_CHECK` set to
+//!   any value.
 //! - **stderr only.** The caller prints the nudge to stderr so `--format json`
 //!   stdout and downstream scripts are never polluted.
 
@@ -27,16 +30,45 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Hard cap on the network call so a slow/hung crates.io never stalls the CLI.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// If a newer `riverctl` than `current` is published on crates.io, return
-/// `Some(latest_version_string)`; otherwise `None`. Blocking (run it on a
-/// `spawn_blocking` thread). Never panics, never errors — any failure yields
-/// `None`.
+/// Decide the update nudge from the **cached** latest version (an instant file
+/// read — never any network on the caller's thread), and, if the cache is stale
+/// or absent, kick off a **detached** background thread to refresh it for next
+/// time. Returns the nudge string if the cached latest is newer than `current`,
+/// else `None`.
 ///
-/// Uses a once-per-day on-disk cache so most invocations do zero network I/O.
-pub fn latest_if_outdated(current: &str) -> Option<String> {
-    let latest = cached_or_fetch_latest()?;
+/// Because the network refresh is fully detached, this adds no measurable
+/// latency to the command and can never delay process exit — the two review
+/// findings on PR #391 (a fast command waiting up to the network timeout, on
+/// both the success `await` and the error-path runtime-drop join). The tradeoff
+/// is that the nudge reflects the cache, so a brand-new install shows nothing on
+/// its first run and nags from the second onward — fine for a passive notice.
+///
+/// Never panics; every failure degrades to `None` / no nudge.
+pub fn start_check(current: &str) -> Option<String> {
+    let now = unix_now();
+    let cache = cache_path();
+    let existing = cache.as_ref().and_then(read_cache);
+
+    let fresh = existing
+        .as_ref()
+        .is_some_and(|(checked_at, _)| now.saturating_sub(*checked_at) < CHECK_INTERVAL.as_secs());
+    if !fresh {
+        // Detached, best-effort refresh for the NEXT invocation. Records the
+        // attempt time on success OR failure (carrying the previous value
+        // forward) so the once/day backoff holds even offline. Killed if the
+        // process exits first; a torn write is handled by read_cache -> None.
+        if let Some(path) = cache {
+            let prev = existing.as_ref().and_then(|(_, l)| l.clone());
+            std::thread::spawn(move || {
+                let latest = fetch_latest_from_index().or(prev);
+                write_cache(&path, unix_now(), latest.as_deref());
+            });
+        }
+    }
+
+    let latest = existing.and_then(|(_, l)| l)?;
     match (parse_semver(current), parse_semver(&latest)) {
-        (Some(cur), Some(new)) if new > cur => Some(latest),
+        (Some(cur), Some(new)) if new > cur => Some(update_message(current, &latest)),
         _ => None,
     }
 }
@@ -47,37 +79,6 @@ pub fn update_message(current: &str, latest: &str) -> String {
         "A newer riverctl is available: {current} -> {latest}. \
          Update with `cargo install riverctl --force`."
     )
-}
-
-/// Return the newest published version, using a once-per-day on-disk cache.
-///
-/// The cache records the timestamp of the last *attempt* — success OR failure —
-/// so the once-per-day limit holds even when offline or during a crates.io
-/// outage. Without caching failures, every invocation while offline would retry
-/// the network and pay the full timeout (Codex review on PR #391). A failed
-/// attempt carries the previous known value forward (so a nudge still shows)
-/// and backs off for a full interval before retrying.
-fn cached_or_fetch_latest() -> Option<String> {
-    let now = unix_now();
-    let cache = cache_path();
-    let existing = cache.as_ref().and_then(read_cache);
-
-    // Fresh cache (from a successful fetch OR a recent failed attempt) →
-    // short-circuit the network entirely.
-    if let Some((checked_at, latest)) = &existing {
-        if now.saturating_sub(*checked_at) < CHECK_INTERVAL.as_secs() {
-            return latest.clone();
-        }
-    }
-
-    // Stale or absent: attempt a fetch and record the attempt time regardless of
-    // outcome. On failure, carry the previous known value forward.
-    let fetched = fetch_latest_from_index();
-    let latest = fetched.or_else(|| existing.and_then(|(_, l)| l));
-    if let Some(p) = cache.as_ref() {
-        write_cache(p, now, latest.as_deref());
-    }
-    latest
 }
 
 /// GET the sparse-index file and return the highest non-yanked `vers`.
@@ -237,9 +238,9 @@ mod tests {
     }
 
     #[test]
-    fn latest_if_outdated_compares_correctly() {
+    fn outdated_comparison_is_correct() {
         // Drive the pure comparison via highest_non_yanked + parse_semver by
-        // reconstructing the decision (latest_if_outdated itself does I/O).
+        // reconstructing the decision (start_check itself does cache I/O).
         let newer = highest_non_yanked(r#"{"vers":"0.1.73","yanked":false}"#).unwrap();
         assert!(parse_semver(&newer).unwrap() > parse_semver("0.1.72").unwrap());
         assert!(!(parse_semver(&newer).unwrap() > parse_semver("0.1.73").unwrap()));

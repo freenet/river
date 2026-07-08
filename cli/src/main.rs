@@ -42,8 +42,10 @@ struct Cli {
     debug: bool,
 
     /// Skip the once-per-day check for a newer riverctl on crates.io.
-    /// Also settable via `RIVERCTL_NO_VERSION_CHECK=true`.
-    #[arg(long, global = true, env = "RIVERCTL_NO_VERSION_CHECK")]
+    /// Also disabled by setting the `RIVERCTL_NO_VERSION_CHECK` env var to any
+    /// value. (The env var is read manually rather than via clap so that a
+    /// common value like `=1` opts out instead of hard-erroring the command.)
+    #[arg(long, global = true)]
     no_version_check: bool,
 
     /// Optional path to write log output (stdout remains reserved for command output/JSON)
@@ -126,16 +128,19 @@ async fn main() -> Result<()> {
 
     info!("River starting...");
 
-    // Kick off a best-effort "newer riverctl available?" check concurrently
-    // with the command (once/day cached, crates.io, fail-silent). We await it
-    // AFTER the command so the nudge is the last thing printed, and only on the
-    // success path. stderr only — never pollutes JSON stdout. Opt out with
-    // --no-version-check / RIVERCTL_NO_VERSION_CHECK.
-    let version_check = (!cli.no_version_check).then(|| {
-        tokio::task::spawn_blocking(|| {
-            riverctl::version_check::latest_if_outdated(env!("CARGO_PKG_VERSION"))
-        })
-    });
+    // Best-effort "newer riverctl available?" nudge (crates.io, once/day cached,
+    // fail-silent, stderr-only). Decided synchronously from the cache — an
+    // instant file read with NO network on this path — while a detached thread
+    // refreshes the cache for next time, so the command is never delayed. Opt
+    // out with --no-version-check, or by setting RIVERCTL_NO_VERSION_CHECK to
+    // ANY value (read manually so `=1` opts out rather than hard-erroring).
+    let version_disabled =
+        cli.no_version_check || std::env::var_os("RIVERCTL_NO_VERSION_CHECK").is_some();
+    let version_nudge = if version_disabled {
+        None
+    } else {
+        riverctl::version_check::start_check(env!("CARGO_PKG_VERSION"))
+    };
 
     // Load configuration
     let config = config::Config::load()?;
@@ -169,14 +174,9 @@ async fn main() -> Result<()> {
         Commands::Dm { command } => dm::execute(command, api_client, cli.format).await?,
     }
 
-    // Surface an update nudge on stderr (only reached on command success).
-    if let Some(handle) = version_check {
-        if let Ok(Some(latest)) = handle.await {
-            eprintln!(
-                "\n{}",
-                riverctl::version_check::update_message(env!("CARGO_PKG_VERSION"), &latest)
-            );
-        }
+    // Surface the update nudge on stderr (only reached on command success).
+    if let Some(msg) = version_nudge {
+        eprintln!("\n{msg}");
     }
 
     Ok(())
