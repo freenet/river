@@ -2969,6 +2969,15 @@ impl ApiClient {
         // Fetch fresh state from network so build_rejoin_delta can detect pruning
         let mut room_state = self.get_room(room_owner_key, false).await?;
 
+        // Decrypt the room's private content BEFORE selecting the reply target:
+        // this rebuilds `actions_state` from the decrypted private edit/delete
+        // actions, so a target the user already deleted is correctly excluded
+        // (`display_messages()` hides it) and an edited target's quoted preview
+        // reflects the edit rather than the stale original. Returns the secrets
+        // used to decrypt the preview body below (empty map / no-op for a public
+        // room, so behaviour there is unchanged).
+        let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
+
         // Find the target message to extract author name and content preview
         let target_msg = room_state
             .recent_messages
@@ -2986,19 +2995,10 @@ impl ApiClient {
             .map(|info| info.member_info.preferred_nickname.to_string_lossy())
             .unwrap_or_else(|| target_msg.message.author.to_string());
 
-        // Collect the room's decryption secrets so the quoted preview of a
-        // PRIVATE target message is its plaintext, not "<encrypted>". Without
-        // this, the CLI sealed "<encrypted>" into the reply's `ReplyContentV1`,
-        // so the quoted context showed "<encrypted>" to every reader forever.
-        // (Reused below to seal the reply body itself — a public room yields an
-        // empty map and unchanged behaviour.)
-        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
-        let secrets = crate::private_room::collect_secrets_for_room(
-            &room_state,
-            &signing_key,
-            &invitation_secrets,
-        );
-
+        // Quote the target's plaintext. A PRIVATE target body is decrypted via
+        // `secrets`; without this the CLI sealed "<encrypted>" into the reply's
+        // `ReplyContentV1`, so the quoted context read "<encrypted>" to every
+        // reader forever.
         let target_content_preview: String =
             message_display_text_with_secrets(&room_state, target_msg, &secrets)
                 .chars()
@@ -3013,6 +3013,7 @@ impl ApiClient {
         // target author name and content preview are sealed alongside the reply
         // text in a private room (they are part of `ReplyContentV1`), so the
         // reply context is not leaked in the clear.
+        let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
         let content = crate::private_room::build_reply_body(
             &room_state,
             &signing_key,

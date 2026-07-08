@@ -294,14 +294,24 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
 
             if !has_changes {
                 // No changes requested, show current config
-                let room_state = api.get_room(&owner_key, false).await?;
+                let mut room_state = api.get_room(&owner_key, false).await?;
+                // For a private room the name/description are AES-256-GCM sealed;
+                // decrypt them with the local member's secrets so this shows the
+                // real values instead of "[Encrypted: N bytes, vN]". Falls back
+                // to that placeholder when the secret is unavailable.
+                let secrets = api.room_display_secrets(&owner_key, &mut room_state);
+                let unseal = |sealed: &river_core::room_state::privacy::SealedBytes| {
+                    river_core::ecies::unseal_bytes_with_secrets(sealed, &secrets)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                        .unwrap_or_else(|_| sealed.to_string_lossy())
+                };
                 let cfg = &room_state.configuration.configuration;
-                let room_name = cfg.display.name.to_string_lossy();
+                let room_name = unseal(&cfg.display.name);
                 let room_desc = cfg
                     .display
                     .description
                     .as_ref()
-                    .map(|d| d.to_string_lossy())
+                    .map(unseal)
                     .unwrap_or_else(|| "(none)".to_string());
                 println!("Current configuration:");
                 println!("  name: {}", room_name);

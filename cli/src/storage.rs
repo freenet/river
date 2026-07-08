@@ -649,13 +649,27 @@ impl Storage {
                 let mut key_array = [0u8; 32];
                 key_array.copy_from_slice(&owner_key_bytes);
                 if let Ok(owner_vk) = VerifyingKey::from_bytes(&key_array) {
-                    let room_name = room_info
-                        .state
-                        .configuration
-                        .configuration
-                        .display
-                        .name
-                        .to_string_lossy();
+                    let sealed_name = &room_info.state.configuration.configuration.display.name;
+                    // A private room's name is AES-256-GCM sealed under the room
+                    // secret. Decrypt it with the local member's secrets so
+                    // `room list` shows the real name instead of the
+                    // "[Encrypted: N bytes, vN]" placeholder that `to_string_lossy`
+                    // yields for a sealed value. Falls back to that placeholder
+                    // when the secret is unavailable (not yet synced / rotated
+                    // past); a public name decrypts trivially to its bytes.
+                    let room_name = if sealed_name.is_private() {
+                        let self_sk = self.resolve_signing_key(&room_info.signing_key_bytes);
+                        let secrets = crate::private_room::collect_secrets_for_room(
+                            &room_info.state,
+                            &self_sk,
+                            &room_info.invitation_secrets,
+                        );
+                        river_core::ecies::unseal_bytes_with_secrets(sealed_name, &secrets)
+                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                            .unwrap_or_else(|_| sealed_name.to_string_lossy())
+                    } else {
+                        sealed_name.to_string_lossy()
+                    };
                     rooms.push((owner_vk, room_name, room_info.contract_key.clone()));
                 }
             }
@@ -697,6 +711,85 @@ mod tests {
         };
         state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
         state
+    }
+
+    /// A `room list` on a **private** room must show the decrypted name, not
+    /// the "[Encrypted: N bytes, vN]" placeholder (reported on Matrix
+    /// 2026-07-08: riverctl "cant see ... the real room name"). Here the room
+    /// secret is supplied via `invitation_secrets`, mirroring a just-joined
+    /// invitee before the owner's delegate has back-filled the contract blob.
+    #[test]
+    fn list_rooms_decrypts_private_room_name() {
+        use river_core::ecies::seal_bytes;
+        use river_core::room_state::privacy::PrivacyMode;
+
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let secret = [3u8; 32];
+        let version = 0u32;
+
+        // Build a PRIVATE room whose display name is sealed under `secret`.
+        let mut state = create_test_state(&owner_sk);
+        state.configuration.configuration.privacy_mode = PrivacyMode::Private;
+        state.configuration.configuration.display.name =
+            seal_bytes(b"Secret Room", &secret, version);
+        // Re-sign so the (mutated) configuration stays owner-authorized.
+        state.configuration =
+            AuthorizedConfigurationV1::new(state.configuration.configuration.clone(), &owner_sk);
+        let contract_key = expected_contract_key(&owner_vk);
+
+        // Store with the secret carried as an invitation secret.
+        let mut invitation_secrets = HashMap::new();
+        invitation_secrets.insert(version, secret);
+        storage
+            .add_room_with_invitation_secrets(
+                &owner_vk,
+                &owner_sk,
+                state,
+                &contract_key,
+                invitation_secrets,
+            )
+            .unwrap();
+
+        let rooms = storage.list_rooms().unwrap();
+        let (_, name, _) = rooms
+            .iter()
+            .find(|(vk, _, _)| *vk == owner_vk)
+            .expect("room present");
+        assert_eq!(name, "Secret Room");
+    }
+
+    /// Without the secret, the private name gracefully falls back to the
+    /// placeholder rather than erroring or panicking.
+    #[test]
+    fn list_rooms_private_name_falls_back_without_secret() {
+        use river_core::ecies::seal_bytes;
+        use river_core::room_state::privacy::PrivacyMode;
+
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+
+        let mut state = create_test_state(&owner_sk);
+        state.configuration.configuration.privacy_mode = PrivacyMode::Private;
+        state.configuration.configuration.display.name = seal_bytes(b"Secret Room", &[3u8; 32], 0);
+        state.configuration =
+            AuthorizedConfigurationV1::new(state.configuration.configuration.clone(), &owner_sk);
+        let contract_key = expected_contract_key(&owner_vk);
+
+        // No invitation secrets, and the state carries no owner-signed blob for
+        // this member → the secret is unavailable.
+        storage
+            .add_room(&owner_vk, &owner_sk, state, &contract_key)
+            .unwrap();
+
+        let rooms = storage.list_rooms().unwrap();
+        let (_, name, _) = rooms
+            .iter()
+            .find(|(vk, _, _)| *vk == owner_vk)
+            .expect("room present");
+        assert_eq!(name, "[Encrypted: 11 bytes, v0]");
     }
 
     #[test]
