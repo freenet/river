@@ -37,8 +37,13 @@ description = "Build the room contract WASM"
 # a whole-workspace `cargo build` would unify `migration` on and could move the
 # contract key. Keep this `-p room-contract` — never `--workspace`. See
 # `common/src/migration.rs` and freenet/river#292.
+#
+# `--locked` is load-bearing for reproducibility (freenet/river#2776 A1): the
+# contract key is BLAKE3(wasm || params), so the WASM must build from the
+# committed Cargo.lock, not a freshly-resolved (possibly drifted) graph. Fails
+# loudly if the lock is stale rather than silently re-keying the contract.
 command = "cargo"
-args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target"]
+args = ["build", "--locked", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target"]
 
 [tasks.sync-cli-wasm]
 description = "Sync room contract WASM to CLI package for crates.io publishing"
@@ -105,13 +110,21 @@ cargo publish
 
 [tasks.build-chat-delegate]
 description = "Build the chat delegate WASM"
+# `--locked` is load-bearing for reproducibility (freenet/river#2776 A1): the
+# delegate key is BLAKE3(BLAKE3(wasm) || params) and users store room data under
+# it, so the WASM must build from the committed Cargo.lock, not a freshly
+# re-resolved graph. See scripts/sync-wasm.sh, which already builds `--locked`.
 command = "cargo"
-args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "chat-delegate", "--target-dir", "target"]
+args = ["build", "--locked", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "chat-delegate", "--target-dir", "target"]
 
 [tasks.build-web-container]
 description = "Build the web container contract WASM"
+# `--locked` for reproducibility (freenet/river#2776 A1): the web-container
+# contract ID is derived from this WASM + committed parameters. Publishing uses
+# the committed published-contract/web_container_contract.wasm, but a rebuild
+# (e.g. update-published-contract) must also come from the committed lock.
 command = "cargo"
-args = ["build", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "web-container-contract", "--target-dir", "target"]
+args = ["build", "--locked", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "web-container-contract", "--target-dir", "target"]
 
 [tasks.build-web-container-tool]
 description = "Build the web container tool for native platform"
