@@ -42,6 +42,18 @@ description = "Build the room contract WASM"
 # contract key is BLAKE3(wasm || params), so the WASM must build from the
 # committed Cargo.lock, not a freshly-resolved (possibly drifted) graph. Fails
 # loudly if the lock is stale rather than silently re-keying the contract.
+#
+# NOT the canonical key-defining build. `scripts/sync-wasm.sh` (cargo make
+# sync-wasm) is the ONLY producer of the committed room_contract.wasm, and it
+# co-builds `-p room-contract -p chat-delegate` in ONE cargo invocation. That
+# unifies river-core's `ecies` feature (which chat-delegate enables) into the
+# shared river-core, so this task — building room-contract ALONE — produces
+# DIFFERENT room_contract.wasm bytes (a different contract key). Its `target/`
+# output must NEVER be copied into ui/public/contracts/ or cli/contracts/;
+# doing so silently re-keys the room contract. Always use `cargo make
+# sync-wasm` to regenerate committed WASMs. (Reconciling the two build entry
+# points is a documented follow-up on freenet/river#2776 A1 — it re-keys, so it
+# must ride a deliberate migration + republish.)
 command = "cargo"
 args = ["build", "--locked", "--profile", "${BUILD_PROFILE}", "--target", "${CONTRACT_TARGET}", "-p", "room-contract", "--target-dir", "target"]
 
@@ -326,6 +338,14 @@ echo "Please commit the changes to git"
 '''
 
 [tasks.publish-river]
+# GUARDRAIL: any republish that regenerates the room-contract / chat-delegate
+# WASM MUST go through a PR that COMMITS the regenerated WASM (run `cargo make
+# sync-wasm`, stage ui/public/contracts/ + cli/contracts/ + the migration TOMLs
+# per .claude/rules/delegate-migration.md). That is what makes CI's
+# check-room-contract-migration / check-delegate-migration run and demand a
+# migration entry. A local `sync-wasm` + `publish-river` that skips committing
+# the new WASM would silently re-key the on-network contract with NO CI
+# trip-wire and orphan every user's room data.
 description = "Publish River to Freenet using the committed contract version"
 dependencies = ["sign-webapp"]
 script = '''
