@@ -361,6 +361,92 @@ fn complete_pending_request_bytes(key_bytes: &[u8], response: ChatDelegateRespon
     false
 }
 
+/// localStorage keys for the persisted per-install chat-delegate registration
+/// cipher/nonce (base58-encoded). See [`chat_delegate_cipher_material`].
+const CHAT_DELEGATE_CIPHER_KEY: &str = "river_chat_delegate_cipher_v1";
+const CHAT_DELEGATE_NONCE_KEY: &str = "river_chat_delegate_nonce_v1";
+
+/// The (cipher, nonce) to register the chat delegate with.
+///
+/// stdlib 0.8 removed the world-known `DelegateRequest::DEFAULT_CIPHER` /
+/// `DEFAULT_NONCE` constants River previously passed here. They were a PUBLIC
+/// 32-byte XChaCha20 key + 24-byte nonce baked into stdlib, so every node
+/// encrypted its delegate secrets at rest under a key anyone could reproduce.
+/// We replace them with a random 32-byte cipher + 24-byte nonce generated once
+/// per browser profile and PERSISTED in localStorage, so:
+///
+///   * Stability: every session re-registers the SAME delegate with the SAME
+///     material. Generating a fresh random value on each load would make a node
+///     that still honors the client-supplied cipher unable to decrypt the
+///     previous session's secrets — bricking room data.
+///   * Confidentiality: the at-rest key becomes a per-install secret instead of
+///     a world-known constant.
+///
+/// NOTE — on a node built against stdlib-0.8 core (freenet-core #4140/#4143)
+/// this cipher/nonce are IGNORED server-side: the node derives a per-delegate
+/// DEK from its own KEK via HKDF and, for pre-0.8 secrets written under the old
+/// world-known cipher, decrypts them via a built-in `LEGACY_DEFAULT_CIPHER`
+/// fallback. So migration of OLD delegate secrets does NOT depend on River
+/// supplying any particular key — the node performs the decrypt/re-encrypt.
+/// Persisting a random per-install value here is the correct, forward-compatible
+/// choice: harmless on new nodes (discarded), and safe on older nodes that still
+/// honor it.
+fn chat_delegate_cipher_material() -> ([u8; 32], [u8; 24]) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some((cipher, nonce)) = load_persisted_cipher_material() {
+            return (cipher, nonce);
+        }
+    }
+    let (cipher, nonce) = generate_cipher_material();
+    #[cfg(target_arch = "wasm32")]
+    persist_cipher_material(&cipher, &nonce);
+    (cipher, nonce)
+}
+
+/// Generate a fresh random (cipher, nonce). `OsRng` routes through the UI's
+/// `getrandom` backend (`window.crypto.getRandomValues` on wasm; the OS entropy
+/// pool natively), so this is a CSPRNG on every target.
+fn generate_cipher_material() -> ([u8; 32], [u8; 24]) {
+    use rand::RngCore;
+    let mut cipher = [0u8; 32];
+    let mut nonce = [0u8; 24];
+    let mut rng = rand::rngs::OsRng;
+    rng.fill_bytes(&mut cipher);
+    rng.fill_bytes(&mut nonce);
+    (cipher, nonce)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_persisted_cipher_material() -> Option<([u8; 32], [u8; 24])> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let cipher_b58 = storage.get_item(CHAT_DELEGATE_CIPHER_KEY).ok()??;
+    let nonce_b58 = storage.get_item(CHAT_DELEGATE_NONCE_KEY).ok()??;
+    let cipher: [u8; 32] = bs58::decode(&cipher_b58).into_vec().ok()?.try_into().ok()?;
+    let nonce: [u8; 24] = bs58::decode(&nonce_b58).into_vec().ok()?.try_into().ok()?;
+    Some((cipher, nonce))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_cipher_material(cipher: &[u8; 32], nonce: &[u8; 24]) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            if let Err(e) = storage.set_item(
+                CHAT_DELEGATE_CIPHER_KEY,
+                &bs58::encode(cipher).into_string(),
+            ) {
+                warn!("Failed to persist chat-delegate cipher: {:?}", e);
+            }
+            if let Err(e) =
+                storage.set_item(CHAT_DELEGATE_NONCE_KEY, &bs58::encode(nonce).into_string())
+            {
+                warn!("Failed to persist chat-delegate nonce: {:?}", e);
+            }
+        }
+    }
+}
+
 pub async fn set_up_chat_delegate() -> Result<(), String> {
     let delegate = create_chat_delegate_container();
 
@@ -370,10 +456,11 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
         if let Some(api) = web_api.as_mut() {
             // Perform the operation while holding the lock
             info!("Registering chat delegate");
+            let (cipher, nonce) = chat_delegate_cipher_material();
             api.send(DelegateOp(DelegateRequest::RegisterDelegate {
                 delegate,
-                cipher: DelegateRequest::DEFAULT_CIPHER,
-                nonce: DelegateRequest::DEFAULT_NONCE,
+                cipher,
+                nonce,
             }))
             .await
         } else {
