@@ -184,6 +184,6 @@ code_hash = "1bda909cd769dd404a4775005a3e6bcbf5cbecf4795b628df587e9997c7c0414"
 
 [[entry]]
 version = "V25"
-description = "Before freenet-stdlib 0.6.0 -> 0.8.2 bump (dogfood): last stdlib-0.6 room-contract generation"
+description = "Before freenet-stdlib 0.6.0 -> 0.8.3 bump (dogfood): last stdlib-0.6 room-contract generation"
 date = "2026-07-10"
 code_hash = "58a5e73c42833cf54d3f7cce9faebf18e1074bf829efb2ae5ee24ca9a2e47c50"

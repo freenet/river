@@ -372,36 +372,90 @@ const CHAT_DELEGATE_NONCE_KEY: &str = "river_chat_delegate_nonce_v1";
 /// `DEFAULT_NONCE` constants River previously passed here. They were a PUBLIC
 /// 32-byte XChaCha20 key + 24-byte nonce baked into stdlib, so every node
 /// encrypted its delegate secrets at rest under a key anyone could reproduce.
-/// We replace them with a random 32-byte cipher + 24-byte nonce generated once
-/// per browser profile and PERSISTED in localStorage, so:
+/// We replace them with a random 32-byte cipher + 24-byte nonce that is
+/// generated once and kept STABLE, so:
 ///
-///   * Stability: every session re-registers the SAME delegate with the SAME
-///     material. Generating a fresh random value on each load would make a node
-///     that still honors the client-supplied cipher unable to decrypt the
-///     previous session's secrets — bricking room data.
+///   * Stability: every registration within a page's lifetime re-registers the
+///     SAME delegate with the SAME material. `set_up_chat_delegate()` fires on
+///     every reconnect and sleep/wake, so a fresh random value per call would
+///     make a node that still honors the client-supplied cipher unable to
+///     decrypt the previous registration's secrets — bricking room data.
 ///   * Confidentiality: the at-rest key becomes a per-install secret instead of
 ///     a world-known constant.
+///
+/// Where the material lives depends on what the browser context allows:
+///
+///   * `localStorage` available (normal top-level origin): the value is
+///     persisted there, so it is stable ACROSS page reloads and browser
+///     restarts, keyed per browser profile.
+///   * `localStorage` unavailable — the PRODUCTION gateway iframe runs with an
+///     opaque origin, so `window.localStorage` THROWS `SecurityError` and both
+///     `load_persisted_cipher_material` and `persist_cipher_material` silently
+///     no-op. In that case we fall back to a process-memory value
+///     ([`in_memory_cipher_material`]) that is generated once and stable for the
+///     PAGE LIFETIME. This is what eliminates the within-page cipher rotation
+///     that the pre-fix code hit on every reconnect / sleep-wake in the iframe
+///     (each call re-generated fresh material because both localStorage sides
+///     no-op'd). It is not stable across a full page RELOAD (a reload restarts
+///     the wasm process and re-generates it) — but the NOTE below is why that
+///     is harmless on the 0.8 fleet.
+///
+/// We still write-through to `localStorage` whenever it is available, so the
+/// first process-memory value is captured for later reloads on origins that
+/// permit storage.
 ///
 /// NOTE — on a node built against stdlib-0.8 core (freenet-core #4140/#4143)
 /// this cipher/nonce are IGNORED server-side: the node derives a per-delegate
 /// DEK from its own KEK via HKDF and, for pre-0.8 secrets written under the old
 /// world-known cipher, decrypts them via a built-in `LEGACY_DEFAULT_CIPHER`
 /// fallback. So migration of OLD delegate secrets does NOT depend on River
-/// supplying any particular key — the node performs the decrypt/re-encrypt.
-/// Persisting a random per-install value here is the correct, forward-compatible
-/// choice: harmless on new nodes (discarded), and safe on older nodes that still
-/// honor it.
+/// supplying any particular key — the node performs the decrypt/re-encrypt, and
+/// cross-reload rotation of the client value is therefore HARMLESS on the entire
+/// 0.8 fleet. The ONLY context in which the client cipher still matters is a
+/// pre-0.8 node that honors it; there the page-stable material above keeps a
+/// single page session's repeated registrations consistent. Whether a
+/// stdlib-0.8 River client can even connect to / register a delegate on a
+/// pre-0.8 node (if the 0.6→0.8 client-API wire is incompatible, this residual
+/// case is unreachable in production) is assessed in the PR (freenet/river#394).
 fn chat_delegate_cipher_material() -> ([u8; 32], [u8; 24]) {
+    // 1. Prefer localStorage where available — it survives reloads/restarts.
     #[cfg(target_arch = "wasm32")]
     {
         if let Some((cipher, nonce)) = load_persisted_cipher_material() {
             return (cipher, nonce);
         }
     }
-    let (cipher, nonce) = generate_cipher_material();
+    // 2. localStorage missing or unreadable (e.g. the sandboxed gateway iframe).
+    //    Use a page-stable process-memory value instead of generating a fresh
+    //    one every call, so the delegate re-registers with identical material on
+    //    every reconnect / sleep-wake within the page's lifetime.
+    let (cipher, nonce) = in_memory_cipher_material();
+    // 3. Write through to localStorage when it IS available (a harmless no-op in
+    //    the iframe) so a subsequent reload can recover the same value.
     #[cfg(target_arch = "wasm32")]
     persist_cipher_material(&cipher, &nonce);
     (cipher, nonce)
+}
+
+thread_local! {
+    /// Process-memory fallback for the chat-delegate cipher/nonce. `None` until
+    /// first use; see [`in_memory_cipher_material`]. wasm is single-threaded, so
+    /// this thread-local is effectively process-global for the page lifetime.
+    static IN_MEMORY_CIPHER_MATERIAL: std::cell::RefCell<Option<([u8; 32], [u8; 24])>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Page-stable process-memory cipher/nonce, used when `localStorage` is
+/// unavailable (the sandboxed gateway iframe). Generated once on first use and
+/// returned unchanged thereafter, so the delegate re-registers with identical
+/// material on every reconnect within the page's lifetime. The native build
+/// only reaches this from unit tests.
+fn in_memory_cipher_material() -> ([u8; 32], [u8; 24]) {
+    IN_MEMORY_CIPHER_MATERIAL.with(|cell| {
+        *cell
+            .borrow_mut()
+            .get_or_insert_with(generate_cipher_material)
+    })
 }
 
 /// Generate a fresh random (cipher, nonce). `OsRng` routes through the UI's
@@ -552,6 +606,25 @@ pub(crate) fn reset_ensure_subscription_dedup() {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    /// Blocker-1 pin (freenet/river#394): the chat-delegate cipher/nonce must be
+    /// STABLE within a process. In the production gateway iframe `localStorage`
+    /// throws (opaque origin), so both persistence sides no-op; the pre-fix code
+    /// therefore re-generated fresh material on every `set_up_chat_delegate()`
+    /// (fired on each reconnect / sleep-wake), rotating the cipher within a page.
+    /// On the native target there is no `localStorage` cfg block, so this
+    /// exercises exactly that fallback: repeated calls must return identical
+    /// bytes via the in-memory cache.
+    #[test]
+    fn cipher_material_is_stable_within_process() {
+        let a = chat_delegate_cipher_material();
+        let b = chat_delegate_cipher_material();
+        assert_eq!(a.0, b.0, "cipher must be stable within the process");
+        assert_eq!(a.1, b.1, "nonce must be stable within the process");
+        // And it must actually be generated (a CSPRNG value, not left zeroed).
+        assert_ne!(a.0, [0u8; 32], "cipher must be randomly generated");
+        assert_ne!(a.1, [0u8; 24], "nonce must be randomly generated");
+    }
 
     /// freenet/river#345 round-9 (pure decision): a `Present` save overwrites a
     /// remote tombstone ONLY when the user explicitly rejoined this session; a
