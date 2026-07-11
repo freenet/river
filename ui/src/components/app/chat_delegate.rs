@@ -412,11 +412,20 @@ const CHAT_DELEGATE_NONCE_KEY: &str = "river_chat_delegate_nonce_v1";
 /// supplying any particular key — the node performs the decrypt/re-encrypt, and
 /// cross-reload rotation of the client value is therefore HARMLESS on the entire
 /// 0.8 fleet. The ONLY context in which the client cipher still matters is a
-/// pre-0.8 node that honors it; there the page-stable material above keeps a
-/// single page session's repeated registrations consistent. Whether a
-/// stdlib-0.8 River client can even connect to / register a delegate on a
-/// pre-0.8 node (if the 0.6→0.8 client-API wire is incompatible, this residual
-/// case is unreachable in production) is assessed in the PR (freenet/river#394).
+/// pre-0.8 node that HONORS the client-supplied value (freenet-core ≲ 0.2.58,
+/// stdlib pre-0.8, ~April 2026, before #4143/#4144); every release from ~0.2.60
+/// onward ignores it. There is no protocol-version handshake and the
+/// `RegisterDelegate` bincode layout is byte-identical from stdlib v0.1.22
+/// through 0.8.3 (verified for freenet/river#394), so a stdlib-0.8 River client
+/// CAN connect to and register a delegate on such an ancient node — the residual
+/// is reachable at the protocol level, NOT gated out by wire incompatibility. In
+/// practice it needs a very old, non-auto-updated peer that the live ~0.2.9x
+/// fleet almost certainly no longer contains. For that residual node the
+/// page-stable material above removes the within-page (reconnect / sleep-wake)
+/// rotation that was the real regression; it does NOT make the value stable
+/// across a full page RELOAD in the iframe (localStorage still no-ops there), so
+/// it reduces rather than fully eliminates the theoretical cross-reload brick
+/// for that node class. See the PR (freenet/river#394) for the full assessment.
 fn chat_delegate_cipher_material() -> ([u8; 32], [u8; 24]) {
     // 1. Prefer localStorage where available — it survives reloads/restarts.
     #[cfg(target_arch = "wasm32")]
