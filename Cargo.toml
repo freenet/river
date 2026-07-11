@@ -61,7 +61,7 @@ river = { path = "cli", package = "river" }
 # Freenet dependencies
 freenet-scaffold = "0.2.2"
 freenet-scaffold-macro = "0.2.2"
-freenet-stdlib = { version = "0.8.2", features = ["contract"] }
+freenet-stdlib = { version = "0.8.3", features = ["contract"] }
 
 [workspace.package]
 version = "0.1.12"
@@ -106,16 +106,5 @@ inherits = "dev"
 
 [workspace.metadata.dx]
 toolchain = "nightly"
-
-# DOGFOOD (stdlib 0.6 -> 0.8 upgrade, NOT FOR MERGE AS-IS): the fixed 0.8 stdlib
-# that River will ship against is not yet published to crates.io as 0.8.3 (the
-# UI-only memory-leak fix). Until it is, resolve `freenet-stdlib = "0.8.2"` to
-# the local checkout, whose 0.8.2 content is byte-identical to the published
-# 0.8.2 for the contract/delegate WASM (the leak fix is confined to the WebApi
-# browser client and does NOT affect the contract/delegate WASM re-keying this
-# upgrade exercises). Drop this patch and bump the version string to "0.8.3"
-# once that release is on crates.io.
-[patch.crates-io]
-freenet-stdlib = { path = "/home/ian/code/freenet/freenet-stdlib/rust" }
 
 # We need to pin specific versions to resolve dependency conflicts
