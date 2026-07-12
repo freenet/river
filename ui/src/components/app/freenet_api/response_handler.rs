@@ -357,6 +357,18 @@ impl ResponseHandler {
                                                             "Failed to deserialize rooms data: {}",
                                                             e
                                                         );
+                                                        // freenet/river#397 Codex review 5
+                                                        // (audit): a `rooms_data` blob exists
+                                                        // only because rooms were stored in it.
+                                                        // This arm is reachable only for a LEGACY
+                                                        // delegate (the current-delegate flow is
+                                                        // List-driven), so a parse failure is
+                                                        // known-stored legacy data that failed to
+                                                        // load — mark it so the backstop resolves
+                                                        // to LoadFailed, not a silent Empty. (A
+                                                        // genuine new user has no legacy delegate
+                                                        // responding, so never reaches here.)
+                                                        mark_fetch_failure();
                                                     }
                                                 }
                                             } else {
@@ -938,17 +950,20 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                     }
                 });
             }
-            // A corrupt current-delegate blob is unparseable; retrying won't
-            // help. We intentionally do NOT mark migration done (a corrupt blob is
-            // not proof there's nothing to migrate) and do NOT touch the
-            // in-progress flag — if a prior migration left it set, the next session
-            // re-runs recovery, and the already-loaded per-room keys remain intact.
+            // A corrupt current-delegate blob is unparseable. We intentionally do
+            // NOT mark migration done (a corrupt blob is not proof there's nothing
+            // to migrate) and do NOT touch the in-progress flag — if a prior
+            // migration left it set, the next session re-runs recovery, and the
+            // already-loaded per-room keys remain intact.
             Err(e) => {
                 error!("Failed to deserialize current-delegate rooms blob: {}", e);
-                // A definitive terminal (can't parse) is a completion — resolve to
-                // `Loaded` even under recovery so the rail doesn't spin on an
-                // unparseable snapshot.
-                set_rooms_load_state(RoomsLoadState::Loaded);
+                // freenet/river#397 Codex review 5 (P2b): a `rooms_data` blob only
+                // exists because rooms were written to it, so a parse failure is
+                // known-stored-data that failed to load — surface LoadFailed (with
+                // Retry), NOT a false Empty. mark_fetch_failure so the backstop and
+                // any concurrent probe agree this attempt failed.
+                mark_fetch_failure();
+                set_rooms_load_state(RoomsLoadState::LoadFailed);
             }
         },
         Ok(_) => {
@@ -965,7 +980,17 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 set_rooms_load_state(load_state_after_probe_legacy(fired));
             }
         }
-        Err(e) => warn!("Failed to read current-delegate rooms blob: {}", e),
+        Err(e) => {
+            // freenet/river#397 Codex review 5 (audit): we only reach this fn from
+            // `LoadPlan::MigrateCurrentBlob`, i.e. the current delegate's index
+            // LISTED a `rooms_data` key, so the blob exists — a SEND failure
+            // reading it is known-stored-data that failed to load. Mark the
+            // failure so the backstop resolves to LoadFailed (with Retry), not a
+            // silent Empty. (Display is masked by `List` if rooms are concurrently
+            // present.)
+            warn!("Failed to read current-delegate rooms blob: {}", e);
+            mark_fetch_failure();
+        }
     }
 }
 
@@ -1946,6 +1971,54 @@ mod tests {
         assert!(
             legacy_arm.contains("set_rooms_load_state(RoomsLoadState::Loaded)"),
             "the legacy re-save-error arm must resolve the load to Loaded (had_rooms)"
+        );
+    }
+
+    /// freenet/river#397 Codex review 5: every failure to load KNOWN or STORED
+    /// room data routes to `mark_fetch_failure()` + a LoadFailed-capable terminal,
+    /// never a silent Empty. Pins the three stored-data failure sites this pass
+    /// added/changed.
+    #[test]
+    fn stored_room_data_failures_route_to_loadfailed() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        // (P2b) corrupt current-delegate `rooms_data` blob → mark_fetch_failure +
+        // LoadFailed (a blob exists only because rooms were written to it).
+        let corrupt = production
+            .find("Failed to deserialize current-delegate rooms blob")
+            .expect("corrupt-current-blob marker must exist");
+        let corrupt_arm = &production[corrupt..(corrupt + 700).min(production.len())];
+        assert!(
+            corrupt_arm.contains("mark_fetch_failure()")
+                && corrupt_arm.contains("set_rooms_load_state(RoomsLoadState::LoadFailed)"),
+            "a corrupt current rooms_data blob must mark_fetch_failure + LoadFailed, not Empty"
+        );
+
+        // (audit) SEND failure reading the current blob (we're here only because
+        // the index listed a rooms_data key) → mark_fetch_failure.
+        let read_err = production
+            .find("Failed to read current-delegate rooms blob")
+            .expect("current-blob read-error marker must exist");
+        let read_arm = &production[read_err..(read_err + 400).min(production.len())];
+        assert!(
+            read_arm.contains("mark_fetch_failure()"),
+            "a failed READ of the current rooms_data blob must mark_fetch_failure"
+        );
+
+        // (audit) parse failure of a legacy `rooms_data` blob → mark_fetch_failure
+        // (a genuine new user never reaches this — no legacy delegate responds).
+        let legacy_parse = production
+            .find("Failed to deserialize rooms data")
+            .expect("legacy rooms_data parse-error marker must exist");
+        let legacy_parse_arm =
+            &production[legacy_parse..(legacy_parse + 1500).min(production.len())];
+        assert!(
+            legacy_parse_arm.contains("mark_fetch_failure()"),
+            "a legacy rooms_data parse failure must mark_fetch_failure"
         );
     }
 
