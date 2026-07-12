@@ -549,16 +549,16 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             fire_list_rooms_request().await;
             fire_load_outbound_dms_request().await;
 
-            // NOTE (freenet/river#397 Codex review, P2-1): the room-list load
-            // backstop is NOT armed here. Arming it unconditionally at startup
-            // would let it flip an in-flight AUTHORITATIVE load (a slow
-            // ListResponse / per-room fetch that takes >20s) to Empty — a false
-            // "no rooms yet". The backstop is only needed for the ONE path with
-            // no synchronous completion signal: a fire-and-forget legacy probe.
-            // It is therefore armed only at the probe-fired sites in
-            // `response_handler.rs`, guarded by `if fired`, by which point the
-            // authoritative current-delegate load has already returned empty, so
-            // the backstop can no longer clobber it.
+            // Arm the UNIVERSAL room-list load backstop once per session
+            // (freenet/river#397 Codex review 3). This is the single mechanism
+            // that GUARANTEES the rail never spins forever: at 30s it resolves ANY
+            // non-terminal state (`Loading` OR `Migrating`) to `Loaded`. It is
+            // generous enough (30s) never to pre-empt a load/migration that is
+            // actually progressing, and because a non-empty `ROOMS` renders `List`
+            // regardless of load state, it only ever shows Empty when genuinely
+            // nothing loaded. Fast definitive completions still resolve earlier;
+            // this is the safety net under all of them.
+            schedule_rooms_load_backstop();
 
             Ok(())
         }
@@ -1248,34 +1248,52 @@ mod tests {
         );
     }
 
-    /// freenet/river#397 (#1 safety invariant): the timeout backstop rescues a
-    /// stuck `Loading` (the new-user-with-no-legacy-data case) into `Loaded`, so
-    /// the spinner is never perpetual — but it must NOT override `Migrating` (a
-    /// slow migration keeps its spinner rather than flashing empty) nor re-open
-    /// an already-resolved `Loaded`.
+    /// freenet/river#397 Codex review 3: the UNIVERSAL backstop resolves EVERY
+    /// non-terminal state to `Loaded` — both `Loading` AND `Migrating` — so the
+    /// rail can never spin forever (a delegate request can time out without the WS
+    /// disconnecting, so "wait for reconnect" cannot guarantee termination). Only
+    /// `Loaded` stays `Loaded`.
     #[test]
-    fn backstop_only_rescues_loading() {
+    fn backstop_resolves_every_non_terminal_state() {
         assert_eq!(
             backstop_resolve(RoomsLoadState::Loading),
             RoomsLoadState::Loaded,
-            "a genuinely-new user must resolve to Loaded, never a perpetual spinner"
+            "Loading must resolve — a new user with no legacy data never spins forever"
         );
         assert_eq!(
             backstop_resolve(RoomsLoadState::Migrating),
-            RoomsLoadState::Migrating,
-            "the backstop must not pre-empt an in-progress migration"
+            RoomsLoadState::Loaded,
+            "Migrating must ALSO resolve — a stalled migration must not spin forever"
         );
         assert_eq!(
             backstop_resolve(RoomsLoadState::Loaded),
             RoomsLoadState::Loaded,
-            "the backstop must not re-open a resolved load"
+            "Loaded stays Loaded (idempotent)"
         );
+    }
+
+    /// freenet/river#397: no state strands — every non-terminal input to the
+    /// backstop is a terminal `Loaded` output, so termination is guaranteed for
+    /// ANY load/migration path that fails to resolve itself.
+    #[test]
+    fn backstop_guarantees_termination_from_any_state() {
+        for state in [
+            RoomsLoadState::Loading,
+            RoomsLoadState::Migrating,
+            RoomsLoadState::Loaded,
+        ] {
+            assert_eq!(
+                backstop_resolve(state),
+                RoomsLoadState::Loaded,
+                "{state:?} must terminate at Loaded"
+            );
+        }
     }
 
     /// freenet/river#397 end-to-end invariant, composed from the pure pieces: a
     /// brand-new user fires legacy probes (→ `Loading`), nothing responds, and
-    /// the backstop resolves them to `Loaded` (→ the empty state). They are NEVER
-    /// stuck loading forever.
+    /// the universal backstop resolves them to `Loaded` (→ the empty state). They
+    /// are NEVER stuck loading forever.
     #[test]
     fn new_user_resolves_to_loaded_never_stuck() {
         let after_probe = load_state_after_probe_legacy(true);
@@ -1283,86 +1301,13 @@ mod tests {
         assert_eq!(backstop_resolve(after_probe), RoomsLoadState::Loaded);
     }
 
-    /// freenet/river#397 Codex review (P2-2): a per-room load that came back
-    /// EMPTY while the index proved rooms exist AND a listed room failed to fetch
-    /// must NOT resolve — staying `Loading` (the honest spinner) instead of
-    /// flashing "no rooms yet" at a user who provably has rooms. Every other
-    /// combination is a definitive answer and resolves.
+    /// freenet/river#397 Codex review 3: the universal backstop is armed once per
+    /// session at the START of load, in `set_up_chat_delegate` (reverting the
+    /// round-3 "arm only on probe-fired" design). It must NOT be conditionally
+    /// armed elsewhere — a single unconditional arming is what makes termination
+    /// universal.
     #[test]
-    fn per_room_load_stays_loading_only_on_empty_listed_with_fetch_error() {
-        // Signature: should_resolve_per_room_load(map_empty, listed_count,
-        // had_fetch_error, recovering). These cases fix recovering = false; the
-        // recovering = true cases are pinned separately below.
-
-        // The one case that must NOT resolve: empty map, index listed rooms, and
-        // a fetch error → stay Loading (retry on WS reconnect).
-        assert!(
-            !should_resolve_per_room_load(true, 3, true, false),
-            "empty + listed + fetch error must NOT resolve (stay Loading)"
-        );
-
-        // Empty but every listed key definitively had no value (no fetch error) →
-        // a real, if odd, empty state → resolve.
-        assert!(
-            should_resolve_per_room_load(true, 3, false, false),
-            "empty + listed + no fetch error is a definitive empty → resolve"
-        );
-
-        // Empty and nothing was listed → genuinely empty delegate → resolve.
-        assert!(
-            should_resolve_per_room_load(true, 0, false, false),
-            "empty + nothing listed is the new-user empty → resolve"
-        );
-        // A fetch error is irrelevant when nothing was listed (can't happen, but
-        // the decision must still resolve — there's provably nothing to wait for).
-        assert!(
-            should_resolve_per_room_load(true, 0, true, false),
-            "empty + nothing listed must resolve regardless of the error flag"
-        );
-
-        // A non-empty map always resolves (a partial load renders as List; the
-        // missing rooms show their own per-room markers), regardless of errors.
-        assert!(should_resolve_per_room_load(false, 3, true, false));
-        assert!(should_resolve_per_room_load(false, 3, false, false));
-        assert!(should_resolve_per_room_load(false, 0, false, false));
-    }
-
-    /// freenet/river#397 Codex review 2 (P2): an interrupted-migration recovery
-    /// on an EMPTY map must stay `Loading` (recovery may still recover stranded
-    /// rooms), even with no fetch error — but recovery is irrelevant once the map
-    /// is non-empty (rooms are already showing).
-    #[test]
-    fn per_room_load_stays_loading_while_recovering_on_empty_map() {
-        // Empty + recovering → stay Loading, regardless of listed/error.
-        assert!(
-            !should_resolve_per_room_load(true, 0, false, true),
-            "empty + recovering must NOT resolve — stranded rooms may still recover"
-        );
-        assert!(
-            !should_resolve_per_room_load(true, 3, false, true),
-            "empty + listed + recovering must NOT resolve"
-        );
-        assert!(
-            !should_resolve_per_room_load(true, 3, true, true),
-            "empty + listed + error + recovering must NOT resolve"
-        );
-
-        // A non-empty map resolves even while recovering (rooms are visible;
-        // recovery continues as a background re-fill).
-        assert!(
-            should_resolve_per_room_load(false, 3, false, true),
-            "non-empty map resolves to List even while recovering"
-        );
-        assert!(should_resolve_per_room_load(false, 0, true, true));
-    }
-
-    /// freenet/river#397 Codex review (P2-1): the load backstop must be armed
-    /// ONLY on the fire-and-forget legacy-probe path (guarded by `if fired`),
-    /// never unconditionally at startup — otherwise a slow but authoritative
-    /// current-delegate load (>20s) gets flipped to a false "no rooms yet".
-    #[test]
-    fn backstop_armed_only_on_fire_and_forget_probe() {
-        // (a) `set_up_chat_delegate` must NOT arm the backstop.
+    fn set_up_chat_delegate_arms_backstop() {
         let self_src = include_str!("chat_delegate.rs");
         let self_production = self_src
             .split("mod tests {")
@@ -1378,38 +1323,22 @@ mod tests {
             .unwrap_or(self_production.len());
         let setup_body = &self_production[setup_idx..setup_end];
         assert!(
-            !setup_body.contains("schedule_rooms_load_backstop"),
-            "set_up_chat_delegate must NOT arm the load backstop (P2-1): arming it \
-             unconditionally could flip a slow authoritative load to a false Empty"
+            setup_body.contains("schedule_rooms_load_backstop();"),
+            "set_up_chat_delegate must arm the universal load backstop once per session"
         );
 
-        // (b) In the response handler, the backstop is armed at EXACTLY the two
-        // probe-fired sites (ProbeLegacy + value-gone blob path), each directly
-        // guarded by `if fired`.
+        // And the response handler must NOT arm it (the round-3 probe-fired arming
+        // is reverted — the universal start-of-load arming replaces it).
         let rh_src = include_str!("freenet_api/response_handler.rs");
         let rh_production = rh_src
             .split("mod tests {")
             .next()
             .expect("production code before `mod tests`");
-        let arm_count = rh_production
-            .matches("schedule_rooms_load_backstop();")
-            .count();
-        assert_eq!(
-            arm_count, 2,
-            "the backstop must be armed at exactly the two probe-fired sites (found {arm_count})"
+        assert!(
+            !rh_production.contains("schedule_rooms_load_backstop"),
+            "the response handler must NOT arm the backstop — it is armed once at \
+             start of load in set_up_chat_delegate (Codex review 3)"
         );
-        let mut search_from = 0;
-        while let Some(rel) = rh_production[search_from..].find("schedule_rooms_load_backstop();") {
-            let pos = search_from + rel;
-            let guard = rh_production[..pos]
-                .rfind("if fired {")
-                .expect("each backstop arming must be guarded by `if fired`");
-            assert!(
-                pos - guard < 500,
-                "each schedule_rooms_load_backstop() must be DIRECTLY inside an `if fired` block"
-            );
-            search_from = pos + 1;
-        }
     }
 
     /// Codex P1 finding on PR #259: the legacy-migration-done
@@ -4194,69 +4123,38 @@ pub(crate) fn load_state_after_probe_legacy(fired_legacy_probes: bool) -> RoomsL
     }
 }
 
-/// The timeout backstop transition. This is a PURE UI SAFETY NET, not the
-/// primary completion signal (the real signals are the classified-load and
-/// migration-conclusion points that call `set_rooms_load_state`). It exists only
-/// for the one case with no reliable synchronous completion signal — a brand-new
-/// user whose fire-and-forget legacy probe finds nothing, so no response ever
-/// arrives — so that user resolves to the empty state instead of spinning
-/// forever (the #1 safety requirement of freenet/river#397).
+/// The UNIVERSAL backstop transition (freenet/river#397 Codex review 3). At the
+/// 30s deadline, ANY non-terminal state resolves to `Loaded` — BOTH `Loading`
+/// AND `Migrating`. This is what GUARANTEES termination: the rounds-3/4 attempt
+/// to "stay `Loading`/`Migrating` and rely on a WS reconnect to retry" could
+/// spin forever, because a delegate request can time out (~10s) WITHOUT
+/// disconnecting the WebSocket, so no reconnect ever comes; and concurrent
+/// legacy probes race on this one global signal. A single backstop that resolves
+/// every non-terminal state removes both failure modes.
 ///
-/// It rescues ONLY a still-`Loading` state: it must not override `Migrating` (a
-/// positive signal that rooms are on the way — a slow migration should keep its
-/// spinner, not flash "no rooms yet"), nor re-open `Loaded`.
+/// This can only ever *show* Empty when `room_count == 0` at the deadline — a
+/// non-empty `ROOMS` renders `List` regardless of the load state — i.e. only
+/// when genuinely nothing loaded, which is the correct, no-worse-than-baseline
+/// outcome (a proper error/retry state is a separate follow-up). The `Loaded`
+/// arm returns `current` (already `Loaded`) so the two arms differ textually
+/// (avoids `clippy::match_same_arms`) while being behaviourally identical.
 pub(crate) fn backstop_resolve(current: RoomsLoadState) -> RoomsLoadState {
     match current {
-        RoomsLoadState::Loading => RoomsLoadState::Loaded,
-        other => other,
+        RoomsLoadState::Loaded => current,
+        // Loading AND Migrating are both non-terminal — resolve them.
+        RoomsLoadState::Loading | RoomsLoadState::Migrating => RoomsLoadState::Loaded,
     }
 }
 
-/// Whether the current-delegate per-room load should RESOLVE the display state
-/// to `Loaded` (freenet/river#397 Codex review, P2-2). Resolve on a DEFINITIVE
-/// answer; stay `Loading` only when the load came back EMPTY but the delegate's
-/// key index PROVED rooms exist AND at least one listed room failed to
-/// materialize (a transport / parse error, NOT a definitive value-absent). In
-/// that failed-load case a WS reconnect re-fires `ListRequest` and retries, so
-/// the honest spinner is correct — we KNOW rooms exist, so flashing "no rooms
-/// yet" would be the feature's own worst failure mode.
-///
-/// - non-empty map → resolve (`true`): we have rooms to show. A PARTIAL load
-///   (some rooms loaded, some errored) has a non-empty map and resolves to
-///   `List`; the missing rooms surface their own per-room `awaiting_sync`/error
-///   markers.
-/// - empty + nothing listed (`listed_count == 0`) + not recovering → resolve
-///   (`true`): a genuinely empty delegate (the new-user / no-rooms case).
-/// - empty + listed + NO fetch error + not recovering → resolve (`true`): every
-///   listed key definitively returned `value: None` — a real (if odd) empty
-///   state, not a failure to fetch.
-/// - empty + listed + a fetch error → do NOT resolve (`false`): stay `Loading`.
-/// - empty + `recovering` → do NOT resolve (`false`): an interrupted-migration
-///   recovery is armed/running, and the in-progress flag explicitly says rooms
-///   may be stranded. Even with no fetch error (e.g. the interrupted save wrote
-///   only tombstones while the live-room writes failed), resolving here would
-///   flash "no rooms yet" before the recovery re-run below has a chance to
-///   recover them. Stay `Loading` until recovery concludes (freenet/river#397
-///   Codex review 2, P2).
-pub(crate) fn should_resolve_per_room_load(
-    map_empty: bool,
-    listed_count: usize,
-    had_fetch_error: bool,
-    recovering: bool,
-) -> bool {
-    !(map_empty && ((listed_count > 0 && had_fetch_error) || recovering))
-}
-
-/// Timeout for the room-list load backstop (see [`backstop_resolve`]). Generous
-/// on purpose: it must comfortably outlast a real legacy migration's
-/// probe→response→migrate window so it never pre-empts an existing user's
-/// migration, so its only visible effect is resolving the genuinely-empty
-/// new-user case. Tradeoff (freenet/river#397 review): a longer timeout means a
-/// brand-new user waits fractionally longer for the empty state, but it avoids
-/// flash-emptying an existing user whose legacy `ListResponse` is slow to arrive
-/// on a cold first connect (before the `Migrating` transition fires). 20s is
-/// chosen to sit safely past a realistic slow probe→response→migrate window.
-const ROOMS_LOAD_BACKSTOP_MS: u64 = 20_000;
+/// Timeout for the UNIVERSAL room-list load backstop (see [`backstop_resolve`]).
+/// Armed once per session at the START of load (`set_up_chat_delegate`); at the
+/// deadline it resolves any non-terminal state to `Loaded`. Generous (30s) so it
+/// never pre-empts a load or migration that is actually progressing — a slow but
+/// live probe→response→migrate or per-room fetch completes and resolves itself
+/// well before this fires; the backstop only bites on genuine timeout /
+/// all-fetch-fail / concurrency-strand cases, where resolving to Empty is the
+/// accepted residual (freenet/river#397 Codex review 3).
+const ROOMS_LOAD_BACKSTOP_MS: u64 = 30_000;
 
 /// One-shot guard so the backstop is scheduled once per session even though
 /// `set_up_chat_delegate` re-runs on every reconnect.
