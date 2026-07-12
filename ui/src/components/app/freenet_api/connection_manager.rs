@@ -140,18 +140,66 @@ mod imp {
                                 // 500ms should be enough for the messages to be queued and
                                 // sent over the WebSocket.
                                 sleep(Duration::from_millis(500)).await;
-                                // Navigate with cache-busting param to ensure the browser
-                                // fetches fresh HTML (with a new auth token) from the
-                                // gateway instead of serving a cached copy.
+                                // Recover the token by reloading the TOP-LEVEL
+                                // document. River runs inside the node shell's
+                                // SANDBOXED child iframe; the shell (top
+                                // document) owns the real WebSocket AND the auth
+                                // token. The node mints that token when it serves
+                                // the shell HTML and holds it only in memory, so a
+                                // node restart invalidates it and ONLY re-fetching
+                                // the shell HTML (a top-level reload) mints a fresh
+                                // one. We can't reload the top from here directly:
+                                // the sandbox has no `allow-top-navigation`, and
+                                // navigating our OWN iframe (the previous behaviour)
+                                // either loops on the same dead token or, during the
+                                // node's ring-rejoin window, gets bounced to the node
+                                // root and X-Frame-blocked -> broken tab. So when
+                                // framed we ask the shell to reload itself via the
+                                // postMessage bridge it already listens on (it
+                                // handles {__freenet_shell__:true, type:"reload"} in
+                                // shell_bridge.js); the shell re-mints the token and
+                                // re-embeds us. When we are NOT framed (local dev /
+                                // dx serve, where we ARE the top document) we reload
+                                // ourselves with a cache-busting param.
                                 if let Some(window) = web_sys::window() {
-                                    let path = window
-                                        .location()
-                                        .pathname()
-                                        .unwrap_or_else(|_| "/".to_string());
-                                    let bust = js_sys::Date::now() as u64;
-                                    let url = format!("{}?_reload={}", path, bust);
-                                    if let Err(e) = window.location().set_href(&url) {
-                                        error!("Failed to navigate for auth reload: {:?}", e);
+                                    let is_top = match window.top() {
+                                        Ok(Some(top)) => {
+                                            js_sys::Object::is(top.as_ref(), window.as_ref())
+                                        }
+                                        // top() blocked/absent: assume we're framed
+                                        // and recover via the shell bridge (the safe
+                                        // path under the sandbox).
+                                        _ => false,
+                                    };
+                                    if is_top {
+                                        let path = window
+                                            .location()
+                                            .pathname()
+                                            .unwrap_or_else(|_| "/".to_string());
+                                        let bust = js_sys::Date::now() as u64;
+                                        let url = format!("{}?_reload={}", path, bust);
+                                        if let Err(e) = window.location().set_href(&url) {
+                                            error!("Failed to navigate for auth reload: {:?}", e);
+                                        }
+                                    } else if let Ok(Some(parent)) = window.parent() {
+                                        let msg = js_sys::Object::new();
+                                        let _ = js_sys::Reflect::set(
+                                            &msg,
+                                            &wasm_bindgen::JsValue::from_str("__freenet_shell__"),
+                                            &wasm_bindgen::JsValue::TRUE,
+                                        );
+                                        let _ = js_sys::Reflect::set(
+                                            &msg,
+                                            &wasm_bindgen::JsValue::from_str("type"),
+                                            &wasm_bindgen::JsValue::from_str("reload"),
+                                        );
+                                        if let Err(e) = parent.post_message(&msg, "*") {
+                                            error!(
+                                                "Failed to ask shell to reload for \
+                                                 auth refresh: {:?}",
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                             });
