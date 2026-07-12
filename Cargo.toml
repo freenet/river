@@ -64,7 +64,7 @@ freenet-scaffold-macro = "0.2.2"
 freenet-stdlib = { version = "0.8.3", features = ["contract"] }
 
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 
 [profile.release]
