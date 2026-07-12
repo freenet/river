@@ -17,7 +17,8 @@ use crate::components::app::chat_delegate::{
     is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
     mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
     prune_outbound_dms_for_purges, room_storage_key, save_outbound_dms_to_delegate,
-    save_rooms_to_delegate, send_delegate_request, send_delegate_request_to, set_rooms_load_state,
+    save_rooms_to_delegate, schedule_rooms_load_backstop, send_delegate_request,
+    send_delegate_request_to, set_rooms_load_state, should_resolve_per_room_load,
     LegacyMigrationAction, RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY,
     ROOMS_STORAGE_KEY,
 };
@@ -622,6 +623,14 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // skipped (nothing is coming). A brand-new user whose probe finds
             // nothing is caught by the timeout backstop, never a perpetual spinner.
             let fired = fire_legacy_migration_request().await;
+            if fired {
+                // P2-1 (Codex review): arm the backstop ONLY here — a
+                // fire-and-forget probe has no synchronous completion signal. By
+                // now the authoritative current-delegate load already returned
+                // empty (this is the ProbeLegacy classification), so the backstop
+                // can no longer clobber an in-flight authoritative load.
+                schedule_rooms_load_backstop();
+            }
             set_rooms_load_state(load_state_after_probe_legacy(fired));
         }
         LoadPlan::MigrateCurrentBlob => {
@@ -657,6 +666,14 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // passes every room still lands in ROOMS. (Load-vs-SAVE never
             // collides — those use distinct prefixed correlation keys.)
             info!("Loading {} per-room slot(s) from delegate", room_vks.len());
+            // freenet/river#397 Codex review (P2-2): the index PROVED these rooms
+            // exist. If every listed room fails to materialize, the assembled map
+            // is empty — but resolving to Empty would render "no rooms yet" for a
+            // user who provably HAS rooms. Track whether a listed room failed to
+            // fetch (transport / parse error — NOT a definitive `value: None`) so
+            // the resolve decision below can stay `Loading` in that case.
+            let listed_count = room_vks.len();
+            let mut had_fetch_error = false;
             let mut slots: Vec<(ed25519_dalek::VerifyingKey, RoomSlot)> = Vec::new();
             for vk in room_vks {
                 match send_delegate_request(ChatDelegateRequestMsg::GetRequest {
@@ -668,14 +685,27 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                         value: Some(bytes), ..
                     }) => match from_reader::<RoomSlot, _>(&bytes[..]) {
                         Ok(slot) => slots.push((vk, slot)),
-                        Err(e) => error!("Unparseable room slot for {:?}: {}", vk, e),
+                        Err(e) => {
+                            // A listed room whose slot won't parse failed to
+                            // materialize — count it as a fetch error.
+                            error!("Unparseable room slot for {:?}: {}", vk, e);
+                            had_fetch_error = true;
+                        }
                     },
                     Ok(ChatDelegateResponseMsg::GetResponse { value: None, .. }) => {
-                        // Listed in the index but the value is gone — skip it.
+                        // Listed in the index but the value is gone — a DEFINITIVE
+                        // "no value for this key", a legitimate skip, NOT a fetch
+                        // failure (do not set had_fetch_error).
                         warn!("Room key {:?} listed but value missing", vk);
                     }
-                    Ok(other) => error!("Unexpected response loading room {:?}: {:?}", vk, other),
-                    Err(e) => error!("Failed to load room {:?}: {}", vk, e),
+                    Ok(other) => {
+                        error!("Unexpected response loading room {:?}: {:?}", vk, other);
+                        had_fetch_error = true;
+                    }
+                    Err(e) => {
+                        error!("Failed to load room {:?}: {}", vk, e);
+                        had_fetch_error = true;
+                    }
                 }
             }
 
@@ -708,16 +738,30 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             };
 
             let loaded = reconstruct_rooms(slots, meta);
+            // Capture emptiness BEFORE `loaded` is moved into hydrate, for the
+            // resolve decision below (freenet/river#397 P2-2).
+            let loaded_map_empty = loaded.map.is_empty();
             if hydrate_loaded_rooms(loaded, false) {
                 schedule_subscription_timeout_check();
             }
 
             // freenet/river#397: the current delegate's per-room set is the
-            // authoritative initial load — it has resolved. Rooms (if any) render
-            // as the list; an empty/all-tombstone set renders the calm empty
-            // state. Set BEFORE the recovery re-run below so an armed recovery's
-            // `Migrating` (set inside `migrate_current_blob_to_per_room`) wins.
-            set_rooms_load_state(RoomsLoadState::Loaded);
+            // authoritative initial load. Resolve to `Loaded` on a DEFINITIVE
+            // answer — rooms (if any) render as the list; a genuinely empty /
+            // all-`value: None` set renders the calm empty state. Set BEFORE the
+            // recovery re-run below so an armed recovery's `Migrating` (set inside
+            // `migrate_current_blob_to_per_room`) wins.
+            //
+            // P2-2 (Codex review): but if the load came back EMPTY while the index
+            // listed rooms AND a listed room failed to fetch, DO NOT resolve —
+            // leave the state `Loading` (the honest spinner). We KNOW rooms exist,
+            // so a WS reconnect re-fires `ListRequest` and retries; flashing "no
+            // rooms yet" here would be the feature's own worst failure mode. The
+            // backstop is deliberately NOT armed on this path (arming it would
+            // flip the spinner to Empty and defeat the fix).
+            if should_resolve_per_room_load(loaded_map_empty, listed_count, had_fetch_error) {
+                set_rooms_load_state(RoomsLoadState::Loaded);
+            }
 
             // Recover from an interrupted migration by re-running it to pick up
             // any room whose per-room key wasn't written before the previous
@@ -923,8 +967,13 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             // freenet/river#397 review: under `recovery` this must NOT run —
             // `load_state_after_probe_legacy(true)` would downgrade the already
             // resolved `Loaded` back to `Loading`, flashing a spinner (and, if the
-            // once-per-session backstop already fired, sticking there).
+            // once-per-session backstop already fired, sticking there). Outside
+            // recovery, arm the backstop when a fire-and-forget probe was fired
+            // (P2-1) — the same probe-fired condition as the ProbeLegacy arm.
             if !recovery {
+                if fired {
+                    schedule_rooms_load_backstop();
+                }
                 set_rooms_load_state(load_state_after_probe_legacy(fired));
             }
         }
@@ -1928,15 +1977,81 @@ mod tests {
         let write_pos = body
             .find("set_rooms_load_state(load_state_after_probe_legacy(fired))")
             .expect("the value-gone branch must write via load_state_after_probe_legacy");
-        // The `if !recovery {` guard must DIRECTLY precede the write (same block),
-        // not merely appear somewhere earlier in the function.
+        // The `if !recovery {` guard must directly enclose the write (same block).
+        // Its enclosing block also arms the backstop (`if fired { … }`) before the
+        // write, so allow for that intervening block — an UNguarded write would put
+        // the nearest `if !recovery {` far earlier (a different arm), not ~150 back.
         let guard_pos = body[..write_pos]
             .rfind("if !recovery {")
             .expect("migrate_current_blob_to_per_room must guard its writes on !recovery");
         assert!(
-            write_pos - guard_pos < 80,
-            "the value-gone probe-legacy write must be DIRECTLY inside an `if !recovery` \
-             block so a background recovery never downgrades a resolved Loaded to Loading"
+            write_pos - guard_pos < 250,
+            "the value-gone probe-legacy write must be inside the `if !recovery` block \
+             so a background recovery never downgrades a resolved Loaded to Loading"
+        );
+    }
+
+    /// freenet/river#397 Codex review (P2-2): the PerRoom load must NOT resolve
+    /// to Empty when the index listed rooms but their fetches failed. Pin the
+    /// wiring: (a) the per-room `Loaded` write is guarded by the pure
+    /// `should_resolve_per_room_load(...)` decision (unit-tested in
+    /// chat_delegate.rs), and (b) the fetch-failure arms set `had_fetch_error`.
+    /// The pure helper is the primary coverage; this pin guards against the
+    /// helper being computed-but-ignored or the failure arms silently not
+    /// flagging an error.
+    #[test]
+    fn per_room_load_failure_does_not_resolve_to_empty() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        // (a) the PerRoom `Loaded` write is gated on the pure decision.
+        let write_pos = production
+            .find("set_rooms_load_state(RoomsLoadState::Loaded)")
+            .expect("a per-room Loaded write must exist");
+        let guard_pos = production[..write_pos]
+            .rfind("should_resolve_per_room_load(")
+            .expect("the PerRoom Loaded write must be guarded by should_resolve_per_room_load");
+        assert!(
+            write_pos - guard_pos < 220,
+            "the PerRoom Loaded write must be directly gated by should_resolve_per_room_load, \
+             so a failed all-empty load stays Loading instead of flashing Empty"
+        );
+        assert!(
+            production.contains(
+                "should_resolve_per_room_load(loaded_map_empty, listed_count, had_fetch_error)"
+            ),
+            "the resolve decision must be fed (map_empty, listed_count, had_fetch_error)"
+        );
+
+        // (b) the fetch-failure arms flag the error so the decision can see it.
+        // Bound the search to the per-room fetch loop (marker → the `let meta`
+        // that immediately follows it) so we count exactly the per-room arms.
+        let loop_start = production
+            .find("Loading {} per-room slot(s) from delegate")
+            .expect("per-room fetch loop marker must exist");
+        let loop_end = production[loop_start..]
+            .find("let meta = if has_meta")
+            .map(|i| loop_start + i)
+            .expect("the per-room loop must be followed by the meta load");
+        let loop_region = &production[loop_start..loop_end];
+        let error_flags = loop_region.matches("had_fetch_error = true;").count();
+        assert!(
+            error_flags >= 3,
+            "the transport-Err, unexpected-response, and unparseable-slot arms must each \
+             set had_fetch_error (found {error_flags})"
+        );
+        // The definitive value-absent arm must NOT be counted as a fetch error.
+        let value_none_pos = loop_region
+            .find("listed but value missing")
+            .expect("the value: None arm must exist");
+        let after_value_none =
+            &loop_region[value_none_pos..(value_none_pos + 120).min(loop_region.len())];
+        assert!(
+            !after_value_none.contains("had_fetch_error = true;"),
+            "a definitive `value: None` is a legitimate skip, not a fetch error"
         );
     }
 

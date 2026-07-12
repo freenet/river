@@ -549,12 +549,16 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             fire_list_rooms_request().await;
             fire_load_outbound_dms_request().await;
 
-            // Room-list load backstop (freenet/river#397): a pure UI safety net
-            // so a brand-new user whose fire-and-forget legacy probe finds
-            // nothing resolves to the empty state rather than spinning forever.
-            // Once per session; the real completion signals live in the load
-            // path's `set_rooms_load_state` calls.
-            schedule_rooms_load_backstop();
+            // NOTE (freenet/river#397 Codex review, P2-1): the room-list load
+            // backstop is NOT armed here. Arming it unconditionally at startup
+            // would let it flip an in-flight AUTHORITATIVE load (a slow
+            // ListResponse / per-room fetch that takes >20s) to Empty — a false
+            // "no rooms yet". The backstop is only needed for the ONE path with
+            // no synchronous completion signal: a fire-and-forget legacy probe.
+            // It is therefore armed only at the probe-fired sites in
+            // `response_handler.rs`, guarded by `if fired`, by which point the
+            // authoritative current-delegate load has already returned empty, so
+            // the backstop can no longer clobber it.
 
             Ok(())
         }
@@ -1277,6 +1281,102 @@ mod tests {
         let after_probe = load_state_after_probe_legacy(true);
         assert_eq!(after_probe, RoomsLoadState::Loading);
         assert_eq!(backstop_resolve(after_probe), RoomsLoadState::Loaded);
+    }
+
+    /// freenet/river#397 Codex review (P2-2): a per-room load that came back
+    /// EMPTY while the index proved rooms exist AND a listed room failed to fetch
+    /// must NOT resolve — staying `Loading` (the honest spinner) instead of
+    /// flashing "no rooms yet" at a user who provably has rooms. Every other
+    /// combination is a definitive answer and resolves.
+    #[test]
+    fn per_room_load_stays_loading_only_on_empty_listed_with_fetch_error() {
+        // The one case that must NOT resolve: empty map, index listed rooms, and
+        // a fetch error → stay Loading (retry on WS reconnect).
+        assert!(
+            !should_resolve_per_room_load(true, 3, true),
+            "empty + listed + fetch error must NOT resolve (stay Loading)"
+        );
+
+        // Empty but every listed key definitively had no value (no fetch error) →
+        // a real, if odd, empty state → resolve.
+        assert!(
+            should_resolve_per_room_load(true, 3, false),
+            "empty + listed + no fetch error is a definitive empty → resolve"
+        );
+
+        // Empty and nothing was listed → genuinely empty delegate → resolve.
+        assert!(
+            should_resolve_per_room_load(true, 0, false),
+            "empty + nothing listed is the new-user empty → resolve"
+        );
+        // A fetch error is irrelevant when nothing was listed (can't happen, but
+        // the decision must still resolve — there's provably nothing to wait for).
+        assert!(
+            should_resolve_per_room_load(true, 0, true),
+            "empty + nothing listed must resolve regardless of the error flag"
+        );
+
+        // A non-empty map always resolves (a partial load renders as List; the
+        // missing rooms show their own per-room markers), regardless of errors.
+        assert!(should_resolve_per_room_load(false, 3, true));
+        assert!(should_resolve_per_room_load(false, 3, false));
+        assert!(should_resolve_per_room_load(false, 0, false));
+    }
+
+    /// freenet/river#397 Codex review (P2-1): the load backstop must be armed
+    /// ONLY on the fire-and-forget legacy-probe path (guarded by `if fired`),
+    /// never unconditionally at startup — otherwise a slow but authoritative
+    /// current-delegate load (>20s) gets flipped to a false "no rooms yet".
+    #[test]
+    fn backstop_armed_only_on_fire_and_forget_probe() {
+        // (a) `set_up_chat_delegate` must NOT arm the backstop.
+        let self_src = include_str!("chat_delegate.rs");
+        let self_production = self_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let setup_idx = self_production
+            .find("pub async fn set_up_chat_delegate()")
+            .expect("set_up_chat_delegate must exist");
+        // Bound the body at the next top-level item's doc comment.
+        let setup_end = self_production[setup_idx..]
+            .find("Per-session dedup map for")
+            .map(|i| setup_idx + i)
+            .unwrap_or(self_production.len());
+        let setup_body = &self_production[setup_idx..setup_end];
+        assert!(
+            !setup_body.contains("schedule_rooms_load_backstop"),
+            "set_up_chat_delegate must NOT arm the load backstop (P2-1): arming it \
+             unconditionally could flip a slow authoritative load to a false Empty"
+        );
+
+        // (b) In the response handler, the backstop is armed at EXACTLY the two
+        // probe-fired sites (ProbeLegacy + value-gone blob path), each directly
+        // guarded by `if fired`.
+        let rh_src = include_str!("freenet_api/response_handler.rs");
+        let rh_production = rh_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let arm_count = rh_production
+            .matches("schedule_rooms_load_backstop();")
+            .count();
+        assert_eq!(
+            arm_count, 2,
+            "the backstop must be armed at exactly the two probe-fired sites (found {arm_count})"
+        );
+        let mut search_from = 0;
+        while let Some(rel) = rh_production[search_from..].find("schedule_rooms_load_backstop();") {
+            let pos = search_from + rel;
+            let guard = rh_production[..pos]
+                .rfind("if fired {")
+                .expect("each backstop arming must be guarded by `if fired`");
+            assert!(
+                pos - guard < 500,
+                "each schedule_rooms_load_backstop() must be DIRECTLY inside an `if fired` block"
+            );
+            search_from = pos + 1;
+        }
     }
 
     /// Codex P1 finding on PR #259: the legacy-migration-done
@@ -4077,6 +4177,33 @@ pub(crate) fn backstop_resolve(current: RoomsLoadState) -> RoomsLoadState {
         RoomsLoadState::Loading => RoomsLoadState::Loaded,
         other => other,
     }
+}
+
+/// Whether the current-delegate per-room load should RESOLVE the display state
+/// to `Loaded` (freenet/river#397 Codex review, P2-2). Resolve on a DEFINITIVE
+/// answer; stay `Loading` only when the load came back EMPTY but the delegate's
+/// key index PROVED rooms exist AND at least one listed room failed to
+/// materialize (a transport / parse error, NOT a definitive value-absent). In
+/// that failed-load case a WS reconnect re-fires `ListRequest` and retries, so
+/// the honest spinner is correct — we KNOW rooms exist, so flashing "no rooms
+/// yet" would be the feature's own worst failure mode.
+///
+/// - non-empty map → resolve (`true`): we have rooms to show. A PARTIAL load
+///   (some rooms loaded, some errored) has a non-empty map and resolves to
+///   `List`; the missing rooms surface their own per-room `awaiting_sync`/error
+///   markers.
+/// - empty + nothing listed (`listed_count == 0`) → resolve (`true`): a
+///   genuinely empty delegate (the new-user / no-rooms case).
+/// - empty + listed + NO fetch error → resolve (`true`): every listed key
+///   definitively returned `value: None` — a real (if odd) empty state, not a
+///   failure to fetch.
+/// - empty + listed + a fetch error → do NOT resolve (`false`): stay `Loading`.
+pub(crate) fn should_resolve_per_room_load(
+    map_empty: bool,
+    listed_count: usize,
+    had_fetch_error: bool,
+) -> bool {
+    !(map_empty && listed_count > 0 && had_fetch_error)
 }
 
 /// Timeout for the room-list load backstop (see [`backstop_resolve`]). Generous
