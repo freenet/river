@@ -56,6 +56,32 @@ pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> = Global::new(Freenet
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
 
+/// Whether the initial room-list load has resolved (freenet/river#397).
+///
+/// Starts `false` and flips to `true` once the current delegate's first
+/// `ListResponse` has been processed AND — for an empty current delegate — the
+/// legacy-migration probe has been given a bounded window to surface migrated
+/// rooms. The room list reads this to distinguish "still loading / migrating
+/// your rooms" (show a quiet indicator) from "you genuinely have no rooms yet"
+/// (show the create/join empty state), so an in-progress load never renders as
+/// data loss. It only ever transitions false → true, so a WebSocket reconnect
+/// that re-fires the load never flashes the list back to a loading state.
+pub static INITIAL_ROOMS_LOADED: GlobalSignal<bool> = Global::new(|| false);
+
+/// Mark the initial room-list load as resolved (freenet/river#397).
+///
+/// Called from the delegate response-handling tasks (which run without a Dioxus
+/// scope), so the signal write is routed through `defer()` per the signal-safety
+/// rules. Idempotent — the flag never transitions back to `false`.
+pub fn mark_initial_rooms_loaded() {
+    crate::util::defer(move || {
+        let already = *INITIAL_ROOMS_LOADED.peek();
+        if !already {
+            *INITIAL_ROOMS_LOADED.write() = true;
+        }
+    });
+}
+
 // Tracks which rooms need to be synced due to USER actions (not network updates)
 // This prevents infinite loops where network responses trigger more syncs
 pub static NEEDS_SYNC: GlobalSignal<std::collections::HashSet<VerifyingKey>> =

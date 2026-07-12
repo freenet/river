@@ -587,6 +587,18 @@ impl ResponseHandler {
     }
 }
 
+/// How long to keep the room list in its "loading" state after firing the
+/// legacy-migration probe for an empty current delegate (freenet/river#397).
+///
+/// The probe is fire-and-forget: a migrating user's rooms arrive on a legacy
+/// delegate a moment later, while a fresh user with no legacy delegate gets no
+/// response at all. This bounded settle lets a migration surface its rooms (or
+/// set the in-progress flag) before the list falls through to the genuinely-empty
+/// "no rooms yet" state. Legacy delegates are LOCAL to the node, so this window
+/// only has to cover a local round-trip — a fresh user waits this long for the
+/// empty-state CTA, which is a small, one-time cost.
+const LEGACY_PROBE_SETTLE_MS: u64 = 3000;
+
 /// Per-room room load (freenet/river#345 / #65). Reconstructs the in-memory
 /// `Rooms` from the current delegate's `room:<vk>` slot keys (+ `rooms_meta`)
 /// discovered by a `ListRequest`, then hands the assembled value to the shared
@@ -617,6 +629,20 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
         LoadPlan::ProbeLegacy => {
             info!("Current delegate has no room data — firing legacy migration probe");
             fire_legacy_migration_request().await;
+            // The current delegate is empty, so any rooms live on a legacy
+            // delegate and arrive asynchronously via the probe above (which is
+            // fire-and-forget — a fresh user with no legacy delegate installed
+            // gets no response at all). Give that probe a bounded window before
+            // declaring the room list "loaded & empty", so a migrating user does
+            // not briefly see the "no rooms yet" empty state during the probe
+            // gap (freenet/river#397). If the probe DID surface rooms, they
+            // hydrate into ROOMS and the list renders them regardless; if a
+            // migration re-save is mid-flight, `is_legacy_migration_in_progress`
+            // keeps the list in its "restoring" state. Marking loaded here only
+            // ends the "loading" indicator for the genuinely-empty (fresh-user)
+            // case.
+            crate::util::sleep(std::time::Duration::from_millis(LEGACY_PROBE_SETTLE_MS)).await;
+            crate::components::app::mark_initial_rooms_loaded();
         }
         LoadPlan::MigrateCurrentBlob => {
             info!(
@@ -624,6 +650,7 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                  migrating it to per-room keys"
             );
             migrate_current_blob_to_per_room().await;
+            crate::components::app::mark_initial_rooms_loaded();
         }
         LoadPlan::PerRoom { room_vks, has_meta } => {
             // Was a prior legacy migration interrupted before it finished writing
@@ -704,6 +731,10 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             if hydrate_loaded_rooms(loaded, false) {
                 schedule_subscription_timeout_check();
             }
+            // The current delegate was authoritative for the room set (whatever
+            // it listed is now hydrated), so the initial load has resolved — the
+            // room list can stop showing its loading indicator (freenet/river#397).
+            crate::components::app::mark_initial_rooms_loaded();
 
             // Recover from an interrupted migration by re-running it to pick up
             // any room whose per-room key wasn't written before the previous

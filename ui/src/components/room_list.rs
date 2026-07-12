@@ -5,12 +5,16 @@ pub(crate) mod join_with_code_modal;
 pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
-use crate::components::app::chat_delegate::save_rooms_to_delegate;
+use crate::components::app::chat_delegate::{
+    is_legacy_migration_in_progress, save_rooms_to_delegate,
+};
 use crate::components::app::document_title::{
     count_unread_in_room_data, mark_current_room_as_read,
 };
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
-use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
+use crate::components::app::{
+    MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, INITIAL_ROOMS_LOADED, MOBILE_VIEW, ROOMS,
+};
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::components::room_list::join_with_code_modal::JoinWithCodeModal;
@@ -34,6 +38,65 @@ const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp n
 // Stable Dioxus key for the reorder tail drop zone (keys must be unique and
 // distinct from any room's `{room_key:?}`).
 const TAIL_DROP_ZONE_KEY: &str = "room-reorder-tail-drop-zone";
+
+/// What the room list should show right now (freenet/river#397).
+///
+/// The map populates one room at a time as each per-room slot GET returns, and
+/// on a re-keyed delegate the rooms arrive later still via legacy migration, so
+/// an empty `ROOMS` map does NOT mean "no rooms" — it usually means "still
+/// loading." This tri-state keeps the genuinely-empty create/join call-to-action
+/// from showing until the initial load has actually resolved, so an in-progress
+/// load or migration never reads to the user as "all my rooms are gone."
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RoomListDisplay {
+    /// Rooms are in the map — render the list.
+    Populated,
+    /// A legacy delegate migration is restoring the user's rooms.
+    Migrating,
+    /// The initial load has not resolved yet (still waiting on the delegate).
+    Loading,
+    /// Load resolved and the user genuinely has no rooms yet.
+    Empty,
+}
+
+/// Pure decision for which face the room list shows (freenet/river#397).
+///
+/// Order matters: a populated map always wins (rooms are rooms, even mid-load);
+/// otherwise an in-progress delegate migration shows the "restoring" state; a
+/// not-yet-resolved initial load shows the "loading" state; and only once the
+/// load has resolved to an empty map do we show the genuinely-empty CTA. The
+/// last branch is the crux — it is what stops an empty-while-loading map from
+/// reading to the user as "all my rooms are gone."
+fn room_list_display(has_rooms: bool, migrating: bool, initial_loaded: bool) -> RoomListDisplay {
+    if has_rooms {
+        RoomListDisplay::Populated
+    } else if migrating {
+        RoomListDisplay::Migrating
+    } else if !initial_loaded {
+        RoomListDisplay::Loading
+    } else {
+        RoomListDisplay::Empty
+    }
+}
+
+/// Dev-only visual override for the room-list state (freenet/river#397), so the
+/// migrating / loading / empty states can be screenshotted from an
+/// `example-data` build without a live node or a forced localStorage flag. Reads
+/// `?room_list_state=migrating` (or `loading` / `empty` / `populated`) from the
+/// URL. Compiled out of production builds — `example-data` is a dev/testing-only
+/// feature.
+#[cfg(all(target_arch = "wasm32", feature = "example-data"))]
+fn dev_room_list_state_override() -> Option<RoomListDisplay> {
+    let search = web_sys::window()?.location().search().ok()?;
+    let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+    match params.get("room_list_state")?.as_str() {
+        "migrating" => Some(RoomListDisplay::Migrating),
+        "loading" => Some(RoomListDisplay::Loading),
+        "empty" => Some(RoomListDisplay::Empty),
+        "populated" => Some(RoomListDisplay::Populated),
+        _ => None,
+    }
+}
 
 /// Convert UTC ISO timestamp to local time string
 fn format_build_time_local() -> String {
@@ -181,6 +244,20 @@ pub fn RoomList() -> Element {
     // room there is nothing to reorder.
     let room_count: usize = room_items.read().len();
 
+    // Room-list tri-state (freenet/river#397). An empty map is ambiguous —
+    // "still loading / migrating" vs "genuinely no rooms" — so decide which of
+    // the three faces to show. `is_legacy_migration_in_progress()` reads
+    // localStorage (not a signal); its transitions coincide with ROOMS changes
+    // (a migration only sets the flag when it has data to re-save, which then
+    // hydrates), and `INITIAL_ROOMS_LOADED` is read reactively below, so the
+    // component re-renders across every relevant transition.
+    let migrating = is_legacy_migration_in_progress();
+    let initial_loaded = INITIAL_ROOMS_LOADED.try_read().map(|g| *g).unwrap_or(false);
+    let display = room_list_display(room_count > 0, migrating, initial_loaded);
+    // Dev-only URL override for screenshotting each state (example-data builds).
+    #[cfg(all(target_arch = "wasm32", feature = "example-data"))]
+    let display = dev_room_list_state_override().unwrap_or(display);
+
     rsx! {
         aside {
             // Stable hook for the connection-indicator regression tests
@@ -258,10 +335,12 @@ pub fn RoomList() -> Element {
                 }
             }
 
-            // Room list
+            // Room list — tri-state (freenet/river#397): the populated list, a
+            // quiet loading/migrating indicator, or the genuinely-empty CTA.
             ul {
                 "data-testid": "room-list",
                 class: "flex-1 px-2 py-1 space-y-0.5",
+                if display == RoomListDisplay::Populated {
                 {room_items.read().iter().enumerate().map(|(idx, (room_key, room_name, is_current, awaiting_sync, is_private, unread, sync_error_msg))| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
@@ -536,6 +615,35 @@ pub fn RoomList() -> Element {
                         "Drop here to move to end"
                     }
                 }
+                } else if display == RoomListDisplay::Empty {
+                    // Load resolved and the user genuinely has no rooms. Only
+                    // shown once the initial load/migration has completed — never
+                    // during the ambiguous empty-while-loading window.
+                    li {
+                        "data-testid": "room-list-empty",
+                        class: "px-3 py-8 flex flex-col items-center gap-1.5 text-center text-text-muted",
+                        Icon { width: 20, height: 20, icon: FaComments }
+                        span { class: "text-sm", "No rooms yet" }
+                        span { class: "text-xs text-text-muted/80", "Create a room or join one with an invite code." }
+                    }
+                } else {
+                    // Loading or Migrating — a quiet inline indicator so an
+                    // in-progress load or delegate migration never reads to the
+                    // user as "all my rooms are gone" (freenet/river#397).
+                    li {
+                        "data-testid": "room-list-loading",
+                        "aria-live": "polite",
+                        class: "flex items-center gap-2 px-3 py-3 text-xs text-text-muted",
+                        div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
+                        span {
+                            if display == RoomListDisplay::Migrating {
+                                "Restoring your rooms…"
+                            } else {
+                                "Loading your rooms…"
+                            }
+                        }
+                    }
+                }
             }
 
             // Direct Messages section under the room list — surfaces DM
@@ -583,5 +691,61 @@ pub fn RoomList() -> Element {
         JoinWithCodeModal {
             is_active: join_code_modal_active
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{room_list_display, RoomListDisplay};
+
+    // freenet/river#397: the room-list tri-state must never show the
+    // genuinely-empty "no rooms yet" CTA while the initial load or a delegate
+    // migration is still in flight — an empty-while-loading map reads to users
+    // as "all my rooms are gone."
+
+    #[test]
+    fn populated_wins_regardless_of_load_or_migration_flags() {
+        // Rooms present → always the list, even if the migration flag is still
+        // set or the initial-load latch hasn't flipped yet.
+        for &migrating in &[false, true] {
+            for &loaded in &[false, true] {
+                assert_eq!(
+                    room_list_display(true, migrating, loaded),
+                    RoomListDisplay::Populated,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_map_during_migration_shows_restoring_not_empty_cta() {
+        // Even after the initial load has otherwise resolved, an in-progress
+        // migration keeps the "restoring" state rather than the empty CTA.
+        assert_eq!(
+            room_list_display(false, true, false),
+            RoomListDisplay::Migrating,
+        );
+        assert_eq!(
+            room_list_display(false, true, true),
+            RoomListDisplay::Migrating,
+        );
+    }
+
+    #[test]
+    fn empty_map_before_initial_load_shows_loading_not_empty_cta() {
+        assert_eq!(
+            room_list_display(false, false, false),
+            RoomListDisplay::Loading,
+        );
+    }
+
+    #[test]
+    fn empty_map_only_after_load_resolves_shows_empty_cta() {
+        // The one path to the empty CTA: not populated, not migrating, and the
+        // initial load has resolved.
+        assert_eq!(
+            room_list_display(false, false, true),
+            RoomListDisplay::Empty,
+        );
     }
 }
