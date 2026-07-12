@@ -549,6 +549,13 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             fire_list_rooms_request().await;
             fire_load_outbound_dms_request().await;
 
+            // Room-list load backstop (freenet/river#397): a pure UI safety net
+            // so a brand-new user whose fire-and-forget legacy probe finds
+            // nothing resolves to the empty state rather than spinning forever.
+            // Once per session; the real completion signals live in the load
+            // path's `set_rooms_load_state` calls.
+            schedule_rooms_load_backstop();
+
             Ok(())
         }
         Err(e) => Err(format!("Failed to register chat delegate: {}", e)),
@@ -1208,6 +1215,68 @@ mod tests {
             interrupted.recover,
             "an interrupted migration must re-run to recover stranded rooms"
         );
+    }
+
+    /// freenet/river#397: when the current delegate is empty and we DID dispatch
+    /// legacy probes, we cannot yet tell a new user (nothing coming) from an
+    /// existing user whose legacy data is about to migrate, so we must stay
+    /// `Loading` — never optimistically `Loaded`, which would flash "no rooms
+    /// yet" at the migrating user before their migration starts.
+    #[test]
+    fn probe_legacy_fired_stays_loading() {
+        assert_eq!(
+            load_state_after_probe_legacy(true),
+            RoomsLoadState::Loading,
+            "dispatched probes: a migration might still arrive, so stay Loading"
+        );
+    }
+
+    /// freenet/river#397: when the probe was SKIPPED (already migrated / already
+    /// attempted this session) nothing more is coming, so the load is resolved —
+    /// the fast path that lets a returning empty user reach the calm empty state
+    /// immediately instead of waiting on the backstop.
+    #[test]
+    fn probe_legacy_skipped_resolves_loaded() {
+        assert_eq!(
+            load_state_after_probe_legacy(false),
+            RoomsLoadState::Loaded,
+            "skipped probes: nothing is coming, resolve immediately"
+        );
+    }
+
+    /// freenet/river#397 (#1 safety invariant): the timeout backstop rescues a
+    /// stuck `Loading` (the new-user-with-no-legacy-data case) into `Loaded`, so
+    /// the spinner is never perpetual — but it must NOT override `Migrating` (a
+    /// slow migration keeps its spinner rather than flashing empty) nor re-open
+    /// an already-resolved `Loaded`.
+    #[test]
+    fn backstop_only_rescues_loading() {
+        assert_eq!(
+            backstop_resolve(RoomsLoadState::Loading),
+            RoomsLoadState::Loaded,
+            "a genuinely-new user must resolve to Loaded, never a perpetual spinner"
+        );
+        assert_eq!(
+            backstop_resolve(RoomsLoadState::Migrating),
+            RoomsLoadState::Migrating,
+            "the backstop must not pre-empt an in-progress migration"
+        );
+        assert_eq!(
+            backstop_resolve(RoomsLoadState::Loaded),
+            RoomsLoadState::Loaded,
+            "the backstop must not re-open a resolved load"
+        );
+    }
+
+    /// freenet/river#397 end-to-end invariant, composed from the pure pieces: a
+    /// brand-new user fires legacy probes (→ `Loading`), nothing responds, and
+    /// the backstop resolves them to `Loaded` (→ the empty state). They are NEVER
+    /// stuck loading forever.
+    #[test]
+    fn new_user_resolves_to_loaded_never_stuck() {
+        let after_probe = load_state_after_probe_legacy(true);
+        assert_eq!(after_probe, RoomsLoadState::Loading);
+        assert_eq!(backstop_resolve(after_probe), RoomsLoadState::Loaded);
     }
 
     /// Codex P1 finding on PR #259: the legacy-migration-done
@@ -3922,6 +3991,123 @@ pub fn clear_legacy_migration_in_progress() {
     }
 }
 
+// =============================================================================
+// ROOM-LIST LOAD STATE (freenet/river#397)
+// Drives the rooms rail's non-room display so an empty `ROOMS` map during
+// startup / migration doesn't render a blank list that reads as data loss.
+// =============================================================================
+
+/// Coarse state of the initial room-list load, consumed by `RoomList` to decide
+/// what to show while `ROOMS` is still empty (spinner vs. migrating vs. a calm
+/// "no rooms yet"). Deliberately coarse: the room COUNT (from `ROOMS`) decides
+/// list-vs-none; this only disambiguates the three non-room states.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoomsLoadState {
+    /// The initial startup load has not resolved yet — the current delegate's
+    /// `ListResponse` isn't classified, or a fire-and-forget legacy probe is
+    /// outstanding and no migration has started. The honest "we don't know yet".
+    Loading,
+    /// A delegate/room migration is actively recovering rooms (the case Ivvor
+    /// hit after a delegate-WASM upgrade). Shown so a migrating user never reads
+    /// the empty rail as "my rooms are gone".
+    Migrating,
+    /// The load resolved: either rooms are present (the list renders them) or the
+    /// user genuinely has none (the calm empty state). Reached ONLY at a real
+    /// completion point or the timeout backstop — never speculatively, so an
+    /// existing user mid-migration can't flash "no rooms yet".
+    Loaded,
+}
+
+/// Reactive room-list load state. Starts `Loading`; advanced to `Loaded` at the
+/// real completion points (see `set_rooms_load_state` call sites) and to
+/// `Migrating` when a legacy migration re-save starts. A reactive signal (not a
+/// bare localStorage read of `is_legacy_migration_in_progress()`) because the
+/// render must re-run when the state transitions, and a migration's start does
+/// not otherwise touch a signal `RoomList` subscribes to.
+pub static ROOMS_LOAD_STATE: GlobalSignal<RoomsLoadState> = Global::new(|| RoomsLoadState::Loading);
+
+/// Set the room-list load state, deferred per the Dioxus signal-safety rules
+/// (all callers run inside spawned load/migration tasks that may hold a signal
+/// borrow). The `peek` guard avoids spurious writes / re-renders when the state
+/// is unchanged.
+pub(crate) fn set_rooms_load_state(state: RoomsLoadState) {
+    crate::util::defer(move || {
+        if *ROOMS_LOAD_STATE.peek() != state {
+            *ROOMS_LOAD_STATE.write() = state;
+        }
+    });
+}
+
+/// After the current delegate's `ListResponse` is classified as `ProbeLegacy`,
+/// pick the load state. A pure decision so the "new user never gets stuck
+/// loading" invariant is unit-testable.
+///
+/// - `fired_legacy_probes == false` — the probe was skipped (already migrated,
+///   or already attempted this session), so nothing more is coming: the load is
+///   resolved (`Loaded`). This is the fast path for a returning empty user.
+/// - `fired_legacy_probes == true` — probes were dispatched fire-and-forget. A
+///   migration MIGHT still arrive (existing user with legacy-only data) OR
+///   nothing will (brand-new user whose node has no legacy delegates). We cannot
+///   tell synchronously, so we stay `Loading`: the migration path flips us to
+///   `Migrating`/`Loaded` if data arrives, and the timeout backstop
+///   (`backstop_resolve`) flips us to `Loaded` if it doesn't. Staying `Loading`
+///   (never optimistic `Loaded`) is what stops an existing user from flashing
+///   "no rooms yet" before their migration starts.
+pub(crate) fn load_state_after_probe_legacy(fired_legacy_probes: bool) -> RoomsLoadState {
+    if fired_legacy_probes {
+        RoomsLoadState::Loading
+    } else {
+        RoomsLoadState::Loaded
+    }
+}
+
+/// The timeout backstop transition. This is a PURE UI SAFETY NET, not the
+/// primary completion signal (the real signals are the classified-load and
+/// migration-conclusion points that call `set_rooms_load_state`). It exists only
+/// for the one case with no reliable synchronous completion signal — a brand-new
+/// user whose fire-and-forget legacy probe finds nothing, so no response ever
+/// arrives — so that user resolves to the empty state instead of spinning
+/// forever (the #1 safety requirement of freenet/river#397).
+///
+/// It rescues ONLY a still-`Loading` state: it must not override `Migrating` (a
+/// positive signal that rooms are on the way — a slow migration should keep its
+/// spinner, not flash "no rooms yet"), nor re-open `Loaded`.
+pub(crate) fn backstop_resolve(current: RoomsLoadState) -> RoomsLoadState {
+    match current {
+        RoomsLoadState::Loading => RoomsLoadState::Loaded,
+        other => other,
+    }
+}
+
+/// Timeout for the room-list load backstop (see [`backstop_resolve`]). Generous
+/// on purpose: it must comfortably outlast a real legacy migration's
+/// probe→response→migrate window so it never pre-empts an existing user's
+/// migration, so its only visible effect is resolving the genuinely-empty
+/// new-user case.
+const ROOMS_LOAD_BACKSTOP_MS: u64 = 15_000;
+
+/// One-shot guard so the backstop is scheduled once per session even though
+/// `set_up_chat_delegate` re-runs on every reconnect.
+static LOAD_BACKSTOP_SCHEDULED: AtomicBool = AtomicBool::new(false);
+
+/// Schedule the room-list load backstop once per session. See
+/// [`backstop_resolve`] for why this is a safety net rather than the primary
+/// signal.
+pub(crate) fn schedule_rooms_load_backstop() {
+    if LOAD_BACKSTOP_SCHEDULED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    crate::util::safe_spawn_local(async {
+        crate::util::sleep(std::time::Duration::from_millis(ROOMS_LOAD_BACKSTOP_MS)).await;
+        crate::util::defer(|| {
+            let resolved = backstop_resolve(*ROOMS_LOAD_STATE.peek());
+            if *ROOMS_LOAD_STATE.peek() != resolved {
+                *ROOMS_LOAD_STATE.write() = resolved;
+            }
+        });
+    });
+}
+
 /// Guard to prevent repeated legacy migration attempts within the same session.
 /// The migration is fire-and-forget: if the legacy delegates don't exist on the node,
 /// the node returns "delegate not found" errors that never reach the response handler's
@@ -3964,18 +4150,24 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
 /// may have data is unsafe because a legacy response can trigger a save that
 /// overwrites the current delegate's storage before its GET response arrives,
 /// destroying rooms the user created after the last legacy snapshot.
-pub(crate) async fn fire_legacy_migration_request() {
+///
+/// Returns `true` if it actually dispatched legacy probes, `false` if it skipped
+/// (migration already done, or already attempted this session). The room-list
+/// load path (freenet/river#397) uses this to decide whether to stay `Loading`
+/// (probes fired — a migration might still arrive) or resolve to `Loaded`
+/// (nothing more is coming) — see [`load_state_after_probe_legacy`].
+pub(crate) async fn fire_legacy_migration_request() -> bool {
     // Check if migration has already been done (persistent across sessions)
     if is_legacy_migration_done() {
         info!("Legacy migration already done, skipping");
-        return;
+        return false;
     }
 
     // Only attempt migration once per session to avoid error spam on reconnect.
     // If the legacy delegates aren't installed, retrying won't help.
     if LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
         info!("Legacy migration already attempted this session, skipping");
-        return;
+        return false;
     }
 
     info!(
@@ -4084,4 +4276,5 @@ pub(crate) async fn fire_legacy_migration_request() {
             ),
         }
     }
+    true
 }

@@ -14,10 +14,11 @@ use crate::components::app::chat_delegate::{
     complete_pending_signing_key_request, decide_legacy_migration_action,
     decide_per_room_load_action, fire_legacy_migration_request, get_versioned_correlation_key,
     hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
-    is_legacy_migration_in_progress, legacy_scoped_correlation, mark_legacy_migration_done,
-    mark_legacy_migration_in_progress, parse_room_storage_key, prune_outbound_dms_for_purges,
-    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
-    send_delegate_request_to, LegacyMigrationAction, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY,
+    is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
+    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
+    prune_outbound_dms_for_purges, room_storage_key, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, send_delegate_request, send_delegate_request_to, set_rooms_load_state,
+    LegacyMigrationAction, RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY,
     ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
@@ -616,7 +617,12 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
     match plan_load_from_keys(&keys) {
         LoadPlan::ProbeLegacy => {
             info!("Current delegate has no room data — firing legacy migration probe");
-            fire_legacy_migration_request().await;
+            // freenet/river#397: stay `Loading` while a dispatched probe might
+            // still yield a migration; resolve to `Loaded` only if the probe was
+            // skipped (nothing is coming). A brand-new user whose probe finds
+            // nothing is caught by the timeout backstop, never a perpetual spinner.
+            let fired = fire_legacy_migration_request().await;
+            set_rooms_load_state(load_state_after_probe_legacy(fired));
         }
         LoadPlan::MigrateCurrentBlob => {
             info!(
@@ -704,6 +710,13 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             if hydrate_loaded_rooms(loaded, false) {
                 schedule_subscription_timeout_check();
             }
+
+            // freenet/river#397: the current delegate's per-room set is the
+            // authoritative initial load — it has resolved. Rooms (if any) render
+            // as the list; an empty/all-tombstone set renders the calm empty
+            // state. Set BEFORE the recovery re-run below so an armed recovery's
+            // `Migrating` (set inside `migrate_current_blob_to_per_room`) wins.
+            set_rooms_load_state(RoomsLoadState::Loaded);
 
             // Recover from an interrupted migration by re-running it to pick up
             // any room whose per-room key wasn't written before the previous
@@ -832,6 +845,10 @@ async fn migrate_current_blob_to_per_room() {
                 // rooms on the next per-room load (freenet/river#345 follow-up,
                 // same hazard as the legacy-delegate path).
                 mark_legacy_migration_in_progress();
+                // freenet/river#397: a current-delegate blob explosion is a
+                // migration. Set `Migrating` BEFORE hydrate merges the rooms so a
+                // re-render lands on the "Migrating…" state before the list fills.
+                set_rooms_load_state(RoomsLoadState::Migrating);
                 if hydrate_loaded_rooms(loaded, false) {
                     schedule_subscription_timeout_check();
                 }
@@ -847,10 +864,15 @@ async fn migrate_current_blob_to_per_room() {
                         Ok(_) => {
                             clear_legacy_migration_in_progress();
                             mark_legacy_migration_done();
+                            // freenet/river#397: the blob explosion completed —
+                            // the migration has resolved.
+                            set_rooms_load_state(RoomsLoadState::Loaded);
                         }
                         Err(e) => {
                             error!("Failed to explode single blob into per-room keys: {}", e);
                             // Leave the in-progress flag set — next load re-runs.
+                            // The rooms are already hydrated (room_count > 0), so
+                            // the list renders regardless of the load-state value.
                         }
                     }
                 });
@@ -861,11 +883,17 @@ async fn migrate_current_blob_to_per_room() {
             // do NOT touch the in-progress flag — if a prior migration left it
             // set, the next session re-runs recovery, and the already-loaded
             // per-room keys remain intact regardless.
-            Err(e) => error!("Failed to deserialize current-delegate rooms blob: {}", e),
+            Err(e) => {
+                error!("Failed to deserialize current-delegate rooms blob: {}", e);
+                // freenet/river#397: nothing loadable from this blob — resolve so
+                // the rail doesn't spin forever on an unparseable snapshot.
+                set_rooms_load_state(RoomsLoadState::Loaded);
+            }
         },
         Ok(_) => {
             // Index listed rooms_data but the value is gone — treat as empty.
-            fire_legacy_migration_request().await;
+            let fired = fire_legacy_migration_request().await;
+            set_rooms_load_state(load_state_after_probe_legacy(fired));
         }
         Err(e) => warn!("Failed to read current-delegate rooms blob: {}", e),
     }
@@ -996,6 +1024,16 @@ fn schedule_subscription_timeout_check() {
 /// `flags.subscriptions_initiated`). Holds no `self`/`flags`, so it is callable
 /// from a spawned task as well as the synchronous message-loop arm.
 fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool) -> bool {
+    // freenet/river#397: a legacy-delegate response means we found the user's
+    // rooms under an OLD delegate key and are about to migrate them (Ivvor's
+    // case). Announce `Migrating` BEFORE the ROOMS merge below (which is
+    // deferred) so a re-render lands on the "Migrating…" state ahead of the list
+    // filling. The current-delegate path (is_legacy_delegate == false) is not a
+    // migration and sets its own resolved state at the call site.
+    if is_legacy_delegate {
+        set_rooms_load_state(RoomsLoadState::Migrating);
+    }
+
     // Tombstone filter for all downstream loops.
     // Includes both: (a) tombstones in the
     // incoming loaded_rooms, and (b) tombstones
@@ -1410,10 +1448,14 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool) -> bool {
                     info!("Successfully migrated room data to new delegate");
                     clear_legacy_migration_in_progress();
                     mark_legacy_migration_done();
+                    // freenet/river#397: migration concluded — resolve the load.
+                    set_rooms_load_state(RoomsLoadState::Loaded);
                 }
                 Err(e) => {
                     error!("Failed to migrate room data to new delegate: {}", e);
                     // Leave the in-progress flag set — the next load re-fills.
+                    // The migrated rooms are already hydrated (room_count > 0),
+                    // so the list renders regardless of the load-state value.
                 }
             }
         });
