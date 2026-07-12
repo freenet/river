@@ -1290,37 +1290,70 @@ mod tests {
     /// combination is a definitive answer and resolves.
     #[test]
     fn per_room_load_stays_loading_only_on_empty_listed_with_fetch_error() {
+        // Signature: should_resolve_per_room_load(map_empty, listed_count,
+        // had_fetch_error, recovering). These cases fix recovering = false; the
+        // recovering = true cases are pinned separately below.
+
         // The one case that must NOT resolve: empty map, index listed rooms, and
         // a fetch error → stay Loading (retry on WS reconnect).
         assert!(
-            !should_resolve_per_room_load(true, 3, true),
+            !should_resolve_per_room_load(true, 3, true, false),
             "empty + listed + fetch error must NOT resolve (stay Loading)"
         );
 
         // Empty but every listed key definitively had no value (no fetch error) →
         // a real, if odd, empty state → resolve.
         assert!(
-            should_resolve_per_room_load(true, 3, false),
+            should_resolve_per_room_load(true, 3, false, false),
             "empty + listed + no fetch error is a definitive empty → resolve"
         );
 
         // Empty and nothing was listed → genuinely empty delegate → resolve.
         assert!(
-            should_resolve_per_room_load(true, 0, false),
+            should_resolve_per_room_load(true, 0, false, false),
             "empty + nothing listed is the new-user empty → resolve"
         );
         // A fetch error is irrelevant when nothing was listed (can't happen, but
         // the decision must still resolve — there's provably nothing to wait for).
         assert!(
-            should_resolve_per_room_load(true, 0, true),
+            should_resolve_per_room_load(true, 0, true, false),
             "empty + nothing listed must resolve regardless of the error flag"
         );
 
         // A non-empty map always resolves (a partial load renders as List; the
         // missing rooms show their own per-room markers), regardless of errors.
-        assert!(should_resolve_per_room_load(false, 3, true));
-        assert!(should_resolve_per_room_load(false, 3, false));
-        assert!(should_resolve_per_room_load(false, 0, false));
+        assert!(should_resolve_per_room_load(false, 3, true, false));
+        assert!(should_resolve_per_room_load(false, 3, false, false));
+        assert!(should_resolve_per_room_load(false, 0, false, false));
+    }
+
+    /// freenet/river#397 Codex review 2 (P2): an interrupted-migration recovery
+    /// on an EMPTY map must stay `Loading` (recovery may still recover stranded
+    /// rooms), even with no fetch error — but recovery is irrelevant once the map
+    /// is non-empty (rooms are already showing).
+    #[test]
+    fn per_room_load_stays_loading_while_recovering_on_empty_map() {
+        // Empty + recovering → stay Loading, regardless of listed/error.
+        assert!(
+            !should_resolve_per_room_load(true, 0, false, true),
+            "empty + recovering must NOT resolve — stranded rooms may still recover"
+        );
+        assert!(
+            !should_resolve_per_room_load(true, 3, false, true),
+            "empty + listed + recovering must NOT resolve"
+        );
+        assert!(
+            !should_resolve_per_room_load(true, 3, true, true),
+            "empty + listed + error + recovering must NOT resolve"
+        );
+
+        // A non-empty map resolves even while recovering (rooms are visible;
+        // recovery continues as a background re-fill).
+        assert!(
+            should_resolve_per_room_load(false, 3, false, true),
+            "non-empty map resolves to List even while recovering"
+        );
+        assert!(should_resolve_per_room_load(false, 0, true, true));
     }
 
     /// freenet/river#397 Codex review (P2-1): the load backstop must be armed
@@ -4192,18 +4225,26 @@ pub(crate) fn backstop_resolve(current: RoomsLoadState) -> RoomsLoadState {
 ///   (some rooms loaded, some errored) has a non-empty map and resolves to
 ///   `List`; the missing rooms surface their own per-room `awaiting_sync`/error
 ///   markers.
-/// - empty + nothing listed (`listed_count == 0`) → resolve (`true`): a
-///   genuinely empty delegate (the new-user / no-rooms case).
-/// - empty + listed + NO fetch error → resolve (`true`): every listed key
-///   definitively returned `value: None` — a real (if odd) empty state, not a
-///   failure to fetch.
+/// - empty + nothing listed (`listed_count == 0`) + not recovering → resolve
+///   (`true`): a genuinely empty delegate (the new-user / no-rooms case).
+/// - empty + listed + NO fetch error + not recovering → resolve (`true`): every
+///   listed key definitively returned `value: None` — a real (if odd) empty
+///   state, not a failure to fetch.
 /// - empty + listed + a fetch error → do NOT resolve (`false`): stay `Loading`.
+/// - empty + `recovering` → do NOT resolve (`false`): an interrupted-migration
+///   recovery is armed/running, and the in-progress flag explicitly says rooms
+///   may be stranded. Even with no fetch error (e.g. the interrupted save wrote
+///   only tombstones while the live-room writes failed), resolving here would
+///   flash "no rooms yet" before the recovery re-run below has a chance to
+///   recover them. Stay `Loading` until recovery concludes (freenet/river#397
+///   Codex review 2, P2).
 pub(crate) fn should_resolve_per_room_load(
     map_empty: bool,
     listed_count: usize,
     had_fetch_error: bool,
+    recovering: bool,
 ) -> bool {
-    !(map_empty && listed_count > 0 && had_fetch_error)
+    !(map_empty && ((listed_count > 0 && had_fetch_error) || recovering))
 }
 
 /// Timeout for the room-list load backstop (see [`backstop_resolve`]). Generous
