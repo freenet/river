@@ -4083,8 +4083,12 @@ pub(crate) fn backstop_resolve(current: RoomsLoadState) -> RoomsLoadState {
 /// on purpose: it must comfortably outlast a real legacy migration's
 /// probe→response→migrate window so it never pre-empts an existing user's
 /// migration, so its only visible effect is resolving the genuinely-empty
-/// new-user case.
-const ROOMS_LOAD_BACKSTOP_MS: u64 = 15_000;
+/// new-user case. Tradeoff (freenet/river#397 review): a longer timeout means a
+/// brand-new user waits fractionally longer for the empty state, but it avoids
+/// flash-emptying an existing user whose legacy `ListResponse` is slow to arrive
+/// on a cold first connect (before the `Migrating` transition fires). 20s is
+/// chosen to sit safely past a realistic slow probe→response→migrate window.
+const ROOMS_LOAD_BACKSTOP_MS: u64 = 20_000;
 
 /// One-shot guard so the backstop is scheduled once per session even though
 /// `set_up_chat_delegate` re-runs on every reconnect.

@@ -629,7 +629,8 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                 "No per-room keys but a current-delegate rooms_data blob exists — \
                  migrating it to per-room keys"
             );
-            migrate_current_blob_to_per_room().await;
+            // Initial load: owns the display state (recovery = false).
+            migrate_current_blob_to_per_room(false).await;
         }
         LoadPlan::PerRoom { room_vks, has_meta } => {
             // Was a prior legacy migration interrupted before it finished writing
@@ -748,7 +749,10 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             //   above). No data loss, no spam loop.
             if action.recover && arm_legacy_migration_recovery() {
                 info!("Prior migration was interrupted — re-running to recover any stranded rooms");
-                migrate_current_blob_to_per_room().await;
+                // Background re-fill: the initial per-room load already resolved
+                // the display state to `Loaded` above, so recovery must NOT write
+                // the load state (recovery = true) — see freenet/river#397 review.
+                migrate_current_blob_to_per_room(true).await;
             }
         }
     }
@@ -830,7 +834,17 @@ fn reconstruct_rooms(
 /// `rooms_data`, so nothing else processes or races this read. After hydrating,
 /// a `save_rooms_to_delegate()` writes the per-room keys; the blob is
 /// intentionally left in place as a rollback fallback.
-async fn migrate_current_blob_to_per_room() {
+/// `recovery` distinguishes the two callers (freenet/river#397 review): the
+/// initial `LoadPlan::MigrateCurrentBlob` load (`false`) OWNS the display state,
+/// so it drives `ROOMS_LOAD_STATE`; the interrupted-migration recovery re-run
+/// (`true`) fires AFTER the per-room load already resolved the state to `Loaded`,
+/// so it must be a pure background re-fill that NEVER writes the load state — in
+/// particular it must never push a resolved `Loaded` back to `Loading` (which
+/// its no-current-blob `fire_legacy_migration_request` path would otherwise do,
+/// because `arm_legacy_migration_recovery` reset the attempt guard so the probe
+/// re-fires). Any real migration the recovery triggers still shows `Migrating`
+/// via the legacy `hydrate_loaded_rooms` path, which is not gated here.
+async fn migrate_current_blob_to_per_room(recovery: bool) {
     match send_delegate_request(ChatDelegateRequestMsg::GetVersionedRequest {
         key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
     })
@@ -848,7 +862,10 @@ async fn migrate_current_blob_to_per_room() {
                 // freenet/river#397: a current-delegate blob explosion is a
                 // migration. Set `Migrating` BEFORE hydrate merges the rooms so a
                 // re-render lands on the "Migrating…" state before the list fills.
-                set_rooms_load_state(RoomsLoadState::Migrating);
+                // Suppressed under `recovery` (the state is already `Loaded`).
+                if !recovery {
+                    set_rooms_load_state(RoomsLoadState::Migrating);
+                }
                 if hydrate_loaded_rooms(loaded, false) {
                     schedule_subscription_timeout_check();
                 }
@@ -859,20 +876,28 @@ async fn migrate_current_blob_to_per_room() {
                 // safe_spawn_local schedules a setTimeout(0) that, being queued
                 // AFTER the merge's defer, runs once the merge has populated
                 // ROOMS (FIFO ordering), mirroring the legacy-delegate re-save.
-                crate::util::safe_spawn_local(async {
+                crate::util::safe_spawn_local(async move {
                     match save_rooms_to_delegate().await {
                         Ok(_) => {
                             clear_legacy_migration_in_progress();
                             mark_legacy_migration_done();
                             // freenet/river#397: the blob explosion completed —
                             // the migration has resolved.
-                            set_rooms_load_state(RoomsLoadState::Loaded);
+                            if !recovery {
+                                set_rooms_load_state(RoomsLoadState::Loaded);
+                            }
                         }
                         Err(e) => {
                             error!("Failed to explode single blob into per-room keys: {}", e);
-                            // Leave the in-progress flag set — next load re-runs.
-                            // The rooms are already hydrated (room_count > 0), so
-                            // the list renders regardless of the load-state value.
+                            // freenet/river#397 (review): a zero-live-room migration
+                            // (e.g. an all-tombstone blob) leaves room_count == 0, so
+                            // a save error must STILL resolve the load — otherwise the
+                            // rail spins on "Migrating…" forever (the backstop only
+                            // rescues `Loading`, not `Migrating`). Leave the
+                            // in-progress flag set so the next load re-runs the fill.
+                            if !recovery {
+                                set_rooms_load_state(RoomsLoadState::Loaded);
+                            }
                         }
                     }
                 });
@@ -887,13 +912,21 @@ async fn migrate_current_blob_to_per_room() {
                 error!("Failed to deserialize current-delegate rooms blob: {}", e);
                 // freenet/river#397: nothing loadable from this blob — resolve so
                 // the rail doesn't spin forever on an unparseable snapshot.
-                set_rooms_load_state(RoomsLoadState::Loaded);
+                if !recovery {
+                    set_rooms_load_state(RoomsLoadState::Loaded);
+                }
             }
         },
         Ok(_) => {
             // Index listed rooms_data but the value is gone — treat as empty.
             let fired = fire_legacy_migration_request().await;
-            set_rooms_load_state(load_state_after_probe_legacy(fired));
+            // freenet/river#397 review: under `recovery` this must NOT run —
+            // `load_state_after_probe_legacy(true)` would downgrade the already
+            // resolved `Loaded` back to `Loading`, flashing a spinner (and, if the
+            // once-per-session backstop already fired, sticking there).
+            if !recovery {
+                set_rooms_load_state(load_state_after_probe_legacy(fired));
+            }
         }
         Err(e) => warn!("Failed to read current-delegate rooms blob: {}", e),
     }
@@ -1453,9 +1486,13 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool) -> bool {
                 }
                 Err(e) => {
                     error!("Failed to migrate room data to new delegate: {}", e);
-                    // Leave the in-progress flag set — the next load re-fills.
-                    // The migrated rooms are already hydrated (room_count > 0),
-                    // so the list renders regardless of the load-state value.
+                    // freenet/river#397 (review): a zero-live-room migration (an
+                    // all-tombstone legacy delegate → empty `map`) leaves
+                    // room_count == 0, so a save error must STILL resolve the load
+                    // — otherwise the rail spins on "Migrating…" forever (the
+                    // backstop only rescues `Loading`, not `Migrating`). Leave the
+                    // in-progress flag set so the next load re-fills.
+                    set_rooms_load_state(RoomsLoadState::Loaded);
                 }
             }
         });
@@ -1795,15 +1832,111 @@ mod tests {
         let recover_idx = production
             .find("if action.recover")
             .expect("per-room load must have an `if action.recover` recovery branch");
-        let recover_block = &production[recover_idx..(recover_idx + 300).min(production.len())];
+        let recover_block = &production[recover_idx..(recover_idx + 700).min(production.len())];
         assert!(
-            recover_block.contains("migrate_current_blob_to_per_room().await;"),
-            "the recovery branch must re-run the migration to recover stranded rooms"
+            recover_block.contains("migrate_current_blob_to_per_room(true).await;"),
+            "the recovery branch must re-run the migration (as a background re-fill, \
+             recovery = true) to recover stranded rooms — see freenet/river#397 review"
         );
         assert!(
             recover_block.contains("arm_legacy_migration_recovery()"),
             "recovery must be armed once-per-session (clears the attempt guard so \
              same-session recovery isn't a no-op — codex review of #352)"
+        );
+    }
+
+    /// freenet/river#397 review (MAJOR): both migration re-save `Err` arms MUST
+    /// resolve the load state to `Loaded`. A zero-live-room migration (e.g. an
+    /// all-tombstone legacy delegate — `reconstruct_rooms` routes `Tombstone` to
+    /// `removed_rooms`, leaving `map` empty) sets `Migrating` before the save with
+    /// room_count == 0; if the save then errors and the arm doesn't resolve, the
+    /// rail spins on "Migrating…" forever (the backstop only rescues `Loading`).
+    /// This pins the fix so a future edit that drops either resolve fails CI.
+    #[test]
+    fn migration_save_error_resolves_load_state() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        // (a) current-delegate blob explosion save error.
+        let blob_err = production
+            .find("Failed to explode single blob into per-room keys")
+            .expect("blob-explosion save-error marker must exist");
+        let blob_arm = &production[blob_err..(blob_err + 900).min(production.len())];
+        assert!(
+            blob_arm.contains("set_rooms_load_state(RoomsLoadState::Loaded)"),
+            "the blob-explosion save-error arm must resolve the load to Loaded, or a \
+             zero-live-room migration spins on Migrating forever (freenet/river#397 review)"
+        );
+
+        // (b) legacy-delegate re-save error.
+        let legacy_err = production
+            .find("Failed to migrate room data to new delegate")
+            .expect("legacy re-save-error marker must exist");
+        let legacy_arm = &production[legacy_err..(legacy_err + 900).min(production.len())];
+        assert!(
+            legacy_arm.contains("set_rooms_load_state(RoomsLoadState::Loaded)"),
+            "the legacy re-save-error arm must resolve the load to Loaded, or a \
+             zero-live-room migration spins on Migrating forever (freenet/river#397 review)"
+        );
+    }
+
+    /// freenet/river#397 review (MINOR): a background interrupted-migration
+    /// recovery re-run must NEVER downgrade a resolved `Loaded` back to `Loading`.
+    /// `migrate_current_blob_to_per_room` takes a `recovery: bool`, and its
+    /// no-current-blob `fire_legacy_migration_request` path (which returns `true`
+    /// after recovery re-armed the attempt guard, so `load_state_after_probe_legacy`
+    /// would yield `Loading`) MUST guard that write on `!recovery`. Pin both the
+    /// signature and the guard so the suppression can't silently regress.
+    #[test]
+    fn recovery_re_run_never_downgrades_load_state_to_loading() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        assert!(
+            production.contains("async fn migrate_current_blob_to_per_room(recovery: bool)"),
+            "migrate_current_blob_to_per_room must thread a `recovery` flag so a \
+             background re-fill can suppress its display-state writes"
+        );
+        // The initial (state-owning) caller passes false; the recovery caller
+        // passes true (the latter is also pinned by
+        // `interrupted_migration_is_recovered_on_next_load`).
+        assert!(
+            production.contains("migrate_current_blob_to_per_room(false).await;"),
+            "the initial LoadPlan::MigrateCurrentBlob caller must own the load state (recovery = false)"
+        );
+        // Slice just the `migrate_current_blob_to_per_room` body (from its
+        // signature to the next top-level `async fn`) so the checks below can't
+        // accidentally match the identically-named write in `load_rooms_per_room`'s
+        // `ProbeLegacy` arm (which is correctly ungated — it OWNS the load).
+        let fn_start = production
+            .find("async fn migrate_current_blob_to_per_room(recovery: bool)")
+            .expect("migrate_current_blob_to_per_room signature must exist");
+        let body_after_sig = &production[fn_start + 1..];
+        let fn_end = body_after_sig
+            .find("\nasync fn ")
+            .map(|i| fn_start + 1 + i)
+            .unwrap_or(production.len());
+        let body = &production[fn_start..fn_end];
+        // The value-gone probe-legacy write — the ONLY one that could yield
+        // `Loading` — must be guarded on `!recovery`.
+        let write_pos = body
+            .find("set_rooms_load_state(load_state_after_probe_legacy(fired))")
+            .expect("the value-gone branch must write via load_state_after_probe_legacy");
+        // The `if !recovery {` guard must DIRECTLY precede the write (same block),
+        // not merely appear somewhere earlier in the function.
+        let guard_pos = body[..write_pos]
+            .rfind("if !recovery {")
+            .expect("migrate_current_blob_to_per_room must guard its writes on !recovery");
+        assert!(
+            write_pos - guard_pos < 80,
+            "the value-gone probe-legacy write must be DIRECTLY inside an `if !recovery` \
+             block so a background recovery never downgrades a resolved Loaded to Loading"
         );
     }
 
