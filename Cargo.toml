@@ -61,7 +61,7 @@ river = { path = "cli", package = "river" }
 # Freenet dependencies
 freenet-scaffold = "0.2.2"
 freenet-scaffold-macro = "0.2.2"
-freenet-stdlib = { version = "0.6.0", features = ["contract"] }
+freenet-stdlib = { version = "0.8.3", features = ["contract"] }
 
 [workspace.package]
 version = "0.1.12"

@@ -176,3 +176,10 @@ description = "Before #345: chat-delegate gains generation + compare-and-swap (C
 date = "2026-06-03"
 delegate_key = "1ec6b3d1d16f7a2d4ecd6e305c05bb9a49321a1043b1d28ae84e6c56c4959bb9"
 code_hash = "904f76ff053f0882a8a036de3eea2ff367dced8bc5b0cbdbadcea3e40a4688f6"
+
+[[entry]]
+version = "V25"
+description = "Before freenet-stdlib 0.6.0 -> 0.8.3 bump (dogfood): last stdlib-0.6 chat-delegate generation"
+date = "2026-07-10"
+delegate_key = "3e0e07376681429abeab623c85b28fee3e0dffddc4f81601cb08e175310eda80"
+code_hash = "8bb5d06fa060b74825355a3e253f006b90f26bdfebe88ed2aa2db2e8e351cc8d"
