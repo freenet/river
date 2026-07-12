@@ -15,11 +15,11 @@ use crate::components::app::chat_delegate::{
     decide_per_room_load_action, fire_legacy_migration_request, get_versioned_correlation_key,
     hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
     is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
-    prune_outbound_dms_for_purges, room_storage_key, save_outbound_dms_to_delegate,
-    save_rooms_to_delegate, send_delegate_request, send_delegate_request_to, set_rooms_load_state,
-    LegacyMigrationAction, RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY,
-    ROOMS_STORAGE_KEY,
+    mark_fetch_failure, mark_legacy_migration_done, mark_legacy_migration_in_progress,
+    parse_room_storage_key, per_room_terminal, prune_outbound_dms_for_purges, room_storage_key,
+    save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
+    send_delegate_request_to, set_rooms_load_state, LegacyMigrationAction, RoomsLoadState,
+    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -658,6 +658,14 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // passes every room still lands in ROOMS. (Load-vs-SAVE never
             // collides — those use distinct prefixed correlation keys.)
             info!("Loading {} per-room slot(s) from delegate", room_vks.len());
+            // freenet/river#397 Codex review 4: the index PROVED these rooms
+            // exist. Track whether any LISTED room failed to materialize (a
+            // transport / parse error — NOT a definitive `value: None`) so the
+            // authoritative PerRoom terminal can resolve to `LoadFailed` instead
+            // of a false "no rooms yet". Set the global `SAW_FETCH_FAILURE` too so
+            // the backstop (and concurrent legacy probes) see it.
+            let listed_count = room_vks.len();
+            let mut had_fetch_error = false;
             let mut slots: Vec<(ed25519_dalek::VerifyingKey, RoomSlot)> = Vec::new();
             for vk in room_vks {
                 match send_delegate_request(ChatDelegateRequestMsg::GetRequest {
@@ -669,14 +677,29 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                         value: Some(bytes), ..
                     }) => match from_reader::<RoomSlot, _>(&bytes[..]) {
                         Ok(slot) => slots.push((vk, slot)),
-                        Err(e) => error!("Unparseable room slot for {:?}: {}", vk, e),
+                        Err(e) => {
+                            // A listed room whose slot won't parse failed to
+                            // materialize — a fetch failure.
+                            error!("Unparseable room slot for {:?}: {}", vk, e);
+                            had_fetch_error = true;
+                            mark_fetch_failure();
+                        }
                     },
                     Ok(ChatDelegateResponseMsg::GetResponse { value: None, .. }) => {
-                        // Listed in the index but the value is gone — skip it.
+                        // Listed in the index but the value is gone — a DEFINITIVE
+                        // "no value", a legitimate skip, NOT a fetch failure.
                         warn!("Room key {:?} listed but value missing", vk);
                     }
-                    Ok(other) => error!("Unexpected response loading room {:?}: {:?}", vk, other),
-                    Err(e) => error!("Failed to load room {:?}: {}", vk, e),
+                    Ok(other) => {
+                        error!("Unexpected response loading room {:?}: {:?}", vk, other);
+                        had_fetch_error = true;
+                        mark_fetch_failure();
+                    }
+                    Err(e) => {
+                        error!("Failed to load room {:?}: {}", vk, e);
+                        had_fetch_error = true;
+                        mark_fetch_failure();
+                    }
                 }
             }
 
@@ -709,21 +732,26 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             };
 
             let loaded = reconstruct_rooms(slots, meta);
+            // Capture emptiness BEFORE `loaded` is moved into hydrate, for the
+            // authoritative terminal decision below.
+            let loaded_map_empty = loaded.map.is_empty();
             if hydrate_loaded_rooms(loaded, false) {
                 schedule_subscription_timeout_check();
             }
 
-            // freenet/river#397 (Codex review 3): the current delegate's per-room
+            // freenet/river#397 (Codex review 4): the current delegate's per-room
             // set is the authoritative initial load — a definitive fast-path
-            // completion, so resolve to `Loaded`. Rooms (if any) render as the
-            // list; a genuinely empty set renders the calm empty state. A rare
-            // all-fetch-fail (the current delegate is the local node's store, so
-            // this is unlikely) shows Empty; the universal 30s backstop is the
-            // termination guarantee for any non-definitive path, so we no longer
-            // hold `Loading` here (that couldn't guarantee termination). Set BEFORE
-            // the recovery re-run below so a recovery that finds stranded rooms and
-            // sets `Migrating` wins over this `Loaded`.
-            set_rooms_load_state(RoomsLoadState::Loaded);
+            // completion. Resolve via the pure `per_room_terminal`: rooms present →
+            // `Loaded` (List); empty with a known-rooms fetch failure → `LoadFailed`
+            // (never a false "no rooms yet"); a genuine empty (nothing listed, or
+            // every slot a clean `value: None`/tombstone) → `Loaded` (Empty). Set
+            // BEFORE the recovery re-run below so a recovery that finds stranded
+            // rooms and sets `Migrating` wins over this terminal.
+            set_rooms_load_state(per_room_terminal(
+                loaded_map_empty,
+                listed_count,
+                had_fetch_error,
+            ));
 
             // Recover from an interrupted migration by re-running it to pick up
             // any room whose per-room key wasn't written before the previous
@@ -872,7 +900,13 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 if !recovery {
                     set_rooms_load_state(RoomsLoadState::Migrating);
                 }
-                if hydrate_loaded_rooms(loaded, false) {
+                // Did the blob carry any LIVE rooms (vs. all tombstones/empty)?
+                // freenet/river#397 Codex review 4: only a completion that merged
+                // live rooms writes `Loaded` — a zero-live-room completion writes
+                // NOTHING so it can't stomp a concurrent legacy probe's `Migrating`
+                // into a false Empty; the universal backstop owns that terminal.
+                let had_rooms = hydrate_loaded_rooms(loaded, false);
+                if had_rooms {
                     schedule_subscription_timeout_check();
                 }
                 // Explode into per-room keys (non-destructive: blob stays).
@@ -887,20 +921,19 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                         Ok(_) => {
                             clear_legacy_migration_in_progress();
                             mark_legacy_migration_done();
-                            // freenet/river#397 (Codex review 3): the blob explosion
-                            // COMPLETED — a completion, so resolve to `Loaded` even
-                            // under recovery. Only a DOWNGRADE (the value-gone
-                            // Loading re-fire below) is `!recovery`-suppressed.
-                            set_rooms_load_state(RoomsLoadState::Loaded);
+                            // Resolve to `Loaded` only if we merged live rooms;
+                            // otherwise let the backstop own the terminal.
+                            if had_rooms {
+                                set_rooms_load_state(RoomsLoadState::Loaded);
+                            }
                         }
                         Err(e) => {
                             error!("Failed to explode single blob into per-room keys: {}", e);
-                            // freenet/river#397: a definitive failure is also a
-                            // completion — resolve to `Loaded` (even under recovery)
-                            // so a zero-live-room migration never strands on
-                            // "Migrating…". Leave the in-progress flag set so the
-                            // next load re-runs the fill.
-                            set_rooms_load_state(RoomsLoadState::Loaded);
+                            // Leave the in-progress flag set so the next load
+                            // re-runs the fill. Same had_rooms gate as the Ok arm.
+                            if had_rooms {
+                                set_rooms_load_state(RoomsLoadState::Loaded);
+                            }
                         }
                     }
                 });
@@ -959,15 +992,16 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
         LoadPlan::MigrateCurrentBlob | LoadPlan::ProbeLegacy => return,
     };
 
-    // freenet/river#397 Codex review 2 (P1): the legacy index is NON-EMPTY, so
+    // freenet/river#397 Codex review 2/4 (P1): the legacy index is NON-EMPTY, so
     // rooms provably exist under the old delegate key. Announce `Migrating`
     // BEFORE the sequential fetch loop below — otherwise the state stays
-    // `Loading` through the whole fetch window and the 20s backstop (armed by the
-    // ProbeLegacy arm) could flip it to `Loaded`→Empty despite that positive
-    // evidence. `Migrating` is not rescued by the backstop, so this closes the
-    // window. Every return path below concludes to a terminal (invariant 2): the
-    // all-fetches-empty early return resolves to `Loaded`, and the hydrate path's
-    // legacy re-save success/`Err` arms resolve to `Loaded`.
+    // `Loading` through the whole fetch window and the 30s backstop could flip it
+    // to a terminal despite that positive evidence. `Migrating` is not rescued
+    // early by the backstop. On an all-empty/all-failed result this writes NOTHING
+    // to the global state (a single legacy probe is not authoritative — concurrent
+    // probes may hold rooms); the universal backstop owns that terminal, and any
+    // failed legacy fetch below sets `SAW_FETCH_FAILURE` so the backstop resolves
+    // to `LoadFailed` rather than a false Empty.
     set_rooms_load_state(RoomsLoadState::Migrating);
 
     info!(
@@ -988,10 +1022,16 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
                 value: Some(bytes), ..
             }) => match from_reader::<RoomSlot, _>(&bytes[..]) {
                 Ok(slot) => slots.push((vk, slot)),
-                Err(e) => error!("Unparseable legacy room slot for {:?}: {}", vk, e),
+                Err(e) => {
+                    error!("Unparseable legacy room slot for {:?}: {}", vk, e);
+                    mark_fetch_failure();
+                }
             },
             Ok(_) => warn!("Legacy room key {:?} listed but value missing", vk),
-            Err(e) => error!("Failed to load legacy room {:?}: {}", vk, e),
+            Err(e) => {
+                error!("Failed to load legacy room {:?}: {}", vk, e);
+                mark_fetch_failure();
+            }
         }
     }
 
@@ -1500,24 +1540,28 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool) -> bool {
         // until the user rejoins (freenet/river#345 follow-up). The flag stays
         // set until a FULL re-save succeeds, so the next load knows to re-fill.
         mark_legacy_migration_in_progress();
-        crate::util::safe_spawn_local(async {
+        // freenet/river#397 Codex review 4: only resolve to `Loaded` when this
+        // legacy re-save actually merged live rooms. A zero-live-room / empty
+        // legacy result writes NOTHING to the global state — so a concurrent
+        // legacy probe that DID find rooms (and set `Migrating`) can't be stomped
+        // into a false Empty by this one. The universal backstop owns the
+        // all-nothing terminal (→ `LoadFailed` if a fetch failed, else Empty).
+        crate::util::safe_spawn_local(async move {
             match save_rooms_to_delegate().await {
                 Ok(_) => {
                     info!("Successfully migrated room data to new delegate");
                     clear_legacy_migration_in_progress();
                     mark_legacy_migration_done();
-                    // freenet/river#397: migration concluded — resolve the load.
-                    set_rooms_load_state(RoomsLoadState::Loaded);
+                    if had_loaded_rooms {
+                        set_rooms_load_state(RoomsLoadState::Loaded);
+                    }
                 }
                 Err(e) => {
                     error!("Failed to migrate room data to new delegate: {}", e);
-                    // freenet/river#397 (review): a zero-live-room migration (an
-                    // all-tombstone legacy delegate → empty `map`) leaves
-                    // room_count == 0, so a save error must STILL resolve the load
-                    // — otherwise the rail spins on "Migrating…" forever (the
-                    // backstop only rescues `Loading`, not `Migrating`). Leave the
-                    // in-progress flag set so the next load re-fills.
-                    set_rooms_load_state(RoomsLoadState::Loaded);
+                    // Leave the in-progress flag set so the next load re-fills.
+                    if had_loaded_rooms {
+                        set_rooms_load_state(RoomsLoadState::Loaded);
+                    }
                 }
             }
         });
@@ -1832,7 +1876,7 @@ mod tests {
         let resave_start = production
             .find("Migrating room data from legacy delegate to new delegate")
             .expect("legacy re-save block marker must exist");
-        let resave = &production[resave_start..(resave_start + 1200).min(production.len())];
+        let resave = &production[resave_start..(resave_start + 1800).min(production.len())];
         assert!(
             resave.contains("mark_legacy_migration_in_progress()"),
             "legacy re-save must mark migration in progress BEFORE saving"
@@ -1870,13 +1914,12 @@ mod tests {
         );
     }
 
-    /// freenet/river#397 review (MAJOR): both migration re-save `Err` arms MUST
-    /// resolve the load state to `Loaded`. A zero-live-room migration (e.g. an
-    /// all-tombstone legacy delegate — `reconstruct_rooms` routes `Tombstone` to
-    /// `removed_rooms`, leaving `map` empty) sets `Migrating` before the save with
-    /// room_count == 0; if the save then errors and the arm doesn't resolve, the
-    /// rail spins on "Migrating…" forever (the backstop only rescues `Loading`).
-    /// This pins the fix so a future edit that drops either resolve fails CI.
+    /// freenet/river#397 review: both migration re-save `Err` arms must resolve
+    /// the load to `Loaded` when the migration merged live rooms (`had_rooms`), so
+    /// a save error can't strand the rail on "Migrating…". A zero-live-room result
+    /// intentionally writes NOTHING (the universal backstop owns that terminal —
+    /// Codex review 4 concurrency fix), so the pinned write is `had_rooms`-gated,
+    /// not unconditional. This pins that neither arm silently drops the resolution.
     #[test]
     fn migration_save_error_resolves_load_state() {
         let src = include_str!("response_handler.rs");
@@ -1892,8 +1935,7 @@ mod tests {
         let blob_arm = &production[blob_err..(blob_err + 900).min(production.len())];
         assert!(
             blob_arm.contains("set_rooms_load_state(RoomsLoadState::Loaded)"),
-            "the blob-explosion save-error arm must resolve the load to Loaded, or a \
-             zero-live-room migration spins on Migrating forever (freenet/river#397 review)"
+            "the blob-explosion save-error arm must resolve the load to Loaded (had_rooms)"
         );
 
         // (b) legacy-delegate re-save error.
@@ -1903,8 +1945,7 @@ mod tests {
         let legacy_arm = &production[legacy_err..(legacy_err + 900).min(production.len())];
         assert!(
             legacy_arm.contains("set_rooms_load_state(RoomsLoadState::Loaded)"),
-            "the legacy re-save-error arm must resolve the load to Loaded, or a \
-             zero-live-room migration spins on Migrating forever (freenet/river#397 review)"
+            "the legacy re-save-error arm must resolve the load to Loaded (had_rooms)"
         );
     }
 
@@ -2038,6 +2079,115 @@ mod tests {
             1,
             "migrate_legacy_per_room must write the load state exactly once (Migrating); \
              the all-empty case must NOT write Loaded (Codex review 3 — not authoritative)"
+        );
+
+        // freenet/river#397 Codex review 4: a failed legacy slot fetch records the
+        // global SAW_FETCH_FAILURE (transport Err + unparseable-slot Err) so the
+        // backstop resolves to LoadFailed rather than a false Empty — but NOT a
+        // `value: None` skip.
+        assert_eq!(
+            body.matches("mark_fetch_failure()").count(),
+            2,
+            "the legacy transport-Err and unparseable-slot arms must mark_fetch_failure"
+        );
+        let value_none_pos = body
+            .find("listed but value missing")
+            .expect("legacy value: None arm must exist");
+        let after_none = &body[value_none_pos..(value_none_pos + 120).min(body.len())];
+        assert!(
+            !after_none.contains("mark_fetch_failure()"),
+            "a legacy `value: None` is a legitimate skip, not a fetch failure"
+        );
+    }
+
+    /// freenet/river#397 Codex review 4: the authoritative current-delegate
+    /// PerRoom load must (a) route its terminal through the pure `per_room_terminal`
+    /// fed (map_empty, listed_count, had_fetch_error), and (b) record fetch
+    /// failures both locally (had_fetch_error) and globally (mark_fetch_failure) in
+    /// the three failure arms — but NOT for a definitive `value: None`.
+    #[test]
+    fn per_room_load_uses_terminal_and_marks_fetch_failure() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        // (a) the PerRoom terminal is the pure decision fed all three inputs.
+        assert!(
+            production.contains("set_rooms_load_state(per_room_terminal(")
+                && production.contains("loaded_map_empty")
+                && production.contains("listed_count")
+                && production.contains("had_fetch_error"),
+            "the PerRoom terminal must be per_room_terminal(loaded_map_empty, listed_count, had_fetch_error)"
+        );
+
+        // (b) the per-room fetch loop's three failure arms mark both signals; the
+        // value: None arm marks neither. Bound to the loop (marker → `let meta`).
+        let loop_start = production
+            .find("Loading {} per-room slot(s) from delegate")
+            .expect("per-room fetch loop marker must exist");
+        let loop_end = production[loop_start..]
+            .find("let meta = if has_meta")
+            .map(|i| loop_start + i)
+            .expect("the per-room loop must be followed by the meta load");
+        let loop_region = &production[loop_start..loop_end];
+        assert_eq!(
+            loop_region.matches("had_fetch_error = true;").count(),
+            3,
+            "the transport-Err, unexpected-response, and unparseable-slot arms must set had_fetch_error"
+        );
+        assert_eq!(
+            loop_region.matches("mark_fetch_failure()").count(),
+            3,
+            "the same three arms must set the global SAW_FETCH_FAILURE"
+        );
+        let value_none_pos = loop_region
+            .find("listed but value missing")
+            .expect("the value: None arm must exist");
+        let after_none =
+            &loop_region[value_none_pos..(value_none_pos + 140).min(loop_region.len())];
+        assert!(
+            !after_none.contains("had_fetch_error = true;")
+                && !after_none.contains("mark_fetch_failure()"),
+            "a definitive `value: None` is a legitimate skip, not a fetch failure"
+        );
+    }
+
+    /// freenet/river#397 Codex review 4 (concurrency P2): the legacy re-save
+    /// completion (in `hydrate_loaded_rooms`) must resolve `Loaded` only when it
+    /// merged live rooms (`had_loaded_rooms`) — an empty legacy completion writes
+    /// NOTHING so it can't stomp a concurrent probe's `Migrating` into a false
+    /// Empty; the backstop owns the all-nothing terminal.
+    #[test]
+    fn legacy_resave_completion_gated_on_had_rooms() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        // Slice the legacy re-save closure (marker → the `had_loaded_rooms` return
+        // that closes hydrate).
+        let start = production
+            .find("Migrating room data from legacy delegate to new delegate")
+            .expect("legacy re-save marker must exist");
+        let end = production[start..]
+            .find("had_loaded_rooms\n}")
+            .map(|i| start + i)
+            .unwrap_or(production.len());
+        let block = &production[start..end];
+        // Both the Ok and Err arms resolve Loaded, each gated on `if had_loaded_rooms`.
+        assert_eq!(
+            block.matches("if had_loaded_rooms {").count(),
+            2,
+            "both legacy re-save arms must gate the Loaded write on had_loaded_rooms"
+        );
+        assert_eq!(
+            block
+                .matches("set_rooms_load_state(RoomsLoadState::Loaded)")
+                .count(),
+            2,
+            "both legacy re-save arms resolve to Loaded when live rooms merged"
         );
     }
 

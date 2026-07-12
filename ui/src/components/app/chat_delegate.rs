@@ -546,18 +546,23 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             // skipped (current is authoritative); if it is empty, migration is
             // fired then. This prevents legacy responses from racing with the
             // current delegate and clobbering newer state (freenet/river#253).
+            // Fresh load attempt: clear the fetch-failure signal so a stale
+            // failure from a prior attempt can't mislabel this load as
+            // `LoadFailed` (freenet/river#397 Codex review 4).
+            SAW_FETCH_FAILURE.store(false, Ordering::Relaxed);
+
             fire_list_rooms_request().await;
             fire_load_outbound_dms_request().await;
 
             // Arm the UNIVERSAL room-list load backstop once per session
-            // (freenet/river#397 Codex review 3). This is the single mechanism
+            // (freenet/river#397 Codex review 3/4). This is the single mechanism
             // that GUARANTEES the rail never spins forever: at 30s it resolves ANY
-            // non-terminal state (`Loading` OR `Migrating`) to `Loaded`. It is
-            // generous enough (30s) never to pre-empt a load/migration that is
-            // actually progressing, and because a non-empty `ROOMS` renders `List`
-            // regardless of load state, it only ever shows Empty when genuinely
-            // nothing loaded. Fast definitive completions still resolve earlier;
-            // this is the safety net under all of them.
+            // non-terminal state (`Loading` OR `Migrating`) to a terminal —
+            // `LoadFailed` if a known-rooms fetch failed, else `Loaded`. Generous
+            // enough (30s) never to pre-empt a load/migration that is actually
+            // progressing; a non-empty `ROOMS` renders `List` regardless of load
+            // state. Fast definitive completions still resolve earlier; this is
+            // the safety net under all of them.
             schedule_rooms_load_backstop();
 
             Ok(())
@@ -1248,66 +1253,129 @@ mod tests {
         );
     }
 
-    /// freenet/river#397 Codex review 3: the UNIVERSAL backstop resolves EVERY
-    /// non-terminal state to `Loaded` — both `Loading` AND `Migrating` — so the
-    /// rail can never spin forever (a delegate request can time out without the WS
-    /// disconnecting, so "wait for reconnect" cannot guarantee termination). Only
-    /// `Loaded` stays `Loaded`.
+    /// freenet/river#397 Codex review 3/4: the UNIVERSAL backstop resolves EVERY
+    /// non-terminal state (`Loading` AND `Migrating`) — to `LoadFailed` if a
+    /// known-rooms fetch failed, else `Loaded` — so the rail can never spin
+    /// forever (a delegate request can time out without the WS disconnecting, so
+    /// "wait for reconnect" cannot guarantee termination). Already-terminal states
+    /// (`Loaded`/`LoadFailed`) pass through unchanged.
     #[test]
     fn backstop_resolves_every_non_terminal_state() {
+        // No fetch failure → non-terminal resolves to Loaded (→ Empty when no rooms).
         assert_eq!(
-            backstop_resolve(RoomsLoadState::Loading),
+            backstop_resolve(RoomsLoadState::Loading, false),
             RoomsLoadState::Loaded,
-            "Loading must resolve — a new user with no legacy data never spins forever"
+            "Loading with no fetch failure resolves to Loaded (Empty)"
         );
         assert_eq!(
-            backstop_resolve(RoomsLoadState::Migrating),
+            backstop_resolve(RoomsLoadState::Migrating, false),
             RoomsLoadState::Loaded,
-            "Migrating must ALSO resolve — a stalled migration must not spin forever"
+            "Migrating with no fetch failure resolves to Loaded"
+        );
+        // A known-rooms fetch failure → non-terminal resolves to LoadFailed.
+        assert_eq!(
+            backstop_resolve(RoomsLoadState::Loading, true),
+            RoomsLoadState::LoadFailed,
+            "Loading with a fetch failure resolves to LoadFailed, not a false Empty"
         );
         assert_eq!(
-            backstop_resolve(RoomsLoadState::Loaded),
+            backstop_resolve(RoomsLoadState::Migrating, true),
+            RoomsLoadState::LoadFailed,
+            "Migrating with a fetch failure resolves to LoadFailed"
+        );
+        // Already-terminal states pass through, regardless of the flag.
+        assert_eq!(
+            backstop_resolve(RoomsLoadState::Loaded, true),
             RoomsLoadState::Loaded,
-            "Loaded stays Loaded (idempotent)"
+            "Loaded is terminal and passes through"
+        );
+        assert_eq!(
+            backstop_resolve(RoomsLoadState::LoadFailed, false),
+            RoomsLoadState::LoadFailed,
+            "LoadFailed is terminal and passes through"
         );
     }
 
     /// freenet/river#397: no state strands — every non-terminal input to the
-    /// backstop is a terminal `Loaded` output, so termination is guaranteed for
-    /// ANY load/migration path that fails to resolve itself.
+    /// backstop is a terminal output (`Loaded` or `LoadFailed`), so termination is
+    /// guaranteed for ANY load/migration path that fails to resolve itself.
     #[test]
     fn backstop_guarantees_termination_from_any_state() {
         for state in [
             RoomsLoadState::Loading,
             RoomsLoadState::Migrating,
             RoomsLoadState::Loaded,
+            RoomsLoadState::LoadFailed,
         ] {
-            assert_eq!(
-                backstop_resolve(state),
-                RoomsLoadState::Loaded,
-                "{state:?} must terminate at Loaded"
-            );
+            for saw in [false, true] {
+                let out = backstop_resolve(state, saw);
+                assert!(
+                    matches!(out, RoomsLoadState::Loaded | RoomsLoadState::LoadFailed),
+                    "{state:?} (saw_fetch_failure={saw}) must terminate at a terminal state, got {out:?}"
+                );
+            }
         }
     }
 
-    /// freenet/river#397 end-to-end invariant, composed from the pure pieces: a
-    /// brand-new user fires legacy probes (→ `Loading`), nothing responds, and
-    /// the universal backstop resolves them to `Loaded` (→ the empty state). They
-    /// are NEVER stuck loading forever.
+    /// freenet/river#397 Codex review 4: the pure `backstop_terminal` picks the
+    /// terminal — `LoadFailed` if a known-rooms fetch failed, else `Loaded`.
     #[test]
-    fn new_user_resolves_to_loaded_never_stuck() {
-        let after_probe = load_state_after_probe_legacy(true);
-        assert_eq!(after_probe, RoomsLoadState::Loading);
-        assert_eq!(backstop_resolve(after_probe), RoomsLoadState::Loaded);
+    fn backstop_terminal_picks_loadfailed_only_on_fetch_failure() {
+        assert_eq!(backstop_terminal(false), RoomsLoadState::Loaded);
+        assert_eq!(backstop_terminal(true), RoomsLoadState::LoadFailed);
     }
 
-    /// freenet/river#397 Codex review 3: the universal backstop is armed once per
-    /// session at the START of load, in `set_up_chat_delegate` (reverting the
-    /// round-3 "arm only on probe-fired" design). It must NOT be conditionally
-    /// armed elsewhere — a single unconditional arming is what makes termination
-    /// universal.
+    /// freenet/river#397 Codex review 4: the authoritative current-delegate
+    /// per-room terminal. Rooms present → `Loaded` (List); empty + listed + a
+    /// fetch error → `LoadFailed` (never a false Empty); a genuine empty (nothing
+    /// listed, or every listed slot a clean skip) → `Loaded` (Empty).
     #[test]
-    fn set_up_chat_delegate_arms_backstop() {
+    fn per_room_terminal_distinguishes_failure_from_empty() {
+        // Rooms present → Loaded, regardless of listed/error.
+        assert_eq!(
+            per_room_terminal(false, 3, true),
+            RoomsLoadState::Loaded,
+            "a non-empty map always resolves to Loaded (List)"
+        );
+        assert_eq!(per_room_terminal(false, 0, false), RoomsLoadState::Loaded);
+
+        // Empty + listed + fetch error → LoadFailed.
+        assert_eq!(
+            per_room_terminal(true, 3, true),
+            RoomsLoadState::LoadFailed,
+            "empty with a known-rooms fetch failure must be LoadFailed, not Empty"
+        );
+
+        // Empty + listed + NO fetch error → genuine empty (Loaded → Empty).
+        assert_eq!(
+            per_room_terminal(true, 3, false),
+            RoomsLoadState::Loaded,
+            "empty with all slots cleanly skipped is a genuine empty"
+        );
+        // Empty + nothing listed → genuine empty (new-user).
+        assert_eq!(per_room_terminal(true, 0, false), RoomsLoadState::Loaded);
+        assert_eq!(per_room_terminal(true, 0, true), RoomsLoadState::Loaded);
+    }
+
+    /// freenet/river#397: a brand-new user fires legacy probes (→ `Loading`),
+    /// nothing responds and NO known-rooms fetch failed, so the universal backstop
+    /// resolves them to `Loaded` (→ Empty) — NEVER stuck, and NEVER LoadFailed.
+    #[test]
+    fn new_user_resolves_to_empty_never_stuck_never_failed() {
+        let after_probe = load_state_after_probe_legacy(true);
+        assert_eq!(after_probe, RoomsLoadState::Loading);
+        assert_eq!(
+            backstop_resolve(after_probe, false),
+            RoomsLoadState::Loaded,
+            "no fetch failure → Empty, not LoadFailed"
+        );
+    }
+
+    /// freenet/river#397 Codex review 3/4: the universal backstop is armed once
+    /// per session at the START of load in `set_up_chat_delegate`, which also
+    /// resets `SAW_FETCH_FAILURE`. It must NOT be armed in the response handler.
+    #[test]
+    fn set_up_chat_delegate_arms_backstop_and_resets_fetch_failure() {
         let self_src = include_str!("chat_delegate.rs");
         let self_production = self_src
             .split("mod tests {")
@@ -1326,9 +1394,12 @@ mod tests {
             setup_body.contains("schedule_rooms_load_backstop();"),
             "set_up_chat_delegate must arm the universal load backstop once per session"
         );
+        assert!(
+            setup_body.contains("SAW_FETCH_FAILURE.store(false"),
+            "set_up_chat_delegate must reset SAW_FETCH_FAILURE at the start of a load"
+        );
 
-        // And the response handler must NOT arm it (the round-3 probe-fired arming
-        // is reverted — the universal start-of-load arming replaces it).
+        // And the response handler must NOT arm the backstop.
         let rh_src = include_str!("freenet_api/response_handler.rs");
         let rh_production = rh_src
             .split("mod tests {")
@@ -1337,7 +1408,48 @@ mod tests {
         assert!(
             !rh_production.contains("schedule_rooms_load_backstop"),
             "the response handler must NOT arm the backstop — it is armed once at \
-             start of load in set_up_chat_delegate (Codex review 3)"
+             start of load in set_up_chat_delegate"
+        );
+    }
+
+    /// freenet/river#397 Codex review 4: the Retry button's `retry_rooms_load`
+    /// must (a) reset `SAW_FETCH_FAILURE`, (b) return the rail to `Loading`,
+    /// (c) re-arm the once-per-session backstop guard, and (d) re-fire the
+    /// current-delegate list request. Pinned by source-scrape (the fn drives the
+    /// Dioxus signal + websocket, so it can't be unit-driven).
+    #[test]
+    fn retry_rooms_load_resets_and_refires() {
+        // `retry_rooms_load` is defined AFTER this (mid-file) test module, so
+        // `split("mod tests")` would miss it. `rfind` finds the real definition
+        // (the last occurrence; this test's own literal above is earlier).
+        let src = include_str!("chat_delegate.rs");
+        let fn_start = src
+            .rfind("pub(crate) fn retry_rooms_load()")
+            .expect("retry_rooms_load must exist");
+        let rest = &src[fn_start + 1..];
+        let fn_end = rest
+            .find("\nstatic ")
+            .or_else(|| rest.find("\npub"))
+            .or_else(|| rest.find("\nfn "))
+            .map(|i| fn_start + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("SAW_FETCH_FAILURE.store(false"),
+            "retry must reset the fetch-failure signal"
+        );
+        assert!(
+            body.contains("set_rooms_load_state(RoomsLoadState::Loading)"),
+            "retry must return the rail to Loading"
+        );
+        assert!(
+            body.contains("LOAD_BACKSTOP_SCHEDULED.store(false")
+                && body.contains("schedule_rooms_load_backstop()"),
+            "retry must re-arm the once-per-session backstop"
+        );
+        assert!(
+            body.contains("fire_list_rooms_request().await"),
+            "retry must re-fire the current-delegate load"
         );
     }
 
@@ -4078,6 +4190,12 @@ pub enum RoomsLoadState {
     /// completion point or the timeout backstop — never speculatively, so an
     /// existing user mid-migration can't flash "no rooms yet".
     Loaded,
+    /// A load that we know involved rooms FAILED or stalled — a LISTED
+    /// `room:<vk>` key's fetch didn't materialize (transport/parse error), or the
+    /// backstop fired while a known-rooms fetch had failed. Renders a distinct
+    /// error + Retry block rather than a false "no rooms yet" (freenet/river#397
+    /// Codex review 4). Distinguished from a genuine empty by `SAW_FETCH_FAILURE`.
+    LoadFailed,
 }
 
 /// Reactive room-list load state. Starts `Loading`; advanced to `Loaded` at the
@@ -4123,26 +4241,73 @@ pub(crate) fn load_state_after_probe_legacy(fired_legacy_probes: bool) -> RoomsL
     }
 }
 
-/// The UNIVERSAL backstop transition (freenet/river#397 Codex review 3). At the
-/// 30s deadline, ANY non-terminal state resolves to `Loaded` — BOTH `Loading`
-/// AND `Migrating`. This is what GUARANTEES termination: the rounds-3/4 attempt
-/// to "stay `Loading`/`Migrating` and rely on a WS reconnect to retry" could
-/// spin forever, because a delegate request can time out (~10s) WITHOUT
-/// disconnecting the WebSocket, so no reconnect ever comes; and concurrent
-/// legacy probes race on this one global signal. A single backstop that resolves
-/// every non-terminal state removes both failure modes.
+/// Set `true` whenever a LISTED `room:<vk>` key's GET fails to materialize (a
+/// transport `Err`, an unexpected `Ok(other)`, or an unparseable slot) in EITHER
+/// the current-delegate per-room load OR a legacy per-room probe. It is NOT set
+/// for a definitive `value: None` (a legitimate skip) or a `Tombstone` (a genuine
+/// "left room"). This is the signal that distinguishes a genuinely-empty load
+/// (new user → Empty) from a failed load of a user who HAS rooms (→ LoadFailed).
+/// Reset at the start of a load (`set_up_chat_delegate`) and on Retry
+/// (`retry_rooms_load`). freenet/river#397 Codex review 4.
+pub(crate) static SAW_FETCH_FAILURE: AtomicBool = AtomicBool::new(false);
+
+/// Record that a listed room's fetch failed to materialize.
+pub(crate) fn mark_fetch_failure() {
+    SAW_FETCH_FAILURE.store(true, Ordering::Relaxed);
+}
+
+/// The terminal state a completed-but-empty load / the backstop resolves to,
+/// given whether any known-rooms fetch failed. Pure so both branches are
+/// unit-testable. `saw_fetch_failure` → `LoadFailed` (we KNOW rooms exist but
+/// couldn't load them); otherwise `Loaded` (genuinely empty → the calm "no rooms
+/// yet"). freenet/river#397 Codex review 4.
+pub(crate) fn backstop_terminal(saw_fetch_failure: bool) -> RoomsLoadState {
+    if saw_fetch_failure {
+        RoomsLoadState::LoadFailed
+    } else {
+        RoomsLoadState::Loaded
+    }
+}
+
+/// The current-delegate per-room load terminal (authoritative, awaited — resolves
+/// FAST, no waiting on the backstop). Pure decision:
+/// - `map` non-empty → `Loaded` (rooms present → the list renders them);
+/// - `map` empty AND rooms were listed AND a listed fetch failed → `LoadFailed`
+///   (we KNOW rooms exist but couldn't load them — never "no rooms yet");
+/// - `map` empty otherwise (nothing listed, or every listed slot was a clean
+///   `value: None`/`Tombstone`) → `Loaded` (a genuine empty).
 ///
-/// This can only ever *show* Empty when `room_count == 0` at the deadline — a
-/// non-empty `ROOMS` renders `List` regardless of the load state — i.e. only
-/// when genuinely nothing loaded, which is the correct, no-worse-than-baseline
-/// outcome (a proper error/retry state is a separate follow-up). The `Loaded`
-/// arm returns `current` (already `Loaded`) so the two arms differ textually
-/// (avoids `clippy::match_same_arms`) while being behaviourally identical.
-pub(crate) fn backstop_resolve(current: RoomsLoadState) -> RoomsLoadState {
+/// freenet/river#397 Codex review 4.
+pub(crate) fn per_room_terminal(
+    map_empty: bool,
+    listed_count: usize,
+    had_fetch_error: bool,
+) -> RoomsLoadState {
+    if !map_empty {
+        RoomsLoadState::Loaded
+    } else if listed_count > 0 && had_fetch_error {
+        RoomsLoadState::LoadFailed
+    } else {
+        RoomsLoadState::Loaded
+    }
+}
+
+/// The UNIVERSAL backstop transition (freenet/river#397 Codex review 3/4). At the
+/// 30s deadline, ANY non-terminal state (`Loading`/`Migrating`) resolves — to
+/// `LoadFailed` if a known-rooms fetch failed, else `Loaded`. This GUARANTEES
+/// termination: the earlier "stay `Loading`/`Migrating` and rely on a WS
+/// reconnect to retry" could spin forever, because a delegate request can time
+/// out (~10s) WITHOUT disconnecting the WebSocket, so no reconnect ever comes;
+/// and concurrent legacy probes race on this one global signal. Because a genuine
+/// empty resolves FAST to `Loaded` at a definitive completion
+/// (ProbeLegacy-found-nothing / all-tombstone), staying non-terminal until 30s
+/// means a stall/failure — so `SAW_FETCH_FAILURE` decides Empty vs. error. Already
+/// terminal states (`Loaded`/`LoadFailed`) are returned unchanged.
+pub(crate) fn backstop_resolve(current: RoomsLoadState, saw_fetch_failure: bool) -> RoomsLoadState {
     match current {
-        RoomsLoadState::Loaded => current,
-        // Loading AND Migrating are both non-terminal — resolve them.
-        RoomsLoadState::Loading | RoomsLoadState::Migrating => RoomsLoadState::Loaded,
+        RoomsLoadState::Loading | RoomsLoadState::Migrating => backstop_terminal(saw_fetch_failure),
+        // Loaded / LoadFailed are already terminal.
+        other => other,
     }
 }
 
@@ -4170,11 +4335,33 @@ pub(crate) fn schedule_rooms_load_backstop() {
     crate::util::safe_spawn_local(async {
         crate::util::sleep(std::time::Duration::from_millis(ROOMS_LOAD_BACKSTOP_MS)).await;
         crate::util::defer(|| {
-            let resolved = backstop_resolve(*ROOMS_LOAD_STATE.peek());
+            let saw_failure = SAW_FETCH_FAILURE.load(Ordering::Relaxed);
+            let resolved = backstop_resolve(*ROOMS_LOAD_STATE.peek(), saw_failure);
             if *ROOMS_LOAD_STATE.peek() != resolved {
                 *ROOMS_LOAD_STATE.write() = resolved;
             }
         });
+    });
+}
+
+/// Retry a failed room-list load (freenet/river#397 Codex review 4). Wired to the
+/// `LoadFailed` block's Retry button. Signal-safe: `set_rooms_load_state` and
+/// `safe_spawn_local` both defer, and the atomics are lock-free, so this is safe
+/// to call directly from an `onclick` handler.
+///
+/// Resets the fetch-failure signal, returns the rail to `Loading`, re-arms the
+/// once-per-session backstop (so a fresh 30s deadline applies), and re-fires the
+/// current-delegate load. If the delegate genuinely has no rooms this time, the
+/// fast ProbeLegacy/PerRoom terminal resolves to `Loaded` (→ Empty); if it
+/// succeeds it renders the list; if it fails again it returns to `LoadFailed`.
+pub(crate) fn retry_rooms_load() {
+    SAW_FETCH_FAILURE.store(false, Ordering::Relaxed);
+    set_rooms_load_state(RoomsLoadState::Loading);
+    // Re-arm the once-per-session backstop guard so a fresh deadline is scheduled.
+    LOAD_BACKSTOP_SCHEDULED.store(false, Ordering::Relaxed);
+    schedule_rooms_load_backstop();
+    crate::util::safe_spawn_local(async {
+        fire_list_rooms_request().await;
     });
 }
 

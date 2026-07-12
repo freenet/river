@@ -6,7 +6,7 @@ pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
 use crate::components::app::chat_delegate::{
-    save_rooms_to_delegate, RoomsLoadState, ROOMS_LOAD_STATE,
+    retry_rooms_load, save_rooms_to_delegate, RoomsLoadState, ROOMS_LOAD_STATE,
 };
 use crate::components::app::document_title::{
     count_unread_in_room_data, mark_current_room_as_read,
@@ -55,6 +55,9 @@ pub(crate) enum RoomListDisplay {
     Migrating,
     /// Load resolved and the user genuinely has no rooms — calm empty state.
     Empty,
+    /// A load we KNOW involved rooms failed/stalled — error + Retry block, never
+    /// a false "no rooms yet" (freenet/river#397 Codex review 4).
+    LoadFailed,
     /// There is at least one room to render — show the list unchanged.
     List,
 }
@@ -64,10 +67,10 @@ pub(crate) enum RoomListDisplay {
 ///
 /// A non-empty room list ALWAYS renders the list — once there's something to
 /// show, load/migration bookkeeping is irrelevant. Only when `room_count == 0`
-/// do we disambiguate the three non-room states, and `Migrating` outranks
-/// `Loading` (it's the more specific, more reassuring message). `Empty` is
-/// reached ONLY from `Loaded`, so an unresolved or migrating load never shows
-/// "no rooms yet".
+/// do we disambiguate the non-room states: `Loading`/`Migrating` spinners, the
+/// `LoadFailed` error+retry block, and the calm `Empty`. `Empty` is reached ONLY
+/// from `Loaded`, so an unresolved / migrating / failed load never shows "no
+/// rooms yet".
 pub(crate) fn room_list_display_state(
     load_state: RoomsLoadState,
     room_count: usize,
@@ -79,6 +82,7 @@ pub(crate) fn room_list_display_state(
             RoomsLoadState::Loading => RoomListDisplay::Loading,
             RoomsLoadState::Migrating => RoomListDisplay::Migrating,
             RoomsLoadState::Loaded => RoomListDisplay::Empty,
+            RoomsLoadState::LoadFailed => RoomListDisplay::LoadFailed,
         }
     }
 }
@@ -355,6 +359,25 @@ pub fn RoomList() -> Element {
                             class: "flex flex-col items-center justify-center gap-1 py-10 px-4 text-center",
                             span { class: "text-sm text-text-muted", "No rooms yet" }
                             span { class: "text-xs text-text-muted opacity-70", "Create a room or join one with an invite code." }
+                        }
+                    },
+                    RoomListDisplay::LoadFailed => rsx! {
+                        li {
+                            key: "{ROOM_LIST_STATE_KEY}",
+                            "data-testid": "room-list-error",
+                            class: "flex flex-col items-center justify-center gap-3 py-10 px-4 text-center",
+                            span { class: "text-sm text-text-muted", "Couldn't load your rooms" }
+                            span { class: "text-xs text-text-muted opacity-70", "Check your connection and try again." }
+                            button {
+                                "data-testid": "room-list-retry-button",
+                                class: "flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
+                                // Retry re-fires the current-delegate load. Safe to
+                                // call directly — `retry_rooms_load` defers its
+                                // signal write and spawns via setTimeout(0) (Dioxus
+                                // signal-safety rules).
+                                onclick: move |_| retry_rooms_load(),
+                                span { "Retry" }
+                            }
                         }
                     },
                     RoomListDisplay::List => rsx! {},
@@ -719,15 +742,27 @@ mod tests {
         );
     }
 
+    /// freenet/river#397 Codex review 4: a failed load with no rooms → the
+    /// LoadFailed error+retry block, NOT a false "no rooms yet".
+    #[test]
+    fn load_failed_with_no_rooms_shows_error() {
+        assert_eq!(
+            room_list_display_state(RoomsLoadState::LoadFailed, 0),
+            RoomListDisplay::LoadFailed
+        );
+    }
+
     /// freenet/river#397: any rooms present → render the list, regardless of the
-    /// load state (mid-migration, still-loading, or resolved). Once there's
-    /// something to show, load bookkeeping is irrelevant.
+    /// load state (mid-migration, still-loading, resolved, OR failed). Once
+    /// there's something to show, load bookkeeping is irrelevant — a partial load
+    /// that fetched SOME rooms shows them rather than the error block.
     #[test]
     fn any_rooms_shows_list_regardless_of_load_state() {
         for state in [
             RoomsLoadState::Loading,
             RoomsLoadState::Migrating,
             RoomsLoadState::Loaded,
+            RoomsLoadState::LoadFailed,
         ] {
             assert_eq!(
                 room_list_display_state(state, 1),
