@@ -758,7 +758,13 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                         None
                     }
                     Err(e) => {
+                        // freenet/river#397 Codex review 9 (send-side audit): a
+                        // rooms_meta send returning Err is a transport failure
+                        // (connection down — the per-room slot GETs on the same
+                        // connection would fail too). Mark it so the load resolves
+                        // to LoadFailed rather than a silent Empty.
                         error!("Failed to load rooms_meta: {}", e);
+                        worker.mark_fetch_failure();
                         None
                     }
                 }
@@ -1106,7 +1112,15 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
             Ok(ChatDelegateResponseMsg::GetResponse {
                 value: Some(bytes), ..
             }) => from_reader::<RoomsMeta, _>(&bytes[..]).ok(),
-            _ => None,
+            // A transport Err on the legacy meta send is a connection failure
+            // (the slot GETs on the same connection fail too) — mark it (review 9
+            // send-side audit); a definitive Ok(None) is a legitimate skip.
+            Err(e) => {
+                error!("Failed to load legacy rooms_meta: {}", e);
+                worker.mark_fetch_failure();
+                None
+            }
+            Ok(_) => None,
         }
     } else {
         None
@@ -2095,6 +2109,39 @@ mod tests {
         }
     }
 
+    /// freenet/river#397 Codex review 9 (send-side audit): a `rooms_meta` GET whose
+    /// SEND returns Err is a transport failure (the same connection the per-room
+    /// slot GETs use), so it routes to `worker.mark_fetch_failure()` — both the
+    /// current-delegate and legacy meta arms — rather than a silent skip.
+    #[test]
+    fn meta_get_transport_failure_marks_fetch_failure() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        // Current-delegate meta arm.
+        let cur = production
+            .find("Failed to load rooms_meta")
+            .expect("current rooms_meta error marker must exist");
+        let cur_arm = &production[cur..(cur + 400).min(production.len())];
+        assert!(
+            cur_arm.contains("worker.mark_fetch_failure()"),
+            "a current rooms_meta send-Err must mark_fetch_failure (transport failure)"
+        );
+
+        // Legacy meta arm.
+        let leg = production
+            .find("Failed to load legacy rooms_meta")
+            .expect("legacy rooms_meta error marker must exist");
+        let leg_arm = &production[leg..(leg + 400).min(production.len())];
+        assert!(
+            leg_arm.contains("worker.mark_fetch_failure()"),
+            "a legacy rooms_meta send-Err must mark_fetch_failure (transport failure)"
+        );
+    }
+
     /// freenet/river#397 Codex review 3: in `migrate_current_blob_to_per_room`,
     /// suppress-under-recovery applies ONLY to a DOWNGRADE (the value-gone
     /// `load_state_after_probe_legacy` write, which could push a resolved `Loaded`
@@ -2228,14 +2275,15 @@ mod tests {
              the all-empty case must NOT write Loaded (Codex review 3 — not authoritative)"
         );
 
-        // freenet/river#397 Codex review 4: a failed legacy slot fetch records the
-        // global SAW_FETCH_FAILURE (transport Err + unparseable-slot Err) so the
-        // backstop resolves to LoadFailed rather than a false Empty — but NOT a
+        // freenet/river#397 Codex review 4/9: a failed legacy fetch records the
+        // global SAW_FETCH_FAILURE — the slot transport-Err, the unparseable-slot
+        // Err, AND the meta-GET transport Err (review 9 send-side audit) — so the
+        // backstop resolves to LoadFailed rather than a false Empty; NOT a
         // `value: None` skip.
         assert_eq!(
             body.matches("mark_fetch_failure()").count(),
-            2,
-            "the legacy transport-Err and unparseable-slot arms must mark_fetch_failure"
+            3,
+            "the legacy slot transport-Err, unparseable-slot Err, and meta-GET Err arms must mark_fetch_failure"
         );
         let value_none_pos = body
             .find("listed but value missing")

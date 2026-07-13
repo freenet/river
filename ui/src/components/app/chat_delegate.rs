@@ -1616,8 +1616,11 @@ mod tests {
         );
     }
 
-    /// freenet/river#397 Codex review 8: a retry is `begin_load_attempt()` PLUS
-    /// re-enabling the legacy probe (retry-only) PLUS re-firing the list request.
+    /// freenet/river#397 Codex review 9 (P2): a retry re-runs the FULL setup
+    /// (`set_up_chat_delegate` → re-register + load) so a RegisterDelegate failure
+    /// can be repaired, PLUS re-enables the legacy probe (retry-only). It must NOT
+    /// call `begin_load_attempt()` directly (set_up owns it — avoid a double bump)
+    /// nor a bare `fire_list_rooms_request()` (which can't re-register).
     #[test]
     fn retry_rooms_load_resets_and_refires() {
         let src = include_str!("chat_delegate.rs");
@@ -1633,16 +1636,20 @@ mod tests {
             .unwrap_or(src.len());
         let body = &src[fn_start..fn_end];
         assert!(
-            body.contains("begin_load_attempt();"),
-            "retry must begin a fresh load attempt (shared entry point)"
-        );
-        assert!(
             body.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"),
             "retry must re-enable the legacy probe so a failed legacy source is retried (P1b)"
         );
         assert!(
-            body.contains("fire_list_rooms_request().await"),
-            "retry must re-fire the current-delegate load"
+            body.contains("set_up_chat_delegate().await"),
+            "retry must re-run full setup (re-register) via set_up_chat_delegate, not a bare list request"
+        );
+        assert!(
+            !body.contains("begin_load_attempt()"),
+            "retry must NOT call begin_load_attempt directly — set_up_chat_delegate owns the fresh attempt (avoid double bump)"
+        );
+        assert!(
+            !body.contains("fire_list_rooms_request()"),
+            "retry must NOT bypass registration with a bare fire_list_rooms_request"
         );
     }
 
@@ -1707,6 +1714,43 @@ mod tests {
             body.matches("resolve_load_failed_if_empty()").count(),
             2,
             "both error arms must directly resolve LoadFailed (out-of-worker, P2#2)"
+        );
+    }
+
+    /// freenet/river#397 Codex review 9 (P1): a legacy probe SEND that returns Err
+    /// is a transport failure — it marks fetch failure; and if NO probe dispatched
+    /// (all sends failed / connection down) the once-per-session
+    /// `LEGACY_MIGRATION_ATTEMPTED` guard is reset so a reconnect re-probes (the
+    /// probe never left). A send that SUCCEEDS sets `any_dispatched` and does NOT
+    /// mark (the genuine new-user / delegate-not-present case).
+    #[test]
+    fn legacy_probe_transport_failure_marks_and_resets_guard() {
+        // `fire_legacy_migration_request` is the last fn in the file, defined
+        // AFTER this mid-file test module → rfind the real definition.
+        let src = include_str!("chat_delegate.rs");
+        let fn_start = src
+            .rfind("pub(crate) async fn fire_legacy_migration_request()")
+            .expect("fire_legacy_migration_request must exist");
+        let body = &src[fn_start..];
+
+        // Transport-Err arms mark (both the GetRequest and ListRequest sends).
+        assert!(
+            body.matches("mark_fetch_failure();").count() >= 2,
+            "both legacy send-Err arms (GetRequest + ListRequest) must mark_fetch_failure"
+        );
+        // Dispatch is tracked, and a successful send does NOT mark.
+        assert!(
+            body.contains("any_dispatched = true;"),
+            "must track whether any probe actually dispatched (send returned Ok)"
+        );
+        // If nothing dispatched, the guard is reset so a reconnect re-probes.
+        let reset_pos = body
+            .find("if !any_dispatched")
+            .expect("must reset the guard when no probe dispatched");
+        let reset_block = &body[reset_pos..(reset_pos + 200).min(body.len())];
+        assert!(
+            reset_block.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"),
+            "all-sends-failed must reset LEGACY_MIGRATION_ATTEMPTED so a reconnect re-probes"
         );
     }
 
@@ -4857,25 +4901,35 @@ fn schedule_rooms_load_backstop() {
     });
 }
 
-/// Retry a failed room-list load (freenet/river#397 Codex review 4/5/8). Wired to
-/// the `LoadFailed` block's Retry button. Signal-safe: `set_rooms_load_state` and
-/// `safe_spawn_local` both defer, and the atomics are lock-free, so this is safe
-/// to call directly from an `onclick` handler.
+/// Retry a failed room-list load (freenet/river#397 Codex review 4/5/8/9). Wired
+/// to the `LoadFailed` block's Retry button. Signal-safe: `set_rooms_load_state`
+/// and `safe_spawn_local` both defer, and the atomics are lock-free, so this is
+/// safe to call directly from an `onclick` handler.
 ///
-/// A retry is just a fresh load attempt ([`begin_load_attempt`]) PLUS re-enabling
-/// the legacy probe (retry-only, so a legacy source that FAILED this session is
-/// re-probed — `is_legacy_migration_done` is left alone) and re-firing the
-/// current-delegate load. If the delegate genuinely has no rooms this time the
-/// fast ProbeLegacy/PerRoom terminal resolves to `Loaded` (→ Empty); if it
-/// succeeds it renders the list; if it fails again it returns to `LoadFailed`.
+/// Re-runs the FULL setup path — `set_up_chat_delegate()` re-registers the
+/// delegate AND loads — so a `LoadFailed` produced by a `RegisterDelegate`
+/// failure (first use / delegate not installed) can actually be repaired; a bare
+/// `fire_list_rooms_request()` to an unregistered delegate never could (review 9,
+/// P2). `set_up_chat_delegate` calls `begin_load_attempt()` at its top, so we do
+/// NOT call it here (avoid a double attempt bump) — the re-setup owns the fresh
+/// attempt. Retry-only: re-enable the legacy probe so a legacy source that FAILED
+/// this session is re-probed (`is_legacy_migration_done` is left alone). If the
+/// delegate genuinely has no rooms this time the fast ProbeLegacy/PerRoom terminal
+/// resolves to `Loaded` (→ Empty); if it succeeds it renders the list; if setup or
+/// load fails again it returns to `LoadFailed`.
 pub(crate) fn retry_rooms_load() {
-    begin_load_attempt();
     // Retry-only (deliberately NOT in `begin_load_attempt`): re-enable the legacy
     // probe so a legacy source that failed THIS session is retried (P1b). A plain
-    // reconnect must not force this (it would defeat the #253 done-gate).
+    // reconnect must not force this (it would defeat the #253 done-gate). Set
+    // BEFORE the re-setup so `fire_legacy_migration_request` sees it cleared.
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     crate::util::safe_spawn_local(async {
-        fire_list_rooms_request().await;
+        // set_up_chat_delegate begins the fresh attempt AND re-registers; its Err
+        // path resolves LoadFailed, so a persistent registration failure re-shows
+        // Retry rather than getting stuck.
+        if let Err(e) = set_up_chat_delegate().await {
+            error!("Retry: chat delegate setup failed: {}", e);
+        }
     });
 }
 
@@ -4946,6 +5000,16 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
         LEGACY_DELEGATES.len()
     );
 
+    // freenet/river#397 Codex review 9 (P1): distinguish a TRANSPORT failure (a
+    // send that returns Err — connection closed) from the genuine new-user case
+    // (a send that SUCCEEDS but the legacy delegate isn't present, so the node
+    // silently drops the response). A send returning Err → mark_fetch_failure so
+    // the load resolves to LoadFailed (Retry), NOT a false Empty. `any_dispatched`
+    // tracks whether ANY probe actually went out; if none did (connection down),
+    // we reset the once-per-session guard below so a reconnect re-probes — the
+    // probe never left, so don't burn the guard on a transport failure.
+    let mut any_dispatched = false;
+
     for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {
         let legacy_code_hash = CodeHash::new(*code_hash_bytes);
         let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
@@ -4991,19 +5055,25 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
             };
 
             match api_result {
-                Ok(_) => info!(
-                    "Legacy migration request #{} sent for key {:?}",
-                    i,
-                    String::from_utf8_lossy(storage_key)
-                ),
-                Err(e) => {
+                Ok(_) => {
+                    any_dispatched = true;
                     info!(
-                        "Could not send legacy migration request #{} for key {:?} \
-                         (expected if delegate not present): {}",
+                        "Legacy migration request #{} sent for key {:?}",
+                        i,
+                        String::from_utf8_lossy(storage_key)
+                    );
+                }
+                Err(e) => {
+                    // A send that RETURNS Err is a transport failure (connection
+                    // closed), NOT "delegate not present". Mark it (P1).
+                    info!(
+                        "Legacy migration request #{} for key {:?} failed to send \
+                         (transport): {}",
                         i,
                         String::from_utf8_lossy(storage_key),
                         e
                     );
+                    mark_fetch_failure();
                 }
             }
         }
@@ -5041,11 +5111,25 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
             }
         };
         match list_result {
-            Ok(_) => info!("Legacy ListRequest #{i} sent for per-room key discovery"),
-            Err(e) => info!(
-                "Could not send legacy ListRequest #{i} (expected if delegate not present): {e}"
-            ),
+            Ok(_) => {
+                any_dispatched = true;
+                info!("Legacy ListRequest #{i} sent for per-room key discovery");
+            }
+            Err(e) => {
+                // Transport failure on the ListRequest send → mark it (P1).
+                info!("Legacy ListRequest #{i} failed to send (transport): {e}");
+                mark_fetch_failure();
+            }
         }
+    }
+
+    // freenet/river#397 Codex review 9 (P1): if NO probe was actually dispatched
+    // (every send failed — connection down), the once-per-session guard was set
+    // for a probe that never left. Reset it so a reconnect re-probes. Keep it set
+    // when at least one probe dispatched (a genuine new user whose node has no
+    // legacy delegate simply gets no response — do NOT re-probe-spam that case).
+    if !any_dispatched {
+        LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     }
     true
 }
