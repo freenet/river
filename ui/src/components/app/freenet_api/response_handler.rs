@@ -1092,7 +1092,23 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
                     worker.mark_fetch_failure();
                 }
             },
-            Ok(_) => warn!("Legacy room key {:?} listed but value missing", vk),
+            Ok(ChatDelegateResponseMsg::GetResponse { value: None, .. }) => {
+                // Definitive "no value for this key" — a legitimate skip, NOT a
+                // fetch failure.
+                warn!("Legacy room key {:?} listed but value missing", vk);
+            }
+            Ok(other) => {
+                // An unexpected response variant (e.g. a delegate protocol
+                // mismatch) is a fetch failure, NOT a definitive missing value —
+                // mirror the current-delegate per-room path (review 10 P2#2), or a
+                // listed room silently fails to materialize and the idle resolver
+                // shows a false Empty.
+                error!(
+                    "Unexpected response loading legacy room {:?}: {:?}",
+                    vk, other
+                );
+                worker.mark_fetch_failure();
+            }
             Err(e) => {
                 error!("Failed to load legacy room {:?}: {}", vk, e);
                 worker.mark_fetch_failure();
@@ -2275,23 +2291,57 @@ mod tests {
              the all-empty case must NOT write Loaded (Codex review 3 — not authoritative)"
         );
 
-        // freenet/river#397 Codex review 4/9: a failed legacy fetch records the
+        // freenet/river#397 Codex review 4/9/10: a failed legacy fetch records the
         // global SAW_FETCH_FAILURE — the slot transport-Err, the unparseable-slot
-        // Err, AND the meta-GET transport Err (review 9 send-side audit) — so the
-        // backstop resolves to LoadFailed rather than a false Empty; NOT a
-        // `value: None` skip.
+        // Err, the unexpected-variant `Ok(other)` arm (review 10 P2#2), AND the
+        // meta-GET transport Err (review 9) — so the backstop resolves to
+        // LoadFailed rather than a false Empty; NOT a `value: None` skip.
         assert_eq!(
             body.matches("mark_fetch_failure()").count(),
-            3,
-            "the legacy slot transport-Err, unparseable-slot Err, and meta-GET Err arms must mark_fetch_failure"
+            4,
+            "legacy slot transport-Err, unparseable-slot Err, Ok(other), and meta-GET Err arms must mark"
         );
+        // The `value: None` arm (definitive missing value) is a legitimate skip,
+        // NOT a fetch failure. Bound the window to that arm alone (the adjacent
+        // `Ok(other)` arm DOES mark).
         let value_none_pos = body
             .find("listed but value missing")
             .expect("legacy value: None arm must exist");
-        let after_none = &body[value_none_pos..(value_none_pos + 120).min(body.len())];
+        let after_none = &body[value_none_pos..(value_none_pos + 55).min(body.len())];
         assert!(
             !after_none.contains("mark_fetch_failure()"),
             "a legacy `value: None` is a legitimate skip, not a fetch failure"
+        );
+    }
+
+    /// freenet/river#397 Codex review 10 (P2#2): the legacy per-slot GET match
+    /// must split the catch-all — an unexpected response variant (`Ok(other)`,
+    /// e.g. a delegate protocol mismatch) is a fetch failure (marks), mirroring
+    /// the current-delegate path; only a definitive `value: None` is a clean skip.
+    #[test]
+    fn legacy_per_slot_unexpected_variant_marks_fetch_failure() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        // Slice the legacy per-slot loop (marker → the `let meta` that follows it).
+        let loop_start = production
+            .find("Migrating {} per-room slot(s) from legacy delegate")
+            .expect("legacy fetch loop marker must exist");
+        let loop_end = production[loop_start..]
+            .find("let meta = if has_meta")
+            .map(|i| loop_start + i)
+            .expect("the legacy loop must be followed by the meta load");
+        let loop_region = &production[loop_start..loop_end];
+        // The unexpected-variant arm exists and marks.
+        let other_pos = loop_region
+            .find("Unexpected response loading legacy room")
+            .expect("legacy per-slot Ok(other) arm must exist");
+        let other_arm = &loop_region[other_pos..(other_pos + 150).min(loop_region.len())];
+        assert!(
+            other_arm.contains("worker.mark_fetch_failure()"),
+            "a legacy per-slot Ok(other) (unexpected variant) must mark_fetch_failure"
         );
     }
 

@@ -1717,12 +1717,14 @@ mod tests {
         );
     }
 
-    /// freenet/river#397 Codex review 9 (P1): a legacy probe SEND that returns Err
+    /// freenet/river#397 Codex review 9/10: a legacy probe SEND that returns Err
     /// is a transport failure — it marks fetch failure; and if NO probe dispatched
     /// (all sends failed / connection down) the once-per-session
-    /// `LEGACY_MIGRATION_ATTEMPTED` guard is reset so a reconnect re-probes (the
-    /// probe never left). A send that SUCCEEDS sets `any_dispatched` and does NOT
-    /// mark (the genuine new-user / delegate-not-present case).
+    /// `LEGACY_MIGRATION_ATTEMPTED` guard is reset so a reconnect re-probes. A send
+    /// that SUCCEEDS sets `any_dispatched` and does NOT mark (the genuine new-user
+    /// case). Review 10 (P2#1): the probe captures the attempt and gates BOTH the
+    /// mark and the guard reset on still-current, so a stale probe (superseded by
+    /// a reconnect's begin_load_attempt) can't pollute the new attempt.
     #[test]
     fn legacy_probe_transport_failure_marks_and_resets_guard() {
         // `fire_legacy_migration_request` is the last fn in the file, defined
@@ -1743,14 +1745,26 @@ mod tests {
             body.contains("any_dispatched = true;"),
             "must track whether any probe actually dispatched (send returned Ok)"
         );
-        // If nothing dispatched, the guard is reset so a reconnect re-probes.
+        // Review 10 P2#1: the attempt is captured and the global writes are gated
+        // on still-current so a stale probe can't pollute a reconnect.
+        assert!(
+            body.contains("let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);"),
+            "the probe must capture the attempt it belongs to"
+        );
+        assert!(
+            body.matches("load_attempt_is_current(attempt)").count() >= 3,
+            "each mark AND the guard reset must be gated on load_attempt_is_current(attempt)"
+        );
+        // If nothing dispatched, the guard is reset (still-current) so a reconnect
+        // re-probes.
         let reset_pos = body
             .find("if !any_dispatched")
             .expect("must reset the guard when no probe dispatched");
         let reset_block = &body[reset_pos..(reset_pos + 200).min(body.len())];
         assert!(
-            reset_block.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"),
-            "all-sends-failed must reset LEGACY_MIGRATION_ATTEMPTED so a reconnect re-probes"
+            reset_block.contains("load_attempt_is_current(attempt)")
+                && reset_block.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"),
+            "all-sends-failed (still current) must reset LEGACY_MIGRATION_ATTEMPTED so a reconnect re-probes"
         );
     }
 
@@ -4730,6 +4744,15 @@ pub(crate) fn guard_drop_applies(guard_attempt: u32, current_attempt: u32) -> bo
     guard_attempt == current_attempt
 }
 
+/// Whether a captured load-attempt is still the current one. For code that
+/// isn't inside a [`LoadWorkerGuard`] (e.g. `fire_legacy_migration_request`,
+/// which runs across an awaited send sequence) but must still gate its global
+/// writes so a reconnect's `begin_load_attempt` doesn't get polluted by a stale
+/// probe's late failure (review 10 P2#1). Reuses the `guard_drop_applies` rule.
+pub(crate) fn load_attempt_is_current(captured_attempt: u32) -> bool {
+    guard_drop_applies(captured_attempt, LOAD_ATTEMPT_GEN.load(Ordering::Relaxed))
+}
+
 /// The DEFINITIVE completion decision once every load worker has settled. Pure.
 /// - `!room_count_zero` → `None`: rooms are present, the List renders — leave the
 ///   load state alone.
@@ -5008,6 +5031,13 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // tracks whether ANY probe actually went out; if none did (connection down),
     // we reset the once-per-session guard below so a reconnect re-probes — the
     // probe never left, so don't burn the guard on a transport failure.
+    //
+    // Review 10 (P2#1): this probe awaits a whole send sequence, so a reconnect's
+    // `begin_load_attempt` can advance the attempt mid-flight. Capture the attempt
+    // and gate the global writes (`mark_fetch_failure`, the guard reset) on
+    // still-current, so a STALE probe's late send-failure can't pollute the new
+    // attempt's `SAW_FETCH_FAILURE` into a false LoadFailed.
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
     let mut any_dispatched = false;
 
     for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {
@@ -5065,7 +5095,9 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
                 }
                 Err(e) => {
                     // A send that RETURNS Err is a transport failure (connection
-                    // closed), NOT "delegate not present". Mark it (P1).
+                    // closed), NOT "delegate not present". Mark it (P1) — but only
+                    // for the current attempt (P2#1), so a stale probe can't
+                    // pollute a reconnect's fresh load.
                     info!(
                         "Legacy migration request #{} for key {:?} failed to send \
                          (transport): {}",
@@ -5073,7 +5105,9 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
                         String::from_utf8_lossy(storage_key),
                         e
                     );
-                    mark_fetch_failure();
+                    if load_attempt_is_current(attempt) {
+                        mark_fetch_failure();
+                    }
                 }
             }
         }
@@ -5116,9 +5150,12 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
                 info!("Legacy ListRequest #{i} sent for per-room key discovery");
             }
             Err(e) => {
-                // Transport failure on the ListRequest send → mark it (P1).
+                // Transport failure on the ListRequest send → mark it (P1),
+                // current-attempt only (P2#1).
                 info!("Legacy ListRequest #{i} failed to send (transport): {e}");
-                mark_fetch_failure();
+                if load_attempt_is_current(attempt) {
+                    mark_fetch_failure();
+                }
             }
         }
     }
@@ -5128,7 +5165,9 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // for a probe that never left. Reset it so a reconnect re-probes. Keep it set
     // when at least one probe dispatched (a genuine new user whose node has no
     // legacy delegate simply gets no response — do NOT re-probe-spam that case).
-    if !any_dispatched {
+    // Gated on still-current (P2#1): a stale probe must not reopen the guard for
+    // the new attempt (whose own probe already ran / set it).
+    if !any_dispatched && load_attempt_is_current(attempt) {
         LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     }
     true
