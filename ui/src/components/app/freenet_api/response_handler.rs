@@ -18,8 +18,8 @@ use crate::components::app::chat_delegate::{
     mark_fetch_failure, mark_legacy_migration_done, mark_legacy_migration_in_progress,
     parse_room_storage_key, per_room_terminal, prune_outbound_dms_for_purges, room_storage_key,
     save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
-    send_delegate_request_to, set_rooms_load_state, LegacyMigrationAction, RoomsLoadState,
-    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    send_delegate_request_to, set_rooms_load_state, LegacyMigrationAction, LoadWorkerGuard,
+    RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -345,6 +345,16 @@ impl ResponseHandler {
                                                             }
                                                         }
 
+                                                        // Progress-tracked
+                                                        // termination
+                                                        // (freenet/river#397
+                                                        // review 6): the legacy
+                                                        // single-blob hydrate is a
+                                                        // load worker. The guard
+                                                        // bumps activity (cancels a
+                                                        // pending idle resolution)
+                                                        // and, on drop, settles.
+                                                        let _worker = LoadWorkerGuard::new();
                                                         if hydrate_loaded_rooms(
                                                             loaded_rooms,
                                                             is_legacy_delegate,
@@ -626,6 +636,12 @@ impl ResponseHandler {
 ///   WASM-key migration path), exactly as the old empty-`rooms_data` GetResponse
 ///   did.
 async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
+    // Progress-tracked termination (freenet/river#397 review 6): this awaited
+    // worker holds a guard for its whole lifetime, so on EVERY exit path the
+    // settled-handler re-evaluates whether the load is complete. For the
+    // ProbeLegacy case the guard drop is exactly the "fired the fire-and-forget
+    // probe and became quiescent" point that arms the idle timer.
+    let _worker = LoadWorkerGuard::new();
     match plan_load_from_keys(&keys) {
         LoadPlan::ProbeLegacy => {
             info!("Current delegate has no room data — firing legacy migration probe");
@@ -891,6 +907,8 @@ fn reconstruct_rooms(
 /// re-fires). Any real migration the recovery triggers still shows `Migrating`
 /// via the legacy `hydrate_loaded_rooms` path, which is not gated here.
 async fn migrate_current_blob_to_per_room(recovery: bool) {
+    // Progress-tracked termination (freenet/river#397 review 6): awaited worker.
+    let _worker = LoadWorkerGuard::new();
     match send_delegate_request(ChatDelegateRequestMsg::GetVersionedRequest {
         key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
     })
@@ -1008,6 +1026,13 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
 /// single-blob legacy format + `outbound_dms` are still handled by the fixed
 /// probes, so this only acts when the legacy delegate actually has per-room keys.
 async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegateKey>) {
+    // Progress-tracked termination (freenet/river#397 review 6): a legacy probe
+    // that responded is an active worker. Holding the guard for the whole
+    // function (including the empty-index early return) keeps the load alive
+    // while this delegate is being processed, and cancels any pending idle
+    // resolution (activity-gen bump) so a concurrent empty completion can't
+    // resolve Empty while this one may still bring rooms.
+    let _worker = LoadWorkerGuard::new();
     let (room_vks, has_meta) = match plan_load_from_keys(&keys) {
         LoadPlan::PerRoom { room_vks, has_meta } => (room_vks, has_meta),
         // No per-room keys on this legacy delegate — its single blob (if any) is
@@ -2170,6 +2195,61 @@ mod tests {
         assert!(
             !after_none.contains("mark_fetch_failure()"),
             "a legacy `value: None` is a legitimate skip, not a fetch failure"
+        );
+    }
+
+    /// freenet/river#397 Codex review 6: EVERY awaited load worker must hold a
+    /// `LoadWorkerGuard` so progress-tracked termination sees it start and finish.
+    /// Pin that all four worker sites are wrapped: the current-delegate load, the
+    /// blob migration, each legacy per-room probe, and the legacy single-blob
+    /// hydrate. If a future edit adds a load path without a guard, the counter
+    /// under-counts and the load could resolve prematurely — this fails CI.
+    #[test]
+    fn all_awaited_load_workers_hold_a_guard() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        // The four production worker sites each construct a guard.
+        assert_eq!(
+            production.matches("LoadWorkerGuard::new()").count(),
+            4,
+            "exactly four awaited load-worker sites must each hold a LoadWorkerGuard"
+        );
+
+        // Each of the three async worker fns opens with a guard before doing work.
+        for func in [
+            "async fn load_rooms_per_room(",
+            "async fn migrate_current_blob_to_per_room(",
+            "async fn migrate_legacy_per_room(",
+        ] {
+            let fn_start = production
+                .find(func)
+                .unwrap_or_else(|| panic!("{func} must exist"));
+            // The guard must appear within the first ~700 bytes of the body (before
+            // the first awaited request), not somewhere deep after work started.
+            let head = &production[fn_start..(fn_start + 700).min(production.len())];
+            assert!(
+                head.contains("LoadWorkerGuard::new()"),
+                "{func} must hold a LoadWorkerGuard from the top"
+            );
+        }
+
+        // The legacy single-blob GetResponse hydrate call is preceded by a guard
+        // (the 4th site; the other three are the fn heads checked above). Find the
+        // `flags.subscriptions_initiated` hydrate call and confirm a guard is
+        // constructed just before it.
+        let hydrate_call = production
+            .find("flags.subscriptions_initiated = true;")
+            .expect("legacy GetResponse hydrate call must exist");
+        let guard_before = production[..hydrate_call]
+            .rfind("LoadWorkerGuard::new()")
+            .expect("the legacy GetResponse hydrate must be preceded by a guard");
+        assert!(
+            hydrate_call - guard_before < 500,
+            "the legacy single-blob GetResponse hydrate must be wrapped in a LoadWorkerGuard"
         );
     }
 

@@ -1336,6 +1336,111 @@ mod tests {
         );
     }
 
+    /// freenet/river#397 Codex review 6: the definitive completion decision once
+    /// every worker has settled. Rooms present → `None` (List renders, leave the
+    /// state); empty + a known-rooms fetch failure → `LoadFailed`; empty + no
+    /// failure → `None` (caller arms the idle timer → Empty after quiescence).
+    #[test]
+    fn settle_terminal_decides_completion() {
+        // Rooms present → None regardless of the failure flag.
+        assert_eq!(settle_terminal(false, false), None);
+        assert_eq!(settle_terminal(false, true), None);
+        // Empty + fetch failure → LoadFailed.
+        assert_eq!(
+            settle_terminal(true, true),
+            Some(RoomsLoadState::LoadFailed),
+            "empty with a known-rooms fetch failure completes to LoadFailed"
+        );
+        // Empty + no failure → None (arm idle → genuine Empty after quiescence),
+        // NOT LoadFailed — this is what makes an all-tombstone/empty legacy
+        // migration resolve to Empty, not error.
+        assert_eq!(
+            settle_terminal(true, false),
+            None,
+            "empty + no failure defers to the idle timer, never LoadFailed"
+        );
+    }
+
+    /// freenet/river#397 Codex review 6: an armed idle resolution applies ONLY
+    /// when nothing superseded it — same activity gen, same attempt gen, and no
+    /// worker active. Any of: a new worker (gen bump), a retry (attempt bump), or
+    /// a pending worker cancels it.
+    #[test]
+    fn idle_resolution_cancelled_by_any_activity() {
+        // All match, no pending → applies.
+        assert!(idle_should_apply(5, 5, 2, 2, 0));
+        // A new worker started (activity gen advanced) → cancelled.
+        assert!(
+            !idle_should_apply(5, 6, 2, 2, 0),
+            "a new worker (activity-gen bump) cancels the idle timer"
+        );
+        // A retry bumped the attempt gen → cancelled.
+        assert!(
+            !idle_should_apply(5, 5, 2, 3, 0),
+            "a retry (attempt-gen bump) cancels the idle timer"
+        );
+        // A worker is active again → cancelled (must not resolve while loading).
+        assert!(
+            !idle_should_apply(5, 5, 2, 2, 1),
+            "a pending worker prevents idle resolution"
+        );
+    }
+
+    /// freenet/river#397 Codex review 6, composed: an all-tombstone / empty
+    /// legacy migration (worker ran, found no LIVE rooms, recorded no fetch
+    /// failure) resolves to Empty, NOT LoadFailed. The worker settles with
+    /// `settle_terminal(empty=true, saw=false) → None` (arm idle), and the idle
+    /// timer's own branch (empty + no failure) resolves to `Loaded` (Empty).
+    #[test]
+    fn all_tombstone_legacy_migration_resolves_to_empty_not_loadfailed() {
+        // Completion decision: empty + no failure defers (arm idle), not LoadFailed.
+        assert_eq!(settle_terminal(true, false), None);
+        // The idle timer applies (nothing superseded it)...
+        assert!(idle_should_apply(9, 9, 1, 1, 0));
+        // ...and its terminal for empty + no failure is Loaded (Empty), not
+        // LoadFailed. (`backstop_terminal(Loading, false)` mirrors that terminal.)
+        assert_eq!(
+            backstop_terminal(RoomsLoadState::Loading, false),
+            RoomsLoadState::Loaded,
+            "empty + no fetch failure resolves to Empty, never LoadFailed"
+        );
+    }
+
+    /// freenet/river#397 Codex review 6: the `LoadWorkerGuard` RAII contract —
+    /// `new` increments the pending counter AND bumps the activity gen; `Drop`
+    /// decrements (saturating) and runs the settled-handler. Source-scrape (it
+    /// drives global signals, so it can't be unit-driven on native).
+    #[test]
+    fn load_worker_guard_counts_and_pulses() {
+        let src = include_str!("chat_delegate.rs");
+        let new_start = src
+            .rfind("impl LoadWorkerGuard {")
+            .expect("LoadWorkerGuard impl must exist");
+        let new_end = src[new_start..]
+            .find("impl Drop for LoadWorkerGuard")
+            .map(|i| new_start + i)
+            .unwrap_or(src.len());
+        let new_body = &src[new_start..new_end];
+        assert!(
+            new_body.contains("PENDING_LOADS.fetch_add(1")
+                && new_body.contains("LOAD_ACTIVITY_GEN.fetch_add(1"),
+            "LoadWorkerGuard::new must inc PENDING_LOADS and bump LOAD_ACTIVITY_GEN"
+        );
+        let drop_start = src
+            .rfind("impl Drop for LoadWorkerGuard")
+            .expect("LoadWorkerGuard Drop must exist");
+        let drop_end = src[drop_start..]
+            .find("\n}\n")
+            .map(|i| drop_start + i)
+            .unwrap_or(src.len());
+        let drop_body = &src[drop_start..drop_end];
+        assert!(
+            drop_body.contains("saturating_sub(1)")
+                && drop_body.contains("on_load_worker_settled()"),
+            "LoadWorkerGuard::drop must saturating-dec PENDING_LOADS and settle"
+        );
+    }
+
     /// freenet/river#397 Codex review 4: the authoritative current-delegate
     /// per-room terminal. Rooms present → `Loaded` (List); empty + listed + a
     /// fetch error → `LoadFailed` (never a false Empty); a genuine empty (nothing
@@ -1462,6 +1567,14 @@ mod tests {
         assert!(
             body.contains("LOAD_ATTEMPT_GEN.fetch_add(1"),
             "retry must bump the attempt generation to invalidate stale backstop timers (P2a)"
+        );
+        assert!(
+            body.contains("PENDING_LOADS.store(0"),
+            "retry must sanity-reset the pending-worker counter (review 6)"
+        );
+        assert!(
+            body.contains("LOAD_ACTIVITY_GEN.fetch_add(1"),
+            "retry must bump the activity generation to cancel any armed idle timer (review 6)"
         );
         assert!(
             body.contains("LOAD_BACKSTOP_SCHEDULED.store(false")
@@ -4401,19 +4514,169 @@ pub(crate) fn per_room_terminal(
     }
 }
 
-/// Timeout for the UNIVERSAL room-list load backstop (see [`backstop_terminal`]).
-/// Armed once per session at the START of load (`set_up_chat_delegate`), re-armed
-/// on Retry. At the deadline it resolves any still-non-terminal state to a
-/// terminal (`LoadFailed` if a known-rooms fetch failed or a migration stalled,
-/// else `Loaded`). Generous (30s) so it never pre-empts a load or migration that
-/// is actually progressing — a slow but live probe→response→migrate or per-room
-/// fetch completes and resolves itself well before this fires; the backstop only
-/// bites on genuine timeout / all-fetch-fail / concurrency-strand cases.
-const ROOMS_LOAD_BACKSTOP_MS: u64 = 30_000;
+// =============================================================================
+// PROGRESS-TRACKED LOAD TERMINATION (freenet/river#397 Codex review 6)
+// Termination is driven by the actual load WORK finishing, not a fixed
+// wall-clock timer: a pending-worker counter + a debounced quiescence idle
+// timer make the primary decision, and a generous hard-max is a last resort.
+// =============================================================================
 
-/// One-shot guard so the backstop is scheduled once per session even though
-/// `set_up_chat_delegate` re-runs on every reconnect. Reset by `retry_rooms_load`
-/// so a fresh deadline is armed for the retry.
+/// Number of ACTIVE awaited load workers (current-delegate load, blob
+/// migration, each legacy per-room probe, each legacy single-blob hydrate).
+/// While this is non-zero the load is still making progress, so nothing resolves
+/// it. Each worker holds a [`LoadWorkerGuard`].
+pub(crate) static PENDING_LOADS: AtomicU32 = AtomicU32::new(0);
+
+/// A "progress pulse" bumped whenever a load worker STARTS. It invalidates any
+/// armed idle-resolution: a new worker beginning means the load is still active,
+/// so a previously-armed quiescence timer must not fire.
+pub(crate) static LOAD_ACTIVITY_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// Quiescence window: once the last worker settles with an empty result and no
+/// fetch failure, wait this long for a late (fire-and-forget legacy) response
+/// before resolving to Empty. A new worker starting (activity-gen bump) cancels
+/// it. Short because delegate ops are node-local (sub-second).
+const LOAD_IDLE_MS: u64 = 4_000;
+
+/// Absolute last-resort safety net (defense-in-depth for invariant 2). The
+/// progress-tracked idle resolution terminates first in practice; this only
+/// fires if the counter logic ever leaks a worker. Generous so it never
+/// pre-empts a genuinely-progressing load.
+const LOAD_HARD_MAX_MS: u64 = 60_000;
+
+/// RAII guard marking an active AWAITED load worker (freenet/river#397 review 6).
+/// `new` increments [`PENDING_LOADS`] and bumps [`LOAD_ACTIVITY_GEN`] (a progress
+/// pulse that cancels any armed idle resolution). `Drop` decrements
+/// `PENDING_LOADS` (saturating, so a stray double-drop / sanity reset can't
+/// underflow) and runs [`on_load_worker_settled`], so completion is detected on
+/// EVERY exit path (success, early return, error). Hold one across each awaited
+/// load worker.
+pub(crate) struct LoadWorkerGuard;
+
+impl LoadWorkerGuard {
+    pub(crate) fn new() -> Self {
+        PENDING_LOADS.fetch_add(1, Ordering::Relaxed);
+        LOAD_ACTIVITY_GEN.fetch_add(1, Ordering::Relaxed);
+        LoadWorkerGuard
+    }
+}
+
+impl Drop for LoadWorkerGuard {
+    fn drop(&mut self) {
+        let _ = PENDING_LOADS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+        on_load_worker_settled();
+    }
+}
+
+/// The DEFINITIVE completion decision once every load worker has settled. Pure.
+/// - `!room_count_zero` → `None`: rooms are present, the List renders — leave the
+///   load state alone.
+/// - `room_count_zero && saw_fetch_failure` → `Some(LoadFailed)`: empty, and a
+///   known-rooms fetch failed → error+retry, never a false Empty.
+/// - `room_count_zero && !saw_fetch_failure` → `None`: empty with no failure — the
+///   caller arms the debounced idle timer (a late legacy response may still bring
+///   rooms; if none does, quiescence resolves to Empty).
+///
+/// freenet/river#397 Codex review 6.
+pub(crate) fn settle_terminal(
+    room_count_zero: bool,
+    saw_fetch_failure: bool,
+) -> Option<RoomsLoadState> {
+    if !room_count_zero {
+        None
+    } else if saw_fetch_failure {
+        Some(RoomsLoadState::LoadFailed)
+    } else {
+        None
+    }
+}
+
+/// Whether an armed idle-resolution should still apply. Cancelled by any new
+/// worker (activity-gen bump), a retry (attempt-gen bump), or a worker becoming
+/// active again (`pending != 0`). Pure. freenet/river#397 Codex review 6.
+pub(crate) fn idle_should_apply(
+    armed_gen: u32,
+    current_gen: u32,
+    armed_attempt: u32,
+    current_attempt: u32,
+    pending: u32,
+) -> bool {
+    armed_gen == current_gen && armed_attempt == current_attempt && pending == 0
+}
+
+/// Read whether the in-memory rooms map is empty. Only called from within a
+/// `defer` (Dioxus runtime present); `peek` avoids registering a subscription.
+fn rooms_map_is_empty() -> bool {
+    ROOMS.peek().map.is_empty()
+}
+
+/// Write the load state directly. Only called from within a `defer`/runtime
+/// context (the settled + idle handlers run in one); the `peek` guard avoids a
+/// spurious write / re-render when unchanged.
+fn write_load_state_now(state: RoomsLoadState) {
+    if *ROOMS_LOAD_STATE.peek() != state {
+        *ROOMS_LOAD_STATE.write() = state;
+    }
+}
+
+/// Called when a load worker drops (and by the fire-and-forget legacy-probe path
+/// once it's quiescent). If work is still active, no-op. Otherwise makes the
+/// definitive completion decision ([`settle_terminal`]): resolve `LoadFailed` on
+/// a known-rooms failure, leave the state when rooms render (List), or arm the
+/// debounced idle timer for the empty+no-failure case. freenet/river#397 review 6.
+pub(crate) fn on_load_worker_settled() {
+    if PENDING_LOADS.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let armed_gen = LOAD_ACTIVITY_GEN.load(Ordering::Relaxed);
+    let armed_attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    crate::util::defer(move || {
+        // A worker may have STARTED between the drop and this deferred decision.
+        if PENDING_LOADS.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let room_count_zero = rooms_map_is_empty();
+        let saw = SAW_FETCH_FAILURE.load(Ordering::Relaxed);
+        match settle_terminal(room_count_zero, saw) {
+            Some(state) => write_load_state_now(state),
+            None if room_count_zero => schedule_idle_resolution(armed_gen, armed_attempt),
+            None => {} // rooms present → List renders, leave the state
+        }
+    });
+}
+
+/// Arm the debounced quiescence timer. After [`LOAD_IDLE_MS`] with no new
+/// activity (same gens, no pending worker), the empty+no-failure load resolves to
+/// `Loaded` (genuine Empty) — or `LoadFailed` if a fetch failure arrived in the
+/// meantime.
+fn schedule_idle_resolution(armed_gen: u32, armed_attempt: u32) {
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(std::time::Duration::from_millis(LOAD_IDLE_MS)).await;
+        crate::util::defer(move || {
+            let cur_gen = LOAD_ACTIVITY_GEN.load(Ordering::Relaxed);
+            let cur_attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+            let pending = PENDING_LOADS.load(Ordering::Relaxed);
+            if !idle_should_apply(armed_gen, cur_gen, armed_attempt, cur_attempt, pending) {
+                return; // superseded by new activity / retry / an active worker
+            }
+            if !rooms_map_is_empty() {
+                return; // rooms arrived → List renders
+            }
+            let resolved = if SAW_FETCH_FAILURE.load(Ordering::Relaxed) {
+                RoomsLoadState::LoadFailed
+            } else {
+                RoomsLoadState::Loaded // genuine Empty after quiescence
+            };
+            write_load_state_now(resolved);
+        });
+    });
+}
+
+/// One-shot guard so the hard-max backstop is scheduled once per session even
+/// though `set_up_chat_delegate` re-runs on every reconnect. Reset by
+/// `retry_rooms_load` so a fresh deadline is armed for the retry.
 static LOAD_BACKSTOP_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
 /// Monotonic load-attempt generation (freenet/river#397 Codex review 5, P2a).
@@ -4423,9 +4686,12 @@ static LOAD_BACKSTOP_SCHEDULED: AtomicBool = AtomicBool::new(false);
 /// superseded attempt is a no-op and cannot resolve the retry's fresh state.
 static LOAD_ATTEMPT_GEN: AtomicU32 = AtomicU32::new(0);
 
-/// Schedule the room-list load backstop once per session (re-armed by Retry).
-/// See [`backstop_terminal`] for why this is a safety net rather than the primary
-/// signal, and [`backstop_should_apply`] for the stale-timer guard.
+/// Schedule the HARD-MAX load backstop once per session (re-armed by Retry).
+/// This is the last-resort safety net (freenet/river#397 review 6): the
+/// progress-tracked idle resolution ([`on_load_worker_settled`]) terminates the
+/// load first in practice; this only fires if the worker counter ever leaks.
+/// See [`backstop_terminal`] for the terminal it resolves to and
+/// [`backstop_should_apply`] for the stale-timer (attempt-gen) guard.
 pub(crate) fn schedule_rooms_load_backstop() {
     if LOAD_BACKSTOP_SCHEDULED.swap(true, Ordering::Relaxed) {
         return;
@@ -4433,18 +4699,16 @@ pub(crate) fn schedule_rooms_load_backstop() {
     // Capture the attempt generation this timer belongs to.
     let armed_gen = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
     crate::util::safe_spawn_local(async move {
-        crate::util::sleep(std::time::Duration::from_millis(ROOMS_LOAD_BACKSTOP_MS)).await;
+        crate::util::sleep(std::time::Duration::from_millis(LOAD_HARD_MAX_MS)).await;
         crate::util::defer(move || {
             // A newer attempt (Retry) superseded this timer → no-op, so a stale
-            // 30s timer can't resolve the retry's fresh Loading/Migrating.
+            // timer can't resolve the retry's fresh Loading/Migrating.
             if !backstop_should_apply(armed_gen, LOAD_ATTEMPT_GEN.load(Ordering::Relaxed)) {
                 return;
             }
             let saw_failure = SAW_FETCH_FAILURE.load(Ordering::Relaxed);
             let resolved = backstop_terminal(*ROOMS_LOAD_STATE.peek(), saw_failure);
-            if *ROOMS_LOAD_STATE.peek() != resolved {
-                *ROOMS_LOAD_STATE.write() = resolved;
-            }
+            write_load_state_now(resolved);
         });
     });
 }
@@ -4469,8 +4733,14 @@ pub(crate) fn retry_rooms_load() {
     // is deliberately left alone — a genuinely-completed migration shouldn't
     // re-probe; this only re-arms a probe that failed.
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
-    // Bump the attempt generation BEFORE re-arming so the previous timer becomes
-    // a no-op (P2a), then re-arm a fresh 30s deadline.
+    // Progress-tracking sanity + invalidation (freenet/river#397 review 6): clear
+    // any leaked pending-worker count, and bump BOTH generations so any armed
+    // idle timer AND any stale hard-max timer from the failed attempt become
+    // no-ops. The re-fired list request starts a fresh worker.
+    PENDING_LOADS.store(0, Ordering::Relaxed);
+    LOAD_ACTIVITY_GEN.fetch_add(1, Ordering::Relaxed);
+    // Bump the attempt generation BEFORE re-arming so the previous hard-max timer
+    // becomes a no-op, then re-arm a fresh deadline.
     LOAD_ATTEMPT_GEN.fetch_add(1, Ordering::Relaxed);
     LOAD_BACKSTOP_SCHEDULED.store(false, Ordering::Relaxed);
     schedule_rooms_load_backstop();
