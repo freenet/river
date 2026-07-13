@@ -5,7 +5,9 @@ pub(crate) mod join_with_code_modal;
 pub(crate) mod receive_invitation_modal;
 pub(crate) mod room_name_field;
 
-use crate::components::app::chat_delegate::save_rooms_to_delegate;
+use crate::components::app::chat_delegate::{
+    retry_rooms_load, save_rooms_to_delegate, RoomsLoadState, ROOMS_LOAD_STATE,
+};
 use crate::components::app::document_title::{
     count_unread_in_room_data, mark_current_room_as_read,
 };
@@ -34,6 +36,56 @@ const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp n
 // Stable Dioxus key for the reorder tail drop zone (keys must be unique and
 // distinct from any room's `{room_key:?}`).
 const TAIL_DROP_ZONE_KEY: &str = "room-reorder-tail-drop-zone";
+
+// Stable Dioxus key for the single non-room state row (freenet/river#397). The
+// three states are mutually exclusive, so they share one key and Dioxus reuses
+// the element across transitions.
+const ROOM_LIST_STATE_KEY: &str = "room-list-state";
+
+/// What the rooms rail shows in place of the room list (freenet/river#397).
+/// When the `ROOMS` map is empty during startup / migration, a bare `<ul>`
+/// rendered nothing, so a user with rooms still loading saw a blank list and
+/// assumed data loss. This picks one of three explicit non-room states; a
+/// non-empty list always wins.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RoomListDisplay {
+    /// Initial load hasn't resolved yet — subtle spinner + "Loading your rooms…".
+    Loading,
+    /// A delegate/room migration is recovering rooms — spinner + "Migrating…".
+    Migrating,
+    /// Load resolved and the user genuinely has no rooms — calm empty state.
+    Empty,
+    /// A load we KNOW involved rooms failed/stalled — error + Retry block, never
+    /// a false "no rooms yet" (freenet/river#397 Codex review 4).
+    LoadFailed,
+    /// There is at least one room to render — show the list unchanged.
+    List,
+}
+
+/// Pure decision for the rail's display state, split out so it is unit-testable
+/// without the Dioxus runtime (freenet/river#397).
+///
+/// A non-empty room list ALWAYS renders the list — once there's something to
+/// show, load/migration bookkeeping is irrelevant. Only when `room_count == 0`
+/// do we disambiguate the non-room states: `Loading`/`Migrating` spinners, the
+/// `LoadFailed` error+retry block, and the calm `Empty`. `Empty` is reached ONLY
+/// from `Loaded`, so an unresolved / migrating / failed load never shows "no
+/// rooms yet".
+pub(crate) fn room_list_display_state(
+    load_state: RoomsLoadState,
+    room_count: usize,
+) -> RoomListDisplay {
+    if room_count > 0 {
+        RoomListDisplay::List
+    } else {
+        match load_state {
+            RoomsLoadState::Loading => RoomListDisplay::Loading,
+            RoomsLoadState::Migrating => RoomListDisplay::Migrating,
+            RoomsLoadState::Loaded => RoomListDisplay::Empty,
+            RoomsLoadState::LoadFailed => RoomListDisplay::LoadFailed,
+        }
+    }
+}
 
 /// Convert UTC ISO timestamp to local time string
 fn format_build_time_local() -> String {
@@ -181,6 +233,18 @@ pub fn RoomList() -> Element {
     // room there is nothing to reorder.
     let room_count: usize = room_items.read().len();
 
+    // Rail display state (freenet/river#397). Read the load-state signal
+    // reactively (fallible per the Dioxus signal-safety rules — a concurrent
+    // write returns Err, in which case we treat the load as still `Loading` and
+    // re-render on the next signal settle rather than panicking on Firefox).
+    // Combined with `room_count` this decides whether the rail shows the list,
+    // a loading spinner, a migrating spinner, or the calm empty state.
+    let load_state: RoomsLoadState = ROOMS_LOAD_STATE
+        .try_read()
+        .map(|g| *g)
+        .unwrap_or(RoomsLoadState::Loading);
+    let display = room_list_display_state(load_state, room_count);
+
     rsx! {
         aside {
             // Stable hook for the connection-indicator regression tests
@@ -262,6 +326,63 @@ pub fn RoomList() -> Element {
             ul {
                 "data-testid": "room-list",
                 class: "flex-1 px-2 py-1 space-y-0.5",
+
+                // Non-room states (freenet/river#397). Shown only when there are
+                // no rooms to render — the room-item map and tail drop zone below
+                // produce nothing while empty, so this is purely additive. A
+                // subtle, near-monochrome block: spinner (loading/migrating) or a
+                // calm empty-state hint, vertically centred in the rail.
+                match display {
+                    RoomListDisplay::Loading => rsx! {
+                        li {
+                            key: "{ROOM_LIST_STATE_KEY}",
+                            "data-testid": "room-list-loading",
+                            class: "flex flex-col items-center justify-center gap-2 py-10 px-4 text-center",
+                            div { class: "animate-spin w-4 h-4 border-2 border-text-muted border-t-transparent rounded-full" }
+                            span { class: "text-sm text-text-muted", "Loading your rooms…" }
+                        }
+                    },
+                    RoomListDisplay::Migrating => rsx! {
+                        li {
+                            key: "{ROOM_LIST_STATE_KEY}",
+                            "data-testid": "room-list-migrating",
+                            class: "flex flex-col items-center justify-center gap-2 py-10 px-4 text-center",
+                            div { class: "animate-spin w-4 h-4 border-2 border-text-muted border-t-transparent rounded-full" }
+                            span { class: "text-sm text-text-muted", "Migrating your rooms…" }
+                            span { class: "text-xs text-text-muted opacity-70", "(one-time step after an update)" }
+                        }
+                    },
+                    RoomListDisplay::Empty => rsx! {
+                        li {
+                            key: "{ROOM_LIST_STATE_KEY}",
+                            "data-testid": "room-list-empty",
+                            class: "flex flex-col items-center justify-center gap-1 py-10 px-4 text-center",
+                            span { class: "text-sm text-text-muted", "No rooms yet" }
+                            span { class: "text-xs text-text-muted opacity-70", "Create a room or join one with an invite code." }
+                        }
+                    },
+                    RoomListDisplay::LoadFailed => rsx! {
+                        li {
+                            key: "{ROOM_LIST_STATE_KEY}",
+                            "data-testid": "room-list-error",
+                            class: "flex flex-col items-center justify-center gap-3 py-10 px-4 text-center",
+                            span { class: "text-sm text-text-muted", "Couldn't load your rooms" }
+                            span { class: "text-xs text-text-muted opacity-70", "Check your connection and try again." }
+                            button {
+                                "data-testid": "room-list-retry-button",
+                                class: "flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
+                                // Retry re-fires the current-delegate load. Safe to
+                                // call directly — `retry_rooms_load` defers its
+                                // signal write and spawns via setTimeout(0) (Dioxus
+                                // signal-safety rules).
+                                onclick: move |_| retry_rooms_load(),
+                                span { "Retry" }
+                            }
+                        }
+                    },
+                    RoomListDisplay::List => rsx! {},
+                }
+
                 {room_items.read().iter().enumerate().map(|(idx, (room_key, room_name, is_current, awaiting_sync, is_private, unread, sync_error_msg))| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
@@ -583,5 +704,89 @@ pub fn RoomList() -> Element {
         JoinWithCodeModal {
             is_active: join_code_modal_active
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// freenet/river#397: the initial load hasn't resolved and there are no
+    /// rooms yet → show the loading spinner, NOT a blank list or a premature
+    /// "no rooms yet".
+    #[test]
+    fn loading_with_no_rooms_shows_loading() {
+        assert_eq!(
+            room_list_display_state(RoomsLoadState::Loading, 0),
+            RoomListDisplay::Loading
+        );
+    }
+
+    /// freenet/river#397: a migration is in progress with the map still empty
+    /// (Ivvor's case) → show "Migrating…", never "no rooms yet".
+    #[test]
+    fn migrating_with_no_rooms_shows_migrating() {
+        assert_eq!(
+            room_list_display_state(RoomsLoadState::Migrating, 0),
+            RoomListDisplay::Migrating
+        );
+    }
+
+    /// freenet/river#397: the load resolved and the user genuinely has no rooms
+    /// → the calm empty state (only reachable from `Loaded`).
+    #[test]
+    fn loaded_with_no_rooms_shows_empty() {
+        assert_eq!(
+            room_list_display_state(RoomsLoadState::Loaded, 0),
+            RoomListDisplay::Empty
+        );
+    }
+
+    /// freenet/river#397 Codex review 4: a failed load with no rooms → the
+    /// LoadFailed error+retry block, NOT a false "no rooms yet".
+    #[test]
+    fn load_failed_with_no_rooms_shows_error() {
+        assert_eq!(
+            room_list_display_state(RoomsLoadState::LoadFailed, 0),
+            RoomListDisplay::LoadFailed
+        );
+    }
+
+    /// freenet/river#397: any rooms present → render the list, regardless of the
+    /// load state (mid-migration, still-loading, resolved, OR failed). Once
+    /// there's something to show, load bookkeeping is irrelevant — a partial load
+    /// that fetched SOME rooms shows them rather than the error block.
+    #[test]
+    fn any_rooms_shows_list_regardless_of_load_state() {
+        for state in [
+            RoomsLoadState::Loading,
+            RoomsLoadState::Migrating,
+            RoomsLoadState::Loaded,
+            RoomsLoadState::LoadFailed,
+        ] {
+            assert_eq!(
+                room_list_display_state(state, 1),
+                RoomListDisplay::List,
+                "{state:?} with rooms must render the list"
+            );
+            assert_eq!(
+                room_list_display_state(state, 7),
+                RoomListDisplay::List,
+                "{state:?} with rooms must render the list"
+            );
+        }
+    }
+
+    /// freenet/river#397 (#1 safety invariant): a genuinely-new user, once the
+    /// load resolves (`Loaded`) with zero rooms, lands on the calm empty state —
+    /// never a perpetual spinner. (The resolution itself — Loading→Loaded via the
+    /// completion signal / backstop — is pinned by the chat_delegate tests.)
+    #[test]
+    fn new_user_resolves_to_empty_not_stuck_loading() {
+        assert_eq!(
+            room_list_display_state(RoomsLoadState::Loaded, 0),
+            RoomListDisplay::Empty,
+            "a resolved new user with no rooms must show Empty, never Loading"
+        );
     }
 }

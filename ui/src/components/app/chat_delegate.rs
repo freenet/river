@@ -19,7 +19,7 @@ use river_core::chat_delegate::{
 use river_core::room_state::direct_messages::{PurgeToken, MAX_DM_MESSAGES_PER_PAIR};
 use river_core::room_state::member::MemberId;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 // Legacy single-blob rooms key. Still read for the one-time client-side
@@ -511,6 +511,21 @@ fn persist_cipher_material(cipher: &[u8; 32], nonce: &[u8; 24]) {
 }
 
 pub async fn set_up_chat_delegate() -> Result<(), String> {
+    // freenet/river#397 Codex review 8 (P2#2): treat EVERY setup-triggered load
+    // as a fresh attempt — the initial load AND every reconnect/wake, since this
+    // fn re-runs on each. `begin_load_attempt` advances LOAD_ATTEMPT_GEN, so every
+    // worker spawned by the PREVIOUS pass is now stale and its Drop/mark/
+    // set_load_state all no-op (attempt-scoped guard) — overlap is harmless. It
+    // also resets SAW_FETCH_FAILURE, returns the rail to `Loading`, and arms a
+    // fresh gen-guarded hard-max BEFORE RegisterDelegate, so even a registration
+    // failure eventually resolves.
+    begin_load_attempt();
+    // Capture the attempt this continuation belongs to (review 11): the
+    // RegisterDelegate + fire_list_rooms_request below run across awaits, so a
+    // reconnect can advance the attempt mid-flight — gate the failure resolve on
+    // still-current.
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+
     let delegate = create_chat_delegate_container();
 
     // Get a write lock on the API and use it directly
@@ -546,12 +561,22 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             // skipped (current is authoritative); if it is empty, migration is
             // fired then. This prevents legacy responses from racing with the
             // current delegate and clobbering newer state (freenet/river#253).
+            // The fresh-attempt bookkeeping (SAW_FETCH_FAILURE reset, Loading
+            // state, hard-max arming) already ran in `begin_load_attempt()` above.
             fire_list_rooms_request().await;
             fire_load_outbound_dms_request().await;
 
             Ok(())
         }
-        Err(e) => Err(format!("Failed to register chat delegate: {}", e)),
+        Err(e) => {
+            // freenet/river#397 Codex review 8/11: RegisterDelegate failed — a
+            // definitive setup failure, and this Err path returns before any load
+            // worker runs. Resolve directly to `LoadFailed` (if still current +
+            // empty) so the user gets Retry immediately rather than waiting for the
+            // hard-max.
+            resolve_load_failed_if_empty(attempt);
+            Err(format!("Failed to register chat delegate: {}", e))
+        }
     }
 }
 
@@ -1207,6 +1232,625 @@ mod tests {
         assert!(
             interrupted.recover,
             "an interrupted migration must re-run to recover stranded rooms"
+        );
+    }
+
+    /// freenet/river#397: when the current delegate is empty and we DID dispatch
+    /// legacy probes, we cannot yet tell a new user (nothing coming) from an
+    /// existing user whose legacy data is about to migrate, so we must stay
+    /// `Loading` — never optimistically `Loaded`, which would flash "no rooms
+    /// yet" at the migrating user before their migration starts.
+    #[test]
+    fn probe_legacy_fired_stays_loading() {
+        assert_eq!(
+            load_state_after_probe_legacy(true),
+            RoomsLoadState::Loading,
+            "dispatched probes: a migration might still arrive, so stay Loading"
+        );
+    }
+
+    /// freenet/river#397: when the probe was SKIPPED (already migrated / already
+    /// attempted this session) nothing more is coming, so the load is resolved —
+    /// the fast path that lets a returning empty user reach the calm empty state
+    /// immediately instead of waiting on the backstop.
+    #[test]
+    fn probe_legacy_skipped_resolves_loaded() {
+        assert_eq!(
+            load_state_after_probe_legacy(false),
+            RoomsLoadState::Loaded,
+            "skipped probes: nothing is coming, resolve immediately"
+        );
+    }
+
+    /// freenet/river#397 Codex review 5: the UNIVERSAL backstop resolves EVERY
+    /// non-terminal state to a terminal, and a stalled `Migrating` (which we set
+    /// ONLY after a non-empty index proved rooms exist) resolves to `LoadFailed`,
+    /// NOT Empty — an honest error+retry for a known-non-empty load that stalled.
+    /// Already-terminal states pass through unchanged.
+    #[test]
+    fn backstop_resolves_every_non_terminal_state() {
+        // A stalled Migrating → LoadFailed, regardless of the fetch-failure flag
+        // (rooms are KNOWN to exist; showing Empty would be a lie).
+        assert_eq!(
+            backstop_terminal(RoomsLoadState::Migrating, false),
+            RoomsLoadState::LoadFailed,
+            "a stalled Migrating resolves to LoadFailed, never Empty"
+        );
+        assert_eq!(
+            backstop_terminal(RoomsLoadState::Migrating, true),
+            RoomsLoadState::LoadFailed,
+        );
+        // Loading with no fetch failure → Loaded (genuine empty / new user).
+        assert_eq!(
+            backstop_terminal(RoomsLoadState::Loading, false),
+            RoomsLoadState::Loaded,
+            "Loading with no fetch failure resolves to Loaded (Empty)"
+        );
+        // Loading with a known-rooms fetch failure → LoadFailed.
+        assert_eq!(
+            backstop_terminal(RoomsLoadState::Loading, true),
+            RoomsLoadState::LoadFailed,
+            "Loading with a fetch failure resolves to LoadFailed, not a false Empty"
+        );
+        // Already-terminal states pass through, regardless of the flag.
+        assert_eq!(
+            backstop_terminal(RoomsLoadState::Loaded, true),
+            RoomsLoadState::Loaded,
+            "Loaded is terminal and passes through"
+        );
+        assert_eq!(
+            backstop_terminal(RoomsLoadState::LoadFailed, false),
+            RoomsLoadState::LoadFailed,
+            "LoadFailed is terminal and passes through"
+        );
+    }
+
+    /// freenet/river#397: no state strands — every non-terminal input to the
+    /// backstop is a terminal output (`Loaded` or `LoadFailed`), so termination is
+    /// guaranteed for ANY load/migration path that fails to resolve itself.
+    #[test]
+    fn backstop_guarantees_termination_from_any_state() {
+        for state in [
+            RoomsLoadState::Loading,
+            RoomsLoadState::Migrating,
+            RoomsLoadState::Loaded,
+            RoomsLoadState::LoadFailed,
+        ] {
+            for saw in [false, true] {
+                let out = backstop_terminal(state, saw);
+                assert!(
+                    matches!(out, RoomsLoadState::Loaded | RoomsLoadState::LoadFailed),
+                    "{state:?} (saw_fetch_failure={saw}) must terminate at a terminal state, got {out:?}"
+                );
+            }
+        }
+    }
+
+    /// freenet/river#397 Codex review 5 (P2a): a backstop timer armed at
+    /// generation N is a no-op once the generation advances (a Retry bumped it),
+    /// so a stale timer can't resolve the retry's fresh state prematurely.
+    #[test]
+    fn stale_backstop_timer_is_a_noop() {
+        assert!(
+            backstop_should_apply(3, 3),
+            "same generation → the timer still applies"
+        );
+        assert!(
+            !backstop_should_apply(3, 4),
+            "a newer attempt superseded this timer → no-op"
+        );
+        assert!(
+            !backstop_should_apply(0, 1),
+            "the first retry invalidates the initial-load timer"
+        );
+    }
+
+    /// freenet/river#397 Codex review 6: the definitive completion decision once
+    /// every worker has settled. Rooms present → `None` (List renders, leave the
+    /// state); empty + a known-rooms fetch failure → `LoadFailed`; empty + no
+    /// failure → `None` (caller arms the idle timer → Empty after quiescence).
+    #[test]
+    fn settle_terminal_decides_completion() {
+        // Rooms present → None regardless of the failure flag.
+        assert_eq!(settle_terminal(false, false), None);
+        assert_eq!(settle_terminal(false, true), None);
+        // Empty + fetch failure → LoadFailed.
+        assert_eq!(
+            settle_terminal(true, true),
+            Some(RoomsLoadState::LoadFailed),
+            "empty with a known-rooms fetch failure completes to LoadFailed"
+        );
+        // Empty + no failure → None (arm idle → genuine Empty after quiescence),
+        // NOT LoadFailed — this is what makes an all-tombstone/empty legacy
+        // migration resolve to Empty, not error.
+        assert_eq!(
+            settle_terminal(true, false),
+            None,
+            "empty + no failure defers to the idle timer, never LoadFailed"
+        );
+    }
+
+    /// freenet/river#397 Codex review 6: an armed idle resolution applies ONLY
+    /// when nothing superseded it — same activity gen, same attempt gen, and no
+    /// worker active. Any of: a new worker (gen bump), a retry (attempt bump), or
+    /// a pending worker cancels it.
+    #[test]
+    fn idle_resolution_cancelled_by_any_activity() {
+        // All match, no pending → applies.
+        assert!(idle_should_apply(5, 5, 2, 2, 0));
+        // A new worker started (activity gen advanced) → cancelled.
+        assert!(
+            !idle_should_apply(5, 6, 2, 2, 0),
+            "a new worker (activity-gen bump) cancels the idle timer"
+        );
+        // A retry bumped the attempt gen → cancelled.
+        assert!(
+            !idle_should_apply(5, 5, 2, 3, 0),
+            "a retry (attempt-gen bump) cancels the idle timer"
+        );
+        // A worker is active again → cancelled (must not resolve while loading).
+        assert!(
+            !idle_should_apply(5, 5, 2, 2, 1),
+            "a pending worker prevents idle resolution"
+        );
+    }
+
+    /// freenet/river#397 Codex review 6, composed: an all-tombstone / empty
+    /// legacy migration (worker ran, found no LIVE rooms, recorded no fetch
+    /// failure) resolves to Empty, NOT LoadFailed. The worker settles with
+    /// `settle_terminal(empty=true, saw=false) → None` (arm idle), and the idle
+    /// timer's own branch (empty + no failure) resolves to `Loaded` (Empty).
+    #[test]
+    fn all_tombstone_legacy_migration_resolves_to_empty_not_loadfailed() {
+        // Completion decision: empty + no failure defers (arm idle), not LoadFailed.
+        assert_eq!(settle_terminal(true, false), None);
+        // The idle timer applies (nothing superseded it)...
+        assert!(idle_should_apply(9, 9, 1, 1, 0));
+        // ...and its terminal for empty + no failure is Loaded (Empty), not
+        // LoadFailed. (`backstop_terminal(Loading, false)` mirrors that terminal.)
+        assert_eq!(
+            backstop_terminal(RoomsLoadState::Loading, false),
+            RoomsLoadState::Loaded,
+            "empty + no fetch failure resolves to Empty, never LoadFailed"
+        );
+    }
+
+    /// freenet/river#397 review 6/7: the `LoadWorkerGuard` RAII + attempt-scope
+    /// contract — `new` captures the attempt, increments the pending counter, and
+    /// bumps the activity gen; `Drop` is a complete NO-OP for a superseded attempt
+    /// (guarded by `guard_drop_applies`), else saturating-decs and settles.
+    /// Source-scrape (it drives global signals, so it can't be unit-driven).
+    #[test]
+    fn load_worker_guard_counts_and_pulses() {
+        let src = include_str!("chat_delegate.rs");
+        let new_start = src
+            .rfind("impl LoadWorkerGuard {")
+            .expect("LoadWorkerGuard impl must exist");
+        let new_end = src[new_start..]
+            .find("impl Drop for LoadWorkerGuard")
+            .map(|i| new_start + i)
+            .unwrap_or(src.len());
+        let new_body = &src[new_start..new_end];
+        assert!(
+            new_body.contains("let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed)")
+                && new_body.contains("PENDING_LOADS.fetch_add(1")
+                && new_body.contains("LOAD_ACTIVITY_GEN.fetch_add(1"),
+            "LoadWorkerGuard::new must capture the attempt, inc PENDING_LOADS, bump LOAD_ACTIVITY_GEN"
+        );
+        // The guard exposes attempt() (for spawned/late writes) and attempt-gated
+        // mark/set helpers.
+        assert!(
+            new_body.contains("fn attempt(&self) -> u32")
+                && new_body.contains("fn mark_fetch_failure(&self)")
+                && new_body.contains("fn set_load_state(&self,"),
+            "LoadWorkerGuard must expose attempt() + attempt-gated mark/set helpers"
+        );
+        let drop_start = src
+            .rfind("impl Drop for LoadWorkerGuard")
+            .expect("LoadWorkerGuard Drop must exist");
+        let drop_end = src[drop_start..]
+            .find("\n}\n")
+            .map(|i| drop_start + i)
+            .unwrap_or(src.len());
+        let drop_body = &src[drop_start..drop_end];
+        // The stale-attempt no-op MUST precede the decrement (return early).
+        let guard_pos = drop_body
+            .find("guard_drop_applies(")
+            .expect("Drop must check guard_drop_applies");
+        let dec_pos = drop_body
+            .find("saturating_sub(1)")
+            .expect("Drop must saturating-dec PENDING_LOADS");
+        assert!(
+            guard_pos < dec_pos && drop_body[guard_pos..dec_pos].contains("return"),
+            "a superseded worker's Drop must return BEFORE decrementing the new attempt's count"
+        );
+        assert!(
+            drop_body.contains("on_load_worker_settled()"),
+            "a current worker's Drop must settle"
+        );
+    }
+
+    /// freenet/river#397 review 7 (P2#1): `guard_drop_applies` — a worker's Drop
+    /// and writes apply only while its attempt matches the current attempt. A
+    /// Retry advances the attempt, making the old worker's Drop a no-op.
+    #[test]
+    fn stale_worker_guard_is_inert() {
+        assert!(
+            guard_drop_applies(4, 4),
+            "same attempt → the worker still applies"
+        );
+        assert!(
+            !guard_drop_applies(4, 5),
+            "a retry advanced the attempt → the stale worker is a no-op"
+        );
+    }
+
+    /// freenet/river#397 Codex review 4: the authoritative current-delegate
+    /// per-room terminal. Rooms present → `Loaded` (List); empty + listed + a
+    /// fetch error → `LoadFailed` (never a false Empty); a genuine empty (nothing
+    /// listed, or every listed slot a clean skip) → `Loaded` (Empty).
+    #[test]
+    fn per_room_terminal_distinguishes_failure_from_empty() {
+        // Rooms present → Loaded, regardless of listed/error.
+        assert_eq!(
+            per_room_terminal(false, 3, true),
+            RoomsLoadState::Loaded,
+            "a non-empty map always resolves to Loaded (List)"
+        );
+        assert_eq!(per_room_terminal(false, 0, false), RoomsLoadState::Loaded);
+
+        // Empty + listed + fetch error → LoadFailed.
+        assert_eq!(
+            per_room_terminal(true, 3, true),
+            RoomsLoadState::LoadFailed,
+            "empty with a known-rooms fetch failure must be LoadFailed, not Empty"
+        );
+
+        // Empty + listed + NO fetch error → genuine empty (Loaded → Empty).
+        assert_eq!(
+            per_room_terminal(true, 3, false),
+            RoomsLoadState::Loaded,
+            "empty with all slots cleanly skipped is a genuine empty"
+        );
+        // Empty + nothing listed → genuine empty (new-user).
+        assert_eq!(per_room_terminal(true, 0, false), RoomsLoadState::Loaded);
+        assert_eq!(per_room_terminal(true, 0, true), RoomsLoadState::Loaded);
+    }
+
+    /// freenet/river#397: a brand-new user fires legacy probes (→ `Loading`),
+    /// nothing responds and NO known-rooms fetch failed, so the universal backstop
+    /// resolves them to `Loaded` (→ Empty) — NEVER stuck, and NEVER LoadFailed.
+    #[test]
+    fn new_user_resolves_to_empty_never_stuck_never_failed() {
+        let after_probe = load_state_after_probe_legacy(true);
+        assert_eq!(after_probe, RoomsLoadState::Loading);
+        assert_eq!(
+            backstop_terminal(after_probe, false),
+            RoomsLoadState::Loaded,
+            "no fetch failure → Empty, not LoadFailed"
+        );
+    }
+
+    /// freenet/river#397 Codex review 8: `set_up_chat_delegate` (initial +
+    /// reconnect/wake) begins a fresh load attempt BEFORE `RegisterDelegate`, and
+    /// its `RegisterDelegate` `Err` path resolves the load (LoadFailed if empty)
+    /// so a registration failure doesn't leave the rail stuck `Loading`. The
+    /// response handler must NOT arm the backstop.
+    #[test]
+    fn set_up_chat_delegate_begins_load_attempt_before_register() {
+        let self_src = include_str!("chat_delegate.rs");
+        let self_production = self_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let setup_idx = self_production
+            .find("pub async fn set_up_chat_delegate()")
+            .expect("set_up_chat_delegate must exist");
+        let setup_end = self_production[setup_idx..]
+            .find("Per-session dedup map for")
+            .map(|i| setup_idx + i)
+            .unwrap_or(self_production.len());
+        let setup_body = &self_production[setup_idx..setup_end];
+
+        let begin = setup_body
+            .find("begin_load_attempt();")
+            .expect("set_up_chat_delegate must begin a fresh load attempt");
+        // Anchor on the actual code token, not the word in the rationale comment.
+        let register = setup_body
+            .find("DelegateRequest::RegisterDelegate")
+            .expect("set_up_chat_delegate must register the delegate");
+        assert!(
+            begin < register,
+            "begin_load_attempt() must run BEFORE RegisterDelegate so even a \
+             registration failure has an armed hard-max"
+        );
+
+        // The RegisterDelegate Err path resolves the load (P2#1).
+        let err_arm = setup_body
+            .find("Failed to register chat delegate")
+            .expect("the RegisterDelegate error arm must exist");
+        let err_ctx = &setup_body[err_arm.saturating_sub(200)..err_arm];
+        assert!(
+            err_ctx.contains("resolve_load_failed_if_empty(attempt)"),
+            "the RegisterDelegate error path must resolve LoadFailed (attempt-gated, review 11)"
+        );
+
+        // And the response handler must NOT arm the backstop.
+        let rh_src = include_str!("freenet_api/response_handler.rs");
+        let rh_production = rh_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        assert!(
+            !rh_production.contains("schedule_rooms_load_backstop"),
+            "the response handler must NOT arm the backstop — it is armed by \
+             begin_load_attempt at every load entry"
+        );
+    }
+
+    /// freenet/river#397 Codex review 8: `begin_load_attempt` (the shared load
+    /// entry point) advances the attempt gen, zeroes the pending count, resets
+    /// SAW_FETCH_FAILURE, bumps the activity gen, returns the rail to `Loading`,
+    /// and arms the hard-max. It must NOT touch `LEGACY_MIGRATION_ATTEMPTED` (a
+    /// plain reconnect must not force a legacy re-probe — that's retry-only).
+    #[test]
+    fn begin_load_attempt_resets_and_arms() {
+        // Defined after this mid-file test module → rfind the real definition.
+        let src = include_str!("chat_delegate.rs");
+        let fn_start = src
+            .rfind("pub(crate) fn begin_load_attempt()")
+            .expect("begin_load_attempt must exist");
+        let rest = &src[fn_start + 1..];
+        let fn_end = rest
+            .find("\nfn schedule_rooms_load_backstop()")
+            .or_else(|| rest.find("\n/// "))
+            .map(|i| fn_start + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        for needle in [
+            "LOAD_ATTEMPT_GEN.fetch_add(1",
+            "PENDING_LOADS.store(0",
+            "SAW_FETCH_FAILURE.store(false",
+            "LOAD_ACTIVITY_GEN.fetch_add(1",
+            "set_rooms_load_state(RoomsLoadState::Loading)",
+            "schedule_rooms_load_backstop();",
+        ] {
+            assert!(body.contains(needle), "begin_load_attempt must `{needle}`");
+        }
+        assert!(
+            !body.contains("LEGACY_MIGRATION_ATTEMPTED"),
+            "begin_load_attempt must NOT touch LEGACY_MIGRATION_ATTEMPTED (retry-only; #253 gate)"
+        );
+    }
+
+    /// freenet/river#397 Codex review 9 (P2): a retry re-runs the FULL setup
+    /// (`set_up_chat_delegate` → re-register + load) so a RegisterDelegate failure
+    /// can be repaired, PLUS re-enables the legacy probe (retry-only). It must NOT
+    /// call `begin_load_attempt()` directly (set_up owns it — avoid a double bump)
+    /// nor a bare `fire_list_rooms_request()` (which can't re-register).
+    #[test]
+    fn retry_rooms_load_resets_and_refires() {
+        let src = include_str!("chat_delegate.rs");
+        let fn_start = src
+            .rfind("pub(crate) fn retry_rooms_load()")
+            .expect("retry_rooms_load must exist");
+        let rest = &src[fn_start + 1..];
+        let fn_end = rest
+            .find("\nstatic ")
+            .or_else(|| rest.find("\npub"))
+            .or_else(|| rest.find("\nfn "))
+            .map(|i| fn_start + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"),
+            "retry must re-enable the legacy probe so a failed legacy source is retried (P1b)"
+        );
+        assert!(
+            body.contains("set_up_chat_delegate().await"),
+            "retry must re-run full setup (re-register) via set_up_chat_delegate, not a bare list request"
+        );
+        assert!(
+            !body.contains("begin_load_attempt()"),
+            "retry must NOT call begin_load_attempt directly — set_up_chat_delegate owns the fresh attempt (avoid double bump)"
+        );
+        assert!(
+            !body.contains("fire_list_rooms_request()"),
+            "retry must NOT bypass registration with a bare fire_list_rooms_request"
+        );
+    }
+
+    /// freenet/river#397 Codex review 5/8: `schedule_rooms_load_backstop` captures
+    /// the attempt generation at arm time and guards its resolution with
+    /// `backstop_should_apply`, so a stale timer (from a superseded attempt/
+    /// reconnect) is a no-op. It is now armed PER ATTEMPT (no once-per-session
+    /// guard).
+    #[test]
+    fn backstop_scheduler_is_generation_guarded() {
+        let src = include_str!("chat_delegate.rs");
+        let fn_start = src
+            .rfind("fn schedule_rooms_load_backstop()")
+            .expect("schedule_rooms_load_backstop must exist");
+        let rest = &src[fn_start + 1..];
+        let fn_end = rest
+            .find("\npub(crate) fn retry_rooms_load()")
+            .or_else(|| rest.find("\n/// "))
+            .map(|i| fn_start + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("LOAD_ATTEMPT_GEN.load(Ordering::Relaxed)"),
+            "the scheduler must capture/compare the attempt generation"
+        );
+        assert!(
+            body.contains("backstop_should_apply("),
+            "the scheduler's resolve closure must bail via backstop_should_apply on a stale gen"
+        );
+        assert!(
+            !body.contains("LOAD_BACKSTOP_SCHEDULED"),
+            "the once-per-session arming guard must be gone (per-attempt arming now)"
+        );
+    }
+
+    /// freenet/river#397 review 5/7/11: `fire_list_rooms_request` runs OUTSIDE any
+    /// load worker, ACROSS an awaited send. It captures the attempt and routes its
+    /// serialize/send-error writes through the ATTEMPT-GATED helpers
+    /// (`mark_fetch_failure_if_current` + `resolve_load_failed_if_empty(attempt)`),
+    /// so a reconnect mid-send isn't polluted.
+    #[test]
+    fn list_request_send_failure_marks_fetch_failure() {
+        // `fire_list_rooms_request` is defined AFTER this mid-file test module;
+        // `rfind` (last occurrence) finds the real definition, not this literal.
+        let src = include_str!("chat_delegate.rs");
+        let fn_start = src
+            .rfind("async fn fire_list_rooms_request()")
+            .expect("fire_list_rooms_request must exist");
+        let rest = &src[fn_start + 1..];
+        let fn_end = rest
+            .find("\n#[allow(dead_code)]")
+            .or_else(|| rest.find("\npub async fn "))
+            .or_else(|| rest.find("\nasync fn "))
+            .map(|i| fn_start + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..fn_end];
+        assert!(
+            body.contains("let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);"),
+            "fire_list_rooms_request must capture the attempt it belongs to"
+        );
+        assert_eq!(
+            body.matches("mark_fetch_failure_if_current(attempt)").count(),
+            2,
+            "both the serialize-error and send-error arms must mark_fetch_failure_if_current(attempt)"
+        );
+        assert_eq!(
+            body.matches("resolve_load_failed_if_empty(attempt)").count(),
+            2,
+            "both error arms must resolve LoadFailed via the attempt-gated helper (P2#2 + review 11)"
+        );
+        // No bare (ungated) forms survive.
+        assert!(
+            !body.contains("mark_fetch_failure();")
+                && !body.contains("resolve_load_failed_if_empty();"),
+            "no ungated bare marks/resolves may survive in fire_list_rooms_request"
+        );
+    }
+
+    /// freenet/river#397 Codex review 11 — the class is closed in chat_delegate
+    /// too: the async load entry points capture the attempt and route EVERY
+    /// post-await load-state / failure write through the attempt-gated helpers.
+    /// The ONLY bare `set_rooms_load_state(RoomsLoadState::` in production is
+    /// `begin_load_attempt`'s synchronous, attempt-DEFINING `Loading` (idempotent
+    /// across attempts, no await), and the ONLY bare `mark_fetch_failure()` is the
+    /// internal call inside `mark_fetch_failure_if_current`.
+    #[test]
+    fn async_load_state_writes_gated_on_captured_attempt() {
+        // These helpers/fns are defined AFTER this mid-file test module, so
+        // `rfind` locates the real definitions (not this test's own literals) and
+        // we slice each body forward to check its content robustly.
+        let src = include_str!("chat_delegate.rs");
+
+        // The uniform gated write helpers exist as real fns (the trailing ` {`
+        // ensures we match the definition, not a call or a comment).
+        for def in [
+            "pub(crate) fn set_load_state_if_current(attempt: u32, state: RoomsLoadState) {",
+            "pub(crate) fn mark_fetch_failure_if_current(attempt: u32) {",
+            "pub(crate) fn resolve_load_failed_if_empty(attempt: u32) {",
+        ] {
+            // At least the definition (last occurrence) — and `set_load_state_if_current`
+            // routes through `write_load_state_now` inside the gated closure.
+            let pos = src
+                .rfind(def)
+                .unwrap_or_else(|| panic!("attempt-gated helper `{def}` must be defined"));
+            assert!(
+                pos > src.rfind("mod tests {").unwrap_or(0),
+                "must be a production def"
+            );
+        }
+        // set_load_state_if_current checks the attempt inside the deferred write.
+        let helper = src
+            .rfind("pub(crate) fn set_load_state_if_current(attempt: u32, state: RoomsLoadState) {")
+            .unwrap();
+        let helper_body = &src[helper..(helper + 300).min(src.len())];
+        assert!(
+            helper_body.contains("load_attempt_is_current(attempt)")
+                && helper_body.contains("write_load_state_now(state)"),
+            "set_load_state_if_current must re-check the attempt inside the deferred write"
+        );
+
+        // on_load_worker_settled's DEFERRED decision gates on the armed attempt
+        // (the Drop is gated too, but the defer runs later — review 11).
+        let settled = src
+            .rfind("pub(crate) fn on_load_worker_settled() {")
+            .expect("on_load_worker_settled must exist");
+        let settled_body = &src[settled..(settled + 1200).min(src.len())];
+        assert!(
+            settled_body.contains("load_attempt_is_current(armed_attempt)"),
+            "on_load_worker_settled must gate its deferred settle on the armed attempt"
+        );
+
+        // fire_legacy_migration_request marks via the gated helper.
+        let fire = src
+            .rfind("pub(crate) async fn fire_legacy_migration_request() -> bool {")
+            .expect("fire_legacy_migration_request must exist");
+        let fire_body = &src[fire..];
+        assert!(
+            fire_body.contains("mark_fetch_failure_if_current(attempt)"),
+            "fire_legacy marks must route through mark_fetch_failure_if_current(attempt)"
+        );
+
+        // The LoadWorkerGuard exposes attempt() so spawned closures / hydrate can
+        // gate their late writes on the same attempt.
+        assert!(
+            src.contains("pub(crate) fn attempt(&self) -> u32 {"),
+            "LoadWorkerGuard must expose attempt() for spawned/late writes"
+        );
+    }
+
+    /// freenet/river#397 Codex review 9/10: a legacy probe SEND that returns Err
+    /// is a transport failure — it marks fetch failure; and if NO probe dispatched
+    /// (all sends failed / connection down) the once-per-session
+    /// `LEGACY_MIGRATION_ATTEMPTED` guard is reset so a reconnect re-probes. A send
+    /// that SUCCEEDS sets `any_dispatched` and does NOT mark (the genuine new-user
+    /// case). Review 10 (P2#1): the probe captures the attempt and gates BOTH the
+    /// mark and the guard reset on still-current, so a stale probe (superseded by
+    /// a reconnect's begin_load_attempt) can't pollute the new attempt.
+    #[test]
+    fn legacy_probe_transport_failure_marks_and_resets_guard() {
+        // `fire_legacy_migration_request` is the last fn in the file, defined
+        // AFTER this mid-file test module → rfind the real definition.
+        let src = include_str!("chat_delegate.rs");
+        let fn_start = src
+            .rfind("pub(crate) async fn fire_legacy_migration_request()")
+            .expect("fire_legacy_migration_request must exist");
+        let body = &src[fn_start..];
+
+        // Transport-Err arms mark via the attempt-gated helper (review 10/11:
+        // both the GetRequest and ListRequest sends).
+        assert!(
+            body.matches("mark_fetch_failure_if_current(attempt)").count() >= 2,
+            "both legacy send-Err arms (GetRequest + ListRequest) must mark_fetch_failure_if_current(attempt)"
+        );
+        // Dispatch is tracked, and a successful send does NOT mark.
+        assert!(
+            body.contains("any_dispatched = true;"),
+            "must track whether any probe actually dispatched (send returned Ok)"
+        );
+        // Review 10 P2#1: the attempt is captured and the guard reset is gated on
+        // still-current so a stale probe can't pollute a reconnect.
+        assert!(
+            body.contains("let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);"),
+            "the probe must capture the attempt it belongs to"
+        );
+        // If nothing dispatched, the guard is reset (still-current) so a reconnect
+        // re-probes.
+        let reset_pos = body
+            .find("if !any_dispatched")
+            .expect("must reset the guard when no probe dispatched");
+        let reset_block = &body[reset_pos..(reset_pos + 200).min(body.len())];
+        assert!(
+            reset_block.contains("load_attempt_is_current(attempt)")
+                && reset_block.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"),
+            "all-sends-failed (still current) must reset LEGACY_MIGRATION_ATTEMPTED so a reconnect re-probes"
         );
     }
 
@@ -2331,12 +2975,24 @@ pub(crate) async fn ensure_room_subscription_once(
 async fn fire_list_rooms_request() {
     info!("Firing ListRequest to enumerate delegate keys for room load");
 
+    // freenet/river#397 review 11: this runs in `set_up_chat_delegate`'s
+    // continuation, ACROSS an awaited send. Capture the attempt so its failure
+    // writes (below) gate on still-current — a reconnect that fires
+    // `begin_load_attempt` mid-send must not get a stale LoadFailed.
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+
     let request = ChatDelegateRequestMsg::ListRequest;
 
     // Serialize and send the request without waiting for response
     let mut payload = Vec::new();
     if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
         error!("Failed to serialize list-rooms request: {}", e);
+        // freenet/river#397 Codex review 5/7/11: the initial list request
+        // definitively failed, so the load can never resolve on its own (no
+        // ListResponse → no worker). Record the failure AND resolve LoadFailed now
+        // (if still current + empty) rather than wait for the hard-max / show Empty.
+        mark_fetch_failure_if_current(attempt);
+        resolve_load_failed_if_empty(attempt);
         return;
     }
 
@@ -2367,6 +3023,12 @@ async fn fire_list_rooms_request() {
 
     if let Err(e) = api_result {
         error!("Failed to send list-rooms request: {}", e);
+        // freenet/river#397 Codex review 5/7/11: the SEND itself failed (no
+        // response will ever come, no worker), so mark the attempt failed AND
+        // resolve LoadFailed now (if still current + empty) instead of a silent
+        // Empty / hard-max wait.
+        mark_fetch_failure_if_current(attempt);
+        resolve_load_failed_if_empty(attempt);
     } else {
         info!("List-rooms request sent, response will be handled by message loop");
     }
@@ -3922,6 +4584,505 @@ pub fn clear_legacy_migration_in_progress() {
     }
 }
 
+// =============================================================================
+// ROOM-LIST LOAD STATE (freenet/river#397)
+// Drives the rooms rail's non-room display so an empty `ROOMS` map during
+// startup / migration doesn't render a blank list that reads as data loss.
+// =============================================================================
+
+/// Coarse state of the initial room-list load, consumed by `RoomList` to decide
+/// what to show while `ROOMS` is still empty (spinner vs. migrating vs. a calm
+/// "no rooms yet"). Deliberately coarse: the room COUNT (from `ROOMS`) decides
+/// list-vs-none; this only disambiguates the three non-room states.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoomsLoadState {
+    /// The initial startup load has not resolved yet — the current delegate's
+    /// `ListResponse` isn't classified, or a fire-and-forget legacy probe is
+    /// outstanding and no migration has started. The honest "we don't know yet".
+    Loading,
+    /// A delegate/room migration is actively recovering rooms (the case Ivvor
+    /// hit after a delegate-WASM upgrade). Shown so a migrating user never reads
+    /// the empty rail as "my rooms are gone".
+    Migrating,
+    /// The load resolved: either rooms are present (the list renders them) or the
+    /// user genuinely has none (the calm empty state). Reached ONLY at a real
+    /// completion point or the timeout backstop — never speculatively, so an
+    /// existing user mid-migration can't flash "no rooms yet".
+    Loaded,
+    /// A load that we know involved rooms FAILED or stalled — a LISTED
+    /// `room:<vk>` key's fetch didn't materialize (transport/parse error), or the
+    /// backstop fired while a known-rooms fetch had failed. Renders a distinct
+    /// error + Retry block rather than a false "no rooms yet" (freenet/river#397
+    /// Codex review 4). Distinguished from a genuine empty by `SAW_FETCH_FAILURE`.
+    LoadFailed,
+}
+
+/// Reactive room-list load state. Starts `Loading`; advanced to `Loaded` at the
+/// real completion points (see `set_rooms_load_state` call sites) and to
+/// `Migrating` when a legacy migration re-save starts. A reactive signal (not a
+/// bare localStorage read of `is_legacy_migration_in_progress()`) because the
+/// render must re-run when the state transitions, and a migration's start does
+/// not otherwise touch a signal `RoomList` subscribes to.
+pub static ROOMS_LOAD_STATE: GlobalSignal<RoomsLoadState> = Global::new(|| RoomsLoadState::Loading);
+
+/// Set the room-list load state, deferred per the Dioxus signal-safety rules
+/// (all callers run inside spawned load/migration tasks that may hold a signal
+/// borrow). The `peek` guard avoids spurious writes / re-renders when the state
+/// is unchanged.
+pub(crate) fn set_rooms_load_state(state: RoomsLoadState) {
+    crate::util::defer(move || {
+        if *ROOMS_LOAD_STATE.peek() != state {
+            *ROOMS_LOAD_STATE.write() = state;
+        }
+    });
+}
+
+/// After the current delegate's `ListResponse` is classified as `ProbeLegacy`,
+/// pick the load state. A pure decision so the "new user never gets stuck
+/// loading" invariant is unit-testable.
+///
+/// - `fired_legacy_probes == false` — the probe was skipped (already migrated,
+///   or already attempted this session), so nothing more is coming: the load is
+///   resolved (`Loaded`). This is the fast path for a returning empty user.
+/// - `fired_legacy_probes == true` — probes were dispatched fire-and-forget. A
+///   migration MIGHT still arrive (existing user with legacy-only data) OR
+///   nothing will (brand-new user whose node has no legacy delegates). We cannot
+///   tell synchronously, so we stay `Loading`: the migration path flips us to
+///   `Migrating`/`Loaded` if data arrives, and the timeout backstop
+///   (`backstop_resolve`) flips us to `Loaded` if it doesn't. Staying `Loading`
+///   (never optimistic `Loaded`) is what stops an existing user from flashing
+///   "no rooms yet" before their migration starts.
+pub(crate) fn load_state_after_probe_legacy(fired_legacy_probes: bool) -> RoomsLoadState {
+    if fired_legacy_probes {
+        RoomsLoadState::Loading
+    } else {
+        RoomsLoadState::Loaded
+    }
+}
+
+/// Set `true` whenever a LISTED `room:<vk>` key's GET fails to materialize (a
+/// transport `Err`, an unexpected `Ok(other)`, or an unparseable slot) in EITHER
+/// the current-delegate per-room load OR a legacy per-room probe. It is NOT set
+/// for a definitive `value: None` (a legitimate skip) or a `Tombstone` (a genuine
+/// "left room"). This is the signal that distinguishes a genuinely-empty load
+/// (new user → Empty) from a failed load of a user who HAS rooms (→ LoadFailed).
+/// Reset at the start of a load (`set_up_chat_delegate`) and on Retry
+/// (`retry_rooms_load`). freenet/river#397 Codex review 4.
+pub(crate) static SAW_FETCH_FAILURE: AtomicBool = AtomicBool::new(false);
+
+/// Record that a listed room's fetch failed to materialize.
+pub(crate) fn mark_fetch_failure() {
+    SAW_FETCH_FAILURE.store(true, Ordering::Relaxed);
+}
+
+/// The terminal state the backstop resolves a still-non-terminal load to,
+/// given the CURRENT state and whether any known-rooms fetch failed. Pure, so
+/// every branch is unit-testable. freenet/river#397 Codex review 4/5:
+/// - `Migrating` → `LoadFailed`. We only ever set `Migrating` after a non-empty
+///   index PROVED rooms exist, so a migration still running at the 30s deadline
+///   is a stall of a known-non-empty load — an honest error+retry, NOT Empty.
+///   It self-corrects to `List` if the migration later completes and hydrates
+///   rooms (a non-empty `ROOMS` outranks the load state).
+/// - `Loading` → `LoadFailed` if a known-rooms fetch failed, else `Loaded`
+///   (a genuine empty / new user with nothing to load).
+/// - `Loaded` / `LoadFailed` are already terminal → returned unchanged.
+pub(crate) fn backstop_terminal(
+    current: RoomsLoadState,
+    saw_fetch_failure: bool,
+) -> RoomsLoadState {
+    match current {
+        RoomsLoadState::Migrating => RoomsLoadState::LoadFailed,
+        RoomsLoadState::Loading => {
+            if saw_fetch_failure {
+                RoomsLoadState::LoadFailed
+            } else {
+                RoomsLoadState::Loaded
+            }
+        }
+        // Already terminal.
+        other => other,
+    }
+}
+
+/// Whether a backstop timer armed at generation `armed_gen` should still apply
+/// its resolution, given the current attempt generation. Pure so the stale-timer
+/// invalidation is unit-testable. A retry increments the generation, so a timer
+/// from an earlier attempt (or any other late callback) is a no-op and cannot
+/// resolve the retry's fresh `Loading`/`Migrating` prematurely. freenet/river#397
+/// Codex review 5 (P2a).
+pub(crate) fn backstop_should_apply(armed_gen: u32, current_gen: u32) -> bool {
+    armed_gen == current_gen
+}
+
+/// The current-delegate per-room load terminal (authoritative, awaited — resolves
+/// FAST, no waiting on the backstop). Pure decision:
+/// - `map` non-empty → `Loaded` (rooms present → the list renders them);
+/// - `map` empty AND rooms were listed AND a listed fetch failed → `LoadFailed`
+///   (we KNOW rooms exist but couldn't load them — never "no rooms yet");
+/// - `map` empty otherwise (nothing listed, or every listed slot was a clean
+///   `value: None`/`Tombstone`) → `Loaded` (a genuine empty).
+///
+/// freenet/river#397 Codex review 4.
+pub(crate) fn per_room_terminal(
+    map_empty: bool,
+    listed_count: usize,
+    had_fetch_error: bool,
+) -> RoomsLoadState {
+    if !map_empty {
+        RoomsLoadState::Loaded
+    } else if listed_count > 0 && had_fetch_error {
+        RoomsLoadState::LoadFailed
+    } else {
+        RoomsLoadState::Loaded
+    }
+}
+
+// =============================================================================
+// PROGRESS-TRACKED LOAD TERMINATION (freenet/river#397 Codex review 6)
+// Termination is driven by the actual load WORK finishing, not a fixed
+// wall-clock timer: a pending-worker counter + a debounced quiescence idle
+// timer make the primary decision, and a generous hard-max is a last resort.
+// =============================================================================
+
+/// Number of ACTIVE awaited load workers (current-delegate load, blob
+/// migration, each legacy per-room probe, each legacy single-blob hydrate).
+/// While this is non-zero the load is still making progress, so nothing resolves
+/// it. Each worker holds a [`LoadWorkerGuard`].
+pub(crate) static PENDING_LOADS: AtomicU32 = AtomicU32::new(0);
+
+/// A "progress pulse" bumped whenever a load worker STARTS. It invalidates any
+/// armed idle-resolution: a new worker beginning means the load is still active,
+/// so a previously-armed quiescence timer must not fire.
+pub(crate) static LOAD_ACTIVITY_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// Quiescence window: once the last worker settles with an empty result and no
+/// fetch failure, wait this long for a late (fire-and-forget legacy) response
+/// before resolving to Empty. A new worker starting (activity-gen bump) cancels
+/// it. Short because delegate ops are node-local (sub-second).
+const LOAD_IDLE_MS: u64 = 4_000;
+
+/// Absolute last-resort safety net (defense-in-depth for invariant 2). The
+/// progress-tracked idle resolution terminates first in practice; this only
+/// fires if the counter logic ever leaks a worker. Generous so it never
+/// pre-empts a genuinely-progressing load.
+const LOAD_HARD_MAX_MS: u64 = 60_000;
+
+/// RAII guard marking an active AWAITED load worker (freenet/river#397 review
+/// 6/7). `new` captures the current [`LOAD_ATTEMPT_GEN`], increments
+/// [`PENDING_LOADS`], and bumps [`LOAD_ACTIVITY_GEN`] (a progress pulse that
+/// cancels any armed idle resolution).
+///
+/// ATTEMPT-SCOPED (review 7): a Retry bumps `LOAD_ATTEMPT_GEN` and zeroes
+/// `PENDING_LOADS`, so a worker still in flight from the OLD attempt must not
+/// touch the new attempt's state. `Drop` therefore no-ops entirely when the
+/// guard's attempt is stale (no decrement, no settle — the count was already
+/// zeroed), and its `mark_fetch_failure` / `set_load_state` write helpers (which
+/// route through the attempt-gated `mark_fetch_failure_if_current` /
+/// `set_load_state_if_current`) gate every global write on still-current, so a
+/// stale worker can neither pollute the retry's `SAW_FETCH_FAILURE` nor write its
+/// display state.
+pub(crate) struct LoadWorkerGuard {
+    attempt: u32,
+}
+
+impl LoadWorkerGuard {
+    pub(crate) fn new() -> Self {
+        let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+        PENDING_LOADS.fetch_add(1, Ordering::Relaxed);
+        LOAD_ACTIVITY_GEN.fetch_add(1, Ordering::Relaxed);
+        LoadWorkerGuard { attempt }
+    }
+
+    /// The attempt this worker belongs to — threaded into SPAWNED closures /
+    /// helper fns (`hydrate_loaded_rooms`, the blob save closure) that outlive the
+    /// guard's sync body, so their late writes gate on the same attempt (review 11).
+    /// `load_attempt_is_current(worker.attempt())` is the "am I current" query.
+    pub(crate) fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// `mark_fetch_failure`, ONLY for the current attempt (review 7/11). Routes
+    /// through the uniform helper.
+    pub(crate) fn mark_fetch_failure(&self) {
+        mark_fetch_failure_if_current(self.attempt);
+    }
+
+    /// `set_rooms_load_state`, ONLY for the current attempt (review 7/11). Routes
+    /// through the uniform helper (checks the attempt at the deferred write).
+    pub(crate) fn set_load_state(&self, state: RoomsLoadState) {
+        set_load_state_if_current(self.attempt, state);
+    }
+}
+
+impl Drop for LoadWorkerGuard {
+    fn drop(&mut self) {
+        // A worker from a SUPERSEDED attempt (a Retry bumped LOAD_ATTEMPT_GEN and
+        // zeroed PENDING_LOADS) must NOT decrement the new attempt's count or
+        // settle it — its Drop is a complete no-op (review 7 P2#1).
+        if !guard_drop_applies(self.attempt, LOAD_ATTEMPT_GEN.load(Ordering::Relaxed)) {
+            return;
+        }
+        let _ = PENDING_LOADS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+        on_load_worker_settled();
+    }
+}
+
+/// Whether a load worker's Drop (or write) still applies, given the attempt it
+/// was created under vs. the current attempt. Pure. A Retry advances the current
+/// attempt, so a superseded worker's Drop and writes are no-ops. review 7 P2#1.
+pub(crate) fn guard_drop_applies(guard_attempt: u32, current_attempt: u32) -> bool {
+    guard_attempt == current_attempt
+}
+
+/// Whether a captured load-attempt is still the current one. For code that
+/// isn't inside a [`LoadWorkerGuard`] (e.g. `fire_legacy_migration_request`,
+/// which runs across an awaited send sequence) but must still gate its global
+/// writes so a reconnect's `begin_load_attempt` doesn't get polluted by a stale
+/// probe's late failure (review 10 P2#1). Reuses the `guard_drop_applies` rule.
+pub(crate) fn load_attempt_is_current(captured_attempt: u32) -> bool {
+    guard_drop_applies(captured_attempt, LOAD_ATTEMPT_GEN.load(Ordering::Relaxed))
+}
+
+/// The DEFINITIVE completion decision once every load worker has settled. Pure.
+/// - `!room_count_zero` → `None`: rooms are present, the List renders — leave the
+///   load state alone.
+/// - `room_count_zero && saw_fetch_failure` → `Some(LoadFailed)`: empty, and a
+///   known-rooms fetch failed → error+retry, never a false Empty.
+/// - `room_count_zero && !saw_fetch_failure` → `None`: empty with no failure — the
+///   caller arms the debounced idle timer (a late legacy response may still bring
+///   rooms; if none does, quiescence resolves to Empty).
+///
+/// freenet/river#397 Codex review 6.
+pub(crate) fn settle_terminal(
+    room_count_zero: bool,
+    saw_fetch_failure: bool,
+) -> Option<RoomsLoadState> {
+    if !room_count_zero {
+        None
+    } else if saw_fetch_failure {
+        Some(RoomsLoadState::LoadFailed)
+    } else {
+        None
+    }
+}
+
+/// Whether an armed idle-resolution should still apply. Cancelled by any new
+/// worker (activity-gen bump), a retry (attempt-gen bump), or a worker becoming
+/// active again (`pending != 0`). Pure. freenet/river#397 Codex review 6.
+pub(crate) fn idle_should_apply(
+    armed_gen: u32,
+    current_gen: u32,
+    armed_attempt: u32,
+    current_attempt: u32,
+    pending: u32,
+) -> bool {
+    armed_gen == current_gen && armed_attempt == current_attempt && pending == 0
+}
+
+/// Read whether the in-memory rooms map is empty. Only called from within a
+/// `defer` (Dioxus runtime present); `peek` avoids registering a subscription.
+fn rooms_map_is_empty() -> bool {
+    ROOMS.peek().map.is_empty()
+}
+
+/// Write the load state directly. Only called from within a `defer`/runtime
+/// context (the settled + idle handlers run in one); the `peek` guard avoids a
+/// spurious write / re-render when unchanged.
+fn write_load_state_now(state: RoomsLoadState) {
+    if *ROOMS_LOAD_STATE.peek() != state {
+        *ROOMS_LOAD_STATE.write() = state;
+    }
+}
+
+/// UNIFORM attempt-gated load-state write (freenet/river#397 Codex review 11).
+/// EVERY write to `ROOMS_LOAD_STATE` that runs in or after an `.await` MUST route
+/// through this (or the `LoadWorkerGuard` helpers, which delegate to it) with the
+/// attempt captured at its async context's START. Deferred, and the attempt is
+/// re-checked INSIDE the defer (at the write moment), so a superseded attempt's
+/// late write is a no-op — closing the "stale async write lands on the new
+/// attempt" class by construction.
+pub(crate) fn set_load_state_if_current(attempt: u32, state: RoomsLoadState) {
+    crate::util::defer(move || {
+        if load_attempt_is_current(attempt) {
+            write_load_state_now(state);
+        }
+    });
+}
+
+/// UNIFORM attempt-gated `mark_fetch_failure` (review 11). `SAW_FETCH_FAILURE` is
+/// a lock-free atomic, so the check is synchronous at the write point. Route
+/// every post-await mark through this with the captured attempt. `begin_load_attempt`
+/// advances `LOAD_ATTEMPT_GEN` BEFORE it clears `SAW_FETCH_FAILURE`, so a stale
+/// mark that races the reset sees the advanced gen and no-ops.
+pub(crate) fn mark_fetch_failure_if_current(attempt: u32) {
+    if load_attempt_is_current(attempt) {
+        mark_fetch_failure();
+    }
+}
+
+/// Resolve to `LoadFailed` IF the rooms map is currently empty AND `attempt` is
+/// still current — for a DEFINITIVE stored-data failure discovered OUTSIDE any
+/// live load worker (so no worker settlement resolves it) that may run AFTER the
+/// state already reached a terminal `Loaded`(Empty) (freenet/river#397 review
+/// 7/11). Deferred; both the attempt and emptiness are checked inside the defer
+/// (at the write moment). A non-empty map is left as `List`. Used by
+/// `fire_list_rooms_request`'s send/serialize errors and `set_up_chat_delegate`'s
+/// RegisterDelegate failure.
+pub(crate) fn resolve_load_failed_if_empty(attempt: u32) {
+    crate::util::defer(move || {
+        if load_attempt_is_current(attempt) && rooms_map_is_empty() {
+            write_load_state_now(RoomsLoadState::LoadFailed);
+        }
+    });
+}
+
+/// Called when a load worker drops (and by the fire-and-forget legacy-probe path
+/// once it's quiescent). If work is still active, no-op. Otherwise makes the
+/// definitive completion decision ([`settle_terminal`]): resolve `LoadFailed` on
+/// a known-rooms failure, leave the state when rooms render (List), or arm the
+/// debounced idle timer for the empty+no-failure case. freenet/river#397 review 6.
+pub(crate) fn on_load_worker_settled() {
+    if PENDING_LOADS.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let armed_gen = LOAD_ACTIVITY_GEN.load(Ordering::Relaxed);
+    let armed_attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    crate::util::defer(move || {
+        // A worker may have STARTED between the drop and this deferred decision.
+        if PENDING_LOADS.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        // A Retry/reconnect may have advanced the attempt between the (current)
+        // worker's Drop and this deferred settle → this settlement belongs to a
+        // superseded attempt, so it must not write the new attempt's state
+        // (review 11). The Drop itself is gated (guard_drop_applies), but the
+        // defer runs later.
+        if !load_attempt_is_current(armed_attempt) {
+            return;
+        }
+        let room_count_zero = rooms_map_is_empty();
+        let saw = SAW_FETCH_FAILURE.load(Ordering::Relaxed);
+        match settle_terminal(room_count_zero, saw) {
+            Some(state) => write_load_state_now(state),
+            None if room_count_zero => schedule_idle_resolution(armed_gen, armed_attempt),
+            None => {} // rooms present → List renders, leave the state
+        }
+    });
+}
+
+/// Arm the debounced quiescence timer. After [`LOAD_IDLE_MS`] with no new
+/// activity (same gens, no pending worker), the empty+no-failure load resolves to
+/// `Loaded` (genuine Empty) — or `LoadFailed` if a fetch failure arrived in the
+/// meantime.
+fn schedule_idle_resolution(armed_gen: u32, armed_attempt: u32) {
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(std::time::Duration::from_millis(LOAD_IDLE_MS)).await;
+        crate::util::defer(move || {
+            let cur_gen = LOAD_ACTIVITY_GEN.load(Ordering::Relaxed);
+            let cur_attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+            let pending = PENDING_LOADS.load(Ordering::Relaxed);
+            if !idle_should_apply(armed_gen, cur_gen, armed_attempt, cur_attempt, pending) {
+                return; // superseded by new activity / retry / an active worker
+            }
+            if !rooms_map_is_empty() {
+                return; // rooms arrived → List renders
+            }
+            let resolved = if SAW_FETCH_FAILURE.load(Ordering::Relaxed) {
+                RoomsLoadState::LoadFailed
+            } else {
+                RoomsLoadState::Loaded // genuine Empty after quiescence
+            };
+            write_load_state_now(resolved);
+        });
+    });
+}
+
+/// Monotonic load-attempt generation (freenet/river#397 Codex review 5/8).
+/// Advanced by [`begin_load_attempt`] — i.e. by EVERY load entry point
+/// (`set_up_chat_delegate`'s initial + reconnect/wake passes, and
+/// `retry_rooms_load`). Every attempt-scoped worker and every hard-max timer
+/// captures the generation at start and only acts while it is unchanged
+/// (`guard_drop_applies` / `backstop_should_apply`), so a worker or timer from a
+/// superseded attempt is a complete no-op.
+static LOAD_ATTEMPT_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// Begin a FRESH load attempt (freenet/river#397 Codex review 8). Called at the
+/// TOP of every load entry point — `set_up_chat_delegate` (initial AND every
+/// reconnect/wake) and `retry_rooms_load`. Advancing `LOAD_ATTEMPT_GEN` makes
+/// every worker and timer from the previous pass stale/inert (attempt-scoped
+/// guard), so overlapping passes are harmless. It also zeroes the pending-worker
+/// count, clears `SAW_FETCH_FAILURE`, returns the rail to `Loading`, and arms a
+/// fresh gen-guarded hard-max backstop. Does NOT touch `LEGACY_MIGRATION_ATTEMPTED`
+/// — a plain reconnect must not force a legacy re-probe (preserves the #253 gate);
+/// only `retry_rooms_load` re-enables it.
+pub(crate) fn begin_load_attempt() {
+    LOAD_ATTEMPT_GEN.fetch_add(1, Ordering::Relaxed);
+    PENDING_LOADS.store(0, Ordering::Relaxed);
+    SAW_FETCH_FAILURE.store(false, Ordering::Relaxed);
+    LOAD_ACTIVITY_GEN.fetch_add(1, Ordering::Relaxed);
+    set_rooms_load_state(RoomsLoadState::Loading);
+    schedule_rooms_load_backstop();
+}
+
+/// Arm a fresh gen-guarded HARD-MAX backstop for the current attempt
+/// (freenet/river#397 review 6/8). Armed once per attempt by [`begin_load_attempt`]
+/// (which bumps `LOAD_ATTEMPT_GEN` first), so every prior attempt's timer is a
+/// stale no-op via [`backstop_should_apply`] — correct across reconnects with no
+/// once-per-session guard. Last-resort safety net: the progress-tracked idle
+/// resolution ([`on_load_worker_settled`]) terminates the load first in practice;
+/// this only fires if the worker counter ever leaks. See [`backstop_terminal`].
+fn schedule_rooms_load_backstop() {
+    // Capture the attempt generation this timer belongs to.
+    let armed_gen = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(std::time::Duration::from_millis(LOAD_HARD_MAX_MS)).await;
+        crate::util::defer(move || {
+            // A newer attempt superseded this timer → no-op, so a stale timer
+            // can't resolve a fresh attempt's Loading/Migrating.
+            if !backstop_should_apply(armed_gen, LOAD_ATTEMPT_GEN.load(Ordering::Relaxed)) {
+                return;
+            }
+            let saw_failure = SAW_FETCH_FAILURE.load(Ordering::Relaxed);
+            let resolved = backstop_terminal(*ROOMS_LOAD_STATE.peek(), saw_failure);
+            write_load_state_now(resolved);
+        });
+    });
+}
+
+/// Retry a failed room-list load (freenet/river#397 Codex review 4/5/8/9). Wired
+/// to the `LoadFailed` block's Retry button. Signal-safe: `set_rooms_load_state`
+/// and `safe_spawn_local` both defer, and the atomics are lock-free, so this is
+/// safe to call directly from an `onclick` handler.
+///
+/// Re-runs the FULL setup path — `set_up_chat_delegate()` re-registers the
+/// delegate AND loads — so a `LoadFailed` produced by a `RegisterDelegate`
+/// failure (first use / delegate not installed) can actually be repaired; a bare
+/// `fire_list_rooms_request()` to an unregistered delegate never could (review 9,
+/// P2). `set_up_chat_delegate` calls `begin_load_attempt()` at its top, so we do
+/// NOT call it here (avoid a double attempt bump) — the re-setup owns the fresh
+/// attempt. Retry-only: re-enable the legacy probe so a legacy source that FAILED
+/// this session is re-probed (`is_legacy_migration_done` is left alone). If the
+/// delegate genuinely has no rooms this time the fast ProbeLegacy/PerRoom terminal
+/// resolves to `Loaded` (→ Empty); if it succeeds it renders the list; if setup or
+/// load fails again it returns to `LoadFailed`.
+pub(crate) fn retry_rooms_load() {
+    // Retry-only (deliberately NOT in `begin_load_attempt`): re-enable the legacy
+    // probe so a legacy source that failed THIS session is retried (P1b). A plain
+    // reconnect must not force this (it would defeat the #253 done-gate). Set
+    // BEFORE the re-setup so `fire_legacy_migration_request` sees it cleared.
+    LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+    crate::util::safe_spawn_local(async {
+        // set_up_chat_delegate begins the fresh attempt AND re-registers; its Err
+        // path resolves LoadFailed, so a persistent registration failure re-shows
+        // Retry rather than getting stuck.
+        if let Err(e) = set_up_chat_delegate().await {
+            error!("Retry: chat delegate setup failed: {}", e);
+        }
+    });
+}
+
 /// Guard to prevent repeated legacy migration attempts within the same session.
 /// The migration is fire-and-forget: if the legacy delegates don't exist on the node,
 /// the node returns "delegate not found" errors that never reach the response handler's
@@ -3964,24 +5125,47 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
 /// may have data is unsafe because a legacy response can trigger a save that
 /// overwrites the current delegate's storage before its GET response arrives,
 /// destroying rooms the user created after the last legacy snapshot.
-pub(crate) async fn fire_legacy_migration_request() {
+///
+/// Returns `true` if it actually dispatched legacy probes, `false` if it skipped
+/// (migration already done, or already attempted this session). The room-list
+/// load path (freenet/river#397) uses this to decide whether to stay `Loading`
+/// (probes fired — a migration might still arrive) or resolve to `Loaded`
+/// (nothing more is coming) — see [`load_state_after_probe_legacy`].
+pub(crate) async fn fire_legacy_migration_request() -> bool {
     // Check if migration has already been done (persistent across sessions)
     if is_legacy_migration_done() {
         info!("Legacy migration already done, skipping");
-        return;
+        return false;
     }
 
     // Only attempt migration once per session to avoid error spam on reconnect.
     // If the legacy delegates aren't installed, retrying won't help.
     if LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
         info!("Legacy migration already attempted this session, skipping");
-        return;
+        return false;
     }
 
     info!(
         "Attempting to migrate data from {} legacy delegate(s)",
         LEGACY_DELEGATES.len()
     );
+
+    // freenet/river#397 Codex review 9 (P1): distinguish a TRANSPORT failure (a
+    // send that returns Err — connection closed) from the genuine new-user case
+    // (a send that SUCCEEDS but the legacy delegate isn't present, so the node
+    // silently drops the response). A send returning Err → mark_fetch_failure so
+    // the load resolves to LoadFailed (Retry), NOT a false Empty. `any_dispatched`
+    // tracks whether ANY probe actually went out; if none did (connection down),
+    // we reset the once-per-session guard below so a reconnect re-probes — the
+    // probe never left, so don't burn the guard on a transport failure.
+    //
+    // Review 10 (P2#1): this probe awaits a whole send sequence, so a reconnect's
+    // `begin_load_attempt` can advance the attempt mid-flight. Capture the attempt
+    // and gate the global writes (`mark_fetch_failure`, the guard reset) on
+    // still-current, so a STALE probe's late send-failure can't pollute the new
+    // attempt's `SAW_FETCH_FAILURE` into a false LoadFailed.
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    let mut any_dispatched = false;
 
     for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {
         let legacy_code_hash = CodeHash::new(*code_hash_bytes);
@@ -4028,19 +5212,27 @@ pub(crate) async fn fire_legacy_migration_request() {
             };
 
             match api_result {
-                Ok(_) => info!(
-                    "Legacy migration request #{} sent for key {:?}",
-                    i,
-                    String::from_utf8_lossy(storage_key)
-                ),
-                Err(e) => {
+                Ok(_) => {
+                    any_dispatched = true;
                     info!(
-                        "Could not send legacy migration request #{} for key {:?} \
-                         (expected if delegate not present): {}",
+                        "Legacy migration request #{} sent for key {:?}",
+                        i,
+                        String::from_utf8_lossy(storage_key)
+                    );
+                }
+                Err(e) => {
+                    // A send that RETURNS Err is a transport failure (connection
+                    // closed), NOT "delegate not present". Mark it (P1) — but only
+                    // for the current attempt (P2#1), so a stale probe can't
+                    // pollute a reconnect's fresh load.
+                    info!(
+                        "Legacy migration request #{} for key {:?} failed to send \
+                         (transport): {}",
                         i,
                         String::from_utf8_lossy(storage_key),
                         e
                     );
+                    mark_fetch_failure_if_current(attempt);
                 }
             }
         }
@@ -4078,10 +5270,28 @@ pub(crate) async fn fire_legacy_migration_request() {
             }
         };
         match list_result {
-            Ok(_) => info!("Legacy ListRequest #{i} sent for per-room key discovery"),
-            Err(e) => info!(
-                "Could not send legacy ListRequest #{i} (expected if delegate not present): {e}"
-            ),
+            Ok(_) => {
+                any_dispatched = true;
+                info!("Legacy ListRequest #{i} sent for per-room key discovery");
+            }
+            Err(e) => {
+                // Transport failure on the ListRequest send → mark it (P1),
+                // current-attempt only (P2#1) via the uniform helper (review 11).
+                info!("Legacy ListRequest #{i} failed to send (transport): {e}");
+                mark_fetch_failure_if_current(attempt);
+            }
         }
     }
+
+    // freenet/river#397 Codex review 9 (P1): if NO probe was actually dispatched
+    // (every send failed — connection down), the once-per-session guard was set
+    // for a probe that never left. Reset it so a reconnect re-probes. Keep it set
+    // when at least one probe dispatched (a genuine new user whose node has no
+    // legacy delegate simply gets no response — do NOT re-probe-spam that case).
+    // Gated on still-current (P2#1): a stale probe must not reopen the guard for
+    // the new attempt (whose own probe already ran / set it).
+    if !any_dispatched && load_attempt_is_current(attempt) {
+        LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+    }
+    true
 }
