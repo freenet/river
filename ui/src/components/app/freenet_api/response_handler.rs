@@ -15,8 +15,8 @@ use crate::components::app::chat_delegate::{
     decide_per_room_load_action, fire_legacy_migration_request, get_versioned_correlation_key,
     hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
     is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_fetch_failure, mark_legacy_migration_done, mark_legacy_migration_in_progress,
-    parse_room_storage_key, per_room_terminal, prune_outbound_dms_for_purges, room_storage_key,
+    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
+    per_room_terminal, prune_outbound_dms_for_purges, room_storage_key,
     save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
     send_delegate_request_to, set_rooms_load_state, LegacyMigrationAction, LoadWorkerGuard,
     RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
@@ -307,6 +307,16 @@ impl ResponseHandler {
                                         // Check if this is the rooms data
                                         if key.as_bytes() == ROOMS_STORAGE_KEY {
                                             if let Some(rooms_data) = value {
+                                                // Progress-tracked termination
+                                                // (freenet/river#397 review 6/7):
+                                                // the legacy single-blob response
+                                                // is a load worker. The guard wraps
+                                                // BOTH parse arms so the Err arm's
+                                                // failure is attempt-scoped AND its
+                                                // settlement resolves `LoadFailed`
+                                                // even if it arrives AFTER the idle
+                                                // timer already set Empty (P2#2).
+                                                let worker = LoadWorkerGuard::new();
                                                 // Deserialize the rooms data
                                                 match from_reader::<Rooms, _>(&rooms_data[..]) {
                                                     Ok(loaded_rooms) => {
@@ -345,16 +355,6 @@ impl ResponseHandler {
                                                             }
                                                         }
 
-                                                        // Progress-tracked
-                                                        // termination
-                                                        // (freenet/river#397
-                                                        // review 6): the legacy
-                                                        // single-blob hydrate is a
-                                                        // load worker. The guard
-                                                        // bumps activity (cancels a
-                                                        // pending idle resolution)
-                                                        // and, on drop, settles.
-                                                        let _worker = LoadWorkerGuard::new();
                                                         if hydrate_loaded_rooms(
                                                             loaded_rooms,
                                                             is_legacy_delegate,
@@ -367,18 +367,20 @@ impl ResponseHandler {
                                                             "Failed to deserialize rooms data: {}",
                                                             e
                                                         );
-                                                        // freenet/river#397 Codex review 5
-                                                        // (audit): a `rooms_data` blob exists
-                                                        // only because rooms were stored in it.
-                                                        // This arm is reachable only for a LEGACY
-                                                        // delegate (the current-delegate flow is
-                                                        // List-driven), so a parse failure is
-                                                        // known-stored legacy data that failed to
-                                                        // load — mark it so the backstop resolves
-                                                        // to LoadFailed, not a silent Empty. (A
-                                                        // genuine new user has no legacy delegate
-                                                        // responding, so never reaches here.)
-                                                        mark_fetch_failure();
+                                                        // freenet/river#397 review 5/7: a
+                                                        // `rooms_data` blob exists only because
+                                                        // rooms were stored in it. This arm is
+                                                        // reachable only for a LEGACY delegate (the
+                                                        // current-delegate flow is List-driven), so
+                                                        // a parse failure is known-stored legacy
+                                                        // data that failed to load. Attempt-scoped
+                                                        // mark; the guard's settlement (on drop)
+                                                        // resolves `LoadFailed` — correcting a
+                                                        // premature Empty from a late response
+                                                        // (P2#2). (A genuine new user has no legacy
+                                                        // delegate responding, so never reaches
+                                                        // here.)
+                                                        worker.mark_fetch_failure();
                                                     }
                                                 }
                                             } else {
@@ -641,7 +643,12 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
     // settled-handler re-evaluates whether the load is complete. For the
     // ProbeLegacy case the guard drop is exactly the "fired the fire-and-forget
     // probe and became quiescent" point that arms the idle timer.
-    let _worker = LoadWorkerGuard::new();
+    //
+    // Attempt-scoped (review 7): every global write below goes through
+    // `worker.mark_fetch_failure()` / `worker.set_load_state()` so a stale worker
+    // (superseded by a Retry) can neither pollute the new attempt's
+    // `SAW_FETCH_FAILURE` nor write its display state.
+    let worker = LoadWorkerGuard::new();
     match plan_load_from_keys(&keys) {
         LoadPlan::ProbeLegacy => {
             info!("Current delegate has no room data — firing legacy migration probe");
@@ -651,7 +658,7 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // empty user). The universal backstop (armed in `set_up_chat_delegate`)
             // guarantees termination if the probe finds nothing.
             let fired = fire_legacy_migration_request().await;
-            set_rooms_load_state(load_state_after_probe_legacy(fired));
+            worker.set_load_state(load_state_after_probe_legacy(fired));
         }
         LoadPlan::MigrateCurrentBlob => {
             info!(
@@ -710,7 +717,7 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                             // materialize — a fetch failure.
                             error!("Unparseable room slot for {:?}: {}", vk, e);
                             had_fetch_error = true;
-                            mark_fetch_failure();
+                            worker.mark_fetch_failure();
                         }
                     },
                     Ok(ChatDelegateResponseMsg::GetResponse { value: None, .. }) => {
@@ -721,12 +728,12 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                     Ok(other) => {
                         error!("Unexpected response loading room {:?}: {:?}", vk, other);
                         had_fetch_error = true;
-                        mark_fetch_failure();
+                        worker.mark_fetch_failure();
                     }
                     Err(e) => {
                         error!("Failed to load room {:?}: {}", vk, e);
                         had_fetch_error = true;
-                        mark_fetch_failure();
+                        worker.mark_fetch_failure();
                     }
                 }
             }
@@ -775,7 +782,7 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // every slot a clean `value: None`/tombstone) → `Loaded` (Empty). Set
             // BEFORE the recovery re-run below so a recovery that finds stranded
             // rooms and sets `Migrating` wins over this terminal.
-            set_rooms_load_state(per_room_terminal(
+            worker.set_load_state(per_room_terminal(
                 loaded_map_empty,
                 listed_count,
                 had_fetch_error,
@@ -907,8 +914,9 @@ fn reconstruct_rooms(
 /// re-fires). Any real migration the recovery triggers still shows `Migrating`
 /// via the legacy `hydrate_loaded_rooms` path, which is not gated here.
 async fn migrate_current_blob_to_per_room(recovery: bool) {
-    // Progress-tracked termination (freenet/river#397 review 6): awaited worker.
-    let _worker = LoadWorkerGuard::new();
+    // Progress-tracked termination (freenet/river#397 review 6); attempt-scoped
+    // writes (review 7): a stale worker's `worker.*` calls no-op.
+    let worker = LoadWorkerGuard::new();
     match send_delegate_request(ChatDelegateRequestMsg::GetVersionedRequest {
         key: ChatDelegateKey::new(ROOMS_STORAGE_KEY.to_vec()),
     })
@@ -928,7 +936,7 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 // re-render lands on the "Migrating…" state before the list fills.
                 // Suppressed under `recovery` (the state is already `Loaded`).
                 if !recovery {
-                    set_rooms_load_state(RoomsLoadState::Migrating);
+                    worker.set_load_state(RoomsLoadState::Migrating);
                 }
                 // Did the blob carry any LIVE rooms (vs. all tombstones/empty)?
                 // freenet/river#397 Codex review 4: only a completion that merged
@@ -978,10 +986,10 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 // freenet/river#397 Codex review 5 (P2b): a `rooms_data` blob only
                 // exists because rooms were written to it, so a parse failure is
                 // known-stored-data that failed to load — surface LoadFailed (with
-                // Retry), NOT a false Empty. mark_fetch_failure so the backstop and
-                // any concurrent probe agree this attempt failed.
-                mark_fetch_failure();
-                set_rooms_load_state(RoomsLoadState::LoadFailed);
+                // Retry), NOT a false Empty. Attempt-scoped (review 7) so a stale
+                // worker doesn't corrupt the retry.
+                worker.mark_fetch_failure();
+                worker.set_load_state(RoomsLoadState::LoadFailed);
             }
         },
         Ok(_) => {
@@ -995,19 +1003,19 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             // skipped, `Loading` when it fired). The universal backstop (armed in
             // `set_up_chat_delegate`) guarantees termination for the fired case.
             if !recovery {
-                set_rooms_load_state(load_state_after_probe_legacy(fired));
+                worker.set_load_state(load_state_after_probe_legacy(fired));
             }
         }
         Err(e) => {
             // freenet/river#397 Codex review 5 (audit): we only reach this fn from
             // `LoadPlan::MigrateCurrentBlob`, i.e. the current delegate's index
             // LISTED a `rooms_data` key, so the blob exists — a SEND failure
-            // reading it is known-stored-data that failed to load. Mark the
-            // failure so the backstop resolves to LoadFailed (with Retry), not a
-            // silent Empty. (Display is masked by `List` if rooms are concurrently
-            // present.)
+            // reading it is known-stored-data that failed to load. Mark the failure
+            // (attempt-scoped, review 7) so the worker's settlement resolves to
+            // LoadFailed rather than a silent Empty. (Display is masked by `List`
+            // if rooms are concurrently present.)
             warn!("Failed to read current-delegate rooms blob: {}", e);
-            mark_fetch_failure();
+            worker.mark_fetch_failure();
         }
     }
 }
@@ -1031,8 +1039,9 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // function (including the empty-index early return) keeps the load alive
     // while this delegate is being processed, and cancels any pending idle
     // resolution (activity-gen bump) so a concurrent empty completion can't
-    // resolve Empty while this one may still bring rooms.
-    let _worker = LoadWorkerGuard::new();
+    // resolve Empty while this one may still bring rooms. Attempt-scoped writes
+    // (review 7): `worker.*` calls no-op for a stale worker.
+    let worker = LoadWorkerGuard::new();
     let (room_vks, has_meta) = match plan_load_from_keys(&keys) {
         LoadPlan::PerRoom { room_vks, has_meta } => (room_vks, has_meta),
         // No per-room keys on this legacy delegate — its single blob (if any) is
@@ -1052,7 +1061,7 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // probes may hold rooms); the universal backstop owns that terminal, and any
     // failed legacy fetch below sets `SAW_FETCH_FAILURE` so the backstop resolves
     // to `LoadFailed` rather than a false Empty.
-    set_rooms_load_state(RoomsLoadState::Migrating);
+    worker.set_load_state(RoomsLoadState::Migrating);
 
     info!(
         "Migrating {} per-room slot(s) from legacy delegate",
@@ -1074,13 +1083,13 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
                 Ok(slot) => slots.push((vk, slot)),
                 Err(e) => {
                     error!("Unparseable legacy room slot for {:?}: {}", vk, e);
-                    mark_fetch_failure();
+                    worker.mark_fetch_failure();
                 }
             },
             Ok(_) => warn!("Legacy room key {:?} listed but value missing", vk),
             Err(e) => {
                 error!("Failed to load legacy room {:?}: {}", vk, e);
-                mark_fetch_failure();
+                worker.mark_fetch_failure();
             }
         }
     }
@@ -2012,15 +2021,16 @@ mod tests {
             .expect("production code before `mod tests`");
 
         // (P2b) corrupt current-delegate `rooms_data` blob → mark_fetch_failure +
-        // LoadFailed (a blob exists only because rooms were written to it).
+        // LoadFailed (a blob exists only because rooms were written to it), both
+        // attempt-scoped through the worker (review 7).
         let corrupt = production
             .find("Failed to deserialize current-delegate rooms blob")
             .expect("corrupt-current-blob marker must exist");
         let corrupt_arm = &production[corrupt..(corrupt + 700).min(production.len())];
         assert!(
-            corrupt_arm.contains("mark_fetch_failure()")
-                && corrupt_arm.contains("set_rooms_load_state(RoomsLoadState::LoadFailed)"),
-            "a corrupt current rooms_data blob must mark_fetch_failure + LoadFailed, not Empty"
+            corrupt_arm.contains("worker.mark_fetch_failure()")
+                && corrupt_arm.contains("worker.set_load_state(RoomsLoadState::LoadFailed)"),
+            "a corrupt current rooms_data blob must worker.mark_fetch_failure + LoadFailed, not Empty"
         );
 
         // (audit) SEND failure reading the current blob (we're here only because
@@ -2042,9 +2052,47 @@ mod tests {
         let legacy_parse_arm =
             &production[legacy_parse..(legacy_parse + 1500).min(production.len())];
         assert!(
-            legacy_parse_arm.contains("mark_fetch_failure()"),
-            "a legacy rooms_data parse failure must mark_fetch_failure"
+            legacy_parse_arm.contains("worker.mark_fetch_failure()"),
+            "a legacy rooms_data parse failure must worker.mark_fetch_failure (settlement → LoadFailed)"
         );
+    }
+
+    /// freenet/river#397 review 7 (P2#1): every global write a load worker makes
+    /// must be attempt-scoped so a stale worker (superseded by a Retry) can't
+    /// corrupt the new attempt. Pin that NO bare `mark_fetch_failure()` survives
+    /// (all go through `worker.mark_fetch_failure()`) and the worker-body terminal
+    /// writes go through `worker.set_load_state(...)`.
+    #[test]
+    fn worker_global_writes_are_attempt_scoped() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        // Every `mark_fetch_failure()` occurrence is part of `worker.mark_fetch_failure()`.
+        assert_eq!(
+            production.matches("mark_fetch_failure()").count(),
+            production.matches("worker.mark_fetch_failure()").count(),
+            "a bare mark_fetch_failure() in a worker body would pollute a stale attempt's SAW_FETCH_FAILURE"
+        );
+        assert!(
+            production.matches("worker.mark_fetch_failure()").count() >= 5,
+            "the current + legacy fetch-failure arms must route through the worker"
+        );
+
+        // The worker-body terminal / probe / migrating writes are attempt-scoped.
+        for terminal in [
+            "worker.set_load_state(per_room_terminal(",
+            "worker.set_load_state(load_state_after_probe_legacy(fired))",
+            "worker.set_load_state(RoomsLoadState::Migrating)",
+            "worker.set_load_state(RoomsLoadState::LoadFailed)",
+        ] {
+            assert!(
+                production.contains(terminal),
+                "worker-body write `{terminal}` must be attempt-scoped via worker.set_load_state"
+            );
+        }
     }
 
     /// freenet/river#397 Codex review 3: in `migrate_current_blob_to_per_room`,
@@ -2090,9 +2138,10 @@ mod tests {
         let body = &production[fn_start..fn_end];
 
         // (b) the value-gone probe-legacy write — the ONLY downgrade — is
-        // `!recovery`-guarded, directly enclosed by the guard (same block).
+        // `!recovery`-guarded, directly enclosed by the guard (same block). It is
+        // attempt-scoped via `worker.set_load_state` (review 7).
         let write_pos = body
-            .find("set_rooms_load_state(load_state_after_probe_legacy(fired))")
+            .find("worker.set_load_state(load_state_after_probe_legacy(fired))")
             .expect("the value-gone branch must write via load_state_after_probe_legacy");
         let guard_pos = body[..write_pos]
             .rfind("if !recovery {")
@@ -2156,9 +2205,9 @@ mod tests {
             .unwrap_or(production.len());
         let body = &production[fn_start..fn_end];
 
-        // `Migrating` is set before the sequential fetch loop.
+        // `Migrating` is set (attempt-scoped, review 7) before the fetch loop.
         let migrating_pos = body
-            .find("set_rooms_load_state(RoomsLoadState::Migrating)")
+            .find("worker.set_load_state(RoomsLoadState::Migrating)")
             .expect("migrate_legacy_per_room must announce Migrating for a non-empty index");
         let loop_pos = body
             .find("for vk in room_vks")
@@ -2173,7 +2222,7 @@ mod tests {
         // write the global load state (concurrent probes may hold rooms). The only
         // load-state write in this function is the `Migrating` above.
         assert_eq!(
-            body.matches("set_rooms_load_state(").count(),
+            body.matches("worker.set_load_state(").count(),
             1,
             "migrate_legacy_per_room must write the load state exactly once (Migrating); \
              the all-empty case must NOT write Loaded (Codex review 3 — not authoritative)"
@@ -2228,28 +2277,30 @@ mod tests {
             let fn_start = production
                 .find(func)
                 .unwrap_or_else(|| panic!("{func} must exist"));
-            // The guard must appear within the first ~700 bytes of the body (before
-            // the first awaited request), not somewhere deep after work started.
-            let head = &production[fn_start..(fn_start + 700).min(production.len())];
+            // The guard must appear near the top of the body (before the first
+            // awaited request), not somewhere deep after work started. Window is
+            // generous to allow for the leading doc/rationale comment.
+            let head = &production[fn_start..(fn_start + 1100).min(production.len())];
             assert!(
                 head.contains("LoadWorkerGuard::new()"),
                 "{func} must hold a LoadWorkerGuard from the top"
             );
         }
 
-        // The legacy single-blob GetResponse hydrate call is preceded by a guard
-        // (the 4th site; the other three are the fn heads checked above). Find the
-        // `flags.subscriptions_initiated` hydrate call and confirm a guard is
-        // constructed just before it.
-        let hydrate_call = production
-            .find("flags.subscriptions_initiated = true;")
-            .expect("legacy GetResponse hydrate call must exist");
-        let guard_before = production[..hydrate_call]
+        // The legacy single-blob GetResponse parse block is the 4th site: the
+        // guard wraps BOTH parse arms (so the Err arm is attempt-scoped and its
+        // settlement resolves LoadFailed — review 7 P2#2). Confirm a guard is
+        // constructed immediately before the `from_reader::<Rooms>(&rooms_data..)`
+        // match that both arms belong to.
+        let parse = production
+            .find("from_reader::<Rooms, _>(&rooms_data[..])")
+            .expect("legacy GetResponse rooms_data parse must exist");
+        let guard_before = production[..parse]
             .rfind("LoadWorkerGuard::new()")
-            .expect("the legacy GetResponse hydrate must be preceded by a guard");
+            .expect("the legacy GetResponse parse must be preceded by a guard");
         assert!(
-            hydrate_call - guard_before < 500,
-            "the legacy single-blob GetResponse hydrate must be wrapped in a LoadWorkerGuard"
+            parse - guard_before < 200,
+            "the legacy single-blob GetResponse parse (both arms) must be wrapped in a LoadWorkerGuard"
         );
     }
 
@@ -2266,13 +2317,14 @@ mod tests {
             .next()
             .expect("production code before `mod tests`");
 
-        // (a) the PerRoom terminal is the pure decision fed all three inputs.
+        // (a) the PerRoom terminal is the pure decision fed all three inputs, and
+        // written through the ATTEMPT-SCOPED `worker.set_load_state` (review 7).
         assert!(
-            production.contains("set_rooms_load_state(per_room_terminal(")
+            production.contains("worker.set_load_state(per_room_terminal(")
                 && production.contains("loaded_map_empty")
                 && production.contains("listed_count")
                 && production.contains("had_fetch_error"),
-            "the PerRoom terminal must be per_room_terminal(loaded_map_empty, listed_count, had_fetch_error)"
+            "the PerRoom terminal must be worker.set_load_state(per_room_terminal(loaded_map_empty, listed_count, had_fetch_error))"
         );
 
         // (b) the per-room fetch loop's three failure arms mark both signals; the

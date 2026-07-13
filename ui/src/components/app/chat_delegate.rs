@@ -1406,10 +1406,11 @@ mod tests {
         );
     }
 
-    /// freenet/river#397 Codex review 6: the `LoadWorkerGuard` RAII contract —
-    /// `new` increments the pending counter AND bumps the activity gen; `Drop`
-    /// decrements (saturating) and runs the settled-handler. Source-scrape (it
-    /// drives global signals, so it can't be unit-driven on native).
+    /// freenet/river#397 review 6/7: the `LoadWorkerGuard` RAII + attempt-scope
+    /// contract — `new` captures the attempt, increments the pending counter, and
+    /// bumps the activity gen; `Drop` is a complete NO-OP for a superseded attempt
+    /// (guarded by `guard_drop_applies`), else saturating-decs and settles.
+    /// Source-scrape (it drives global signals, so it can't be unit-driven).
     #[test]
     fn load_worker_guard_counts_and_pulses() {
         let src = include_str!("chat_delegate.rs");
@@ -1422,9 +1423,17 @@ mod tests {
             .unwrap_or(src.len());
         let new_body = &src[new_start..new_end];
         assert!(
-            new_body.contains("PENDING_LOADS.fetch_add(1")
+            new_body.contains("let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed)")
+                && new_body.contains("PENDING_LOADS.fetch_add(1")
                 && new_body.contains("LOAD_ACTIVITY_GEN.fetch_add(1"),
-            "LoadWorkerGuard::new must inc PENDING_LOADS and bump LOAD_ACTIVITY_GEN"
+            "LoadWorkerGuard::new must capture the attempt, inc PENDING_LOADS, bump LOAD_ACTIVITY_GEN"
+        );
+        // is_current / the guard's write helpers gate on the current attempt.
+        assert!(
+            new_body.contains("fn is_current(&self)")
+                && new_body.contains("fn mark_fetch_failure(&self)")
+                && new_body.contains("fn set_load_state(&self,"),
+            "LoadWorkerGuard must expose is_current + attempt-gated mark/set helpers"
         );
         let drop_start = src
             .rfind("impl Drop for LoadWorkerGuard")
@@ -1434,10 +1443,35 @@ mod tests {
             .map(|i| drop_start + i)
             .unwrap_or(src.len());
         let drop_body = &src[drop_start..drop_end];
+        // The stale-attempt no-op MUST precede the decrement (return early).
+        let guard_pos = drop_body
+            .find("guard_drop_applies(")
+            .expect("Drop must check guard_drop_applies");
+        let dec_pos = drop_body
+            .find("saturating_sub(1)")
+            .expect("Drop must saturating-dec PENDING_LOADS");
         assert!(
-            drop_body.contains("saturating_sub(1)")
-                && drop_body.contains("on_load_worker_settled()"),
-            "LoadWorkerGuard::drop must saturating-dec PENDING_LOADS and settle"
+            guard_pos < dec_pos && drop_body[guard_pos..dec_pos].contains("return"),
+            "a superseded worker's Drop must return BEFORE decrementing the new attempt's count"
+        );
+        assert!(
+            drop_body.contains("on_load_worker_settled()"),
+            "a current worker's Drop must settle"
+        );
+    }
+
+    /// freenet/river#397 review 7 (P2#1): `guard_drop_applies` — a worker's Drop
+    /// and writes apply only while its attempt matches the current attempt. A
+    /// Retry advances the attempt, making the old worker's Drop a no-op.
+    #[test]
+    fn stale_worker_guard_is_inert() {
+        assert!(
+            guard_drop_applies(4, 4),
+            "same attempt → the worker still applies"
+        );
+        assert!(
+            !guard_drop_applies(4, 5),
+            "a retry advanced the attempt → the stale worker is a no-op"
         );
     }
 
@@ -1614,9 +1648,10 @@ mod tests {
         );
     }
 
-    /// freenet/river#397 Codex review 5 (P2c): `fire_list_rooms_request` marks the
-    /// attempt failed on a SEND / serialize error, so the backstop resolves to
-    /// LoadFailed (with Retry) rather than a silent Empty.
+    /// freenet/river#397 review 5/7: `fire_list_rooms_request` runs OUTSIDE any
+    /// load worker, so on a SEND / serialize error it marks the attempt failed AND
+    /// directly resolves `LoadFailed` (if empty) — a definitive stored-data failure
+    /// that would otherwise only be caught by the 60s hard-max (P2#2, case (b)).
     #[test]
     fn list_request_send_failure_marks_fetch_failure() {
         // `fire_list_rooms_request` is defined AFTER this mid-file test module;
@@ -1637,6 +1672,11 @@ mod tests {
             body.matches("mark_fetch_failure()").count(),
             2,
             "both the serialize-error and send-error arms must mark_fetch_failure"
+        );
+        assert_eq!(
+            body.matches("resolve_load_failed_if_empty()").count(),
+            2,
+            "both error arms must directly resolve LoadFailed (out-of-worker, P2#2)"
         );
     }
 
@@ -2767,11 +2807,12 @@ async fn fire_list_rooms_request() {
     let mut payload = Vec::new();
     if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
         error!("Failed to serialize list-rooms request: {}", e);
-        // freenet/river#397 Codex review 5 (P2c): the initial list request
-        // definitively failed to send, so the load can never resolve on its own.
-        // Record it as a fetch failure so the backstop resolves to LoadFailed
-        // (with Retry) rather than a silent Empty.
+        // freenet/river#397 Codex review 5/7: the initial list request definitively
+        // failed, so the load can never resolve on its own (no ListResponse → no
+        // worker). Record the failure AND resolve LoadFailed now (if empty) rather
+        // than wait for the 60s hard-max or show a silent Empty.
         mark_fetch_failure();
+        resolve_load_failed_if_empty();
         return;
     }
 
@@ -2802,10 +2843,11 @@ async fn fire_list_rooms_request() {
 
     if let Err(e) = api_result {
         error!("Failed to send list-rooms request: {}", e);
-        // freenet/river#397 Codex review 5 (P2c): the SEND itself failed (no
-        // response will ever come), so mark the attempt failed — the backstop
-        // then resolves to LoadFailed (with Retry) instead of a silent Empty.
+        // freenet/river#397 Codex review 5/7: the SEND itself failed (no response
+        // will ever come, no worker), so mark the attempt failed AND resolve
+        // LoadFailed now (if empty) instead of a silent Empty / 60s hard-max wait.
         mark_fetch_failure();
+        resolve_load_failed_if_empty();
     } else {
         info!("List-rooms request sent, response will be handled by message loop");
     }
@@ -4544,30 +4586,74 @@ const LOAD_IDLE_MS: u64 = 4_000;
 /// pre-empts a genuinely-progressing load.
 const LOAD_HARD_MAX_MS: u64 = 60_000;
 
-/// RAII guard marking an active AWAITED load worker (freenet/river#397 review 6).
-/// `new` increments [`PENDING_LOADS`] and bumps [`LOAD_ACTIVITY_GEN`] (a progress
-/// pulse that cancels any armed idle resolution). `Drop` decrements
-/// `PENDING_LOADS` (saturating, so a stray double-drop / sanity reset can't
-/// underflow) and runs [`on_load_worker_settled`], so completion is detected on
-/// EVERY exit path (success, early return, error). Hold one across each awaited
-/// load worker.
-pub(crate) struct LoadWorkerGuard;
+/// RAII guard marking an active AWAITED load worker (freenet/river#397 review
+/// 6/7). `new` captures the current [`LOAD_ATTEMPT_GEN`], increments
+/// [`PENDING_LOADS`], and bumps [`LOAD_ACTIVITY_GEN`] (a progress pulse that
+/// cancels any armed idle resolution).
+///
+/// ATTEMPT-SCOPED (review 7): a Retry bumps `LOAD_ATTEMPT_GEN` and zeroes
+/// `PENDING_LOADS`, so a worker still in flight from the OLD attempt must not
+/// touch the new attempt's state. `Drop` therefore no-ops entirely when the
+/// guard's attempt is stale (no decrement, no settle — the count was already
+/// zeroed), and [`Self::is_current`] gates every global write a worker makes
+/// (`mark_fetch_failure`, `set_load_state`) so a stale worker can neither
+/// pollute the retry's `SAW_FETCH_FAILURE` nor write its display state.
+pub(crate) struct LoadWorkerGuard {
+    attempt: u32,
+}
 
 impl LoadWorkerGuard {
     pub(crate) fn new() -> Self {
+        let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
         PENDING_LOADS.fetch_add(1, Ordering::Relaxed);
         LOAD_ACTIVITY_GEN.fetch_add(1, Ordering::Relaxed);
-        LoadWorkerGuard
+        LoadWorkerGuard { attempt }
+    }
+
+    /// True while this worker still belongs to the current load attempt. A Retry
+    /// advances `LOAD_ATTEMPT_GEN`, so a superseded worker returns `false` and
+    /// must not write any global load state.
+    pub(crate) fn is_current(&self) -> bool {
+        guard_drop_applies(self.attempt, LOAD_ATTEMPT_GEN.load(Ordering::Relaxed))
+    }
+
+    /// `mark_fetch_failure`, but ONLY for the current attempt — a stale worker
+    /// must not pollute the retry's `SAW_FETCH_FAILURE` (review 7 P2#1).
+    pub(crate) fn mark_fetch_failure(&self) {
+        if self.is_current() {
+            mark_fetch_failure();
+        }
+    }
+
+    /// `set_rooms_load_state`, but ONLY for the current attempt — a stale worker
+    /// must not write the retry's display state (review 7 P2#1).
+    pub(crate) fn set_load_state(&self, state: RoomsLoadState) {
+        if self.is_current() {
+            set_rooms_load_state(state);
+        }
     }
 }
 
 impl Drop for LoadWorkerGuard {
     fn drop(&mut self) {
+        // A worker from a SUPERSEDED attempt (a Retry bumped LOAD_ATTEMPT_GEN and
+        // zeroed PENDING_LOADS) must NOT decrement the new attempt's count or
+        // settle it — its Drop is a complete no-op (review 7 P2#1).
+        if !guard_drop_applies(self.attempt, LOAD_ATTEMPT_GEN.load(Ordering::Relaxed)) {
+            return;
+        }
         let _ = PENDING_LOADS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(1))
         });
         on_load_worker_settled();
     }
+}
+
+/// Whether a load worker's Drop (or write) still applies, given the attempt it
+/// was created under vs. the current attempt. Pure. A Retry advances the current
+/// attempt, so a superseded worker's Drop and writes are no-ops. review 7 P2#1.
+pub(crate) fn guard_drop_applies(guard_attempt: u32, current_attempt: u32) -> bool {
+    guard_attempt == current_attempt
 }
 
 /// The DEFINITIVE completion decision once every load worker has settled. Pure.
@@ -4619,6 +4705,21 @@ fn write_load_state_now(state: RoomsLoadState) {
     if *ROOMS_LOAD_STATE.peek() != state {
         *ROOMS_LOAD_STATE.write() = state;
     }
+}
+
+/// Resolve to `LoadFailed` IF the rooms map is currently empty — for a DEFINITIVE
+/// stored-data failure discovered OUTSIDE any live load worker (so no worker
+/// settlement will resolve it) that may run AFTER the state already reached a
+/// terminal `Loaded`(Empty) (freenet/river#397 review 7, P2#2). Deferred so it
+/// reads `ROOMS` and writes the state inside the Dioxus runtime. A non-empty map
+/// is left as `List`. Used by `fire_list_rooms_request`'s send/serialize errors,
+/// which run synchronously for the current attempt.
+pub(crate) fn resolve_load_failed_if_empty() {
+    crate::util::defer(|| {
+        if rooms_map_is_empty() {
+            write_load_state_now(RoomsLoadState::LoadFailed);
+        }
+    });
 }
 
 /// Called when a load worker drops (and by the fire-and-forget legacy-probe path
