@@ -18,7 +18,7 @@ use crate::components::app::chat_delegate::{
     mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
     per_room_terminal, prune_outbound_dms_for_purges, room_storage_key,
     save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
-    send_delegate_request_to, set_rooms_load_state, LegacyMigrationAction, LoadWorkerGuard,
+    send_delegate_request_to, set_load_state_if_current, LegacyMigrationAction, LoadWorkerGuard,
     RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
@@ -358,6 +358,7 @@ impl ResponseHandler {
                                                         if hydrate_loaded_rooms(
                                                             loaded_rooms,
                                                             is_legacy_delegate,
+                                                            worker.attempt(),
                                                         ) {
                                                             flags.subscriptions_initiated = true;
                                                         }
@@ -776,7 +777,7 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // Capture emptiness BEFORE `loaded` is moved into hydrate, for the
             // authoritative terminal decision below.
             let loaded_map_empty = loaded.map.is_empty();
-            if hydrate_loaded_rooms(loaded, false) {
+            if hydrate_loaded_rooms(loaded, false, worker.attempt()) {
                 schedule_subscription_timeout_check();
             }
 
@@ -949,7 +950,7 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 // live rooms writes `Loaded` — a zero-live-room completion writes
                 // NOTHING so it can't stomp a concurrent legacy probe's `Migrating`
                 // into a false Empty; the universal backstop owns that terminal.
-                let had_rooms = hydrate_loaded_rooms(loaded, false);
+                let had_rooms = hydrate_loaded_rooms(loaded, false, worker.attempt());
                 if had_rooms {
                     schedule_subscription_timeout_check();
                 }
@@ -960,6 +961,11 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 // safe_spawn_local schedules a setTimeout(0) that, being queued
                 // AFTER the merge's defer, runs once the merge has populated
                 // ROOMS (FIFO ordering), mirroring the legacy-delegate re-save.
+                //
+                // Review 11: this SPAWNED closure runs after the worker's sync body
+                // (its guard may have dropped), so capture the worker's attempt and
+                // gate the Loaded writes on still-current explicitly.
+                let attempt = worker.attempt();
                 crate::util::safe_spawn_local(async move {
                     match save_rooms_to_delegate().await {
                         Ok(_) => {
@@ -968,7 +974,7 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                             // Resolve to `Loaded` only if we merged live rooms;
                             // otherwise let the backstop own the terminal.
                             if had_rooms {
-                                set_rooms_load_state(RoomsLoadState::Loaded);
+                                set_load_state_if_current(attempt, RoomsLoadState::Loaded);
                             }
                         }
                         Err(e) => {
@@ -976,7 +982,7 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                             // Leave the in-progress flag set so the next load
                             // re-runs the fill. Same had_rooms gate as the Ok arm.
                             if had_rooms {
-                                set_rooms_load_state(RoomsLoadState::Loaded);
+                                set_load_state_if_current(attempt, RoomsLoadState::Loaded);
                             }
                         }
                     }
@@ -1157,7 +1163,7 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // re-save to the CURRENT delegate (which also marks legacy migration done and
     // resolves the load state to `Loaded` on the re-save's success/`Err` arms).
     let loaded = reconstruct_rooms(slots, meta);
-    if hydrate_loaded_rooms(loaded, true) {
+    if hydrate_loaded_rooms(loaded, true, worker.attempt()) {
         schedule_subscription_timeout_check();
     }
 }
@@ -1210,15 +1216,20 @@ fn schedule_subscription_timeout_check() {
 /// schedule the subscription-timeout backstop (the old
 /// `flags.subscriptions_initiated`). Holds no `self`/`flags`, so it is callable
 /// from a spawned task as well as the synchronous message-loop arm.
-fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool) -> bool {
+fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool, attempt: u32) -> bool {
     // freenet/river#397: a legacy-delegate response means we found the user's
     // rooms under an OLD delegate key and are about to migrate them (Ivvor's
     // case). Announce `Migrating` BEFORE the ROOMS merge below (which is
     // deferred) so a re-render lands on the "Migrating…" state ahead of the list
     // filling. The current-delegate path (is_legacy_delegate == false) is not a
     // migration and sets its own resolved state at the call site.
+    //
+    // Review 11: `attempt` is the caller worker's captured attempt. This runs
+    // AFTER awaited fetches (and the re-save below is a SPAWNED closure), so gate
+    // every load-state write on still-current so a reconnect/retry that superseded
+    // the caller isn't polluted.
     if is_legacy_delegate {
-        set_rooms_load_state(RoomsLoadState::Migrating);
+        set_load_state_if_current(attempt, RoomsLoadState::Migrating);
     }
 
     // Tombstone filter for all downstream loops.
@@ -1641,15 +1652,17 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool) -> bool {
                     info!("Successfully migrated room data to new delegate");
                     clear_legacy_migration_in_progress();
                     mark_legacy_migration_done();
+                    // Review 11: this runs after the save await, so gate on the
+                    // captured attempt (a reconnect/retry may have superseded us).
                     if had_loaded_rooms {
-                        set_rooms_load_state(RoomsLoadState::Loaded);
+                        set_load_state_if_current(attempt, RoomsLoadState::Loaded);
                     }
                 }
                 Err(e) => {
                     error!("Failed to migrate room data to new delegate: {}", e);
                     // Leave the in-progress flag set so the next load re-fills.
                     if had_loaded_rooms {
-                        set_rooms_load_state(RoomsLoadState::Loaded);
+                        set_load_state_if_current(attempt, RoomsLoadState::Loaded);
                     }
                 }
             }
@@ -2023,8 +2036,8 @@ mod tests {
             .expect("blob-explosion save-error marker must exist");
         let blob_arm = &production[blob_err..(blob_err + 900).min(production.len())];
         assert!(
-            blob_arm.contains("set_rooms_load_state(RoomsLoadState::Loaded)"),
-            "the blob-explosion save-error arm must resolve the load to Loaded (had_rooms)"
+            blob_arm.contains("set_load_state_if_current(attempt, RoomsLoadState::Loaded)"),
+            "the blob-explosion save-error arm must resolve to Loaded (had_rooms), attempt-gated (review 11)"
         );
 
         // (b) legacy-delegate re-save error.
@@ -2033,8 +2046,8 @@ mod tests {
             .expect("legacy re-save-error marker must exist");
         let legacy_arm = &production[legacy_err..(legacy_err + 900).min(production.len())];
         assert!(
-            legacy_arm.contains("set_rooms_load_state(RoomsLoadState::Loaded)"),
-            "the legacy re-save-error arm must resolve the load to Loaded (had_rooms)"
+            legacy_arm.contains("set_load_state_if_current(attempt, RoomsLoadState::Loaded)"),
+            "the legacy re-save-error arm must resolve to Loaded (had_rooms), attempt-gated (review 11)"
         );
     }
 
@@ -2123,6 +2136,48 @@ mod tests {
                 "worker-body write `{terminal}` must be attempt-scoped via worker.set_load_state"
             );
         }
+    }
+
+    /// freenet/river#397 Codex review 11 — the class is closed BY CONSTRUCTION:
+    /// the response handler has ZERO bare `set_rooms_load_state(` and ZERO bare
+    /// `mark_fetch_failure()` — EVERY load-state / failure write (including the
+    /// SPAWNED save closures and `hydrate_loaded_rooms`' legacy writes that outlive
+    /// their worker's sync body) routes through the attempt-gated
+    /// `worker.set_load_state` / `worker.mark_fetch_failure` / `set_load_state_if_current`
+    /// helpers. A future edit that adds an ungated async write fails this pin.
+    #[test]
+    fn no_ungated_async_load_state_writes() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        assert!(
+            !production.contains("set_rooms_load_state("),
+            "no bare set_rooms_load_state — use worker.set_load_state / set_load_state_if_current (attempt-gated)"
+        );
+        assert_eq!(
+            production.matches("mark_fetch_failure()").count(),
+            production.matches("worker.mark_fetch_failure()").count(),
+            "no bare mark_fetch_failure — all attempt-scoped via worker.mark_fetch_failure"
+        );
+        // hydrate threads the attempt through, and its legacy writes are gated.
+        assert!(
+            production.contains(
+                "fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool, attempt: u32)"
+            ),
+            "hydrate_loaded_rooms must take an attempt to gate its legacy load-state writes"
+        );
+        assert!(
+            production.contains("set_load_state_if_current(attempt, RoomsLoadState::Migrating)"),
+            "hydrate's legacy Migrating write must be attempt-gated via set_load_state_if_current"
+        );
+        // The spawned blob-explosion save closure captures the worker's attempt.
+        assert!(
+            production.contains("let attempt = worker.attempt();"),
+            "the spawned save closure must capture worker.attempt() to gate its late Loaded write"
+        );
     }
 
     /// freenet/river#397 Codex review 9 (send-side audit): a `rooms_meta` GET whose
@@ -2228,8 +2283,8 @@ mod tests {
             .unwrap_or(body.len());
         let save_closure = &body[save_pos..save_end];
         assert!(
-            save_closure.contains("set_rooms_load_state(RoomsLoadState::Loaded)"),
-            "the save-completion arms must resolve to Loaded"
+            save_closure.contains("set_load_state_if_current(attempt, RoomsLoadState::Loaded)"),
+            "the save-completion arms must resolve to Loaded (attempt-gated, review 11)"
         );
         assert!(
             !save_closure.contains("if !recovery"),
@@ -2487,10 +2542,10 @@ mod tests {
         );
         assert_eq!(
             block
-                .matches("set_rooms_load_state(RoomsLoadState::Loaded)")
+                .matches("set_load_state_if_current(attempt, RoomsLoadState::Loaded)")
                 .count(),
             2,
-            "both legacy re-save arms resolve to Loaded when live rooms merged"
+            "both legacy re-save arms resolve to Loaded (attempt-gated, review 11) when live rooms merged"
         );
     }
 
