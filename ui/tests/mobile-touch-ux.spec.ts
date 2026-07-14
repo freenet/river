@@ -249,14 +249,18 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await kebabs.nth(0).click();
     await expect(menus).toHaveCount(1);
 
-    // A later message's kebab (its z-50 container paints above the first menu's
-    // backdrop) is tappable while the first menu is open. Opening it must leave
-    // exactly ONE menu — the hoisted open-menu state closes the first. Without
-    // that shared state both would stay open.
-    const later = kebabs.nth(2);
-    await later.scrollIntoViewIfNeeded();
-    await later.click();
-    await expect(menus).toHaveCount(1);
+    // While a menu is open its wrapper is raised (z-[60]) so its full-viewport
+    // backdrop covers every other kebab. A tap at a later message's kebab
+    // therefore lands on the backdrop (Playwright's .click() would refuse the
+    // obscured element, so dispatch at the coordinate) and dismisses the menu —
+    // never two open, and the menu's own rows can't be intercepted by a sibling
+    // kebab. A second tap would then open that message's menu.
+    const box = await kebabs.nth(2).boundingBox();
+    expect(box).not.toBeNull();
+    if (box) {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    }
+    await expect(menus).toHaveCount(0);
   });
 });
 

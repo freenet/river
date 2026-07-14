@@ -2791,8 +2791,16 @@ fn MessageGroupComponent(
                                                 // would become the containing block for the `fixed`
                                                 // dismiss backdrop below, shrinking it to this element
                                                 // instead of the viewport (#402 review).
+                                                // Raise the OPEN wrapper above sibling kebabs: every
+                                                // `.touch-actions` is z-50, and later ones paint above an
+                                                // open popover, so without this a nearby message's kebab
+                                                // could sit over the menu rows and steal the tap. `z-[60]`
+                                                // lifts the whole open popover+backdrop above them (and its
+                                                // backdrop then covers those kebabs, so a tap on one just
+                                                // dismisses). (#402 review)
                                                 class: format!(
-                                                    "touch-actions absolute top-1 z-50 {}",
+                                                    "touch-actions absolute top-1 {} {}",
+                                                    if menu_open { "z-[60]" } else { "z-50" },
                                                     if is_self { "right-full mr-1" } else { "left-full ml-1" }
                                                 ),
                                                 // Kebab toggle button
@@ -2820,22 +2828,30 @@ fn MessageGroupComponent(
                                                                 .and_then(|w| w.inner_width().ok())
                                                                 .and_then(|v| v.as_f64())
                                                                 .unwrap_or(400.0);
-                                                            // Flip the menu above the kebab when there isn't room for
-                                                            // it below the tap (the menu is ~190px tall for an own
-                                                            // message). Measure space against the chat scrollport's
-                                                            // bottom, NOT the window: the menu lives inside that
-                                                            // overflow-y-auto container, whose bottom sits above the
-                                                            // composer, so a downward menu past that edge would clip
-                                                            // Edit/Delete. Keeps the actions reachable on short and
-                                                            // landscape viewports. (#402 review)
-                                                            let scrollport_bottom = web_sys::window()
+                                                            // Choose the flip direction from the space available in
+                                                            // BOTH directions within the chat scrollport (which lives
+                                                            // inside an overflow-y-auto container whose bounds sit
+                                                            // above the composer and below the header). Open downward
+                                                            // when the menu fits below; only flip up when it doesn't
+                                                            // fit below AND there's more room above. A received menu
+                                                            // (2 rows) is shorter than an own menu (4 rows), so it
+                                                            // stays down in cases where an own menu would flip.
+                                                            // (#402 review)
+                                                            let (sp_top, sp_bottom) = web_sys::window()
                                                                 .and_then(|w| w.document())
                                                                 .and_then(|d| {
                                                                     d.get_element_by_id("chat-scroll-container")
                                                                 })
-                                                                .map(|el| el.get_bounding_client_rect().bottom())
-                                                                .unwrap_or(600.0);
-                                                            let above = (scrollport_bottom - coords.y) < 200.0;
+                                                                .map(|el| {
+                                                                    let r = el.get_bounding_client_rect();
+                                                                    (r.top(), r.bottom())
+                                                                })
+                                                                .unwrap_or((60.0, 600.0));
+                                                            let menu_height = if is_self { 200.0 } else { 110.0 };
+                                                            let space_below = sp_bottom - coords.y;
+                                                            let space_above = coords.y - sp_top;
+                                                            let above =
+                                                                space_below < menu_height && space_above > space_below;
                                                             let align_left = coords.x < win_w * 0.5;
                                                             let id = msg_id_kebab_toggle.clone();
                                                             // Defer signal writes out of the event handler per
