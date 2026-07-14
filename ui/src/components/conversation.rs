@@ -2891,7 +2891,7 @@ fn MessageGroupComponent(
                                                         // kebab); `max-w` clamps it to the viewport as a
                                                         // backstop against a narrow-screen overflow.
                                                         class: format!(
-                                                            "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                            "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] max-h-[80vh] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
                                                             if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
                                                             if *menu_align_left.read() { "left-0" } else { "right-0" }
                                                         ),
@@ -3043,7 +3043,14 @@ fn MessageGroupComponent(
                                             }
                                             // Inline add reaction button (same line height as reactions)
                                             div {
-                                                class: "relative group/react inline-flex items-center",
+                                                // Raise the whole picker (grid + z-40 backdrop) above the
+                                                // z-50 message kebabs while it's open, so a nearby closed
+                                                // kebab can't paint over the emoji grid and steal a tap
+                                                // (mirrors the action menu's z-[60] behaviour). (#402 review)
+                                                class: format!(
+                                                    "relative group/react inline-flex items-center {}",
+                                                    if is_inline_picker_open { "z-[60]" } else { "" }
+                                                ),
                                                 // Invisible backdrop when picker is open
                                                 if is_inline_picker_open {
                                                     div {

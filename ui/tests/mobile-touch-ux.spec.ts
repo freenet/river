@@ -78,12 +78,18 @@ async function distanceFromBottom(page: Page): Promise<number> {
   });
 }
 
-// Scroll the history to the top and HOLD it there for a few frames. iOS WebKit
-// momentum scrolling plus the app's async entry-scroll can otherwise snap the
-// container back down before the IntersectionObserver registers that the user
-// left the bottom. Holding at the top gives the observer a stable frame to fire
-// (a real finger-scroll produces the same sustained not-at-bottom state).
-async function scrollHistoryToTop(page: Page) {
+// Scroll the history to the top and wait for the scroll-to-latest button to
+// appear. iOS WebKit momentum scrolling plus the app's async entry-scroll and
+// the deferred (setTimeout-based) IntersectionObserver can otherwise miss a
+// single programmatic scroll, so re-assert scrollTop=0 on each poll until the
+// observer registers "not at bottom" and the button renders.
+async function scrollUpUntilButtonVisible(page: Page) {
+  const button = page.locator('[data-testid="scroll-to-bottom"]');
+  // Jump to the top and hold there briefly to defeat the app's async
+  // entry-scroll, then STOP scrolling. WebKit's IntersectionObserver lags on a
+  // programmatic scroll (worsened by -webkit-overflow-scrolling: touch) but DOES
+  // fire once the position is stable — continuously re-scrolling instead keeps
+  // rescheduling the deferred observer callback so it never settles.
   await page.evaluate(
     () =>
       new Promise<void>((resolve) => {
@@ -91,13 +97,15 @@ async function scrollHistoryToTop(page: Page) {
         let n = 0;
         const id = setInterval(() => {
           if (el) el.scrollTop = 0;
-          if (++n > 6) {
+          if (++n > 5) {
             clearInterval(id);
             resolve();
           }
-        }, 60);
+        }, 80);
       })
   );
+  // Position is now stable at the top; give the lagging observer time to fire.
+  await expect(button).toBeVisible({ timeout: 12_000 });
 }
 
 test.describe("Message action kebab menu (#402.1)", () => {
@@ -201,10 +209,19 @@ test.describe("Message action kebab menu (#402.1)", () => {
       timeout: 5_000,
     });
 
-    // Opening an action menu again dismisses the picker (they must not stack).
-    await page.locator('[data-testid="message-kebab"]').first().click();
-    await expect(menu).toBeVisible();
+    // While the picker is open its raised backdrop covers the kebabs, so a tap
+    // at a kebab lands on that backdrop and dismisses the picker (the two
+    // popovers can't stack). No action menu opens from that same tap.
+    const kbox = await page
+      .locator('[data-testid="message-kebab"]')
+      .first()
+      .boundingBox();
+    expect(kbox).not.toBeNull();
+    if (kbox) {
+      await page.mouse.click(kbox.x + kbox.width / 2, kbox.y + kbox.height / 2);
+    }
     await expect(page.getByTitle(/^React with/)).toHaveCount(0);
+    await expect(menu).toBeHidden();
   });
 
   test("menu stays on-screen and dismisses via a far tap (narrow phone)", async ({
@@ -338,15 +355,17 @@ test.describe("Scroll-to-latest button (#402.3)", () => {
     await expect(button).toHaveCount(0);
 
     // Scroll the history to the top; the button must appear.
-    await scrollHistoryToTop(page);
-    await expect(button).toBeVisible({ timeout: 5_000 });
+    await scrollUpUntilButtonVisible(page);
+    await expect(button).toBeVisible();
 
     await button.click();
 
-    // After clicking, the history returns to the bottom and the button hides.
+    // Ground truth: the animated scroll returns the history to the bottom.
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 8_000 })
+      .toBeLessThan(120);
+    // Once the observer sees the sentinel again, the button hides.
     await expect(button).toBeHidden({ timeout: 5_000 });
-    // The scroll is animated (smooth), so poll until it settles at the bottom.
-    await expect.poll(() => distanceFromBottom(page), { timeout: 5_000 }).toBeLessThan(120);
   });
 });
 
@@ -363,10 +382,7 @@ test.describe("Room-switch scroll reset (#402.3)", () => {
     // Enter a room and scroll up so it is no longer pinned to the bottom.
     await selectRoom(page, "Your Private Room");
     await waitSettledAtBottom(page);
-    await scrollHistoryToTop(page);
-    await expect(
-      page.locator('[data-testid="scroll-to-bottom"]')
-    ).toBeVisible({ timeout: 5_000 });
+    await scrollUpUntilButtonVisible(page);
 
     // Switch away and back. The Conversation component is reused across rooms,
     // so without the room-change reset the scroll position would persist near
