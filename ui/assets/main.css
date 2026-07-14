@@ -111,3 +111,26 @@
     outline: 2px solid currentColor;
     outline-offset: 1px;
 }
+
+/* Touch-only message action affordance (freenet/river#402).
+ *
+ * The per-message hover action bar (reply / edit / delete) is built with
+ * Tailwind `group-hover:` utilities, which Tailwind v4 automatically wraps in
+ * `@media (hover: hover)`. On a touch device (phone, tablet) there is no hover
+ * pointer, so that bar can NEVER become visible and touch users have no way to
+ * reach reply / edit / delete / react.
+ *
+ * `.touch-actions` is the exact complement: hidden by default (so mouse users
+ * keep the clean hover-reveal desktop UI) and shown only where `hover: none`
+ * matches — i.e. precisely the devices where the hover bar cannot appear. It
+ * decorates the always-visible kebab (⋮) button that opens the touch action
+ * menu. */
+.touch-actions {
+    display: none;
+}
+
+@media (hover: none) {
+    .touch-actions {
+        display: flex;
+    }
+}

@@ -23,7 +23,8 @@ use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaCircleInfo, FaTriangleExclamation, FaUsers,
+    FaBars, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile, FaPenToSquare, FaReply,
+    FaTrashCan, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -1131,6 +1132,24 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // Reset the scroll-to-bottom state whenever the selected room changes so a
+    // room switch always lands pinned to the newest message (#402). The
+    // Conversation component is mounted once and reused across rooms (hidden or
+    // shown via CSS), so `#chat-scroll-container` and `is_at_bottom` otherwise
+    // persist from the previous room, frequently leaving the user far up the
+    // new room's history. Reading `CURRENT_ROOM` (which holds only `owner_key`)
+    // makes this effect re-run on every room change and nothing else. Marking
+    // `first_scroll` true makes the next mount-triggered auto-scroll snap
+    // instantly rather than animate from an arbitrary position.
+    {
+        let first_scroll = first_scroll.clone();
+        use_effect(move || {
+            let _room = CURRENT_ROOM.read().owner_key;
+            is_at_bottom.set(true);
+            first_scroll.set(true);
+        });
+    }
+
     // Handler for toggling a reaction on a message (add or remove)
     let handle_toggle_reaction = {
         let current_room_data = current_room_data.clone();
@@ -1758,10 +1777,13 @@ pub fn Conversation() -> Element {
                 current_room_data.as_ref().map(|_room_data| {
                     rsx! {
                         div { class: "flex-shrink-0 px-3 md:px-6 py-3 border-b border-border bg-panel",
-                            div { class: "flex items-center justify-between max-w-4xl mx-auto",
-                                // Mobile: hamburger to open rooms panel
+                            div { class: "flex items-center justify-between gap-2 md:gap-3 max-w-4xl mx-auto",
+                                // Mobile: hamburger to open rooms panel. `mr-1` plus the row
+                                // `gap-2` keep this switch-rooms button clear of the room-name
+                                // tap target so a touch user does not open the room-details
+                                // modal by mistake when reaching for the room list (#402).
                                 button {
-                                    class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                    class: "md:hidden flex-shrink-0 mr-1 p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
                                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                     Icon { icon: FaBars, width: 18, height: 18 }
                                 }
@@ -1771,7 +1793,11 @@ pub fn Conversation() -> Element {
                                 // clicks to the modal-opening onclick handler.
                                 div { class: "min-w-0 flex-1",
                                     button {
-                                        class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 w-full",
+                                        // `md:-mx-3` only pulls the hover target outward on
+                                        // desktop, where there is no adjacent hamburger. On
+                                        // mobile the negative margin is dropped so this
+                                        // room-details target stays clear of the hamburger (#402).
+                                        class: "flex items-center gap-2 px-3 py-1.5 md:-mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 w-full",
                                         title: "Room details",
                                         onclick: move |_| {
                                             crate::util::defer(move || {
@@ -1814,7 +1840,7 @@ pub fn Conversation() -> Element {
             // Combining flex-1 with overflow on the same element causes the
             // scroll container to shift behind the sidebar during re-renders.
             div {
-                class: "flex-1 min-h-0",
+                class: "flex-1 min-h-0 relative",
                 div {
                     class: "h-full overflow-y-auto",
                     id: "chat-scroll-container",
@@ -1959,6 +1985,37 @@ pub fn Conversation() -> Element {
                         class: "h-px pointer-events-none",
                     }
             }
+                // Scroll-to-latest button (#402): shown whenever the user is not
+                // pinned to the bottom of the history. Reuses the `is_at_bottom`
+                // IntersectionObserver state, so it appears after scrolling up
+                // (e.g. reading back through a long, multi-room history) and
+                // hides once the newest message is in view. Handy on every
+                // device but especially on touch, where there is no scrollbar
+                // to drag.
+                if !is_at_bottom() {
+                    button {
+                        class: "absolute bottom-4 right-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-panel shadow-lg border border-border text-text-muted hover:text-accent transition-colors",
+                        "aria-label": "Scroll to latest messages",
+                        "data-testid": "scroll-to-bottom",
+                        onclick: move |_| {
+                            is_at_bottom.set(true);
+                            #[cfg(target_arch = "wasm32")]
+                            crate::util::safe_spawn_local(async move {
+                                let Some(container) = web_sys::window()
+                                    .and_then(|w| w.document())
+                                    .and_then(|d| d.get_element_by_id("chat-scroll-container"))
+                                else {
+                                    return;
+                                };
+                                let opts = web_sys::ScrollToOptions::new();
+                                opts.set_top(container.scroll_height() as f64);
+                                opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+                                container.scroll_to_with_scroll_to_options(&opts);
+                            });
+                        },
+                        Icon { icon: FaChevronDown, width: 18, height: 18 }
+                    }
+                }
             }
 
             // Message input or status
@@ -2200,6 +2257,19 @@ fn MessageGroupComponent(
 
     // Track which message's emoji picker is open (by message ID string)
     let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
+
+    // Track which message's touch action menu (kebab) is open, by message ID
+    // string. The hover action bar is gated by Tailwind's automatic
+    // `@media (hover:hover)` wrapper and so can never appear on a touch device;
+    // the kebab menu is the touch-only path to Reply / React / Edit / Delete
+    // (#402).
+    let mut open_action_menu: Signal<Option<String>> = use_signal(|| None);
+
+    // Whether the kebab action menu should open above (true) or below (false)
+    // the kebab. Set from the tap position so the menu for a message near the
+    // bottom of the viewport flips upward instead of being clipped by the
+    // composer — mirrors `picker_show_above` for the emoji picker (#402).
+    let mut menu_show_above: Signal<bool> = use_signal(|| false);
 
     // Track if emoji picker should appear above (true) or below (false) the button
     let mut picker_show_above: Signal<bool> = use_signal(|| false);
@@ -2596,8 +2666,13 @@ fn MessageGroupComponent(
                                         let reply_author_name = group.author_name.clone();
                                         rsx! {
                                             div {
+                                                // `pointer-events-none` until hovered so the invisible
+                                                // (opacity-0) bar never intercepts a tap on a touch device —
+                                                // Tailwind gates `group-hover:` behind `@media (hover:hover)`,
+                                                // so on touch this stays non-interactive and the kebab below
+                                                // owns the gutter (#402).
                                                 class: format!(
-                                                    "absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 {} {}",
+                                                    "absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto {} {}",
                                                     if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" },
                                                     ""
                                                 ),
@@ -2632,6 +2707,121 @@ fn MessageGroupComponent(
                                                             on_request_delete.call(msg_id_for_delete.clone());
                                                         },
                                                         "delete"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Touch-only kebab action menu (#402). The hover
+                                    // action bar above is wrapped by Tailwind in
+                                    // `@media (hover:hover)`, so it can never appear on a
+                                    // touch device. `.touch-actions` (main.css) reveals
+                                    // this kebab only where there is no hover pointer;
+                                    // tapping it opens a menu with the same Reply / React /
+                                    // Edit / Delete actions.
+                                    {
+                                        let msg_id_kebab = msg.id.clone();
+                                        let msg_id_kebab_toggle = msg.id.clone();
+                                        let msg_id_menu_reply = msg.message_id.clone();
+                                        let msg_id_menu_delete = msg.message_id.clone();
+                                        let msg_id_menu_edit = msg.id.clone();
+                                        let msg_id_menu_react = msg.id.clone();
+                                        let edit_text_kebab = msg.content_text.clone();
+                                        let reply_author_kebab = group.author_name.clone();
+                                        let reply_preview_kebab = clean_reply_preview(&msg.content_text, &member_names)
+                                            .chars()
+                                            .take(100)
+                                            .collect::<String>();
+                                        let menu_open = open_action_menu.read().as_deref()
+                                            == Some(msg_id_kebab.as_str());
+                                        rsx! {
+                                            div {
+                                                class: format!(
+                                                    "touch-actions absolute top-1 z-50 {}",
+                                                    if is_self { "left-0 -translate-x-full -ml-1" } else { "right-0 translate-x-full mr-1" }
+                                                ),
+                                                // Kebab toggle button
+                                                button {
+                                                    class: "flex items-center justify-center w-8 h-8 rounded-full bg-panel shadow-md border border-border text-text-muted",
+                                                    "aria-label": "Message actions",
+                                                    "data-testid": "message-kebab",
+                                                    onclick: move |e: MouseEvent| {
+                                                        e.stop_propagation();
+                                                        let is_open = open_action_menu.peek().as_deref()
+                                                            == Some(msg_id_kebab_toggle.as_str());
+                                                        if is_open {
+                                                            open_action_menu.set(None);
+                                                        } else {
+                                                            // Flip the menu above the kebab when the tap is in the
+                                                            // bottom ~40% of the viewport so it is not clipped by the
+                                                            // composer or the screen edge.
+                                                            let click_y = e.client_coordinates().y;
+                                                            let viewport_height = web_sys::window()
+                                                                .and_then(|w| w.inner_height().ok())
+                                                                .and_then(|h| h.as_f64())
+                                                                .unwrap_or(800.0);
+                                                            menu_show_above.set(click_y > viewport_height * 0.6);
+                                                            open_action_menu.set(Some(msg_id_kebab_toggle.clone()));
+                                                        }
+                                                    },
+                                                    Icon { icon: FaEllipsisVertical, width: 16, height: 16 }
+                                                }
+                                                // Action menu popover + dismiss backdrop
+                                                if menu_open {
+                                                    div {
+                                                        class: "fixed inset-0 z-40",
+                                                        onclick: move |_| open_action_menu.set(None),
+                                                    }
+                                                    div {
+                                                        class: format!(
+                                                            "absolute z-50 min-w-[8rem] bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                            if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                            if is_self { "left-0" } else { "right-0" }
+                                                        ),
+                                                        "data-testid": "message-action-menu",
+                                                        button {
+                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
+                                                            onclick: move |_| {
+                                                                on_reply.call(ReplyContext {
+                                                                    message_id: msg_id_menu_reply.clone(),
+                                                                    author_name: reply_author_kebab.clone(),
+                                                                    content_preview: reply_preview_kebab.clone(),
+                                                                });
+                                                                open_action_menu.set(None);
+                                                            },
+                                                            Icon { icon: FaReply, width: 14, height: 14 }
+                                                            "Reply"
+                                                        }
+                                                        button {
+                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
+                                                            onclick: move |_| {
+                                                                open_emoji_picker.set(Some(format!("inline-{}", msg_id_menu_react)));
+                                                                open_action_menu.set(None);
+                                                            },
+                                                            Icon { icon: FaFaceSmile, width: 14, height: 14 }
+                                                            "React"
+                                                        }
+                                                        if is_self {
+                                                            button {
+                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
+                                                                onclick: move |_| {
+                                                                    edit_text.set(edit_text_kebab.clone());
+                                                                    editing_message.set(Some(msg_id_menu_edit.clone()));
+                                                                    open_action_menu.set(None);
+                                                                },
+                                                                Icon { icon: FaPenToSquare, width: 14, height: 14 }
+                                                                "Edit"
+                                                            }
+                                                            button {
+                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-error-bg text-left",
+                                                                onclick: move |_| {
+                                                                    on_request_delete.call(msg_id_menu_delete.clone());
+                                                                    open_action_menu.set(None);
+                                                                },
+                                                                Icon { icon: FaTrashCan, width: 14, height: 14 }
+                                                                "Delete"
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
