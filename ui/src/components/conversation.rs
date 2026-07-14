@@ -919,10 +919,6 @@ pub fn Conversation() -> Element {
     // Owned by Conversation (not per message group) so only ONE menu is open at
     // a time across the whole history — opening one closes any other (#402).
     let open_action_menu: Signal<Option<String>> = use_signal(|| None);
-    // Which message's emoji reaction picker is open, by picker ID string. Also
-    // owned by Conversation so at most one picker is open across all groups, and
-    // opening an action menu can dismiss it (they'd otherwise stack) (#402).
-    let open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
 
     // State for delete confirmation modal
@@ -2004,7 +2000,6 @@ pub fn Conversation() -> Element {
                                                                     }
                                                                 },
                                                                 open_action_menu: open_action_menu,
-                                                                open_emoji_picker: open_emoji_picker,
                                                             }
                                                         }
                                                     }
@@ -2289,13 +2284,16 @@ fn MessageGroupComponent(
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
     on_reply: EventHandler<ReplyContext>,
-    // Shared across all groups so only one action menu / one picker is open at a
-    // time, and the two can coordinate (opening a menu dismisses a picker) (#402).
+    // Shared across all groups so only one action menu is open at a time (#402).
     open_action_menu: Signal<Option<String>>,
-    open_emoji_picker: Signal<Option<String>>,
 ) -> Element {
     let mut open_action_menu = open_action_menu;
-    let mut open_emoji_picker = open_emoji_picker;
+    // Per-group: at most one picker per group, and while a picker is open its
+    // raised (z-[60]) backdrop covers every other group's kebabs and "+"
+    // buttons, so tapping one dismisses the picker rather than stacking a
+    // second popover — the single-popover guarantee comes from the z-order, not
+    // a shared signal (#402).
+    let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
     let delay_suffix = group
@@ -2891,7 +2889,7 @@ fn MessageGroupComponent(
                                                         // kebab); `max-w` clamps it to the viewport as a
                                                         // backstop against a narrow-screen overflow.
                                                         class: format!(
-                                                            "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] max-h-[80vh] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                            "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] max-h-[calc(100vh-9rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
                                                             if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
                                                             if *menu_align_left.read() { "left-0" } else { "right-0" }
                                                         ),
