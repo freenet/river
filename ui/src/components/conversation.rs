@@ -2816,28 +2816,26 @@ fn MessageGroupComponent(
                                                             // the kebab is on the left half, right-anchored on the
                                                             // right half) so its content never runs off a screen edge.
                                                             let coords = e.client_coordinates();
-                                                            let (win_w, win_h) = web_sys::window()
-                                                                .map(|w| {
-                                                                    let h = w
-                                                                        .inner_height()
-                                                                        .ok()
-                                                                        .and_then(|v| v.as_f64())
-                                                                        .unwrap_or(800.0);
-                                                                    let w = w
-                                                                        .inner_width()
-                                                                        .ok()
-                                                                        .and_then(|v| v.as_f64())
-                                                                        .unwrap_or(400.0);
-                                                                    (w, h)
+                                                            let win_w = web_sys::window()
+                                                                .and_then(|w| w.inner_width().ok())
+                                                                .and_then(|v| v.as_f64())
+                                                                .unwrap_or(400.0);
+                                                            // Flip the menu above the kebab when there isn't room for
+                                                            // it below the tap (the menu is ~190px tall for an own
+                                                            // message). Measure space against the chat scrollport's
+                                                            // bottom, NOT the window: the menu lives inside that
+                                                            // overflow-y-auto container, whose bottom sits above the
+                                                            // composer, so a downward menu past that edge would clip
+                                                            // Edit/Delete. Keeps the actions reachable on short and
+                                                            // landscape viewports. (#402 review)
+                                                            let scrollport_bottom = web_sys::window()
+                                                                .and_then(|w| w.document())
+                                                                .and_then(|d| {
+                                                                    d.get_element_by_id("chat-scroll-container")
                                                                 })
-                                                                .unwrap_or((400.0, 800.0));
-                                                            // Flip the menu above the kebab when there isn't room
-                                                            // for it below the tap (the menu is ~190px tall for an
-                                                            // own message; the composer eats the bottom too). Basing
-                                                            // this on actual space-below rather than a fixed viewport
-                                                            // fraction keeps the actions reachable on short/landscape
-                                                            // viewports. (#402 review)
-                                                            let above = (win_h - coords.y) < 220.0;
+                                                                .map(|el| el.get_bounding_client_rect().bottom())
+                                                                .unwrap_or(600.0);
+                                                            let above = (scrollport_bottom - coords.y) < 200.0;
                                                             let align_left = coords.x < win_w * 0.5;
                                                             let id = msg_id_kebab_toggle.clone();
                                                             // Defer signal writes out of the event handler per
