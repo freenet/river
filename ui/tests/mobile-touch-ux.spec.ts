@@ -146,8 +146,13 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await expect(menu.getByRole("button", { name: "Edit" })).toBeVisible();
     await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
 
-    // Tapping the backdrop dismisses the menu.
-    await page.locator(".fixed.inset-0").first().click({ position: { x: 5, y: 5 } });
+    // Tapping anywhere else (a real viewport coordinate far from the menu, NOT
+    // the backdrop's own local origin) dismisses the menu — this verifies the
+    // fixed backdrop actually covers the viewport, not just the kebab box.
+    const vp = page.viewportSize();
+    const box = await menu.boundingBox();
+    const farX = box && vp && box.x > vp.width / 2 ? 5 : (vp?.width ?? 100) - 5;
+    await page.mouse.click(farX, 5);
     await expect(menu).toBeHidden();
   });
 
@@ -172,6 +177,51 @@ test.describe("Message action kebab menu (#402.1)", () => {
     // The composer shows a reply-preview strip (with a "Cancel reply" button)
     // once a reply target is set.
     await expect(page.getByTitle("Cancel reply")).toBeVisible({ timeout: 5_000 });
+  });
+
+  test("menu stays on-screen and dismisses via a far tap (narrow phone)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    const vp = page.viewportSize();
+    // Both a self (accent bubble) and a received (surface bubble) message: the
+    // menu opens on opposite sides, so both must stay within the viewport.
+    for (const sel of [
+      '[id^="msg-"]:has(.bg-accent)',
+      '[id^="msg-"]:has(.bg-surface)',
+    ]) {
+      const row = page.locator(sel).first();
+      if ((await row.count()) === 0) continue;
+      await row.locator('[data-testid="message-kebab"]').click();
+      const menu = page.locator('[data-testid="message-action-menu"]');
+      await expect(menu).toBeVisible();
+
+      const box = await menu.boundingBox();
+      expect(box).not.toBeNull();
+      if (box && vp) {
+        expect(box.x).toBeGreaterThanOrEqual(-1);
+        expect(box.x + box.width).toBeLessThanOrEqual(vp.width + 1);
+      }
+      // Opening the menu must not introduce a horizontal page scrollbar.
+      const hScroll = await page.evaluate(
+        () =>
+          document.documentElement.scrollWidth >
+          document.documentElement.clientWidth
+      );
+      expect(hScroll).toBe(false);
+
+      // Dismiss via a far viewport tap before the next iteration.
+      const farX = box && vp && box.x > vp.width / 2 ? 5 : (vp?.width ?? 100) - 5;
+      await page.mouse.click(farX, 5);
+      await expect(menu).toBeHidden();
+    }
   });
 });
 
