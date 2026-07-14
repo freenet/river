@@ -55,26 +55,50 @@ test.describe("Edit box width (#205)", () => {
     const count = await bubbles.count();
     expect(count).toBeGreaterThan(0);
 
+    // On touch devices (no hover) the hover action bar is non-interactive; the
+    // real edit path is the kebab menu (freenet/river#402). Use whichever
+    // affordance the current device exposes.
+    const touch = await page.evaluate(
+      () => window.matchMedia("(hover: none)").matches
+    );
+
     let clicked = false;
     for (let i = 0; i < count; i++) {
       const bubble = bubbles.nth(i);
       await bubble.scrollIntoViewIfNeeded();
-      await bubble.hover();
-      // Scope the edit button lookup to the hovered bubble's ancestor
-      // (the outer message container with the hover action bar), so a
-      // stray previously-visible edit button on another message doesn't
-      // mask the current hover target.
+      // Scope the edit affordance lookup to this bubble's ancestor (the outer
+      // message container), so a stray control on another message doesn't mask
+      // the current target.
       const msgContainer = bubble.locator(
         "xpath=ancestor::*[starts-with(@id,'msg-')][1]"
       );
-      const editBtn = msgContainer.getByRole("button", { name: /edit/i });
-      if (await editBtn.isVisible({ timeout: 500 }).catch(() => false)) {
-        await editBtn.click();
-        clicked = true;
-        break;
+
+      if (touch) {
+        const kebab = msgContainer.locator('[data-testid="message-kebab"]');
+        if (!(await kebab.isVisible({ timeout: 500 }).catch(() => false)))
+          continue;
+        await kebab.click();
+        const editItem = page
+          .locator('[data-testid="message-action-menu"]')
+          .getByRole("button", { name: /edit/i });
+        if (await editItem.isVisible({ timeout: 500 }).catch(() => false)) {
+          await editItem.click();
+          clicked = true;
+          break;
+        }
+        // Received message (no Edit item): dismiss the menu and try the next.
+        await page.mouse.click(2, 2);
+      } else {
+        await bubble.hover();
+        const editBtn = msgContainer.getByRole("button", { name: /edit/i });
+        if (await editBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+          await editBtn.click();
+          clicked = true;
+          break;
+        }
       }
     }
-    expect(clicked, "found an own-message edit button").toBe(true);
+    expect(clicked, "found an own-message edit affordance").toBe(true);
 
     const textarea = page.locator("textarea").first();
     await expect(textarea).toBeVisible({ timeout: 5_000 });

@@ -1059,7 +1059,14 @@ pub fn Conversation() -> Element {
                 .get(0)
                 .dyn_ref::<web_sys::IntersectionObserverEntry>()
             {
-                is_at_bottom.set(entry.is_intersecting());
+                // Defer the signal write: this raw JS callback runs with no
+                // Dioxus runtime/scope on the stack, and `is_at_bottom` is now
+                // subscribed in render (the scroll-to-latest button), so a
+                // direct `.set()` would fire a subscriber notification from an
+                // empty scope and panic on Firefox mobile. See
+                // .claude/rules/dioxus-signal-safety.md. (#402)
+                let intersecting = entry.is_intersecting();
+                crate::util::defer(move || is_at_bottom.set(intersecting));
             }
         }) as Box<dyn FnMut(js_sys::Array)>);
 
@@ -1861,7 +1868,12 @@ pub fn Conversation() -> Element {
             div {
                 class: "flex-1 min-h-0 relative",
                 div {
-                    class: "h-full overflow-y-auto",
+                    // `overflow-x-hidden` is a backstop: a kebab action menu on
+                    // a very short self message can extend a few px past the
+                    // viewport edge; clip it (trailing whitespace only — the
+                    // menu content is left-aligned and stays visible) rather
+                    // than show a horizontal scrollbar in the history. #402.
+                    class: "h-full overflow-y-auto overflow-x-hidden",
                     id: "chat-scroll-container",
                     div { class: "max-w-4xl mx-auto px-4 py-4",
                     {
