@@ -915,6 +915,10 @@ pub fn Conversation() -> Element {
     };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut is_at_bottom = use_signal(|| true);
+    // Which message's touch action menu (kebab) is open, by message ID string.
+    // Owned by Conversation (not per message group) so only ONE menu is open at
+    // a time across the whole history — opening one closes any other (#402).
+    let open_action_menu: Signal<Option<String>> = use_signal(|| None);
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
 
     // State for delete confirmation modal
@@ -1992,6 +1996,7 @@ pub fn Conversation() -> Element {
                                                                         }
                                                                     }
                                                                 },
+                                                                open_action_menu: open_action_menu,
                                                             }
                                                         }
                                                     }
@@ -2276,7 +2281,10 @@ fn MessageGroupComponent(
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
     on_reply: EventHandler<ReplyContext>,
+    // Shared across all groups so only one action menu is open at a time (#402).
+    open_action_menu: Signal<Option<String>>,
 ) -> Element {
+    let mut open_action_menu = open_action_menu;
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
     let delay_suffix = group
@@ -2297,13 +2305,6 @@ fn MessageGroupComponent(
 
     // Track which message's emoji picker is open (by message ID string)
     let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
-
-    // Track which message's touch action menu (kebab) is open, by message ID
-    // string. The hover action bar is gated by Tailwind's automatic
-    // `@media (hover:hover)` wrapper and so can never appear on a touch device;
-    // the kebab menu is the touch-only path to Reply / React / Edit / Delete
-    // (#402).
-    let mut open_action_menu: Signal<Option<String>> = use_signal(|| None);
 
     // Whether the kebab action menu should open above (true) or below (false)
     // the kebab. Set from the tap position so the menu for a message near the
@@ -2830,7 +2831,13 @@ fn MessageGroupComponent(
                                                                     (w, h)
                                                                 })
                                                                 .unwrap_or((400.0, 800.0));
-                                                            let above = coords.y > win_h * 0.6;
+                                                            // Flip the menu above the kebab when there isn't room
+                                                            // for it below the tap (the menu is ~190px tall for an
+                                                            // own message; the composer eats the bottom too). Basing
+                                                            // this on actual space-below rather than a fixed viewport
+                                                            // fraction keeps the actions reachable on short/landscape
+                                                            // viewports. (#402 review)
+                                                            let above = (win_h - coords.y) < 220.0;
                                                             let align_left = coords.x < win_w * 0.5;
                                                             let id = msg_id_kebab_toggle.clone();
                                                             // Defer signal writes out of the event handler per

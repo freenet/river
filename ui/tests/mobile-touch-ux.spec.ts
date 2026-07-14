@@ -232,6 +232,32 @@ test.describe("Message action kebab menu (#402.1)", () => {
       await expect(menu).toBeHidden();
     }
   });
+
+  test("never more than one menu open at a time", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    const menus = page.locator('[data-testid="message-action-menu"]');
+    const kebabs = page.locator('[data-testid="message-kebab"]');
+
+    // Open the first message's menu.
+    await kebabs.nth(0).click();
+    await expect(menus).toHaveCount(1);
+
+    // A later message's kebab (its z-50 container paints above the first menu's
+    // backdrop) is tappable while the first menu is open. Opening it must leave
+    // exactly ONE menu — the hoisted open-menu state closes the first. Without
+    // that shared state both would stay open.
+    const later = kebabs.nth(2);
+    await later.scrollIntoViewIfNeeded();
+    await later.click();
+    await expect(menus).toHaveCount(1);
+  });
 });
 
 test.describe("Mobile header hamburger spacing (#402.2)", () => {
