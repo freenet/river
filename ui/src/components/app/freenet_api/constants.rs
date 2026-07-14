@@ -41,6 +41,29 @@ pub const RECONNECT_INITIAL_MS: u64 = 3000;
 /// Maximum retry interval for reconnection attempts in milliseconds
 pub const RECONNECT_MAX_MS: u64 = 60_000;
 
+/// How long (ms) a connection must stay up before the reconnect backoff counter
+/// is reset. Resetting merely on socket `onopen` let a socket that opens then
+/// immediately dies reset the counter every cycle, defeating the exponential
+/// backoff and producing an endless ~3s reconnect loop after an Android
+/// background→resume (freenet/river#406). A connection must prove itself stable
+/// for this long before we treat it as a fresh, healthy baseline.
+///
+/// Chosen at 15s deliberately, relative to the neighbouring timers:
+/// - Above connection setup: the dwell starts only *after* `initialize_connection`
+///   returns Ok (i.e. after `onopen`), and setup is bounded by
+///   `CONNECTION_TIMEOUT_MS` (5s), so a slow-but-real connect never eats the dwell.
+/// - Below the watchdog's death window: a half-open socket isn't declared dead
+///   until roughly `LIVENESS_IDLE_PROBE_MS` + `LIVENESS_PROBE_TIMEOUT_MS` (~80s),
+///   so a dwell-reset can't fire on a socket the watchdog is about to kill.
+///
+/// Tradeoff (accepted): a link that repeatedly opens and survives just under 15s
+/// before dying never reaches the dwell, so its backoff climbs toward the 60s cap
+/// even though each attempt partly succeeds. That is the desired behaviour — don't
+/// hammer a genuinely flaky link — and it self-corrects the instant one connection
+/// survives 15s. Ivvor's report is "connects very briefly" (sub-second), which
+/// backs off correctly well before this edge matters.
+pub const CONNECTION_STABLE_DWELL_MS: u64 = 15_000;
+
 /// Maximum number of retries for API requests
 pub const MAX_REQUEST_RETRIES: u8 = 3;
 
