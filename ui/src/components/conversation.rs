@@ -2325,6 +2325,13 @@ fn MessageGroupComponent(
     // screen edge (#402 review).
     let mut menu_align_left: Signal<bool> = use_signal(|| false);
 
+    // Max height (px) for the kebab action menu, measured at tap time as the
+    // actual space available on the chosen side within the chat scrollport. The
+    // menu is `overflow-y-auto`, so on a very short/landscape viewport where it
+    // fits neither side fully it scrolls internally instead of being clipped by
+    // the scroll container with Edit/Delete unreachable (#402 review).
+    let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
+
     // Track if emoji picker should appear above (true) or below (false) the button
     let mut picker_show_above: Signal<bool> = use_signal(|| false);
 
@@ -2859,6 +2866,13 @@ fn MessageGroupComponent(
                                                             let above =
                                                                 space_below < menu_height && space_above > space_below;
                                                             let align_left = coords.x < win_w * 0.5;
+                                                            // Cap the menu to the actual space on the chosen side
+                                                            // (minus a small gap) so it scrolls internally rather
+                                                            // than being clipped by the scroll container when it
+                                                            // fits neither side. Floor so it never collapses.
+                                                            let avail =
+                                                                (if above { space_above } else { space_below }) - 16.0;
+                                                            let max_h = avail.max(140.0);
                                                             let id = msg_id_kebab_toggle.clone();
                                                             // Defer signal writes out of the event handler per
                                                             // .claude/rules/dioxus-signal-safety.md (Firefox-mobile
@@ -2866,6 +2880,7 @@ fn MessageGroupComponent(
                                                             crate::util::defer(move || {
                                                                 menu_show_above.set(above);
                                                                 menu_align_left.set(align_left);
+                                                                menu_max_h.set(max_h);
                                                                 // Dismiss any open reaction picker so the two
                                                                 // popovers can't stack (#402 review).
                                                                 open_emoji_picker.set(None);
@@ -2889,10 +2904,11 @@ fn MessageGroupComponent(
                                                         // kebab); `max-w` clamps it to the viewport as a
                                                         // backstop against a narrow-screen overflow.
                                                         class: format!(
-                                                            "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] max-h-[calc(100vh-9rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                            "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
                                                             if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
                                                             if *menu_align_left.read() { "left-0" } else { "right-0" }
                                                         ),
+                                                        style: format!("max-height: {}px", *menu_max_h.read()),
                                                         "data-testid": "message-action-menu",
                                                         button {
                                                             class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",

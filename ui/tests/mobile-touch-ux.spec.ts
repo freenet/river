@@ -278,6 +278,41 @@ test.describe("Message action kebab menu (#402.1)", () => {
     }
   });
 
+  test("menu is capped to the scrollport height on a short viewport", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 500, height: 340 });
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    // Own message (4-row menu) opened on a short scrollport: the menu must be
+    // capped to the available space (and scroll internally) rather than extend
+    // past the scroll container with actions unreachable.
+    await page
+      .locator('[id^="msg-"]:has(.bg-accent)')
+      .first()
+      .locator('[data-testid="message-kebab"]')
+      .click();
+    const menu = page.locator('[data-testid="message-action-menu"]');
+    await expect(menu).toBeVisible();
+
+    const box = await menu.boundingBox();
+    const scrollportH = await page.evaluate(() => {
+      const el = document.getElementById("chat-scroll-container");
+      return el ? el.clientHeight : 0;
+    });
+    expect(box).not.toBeNull();
+    if (box) {
+      // Fits within the scrollport (a few px slack), so nothing is clipped away.
+      expect(box.height).toBeLessThanOrEqual(scrollportH + 4);
+    }
+  });
+
   test("never more than one menu open at a time", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
