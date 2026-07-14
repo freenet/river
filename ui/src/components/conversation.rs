@@ -1169,14 +1169,25 @@ pub fn Conversation() -> Element {
     // `first_scroll` = true makes that snap instant rather than animated from an
     // arbitrary position. `is_at_bottom` = true hides the scroll-to-latest
     // button immediately on switch (the observer reconfirms after the snap).
+    //
+    // Guarded on an ACTUAL key change: Dioxus re-runs the effect on any write
+    // to `CURRENT_ROOM`, and re-selecting the already-open room in the sidebar
+    // rewrites it with the same key. Without the guard that would arm
+    // `force_scroll` with no new bubble to consume it, so a later message would
+    // snap the reader to the bottom (#402 review).
     {
         let first_scroll = first_scroll.clone();
         let force_scroll = force_scroll.clone();
+        let prev_room =
+            use_hook(|| Rc::new(std::cell::Cell::new(None::<ed25519_dalek::VerifyingKey>)));
         use_effect(move || {
-            let _room = CURRENT_ROOM.read().owner_key;
-            force_scroll.set(true);
-            first_scroll.set(true);
-            is_at_bottom.set(true);
+            let room = CURRENT_ROOM.read().owner_key;
+            if prev_room.get() != room {
+                prev_room.set(room);
+                force_scroll.set(true);
+                first_scroll.set(true);
+                is_at_bottom.set(true);
+            }
         });
     }
 
@@ -1796,8 +1807,14 @@ pub fn Conversation() -> Element {
                         });
                         if delta_applied {
                             // Local apply succeeded and a message will mount:
-                            // scroll it into view (#402 review).
-                            force_scroll.set(true);
+                            // scroll it into view — but only if the user is still
+                            // viewing the room this send targeted. Signing is
+                            // async, so they may have switched rooms; arming the
+                            // conversation-wide flag then would snap the NEW room
+                            // to the bottom on its next message (#402 review).
+                            if CURRENT_ROOM.peek().owner_key == Some(current_room) {
+                                force_scroll.set(true);
+                            }
                             crate::util::debug_log("[send] marking NEEDS_SYNC");
                             crate::components::app::mark_needs_sync(current_room);
                             #[cfg(target_arch = "wasm32")]
