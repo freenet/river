@@ -48,13 +48,6 @@ test.describe("Edit box width (#205)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    // Hover each message bubble until we find one that exposes an Edit
-    // button (own messages in the private room, where the owner IS self).
-    // Bubbles are divs with `max-w-prose` in the class list.
-    const bubbles = page.locator(".max-w-prose");
-    const count = await bubbles.count();
-    expect(count).toBeGreaterThan(0);
-
     // On touch devices (no hover) the hover action bar is non-interactive; the
     // real edit path is the kebab menu (freenet/river#402). Use whichever
     // affordance the current device exposes.
@@ -63,34 +56,33 @@ test.describe("Edit box width (#205)", () => {
     );
 
     let clicked = false;
-    for (let i = 0; i < count; i++) {
-      const bubble = bubbles.nth(i);
-      await bubble.scrollIntoViewIfNeeded();
-      // Scope the edit affordance lookup to this bubble's ancestor (the outer
-      // message container), so a stray control on another message doesn't mask
-      // the current target.
-      const msgContainer = bubble.locator(
-        "xpath=ancestor::*[starts-with(@id,'msg-')][1]"
-      );
-
-      if (touch) {
-        const kebab = msgContainer.locator('[data-testid="message-kebab"]');
-        if (!(await kebab.isVisible({ timeout: 500 }).catch(() => false)))
-          continue;
-        await kebab.click();
-        const editItem = page
-          .locator('[data-testid="message-action-menu"]')
-          .getByRole("button", { name: /edit/i });
-        if (await editItem.isVisible({ timeout: 500 }).catch(() => false)) {
-          await editItem.click();
-          clicked = true;
-          break;
-        }
-        // Received message (no Edit item): dismiss the menu and try the next.
-        await page.mouse.click(2, 2);
-      } else {
+    if (touch) {
+      // Target a self (accent) message directly and open Edit from its kebab —
+      // no iterating/dismissing, so the deferred menu-close can't race a
+      // following kebab tap.
+      const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
+      await expect(ownRow).toBeVisible();
+      await ownRow.scrollIntoViewIfNeeded();
+      await ownRow.locator('[data-testid="message-kebab"]').click();
+      await page
+        .locator('[data-testid="message-action-menu"]')
+        .getByRole("button", { name: /edit/i })
+        .click();
+      clicked = true;
+    } else {
+      // Hover each message bubble until one exposes an Edit button (own messages
+      // in the private room, where the owner IS self). Bubbles are divs with
+      // `max-w-prose` in the class list.
+      const bubbles = page.locator(".max-w-prose");
+      const count = await bubbles.count();
+      expect(count).toBeGreaterThan(0);
+      for (let i = 0; i < count; i++) {
+        const bubble = bubbles.nth(i);
+        await bubble.scrollIntoViewIfNeeded();
         await bubble.hover();
-        const editBtn = msgContainer.getByRole("button", { name: /edit/i });
+        const editBtn = bubble
+          .locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]")
+          .getByRole("button", { name: /edit/i });
         if (await editBtn.isVisible({ timeout: 500 }).catch(() => false)) {
           await editBtn.click();
           clicked = true;
