@@ -919,6 +919,10 @@ pub fn Conversation() -> Element {
     // Owned by Conversation (not per message group) so only ONE menu is open at
     // a time across the whole history — opening one closes any other (#402).
     let open_action_menu: Signal<Option<String>> = use_signal(|| None);
+    // Which message's emoji reaction picker is open, by picker ID string. Also
+    // owned by Conversation so at most one picker is open across all groups, and
+    // opening an action menu can dismiss it (they'd otherwise stack) (#402).
+    let open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
 
     // State for delete confirmation modal
@@ -1588,13 +1592,16 @@ pub fn Conversation() -> Element {
 
     // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
+        let force_scroll = force_scroll.clone();
         move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
-            // Always scroll to bottom when the user sends their own message.
-            // Deferred: `is_at_bottom` is now subscribed in render (the
-            // scroll-to-latest button), so a synchronous write from this event
-            // handler could fire a subscriber notification mid-stack and panic
-            // on Firefox mobile (.claude/rules/dioxus-signal-safety.md). #402
-            crate::util::defer(move || is_at_bottom.set(true));
+            // Scroll the user's own new message into view once it mounts. Uses
+            // `force_scroll` (a plain Cell, consumed by the mount-triggered
+            // effect) rather than writing `is_at_bottom`: a send that fails
+            // (payload too large, delta rejected) mounts no message, so nothing
+            // scrolls and the scroll-to-latest button's state is left untouched
+            // instead of being wrongly cleared. Also avoids a signal write from
+            // this event handler entirely. #402
+            force_scroll.set(true);
 
             if message_text.is_empty() {
                 warn!("Message is empty");
@@ -1997,6 +2004,7 @@ pub fn Conversation() -> Element {
                                                                     }
                                                                 },
                                                                 open_action_menu: open_action_menu,
+                                                                open_emoji_picker: open_emoji_picker,
                                                             }
                                                         }
                                                     }
@@ -2281,10 +2289,13 @@ fn MessageGroupComponent(
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
     on_reply: EventHandler<ReplyContext>,
-    // Shared across all groups so only one action menu is open at a time (#402).
+    // Shared across all groups so only one action menu / one picker is open at a
+    // time, and the two can coordinate (opening a menu dismisses a picker) (#402).
     open_action_menu: Signal<Option<String>>,
+    open_emoji_picker: Signal<Option<String>>,
 ) -> Element {
     let mut open_action_menu = open_action_menu;
+    let mut open_emoji_picker = open_emoji_picker;
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
     let delay_suffix = group
@@ -2302,9 +2313,6 @@ fn MessageGroupComponent(
     };
     let time_clamped = group.time_clamped;
     let is_self = group.is_self;
-
-    // Track which message's emoji picker is open (by message ID string)
-    let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
 
     // Whether the kebab action menu should open above (true) or below (false)
     // the kebab. Set from the tap position so the menu for a message near the
@@ -2860,6 +2868,9 @@ fn MessageGroupComponent(
                                                             crate::util::defer(move || {
                                                                 menu_show_above.set(above);
                                                                 menu_align_left.set(align_left);
+                                                                // Dismiss any open reaction picker so the two
+                                                                // popovers can't stack (#402 review).
+                                                                open_emoji_picker.set(None);
                                                                 open_action_menu.set(Some(id));
                                                             });
                                                         }
