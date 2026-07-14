@@ -70,9 +70,9 @@
 //!   *asynchronously* in the synchronizer message loop: if that loop lags
 //!   longer than a probe tick plus [`LIVENESS_PROBE_TIMEOUT_MS`], a naive
 //!   watchdog would re-probe and fire a SECOND `ConnectionLost`, and each one
-//!   independently schedules a reconnect and bumps `consecutive_failures`,
-//!   producing overlapping reconnects and inflated backoff. The latch makes the
-//!   "exactly once" guarantee hold even under message-loop lag.
+//!   independently schedules a reconnect and bumps the reconnect backoff
+//!   counter, producing overlapping reconnects and inflated backoff. The latch
+//!   makes the "exactly once" guarantee hold even under message-loop lag.
 //! * The probe timeout ([`LIVENESS_PROBE_TIMEOUT_MS`]) is far larger than a
 //!   local GET's real latency, so a momentarily slow node does not trigger a
 //!   false reconnect. If no room exists to probe, the watchdog never declares

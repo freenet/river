@@ -9,7 +9,7 @@ use crate::components::app::chat_delegate::{
 };
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
-use crate::util::{owner_vk_to_contract_key, sleep};
+use crate::util::{owner_vk_to_contract_key, safe_spawn_local, sleep};
 use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
@@ -49,18 +49,39 @@ fn reconnect_delay_ms(consecutive_failures: u32) -> u64 {
     (capped - jitter_range + jitter).min(RECONNECT_MAX_MS)
 }
 
-/// Reconnect bookkeeping: the exponential-backoff failure counter plus a
-/// single-outstanding-reconnect latch. Extracted from the message loop so the
-/// two behaviours behind the endless Android reconnect loop (freenet/river#406)
-/// are unit-testable: (1) the backoff must GROW across an open-then-die flap
-/// and reset only after a connection proves stable, and (2) a duplicate
-/// ConnectionLost (a dropped socket's orphaned `onclose`, or the watchdog and
-/// transport reporting the same death) must be coalesced, not stack another
-/// reconnect.
+/// A scheduled reconnect: the backoff delay to wait, plus the `generation` that
+/// identifies this specific arming. A delayed reconnect timer captures the
+/// generation and, when it fires, drives a reconnect only if the generation is
+/// still current (`ReconnectState::is_current_reconnect`). This lets an
+/// immediate Connect — from PageBecameVisible/ProcessRooms, or a thawed
+/// background-timer backlog firing all at once on resume — supersede an
+/// already-scheduled backoff timer instead of running in parallel with it, so
+/// reconnect chains can't stack (freenet/river#406).
+#[derive(Clone, Copy)]
+struct ArmedReconnect {
+    delay_ms: u64,
+    generation: u64,
+}
+
+/// Reconnect bookkeeping: the exponential-backoff failure counter, a
+/// single-outstanding-reconnect latch, and a generation counter that lets a
+/// stale reconnect timer detect it has been superseded. Extracted from the
+/// message loop so the behaviours behind the endless Android reconnect loop
+/// (freenet/river#406) are unit-testable: (1) the backoff must GROW across an
+/// open-then-die flap and reset only after a connection proves stable; (2) a
+/// duplicate ConnectionLost (a dropped socket's orphaned `onclose`, or the
+/// watchdog and transport reporting the same death) must be coalesced, not
+/// stack another reconnect; and (3) once a newer reconnect is armed, an older
+/// timer that fires late must drop itself rather than launch a parallel
+/// attempt.
 #[derive(Default)]
 struct ReconnectState {
     consecutive_failures: u32,
     reconnect_pending: bool,
+    /// Bumped on every `arm()`. A delayed reconnect timer is honored only if the
+    /// generation it captured still equals this value (see
+    /// [`is_current_reconnect`](Self::is_current_reconnect)).
+    generation: u64,
 }
 
 impl ReconnectState {
@@ -69,10 +90,10 @@ impl ReconnectState {
         self.reconnect_pending = false;
     }
 
-    /// A ConnectionLost arrived. `Some(delay_ms)` → schedule a reconnect after
-    /// that delay; `None` → a reconnect is already pending, so this is a
+    /// A ConnectionLost arrived. `Some(armed)` → schedule a reconnect with that
+    /// delay/generation; `None` → a reconnect is already pending, so this is a
     /// coalesced duplicate loss and must be ignored.
-    fn on_connection_lost(&mut self) -> Option<u64> {
+    fn on_connection_lost(&mut self) -> Option<ArmedReconnect> {
         if self.reconnect_pending {
             None
         } else {
@@ -81,7 +102,7 @@ impl ReconnectState {
     }
 
     /// A Connect attempt failed to open — always schedule a retry.
-    fn on_connect_failed(&mut self) -> u64 {
+    fn on_connect_failed(&mut self) -> ArmedReconnect {
         self.arm()
     }
 
@@ -94,12 +115,26 @@ impl ReconnectState {
         }
     }
 
-    /// Current backoff delay, then advance the failure count and arm the latch.
-    fn arm(&mut self) -> u64 {
+    /// Whether a delayed reconnect timer tagged with `generation` should still
+    /// drive a reconnect. False once a newer `arm()` has superseded it (a newer
+    /// timer is already scheduled) or the pending reconnect has already been
+    /// consumed — so a late-firing stale timer drops itself instead of stacking
+    /// a parallel attempt (freenet/river#406).
+    fn is_current_reconnect(&self, generation: u64) -> bool {
+        self.reconnect_pending && self.generation == generation
+    }
+
+    /// Current backoff delay, then advance the failure count, arm the latch, and
+    /// bump the generation (invalidating any previously-scheduled timer).
+    fn arm(&mut self) -> ArmedReconnect {
         let delay = reconnect_delay_ms(self.consecutive_failures);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.reconnect_pending = true;
-        delay
+        self.generation = self.generation.saturating_add(1);
+        ArmedReconnect {
+            delay_ms: delay,
+            generation: self.generation,
+        }
     }
 
     /// Human-facing attempt number for logs (1-based after arming).
@@ -112,6 +147,14 @@ impl ReconnectState {
 pub enum SynchronizerMessage {
     ProcessRooms,
     Connect,
+    /// Sent (delayed) by a reconnect backoff timer, tagged with the reconnect
+    /// generation it was armed for. Drives a reconnect only if that generation
+    /// is still current — a newer arming (e.g. from an immediate Connect after
+    /// resume) supersedes it, so stale timers drop themselves instead of
+    /// stacking parallel reconnect chains (freenet/river#406).
+    ScheduledReconnect {
+        generation: u64,
+    },
     /// Sent when WebSocket connection is lost (closed or errored)
     ConnectionLost,
     /// Sent (delayed) after a Connect succeeds, tagged with the connection
@@ -250,16 +293,26 @@ impl FreenetSynchronizer {
             let mut reconnect = ReconnectState::default();
 
             // Spawn the delayed reconnect (the async setTimeout part; the backoff
-            // math + pending latch live in `ReconnectState`).
-            let spawn_reconnect = |delay: u64, tx: &UnboundedSender<SynchronizerMessage>| {
-                let tx = tx.clone();
-                spawn_local(async move {
-                    sleep(Duration::from_millis(delay)).await;
-                    if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
-                        error!("Failed to send reconnect message: {}", e);
-                    }
-                });
-            };
+            // math + pending latch + generation live in `ReconnectState`). The
+            // timer sends `ScheduledReconnect { generation }` rather than a bare
+            // Connect, so a stale timer (superseded by a newer arming) drops
+            // itself in the handler instead of stacking a parallel reconnect
+            // (freenet/river#406). `safe_spawn_local` defers the spawn via
+            // setTimeout(0) so spawning from inside this polled loop future can't
+            // re-enter wasm-bindgen's task scheduler and panic on Firefox mobile
+            // (mirrors the watchdog's own convention).
+            let spawn_reconnect =
+                |armed: ArmedReconnect, tx: &UnboundedSender<SynchronizerMessage>| {
+                    let tx = tx.clone();
+                    safe_spawn_local(async move {
+                        sleep(Duration::from_millis(armed.delay_ms)).await;
+                        if let Err(e) = tx.unbounded_send(SynchronizerMessage::ScheduledReconnect {
+                            generation: armed.generation,
+                        }) {
+                            error!("Failed to send reconnect message: {}", e);
+                        }
+                    });
+                };
 
             info!("Entering message loop");
             while let Some(msg) = message_rx.next().await {
@@ -307,17 +360,38 @@ impl FreenetSynchronizer {
                             None => {
                                 info!("ConnectionLost ignored — a reconnect is already pending");
                             }
-                            Some(delay) => {
+                            Some(armed) => {
                                 // Clear the web API so is_connected() returns false
                                 WEB_API.write().take();
                                 *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
                                 warn!(
                                     "Connection lost (attempt {}), reconnecting in {}ms",
                                     reconnect.attempt(),
-                                    delay
+                                    armed.delay_ms
                                 );
-                                spawn_reconnect(delay, &message_tx);
+                                spawn_reconnect(armed, &message_tx);
                             }
+                        }
+                    }
+                    SynchronizerMessage::ScheduledReconnect { generation } => {
+                        // A backoff timer fired. Honor it only if it is still the
+                        // current reconnect generation; a newer arming (typically
+                        // an immediate Connect after resume that itself failed, or
+                        // another loss) supersedes it, so an older timer that fires
+                        // late drops itself here instead of launching a second,
+                        // parallel reconnect chain (freenet/river#406). When
+                        // current, funnel through the normal Connect path so the
+                        // connect/dedup logic lives in one place.
+                        if reconnect.is_current_reconnect(generation) {
+                            if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect)
+                            {
+                                error!("Failed to send Connect from ScheduledReconnect: {}", e);
+                            }
+                        } else {
+                            info!(
+                                "Stale reconnect timer (generation {}) dropped — superseded by a newer attempt",
+                                generation
+                            );
                         }
                     }
                     SynchronizerMessage::ConnectionStable { connect_seq } => {
@@ -346,10 +420,12 @@ impl FreenetSynchronizer {
                             // runs now rather than waiting out any pending backoff
                             // timer). Do NOT reset the backoff here: eagerly zeroing
                             // it on every resume was part of the never-terminating
-                            // loop. The Connect dedup makes a redundant attempt (if
-                            // a reconnect was already pending) a no-op, and the
-                            // dwell resets the backoff once a connection is stable
-                            // (freenet/river#406).
+                            // loop. This immediate Connect also bumps the reconnect
+                            // generation if it fails, so any backoff timer already
+                            // scheduled for the old generation drops itself when it
+                            // fires (see `ScheduledReconnect`) rather than adding a
+                            // parallel attempt; the dwell resets the backoff once a
+                            // connection proves stable (freenet/river#406).
                             info!("Connection is not active after wake, triggering reconnection");
                             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect)
                             {
@@ -423,17 +499,24 @@ impl FreenetSynchronizer {
                     }
                     SynchronizerMessage::Connect => {
                         // A reconnect (or the first connect) is now being
-                        // attempted; clear the pending latch. A redundant Connect
-                        // — from repeated PageBecameVisible, a frozen background
-                        // timer backlog that all fires at once on resume, or the
+                        // attempted; clear the pending latch so the next loss can
+                        // arm a fresh reconnect. A redundant Connect — from
+                        // repeated PageBecameVisible, a frozen background-timer
+                        // backlog that all fires at once on resume, or the
                         // ProcessRooms/RefreshAllRooms no-delay Connect paths —
                         // must NOT tear down a live connection: initialize_connection
                         // would overwrite a live WEB_API, dropping its socket, whose
                         // orphaned `onclose` then injects a spurious ConnectionLost
                         // and self-sustains the loop (freenet/river#406). Skip when
-                        // already connected.
+                        // we already have a live, usable connection. Both conditions
+                        // are required: SYNC_STATUS and WEB_API are written by
+                        // separate deferred tasks, so a late `onopen` can leave
+                        // `is_connected()` true while WEB_API is still None (a
+                        // half-open zombie). Gating on WEB_API too keeps the skip
+                        // self-contained rather than relying on a later onclose to
+                        // re-assert the disconnect.
                         reconnect.note_connect_attempt();
-                        if connection_manager.is_connected() {
+                        if connection_manager.is_connected() && WEB_API.read().is_some() {
                             info!("Connect ignored — already connected");
                             continue;
                         }
@@ -453,7 +536,13 @@ impl FreenetSynchronizer {
                                 // (freenet/river#406).
                                 let connect_seq = super::connection_watchdog::ws_connect_seq();
                                 let stable_tx = message_tx.clone();
-                                spawn_local(async move {
+                                // `safe_spawn_local` (not raw `spawn_local`) defers
+                                // the spawn via setTimeout(0): spawning from inside
+                                // this polled loop future can otherwise re-enter
+                                // wasm-bindgen's task scheduler and panic on Firefox
+                                // mobile — the same convention the liveness watchdog
+                                // uses for exactly this reason.
+                                safe_spawn_local(async move {
                                     sleep(Duration::from_millis(
                                         super::constants::CONNECTION_STABLE_DWELL_MS,
                                     ))
@@ -515,13 +604,13 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Failed to initialize connection: {}", e);
-                                let delay = reconnect.on_connect_failed();
+                                let armed = reconnect.on_connect_failed();
                                 warn!(
                                     "Connection failed (attempt {}), reconnecting in {}ms",
                                     reconnect.attempt(),
-                                    delay
+                                    armed.delay_ms
                                 );
-                                spawn_reconnect(delay, &message_tx);
+                                spawn_reconnect(armed, &message_tx);
                             }
                         }
                     }
@@ -804,9 +893,6 @@ mod tests {
         assert_eq!(reconnect_delay_ms(u32::MAX), 60000);
     }
 
-    // On non-wasm, jitter is deterministic (= jitter_range), so
-    // reconnect_delay_ms(n) == the capped exponential: 3s, 6s, 12s, 24s, 48s, 60s…
-
     #[test]
     fn flapping_open_then_die_backs_off() {
         // The regression: an Android socket that opens then immediately dies
@@ -818,10 +904,10 @@ mod tests {
         for _ in 0..5 {
             r.note_connect_attempt(); // Connect dequeued
                                       // socket opens (Ok) — no failure increment, dwell not yet reached
-            let delay = r
+            let armed = r
                 .on_connection_lost()
                 .expect("first loss of each cycle schedules a reconnect");
-            delays.push(delay);
+            delays.push(armed.delay_ms);
         }
         assert_eq!(delays, vec![3000, 6000, 12000, 24000, 48000]);
     }
@@ -837,12 +923,12 @@ mod tests {
         // A dwell for a connection that is no longer the live one must NOT reset.
         r.note_stable(false);
         r.note_connect_attempt();
-        assert_eq!(r.on_connection_lost(), Some(12000)); // still failures=2 -> 12s
+        assert_eq!(r.on_connection_lost().map(|a| a.delay_ms), Some(12000)); // failures=2 -> 12s
 
         // A connection that stayed up for the dwell (still current) resets it.
         r.note_stable(true);
         r.note_connect_attempt();
-        assert_eq!(r.on_connection_lost(), Some(3000)); // reset -> 3s
+        assert_eq!(r.on_connection_lost().map(|a| a.delay_ms), Some(3000)); // reset -> 3s
     }
 
     #[test]
@@ -851,12 +937,40 @@ mod tests {
         // same death, must not each schedule a reconnect (freenet/river#406).
         let mut r = ReconnectState::default();
         r.note_connect_attempt();
-        assert_eq!(r.on_connection_lost(), Some(3000)); // schedules; pending latched
-        assert_eq!(r.on_connection_lost(), None); // duplicate ignored
-        assert_eq!(r.on_connection_lost(), None); // and again
-                                                  // The next real attempt clears the latch; a later loss schedules again,
-                                                  // and the duplicates above did NOT inflate the failure count (6s, not 24s).
+        assert_eq!(r.on_connection_lost().map(|a| a.delay_ms), Some(3000)); // schedules; pending latched
+        assert!(r.on_connection_lost().is_none()); // duplicate ignored
+        assert!(r.on_connection_lost().is_none()); // and again
+                                                   // The next real attempt clears the latch; a later loss schedules again,
+                                                   // and the duplicates above did NOT inflate the failure count (6s, not 24s).
         r.note_connect_attempt();
-        assert_eq!(r.on_connection_lost(), Some(6000));
+        assert_eq!(r.on_connection_lost().map(|a| a.delay_ms), Some(6000));
+    }
+
+    #[test]
+    fn stale_reconnect_timer_is_dropped_but_current_one_fires() {
+        // A backoff timer must only drive a reconnect if its generation is still
+        // current. When an immediate Connect (e.g. from PageBecameVisible on
+        // resume) supersedes an already-scheduled timer, the old timer that fires
+        // late must drop itself rather than stack a parallel reconnect chain
+        // (freenet/river#406).
+        let mut r = ReconnectState::default();
+
+        // Loss 1 arms a timer at generation g1.
+        r.note_connect_attempt();
+        let g1 = r.on_connection_lost().expect("first loss arms").generation;
+        assert!(r.is_current_reconnect(g1)); // its own timer is current
+
+        // An immediate Connect runs, fails, and arms a NEW timer at g2. That
+        // arming supersedes g1.
+        r.note_connect_attempt(); // clears the pending latch (Connect dequeued)
+        let g2 = r.on_connect_failed().generation;
+        assert_ne!(g1, g2);
+        assert!(!r.is_current_reconnect(g1)); // the g1 timer is now stale -> dropped
+        assert!(r.is_current_reconnect(g2)); // the g2 timer is current -> fires
+
+        // Once the g2 timer's Connect is dequeued (latch cleared), even g2 is no
+        // longer a pending reconnect, so a duplicate firing is a no-op.
+        r.note_connect_attempt();
+        assert!(!r.is_current_reconnect(g2));
     }
 }
