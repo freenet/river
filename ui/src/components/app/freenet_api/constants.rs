@@ -41,6 +41,14 @@ pub const RECONNECT_INITIAL_MS: u64 = 3000;
 /// Maximum retry interval for reconnection attempts in milliseconds
 pub const RECONNECT_MAX_MS: u64 = 60_000;
 
+/// How long (ms) a connection must stay up before the reconnect backoff counter
+/// is reset. Resetting merely on socket `onopen` let a socket that opens then
+/// immediately dies reset the counter every cycle, defeating the exponential
+/// backoff and producing an endless ~3s reconnect loop after an Android
+/// background→resume (freenet/river#406). A connection must prove itself stable
+/// for this long before we treat it as a fresh, healthy baseline.
+pub const CONNECTION_STABLE_DWELL_MS: u64 = 15_000;
+
 /// Maximum number of retries for API requests
 pub const MAX_REQUEST_RETRIES: u8 = 3;
 

@@ -49,12 +49,78 @@ fn reconnect_delay_ms(consecutive_failures: u32) -> u64 {
     (capped - jitter_range + jitter).min(RECONNECT_MAX_MS)
 }
 
+/// Reconnect bookkeeping: the exponential-backoff failure counter plus a
+/// single-outstanding-reconnect latch. Extracted from the message loop so the
+/// two behaviours behind the endless Android reconnect loop (freenet/river#406)
+/// are unit-testable: (1) the backoff must GROW across an open-then-die flap
+/// and reset only after a connection proves stable, and (2) a duplicate
+/// ConnectionLost (a dropped socket's orphaned `onclose`, or the watchdog and
+/// transport reporting the same death) must be coalesced, not stack another
+/// reconnect.
+#[derive(Default)]
+struct ReconnectState {
+    consecutive_failures: u32,
+    reconnect_pending: bool,
+}
+
+impl ReconnectState {
+    /// A Connect is now being attempted — clear the single-pending latch.
+    fn note_connect_attempt(&mut self) {
+        self.reconnect_pending = false;
+    }
+
+    /// A ConnectionLost arrived. `Some(delay_ms)` → schedule a reconnect after
+    /// that delay; `None` → a reconnect is already pending, so this is a
+    /// coalesced duplicate loss and must be ignored.
+    fn on_connection_lost(&mut self) -> Option<u64> {
+        if self.reconnect_pending {
+            None
+        } else {
+            Some(self.arm())
+        }
+    }
+
+    /// A Connect attempt failed to open — always schedule a retry.
+    fn on_connect_failed(&mut self) -> u64 {
+        self.arm()
+    }
+
+    /// A connection proved stable for the dwell window. Reset the backoff ONLY
+    /// if it is still the live connection (`still_current`), so an open-then-die
+    /// socket keeps backing off instead of resetting the counter every cycle.
+    fn note_stable(&mut self, still_current: bool) {
+        if still_current {
+            self.consecutive_failures = 0;
+        }
+    }
+
+    /// Current backoff delay, then advance the failure count and arm the latch.
+    fn arm(&mut self) -> u64 {
+        let delay = reconnect_delay_ms(self.consecutive_failures);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.reconnect_pending = true;
+        delay
+    }
+
+    /// Human-facing attempt number for logs (1-based after arming).
+    fn attempt(&self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
 /// Message types for communicating with the synchronizer
 pub enum SynchronizerMessage {
     ProcessRooms,
     Connect,
     /// Sent when WebSocket connection is lost (closed or errored)
     ConnectionLost,
+    /// Sent (delayed) after a Connect succeeds, tagged with the connection
+    /// generation it was scheduled for. Resets the reconnect backoff only if
+    /// that same connection is still up — so backoff is reset by proven
+    /// stability, not merely by a socket opening (freenet/river#406).
+    ConnectionStable {
+        connect_seq: u64,
+    },
     /// Sent when page becomes visible after being hidden (e.g., after sleep/wake)
     PageBecameVisible,
     /// Sent to refresh all room states after reconnection (e.g., after sleep/wake)
@@ -181,25 +247,19 @@ impl FreenetSynchronizer {
                 error!("Failed to send Connect message: {}", e);
             }
 
-            let mut consecutive_failures: u32 = 0;
+            let mut reconnect = ReconnectState::default();
 
-            // Helper: compute delay from current failure count, then increment for next time
-            let schedule_reconnect =
-                |consecutive_failures: &mut u32, tx: &UnboundedSender<SynchronizerMessage>| {
-                    let delay = reconnect_delay_ms(*consecutive_failures);
-                    *consecutive_failures = consecutive_failures.saturating_add(1);
-                    warn!(
-                        "Connection failed (attempt {}), reconnecting in {}ms",
-                        *consecutive_failures, delay
-                    );
-                    let tx = tx.clone();
-                    spawn_local(async move {
-                        sleep(Duration::from_millis(delay)).await;
-                        if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
-                            error!("Failed to send reconnect message: {}", e);
-                        }
-                    });
-                };
+            // Spawn the delayed reconnect (the async setTimeout part; the backoff
+            // math + pending latch live in `ReconnectState`).
+            let spawn_reconnect = |delay: u64, tx: &UnboundedSender<SynchronizerMessage>| {
+                let tx = tx.clone();
+                spawn_local(async move {
+                    sleep(Duration::from_millis(delay)).await;
+                    if let Err(e) = tx.unbounded_send(SynchronizerMessage::Connect) {
+                        error!("Failed to send reconnect message: {}", e);
+                    }
+                });
+            };
 
             info!("Entering message loop");
             while let Some(msg) = message_rx.next().await {
@@ -237,18 +297,59 @@ impl FreenetSynchronizer {
                         }
                     }
                     SynchronizerMessage::ConnectionLost => {
-                        // Clear the web API so is_connected() returns false
-                        WEB_API.write().take();
-                        *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
-                        schedule_reconnect(&mut consecutive_failures, &message_tx);
+                        // Coalesce: if a reconnect is already scheduled this is a
+                        // duplicate loss — the socket we're about to drop will
+                        // itself fire `onclose` → another ConnectionLost, and the
+                        // watchdog and transport can both report the same death.
+                        // Acting again would stack extra reconnects and inflate
+                        // the backoff, part of the endless loop (freenet/river#406).
+                        match reconnect.on_connection_lost() {
+                            None => {
+                                info!("ConnectionLost ignored — a reconnect is already pending");
+                            }
+                            Some(delay) => {
+                                // Clear the web API so is_connected() returns false
+                                WEB_API.write().take();
+                                *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
+                                warn!(
+                                    "Connection lost (attempt {}), reconnecting in {}ms",
+                                    reconnect.attempt(),
+                                    delay
+                                );
+                                spawn_reconnect(delay, &message_tx);
+                            }
+                        }
+                    }
+                    SynchronizerMessage::ConnectionStable { connect_seq } => {
+                        // The connection scheduled at `connect_seq` has now stayed
+                        // up for the dwell window. Reset the backoff ONLY if this
+                        // is still the live connection — a flap that reconnected
+                        // meanwhile bumped `ws_connect_seq`, so its own (later)
+                        // ConnectionStable governs the reset. This is what makes a
+                        // socket that opens-then-dies keep backing off instead of
+                        // resetting the counter every cycle (freenet/river#406).
+                        let still_current = connection_manager.is_connected()
+                            && super::connection_watchdog::ws_connect_seq() == connect_seq;
+                        if still_current {
+                            info!(
+                                "Connection stable for dwell window; resetting reconnect backoff"
+                            );
+                        }
+                        reconnect.note_stable(still_current);
                     }
                     SynchronizerMessage::PageBecameVisible => {
                         // Page became visible after being hidden (e.g., after sleep/wake)
                         // Check if we're still connected, if not trigger reconnection
                         info!("Page visibility changed to visible, checking connection status");
                         if !connection_manager.is_connected() {
-                            // Reset backoff — user is actively looking at the page
-                            consecutive_failures = 0;
+                            // Send Connect for an immediate reconnect attempt (it
+                            // runs now rather than waiting out any pending backoff
+                            // timer). Do NOT reset the backoff here: eagerly zeroing
+                            // it on every resume was part of the never-terminating
+                            // loop. The Connect dedup makes a redundant attempt (if
+                            // a reconnect was already pending) a no-op, and the
+                            // dwell resets the backoff once a connection is stable
+                            // (freenet/river#406).
                             info!("Connection is not active after wake, triggering reconnection");
                             if let Err(e) = message_tx.unbounded_send(SynchronizerMessage::Connect)
                             {
@@ -321,6 +422,21 @@ impl FreenetSynchronizer {
                         }
                     }
                     SynchronizerMessage::Connect => {
+                        // A reconnect (or the first connect) is now being
+                        // attempted; clear the pending latch. A redundant Connect
+                        // — from repeated PageBecameVisible, a frozen background
+                        // timer backlog that all fires at once on resume, or the
+                        // ProcessRooms/RefreshAllRooms no-delay Connect paths —
+                        // must NOT tear down a live connection: initialize_connection
+                        // would overwrite a live WEB_API, dropping its socket, whose
+                        // orphaned `onclose` then injects a spurious ConnectionLost
+                        // and self-sustains the loop (freenet/river#406). Skip when
+                        // already connected.
+                        reconnect.note_connect_attempt();
+                        if connection_manager.is_connected() {
+                            info!("Connect ignored — already connected");
+                            continue;
+                        }
                         info!("Connecting to Freenet");
                         match connection_manager
                             .initialize_connection(message_tx.clone())
@@ -328,7 +444,26 @@ impl FreenetSynchronizer {
                         {
                             Ok(()) => {
                                 info!("Connection established successfully");
-                                consecutive_failures = 0;
+                                // Do NOT reset the backoff on mere socket-open — an
+                                // open-then-die socket would reset it every cycle,
+                                // defeating the exponential backoff. Instead arm a
+                                // dwell check tagged with this connection's
+                                // generation; the backoff resets only if this same
+                                // connection is still up after the dwell window
+                                // (freenet/river#406).
+                                let connect_seq = super::connection_watchdog::ws_connect_seq();
+                                let stable_tx = message_tx.clone();
+                                spawn_local(async move {
+                                    sleep(Duration::from_millis(
+                                        super::constants::CONNECTION_STABLE_DWELL_MS,
+                                    ))
+                                    .await;
+                                    if let Err(e) = stable_tx.unbounded_send(
+                                        SynchronizerMessage::ConnectionStable { connect_seq },
+                                    ) {
+                                        error!("Failed to send ConnectionStable: {}", e);
+                                    }
+                                });
                                 // Check if web API is available without holding the lock
                                 // during process_rooms() call
                                 let api_available = WEB_API.read().is_some();
@@ -380,7 +515,13 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Failed to initialize connection: {}", e);
-                                schedule_reconnect(&mut consecutive_failures, &message_tx);
+                                let delay = reconnect.on_connect_failed();
+                                warn!(
+                                    "Connection failed (attempt {}), reconnecting in {}ms",
+                                    reconnect.attempt(),
+                                    delay
+                                );
+                                spawn_reconnect(delay, &message_tx);
                             }
                         }
                     }
@@ -661,5 +802,61 @@ mod tests {
         }
         // Extreme values must not overflow
         assert_eq!(reconnect_delay_ms(u32::MAX), 60000);
+    }
+
+    // On non-wasm, jitter is deterministic (= jitter_range), so
+    // reconnect_delay_ms(n) == the capped exponential: 3s, 6s, 12s, 24s, 48s, 60s…
+
+    #[test]
+    fn flapping_open_then_die_backs_off() {
+        // The regression: an Android socket that opens then immediately dies
+        // must NOT reset the backoff on mere open. Because the stability dwell is
+        // never reached, `note_stable` is never called, so each loss grows the
+        // delay instead of pinning it at the 3s floor forever (freenet/river#406).
+        let mut r = ReconnectState::default();
+        let mut delays = vec![];
+        for _ in 0..5 {
+            r.note_connect_attempt(); // Connect dequeued
+                                      // socket opens (Ok) — no failure increment, dwell not yet reached
+            let delay = r
+                .on_connection_lost()
+                .expect("first loss of each cycle schedules a reconnect");
+            delays.push(delay);
+        }
+        assert_eq!(delays, vec![3000, 6000, 12000, 24000, 48000]);
+    }
+
+    #[test]
+    fn stable_connection_resets_backoff_but_stale_dwell_does_not() {
+        let mut r = ReconnectState::default();
+        r.note_connect_attempt();
+        r.on_connection_lost(); // failures 0 -> 1
+        r.note_connect_attempt();
+        r.on_connection_lost(); // failures 1 -> 2
+
+        // A dwell for a connection that is no longer the live one must NOT reset.
+        r.note_stable(false);
+        r.note_connect_attempt();
+        assert_eq!(r.on_connection_lost(), Some(12000)); // still failures=2 -> 12s
+
+        // A connection that stayed up for the dwell (still current) resets it.
+        r.note_stable(true);
+        r.note_connect_attempt();
+        assert_eq!(r.on_connection_lost(), Some(3000)); // reset -> 3s
+    }
+
+    #[test]
+    fn duplicate_connection_lost_is_coalesced() {
+        // A dropped socket's orphaned `onclose`, plus the watchdog reporting the
+        // same death, must not each schedule a reconnect (freenet/river#406).
+        let mut r = ReconnectState::default();
+        r.note_connect_attempt();
+        assert_eq!(r.on_connection_lost(), Some(3000)); // schedules; pending latched
+        assert_eq!(r.on_connection_lost(), None); // duplicate ignored
+        assert_eq!(r.on_connection_lost(), None); // and again
+                                                  // The next real attempt clears the latch; a later loss schedules again,
+                                                  // and the duplicates above did NOT inflate the failure count (6s, not 24s).
+        r.note_connect_attempt();
+        assert_eq!(r.on_connection_lost(), Some(6000));
     }
 }
