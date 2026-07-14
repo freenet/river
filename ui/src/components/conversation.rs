@@ -1585,8 +1585,12 @@ pub fn Conversation() -> Element {
     // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
         move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
-            // Always scroll to bottom when user sends their own message
-            is_at_bottom.set(true);
+            // Always scroll to bottom when the user sends their own message.
+            // Deferred: `is_at_bottom` is now subscribed in render (the
+            // scroll-to-latest button), so a synchronous write from this event
+            // handler could fire a subscriber notification mid-stack and panic
+            // on Firefox mobile (.claude/rules/dioxus-signal-safety.md). #402
+            crate::util::defer(move || is_at_bottom.set(true));
 
             if message_text.is_empty() {
                 warn!("Message is empty");
@@ -2307,6 +2311,13 @@ fn MessageGroupComponent(
     // composer — mirrors `picker_show_above` for the emoji picker (#402).
     let mut menu_show_above: Signal<bool> = use_signal(|| false);
 
+    // Whether the kebab action menu should be left-anchored (open rightward) or
+    // right-anchored (open leftward). Chosen from the tap's horizontal position
+    // so the menu always opens toward the viewport centre regardless of
+    // self/other side or bubble width, and never clips its content off a narrow
+    // screen edge (#402 review).
+    let mut menu_align_left: Signal<bool> = use_signal(|| false);
+
     // Track if emoji picker should appear above (true) or below (false) the button
     let mut picker_show_above: Signal<bool> = use_signal(|| false);
 
@@ -2797,21 +2808,37 @@ fn MessageGroupComponent(
                                                         if is_open {
                                                             crate::util::defer(move || open_action_menu.set(None));
                                                         } else {
-                                                            // Flip the menu above the kebab when the tap is in the
-                                                            // bottom ~40% of the viewport so it is not clipped by the
-                                                            // composer or the screen edge.
-                                                            let click_y = e.client_coordinates().y;
-                                                            let viewport_height = web_sys::window()
-                                                                .and_then(|w| w.inner_height().ok())
-                                                                .and_then(|h| h.as_f64())
-                                                                .unwrap_or(800.0);
-                                                            let above = click_y > viewport_height * 0.6;
+                                                            // Position the menu from the tap coordinates: flip it
+                                                            // above the kebab when the tap is in the bottom ~40% of
+                                                            // the viewport (so the composer doesn't clip it), and
+                                                            // open it toward the viewport centre (left-anchored when
+                                                            // the kebab is on the left half, right-anchored on the
+                                                            // right half) so its content never runs off a screen edge.
+                                                            let coords = e.client_coordinates();
+                                                            let (win_w, win_h) = web_sys::window()
+                                                                .map(|w| {
+                                                                    let h = w
+                                                                        .inner_height()
+                                                                        .ok()
+                                                                        .and_then(|v| v.as_f64())
+                                                                        .unwrap_or(800.0);
+                                                                    let w = w
+                                                                        .inner_width()
+                                                                        .ok()
+                                                                        .and_then(|v| v.as_f64())
+                                                                        .unwrap_or(400.0);
+                                                                    (w, h)
+                                                                })
+                                                                .unwrap_or((400.0, 800.0));
+                                                            let above = coords.y > win_h * 0.6;
+                                                            let align_left = coords.x < win_w * 0.5;
                                                             let id = msg_id_kebab_toggle.clone();
                                                             // Defer signal writes out of the event handler per
                                                             // .claude/rules/dioxus-signal-safety.md (Firefox-mobile
                                                             // re-entrant borrow crashes).
                                                             crate::util::defer(move || {
                                                                 menu_show_above.set(above);
+                                                                menu_align_left.set(align_left);
                                                                 open_action_menu.set(Some(id));
                                                             });
                                                         }
@@ -2834,7 +2861,7 @@ fn MessageGroupComponent(
                                                         class: format!(
                                                             "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
                                                             if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                            if is_self { "left-0" } else { "right-0" }
+                                                            if *menu_align_left.read() { "left-0" } else { "right-0" }
                                                         ),
                                                         "data-testid": "message-action-menu",
                                                         button {

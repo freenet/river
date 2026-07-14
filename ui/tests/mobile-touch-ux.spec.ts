@@ -209,6 +209,15 @@ test.describe("Message action kebab menu (#402.1)", () => {
         expect(box.x).toBeGreaterThanOrEqual(-1);
         expect(box.x + box.width).toBeLessThanOrEqual(vp.width + 1);
       }
+      // The menu content (first action) must be fully on-screen, not clipped by
+      // the scroll container's overflow-x-hidden backstop.
+      const replyBox = await menu
+        .getByRole("button", { name: "Reply" })
+        .boundingBox();
+      if (replyBox && vp) {
+        expect(replyBox.x).toBeGreaterThanOrEqual(-1);
+        expect(replyBox.x + replyBox.width).toBeLessThanOrEqual(vp.width + 1);
+      }
       // Opening the menu must not introduce a horizontal page scrollbar.
       const hScroll = await page.evaluate(
         () =>
