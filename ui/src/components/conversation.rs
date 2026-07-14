@@ -23,7 +23,8 @@ use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaCircleInfo, FaTriangleExclamation, FaUsers,
+    FaBars, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile, FaPenToSquare, FaReply,
+    FaTrashCan, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -914,6 +915,10 @@ pub fn Conversation() -> Element {
     };
     let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
     let mut is_at_bottom = use_signal(|| true);
+    // Which message's touch action menu (kebab) is open, by message ID string.
+    // Owned by Conversation (not per message group) so only ONE menu is open at
+    // a time across the whole history — opening one closes any other (#402).
+    let open_action_menu: Signal<Option<String>> = use_signal(|| None);
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
 
     // State for delete confirmation modal
@@ -1058,7 +1063,14 @@ pub fn Conversation() -> Element {
                 .get(0)
                 .dyn_ref::<web_sys::IntersectionObserverEntry>()
             {
-                is_at_bottom.set(entry.is_intersecting());
+                // Defer the signal write: this raw JS callback runs with no
+                // Dioxus runtime/scope on the stack, and `is_at_bottom` is now
+                // subscribed in render (the scroll-to-latest button), so a
+                // direct `.set()` would fire a subscriber notification from an
+                // empty scope and panic on Firefox mobile. See
+                // .claude/rules/dioxus-signal-safety.md. (#402)
+                let intersecting = entry.is_intersecting();
+                crate::util::defer(move || is_at_bottom.set(intersecting));
             }
         }) as Box<dyn FnMut(js_sys::Array)>);
 
@@ -1090,13 +1102,23 @@ pub fn Conversation() -> Element {
     // First scroll uses Instant so a page refresh snaps to the bottom rather than animating
     // a ~500ms scroll from top. Subsequent scrolls (new messages while at bottom) use Smooth.
     let first_scroll = use_hook(|| Rc::new(std::cell::Cell::new(true)));
+    // Set by the room-change effect below to force the next mount-triggered
+    // scroll regardless of `is_at_bottom` (#402). This decouples the room-switch
+    // snap from `is_at_bottom`, so the IntersectionObserver flipping the signal
+    // to `false` (new room's persisted scroll position) between the room-change
+    // effect and this one can't suppress the snap. A plain `Cell`, not a signal,
+    // so reading it here does not subscribe.
+    let force_scroll = use_hook(|| Rc::new(std::cell::Cell::new(false)));
     use_effect({
         let first_scroll = first_scroll.clone();
+        let force_scroll = force_scroll.clone();
         move || {
             // Re-run when the last bubble mounts (new messages or initial load).
             let trigger = last_chat_element();
-            let should_scroll = *is_at_bottom.peek();
+            let forced = force_scroll.get();
+            let should_scroll = forced || *is_at_bottom.peek();
             if should_scroll && trigger.is_some() {
+                force_scroll.set(false);
                 let is_first = first_scroll.replace(false);
                 // `behavior` is only used inside the wasm32 block below; on
                 // native it would warn as unused. Gate the binding too so
@@ -1130,6 +1152,44 @@ pub fn Conversation() -> Element {
             }
         }
     });
+
+    // Snap to the newest message whenever the selected room changes (#402). The
+    // Conversation component is mounted once and reused across rooms (hidden or
+    // shown via CSS), so `#chat-scroll-container` and `is_at_bottom` otherwise
+    // persist from the previous room, frequently leaving the user far up the
+    // new room's history. Reading `CURRENT_ROOM` (which holds only `owner_key`)
+    // makes this effect re-run on every room change and nothing else.
+    //
+    // This effect only raises `force_scroll`; the actual scroll runs in the
+    // mount-triggered effect above once the new room's last bubble mounts (its
+    // trigger, `last_chat_element`, necessarily changes AFTER this room change,
+    // so the ordering is causal — not dependent on effect scheduling). Using a
+    // persistent `force_scroll` flag instead of `is_at_bottom` means the
+    // observer can't cancel the snap in the gap between the two effects.
+    // `first_scroll` = true makes that snap instant rather than animated from an
+    // arbitrary position. `is_at_bottom` = true hides the scroll-to-latest
+    // button immediately on switch (the observer reconfirms after the snap).
+    //
+    // Guarded on an ACTUAL key change: Dioxus re-runs the effect on any write
+    // to `CURRENT_ROOM`, and re-selecting the already-open room in the sidebar
+    // rewrites it with the same key. Without the guard that would arm
+    // `force_scroll` with no new bubble to consume it, so a later message would
+    // snap the reader to the bottom (#402 review).
+    {
+        let first_scroll = first_scroll.clone();
+        let force_scroll = force_scroll.clone();
+        let prev_room =
+            use_hook(|| Rc::new(std::cell::Cell::new(None::<ed25519_dalek::VerifyingKey>)));
+        use_effect(move || {
+            let room = CURRENT_ROOM.read().owner_key;
+            if prev_room.get() != room {
+                prev_room.set(room);
+                force_scroll.set(true);
+                first_scroll.set(true);
+                is_at_bottom.set(true);
+            }
+        });
+    }
 
     // Handler for toggling a reaction on a message (add or remove)
     let handle_toggle_reaction = {
@@ -1539,10 +1599,8 @@ pub fn Conversation() -> Element {
 
     // Message sending handler - receives message text from MessageInput component
     let handle_send_message = {
+        let force_scroll = force_scroll.clone();
         move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
-            // Always scroll to bottom when user sends their own message
-            is_at_bottom.set(true);
-
             if message_text.is_empty() {
                 warn!("Message is empty");
                 return;
@@ -1576,6 +1634,14 @@ pub fn Conversation() -> Element {
                     .get_secret()
                     .map(|(secret, version)| (*secret, version));
 
+                // Cloned into the async send so `force_scroll` (consumed by the
+                // mount effect when the sent message appears) is raised ONLY
+                // after the delta applies locally — a rejected send (empty,
+                // over-size, serialize/sign/delta failure) then leaves the
+                // scroll position and the scroll-to-latest button untouched
+                // rather than snapping a later unrelated message to the bottom
+                // (#402 review).
+                let force_scroll = force_scroll.clone();
                 spawn_local(async move {
                     use river_core::room_state::content::{
                         ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
@@ -1740,6 +1806,15 @@ pub fn Conversation() -> Element {
                             }
                         });
                         if delta_applied {
+                            // Local apply succeeded and a message will mount:
+                            // scroll it into view — but only if the user is still
+                            // viewing the room this send targeted. Signing is
+                            // async, so they may have switched rooms; arming the
+                            // conversation-wide flag then would snap the NEW room
+                            // to the bottom on its next message (#402 review).
+                            if CURRENT_ROOM.peek().owner_key == Some(current_room) {
+                                force_scroll.set(true);
+                            }
                             crate::util::debug_log("[send] marking NEEDS_SYNC");
                             crate::components::app::mark_needs_sync(current_room);
                             #[cfg(target_arch = "wasm32")]
@@ -1758,10 +1833,13 @@ pub fn Conversation() -> Element {
                 current_room_data.as_ref().map(|_room_data| {
                     rsx! {
                         div { class: "flex-shrink-0 px-3 md:px-6 py-3 border-b border-border bg-panel",
-                            div { class: "flex items-center justify-between max-w-4xl mx-auto",
-                                // Mobile: hamburger to open rooms panel
+                            div { class: "flex items-center justify-between gap-2 md:gap-3 max-w-4xl mx-auto",
+                                // Mobile: hamburger to open rooms panel. `mr-1` plus the row
+                                // `gap-2` keep this switch-rooms button clear of the room-name
+                                // tap target so a touch user does not open the room-details
+                                // modal by mistake when reaching for the room list (#402).
                                 button {
-                                    class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                    class: "md:hidden flex-shrink-0 mr-1 p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
                                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                     Icon { icon: FaBars, width: 18, height: 18 }
                                 }
@@ -1771,7 +1849,11 @@ pub fn Conversation() -> Element {
                                 // clicks to the modal-opening onclick handler.
                                 div { class: "min-w-0 flex-1",
                                     button {
-                                        class: "flex items-center gap-2 px-3 py-1.5 -mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 w-full",
+                                        // `md:-mx-3` only pulls the hover target outward on
+                                        // desktop, where there is no adjacent hamburger. On
+                                        // mobile the negative margin is dropped so this
+                                        // room-details target stays clear of the hamburger (#402).
+                                        class: "flex items-center gap-2 px-3 py-1.5 md:-mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 w-full",
                                         title: "Room details",
                                         onclick: move |_| {
                                             crate::util::defer(move || {
@@ -1814,9 +1896,14 @@ pub fn Conversation() -> Element {
             // Combining flex-1 with overflow on the same element causes the
             // scroll container to shift behind the sidebar during re-renders.
             div {
-                class: "flex-1 min-h-0",
+                class: "flex-1 min-h-0 relative",
                 div {
-                    class: "h-full overflow-y-auto",
+                    // `overflow-x-hidden` is a backstop: a kebab action menu on
+                    // a very short self message can extend a few px past the
+                    // viewport edge; clip it (trailing whitespace only — the
+                    // menu content is left-aligned and stays visible) rather
+                    // than show a horizontal scrollbar in the history. #402.
+                    class: "h-full overflow-y-auto overflow-x-hidden",
                     id: "chat-scroll-container",
                     div { class: "max-w-4xl mx-auto px-4 py-4",
                     {
@@ -1931,6 +2018,7 @@ pub fn Conversation() -> Element {
                                                                         }
                                                                     }
                                                                 },
+                                                                open_action_menu: open_action_menu,
                                                             }
                                                         }
                                                     }
@@ -1959,6 +2047,42 @@ pub fn Conversation() -> Element {
                         class: "h-px pointer-events-none",
                     }
             }
+                // Scroll-to-latest button (#402): shown whenever the user is not
+                // pinned to the bottom of the history. Reuses the `is_at_bottom`
+                // IntersectionObserver state, so it appears after scrolling up
+                // (e.g. reading back through a long, multi-room history) and
+                // hides once the newest message is in view. Handy on every
+                // device but especially on touch, where there is no scrollbar
+                // to drag.
+                if !is_at_bottom() {
+                    button {
+                        class: "absolute bottom-4 right-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-panel shadow-lg border border-border text-text-muted hover:text-accent transition-colors",
+                        "aria-label": "Scroll to latest messages",
+                        "data-testid": "scroll-to-bottom",
+                        // Do NOT optimistically set `is_at_bottom` here: the
+                        // IntersectionObserver flips it (hiding the button) once
+                        // the sentinel actually reaches view. Setting it eagerly
+                        // would leave the button hidden if the user interrupts
+                        // the smooth scroll before reaching the bottom (the
+                        // observer emits no new change and stays quiet). #402.
+                        onclick: move |_| {
+                            #[cfg(target_arch = "wasm32")]
+                            crate::util::safe_spawn_local(async move {
+                                let Some(container) = web_sys::window()
+                                    .and_then(|w| w.document())
+                                    .and_then(|d| d.get_element_by_id("chat-scroll-container"))
+                                else {
+                                    return;
+                                };
+                                let opts = web_sys::ScrollToOptions::new();
+                                opts.set_top(container.scroll_height() as f64);
+                                opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+                                container.scroll_to_with_scroll_to_options(&opts);
+                            });
+                        },
+                        Icon { icon: FaChevronDown, width: 18, height: 18 }
+                    }
+                }
             }
 
             // Message input or status
@@ -2179,7 +2303,16 @@ fn MessageGroupComponent(
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
     on_reply: EventHandler<ReplyContext>,
+    // Shared across all groups so only one action menu is open at a time (#402).
+    open_action_menu: Signal<Option<String>>,
 ) -> Element {
+    let mut open_action_menu = open_action_menu;
+    // Per-group: at most one picker per group, and while a picker is open its
+    // raised (z-[60]) backdrop covers every other group's kebabs and "+"
+    // buttons, so tapping one dismisses the picker rather than stacking a
+    // second popover — the single-popover guarantee comes from the z-order, not
+    // a shared signal (#402).
+    let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
     let delay_suffix = group
@@ -2198,8 +2331,25 @@ fn MessageGroupComponent(
     let time_clamped = group.time_clamped;
     let is_self = group.is_self;
 
-    // Track which message's emoji picker is open (by message ID string)
-    let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
+    // Whether the kebab action menu should open above (true) or below (false)
+    // the kebab. Set from the tap position so the menu for a message near the
+    // bottom of the viewport flips upward instead of being clipped by the
+    // composer — mirrors `picker_show_above` for the emoji picker (#402).
+    let mut menu_show_above: Signal<bool> = use_signal(|| false);
+
+    // Whether the kebab action menu should be left-anchored (open rightward) or
+    // right-anchored (open leftward). Chosen from the tap's horizontal position
+    // so the menu always opens toward the viewport centre regardless of
+    // self/other side or bubble width, and never clips its content off a narrow
+    // screen edge (#402 review).
+    let mut menu_align_left: Signal<bool> = use_signal(|| false);
+
+    // Max height (px) for the kebab action menu, measured at tap time as the
+    // actual space available on the chosen side within the chat scrollport. The
+    // menu is `overflow-y-auto`, so on a very short/landscape viewport where it
+    // fits neither side fully it scrolls internally instead of being clipped by
+    // the scroll container with Edit/Delete unreachable (#402 review).
+    let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
 
     // Track if emoji picker should appear above (true) or below (false) the button
     let mut picker_show_above: Signal<bool> = use_signal(|| false);
@@ -2596,8 +2746,15 @@ fn MessageGroupComponent(
                                         let reply_author_name = group.author_name.clone();
                                         rsx! {
                                             div {
+                                                // `.hover-actions` (main.css) makes this invisible
+                                                // (opacity-0) bar `pointer-events:none` ONLY on touch
+                                                // devices (@media hover:none), so it can't intercept a
+                                                // gutter tap there — while leaving it fully hit-testable on
+                                                // desktop, where the pointer must cross an empty gap to
+                                                // reach it (a Tailwind `group-hover:pointer-events` gate
+                                                // would drop hover mid-gap and make it unreachable). #402.
                                                 class: format!(
-                                                    "absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 {} {}",
+                                                    "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 {} {}",
                                                     if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" },
                                                     ""
                                                 ),
@@ -2632,6 +2789,215 @@ fn MessageGroupComponent(
                                                             on_request_delete.call(msg_id_for_delete.clone());
                                                         },
                                                         "delete"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Touch-only kebab action menu (#402). The hover
+                                    // action bar above is wrapped by Tailwind in
+                                    // `@media (hover:hover)`, so it can never appear on a
+                                    // touch device. `.touch-actions` (main.css) reveals
+                                    // this kebab only where there is no hover pointer;
+                                    // tapping it opens a menu with the same Reply / React /
+                                    // Edit / Delete actions.
+                                    {
+                                        let msg_id_kebab = msg.id.clone();
+                                        let msg_id_kebab_toggle = msg.id.clone();
+                                        let msg_id_menu_reply = msg.message_id.clone();
+                                        let msg_id_menu_delete = msg.message_id.clone();
+                                        let msg_id_menu_edit = msg.id.clone();
+                                        let msg_id_menu_react = msg.id.clone();
+                                        let edit_text_kebab = msg.content_text.clone();
+                                        let reply_author_kebab = group.author_name.clone();
+                                        let reply_preview_kebab = clean_reply_preview(&msg.content_text, &member_names)
+                                            .chars()
+                                            .take(100)
+                                            .collect::<String>();
+                                        let menu_open = open_action_menu.read().as_deref()
+                                            == Some(msg_id_kebab.as_str());
+                                        rsx! {
+                                            div {
+                                                // Positioned in the gutter beside the bubble with
+                                                // `right-full`/`left-full` (NOT `translate`): a transform
+                                                // would become the containing block for the `fixed`
+                                                // dismiss backdrop below, shrinking it to this element
+                                                // instead of the viewport (#402 review).
+                                                // Raise the OPEN wrapper above sibling kebabs: every
+                                                // `.touch-actions` is z-50, and later ones paint above an
+                                                // open popover, so without this a nearby message's kebab
+                                                // could sit over the menu rows and steal the tap. `z-[60]`
+                                                // lifts the whole open popover+backdrop above them (and its
+                                                // backdrop then covers those kebabs, so a tap on one just
+                                                // dismisses). (#402 review)
+                                                class: format!(
+                                                    "touch-actions absolute top-1 {} {}",
+                                                    if menu_open { "z-[60]" } else { "z-50" },
+                                                    if is_self { "right-full mr-1" } else { "left-full ml-1" }
+                                                ),
+                                                // Kebab toggle button
+                                                button {
+                                                    class: "flex items-center justify-center w-8 h-8 rounded-full bg-panel shadow-md border border-border text-text-muted",
+                                                    "aria-label": "Message actions",
+                                                    "aria-haspopup": "menu",
+                                                    "aria-expanded": "{menu_open}",
+                                                    "data-testid": "message-kebab",
+                                                    onclick: move |e: MouseEvent| {
+                                                        e.stop_propagation();
+                                                        let is_open = open_action_menu.peek().as_deref()
+                                                            == Some(msg_id_kebab_toggle.as_str());
+                                                        if is_open {
+                                                            crate::util::defer(move || open_action_menu.set(None));
+                                                        } else {
+                                                            // Position the menu from the tap coordinates: flip it
+                                                            // above the kebab when the tap is in the bottom ~40% of
+                                                            // the viewport (so the composer doesn't clip it), and
+                                                            // open it toward the viewport centre (left-anchored when
+                                                            // the kebab is on the left half, right-anchored on the
+                                                            // right half) so its content never runs off a screen edge.
+                                                            let coords = e.client_coordinates();
+                                                            let win_w = web_sys::window()
+                                                                .and_then(|w| w.inner_width().ok())
+                                                                .and_then(|v| v.as_f64())
+                                                                .unwrap_or(400.0);
+                                                            // Choose the flip direction from the space available in
+                                                            // BOTH directions within the chat scrollport (which lives
+                                                            // inside an overflow-y-auto container whose bounds sit
+                                                            // above the composer and below the header). Open downward
+                                                            // when the menu fits below; only flip up when it doesn't
+                                                            // fit below AND there's more room above. A received menu
+                                                            // (2 rows) is shorter than an own menu (4 rows), so it
+                                                            // stays down in cases where an own menu would flip.
+                                                            // (#402 review)
+                                                            let (sp_top, sp_bottom) = web_sys::window()
+                                                                .and_then(|w| w.document())
+                                                                .and_then(|d| {
+                                                                    d.get_element_by_id("chat-scroll-container")
+                                                                })
+                                                                .map(|el| {
+                                                                    let r = el.get_bounding_client_rect();
+                                                                    (r.top(), r.bottom())
+                                                                })
+                                                                .unwrap_or((60.0, 600.0));
+                                                            let menu_height = if is_self { 200.0 } else { 110.0 };
+                                                            let space_below = sp_bottom - coords.y;
+                                                            let space_above = coords.y - sp_top;
+                                                            let above =
+                                                                space_below < menu_height && space_above > space_below;
+                                                            let align_left = coords.x < win_w * 0.5;
+                                                            // Cap the menu to the actual space on the chosen side
+                                                            // (minus a small gap) so it scrolls internally rather
+                                                            // than being clipped by the scroll container when it
+                                                            // fits neither side. Floor so it never collapses.
+                                                            // Exactly the space on the chosen side (minus the
+                                                            // mt-1/mb-1 gap): never larger, so the overflow-y-auto
+                                                            // menu can't exceed the scrollport and clip its own
+                                                            // rows. `above` already selects the roomier side, so
+                                                            // this is realistically ample; the 1px floor only
+                                                            // guards a degenerate near-zero measurement.
+                                                            let max_h = ((if above { space_above } else { space_below })
+                                                                - 16.0)
+                                                                .max(1.0);
+                                                            let id = msg_id_kebab_toggle.clone();
+                                                            // Defer signal writes out of the event handler per
+                                                            // .claude/rules/dioxus-signal-safety.md (Firefox-mobile
+                                                            // re-entrant borrow crashes).
+                                                            crate::util::defer(move || {
+                                                                menu_show_above.set(above);
+                                                                menu_align_left.set(align_left);
+                                                                menu_max_h.set(max_h);
+                                                                // Dismiss any open reaction picker so the two
+                                                                // popovers can't stack (#402 review).
+                                                                open_emoji_picker.set(None);
+                                                                open_action_menu.set(Some(id));
+                                                            });
+                                                        }
+                                                    },
+                                                    Icon { icon: FaEllipsisVertical, width: 16, height: 16 }
+                                                }
+                                                // Action menu popover + dismiss backdrop. The backdrop is
+                                                // `fixed inset-0` (covers the viewport now that no transformed
+                                                // ancestor clips it) so a tap anywhere else dismisses.
+                                                if menu_open {
+                                                    div {
+                                                        class: "fixed inset-0 z-40",
+                                                        onclick: move |_| crate::util::defer(move || open_action_menu.set(None)),
+                                                    }
+                                                    div {
+                                                        // Opens toward the bubble/centre (self: right of the
+                                                        // left-gutter kebab; other: left of the right-gutter
+                                                        // kebab); `max-w` clamps it to the viewport as a
+                                                        // backstop against a narrow-screen overflow.
+                                                        class: format!(
+                                                            "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
+                                                            if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                            if *menu_align_left.read() { "left-0" } else { "right-0" }
+                                                        ),
+                                                        style: format!("max-height: {}px", *menu_max_h.read()),
+                                                        "data-testid": "message-action-menu",
+                                                        button {
+                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
+                                                            onclick: move |_| {
+                                                                let id = msg_id_menu_reply.clone();
+                                                                let author = reply_author_kebab.clone();
+                                                                let preview = reply_preview_kebab.clone();
+                                                                crate::util::defer(move || {
+                                                                    on_reply.call(ReplyContext {
+                                                                        message_id: id,
+                                                                        author_name: author,
+                                                                        content_preview: preview,
+                                                                    });
+                                                                    open_action_menu.set(None);
+                                                                });
+                                                            },
+                                                            Icon { icon: FaReply, width: 14, height: 14 }
+                                                            "Reply"
+                                                        }
+                                                        button {
+                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
+                                                            onclick: move |_| {
+                                                                let picker_id = format!("inline-{}", msg_id_menu_react);
+                                                                // Inherit the kebab's flip direction so the picker
+                                                                // for a bottom message also opens upward, not
+                                                                // clipped by the composer (#402 review).
+                                                                let above = *menu_show_above.peek();
+                                                                crate::util::defer(move || {
+                                                                    picker_show_above.set(above);
+                                                                    open_emoji_picker.set(Some(picker_id));
+                                                                    open_action_menu.set(None);
+                                                                });
+                                                            },
+                                                            Icon { icon: FaFaceSmile, width: 14, height: 14 }
+                                                            "React"
+                                                        }
+                                                        if is_self {
+                                                            button {
+                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
+                                                                onclick: move |_| {
+                                                                    let t = edit_text_kebab.clone();
+                                                                    let id = msg_id_menu_edit.clone();
+                                                                    crate::util::defer(move || {
+                                                                        edit_text.set(t);
+                                                                        editing_message.set(Some(id));
+                                                                        open_action_menu.set(None);
+                                                                    });
+                                                                },
+                                                                Icon { icon: FaPenToSquare, width: 14, height: 14 }
+                                                                "Edit"
+                                                            }
+                                                            button {
+                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-error-bg text-left",
+                                                                onclick: move |_| {
+                                                                    let id = msg_id_menu_delete.clone();
+                                                                    crate::util::defer(move || {
+                                                                        on_request_delete.call(id);
+                                                                        open_action_menu.set(None);
+                                                                    });
+                                                                },
+                                                                Icon { icon: FaTrashCan, width: 14, height: 14 }
+                                                                "Delete"
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2716,7 +3082,14 @@ fn MessageGroupComponent(
                                             }
                                             // Inline add reaction button (same line height as reactions)
                                             div {
-                                                class: "relative group/react inline-flex items-center",
+                                                // Raise the whole picker (grid + z-40 backdrop) above the
+                                                // z-50 message kebabs while it's open, so a nearby closed
+                                                // kebab can't paint over the emoji grid and steal a tap
+                                                // (mirrors the action menu's z-[60] behaviour). (#402 review)
+                                                class: format!(
+                                                    "relative group/react inline-flex items-center {}",
+                                                    if is_inline_picker_open { "z-[60]" } else { "" }
+                                                ),
                                                 // Invisible backdrop when picker is open
                                                 if is_inline_picker_open {
                                                     div {

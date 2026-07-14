@@ -1,0 +1,430 @@
+import { test, expect, Page } from "@playwright/test";
+
+// Coverage for freenet/river#402 — mobile / touch UX improvements:
+//   1. Touch-accessible message action menu (kebab), since the hover action
+//      bar can never appear on a device without a hover pointer.
+//   2. Extra spacing between the header hamburger (open room list) and the
+//      room-name/details tap target, so switching rooms does not accidentally
+//      open the room-details modal.
+//   3. A scroll-to-latest button shown whenever the history is not pinned to
+//      the bottom, plus a snap-to-bottom on room switch.
+
+// Helper: wait for WASM app to fully render
+async function waitForApp(page: Page) {
+  await page.waitForSelector(".app-root", { timeout: 30_000 });
+  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
+}
+
+// Helper: select a room at any viewport width (mirrors responsive-layout.spec).
+async function selectRoom(page: Page, roomName: string) {
+  const roomBtn = page.getByRole("button", { name: roomName });
+
+  if (!(await roomBtn.isVisible({ timeout: 500 }).catch(() => false))) {
+    const hamburger = page.locator(
+      ".border-b.border-border.bg-panel button >> nth=0"
+    );
+    if (await hamburger.isVisible({ timeout: 500 }).catch(() => false)) {
+      await hamburger.click();
+      await expect(roomBtn).toBeVisible({ timeout: 5_000 });
+    } else {
+      const vp = page.viewportSize();
+      if (vp && vp.width < 768) {
+        await page.setViewportSize({ width: 1280, height: vp.height });
+        await expect(roomBtn).toBeVisible({ timeout: 5_000 });
+        await roomBtn.click();
+        await expect(
+          page.getByRole("heading", { name: roomName })
+        ).toBeVisible({ timeout: 5_000 });
+        await page.setViewportSize({ width: vp.width, height: vp.height });
+        return;
+      }
+    }
+  }
+
+  await roomBtn.click();
+  await expect(
+    page.getByRole("heading", { name: roomName })
+  ).toBeVisible({ timeout: 5_000 });
+}
+
+// Whether this browser context has no hover pointer (i.e. a touch device).
+// The kebab is shown only in that case; the hover action bar only otherwise.
+async function isTouchOnly(page: Page): Promise<boolean> {
+  return page.evaluate(() => window.matchMedia("(hover: none)").matches);
+}
+
+// The app scrolls to the bottom asynchronously on room entry. Wait for that to
+// settle before a test scrolls up, otherwise the pending async scroll races the
+// test and snaps the history back down under it.
+async function waitSettledAtBottom(page: Page) {
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const el = document.getElementById("chat-scroll-container");
+          if (!el) return Number.MAX_SAFE_INTEGER;
+          return el.scrollHeight - el.scrollTop - el.clientHeight;
+        }),
+      { timeout: 5_000 }
+    )
+    .toBeLessThan(120);
+}
+
+async function distanceFromBottom(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const el = document.getElementById("chat-scroll-container");
+    if (!el) return Number.MAX_SAFE_INTEGER;
+    return el.scrollHeight - el.scrollTop - el.clientHeight;
+  });
+}
+
+// Scroll the history to the top and wait for the scroll-to-latest button to
+// appear. iOS WebKit momentum scrolling plus the app's async entry-scroll and
+// the deferred (setTimeout-based) IntersectionObserver can otherwise miss a
+// single programmatic scroll, so re-assert scrollTop=0 on each poll until the
+// observer registers "not at bottom" and the button renders.
+async function scrollUpUntilButtonVisible(page: Page) {
+  const button = page.locator('[data-testid="scroll-to-bottom"]');
+  // Jump to the top and hold there briefly to defeat the app's async
+  // entry-scroll, then STOP scrolling. WebKit's IntersectionObserver lags on a
+  // programmatic scroll (worsened by -webkit-overflow-scrolling: touch) but DOES
+  // fire once the position is stable — continuously re-scrolling instead keeps
+  // rescheduling the deferred observer callback so it never settles.
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        const el = document.getElementById("chat-scroll-container");
+        let n = 0;
+        const id = setInterval(() => {
+          if (el) el.scrollTop = 0;
+          if (++n > 5) {
+            clearInterval(id);
+            resolve();
+          }
+        }, 80);
+      })
+  );
+  // Position is now stable at the top; give the lagging observer time to fire.
+  await expect(button).toBeVisible({ timeout: 12_000 });
+}
+
+test.describe("Message action kebab menu (#402.1)", () => {
+  test("kebab visibility follows hover capability", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const kebab = page.locator('[data-testid="message-kebab"]').first();
+    // Every message renders a kebab element; whether it is *displayed* is a
+    // pure-CSS decision keyed on `@media (hover: none)`.
+    await expect(kebab).toHaveCount(1);
+
+    if (await isTouchOnly(page)) {
+      await expect(kebab).toBeVisible();
+    } else {
+      // On a device with a hover pointer the kebab stays display:none — the
+      // desktop hover action bar is used instead.
+      await expect(kebab).toBeHidden();
+    }
+  });
+
+  test("kebab opens a menu with Reply / Edit / Delete on own messages", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    // This flow only applies where the kebab is actually usable (touch).
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    // A self (right-aligned, accent-coloured) message bubble. Its row carries
+    // the kebab that must expose Edit + Delete as well as Reply.
+    const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
+    await expect(ownRow).toBeVisible();
+    const ownKebab = ownRow.locator('[data-testid="message-kebab"]');
+    await ownKebab.click();
+
+    const menu = page.locator('[data-testid="message-action-menu"]');
+    await expect(menu).toBeVisible();
+    await expect(menu.getByRole("button", { name: "Reply" })).toBeVisible();
+    await expect(menu.getByRole("button", { name: "Edit" })).toBeVisible();
+    await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
+
+    // Tapping anywhere else (a real viewport coordinate far from the menu, NOT
+    // the backdrop's own local origin) dismisses the menu — this verifies the
+    // fixed backdrop actually covers the viewport, not just the kebab box.
+    const vp = page.viewportSize();
+    const box = await menu.boundingBox();
+    const farX = box && vp && box.x > vp.width / 2 ? 5 : (vp?.width ?? 100) - 5;
+    await page.mouse.click(farX, 5);
+    await expect(menu).toBeHidden();
+  });
+
+  test("Reply from the kebab opens the composer reply preview", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    const kebab = page.locator('[data-testid="message-kebab"]').first();
+    await kebab.click();
+    await page
+      .locator('[data-testid="message-action-menu"]')
+      .getByRole("button", { name: "Reply" })
+      .click();
+
+    // The composer shows a reply-preview strip (with a "Cancel reply" button)
+    // once a reply target is set.
+    await expect(page.getByTitle("Cancel reply")).toBeVisible({ timeout: 5_000 });
+  });
+
+  test("React from the kebab opens the emoji picker and closes the menu", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    const menu = page.locator('[data-testid="message-action-menu"]');
+    await page.locator('[data-testid="message-kebab"]').first().click();
+    await menu.getByRole("button", { name: "React" }).click();
+
+    // The action menu closes and the emoji picker (emoji buttons titled
+    // "React with …") opens.
+    await expect(menu).toBeHidden();
+    await expect(page.getByTitle(/^React with/).first()).toBeVisible({
+      timeout: 5_000,
+    });
+
+    // While the picker is open its raised backdrop covers the kebabs, so a tap
+    // at a kebab lands on that backdrop and dismisses the picker (the two
+    // popovers can't stack). No action menu opens from that same tap.
+    const kbox = await page
+      .locator('[data-testid="message-kebab"]')
+      .first()
+      .boundingBox();
+    expect(kbox).not.toBeNull();
+    if (kbox) {
+      await page.mouse.click(kbox.x + kbox.width / 2, kbox.y + kbox.height / 2);
+    }
+    await expect(page.getByTitle(/^React with/)).toHaveCount(0);
+    await expect(menu).toBeHidden();
+  });
+
+  test("menu stays on-screen and dismisses via a far tap (narrow phone)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    const vp = page.viewportSize();
+    // Both a self (accent bubble) and a received (surface bubble) message: the
+    // menu opens on opposite sides, so both must stay within the viewport.
+    for (const sel of [
+      '[id^="msg-"]:has(.bg-accent)',
+      '[id^="msg-"]:has(.bg-surface)',
+    ]) {
+      const row = page.locator(sel).first();
+      if ((await row.count()) === 0) continue;
+      await row.locator('[data-testid="message-kebab"]').click();
+      const menu = page.locator('[data-testid="message-action-menu"]');
+      await expect(menu).toBeVisible();
+
+      const box = await menu.boundingBox();
+      expect(box).not.toBeNull();
+      if (box && vp) {
+        expect(box.x).toBeGreaterThanOrEqual(-1);
+        expect(box.x + box.width).toBeLessThanOrEqual(vp.width + 1);
+      }
+      // The menu content (first action) must be fully on-screen, not clipped by
+      // the scroll container's overflow-x-hidden backstop.
+      const replyBox = await menu
+        .getByRole("button", { name: "Reply" })
+        .boundingBox();
+      if (replyBox && vp) {
+        expect(replyBox.x).toBeGreaterThanOrEqual(-1);
+        expect(replyBox.x + replyBox.width).toBeLessThanOrEqual(vp.width + 1);
+      }
+      // Opening the menu must not introduce a horizontal page scrollbar.
+      const hScroll = await page.evaluate(
+        () =>
+          document.documentElement.scrollWidth >
+          document.documentElement.clientWidth
+      );
+      expect(hScroll).toBe(false);
+
+      // Dismiss via a far viewport tap before the next iteration.
+      const farX = box && vp && box.x > vp.width / 2 ? 5 : (vp?.width ?? 100) - 5;
+      await page.mouse.click(farX, 5);
+      await expect(menu).toBeHidden();
+    }
+  });
+
+  test("menu is capped to the scrollport height on a short viewport", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 500, height: 340 });
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    // Own message (4-row menu) opened on a short scrollport: the menu must be
+    // capped to the available space (and scroll internally) rather than extend
+    // past the scroll container with actions unreachable.
+    await page
+      .locator('[id^="msg-"]:has(.bg-accent)')
+      .first()
+      .locator('[data-testid="message-kebab"]')
+      .click();
+    const menu = page.locator('[data-testid="message-action-menu"]');
+    await expect(menu).toBeVisible();
+
+    const box = await menu.boundingBox();
+    const scrollportH = await page.evaluate(() => {
+      const el = document.getElementById("chat-scroll-container");
+      return el ? el.clientHeight : 0;
+    });
+    expect(box).not.toBeNull();
+    if (box) {
+      // Fits within the scrollport (a few px slack), so nothing is clipped away.
+      expect(box.height).toBeLessThanOrEqual(scrollportH + 4);
+    }
+  });
+
+  test("never more than one menu open at a time", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    const menus = page.locator('[data-testid="message-action-menu"]');
+    const kebabs = page.locator('[data-testid="message-kebab"]');
+
+    // Open the first message's menu.
+    await kebabs.nth(0).click();
+    await expect(menus).toHaveCount(1);
+
+    // While a menu is open its wrapper is raised (z-[60]) so its full-viewport
+    // backdrop covers every other kebab. A tap at a later message's kebab
+    // therefore lands on the backdrop (Playwright's .click() would refuse the
+    // obscured element, so dispatch at the coordinate) and dismisses the menu —
+    // never two open, and the menu's own rows can't be intercepted by a sibling
+    // kebab. A second tap would then open that message's menu.
+    const box = await kebabs.nth(2).boundingBox();
+    expect(box).not.toBeNull();
+    if (box) {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    }
+    await expect(menus).toHaveCount(0);
+  });
+});
+
+test.describe("Mobile header hamburger spacing (#402.2)", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test("hamburger does not overlap the room-name tap target", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+
+    const header = page.locator(".border-b.border-border.bg-panel").first();
+    const hamburger = header.locator("button").first();
+    // The room-details button is the one wrapping the room-name heading.
+    const roomDetails = header.locator("button:has(h2)").first();
+
+    const hb = await hamburger.boundingBox();
+    const rb = await roomDetails.boundingBox();
+    expect(hb).not.toBeNull();
+    expect(rb).not.toBeNull();
+    if (hb && rb) {
+      // The room-details target must start strictly to the right of the
+      // hamburger, with a real gap rather than an overlapping hit area.
+      const gap = rb.x - (hb.x + hb.width);
+      expect(gap).toBeGreaterThanOrEqual(4);
+    }
+  });
+});
+
+test.describe("Scroll-to-latest button (#402.3)", () => {
+  // A short viewport guarantees the example history overflows and is scrollable
+  // regardless of the (randomised) example message lengths.
+  test.use({ viewport: { width: 500, height: 400 } });
+
+  test("appears when scrolled up and returns to bottom on click", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+
+    const button = page.locator('[data-testid="scroll-to-bottom"]');
+    // Pinned to the bottom on entry (once the async entry-scroll settles): no button.
+    await waitSettledAtBottom(page);
+    await expect(button).toHaveCount(0);
+
+    // Scroll the history to the top; the button must appear.
+    await scrollUpUntilButtonVisible(page);
+    await expect(button).toBeVisible();
+
+    await button.click();
+
+    // Ground truth: the animated scroll returns the history to the bottom.
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 8_000 })
+      .toBeLessThan(120);
+    // Once the observer sees the sentinel again, the button hides.
+    await expect(button).toBeHidden({ timeout: 5_000 });
+  });
+});
+
+test.describe("Room-switch scroll reset (#402.3)", () => {
+  // Short viewport so the example history overflows and is scrollable.
+  test.use({ viewport: { width: 1280, height: 420 } });
+
+  test("switching rooms lands at the bottom even after scrolling up", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+
+    // Enter a room and scroll up so it is no longer pinned to the bottom.
+    await selectRoom(page, "Your Private Room");
+    await waitSettledAtBottom(page);
+    await scrollUpUntilButtonVisible(page);
+
+    // Switch away and back. The Conversation component is reused across rooms,
+    // so without the room-change reset the scroll position would persist near
+    // the top. It must snap back to the newest message instead.
+    await selectRoom(page, "Team Chat Room");
+    await selectRoom(page, "Your Private Room");
+
+    await expect.poll(() => distanceFromBottom(page), { timeout: 5_000 }).toBeLessThan(120);
+  });
+});
