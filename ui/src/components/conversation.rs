@@ -1590,15 +1590,6 @@ pub fn Conversation() -> Element {
     let handle_send_message = {
         let force_scroll = force_scroll.clone();
         move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
-            // Scroll the user's own new message into view once it mounts. Uses
-            // `force_scroll` (a plain Cell, consumed by the mount-triggered
-            // effect) rather than writing `is_at_bottom`: a send that fails
-            // (payload too large, delta rejected) mounts no message, so nothing
-            // scrolls and the scroll-to-latest button's state is left untouched
-            // instead of being wrongly cleared. Also avoids a signal write from
-            // this event handler entirely. #402
-            force_scroll.set(true);
-
             if message_text.is_empty() {
                 warn!("Message is empty");
                 return;
@@ -1632,6 +1623,14 @@ pub fn Conversation() -> Element {
                     .get_secret()
                     .map(|(secret, version)| (*secret, version));
 
+                // Cloned into the async send so `force_scroll` (consumed by the
+                // mount effect when the sent message appears) is raised ONLY
+                // after the delta applies locally — a rejected send (empty,
+                // over-size, serialize/sign/delta failure) then leaves the
+                // scroll position and the scroll-to-latest button untouched
+                // rather than snapping a later unrelated message to the bottom
+                // (#402 review).
+                let force_scroll = force_scroll.clone();
                 spawn_local(async move {
                     use river_core::room_state::content::{
                         ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
@@ -1796,6 +1795,9 @@ pub fn Conversation() -> Element {
                             }
                         });
                         if delta_applied {
+                            // Local apply succeeded and a message will mount:
+                            // scroll it into view (#402 review).
+                            force_scroll.set(true);
                             crate::util::debug_log("[send] marking NEEDS_SYNC");
                             crate::components::app::mark_needs_sync(current_room);
                             #[cfg(target_arch = "wasm32")]
@@ -2870,9 +2872,15 @@ fn MessageGroupComponent(
                                                             // (minus a small gap) so it scrolls internally rather
                                                             // than being clipped by the scroll container when it
                                                             // fits neither side. Floor so it never collapses.
-                                                            let avail =
-                                                                (if above { space_above } else { space_below }) - 16.0;
-                                                            let max_h = avail.max(140.0);
+                                                            // Exactly the space on the chosen side (minus the
+                                                            // mt-1/mb-1 gap): never larger, so the overflow-y-auto
+                                                            // menu can't exceed the scrollport and clip its own
+                                                            // rows. `above` already selects the roomier side, so
+                                                            // this is realistically ample; the 1px floor only
+                                                            // guards a degenerate near-zero measurement.
+                                                            let max_h = ((if above { space_above } else { space_below })
+                                                                - 16.0)
+                                                                .max(1.0);
                                                             let id = msg_id_kebab_toggle.clone();
                                                             // Defer signal writes out of the event handler per
                                                             // .claude/rules/dioxus-signal-safety.md (Firefox-mobile
