@@ -96,6 +96,11 @@ pub fn App() -> Element {
     // Must be called from within a Dioxus component where the runtime is active.
     crate::util::capture_runtime();
 
+    // In the gateway iframe, notifications are shown by the shell page; listen
+    // for its `notification_click` replies to route to the clicked room
+    // (freenet/river#408). No-op when served as a top-level page. Installs once.
+    crate::components::app::notifications::install_shell_notification_listener();
+
     // Install the document-level click interceptor that catches
     // in-page invite-URL anchor clicks and routes them through the
     // in-app receive-invitation flow instead of letting the browser

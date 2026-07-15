@@ -16,9 +16,12 @@ use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::MemberInfoV1;
 use river_core::room_state::message::{AuthorizedMessageV1, RoomMessageBody};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Notification, NotificationOptions, NotificationPermission, VisibilityState};
+use web_sys::{
+    MessageEvent, Notification, NotificationOptions, NotificationPermission, VisibilityState,
+};
 
 const NOTIFICATION_PROMPTED_KEY: &str = "river_notification_prompted";
 
@@ -142,6 +145,152 @@ fn mark_prompted_for_permission() {
     }
 }
 
+// --- Gateway shell-bridge notification proxy -----------------------------
+//
+// In the deployed gateway, River runs inside the shell's sandboxed iframe,
+// which has an opaque (null) origin. Browsers block the Notifications API from
+// opaque-origin iframes, so River can't request permission or show a
+// notification directly (freenet/river#408; the iframe isolation was added in
+// freenet-core#3254). Instead we hand the notification to the shell page (which
+// is same-origin with the node, a real origin) over the existing
+// `__freenet_shell__` postMessage bridge — the same channel that already
+// carries title/favicon updates. The shell shows the notification and posts a
+// `notification_click` reply back so we can route to the room.
+//
+// When River is served directly as a top-level page (dev / `no-sync`), it has a
+// real origin and uses the Notifications API directly, so the direct path below
+// is preserved for that case.
+
+/// Only send the "offer notifications" request to the shell once per session
+/// (the iframe's opaque origin can't persist a localStorage flag anyway).
+static ENABLE_PROMPT_SENT: AtomicBool = AtomicBool::new(false);
+/// Install the `notification_click` listener at most once.
+static CLICK_LISTENER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether River is running inside the gateway's sandboxed iframe (opaque
+/// origin, no Notifications API) rather than as a top-level page. In the
+/// gateway `window.parent` is the shell page — a different window; served
+/// directly, `window.parent === window`.
+fn is_in_shell_iframe() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    match window.parent() {
+        Ok(Some(parent)) => !js_sys::Object::is(parent.as_ref(), window.as_ref()),
+        _ => false,
+    }
+}
+
+/// Post a `__freenet_shell__` message to the parent shell page. Target origin
+/// `"*"` because the shell's origin can't be named from here; the shell gates
+/// on `event.source` being its own iframe.
+fn post_to_shell(msg: &JsValue) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(parent)) = window.parent() {
+            let _ = parent.post_message(msg, "*");
+        }
+    }
+}
+
+/// Build a `{__freenet_shell__: true, type: <kind>}` message object.
+fn shell_message(kind: &str) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&o, &JsValue::from_str("__freenet_shell__"), &JsValue::TRUE);
+    let _ = js_sys::Reflect::set(&o, &JsValue::from_str("type"), &JsValue::from_str(kind));
+    o
+}
+
+/// Encode a room's owner key as the notification `tag` so a `notification_click`
+/// reply from the shell can be routed back to the right room.
+fn room_key_to_tag(room_key: &VerifyingKey) -> String {
+    bs58::encode(room_key.as_bytes()).into_string()
+}
+
+/// Inverse of [`room_key_to_tag`]. Returns `None` for a malformed tag.
+fn tag_to_room_key(tag: &str) -> Option<VerifyingKey> {
+    let bytes = bs58::decode(tag).into_vec().ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    VerifyingKey::from_bytes(&arr).ok()
+}
+
+/// Ask the shell to offer notifications (it owns the real-origin permission
+/// prompt). Sent at most once per session.
+fn request_enable_via_shell() {
+    if ENABLE_PROMPT_SENT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    post_to_shell(&shell_message("notification_enable_prompt"));
+}
+
+/// Proxy a new-message notification to the shell (gateway iframe path).
+fn post_notification_to_shell(room_key: VerifyingKey, room_name: &str, body: &str) {
+    let o = shell_message("notification");
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("title"),
+        &JsValue::from_str(room_name),
+    );
+    let _ = js_sys::Reflect::set(&o, &JsValue::from_str("body"), &JsValue::from_str(body));
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("tag"),
+        &JsValue::from_str(&room_key_to_tag(&room_key)),
+    );
+    post_to_shell(&o);
+}
+
+/// Listen for `notification_click` replies from the shell and route to the room.
+/// No-op when not in the shell iframe, and installs the listener at most once.
+/// The iframe's window is only reachable by its parent shell, so we don't need
+/// a separate source check; the payload is validated defensively.
+pub fn install_shell_notification_listener() {
+    if !is_in_shell_iframe() {
+        return;
+    }
+    if CLICK_LISTENER_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data = event.data();
+        let is_shell = js_sys::Reflect::get(&data, &JsValue::from_str("__freenet_shell__"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !is_shell {
+            return;
+        }
+        let kind = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        if kind != "notification_click" {
+            return;
+        }
+        let Some(room_key) = js_sys::Reflect::get(&data, &JsValue::from_str("tag"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .and_then(|tag| tag_to_room_key(&tag))
+        else {
+            return;
+        };
+        // Signal mutation from a JS event callback must be deferred to a clean
+        // execution context (Dioxus signal-safety rules).
+        crate::util::defer(move || {
+            *CURRENT_ROOM.write() = CurrentRoom {
+                owner_key: Some(room_key),
+            };
+            if let Some(window) = web_sys::window() {
+                let _ = window.focus();
+            }
+        });
+    }) as Box<dyn Fn(MessageEvent)>);
+    let _ = window.add_event_listener_with_callback("message", cb.as_ref().unchecked_ref());
+    cb.forget();
+}
+
 /// Request notification permission on first user message.
 ///
 /// This follows best practices:
@@ -149,6 +298,13 @@ fn mark_prompted_for_permission() {
 /// - Respects if user already granted or denied permission
 /// - Triggered by user action (sending a message) for better UX
 pub fn request_permission_on_first_message() {
+    // In the gateway iframe we can't use the Notifications API directly; ask the
+    // shell (real origin) to offer notifications via its affordance instead.
+    if is_in_shell_iframe() {
+        request_enable_via_shell();
+        return;
+    }
+
     let permission = get_permission();
 
     // Already have a definitive answer - don't prompt
@@ -195,6 +351,14 @@ pub fn show_notification(
     sender_name: &str,
     message_preview: &str,
 ) {
+    // Gateway iframe: hand the notification to the shell (real origin) over the
+    // postMessage bridge — the sandboxed iframe can't use the Notifications API.
+    if is_in_shell_iframe() {
+        let body = format!("{}: {}", sender_name, message_preview);
+        post_notification_to_shell(room_key, room_name, &body);
+        return;
+    }
+
     // Check permission
     let permission = get_permission();
     info!(
@@ -617,6 +781,28 @@ mod notify_gate_tests {
             },
             author_sk,
         )
+    }
+
+    #[test]
+    fn notification_tag_round_trips_room_key() {
+        // The gateway iframe path encodes the room's owner key as the
+        // notification `tag`; a `notification_click` reply carries it back and
+        // must decode to the same key so we route to the right room (#408).
+        let owner = key(9).verifying_key();
+        let tag = room_key_to_tag(&owner);
+        assert_eq!(tag_to_room_key(&tag), Some(owner));
+    }
+
+    #[test]
+    fn malformed_notification_tag_is_rejected() {
+        assert_eq!(tag_to_room_key(""), None);
+        // Contains characters outside the base58 alphabet (0, O, I, l).
+        assert_eq!(tag_to_room_key("0OIl"), None);
+        // Valid base58 but the wrong byte length (not a 32-byte key).
+        assert_eq!(
+            tag_to_room_key(&bs58::encode([1u8; 16]).into_string()),
+            None
+        );
     }
 
     #[test]
