@@ -44,6 +44,7 @@ web-sys = { workspace = true, features = [
     "HtmlAnchorElement",
     "HtmlElement",
     "HtmlTextAreaElement",
+    "MessageEvent",
     "MouseEvent",
     "IntersectionObserver",
     "IntersectionObserverEntry",

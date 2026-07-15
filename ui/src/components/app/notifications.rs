@@ -6,7 +6,7 @@
 //! - Room is not currently active
 //! - Permission has been granted
 
-use crate::components::app::{CURRENT_ROOM, ROOMS};
+use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::room_data::CurrentRoom;
 use crate::util::ecies::{decrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{debug, info, warn};
@@ -167,10 +167,12 @@ static ENABLE_PROMPT_SENT: AtomicBool = AtomicBool::new(false);
 /// Install the `notification_click` listener at most once.
 static CLICK_LISTENER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-/// Whether River is running inside the gateway's sandboxed iframe (opaque
-/// origin, no Notifications API) rather than as a top-level page. In the
-/// gateway `window.parent` is the shell page — a different window; served
-/// directly, `window.parent === window`.
+/// Whether River is running framed rather than as a top-level page. This
+/// detects framing in general (`window.parent !== window`); River only ever
+/// runs top-level (dev / `no-sync`) or inside the gateway's sandboxed iframe
+/// (opaque origin, no Notifications API), so "framed" reliably means "in the
+/// gateway shell" in practice. In the gateway `window.parent` is the shell page
+/// — a different window; served directly, `window.parent === window`.
 fn is_in_shell_iframe() -> bool {
     let Some(window) = web_sys::window() else {
         return false;
@@ -241,8 +243,8 @@ fn post_notification_to_shell(room_key: VerifyingKey, room_name: &str, body: &st
 
 /// Listen for `notification_click` replies from the shell and route to the room.
 /// No-op when not in the shell iframe, and installs the listener at most once.
-/// The iframe's window is only reachable by its parent shell, so we don't need
-/// a separate source check; the payload is validated defensively.
+/// Accepts messages only from the parent shell window and validates the payload
+/// defensively.
 pub fn install_shell_notification_listener() {
     if !is_in_shell_iframe() {
         return;
@@ -254,6 +256,18 @@ pub fn install_shell_notification_listener() {
         return;
     };
     let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
+        // Defense-in-depth: only act on messages from the parent shell window.
+        // In the gateway only the shell holds a handle to this iframe's window,
+        // but a source check keeps a stray postMessage from forcing a room
+        // switch. Worst case if this ever mis-rejected is a dropped click.
+        let from_parent = web_sys::window()
+            .and_then(|w| w.parent().ok().flatten())
+            .zip(event.source())
+            .map(|(parent, src)| js_sys::Object::is(src.as_ref(), parent.as_ref()))
+            .unwrap_or(false);
+        if !from_parent {
+            return;
+        }
         let data = event.data();
         let is_shell = js_sys::Reflect::get(&data, &JsValue::from_str("__freenet_shell__"))
             .ok()
@@ -282,6 +296,11 @@ pub fn install_shell_notification_listener() {
             *CURRENT_ROOM.write() = CurrentRoom {
                 owner_key: Some(room_key),
             };
+            // Mirror normal room selection: on mobile, switch to the chat panel
+            // so the clicked conversation is actually shown (otherwise the user
+            // stays on the Rooms/Members panel and the room may be marked read
+            // without ever being displayed).
+            *MOBILE_VIEW.write() = MobileView::Chat;
             if let Some(window) = web_sys::window() {
                 let _ = window.focus();
             }
