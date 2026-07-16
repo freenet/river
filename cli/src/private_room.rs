@@ -341,6 +341,7 @@ pub fn build_member_info_heal(
         member_id,
         version: 0,
         preferred_nickname: sealed,
+        deputies: Vec::new(),
     };
     Some(AuthorizedMemberInfo::new_with_member_key(info, self_sk))
 }
@@ -894,6 +895,7 @@ mod tests {
             member_id: MemberId::from(&member_sk.verifying_key()),
             version: 0,
             preferred_nickname: sealed,
+            deputies: Vec::new(),
         };
         state
             .member_info

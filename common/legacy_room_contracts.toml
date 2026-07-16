@@ -187,3 +187,9 @@ version = "V25"
 description = "Before freenet-stdlib 0.6.0 -> 0.8.3 bump (dogfood): last stdlib-0.6 room-contract generation"
 date = "2026-07-10"
 code_hash = "58a5e73c42833cf54d3f7cce9faebf18e1074bf829efb2ae5ee24ca9a2e47c50"
+
+[[entry]]
+version = "V26"
+description = "Before adding MemberInfo.deputies field (deputy ban authority, #410): last pre-deputy room-contract generation"
+date = "2026-07-16"
+code_hash = "74f3dff1c3c2f4ef89e4c93ee45ddb62952df22161450a905c2784c1facf6740"

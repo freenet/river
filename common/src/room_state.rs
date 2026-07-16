@@ -93,6 +93,28 @@ impl ChatRoomStateV1 {
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
 
+        // 0. Enforce bans from the CONVERGED state, deputy-aware (#410).
+        //
+        // `MembersV1::apply_delta` already removed members banned by the owner
+        // or an ancestor, but it ran BEFORE the sibling `member_info` field
+        // (which carries deputy grants) was applied, so it could not evaluate
+        // deputy authority. This pass runs after every field has been applied,
+        // so `self.member_info` is converged: it removes members banned by a
+        // currently-authorized deputy, and — crucially — does NOT remove
+        // members whose deputy was revoked (the deputizer removed them from
+        // `MemberInfo.deputies` at a higher version). Because the removal set
+        // is a pure function of the converged (members + deputies + bans)
+        // state, and bans stay an add-only CRDT (never pruned here), every peer
+        // converges to the same member set regardless of delta order. Kept in
+        // post_apply_cleanup (NOT verify) so verify stays stable across
+        // ban/deputy changes — mirrors the DM ban-sweep precedent.
+        let enforced_banned_ids =
+            self.members
+                .banned_member_ids(&self.bans, &self.member_info, parameters);
+        self.members
+            .members
+            .retain(|m| !enforced_banned_ids.contains(&m.member.id()));
+
         // 1. Collect message author IDs + DM participants + secret recipients.
         //
         // Secret recipients (i.e. members for whom the owner has issued an
@@ -181,6 +203,24 @@ impl ChatRoomStateV1 {
                 || required_ids.contains(&info.member_info.member_id)
         });
 
+        // 4b. Sweep recent messages authored by members removed above (deputy-
+        //     authorized ban cascade or inactivity prune).
+        //     `MessagesV1::apply_delta` already drops non-member-authored
+        //     messages, but it runs BEFORE this cleanup in field order — so a
+        //     member removed HERE (a deputy-authorized ban, #410, is only
+        //     enforceable once the converged member_info is available, which is
+        //     after the recent_messages field has been applied) would otherwise
+        //     leave orphaned messages that fail `MessagesV1::verify`
+        //     ("Message author not found"). Owner-authored messages are always
+        //     valid. `MessagesV1::actions_state` is a `#[serde(skip)]` computed
+        //     cache (rebuilt on the next apply_delta, and by the UI's private
+        //     rebuild), so it is intentionally not recomputed here.
+        let current_member_ids: HashSet<MemberId> =
+            self.members.members.iter().map(|m| m.member.id()).collect();
+        self.recent_messages.messages.retain(|m| {
+            m.message.author == owner_id || current_member_ids.contains(&m.message.author)
+        });
+
         // 5. Clean orphaned bans: only remove if banner was BANNED (not just pruned)
         // A ban is orphaned when:
         // - The banner is not the owner AND
@@ -188,8 +228,8 @@ impl ChatRoomStateV1 {
         // - The banner IS in the banned users set (i.e., they were banned, not pruned)
         let banned_user_ids: HashSet<MemberId> =
             self.bans.0.iter().map(|b| b.ban.banned_user).collect();
-        let current_member_ids: HashSet<MemberId> =
-            self.members.members.iter().map(|m| m.member.id()).collect();
+        // `current_member_ids` was computed in step 4b above (nothing between
+        // there and here changes the member set).
 
         self.bans.0.retain(|ban| {
             // Keep if: banner is owner, OR banner is still a member, OR banner is NOT banned
@@ -200,17 +240,22 @@ impl ChatRoomStateV1 {
         });
 
         // 6. Sweep DMs whose participants are no longer current members
-        //    or are banned. Without this, a fresh ban (or member-prune)
+        //    or are ENFORCED-banned. Without this, a fresh ban (or member-prune)
         //    would leave the DMs in state but break `verify` because the
         //    sender/recipient can no longer be resolved.
-        let banned_user_ids_for_sweep: HashSet<MemberId> =
-            self.bans.0.iter().map(|b| b.ban.banned_user).collect();
+        //
+        //    We use the enforced-ban set from step 0 rather than every ban
+        //    target: a member whose ban is inert (e.g. a revoked deputy's ban,
+        //    #410) is still a current member and their DMs must survive.
+        //    Enforced-banned members were already removed above, so the
+        //    active-member check alone would sweep them, but passing the set is
+        //    harmless and keeps the intent explicit.
         let active_member_ids_for_sweep: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
         self.direct_messages.sweep_after_membership_change(
             owner_id,
             &active_member_ids_for_sweep,
-            &banned_user_ids_for_sweep,
+            &enforced_banned_ids,
         );
 
         // 7. Re-sort for deterministic ordering
@@ -631,6 +676,7 @@ mod tests {
             member_id: joiner_id,
             version: 0,
             preferred_nickname: SealedBytes::public("NewUser".to_string().into_bytes()),
+            deputies: Vec::new(),
         };
         let authorized_info = AuthorizedMemberInfo::new_with_member_key(member_info, &joiner_sk);
 

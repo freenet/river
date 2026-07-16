@@ -109,6 +109,7 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
                 preferred_nickname: SealedBytes::public(
                     (random_full_name() + " (Owner)").into_bytes(),
                 ),
+                deputies: Vec::new(),
             },
             owner_sk,
         ));
@@ -136,6 +137,7 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
                     preferred_nickname: SealedBytes::public(
                         (random_full_name() + " (You)").into_bytes(),
                     ),
+                    deputies: Vec::new(),
                 },
                 &self_sk,
             ));
@@ -177,6 +179,7 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
                 preferred_nickname: SealedBytes::public(
                     (random_full_name() + " (Member)").into_bytes(),
                 ),
+                deputies: Vec::new(),
             },
             &other_member_sk,
         ));

@@ -701,6 +701,7 @@ fn build_new_room_state(
         member_id: owner_vk.into(),
         version: 0,
         preferred_nickname: seal(nickname.as_bytes()),
+        deputies: Vec::new(),
     };
     room_state
         .member_info
@@ -1856,6 +1857,7 @@ impl ApiClient {
                                 member_id: self_id,
                                 version: 0,
                                 preferred_nickname: sealed,
+                                deputies: Vec::new(),
                             };
                             let authorized_info = river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
                                 member_info, signing_key,
@@ -2479,6 +2481,10 @@ impl ApiClient {
             member_id: self_id,
             version: existing_version,
             preferred_nickname,
+            // A rejoining member was pruned for inactivity, so their previous
+            // member_info (and any deputy grants) was already cleaned up; they
+            // re-appoint deputies after rejoining if desired. (#410)
+            deputies: Vec::new(),
         };
         let authorized_info = AuthorizedMemberInfo::new_with_member_key(member_info, signing_key);
 
@@ -3844,20 +3850,28 @@ impl ApiClient {
         )
         .map_err(|e| anyhow!(e))?;
 
-        // Find our current member info to get the version
-        let current_version = room_state
+        // Find our current member info to get the version AND our existing
+        // deputy grants — republishing member_info replaces the whole signed
+        // record, so we must carry `deputies` forward or a nickname change would
+        // silently revoke every deputy we appointed (#410).
+        let current_self_info = room_state
             .member_info
             .member_info
             .iter()
-            .find(|info| info.member_info.member_id == my_member_id)
+            .find(|info| info.member_info.member_id == my_member_id);
+        let current_version = current_self_info
             .map(|info| info.member_info.version)
             .unwrap_or(0);
+        let existing_deputies = current_self_info
+            .map(|info| info.member_info.deputies.clone())
+            .unwrap_or_default();
 
         // Create new member info with incremented version
         let new_member_info = MemberInfo {
             member_id: my_member_id,
             version: current_version + 1,
             preferred_nickname: sealed_nickname,
+            deputies: existing_deputies,
         };
 
         // Sign with our member key
@@ -4000,47 +4014,24 @@ impl ApiClient {
             return Err(anyhow!("Cannot ban the room owner"));
         }
 
-        // Verify authorization: must be room owner OR in the invite chain of the banned member
+        // Verify authorization using the SAME predicate the contract enforces
+        // (owner OR ancestor-of-target OR deputy-of-an-ancestor, minus the
+        // "can't ban your deputizer" guardrail), so client-side rejection stays
+        // in lockstep with on-contract enforcement (#410).
         if my_member_id != owner_member_id {
-            // Build a map of member IDs to their AuthorizedMember for invite chain traversal
-            let members_by_id: std::collections::HashMap<_, _> = room_state
-                .members
-                .members
-                .iter()
-                .map(|m| (m.member.id(), m))
-                .collect();
-
-            // Find the banned member in the members list
-            let banned_member = members_by_id.get(&banned_member_id).ok_or_else(|| {
-                anyhow!(
-                    "Banned member not found in members list (may already be banned or removed)"
-                )
-            })?;
-
-            // Walk up the invite chain from the banned member to verify authorization
-            let mut current_id = banned_member.member.invited_by;
-            let mut found_in_chain = false;
-            let mut visited = std::collections::HashSet::new();
-
-            while current_id != owner_member_id {
-                if current_id == my_member_id {
-                    found_in_chain = true;
-                    break;
-                }
-
-                if !visited.insert(current_id) {
-                    return Err(anyhow!("Circular invite chain detected"));
-                }
-
-                let inviter = members_by_id
-                    .get(&current_id)
-                    .ok_or_else(|| anyhow!("Invite chain broken: inviter not found"))?;
-                current_id = inviter.member.invited_by;
-            }
-
-            if !found_in_chain {
+            let members_by_id = room_state.members.members_by_member_id();
+            let authorized = river_core::room_state::member::MembersV1::is_ban_authorized(
+                my_member_id,
+                banned_member_id,
+                &members_by_id,
+                &room_state.member_info,
+                owner_member_id,
+            );
+            if !authorized {
                 return Err(anyhow!(
-                    "Not authorized to ban this member. You can only ban members you invited (directly or indirectly)."
+                    "Not authorized to ban this member. You can ban members you invited \
+                     (directly or indirectly), or members within a subtree you have been \
+                     deputized over."
                 ));
             }
         }
@@ -4105,6 +4096,134 @@ impl ApiClient {
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }
+    }
+
+    /// Deputize a member (#410): grant them authority to ban within the
+    /// caller's invite subtree. Implemented by republishing the caller's own
+    /// `MemberInfo` at `version + 1` with the target added to `deputies`.
+    pub async fn deputize(
+        &self,
+        room_owner_key: &VerifyingKey,
+        member_id_short: &str,
+    ) -> Result<()> {
+        self.update_own_deputies(room_owner_key, member_id_short, true)
+            .await
+    }
+
+    /// Revoke a member's deputy authority (#410). Their prior bans stop
+    /// enforcing on the contract once this republish converges. Implemented by
+    /// republishing the caller's own `MemberInfo` at `version + 1` with the
+    /// target removed from `deputies`.
+    pub async fn revoke_deputy(
+        &self,
+        room_owner_key: &VerifyingKey,
+        member_id_short: &str,
+    ) -> Result<()> {
+        self.update_own_deputies(room_owner_key, member_id_short, false)
+            .await
+    }
+
+    /// Shared implementation for [`Self::deputize`] / [`Self::revoke_deputy`].
+    /// Republishes the caller's own signed `MemberInfo` at `version + 1` with
+    /// `target` added (`add = true`) or removed (`add = false`) from the
+    /// `deputies` list, preserving the existing sealed nickname, and sends it as
+    /// a `member_info`-only delta.
+    async fn update_own_deputies(
+        &self,
+        room_owner_key: &VerifyingKey,
+        member_id_short: &str,
+        add: bool,
+    ) -> Result<()> {
+        use river_core::room_state::member_info::MAX_DEPUTIES;
+
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be a member of the room to manage deputies.")
+        })?;
+        let (signing_key, _stored_state, _contract_key_str) = room_data;
+
+        let room_state = self.get_room(room_owner_key, false).await?;
+
+        let my_member_id: MemberId = signing_key.verifying_key().into();
+        let owner_member_id: MemberId = room_owner_key.into();
+
+        // Resolve the target's full MemberId from the short id (same lookup as
+        // ban_member).
+        let target = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|info| {
+                let s = info.member_info.member_id.to_string();
+                s.starts_with(member_id_short)
+                    || s[..8.min(s.len())].eq_ignore_ascii_case(member_id_short)
+            })
+            .map(|info| info.member_info.member_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Member '{}' not found. Use 'member list' to see member IDs.",
+                    member_id_short
+                )
+            })?;
+
+        if target == my_member_id {
+            return Err(anyhow!("You cannot deputize yourself"));
+        }
+        if target == owner_member_id {
+            return Err(anyhow!(
+                "The room owner already has full authority; deputizing them is a no-op"
+            ));
+        }
+
+        // Load the caller's current signed member_info: we must preserve the
+        // (already-sealed) nickname and version-continuity when republishing.
+        let current_self_info = room_state
+            .member_info
+            .member_info
+            .iter()
+            .find(|info| info.member_info.member_id == my_member_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "You don't have a member_info entry in this room yet. \
+                     Set your nickname first (`member set-nickname`), then retry."
+                )
+            })?;
+        let current_version = current_self_info.member_info.version;
+        let preferred_nickname = current_self_info.member_info.preferred_nickname.clone();
+        let mut deputies = current_self_info.member_info.deputies.clone();
+
+        if add {
+            if deputies.contains(&target) {
+                info!("Member is already a deputy; nothing to do");
+                return Ok(());
+            }
+            if deputies.len() >= MAX_DEPUTIES {
+                return Err(anyhow!(
+                    "You already have the maximum of {} deputies",
+                    MAX_DEPUTIES
+                ));
+            }
+            deputies.push(target);
+        } else if let Some(pos) = deputies.iter().position(|d| *d == target) {
+            deputies.remove(pos);
+        } else {
+            info!("Member is not currently a deputy; nothing to do");
+            return Ok(());
+        }
+
+        let new_member_info = MemberInfo {
+            member_id: my_member_id,
+            version: current_version + 1,
+            preferred_nickname,
+            deputies,
+        };
+        let authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
+
+        let delta = ChatRoomStateV1Delta {
+            member_info: Some(vec![authorized_member_info]),
+            ..Default::default()
+        };
+        self.send_delta(room_owner_key, delta).await
     }
 
     /// Update room configuration. Only the room owner can do this.
@@ -5892,6 +6011,7 @@ mod mention_cli_tests {
                 member_id: member_id(sk),
                 version: i as u32,
                 preferred_nickname: nickname.clone(),
+                deputies: Vec::new(),
             };
             state
                 .member_info

@@ -1,10 +1,12 @@
 mod ban_button;
+mod deputy_button;
 mod invited_by_field;
 mod nickname_field;
 
 use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::components::direct_messages::{open_dm_thread, open_invite_via_dm_picker};
 use crate::components::members::member_info_modal::ban_button::BanButton;
+use crate::components::members::member_info_modal::deputy_button::DeputyButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
 use crate::util::ecies::unseal_bytes_with_secrets;
@@ -166,6 +168,48 @@ pub fn MemberInfoModal() -> Element {
                 (nickname, Some(inviter_id))
             }
             _ => ("Unknown".to_string(), None),
+        };
+
+        // Deputy authority gating (#410). Unlike Ban (gated on the TARGET being
+        // downstream), Deputize is gated on the VIEWER holding authority: the
+        // owner, or a member whose own invite subtree is non-empty. The deputy
+        // can be any member, so this shows in any member's modal (except self /
+        // owner as targets); it is hidden entirely for a viewer with an empty
+        // subtree to avoid advertising power they don't have.
+        let viewer_has_authority = {
+            let viewer_is_owner = owner_key_signal
+                .as_ref()
+                .is_some_and(|k| MemberId::from(&*k) == self_member_id);
+            if viewer_is_owner {
+                true
+            } else if let Some(owner) = owner_key_signal.as_ref() {
+                let params = ChatRoomParametersV1 { owner: *owner };
+                room_state.room_state.members.members.iter().any(|m| {
+                    m.member.id() != self_member_id
+                        && room_state
+                            .room_state
+                            .members
+                            .get_invite_chain(m, &params)
+                            .map(|chain| chain.iter().any(|a| a.member.id() == self_member_id))
+                            .unwrap_or(false)
+                })
+            } else {
+                false
+            }
+        };
+        // Whether the target is currently one of the VIEWER's own deputies.
+        let target_is_my_deputy = room_state
+            .room_state
+            .member_info
+            .deputies_of(self_member_id)
+            .contains(&member_id);
+        // Decrypted display nickname for the target (for the deputy action copy).
+        let target_nickname = match unseal_bytes_with_secrets(
+            &member_info.member_info.preferred_nickname,
+            &room_state.secrets,
+        ) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
         };
 
         // Get the member ID string to display
@@ -337,6 +381,17 @@ pub fn MemberInfoModal() -> Element {
                                 }
                             }
 
+                            // Deputize / revoke-deputy (#410). Any non-owner
+                            // member (except self) may be deputized; the action
+                            // hides itself when the viewer lacks authority.
+                            if member_id != self_member_id {
+                                DeputyButton {
+                                    target: member_id,
+                                    viewer_has_authority: viewer_has_authority,
+                                    target_is_my_deputy: target_is_my_deputy,
+                                    nickname: target_nickname.clone(),
+                                }
+                            }
                         }
                     }
                     // Close button

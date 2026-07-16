@@ -966,6 +966,7 @@ fn issue_318_member_info_apply_delta_has_no_contract_privacy_guard() {
         member_id,
         version: 1,
         preferred_nickname: SealedBytes::public(b"PlaintextNick".to_vec()),
+        deputies: Vec::new(),
     };
     let authorized = AuthorizedMemberInfo::new_with_member_key(public_nickname, &member_sk);
 

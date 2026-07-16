@@ -442,6 +442,7 @@ fn pruned_sender_can_dm_when_bundling_rejoin_delta() {
             member_id: f.alice_id,
             version: 0,
             preferred_nickname: SealedBytes::public(b"Alice".to_vec()),
+            deputies: Vec::new(),
         },
         &f.alice_sk,
     );

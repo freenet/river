@@ -375,6 +375,7 @@ pub async fn handle_get_response(
                             member_id,
                             version: 0,
                             preferred_nickname,
+                            deputies: Vec::new(),
                         },
                         &self_sk,
                     )
@@ -1588,6 +1589,7 @@ mod tests {
                 member_id: MemberId::from(&sk.verifying_key()),
                 version: 0,
                 preferred_nickname: SealedBytes::public(b"Tester".to_vec()),
+                deputies: Vec::new(),
             },
             sk,
         )

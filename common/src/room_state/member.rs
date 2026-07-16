@@ -1,4 +1,5 @@
 use crate::room_state::ban::BansV1;
+use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, truncated_base32, verify_struct};
 use crate::ChatRoomStateV1;
@@ -135,8 +136,15 @@ impl ComposableState for MembersV1 {
             }
         }
 
-        // Always check for and remove banned members
-        self.remove_banned_members(&parent_state.bans, parameters);
+        // Always check for and remove banned members. During apply_delta the
+        // sibling `member_info` field (which carries deputy grants) has not
+        // been applied yet — field ordering applies `members` before
+        // `member_info` — so deputy authority cannot be evaluated correctly
+        // here. We therefore pass an EMPTY `member_info`, enforcing only the
+        // stable owner/ancestor authority. The full deputy-aware enforcement
+        // (which needs the converged deputy state) runs afterwards in
+        // `ChatRoomStateV1::post_apply_cleanup`. See #410.
+        self.remove_banned_members(&parent_state.bans, &MemberInfoV1::default(), parameters);
 
         // Always enforce max members limit
         self.remove_excess_members(parameters, max_members);
@@ -208,15 +216,122 @@ impl MembersV1 {
         self.check_banned_members(bans_v1, parameters).is_some()
     }
 
-    /// Removes banned members or members downstream of banned members in the invite chain
-    fn remove_banned_members(&mut self, bans_v1: &BansV1, _parameters: &ChatRoomParametersV1) {
-        let mut banned_ids = HashSet::new();
-        for ban in &bans_v1.0 {
-            banned_ids.insert(ban.ban.banned_user);
-            banned_ids.extend(self.get_downstream_members(ban.ban.banned_user));
-        }
+    /// Removes banned members or members downstream of banned members in the
+    /// invite chain, for every currently-AUTHORIZED ban (see
+    /// [`Self::banned_member_ids`]). A ban whose banner has no current
+    /// authority (e.g. a revoked deputy, #410) is inert and removes nobody.
+    fn remove_banned_members(
+        &mut self,
+        bans_v1: &BansV1,
+        member_info: &MemberInfoV1,
+        parameters: &ChatRoomParametersV1,
+    ) {
+        let banned_ids = self.banned_member_ids(bans_v1, member_info, parameters);
         self.members
             .retain(|m| !banned_ids.contains(&m.member.id()));
+    }
+
+    /// The set of member ids that must be removed because they are the target
+    /// of (or downstream of the target of) a currently-authorized ban.
+    ///
+    /// This is the deputy-aware member cascade (#410). It is a **pure function
+    /// of the converged `(members + member_info deputies + bans)` state**, so
+    /// every peer computes the same removal set regardless of the order deltas
+    /// arrived in — which is why enforcement lives here / in
+    /// `ChatRoomStateV1::post_apply_cleanup`, NOT in `verify` (flipping ban
+    /// validity inside `verify` would make it non-stable across deputy-state
+    /// changes and break convergence). Bans themselves are never pruned by this
+    /// (they remain an add-only CRDT tombstone set); revoking a deputy simply
+    /// makes their bans stop being authorized, so the previously-removed
+    /// members are no longer in this set and can rejoin.
+    pub fn banned_member_ids(
+        &self,
+        bans_v1: &BansV1,
+        member_info: &MemberInfoV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> HashSet<MemberId> {
+        let owner_id = parameters.owner_id();
+        let members_by_id = self.members_by_member_id();
+        let mut banned_ids = HashSet::new();
+        for ban in &bans_v1.0 {
+            if Self::is_ban_authorized(
+                ban.banned_by,
+                ban.ban.banned_user,
+                &members_by_id,
+                member_info,
+                owner_id,
+            ) {
+                banned_ids.insert(ban.ban.banned_user);
+                banned_ids.extend(self.get_downstream_members(ban.ban.banned_user));
+            }
+        }
+        banned_ids
+    }
+
+    /// Whether `banner` is currently authorized to ban `target` (#410).
+    ///
+    /// Authorized iff any of:
+    /// - `banner` is the room owner (absolute, non-revocable authority);
+    /// - `banner` is `target` itself or an ancestor of `target` in the invite
+    ///   tree (the classic "you can ban your own subtree" authority);
+    /// - some ancestor `A` of `target` — including the owner, who is the
+    ///   implicit root ancestor of everyone — lists `banner` in `A.deputies`
+    ///   (deputy authority scoped to `A`'s subtree).
+    ///
+    /// Guardrail ("cannot ban the member who deputized you"): a non-owner
+    /// `banner` can NEVER ban a member who currently lists `banner` among their
+    /// own deputies. This protects a deputizer from a deputy they share with a
+    /// higher-up member escalating across subtrees. It does not override the
+    /// owner's authority (the owner is never a valid ban target anyway).
+    ///
+    /// Note there is no transitive re-deputization: a deputy's own `deputies`
+    /// only grant authority over the deputy's OWN subtree (where the deputy is
+    /// a genuine ancestor), never over a subtree they merely hold as a deputy.
+    pub fn is_ban_authorized(
+        banner: MemberId,
+        target: MemberId,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        member_info: &MemberInfoV1,
+        owner_id: MemberId,
+    ) -> bool {
+        // Owner authority is absolute and non-revocable.
+        if banner == owner_id {
+            return true;
+        }
+        // Guardrail: you cannot ban a member who currently deputizes you.
+        // Checked before any authority grant (except the owner's above).
+        if member_info.deputies_of(target).contains(&banner) {
+            return false;
+        }
+        // The owner is the implicit root ancestor of every member, so an
+        // owner-granted deputy may ban anyone in the room.
+        if member_info.deputies_of(owner_id).contains(&banner) {
+            return true;
+        }
+        // Walk target's present ancestor chain toward the owner.
+        let mut current = target;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            // banner is the target itself, or a genuine ancestor of the target.
+            if current == banner {
+                return true;
+            }
+            // an ancestor `current` deputized banner over `current`'s subtree
+            // (which contains target).
+            if member_info.deputies_of(current).contains(&banner) {
+                return true;
+            }
+            match members_by_id.get(&current) {
+                Some(m) => {
+                    if m.member.invited_by == owner_id {
+                        break;
+                    }
+                    current = m.member.invited_by;
+                }
+                None => break,
+            }
+        }
+        false
     }
 
     /// Helper function to get all downstream members of a given member
@@ -972,7 +1087,7 @@ mod tests {
 
         // Test case 1: No banned members
         let empty_bans = BansV1(vec![]);
-        members.remove_banned_members(&empty_bans, &parameters);
+        members.remove_banned_members(&empty_bans, &MemberInfoV1::default(), &parameters);
         assert_eq!(members.members.len(), 4);
 
         // Test case 2: One banned member
@@ -983,7 +1098,7 @@ mod tests {
         };
         let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
         let bans = BansV1(vec![authorized_ban]);
-        members.remove_banned_members(&bans, &parameters);
+        members.remove_banned_members(&bans, &MemberInfoV1::default(), &parameters);
         assert_eq!(members.members.len(), 2);
         assert!(members
             .members
@@ -1018,7 +1133,7 @@ mod tests {
         };
         let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
         let bans = BansV1(vec![authorized_ban]);
-        members.remove_banned_members(&bans, &parameters);
+        members.remove_banned_members(&bans, &MemberInfoV1::default(), &parameters);
         assert_eq!(members.members.len(), 3);
         assert!(members
             .members

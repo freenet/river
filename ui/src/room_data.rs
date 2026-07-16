@@ -793,6 +793,7 @@ impl RoomData {
                             member_id,
                             version: existing_version,
                             preferred_nickname,
+                            deputies: Vec::new(),
                         },
                         &self.self_sk,
                     )
@@ -909,6 +910,7 @@ impl RoomData {
                 member_id,
                 version: 0,
                 preferred_nickname: seal_bytes(nickname.as_bytes(), &secret, version),
+                deputies: Vec::new(),
             };
             return Some(AuthorizedMemberInfo::new_with_member_key(
                 info,
@@ -933,6 +935,7 @@ impl RoomData {
             member_id,
             version: 0,
             preferred_nickname: SealedBytes::public(nickname.into_bytes()),
+            deputies: Vec::new(),
         };
         Some(AuthorizedMemberInfo::new_with_member_key(
             info,
@@ -1509,6 +1512,7 @@ impl Rooms {
             } else {
                 SealedBytes::public(nickname.into_bytes())
             },
+            deputies: Vec::new(),
         };
         let authorized_owner_info = AuthorizedMemberInfo::new(owner_info, &self_sk);
         room_state
@@ -1928,6 +1932,7 @@ mod tests {
             member_id,
             version: 0,
             preferred_nickname: SealedBytes::public("Alice".to_string().into_bytes()),
+            deputies: Vec::new(),
         };
         let authorized_info = AuthorizedMemberInfo::new_with_member_key(info, &invitee_sk);
         room_state.member_info.member_info.push(authorized_info);
@@ -1971,6 +1976,7 @@ mod tests {
             member_id,
             version: 1,
             preferred_nickname: SealedBytes::public("Bob".to_string().into_bytes()),
+            deputies: Vec::new(),
         };
         let updated_authorized =
             AuthorizedMemberInfo::new_with_member_key(updated_info, &invitee_sk);
@@ -2357,6 +2363,7 @@ mod tests {
             member_id: MemberId::from(&member_sk.verifying_key()),
             version: 2,
             preferred_nickname: SealedBytes::public(b"PlainLeak".to_vec()),
+            deputies: Vec::new(),
         };
         room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
             public_entry,
@@ -2403,6 +2410,7 @@ mod tests {
             member_id: MemberId::from(&member_sk.verifying_key()),
             version: 6,
             preferred_nickname: seal_bytes(b"SealedName", &v0_secret, 0),
+            deputies: Vec::new(),
         };
         room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
             private_entry,
@@ -2441,6 +2449,7 @@ mod tests {
             member_id: self_member_id,
             version: 2,
             preferred_nickname: SealedBytes::public(b"Edited".to_vec()),
+            deputies: Vec::new(),
         };
         let edited = AuthorizedMemberInfo::new_with_member_key(edited, &invitee_sk);
 
@@ -2466,6 +2475,7 @@ mod tests {
             member_id: other_member_id,
             version: 1,
             preferred_nickname: SealedBytes::public(b"Other".to_vec()),
+            deputies: Vec::new(),
         };
         let other = AuthorizedMemberInfo::new_with_member_key(other, &other_sk);
 
@@ -2494,6 +2504,7 @@ mod tests {
             member_id,
             version: 5,
             preferred_nickname: SealedBytes::public("Alice".to_string().into_bytes()),
+            deputies: Vec::new(),
         };
         room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(info, &invitee_sk));
 
@@ -2567,6 +2578,7 @@ mod tests {
             member_id: MemberId::from(&invitee_vk),
             version: 0,
             preferred_nickname: SealedBytes::public(b"Present".to_vec()),
+            deputies: Vec::new(),
         };
         network_state
             .member_info
@@ -2611,6 +2623,7 @@ mod tests {
             member_id,
             version: 7,
             preferred_nickname: SealedBytes::public(b"ChosenName".to_vec()),
+            deputies: Vec::new(),
         };
         room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
             stored,
@@ -2737,6 +2750,7 @@ mod tests {
             member_id: MemberId::from(&member_sk.verifying_key()),
             version: 3,
             preferred_nickname: SealedBytes::public(b"PlainName".to_vec()),
+            deputies: Vec::new(),
         };
         room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
             public_entry,
@@ -2919,6 +2933,7 @@ mod tests {
             member_id,
             version: 9,
             preferred_nickname: SealedBytes::public(b"PublishedName".to_vec()),
+            deputies: Vec::new(),
         };
         room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
             stored,
@@ -2960,6 +2975,7 @@ mod tests {
             member_id: MemberId::from(&member_sk.verifying_key()),
             version: 4,
             preferred_nickname: seal_bytes(b"PublishedName", &v0_secret, 0),
+            deputies: Vec::new(),
         };
         room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
             stored_info,

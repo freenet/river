@@ -25,6 +25,20 @@ pub enum MemberCommands {
         /// Member ID to ban (8-character short ID from member list)
         member_id: String,
     },
+    /// Deputize a member so they can help moderate (ban) within your invite subtree
+    Deputize {
+        /// Room ID (owner key in base58)
+        room_id: String,
+        /// Member ID to deputize (8-character short ID from member list)
+        member_id: String,
+    },
+    /// Revoke a member's deputy authority (their prior bans stop enforcing)
+    RevokeDeputy {
+        /// Room ID (owner key in base58)
+        room_id: String,
+        /// Member ID whose deputy authority to revoke (8-character short ID)
+        member_id: String,
+    },
 }
 
 pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
@@ -178,5 +192,69 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
             }
             Ok(())
         }
+        MemberCommands::Deputize { room_id, member_id } => {
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Deputizing member '{}' in room: {}", member_id, room_id);
+            }
+            let owner_vk = parse_room_id(&room_id)?;
+            match api.deputize(&owner_vk, &member_id).await {
+                Ok(()) => match format {
+                    OutputFormat::Human => println!(
+                        "{}",
+                        format!(
+                            "Member '{}' can now help moderate people you invited.",
+                            member_id
+                        )
+                        .green()
+                    ),
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::json!({ "success": true, "deputized_member_id": member_id })
+                    ),
+                },
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red(), e);
+                    return Err(e);
+                }
+            }
+            Ok(())
+        }
+        MemberCommands::RevokeDeputy { room_id, member_id } => {
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Revoking deputy '{}' in room: {}", member_id, room_id);
+            }
+            let owner_vk = parse_room_id(&room_id)?;
+            match api.revoke_deputy(&owner_vk, &member_id).await {
+                Ok(()) => match format {
+                    OutputFormat::Human => println!(
+                        "{}",
+                        format!("Member '{}' is no longer your deputy.", member_id).green()
+                    ),
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::json!({ "success": true, "revoked_member_id": member_id })
+                    ),
+                },
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red(), e);
+                    return Err(e);
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+/// Decode a base58 room id (owner verifying key) into a `VerifyingKey`.
+fn parse_room_id(room_id: &str) -> Result<ed25519_dalek::VerifyingKey> {
+    let owner_key_bytes = bs58::decode(room_id)
+        .into_vec()
+        .map_err(|e| anyhow!("Invalid room ID: {}", e))?;
+    if owner_key_bytes.len() != 32 {
+        return Err(anyhow!("Invalid room ID: expected 32 bytes"));
+    }
+    let mut key_array = [0u8; 32];
+    key_array.copy_from_slice(&owner_key_bytes);
+    ed25519_dalek::VerifyingKey::from_bytes(&key_array)
+        .map_err(|e| anyhow!("Invalid room ID: {}", e))
 }

@@ -8,9 +8,30 @@ use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Maximum number of deputies a single member may list in their `MemberInfo`,
+/// to bound state-bloat abuse (deputy ban authority, #410). A `MemberInfo`
+/// whose `deputies` list exceeds this is rejected by `MemberInfoV1::verify`.
+pub const MAX_DEPUTIES: usize = 64;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct MemberInfoV1 {
     pub member_info: Vec<AuthorizedMemberInfo>,
+}
+
+impl MemberInfoV1 {
+    /// The deputies currently listed by `member_id`'s own signed `MemberInfo`,
+    /// or an empty slice if that member has no info entry or no deputies.
+    ///
+    /// Deputies are a member's authenticated statement (their own signed
+    /// `MemberInfo`) that the listed members may ban within the deputizing
+    /// member's invite subtree (#410).
+    pub fn deputies_of(&self, member_id: MemberId) -> &[MemberId] {
+        self.member_info
+            .iter()
+            .find(|info| info.member_info.member_id == member_id)
+            .map(|info| info.member_info.deputies.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 impl ComposableState for MemberInfoV1 {
@@ -29,6 +50,16 @@ impl ComposableState for MemberInfoV1 {
 
         for member_info in &self.member_info {
             let member_id = member_info.member_info.member_id;
+
+            // Bound the deputy list to prevent state-bloat abuse (#410).
+            if member_info.member_info.deputies.len() > MAX_DEPUTIES {
+                return Err(format!(
+                    "Member {:?} lists {} deputies, exceeding the maximum of {}",
+                    member_id,
+                    member_info.member_info.deputies.len(),
+                    MAX_DEPUTIES
+                ));
+            }
 
             if member_id == owner_id {
                 // If this is the owner's member info, verify against owner's key
@@ -202,6 +233,22 @@ pub struct MemberInfo {
     pub member_id: MemberId,
     pub version: u32,
     pub preferred_nickname: SealedBytes,
+    /// Members this member has deputized to ban within this member's invite
+    /// subtree (deputy ban authority, #410). Empty for the vast majority of
+    /// members.
+    ///
+    /// LOAD-BEARING: this MUST be the LAST field and MUST keep BOTH
+    /// `#[serde(default)]` (so pre-#410 records — which have no `deputies`
+    /// key — still deserialize) AND `skip_serializing_if = "Vec::is_empty"`
+    /// (so an EMPTY list serializes byte-identically to the old 3-field
+    /// record). `MemberInfo` is INDIVIDUALLY signed over its ciborium bytes
+    /// (`AuthorizedMemberInfo`), so a plain `#[serde(default)]` alone would
+    /// re-serialize every existing member's record with an extra field,
+    /// breaking their signature on migration and stranding every existing
+    /// room. Never reorder the first three fields. Pinned by
+    /// `empty_deputies_serializes_identically_to_legacy_member_info`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deputies: Vec<MemberId>,
 }
 
 impl MemberInfo {
@@ -211,6 +258,7 @@ impl MemberInfo {
             member_id,
             version,
             preferred_nickname: SealedBytes::public(nickname.into_bytes()),
+            deputies: Vec::new(),
         }
     }
 
@@ -232,6 +280,7 @@ impl MemberInfo {
                 secret_version,
                 declared_len,
             ),
+            deputies: Vec::new(),
         }
     }
 }
@@ -245,6 +294,88 @@ mod tests {
 
     fn create_test_member_info(member_id: MemberId) -> MemberInfo {
         MemberInfo::new_public(member_id, 1, "TestUser".to_string())
+    }
+
+    /// LOAD-BEARING regression test (issue #410).
+    ///
+    /// `MemberInfo` is individually signed over its ciborium bytes
+    /// (`AuthorizedMemberInfo::new*` -> `sign_struct`; `verify_signature`
+    /// re-serializes and checks). Adding `deputies` with a PLAIN
+    /// `#[serde(default)]` would make the new WASM re-serialize a 4-field
+    /// struct, changing the bytes and breaking every existing member's
+    /// signature -> `validate_state` rejects the permissionless migration PUT
+    /// -> every existing room migrates to empty. The
+    /// `skip_serializing_if = "Vec::is_empty"` attribute makes an empty
+    /// `deputies` list serialize byte-identically to the old 3-field record,
+    /// so old signatures still verify.
+    ///
+    /// This test constructs the OLD 3-field shape, signs its ciborium bytes,
+    /// and asserts the new `MemberInfo` with an empty `deputies` list (a)
+    /// serializes to byte-identical bytes and (b) still verifies against that
+    /// old signature. It MUST fail if `skip_serializing_if` is dropped.
+    #[test]
+    fn empty_deputies_serializes_identically_to_legacy_member_info() {
+        use crate::util::{sign_struct, verify_struct};
+
+        // Exact mirror of the pre-#410 3-field MemberInfo layout, in order.
+        #[derive(Serialize)]
+        struct OldMemberInfo {
+            member_id: MemberId,
+            version: u32,
+            preferred_nickname: SealedBytes,
+        }
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let member_id: MemberId = signing_key.verifying_key().into();
+        let nickname = SealedBytes::public("LegacyNick".to_string().into_bytes());
+
+        let old = OldMemberInfo {
+            member_id,
+            version: 7,
+            preferred_nickname: nickname.clone(),
+        };
+        // New struct: same first three fields, EMPTY deputies.
+        let new_empty = MemberInfo {
+            member_id,
+            version: 7,
+            preferred_nickname: nickname.clone(),
+            deputies: Vec::new(),
+        };
+
+        // (a) direct byte-identity of the ciborium serialization.
+        let mut old_bytes = Vec::new();
+        ciborium::ser::into_writer(&old, &mut old_bytes).unwrap();
+        let mut new_bytes = Vec::new();
+        ciborium::ser::into_writer(&new_empty, &mut new_bytes).unwrap();
+        assert_eq!(
+            old_bytes, new_bytes,
+            "MemberInfo with empty deputies MUST serialize byte-identically to \
+             the legacy 3-field record; dropping skip_serializing_if breaks this \
+             and strands every existing room (issue #410)"
+        );
+
+        // (b) a signature over the OLD record still verifies against the NEW struct.
+        let signature = sign_struct(&old, &signing_key);
+        assert!(
+            verify_struct(&new_empty, &signature, &signing_key.verifying_key()).is_ok(),
+            "signature over legacy MemberInfo bytes must still verify against the \
+             new struct with empty deputies (proves byte-identical serialization)"
+        );
+
+        // Sanity: a NON-empty deputies list MUST change the bytes (proves the
+        // field really is serialized when populated, so it is not a silent no-op).
+        let with_deputy = MemberInfo {
+            member_id,
+            version: 7,
+            preferred_nickname: nickname,
+            deputies: vec![member_id],
+        };
+        let mut with_deputy_bytes = Vec::new();
+        ciborium::ser::into_writer(&with_deputy, &mut with_deputy_bytes).unwrap();
+        assert_ne!(
+            old_bytes, with_deputy_bytes,
+            "a populated deputies list must change the serialized bytes"
+        );
     }
 
     #[test]

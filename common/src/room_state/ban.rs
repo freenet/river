@@ -102,7 +102,20 @@ impl BansV1 {
         invalid_bans
     }
 
-    /// Validates a single ban and adds any validation errors to the invalid_bans map
+    /// Validates a single ban and adds any validation errors to the invalid_bans map.
+    ///
+    /// Note (#410): this does NOT reject a ban merely because the banner is not
+    /// a current ancestor of the target. Authority to ENFORCE a ban (owner /
+    /// ancestor / deputy, including retroactive deputy revocation) is evaluated
+    /// at enforcement time in [`crate::room_state::member::MembersV1::banned_member_ids`]
+    /// (run from `post_apply_cleanup`), NOT here. A ban whose banner has no
+    /// current authority (for example a revoked deputy) is INERT — it removes
+    /// nobody — but must still pass `verify`: a legitimately converged state (a
+    /// previously-banned user who rejoined after their deputy was revoked)
+    /// would otherwise fail validation and break convergence. Keeping ban
+    /// authority out of `verify` is exactly what makes `verify` stable across
+    /// deputy-state changes. Ban SIGNATURES are still verified in `verify`, and
+    /// the orphaned-ban check (banner was themselves banned) is retained.
     fn validate_single_ban(
         &self,
         ban: &AuthorizedUserBan,
@@ -111,93 +124,28 @@ impl BansV1 {
         invalid_bans: &mut HashMap<BanId, BanValidationError>,
         banned_user_ids: &HashSet<MemberId>,
     ) {
-        // Check if banned member exists - if not, that's OK, they've been removed due to the ban.
-        // We can skip the invite chain verification in that case since:
-        // 1. The ban signature verification (done separately) proves authenticity
-        // 2. The ban has already taken effect (member was removed)
-        // 3. The invite chain was valid when the ban was first created and applied
-        let banned_member = match member_map.get(&ban.ban.banned_user) {
-            Some(member) => member,
-            None => {
-                // Banned member already removed - ban is valid, skip further checks
-                return;
-            }
-        };
-
-        // Skip banning member verification if banner is room owner
-        if ban.banned_by != parameters.owner_id() {
-            // Check if banning member exists
-            let banning_member = match member_map.get(&ban.banned_by) {
-                Some(member) => member,
-                None => {
-                    // Banner not in members list. Check if they were banned
-                    // (orphaned ban) or just pruned for inactivity (valid ban).
-                    if banned_user_ids.contains(&ban.banned_by) {
-                        // Banner was banned — this ban is orphaned
-                        invalid_bans
-                            .insert(ban.id(), BanValidationError::BannerNotFound(ban.banned_by));
-                    }
-                    // Otherwise banner was pruned for inactivity — ban is still valid
-                    return;
-                }
-            };
-
-            // Verify banning member is in the invite chain of banned member
-            if let Err(error) = self.validate_invite_chain(
-                banned_member,
-                banning_member,
-                member_map,
-                parameters.owner_id(),
-                ban.id(),
-            ) {
-                invalid_bans.insert(ban.id(), error);
-            }
-        }
-    }
-
-    /// Validates that the banning member is in the invite chain of the banned member
-    fn validate_invite_chain(
-        &self,
-        banned_member: &AuthorizedMember,
-        banning_member: &AuthorizedMember,
-        member_map: &HashMap<MemberId, &AuthorizedMember>,
-        owner_id: MemberId,
-        _ban_id: BanId,
-    ) -> Result<(), BanValidationError> {
-        let mut current_member = banned_member;
-        let mut chain = Vec::new();
-
-        while current_member.member.id() != owner_id {
-            chain.push(current_member);
-
-            // If we found the banning member in the chain, the ban is valid
-            if current_member.member.id() == banning_member.member.id() {
-                return Ok(());
-            }
-
-            // Move up the invite chain
-            current_member = match member_map.get(&current_member.member.invited_by) {
-                Some(m) => m,
-                None => {
-                    return Err(BanValidationError::InviterNotFound(
-                        current_member.member.id(),
-                    ));
-                }
-            };
-
-            // Check for circular invite chains
-            if chain.contains(&current_member) {
-                return Err(BanValidationError::SelfInvitationDetected(
-                    current_member.member.id(),
-                ));
-            }
+        // If the banned member is no longer present they were already removed
+        // (e.g. by this ban, a cascade, or an inactivity prune); nothing left
+        // to enforce, so the ban is valid.
+        if !member_map.contains_key(&ban.ban.banned_user) {
+            return;
         }
 
-        // If we reached the owner without finding the banning member, the ban is invalid
-        Err(BanValidationError::NotInInviteChain(
-            banning_member.member.id(),
-            banned_member.member.id(),
-        ))
+        // Owner bans are always valid.
+        if ban.banned_by == parameters.owner_id() {
+            return;
+        }
+
+        // If the banner is not a current member, distinguish an orphaned ban
+        // (the banner was themselves banned) from a still-valid ban by a member
+        // who was merely pruned for inactivity. If the banner IS a current
+        // member the ban is accepted regardless of the banner's current
+        // ancestor/deputy authority (see the doc comment above) — enforcement
+        // decides who is actually removed.
+        if !member_map.contains_key(&ban.banned_by) && banned_user_ids.contains(&ban.banned_by) {
+            // Banner was banned — this ban is orphaned.
+            invalid_bans.insert(ban.id(), BanValidationError::BannerNotFound(ban.banned_by));
+        }
     }
 
     /// Identifies bans that exceed the maximum allowed limit.

@@ -150,6 +150,10 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                         member_id: member_info.member_info.member_id,
                         version: member_info.member_info.version + 1,
                         preferred_nickname: sealed_nickname,
+                        // Preserve existing deputy grants (#410): republishing
+                        // member_info replaces the whole signed record, so
+                        // dropping deputies would silently revoke them.
+                        deputies: member_info.member_info.deputies.clone(),
                     };
                     let new_authorized_member_info =
                         AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);

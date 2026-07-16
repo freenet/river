@@ -172,6 +172,9 @@ struct MemberDisplay {
     sponsored_you: bool,
     invited_by_you: bool,
     in_your_network: bool,
+    /// This member holds deputy ban authority — some member's signed
+    /// `MemberInfo.deputies` lists them (#410).
+    is_deputy: bool,
 }
 
 fn is_member_sponsor(
@@ -241,6 +244,9 @@ fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
     } else if member.sponsored_you {
         tags.push(("🔭", "In Your Invite Chain"));
     }
+    if member.is_deputy {
+        tags.push(("🛡", "Deputy — can help moderate a subtree"));
+    }
 
     MemberDisplayParts {
         nickname: member.nickname.clone(),
@@ -309,6 +315,15 @@ pub fn MemberList() -> Element {
 
         let ordered_ids = invite_tree_order(owner_id, members);
 
+        // Members holding deputy authority: anyone listed in ANY member's
+        // signed `MemberInfo.deputies` (#410). The badge shows who CAN help
+        // moderate (a subtree), not who has appointed deputies.
+        let deputies: std::collections::HashSet<MemberId> = member_info
+            .member_info
+            .iter()
+            .flat_map(|mi| mi.member_info.deputies.iter().copied())
+            .collect();
+
         // Build display list in tree order
         let mut all_members = Vec::new();
         for &member_id in &ordered_ids {
@@ -350,6 +365,7 @@ pub fn MemberList() -> Element {
                 } else {
                     is_in_your_network(member_id, members, self_member_id)
                 },
+                is_deputy: deputies.contains(&member_id),
             };
 
             all_members.push((member_display_parts(&member_display), member_id));
@@ -1039,6 +1055,7 @@ mod tests {
             sponsored_you: false,
             invited_by_you: false,
             in_your_network: false,
+            is_deputy: false,
         }
     }
 

@@ -281,6 +281,7 @@ mod tests {
             member_id: MemberId::from(&member_b_sk.verifying_key()),
             version: 1,
             preferred_nickname: SealedBytes::public("TestUser".as_bytes().to_vec()),
+            deputies: Vec::new(),
         };
         let auth_member_info = AuthorizedMemberInfo::new_with_member_key(member_info, &member_b_sk);
 
