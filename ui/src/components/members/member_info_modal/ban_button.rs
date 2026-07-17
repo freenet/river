@@ -167,9 +167,9 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
 
     if is_downstream {
         rsx! {
-            div { class: "mt-4",
+            div {
                 button {
-                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors",
+                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors whitespace-nowrap",
                     onclick: move |_| show_confirmation.set(true),
                     "Ban User"
                 }

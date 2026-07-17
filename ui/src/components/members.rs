@@ -172,9 +172,10 @@ struct MemberDisplay {
     sponsored_you: bool,
     invited_by_you: bool,
     in_your_network: bool,
-    /// This member holds deputy ban authority — some member's signed
-    /// `MemberInfo.deputies` lists them (#410).
-    is_deputy: bool,
+    /// Display names of the members who have deputized this member (the owner
+    /// shows as "room owner"). Empty means not a deputy. Drives the 🛡 badge
+    /// and its tooltip (#410).
+    deputized_by: Vec<String>,
 }
 
 fn is_member_sponsor(
@@ -222,30 +223,33 @@ fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: Memb
 #[derive(Clone, PartialEq)]
 struct MemberDisplayParts {
     nickname: String,
-    tags: Vec<(&'static str, &'static str)>,
+    tags: Vec<(&'static str, String)>,
 }
 
 fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
-    let mut tags: Vec<(&'static str, &'static str)> = Vec::new();
+    let mut tags: Vec<(&'static str, String)> = Vec::new();
 
     if member.is_owner {
-        tags.push(("👑", "Room Owner"));
+        tags.push(("👑", "Room Owner".to_string()));
     }
     if member.is_self {
-        tags.push(("⭐", "You"));
+        tags.push(("⭐", "You".to_string()));
     }
     if member.invited_by_you {
-        tags.push(("🔑", "Invited by You"));
+        tags.push(("🔑", "Invited by You".to_string()));
     } else if member.in_your_network {
-        tags.push(("🌐", "In Your Network"));
+        tags.push(("🌐", "In Your Network".to_string()));
     }
     if member.invited_you {
-        tags.push(("🎪", "Invited You"));
+        tags.push(("🎪", "Invited You".to_string()));
     } else if member.sponsored_you {
-        tags.push(("🔭", "In Your Invite Chain"));
+        tags.push(("🔭", "In Your Invite Chain".to_string()));
     }
-    if member.is_deputy {
-        tags.push(("🛡", "Deputy — can help moderate a subtree"));
+    if !member.deputized_by.is_empty() {
+        tags.push((
+            "🛡",
+            format!("Deputy (appointed by {})", member.deputized_by.join(", ")),
+        ));
     }
 
     MemberDisplayParts {
@@ -315,14 +319,38 @@ pub fn MemberList() -> Element {
 
         let ordered_ids = invite_tree_order(owner_id, members);
 
-        // Members holding deputy authority: anyone listed in ANY member's
-        // signed `MemberInfo.deputies` (#410). The badge shows who CAN help
-        // moderate (a subtree), not who has appointed deputies.
-        let deputies: std::collections::HashSet<MemberId> = member_info
-            .member_info
-            .iter()
-            .flat_map(|mi| mi.member_info.deputies.iter().copied())
-            .collect();
+        // Reverse map: for each deputy member, who has deputized them (#410).
+        // Built from every member's signed `MemberInfo.deputies`, so the 🛡
+        // badge tooltip can name the appointer(s) rather than a generic label.
+        let mut deputizers_of: std::collections::HashMap<MemberId, Vec<MemberId>> =
+            std::collections::HashMap::new();
+        for mi in &member_info.member_info {
+            let appointer = mi.member_info.member_id;
+            for deputy in &mi.member_info.deputies {
+                deputizers_of.entry(*deputy).or_default().push(appointer);
+            }
+        }
+
+        // Resolve an appointer's id to a display name (owner -> "room owner").
+        let name_of = |id: MemberId| -> String {
+            if id == owner_id {
+                return "room owner".to_string();
+            }
+            member_info
+                .member_info
+                .iter()
+                .find(|mi| mi.member_info.member_id == id)
+                .map(|mi| {
+                    match unseal_bytes_with_secrets(
+                        &mi.member_info.preferred_nickname,
+                        room_secrets,
+                    ) {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                        Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
+                    }
+                })
+                .unwrap_or_else(|| "Unknown".to_string())
+        };
 
         // Build display list in tree order
         let mut all_members = Vec::new();
@@ -365,7 +393,10 @@ pub fn MemberList() -> Element {
                 } else {
                     is_in_your_network(member_id, members, self_member_id)
                 },
-                is_deputy: deputies.contains(&member_id),
+                deputized_by: deputizers_of
+                    .get(&member_id)
+                    .map(|ids| ids.iter().map(|id| name_of(*id)).collect())
+                    .unwrap_or_default(),
             };
 
             all_members.push((member_display_parts(&member_display), member_id));
@@ -1055,7 +1086,7 @@ mod tests {
             sponsored_you: false,
             invited_by_you: false,
             in_your_network: false,
-            is_deputy: false,
+            deputized_by: Vec::new(),
         }
     }
 

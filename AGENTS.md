@@ -294,6 +294,17 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
 
 `ChatRoomStateV1` and all sub-types must remain backwards-compatible:
 - New fields must use `#[serde(default)]`
+- **On an INDIVIDUALLY-SIGNED sub-struct (`MemberInfo`, `Member`, `UserBan`,
+  `MessageV1`, `Configuration` — anything wrapped in an `Authorized…` whose
+  signature covers its ciborium bytes), a new field needs BOTH
+  `#[serde(default)]` AND `#[serde(skip_serializing_if = …)]` so that the
+  default/empty value serializes byte-identically to the old record.** A plain
+  `#[serde(default)]` alone re-serializes a wider struct, so every existing
+  member's/message's/ban's signature fails verification and every existing room
+  migrates to empty. Put the new field LAST, never reorder existing fields, and
+  gate it with a byte-identity regression test (see
+  `member_info.rs::empty_deputies_serializes_identically_to_legacy_member_info`,
+  #410). Plain `#[serde(default)]` is only safe on UNSIGNED containers.
 - Never remove or rename existing fields
 - Never change serialization format of existing fields
 - If a breaking change is truly needed, create a V2 type with explicit migration (separate project)

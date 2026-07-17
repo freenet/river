@@ -589,3 +589,496 @@ fn too_many_deputies_is_rejected() {
         "error should mention deputies: {err}"
     );
 }
+
+// ===================================================================
+// Self-immunization + reorder guardrail tests (review round 1, #410)
+// ===================================================================
+
+/// A genuine strict ancestor keeps ABSOLUTE ban authority even if the target
+/// tries to "self-immunize" by listing the ancestor in their own deputies.
+#[test]
+fn strict_ancestor_immune_to_self_immunization() {
+    let owner = Peer::new();
+    let a = Peer::new();
+    let t = Peer::new();
+    let owner_id = owner.id;
+
+    // owner -> A -> T, and T self-immunizes: T.deputies = [A].
+    let mut state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![
+                member(&a, owner_id, &owner.sk, owner_id),
+                member(&t, a.id, &a.sk, owner_id),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![info(&a, 0, vec![]), info(&t, 1, vec![a.id])],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&a, owner_id), join(&t, owner_id)],
+            ..Default::default()
+        },
+        bans: BansV1(vec![ban(t.id, &a, owner_id)]),
+        ..Default::default()
+    };
+
+    state.post_apply_cleanup(&params(&owner)).unwrap();
+    assert!(
+        !member_ids(&state).contains(&t.id),
+        "A is a genuine ancestor of T; T listing A in deputies must NOT strip A's authority"
+    );
+}
+
+/// An owner-appointed global moderator keeps ABSOLUTE authority even if the
+/// spammer self-immunizes by listing the mod in their own deputies.
+#[test]
+fn global_mod_immune_to_self_immunization() {
+    let owner = Peer::new();
+    let b = Peer::new(); // global mod
+    let s = Peer::new(); // spammer
+    let owner_id = owner.id;
+
+    // owner deputizes B (global). owner -> S (spammer), S.deputies = [B].
+    let mut state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![
+                member(&b, owner_id, &owner.sk, owner_id),
+                member(&s, owner_id, &owner.sk, owner_id),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![
+                info(&owner, 1, vec![b.id]), // owner deputizes B globally
+                info(&b, 0, vec![]),
+                info(&s, 1, vec![b.id]), // S self-immunizes
+            ],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&b, owner_id), join(&s, owner_id)],
+            ..Default::default()
+        },
+        bans: BansV1(vec![ban(s.id, &b, owner_id)]),
+        ..Default::default()
+    };
+
+    state.post_apply_cleanup(&params(&owner)).unwrap();
+    assert!(
+        !member_ids(&state).contains(&s.id),
+        "owner-appointed global mod B must be able to ban spammer S despite S self-immunizing"
+    );
+    assert!(member_ids(&state).contains(&b.id), "B remains");
+}
+
+/// The fellow-deputizer guardrail still holds (B cannot ban A2 who deputizes B),
+/// while B CAN still ban another member of A1's subtree (A3) via A1's grant.
+#[test]
+fn fellow_deputizer_protected_but_other_subtree_member_bannable() {
+    let owner = Peer::new();
+    let a1 = Peer::new();
+    let a2 = Peer::new();
+    let a3 = Peer::new();
+    let b = Peer::new();
+    let owner_id = owner.id;
+
+    // owner -> A1 -> {A2, A3}; owner -> B. A1.deputies=[B], A2.deputies=[B].
+    let base_members = vec![
+        member(&a1, owner_id, &owner.sk, owner_id),
+        member(&a2, a1.id, &a1.sk, owner_id),
+        member(&a3, a1.id, &a1.sk, owner_id),
+        member(&b, owner_id, &owner.sk, owner_id),
+    ];
+    let base_info = vec![
+        info(&a1, 1, vec![b.id]),
+        info(&a2, 1, vec![b.id]),
+        info(&a3, 0, vec![]),
+        info(&b, 0, vec![]),
+    ];
+    let base_msgs = vec![
+        join(&a1, owner_id),
+        join(&a2, owner_id),
+        join(&a3, owner_id),
+        join(&b, owner_id),
+    ];
+
+    // B bans A2 (a fellow deputizer) -> guardrail denies, A2 stays.
+    let mut s1 = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: base_members.clone(),
+        },
+        member_info: MemberInfoV1 {
+            member_info: base_info.clone(),
+        },
+        recent_messages: MessagesV1 {
+            messages: base_msgs.clone(),
+            ..Default::default()
+        },
+        bans: BansV1(vec![ban(a2.id, &b, owner_id)]),
+        ..Default::default()
+    };
+    s1.post_apply_cleanup(&params(&owner)).unwrap();
+    assert!(
+        member_ids(&s1).contains(&a2.id),
+        "B cannot ban A2 (A2 deputizes B — fellow-deputizer guardrail)"
+    );
+
+    // B bans A3 (a non-deputizer in A1's subtree) -> authorized via A1's grant.
+    let mut s2 = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: base_members,
+        },
+        member_info: MemberInfoV1 {
+            member_info: base_info,
+        },
+        recent_messages: MessagesV1 {
+            messages: base_msgs,
+            ..Default::default()
+        },
+        bans: BansV1(vec![ban(a3.id, &b, owner_id)]),
+        ..Default::default()
+    };
+    s2.post_apply_cleanup(&params(&owner)).unwrap();
+    assert!(
+        !member_ids(&s2).contains(&a3.id),
+        "B CAN ban A3 (another member of A1's subtree) via A1's deputy grant"
+    );
+}
+
+/// No transitive re-deputization: A deputizes B, B deputizes C in B's OWN
+/// MemberInfo — C gets NO authority over A's subtree.
+#[test]
+fn no_transitive_re_deputization() {
+    let owner = Peer::new();
+    let a = Peer::new();
+    let b = Peer::new();
+    let c = Peer::new();
+    let t = Peer::new();
+    let owner_id = owner.id;
+
+    // owner -> A -> T ; owner -> B ; owner -> C. A.deputies=[B], B.deputies=[C].
+    let mut state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![
+                member(&a, owner_id, &owner.sk, owner_id),
+                member(&b, owner_id, &owner.sk, owner_id),
+                member(&c, owner_id, &owner.sk, owner_id),
+                member(&t, a.id, &a.sk, owner_id),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![
+                info(&a, 1, vec![b.id]), // A deputizes B
+                info(&b, 1, vec![c.id]), // B (a deputy) tries to sub-deputize C
+                info(&c, 0, vec![]),
+                info(&t, 0, vec![]),
+            ],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![
+                join(&a, owner_id),
+                join(&b, owner_id),
+                join(&c, owner_id),
+                join(&t, owner_id),
+            ],
+            ..Default::default()
+        },
+        // C tries to ban T (in A's subtree). C only holds authority via B, who
+        // is not an ancestor of T — so this must be inert.
+        bans: BansV1(vec![ban(t.id, &c, owner_id)]),
+        ..Default::default()
+    };
+
+    state.post_apply_cleanup(&params(&owner)).unwrap();
+    assert!(
+        member_ids(&state).contains(&t.id),
+        "C's authority (only via deputy B) does NOT reach into A's subtree — no transitive re-deputization"
+    );
+}
+
+/// The owner is never a valid ban target: an "authorized" ban of the owner
+/// would cascade `get_downstream_members(owner)` = the whole room. Even an
+/// owner-appointed global mod cannot ban the owner.
+#[test]
+fn deputy_cannot_ban_owner_and_room_survives() {
+    let owner = Peer::new();
+    let b = Peer::new(); // global mod
+    let x = Peer::new();
+    let y = Peer::new();
+    let owner_id = owner.id;
+
+    // owner deputizes B globally. owner -> B, owner -> X -> Y.
+    let mut state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![
+                member(&b, owner_id, &owner.sk, owner_id),
+                member(&x, owner_id, &owner.sk, owner_id),
+                member(&y, x.id, &x.sk, owner_id),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![
+                info(&owner, 1, vec![b.id]),
+                info(&b, 0, vec![]),
+                info(&x, 0, vec![]),
+                info(&y, 0, vec![]),
+            ],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&b, owner_id), join(&x, owner_id), join(&y, owner_id)],
+            ..Default::default()
+        },
+        // Global mod B attempts to ban the OWNER.
+        bans: BansV1(vec![ban(owner_id, &b, owner_id)]),
+        ..Default::default()
+    };
+
+    state.post_apply_cleanup(&params(&owner)).unwrap();
+    let ids = member_ids(&state);
+    assert!(
+        ids.contains(&b.id) && ids.contains(&x.id) && ids.contains(&y.id),
+        "banning the owner must be INERT — the whole room must survive, got {ids:?}"
+    );
+}
+
+/// An over-cap deputy record (> MAX_DEPUTIES) is SKIPPED by
+/// `MemberInfoV1::apply_delta` (not stored) and the resulting state stays
+/// valid — so a self-signed 65-deputy record can neither enter state via a
+/// delta nor block full-state validation. (#410, review round 1)
+#[test]
+fn over_cap_deputies_delta_is_skipped_and_state_stays_valid() {
+    let owner = Peer::new();
+    let a = Peer::new();
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    let mut state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![member(&a, owner_id, &owner.sk, owner_id)],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![info(&a, 0, vec![])],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&a, owner_id)],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // A self-signs a record with MAX_DEPUTIES + 1 deputies at version 1.
+    let too_many: Vec<MemberId> = (0..=MAX_DEPUTIES).map(|_| Peer::new().id).collect();
+    assert!(too_many.len() > MAX_DEPUTIES);
+    let delta = river_core::room_state::ChatRoomStateV1Delta {
+        member_info: Some(vec![info(&a, 1, too_many)]),
+        ..Default::default()
+    };
+
+    let before = state.clone();
+    state
+        .apply_delta(&before, &p, &Some(delta))
+        .expect("apply_delta must not error — the over-cap entry is skipped, not rejected");
+
+    assert!(
+        state.member_info.deputies_of(a.id).is_empty(),
+        "the over-cap deputy record must be skipped, leaving A's original (empty) deputies"
+    );
+    state
+        .verify(&state, &p)
+        .expect("state stays valid because the over-cap record never entered");
+}
+
+// ===================================================================
+// Forged/inert-ban un-ban DoS defense (review round 1, #410)
+// ===================================================================
+
+fn ban_at(target: MemberId, banner: &Peer, owner_id: MemberId, secs: u64) -> AuthorizedUserBan {
+    AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            banned_user: target,
+        },
+        banner.id,
+        &banner.sk,
+    )
+}
+
+fn config_max_bans(owner: &Peer, max_user_bans: usize) -> AuthorizedConfigurationV1 {
+    AuthorizedConfigurationV1::new(
+        Configuration {
+            max_members: 100,
+            max_user_bans,
+            max_recent_messages: 1000,
+            ..Default::default()
+        },
+        &owner.sk,
+    )
+}
+
+/// A flood of forged/inert bans over `max_user_bans` must NOT evict the real,
+/// enforcing moderator bans — the real bans survive AND still keep the spammers
+/// out. The real bans are made OLDER than the forged flood, so the previous
+/// oldest-first eviction WOULD have dropped them (this test fails under that
+/// policy and passes under inert-first eviction).
+#[test]
+fn forged_ban_flood_does_not_evict_enforcing_bans() {
+    let owner = Peer::new();
+    let a = Peer::new();
+    let s1 = Peer::new();
+    let s2 = Peer::new();
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    let members = vec![
+        member(&a, owner_id, &owner.sk, owner_id),
+        member(&s1, owner_id, &owner.sk, owner_id),
+        member(&s2, owner_id, &owner.sk, owner_id),
+    ];
+    let infos = vec![
+        info(&a, 0, vec![]),
+        info(&s1, 0, vec![]),
+        info(&s2, 0, vec![]),
+    ];
+    let msgs = vec![join(&a, owner_id), join(&s1, owner_id), join(&s2, owner_id)];
+
+    // Two real enforcing owner bans, made OLDEST (secs 1, 2).
+    let real1 = ban_at(s1.id, &owner, owner_id, 1);
+    let real2 = ban_at(s2.id, &owner, owner_id, 2);
+
+    // Five FORGED inert bans by fresh NON-member keys targeting present member A,
+    // all NEWER (secs 100+). is_ban_authorized(fake, A) == false -> inert.
+    let forged: Vec<AuthorizedUserBan> = (0..5)
+        .map(|i| ban_at(a.id, &Peer::new(), owner_id, 100 + i))
+        .collect();
+
+    // Order the stored list forged-first so an oldest-first cap would drop the
+    // (older) real bans.
+    let mut all = forged.clone();
+    all.push(real1.clone());
+    all.push(real2.clone());
+
+    let mut state = ChatRoomStateV1 {
+        configuration: config_max_bans(&owner, 4),
+        members: MembersV1 { members },
+        member_info: MemberInfoV1 { member_info: infos },
+        recent_messages: MessagesV1 {
+            messages: msgs,
+            ..Default::default()
+        },
+        bans: BansV1(all),
+        ..Default::default()
+    };
+
+    state.post_apply_cleanup(&p).unwrap();
+
+    assert_eq!(state.bans.0.len(), 4, "bans capped to max_user_bans");
+    assert!(
+        state.bans.0.contains(&real1),
+        "the real (older) enforcing ban of S1 must survive the forged flood"
+    );
+    assert!(
+        state.bans.0.contains(&real2),
+        "the real (older) enforcing ban of S2 must survive the forged flood"
+    );
+    let ids = member_ids(&state);
+    assert!(
+        !ids.contains(&s1.id) && !ids.contains(&s2.id),
+        "the enforcing bans still enforce — S1 and S2 stay removed"
+    );
+    assert!(
+        ids.contains(&a.id),
+        "A (target of the inert forged bans) stays a member"
+    );
+    state
+        .verify(&state, &p)
+        .expect("capped post-cleanup state must verify");
+}
+
+/// The inert-first eviction is deterministic across delta order: two peers that
+/// receive the real + forged bans in opposite orders and then anti-entropy
+/// merge converge to the same capped ban set.
+#[test]
+fn inert_ban_eviction_converges_across_delta_order() {
+    let owner = Peer::new();
+    let a = Peer::new();
+    let s1 = Peer::new();
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    let baseline = ChatRoomStateV1 {
+        configuration: config_max_bans(&owner, 3),
+        members: MembersV1 {
+            members: vec![
+                member(&a, owner_id, &owner.sk, owner_id),
+                member(&s1, owner_id, &owner.sk, owner_id),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![info(&a, 0, vec![]), info(&s1, 0, vec![])],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&a, owner_id), join(&s1, owner_id)],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let real = ban_at(s1.id, &owner, owner_id, 1); // enforcing, oldest
+    let forged: Vec<AuthorizedUserBan> = (0..4)
+        .map(|i| ban_at(a.id, &Peer::new(), owner_id, 100 + i))
+        .collect();
+
+    let real_delta = river_core::room_state::ChatRoomStateV1Delta {
+        bans: Some(vec![real.clone()]),
+        ..Default::default()
+    };
+    let forged_delta = river_core::room_state::ChatRoomStateV1Delta {
+        bans: Some(forged.clone()),
+        ..Default::default()
+    };
+
+    // Peer 1: forged first, then real.
+    let mut peer1 = baseline.clone();
+    peer1
+        .apply_delta(&baseline.clone(), &p, &Some(forged_delta.clone()))
+        .unwrap();
+    let m1 = peer1.clone();
+    peer1
+        .apply_delta(&m1, &p, &Some(real_delta.clone()))
+        .unwrap();
+
+    // Peer 2: real first, then forged.
+    let mut peer2 = baseline.clone();
+    peer2
+        .apply_delta(&baseline.clone(), &p, &Some(real_delta))
+        .unwrap();
+    let m2 = peer2.clone();
+    peer2.apply_delta(&m2, &p, &Some(forged_delta)).unwrap();
+
+    // Anti-entropy merge.
+    let snap1 = peer1.clone();
+    let snap2 = peer2.clone();
+    peer1.merge(&snap1, &p, &snap2).unwrap();
+    peer2.merge(&snap2, &p, &snap1).unwrap();
+
+    assert_eq!(
+        peer1.bans, peer2.bans,
+        "capped ban sets converge across delta order"
+    );
+    assert!(
+        peer1.bans.0.contains(&real),
+        "the real enforcing ban survives on both peers"
+    );
+    assert!(
+        !member_ids(&peer1).contains(&s1.id),
+        "S1 stays banned after convergence"
+    );
+    peer1.verify(&peer1, &p).expect("converged peer1 verifies");
+    peer2.verify(&peer2, &p).expect("converged peer2 verifies");
+}

@@ -34,8 +34,17 @@ pub fn DeputyButton(
     });
 
     // Anti-confusion: a viewer with an empty invite subtree can ban nobody, so
-    // offering them "Deputize" advertises power they don't have. Hide entirely.
-    if !viewer_has_authority {
+    // offering them "Deputize" advertises power they don't have. Also never
+    // offer to deputize the room OWNER — they already have full authority and
+    // the contract treats it as a no-op (belt-and-suspenders: the modal already
+    // only mounts this for non-owner targets, #410 review round 1). Hide
+    // entirely in either case.
+    let target_is_owner = CURRENT_ROOM
+        .read()
+        .owner_key
+        .map(|k| MemberId::from(&k) == target)
+        .unwrap_or(false);
+    if !viewer_has_authority || target_is_owner {
         return rsx! { "" };
     }
 
@@ -137,10 +146,10 @@ pub fn DeputyButton(
 
     if target_is_my_deputy {
         rsx! {
-            div { class: "mt-4",
+            div {
                 button {
                     "data-testid": "member-info-revoke-deputy-button",
-                    class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text font-medium rounded-lg transition-colors border border-border",
+                    class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text font-medium rounded-lg transition-colors border border-border whitespace-nowrap",
                     onclick: move |_| apply_change(false),
                     "Revoke deputy"
                 }
@@ -151,10 +160,10 @@ pub fn DeputyButton(
         }
     } else {
         rsx! {
-            div { class: "mt-4",
+            div {
                 button {
                     "data-testid": "member-info-deputize-button",
-                    class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text font-medium rounded-lg transition-colors border border-border",
+                    class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text font-medium rounded-lg transition-colors border border-border whitespace-nowrap",
                     onclick: move |_| apply_change(true),
                     "Deputize"
                 }

@@ -270,23 +270,29 @@ impl MembersV1 {
 
     /// Whether `banner` is currently authorized to ban `target` (#410).
     ///
-    /// Authorized iff any of:
-    /// - `banner` is the room owner (absolute, non-revocable authority);
-    /// - `banner` is `target` itself or an ancestor of `target` in the invite
-    ///   tree (the classic "you can ban your own subtree" authority);
-    /// - some ancestor `A` of `target` — including the owner, who is the
-    ///   implicit root ancestor of everyone — lists `banner` in `A.deputies`
-    ///   (deputy authority scoped to `A`'s subtree).
+    /// Grants are checked in priority order. The ABSOLUTE grants come FIRST so
+    /// they cannot be stripped by the target "self-immunizing" (a spammer
+    /// listing the moderator in their OWN `deputies` to make the mod's ban go
+    /// inert):
+    /// 1. `banner` is the room owner — absolute.
+    /// 2. `banner` is a STRICT ancestor of `target` in the invite tree ("you can
+    ///    ban your own subtree") — absolute.
+    /// 3. `banner` is an owner-appointed global moderator (`owner`'s `deputies`
+    ///    list `banner`) — absolute (the owner's subtree is everyone).
     ///
-    /// Guardrail ("cannot ban the member who deputized you"): a non-owner
-    /// `banner` can NEVER ban a member who currently lists `banner` among their
-    /// own deputies. This protects a deputizer from a deputy they share with a
-    /// higher-up member escalating across subtrees. It does not override the
-    /// owner's authority (the owner is never a valid ban target anyway).
+    /// Only then the deputy-derived branch (authority via a NON-owner ancestor),
+    /// which the guardrail applies to:
+    /// 4. Guardrail ("cannot ban the member who deputized you"): if `target`
+    ///    currently lists `banner` in `target.deputies`, DENY — a deputy cannot
+    ///    ban a fellow deputizer. Checked AFTER the absolute grants, so a genuine
+    ///    ancestor / owner-appointed mod keeps authority even if the target
+    ///    deputizes them.
+    /// 5. Some strict NON-owner ancestor `A` of `target` lists `banner` in
+    ///    `A.deputies` — deputy authority scoped to `A`'s subtree.
     ///
-    /// Note there is no transitive re-deputization: a deputy's own `deputies`
-    /// only grant authority over the deputy's OWN subtree (where the deputy is
-    /// a genuine ancestor), never over a subtree they merely hold as a deputy.
+    /// There is no transitive re-deputization: a deputy's own `deputies` only
+    /// grant authority over the deputy's OWN subtree (where the deputy is a
+    /// genuine ancestor), never over a subtree they merely hold as a deputy.
     pub fn is_ban_authorized(
         banner: MemberId,
         target: MemberId,
@@ -294,41 +300,61 @@ impl MembersV1 {
         member_info: &MemberInfoV1,
         owner_id: MemberId,
     ) -> bool {
-        // Owner authority is absolute and non-revocable.
+        // The owner is NEVER a valid ban target: they are not in the members
+        // list, and `get_downstream_members(owner)` is the entire room, so an
+        // "authorized" ban of the owner would cascade-remove everyone. Deny
+        // outright, before any grant. (This guard is load-bearing since the
+        // reorder below puts the owner-global-mod grant ahead of the
+        // deputizer guardrail that previously masked this case.)
+        if target == owner_id {
+            return false;
+        }
+
+        // 1. Owner — absolute.
         if banner == owner_id {
             return true;
         }
-        // Guardrail: you cannot ban a member who currently deputizes you.
-        // Checked before any authority grant (except the owner's above).
-        if member_info.deputies_of(target).contains(&banner) {
-            return false;
+
+        // Collect target's STRICT ancestors: the invite chain strictly above
+        // target, up to and including the owner (the root ancestor of everyone).
+        // Excludes target itself. Retains a visited-set cycle guard.
+        let mut strict_ancestors: HashSet<MemberId> = HashSet::new();
+        strict_ancestors.insert(owner_id);
+        let mut visited = HashSet::new();
+        visited.insert(target);
+        let mut current = members_by_id.get(&target).map(|m| m.member.invited_by);
+        while let Some(c) = current {
+            if !visited.insert(c) {
+                break; // cycle guard
+            }
+            strict_ancestors.insert(c);
+            if c == owner_id {
+                break;
+            }
+            current = members_by_id.get(&c).map(|m| m.member.invited_by);
         }
-        // The owner is the implicit root ancestor of every member, so an
-        // owner-granted deputy may ban anyone in the room.
+
+        // 2. Genuine strict ancestor — absolute (cannot be self-immunized away).
+        if strict_ancestors.contains(&banner) {
+            return true;
+        }
+        // 3. Owner-appointed global moderator — absolute.
         if member_info.deputies_of(owner_id).contains(&banner) {
             return true;
         }
-        // Walk target's present ancestor chain toward the owner.
-        let mut current = target;
-        let mut visited = HashSet::new();
-        while visited.insert(current) {
-            // banner is the target itself, or a genuine ancestor of the target.
-            if current == banner {
-                return true;
+        // 4. Guardrail: a deputy cannot ban a member who currently deputizes
+        //    them (a fellow deputizer). Only reachable once the absolute grants
+        //    above have been ruled out.
+        if member_info.deputies_of(target).contains(&banner) {
+            return false;
+        }
+        // 5. Deputy authority via a strict NON-owner ancestor of target.
+        for a in &strict_ancestors {
+            if *a == owner_id {
+                continue; // the owner's grant is handled absolutely in (3)
             }
-            // an ancestor `current` deputized banner over `current`'s subtree
-            // (which contains target).
-            if member_info.deputies_of(current).contains(&banner) {
+            if member_info.deputies_of(*a).contains(&banner) {
                 return true;
-            }
-            match members_by_id.get(&current) {
-                Some(m) => {
-                    if m.member.invited_by == owner_id {
-                        break;
-                    }
-                    current = m.member.invited_by;
-                }
-                None => break,
             }
         }
         false

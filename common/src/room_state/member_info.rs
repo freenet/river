@@ -134,6 +134,20 @@ impl ComposableState for MemberInfoV1 {
                     ));
                 }
 
+                // Enforce the deputy-list cap at the DELTA boundary too — `verify`
+                // rejects an over-cap record on stored state, but without this an
+                // over-cap self-signed record would enter state via a delta and
+                // then block new-joiner / migration full-state validation (#410).
+                // SKIP the offending entry (like the removed-member case below)
+                // rather than erroring the whole delta: erroring would let one
+                // malicious over-cap record deadlock every full-state merge that
+                // carries it (the receiver would reject the entire state and never
+                // converge). Skipping is deterministic across peers and drops only
+                // the bad entry.
+                if member_info.member_info.deputies.len() > MAX_DEPUTIES {
+                    continue;
+                }
+
                 // Check if this is the room owner
                 if *member_id == parameters.owner_id() {
                     // If it's the owner, verify against the room owner's key

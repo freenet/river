@@ -4014,10 +4014,11 @@ impl ApiClient {
             return Err(anyhow!("Cannot ban the room owner"));
         }
 
-        // Verify authorization using the SAME predicate the contract enforces
-        // (owner OR ancestor-of-target OR deputy-of-an-ancestor, minus the
-        // "can't ban your deputizer" guardrail), so client-side rejection stays
-        // in lockstep with on-contract enforcement (#410).
+        // Verify authorization using the SAME `is_ban_authorized` predicate the
+        // contract enforces (owner OR strict-ancestor-of-target OR
+        // deputy-of-an-ancestor, including the "can't ban your deputizer"
+        // guardrail), so client-side rejection stays in lockstep with
+        // on-contract enforcement (#410).
         if my_member_id != owner_member_id {
             let members_by_id = room_state.members.members_by_member_id();
             let authorized = river_core::room_state::member::MembersV1::is_ban_authorized(

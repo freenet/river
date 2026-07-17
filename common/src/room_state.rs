@@ -239,6 +239,43 @@ impl ChatRoomStateV1 {
                 || !banned_user_ids.contains(&ban.banned_by)
         });
 
+        // 5b. Enforce `max_user_bans`, evicting INERT (currently-unauthorized)
+        //     bans BEFORE enforcing ones. This defends the un-ban DoS: the
+        //     relaxed `verify` accepts forged/inert bans, and a flood of them
+        //     over the cap would otherwise evict the real moderator bans that
+        //     keep spammers out (#410 review round 1). Eviction runs HERE (not
+        //     in `BansV1::apply_delta`, which sees a stale/empty `member_info`
+        //     due to field-apply order) so the enforcing/inert classification
+        //     uses the CONVERGED state; the classification and the tie-break sort
+        //     key are a pure function of that state, so every peer evicts an
+        //     identical set. `verify`'s hard cap ceiling still rejects any stored
+        //     state left over the cap.
+        let max_bans = self.configuration.configuration.max_user_bans;
+        if self.bans.0.len() > max_bans {
+            let members_by_id = self.members.members_by_member_id();
+            // Order so the entries to DROP come first: inert-before-enforcing,
+            // then oldest-before-newest, then ban id (fully deterministic).
+            self.bans.0.sort_by(|a, b| {
+                let a_enf =
+                    BansV1::ban_is_enforcing(a, &members_by_id, &self.member_info, owner_id);
+                let b_enf =
+                    BansV1::ban_is_enforcing(b, &members_by_id, &self.member_info, owner_id);
+                a_enf
+                    .cmp(&b_enf) // false (inert) sorts first → dropped first
+                    .then_with(|| a.ban.banned_at.cmp(&b.ban.banned_at))
+                    .then_with(|| a.id().cmp(&b.id()))
+            });
+            let to_remove = self.bans.0.len() - max_bans;
+            self.bans.0.drain(0..to_remove);
+            // Restore the canonical (banned_at, id) stored order.
+            self.bans.0.sort_by(|a, b| {
+                a.ban
+                    .banned_at
+                    .cmp(&b.ban.banned_at)
+                    .then_with(|| a.id().cmp(&b.id()))
+            });
+        }
+
         // 6. Sweep DMs whose participants are no longer current members
         //    or are ENFORCED-banned. Without this, a fresh ban (or member-prune)
         //    would leave the DMs in state but break `verify` because the
