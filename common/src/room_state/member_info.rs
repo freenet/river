@@ -6,7 +6,7 @@ use crate::util::{sign_struct, verify_struct};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Maximum number of deputies a single member may list in their `MemberInfo`,
 /// to bound state-bloat abuse (deputy ban authority, #410). A `MemberInfo`
@@ -31,9 +31,11 @@ impl MemberInfoV1 {
     /// signature) — the SAME winner `summarize`/`apply_delta` converge on. A
     /// bare `.find()` (first) could return a lower-rank record and disagree with
     /// what anti-entropy propagates, permanently diverging ban authority from
-    /// the converged state (#411 round 7 / Codex P1 #3). `verify` now rejects
-    /// duplicates outright, so this only guards a transient in-memory state
-    /// mid-apply; it makes lookup consistent with the wire layer regardless.
+    /// the converged state (#411 round 7 / Codex P1 #3). `verify` deliberately
+    /// does NOT reject duplicates (migration-safety — see its comment), so this
+    /// canonicalization is what makes a duplicate HARMLESS: enforcement here and
+    /// the `summarize` advertised value select the same record, so peers with
+    /// different duplicate sets still converge.
     pub fn deputies_of(&self, member_id: MemberId) -> &[MemberId] {
         self.member_info
             .iter()
@@ -80,24 +82,18 @@ impl ComposableState for MemberInfoV1 {
         let members_by_id = parent_state.members.members_by_member_id();
         let owner_id = parameters.owner_id();
 
-        // Reject a state carrying more than one `member_info` record for the same
-        // member (#411 round 7 / Codex P1 #3). Two validly-signed records for one
-        // `member_id` make `deputies_of` (which reads ONE record) and
-        // `summarize`/`apply_delta` (LWW by `member_info_rank`) disagree on that
-        // member's deputies, so ban ENFORCEMENT and ANTI-ENTROPY permanently
-        // diverge. Migration-safe: `apply_delta` keeps at most one entry per
-        // member (it updates-or-inserts by `member_id`), so every legitimately
-        // produced state — including the Official room's migration PUT — already
-        // has <=1 per member and still verifies.
-        let mut seen_member_ids: HashSet<MemberId> = HashSet::new();
-        for member_info in &self.member_info {
-            if !seen_member_ids.insert(member_info.member_info.member_id) {
-                return Err(format!(
-                    "Duplicate member_info for member: {:?}",
-                    member_info.member_info.member_id
-                ));
-            }
-        }
+        // NOTE (#411 round 7 / Codex P1 #3): `verify` deliberately does NOT reject
+        // a state that carries more than one `member_info` record for the same
+        // member. Rejecting would be migration-UNSAFE — the real Official-room
+        // state is re-PUT to the new contract through `verify`, and if it happens
+        // to contain a duplicate, rejection would strand the room EMPTY. Instead,
+        // duplicates are made HARMLESS by canonicalizing every by-id READER to the
+        // highest-`member_info_rank` record: `deputies_of` (enforcement) and
+        // `summarize` (the anti-entropy advertised value) both select the same
+        // winner, so two peers holding different duplicate SETS still agree on ban
+        // authority AND on the summary, and anti-entropy converges. A reject-in-
+        // `verify` guard could be added later as belt-and-suspenders ONLY once the
+        // real state is confirmed duplicate-free.
 
         for member_info in &self.member_info {
             let member_id = member_info.member_info.member_id;
@@ -135,15 +131,29 @@ impl ComposableState for MemberInfoV1 {
     ) -> Self::Summary {
         // Carry the signature alongside the version so anti-entropy can detect a
         // SAME-version content difference and correct it (#411 round 4 B).
-        self.member_info
-            .iter()
-            .map(|info| {
-                (
-                    info.member_info.member_id,
-                    (info.member_info.version, info.signature),
-                )
-            })
-            .collect()
+        //
+        // Fold keeping the HIGHEST-`member_info_rank` record per member (#411
+        // round 7 / Codex P1 #3), NOT a plain `.collect()` (which keeps whichever
+        // duplicate was iterated LAST). If a state holds two records for one
+        // member, the advertised `(version, signature)` MUST match the record
+        // `deputies_of` enforces on, or a peer with a different duplicate set
+        // would advertise a different summary and anti-entropy would never
+        // reconcile. Migration-safe: `verify` still accepts duplicates.
+        let mut summary: Self::Summary = HashMap::new();
+        for info in &self.member_info {
+            let candidate = (info.member_info.version, info.signature);
+            summary
+                .entry(info.member_info.member_id)
+                .and_modify(|existing| {
+                    if member_info_rank(candidate.0, &candidate.1)
+                        > member_info_rank(existing.0, &existing.1)
+                    {
+                        *existing = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+        summary
     }
 
     fn delta(
@@ -1101,12 +1111,14 @@ mod tests {
     }
 
     /// #411 round 7 / Codex P1 #3: a state carrying TWO validly-signed
-    /// `member_info` records for the SAME member must be rejected by `verify`.
-    /// Otherwise `deputies_of` (one record) and `summarize`/`apply_delta` (LWW)
-    /// disagree on that member's deputies, diverging ban authority from
-    /// anti-entropy.
+    /// `member_info` records for the same member (a `grant` at v1 and a `revoke`
+    /// at v2) must READ consistently. `verify` MUST still accept it
+    /// (migration-safety), and BOTH `deputies_of` (enforcement) and `summarize`
+    /// (the anti-entropy advertised value) must select the highest-rank (v2 =
+    /// revoke) record, regardless of vector order — so peers with different
+    /// duplicate sets converge on both enforcement and the summary.
     #[test]
-    fn verify_rejects_duplicate_member_info() {
+    fn duplicate_member_info_reads_canonicalize_to_highest_rank() {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
         let owner_verifying_key = owner_signing_key.verifying_key();
         let owner_id = owner_verifying_key.into();
@@ -1115,20 +1127,18 @@ mod tests {
         let member_verifying_key = member_signing_key.verifying_key();
         let member_id = member_verifying_key.into();
 
-        // Two DIFFERENT but individually-valid records for the same member
-        // (distinct versions → distinct signatures → both self-signed).
-        let info_a = AuthorizedMemberInfo::new_with_member_key(
-            MemberInfo::new_public(member_id, 1, "NickA".to_string()),
-            &member_signing_key,
-        );
-        let info_b = AuthorizedMemberInfo::new_with_member_key(
-            MemberInfo::new_public(member_id, 2, "NickB".to_string()),
-            &member_signing_key,
-        );
+        let deputy = SigningKey::generate(&mut OsRng).verifying_key().into();
 
-        let member_info_v1 = MemberInfoV1 {
-            member_info: vec![info_a, info_b],
-        };
+        // grant @ v1: member deputizes `deputy`.
+        let mut grant_mi = MemberInfo::new_public(member_id, 1, "nick".to_string());
+        grant_mi.deputies = vec![deputy];
+        let grant = AuthorizedMemberInfo::new_with_member_key(grant_mi, &member_signing_key);
+
+        // revoke @ v2 (higher rank): member clears their deputies.
+        let mut revoke_mi = MemberInfo::new_public(member_id, 2, "nick".to_string());
+        revoke_mi.deputies = vec![];
+        let revoke = AuthorizedMemberInfo::new_with_member_key(revoke_mi, &member_signing_key);
+        let revoke_summary_value = (2u32, revoke.signature);
 
         let mut parent_state = ChatRoomStateV1::default();
         parent_state.members.members.push(AuthorizedMember::new(
@@ -1139,32 +1149,39 @@ mod tests {
             },
             &owner_signing_key,
         ));
-
         let parameters = ChatRoomParametersV1 {
             owner: owner_verifying_key,
         };
 
-        let result = member_info_v1.verify(&parent_state, &parameters);
-        assert!(
-            result.is_err(),
-            "verify must reject duplicate member_info for one member"
-        );
-        assert!(
-            result.unwrap_err().contains("Duplicate member_info"),
-            "error should name the duplicate"
-        );
+        for (label, entries) in [
+            ("grant-then-revoke", vec![grant.clone(), revoke.clone()]),
+            ("revoke-then-grant", vec![revoke.clone(), grant.clone()]),
+        ] {
+            let state = MemberInfoV1 {
+                member_info: entries,
+            };
 
-        // Sanity: a single record for that member still verifies.
-        let single = MemberInfoV1 {
-            member_info: vec![AuthorizedMemberInfo::new_with_member_key(
-                MemberInfo::new_public(member_id, 2, "NickB".to_string()),
-                &member_signing_key,
-            )],
-        };
-        assert!(
-            single.verify(&parent_state, &parameters).is_ok(),
-            "a single member_info record must still verify"
-        );
+            // Migration-safety: `verify` accepts the duplicate state.
+            assert!(
+                state.verify(&parent_state, &parameters).is_ok(),
+                "verify must ACCEPT a duplicate-member_info state ({label})"
+            );
+
+            // Enforcement reads the highest-rank (revoke @ v2 → no deputies).
+            assert_eq!(
+                state.deputies_of(member_id),
+                &[] as &[MemberId],
+                "deputies_of must return the v2 (revoke) result ({label})"
+            );
+
+            // Anti-entropy advertises the highest-rank (version, signature).
+            let summary = state.summarize(&parent_state, &parameters);
+            assert_eq!(
+                summary.get(&member_id).copied(),
+                Some(revoke_summary_value),
+                "summarize must advertise the v2 (revoke) (version, signature) ({label})"
+            );
+        }
     }
 
     /// #411 round 7 / Codex P1 #3: when two records for one member are present,
