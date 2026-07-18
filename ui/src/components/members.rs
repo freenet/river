@@ -460,7 +460,7 @@ pub fn MemberList() -> Element {
                     self_member_id,
                 )
                 .into_iter()
-                .map(|id| name_of(id))
+                .map(&name_of)
                 .collect(),
             };
 
