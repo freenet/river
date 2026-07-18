@@ -519,6 +519,27 @@ impl RoomData {
         }
     }
 
+    /// The member ids currently ENFORCED as banned — the deputy-aware cascade
+    /// the room contract actually applies
+    /// ([`river_core::room_state::member::MembersV1::banned_member_ids`] /
+    /// `ChatRoomStateV1::post_apply_cleanup`), NOT the raw `bans.0` list.
+    ///
+    /// A stored ban can be INERT: its banner may have no current authority — a
+    /// revoked-deputy tombstone, an unauthorized banner, or a garbage-signature
+    /// ban — in which case it removes nobody. Consulting the raw ban list would
+    /// keep such a target blocked in the UI and omit their secret on rotation,
+    /// so the deputy design's retroactive un-ban would never take effect
+    /// client-side (freenet/river#411 round 6). Every ban-status consumer
+    /// (`can_send_message`, `can_participate`, `rotate_secret`) MUST use THIS
+    /// set rather than iterating `bans.0` directly.
+    fn enforced_banned_member_ids(&self) -> std::collections::HashSet<MemberId> {
+        self.room_state.members.banned_member_ids(
+            &self.room_state.bans,
+            &self.room_state.member_info,
+            &self.parameters(),
+        )
+    }
+
     /// Check if the user can send a message in the room.
     /// A user is considered a member if they are the owner, are in the active
     /// members list, or have a stored invitation (self_authorized_member).
@@ -526,14 +547,11 @@ impl RoomData {
         let verifying_key = self.self_sk.verifying_key();
         let member_id = MemberId::from(&verifying_key);
 
-        // Check if banned first
-        if self
-            .room_state
-            .bans
-            .0
-            .iter()
-            .any(|b| b.ban.banned_user == member_id)
-        {
+        // Check if banned first — using the ENFORCING banned set (deputy-aware),
+        // not the raw bans list. An inert ban (revoked-deputy tombstone,
+        // unauthorized banner) removes nobody, so a member it names must NOT be
+        // blocked here (freenet/river#411 round 6).
+        if self.enforced_banned_member_ids().contains(&member_id) {
             return Err(SendMessageError::UserBanned);
         }
 
@@ -567,14 +585,10 @@ impl RoomData {
         let verifying_key = self.self_sk.verifying_key();
         let member_id = MemberId::from(&verifying_key);
 
-        // Check if banned first
-        if self
-            .room_state
-            .bans
-            .0
-            .iter()
-            .any(|b| b.ban.banned_user == member_id)
-        {
+        // Check if banned first — using the ENFORCING banned set (deputy-aware),
+        // not the raw bans list; an inert ban removes nobody (freenet/river#411
+        // round 6). See `enforced_banned_member_ids`.
+        if self.enforced_banned_member_ids().contains(&member_id) {
             return Err(SendMessageError::UserBanned);
         }
 
@@ -691,6 +705,104 @@ impl RoomData {
         }
         self.self_member_info = Some(new_member_info);
         self.self_nickname = Some(nickname);
+    }
+
+    /// Add or remove `target` from the local user's own `deputies` grant list,
+    /// republishing our signed `member_info` at `version + 1` and applying the
+    /// resulting delta to `room_state` (re-adding ourselves if we were pruned
+    /// for inactivity). `add == true` deputizes `target`; `add == false`
+    /// revokes.
+    ///
+    /// Returns `true` when a change was applied (the caller should then mark
+    /// the room for sync), `false` when there was nothing to publish (already a
+    /// deputy on add / not a deputy on revoke, at the `MAX_DEPUTIES` cap, or no
+    /// self `member_info` exists yet) or the delta failed to apply.
+    ///
+    /// On success it refreshes the cached [`Self::self_member_info`] with the
+    /// just-signed record — mirroring the nickname-edit `self_*` refresh
+    /// ([`Self::record_self_nickname_edit`]). Without this, after the appointer
+    /// is pruned for inactivity, [`Self::build_rejoin_delta`] would republish a
+    /// STALE cached record whose `deputies` still list a just-revoked deputy,
+    /// silently reactivating revoked authority on rejoin (freenet/river#411
+    /// round 6 B).
+    pub fn apply_deputy_change(&mut self, target: MemberId, add: bool) -> bool {
+        use dioxus::logger::tracing::{error, info};
+        use river_core::room_state::member_info::MAX_DEPUTIES;
+        use river_core::room_state::ChatRoomStateV1Delta;
+
+        let self_id = MemberId::from(&self.self_sk.verifying_key());
+
+        // The viewer's current signed member_info (highest version).
+        let Some(current_self) = self
+            .room_state
+            .member_info
+            .member_info
+            .iter()
+            .filter(|i| i.member_info.member_id == self_id)
+            .max_by_key(|i| i.member_info.version)
+            .cloned()
+        else {
+            error!("Cannot manage deputies: no member_info for self yet");
+            return false;
+        };
+
+        let mut deputies = current_self.member_info.deputies.clone();
+        if add {
+            if deputies.contains(&target) {
+                return false; // already a deputy, nothing to publish
+            }
+            if deputies.len() >= MAX_DEPUTIES {
+                error!("Cannot deputize: already at the maximum of {MAX_DEPUTIES}");
+                return false;
+            }
+            deputies.push(target);
+        } else if let Some(pos) = deputies.iter().position(|d| *d == target) {
+            deputies.remove(pos);
+        } else {
+            return false; // not a deputy, nothing to publish
+        }
+
+        // Republish our own member_info at version+1, preserving the
+        // (already-sealed) nickname; only `deputies` changes.
+        let new_info = MemberInfo {
+            member_id: self_id,
+            version: current_self.member_info.version + 1,
+            preferred_nickname: current_self.member_info.preferred_nickname.clone(),
+            deputies,
+        };
+        let self_sk = self.self_sk.clone();
+        let authorized = AuthorizedMemberInfo::new_with_member_key(new_info, &self_sk);
+
+        // Re-add ourselves if we were pruned for inactivity — a
+        // member_info-only UPDATE for a non-member would be rejected.
+        let members_delta = self.build_rejoin_delta().0;
+        let parent = self.room_state.clone();
+        let delta = ChatRoomStateV1Delta {
+            member_info: Some(vec![authorized.clone()]),
+            members: members_delta,
+            ..Default::default()
+        };
+        if let Err(e) = self.room_state.apply_delta(
+            &parent,
+            &ChatRoomParametersV1 {
+                owner: self.owner_vk,
+            },
+            &Some(delta),
+        ) {
+            error!("Failed to apply deputy delta: {e:?}");
+            return false;
+        }
+
+        // Cache the just-signed record so a later inactivity-rejoin
+        // republishes the UPDATED deputies, not a stale record that still
+        // lists a revoked deputy (freenet/river#411 round 6 B).
+        self.self_member_info = Some(authorized);
+
+        // apply_delta re-runs the public-only rebuild_actions_state, wiping
+        // private edits/reactions; re-derive with decryption. No-op on public.
+        self.rebuild_private_actions_state();
+        info!("Deputy change applied for {target:?} (deputize={add})");
+        true
     }
 
     /// Build the members + member_info deltas needed to re-add ourselves to
@@ -1050,13 +1162,14 @@ impl RoomData {
         // Get all current members, excluding banned members. We pair
         // each `MemberId` with their `VerifyingKey` so the shared
         // back-fill helper can encrypt for them directly.
-        let banned_members: std::collections::HashSet<MemberId> = self
-            .room_state
-            .bans
-            .0
-            .iter()
-            .map(|b| b.ban.banned_user)
-            .collect();
+        //
+        // Exclude only ENFORCED bans (deputy-aware), not the raw `bans.0`
+        // list. An inert ban — a revoked-deputy tombstone or an unauthorized
+        // banner — removes nobody, so its target is still a member and MUST
+        // receive the rotated secret; otherwise a UI-revoked member would
+        // silently lose access to a private room the contract still keeps them
+        // in (freenet/river#411 round 6). See `enforced_banned_member_ids`.
+        let banned_members = self.enforced_banned_member_ids();
 
         let owner_id = MemberId::from(&self.owner_vk);
         let current_members_with_vks: Vec<(MemberId, ed25519_dalek::VerifyingKey)> = self
@@ -4768,5 +4881,307 @@ mod tests {
             1,
             "seal_invitee_nickname must be called exactly once in get_response.rs"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #411 round 6 A: ban-status consumers must use the ENFORCING banned
+    // set (deputy-aware), not the raw `bans.0` list. An INERT ban — a
+    // revoked-deputy tombstone or an otherwise-unauthorized banner — removes
+    // nobody, so it must not block the target in the UI nor omit their secret
+    // on rotation.
+    // ------------------------------------------------------------------
+
+    /// Build a room owned by `owner_sk` with two members `d` and `t`, both
+    /// invited directly by the owner (so `d` is NOT an ancestor of `t` and
+    /// holds no authority over `t` unless separately deputized). Each member
+    /// gets a self-signed public `member_info` entry (version 0, no deputies).
+    /// `private` seeds the deterministic owner-derived v0 secret so
+    /// `rotate_secret` has a current version to rotate from. `self_sk` is the
+    /// owner; callers override it for the send/participate checks.
+    fn make_room_owner_d_t(
+        owner_sk: &SigningKey,
+        d_sk: &SigningKey,
+        t_sk: &SigningKey,
+        private: bool,
+    ) -> RoomData {
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id: MemberId = owner_vk.into();
+
+        let mut config = Configuration {
+            owner_member_id: owner_id,
+            privacy_mode: if private {
+                PrivacyMode::Private
+            } else {
+                PrivacyMode::Public
+            },
+            ..Configuration::default()
+        };
+        config.configuration_version = 1;
+        let mut room_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(config, owner_sk),
+            ..Default::default()
+        };
+
+        for member_sk in [d_sk, t_sk] {
+            let member_vk = member_sk.verifying_key();
+            let member = Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk,
+            };
+            room_state
+                .members
+                .members
+                .push(AuthorizedMember::new(member, owner_sk));
+            let info = MemberInfo {
+                member_id: member_vk.into(),
+                version: 0,
+                preferred_nickname: SealedBytes::public(b"m".to_vec()),
+                deputies: Vec::new(),
+            };
+            room_state
+                .member_info
+                .member_info
+                .push(AuthorizedMemberInfo::new_with_member_key(info, member_sk));
+        }
+
+        let mut secrets = HashMap::new();
+        if private {
+            let v0_secret =
+                river_core::key_derivation::derive_room_secret(&owner_sk.to_bytes(), &owner_vk, 0);
+            let v0_record = SecretVersionRecordV1 {
+                version: 0,
+                cipher_spec: RoomCipherSpec::Aes256Gcm,
+                created_at: get_current_system_time(),
+            };
+            room_state
+                .secrets
+                .versions
+                .push(AuthorizedSecretVersionRecord::new(v0_record, owner_sk));
+            room_state.secrets.current_version = 0;
+            secrets.insert(0u32, v0_secret);
+
+            // Owner-issued encrypted_secrets at the CURRENT version for both
+            // members. This is the #110 exemption: a current-version secret
+            // recipient is not inactivity-pruned by `post_apply_cleanup`, so D
+            // and T survive an `apply_delta` (needed by the deputize/revoke
+            // test, which applies a member_info delta through cleanup).
+            for member_sk in [d_sk, t_sk] {
+                let member_vk = member_sk.verifying_key();
+                let (ciphertext, nonce, ephemeral_key) =
+                    encrypt_secret_for_member(&v0_secret, &member_vk);
+                let enc = EncryptedSecretForMemberV1 {
+                    member_id: member_vk.into(),
+                    secret_version: 0,
+                    ciphertext,
+                    nonce,
+                    sender_ephemeral_public_key: ephemeral_key.to_bytes(),
+                    provider: owner_id,
+                };
+                room_state
+                    .secrets
+                    .encrypted_secrets
+                    .push(AuthorizedEncryptedSecretForMember::new(enc, owner_sk));
+            }
+        }
+
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_key = ContractKey::from_params_and_code(
+            Parameters::from(params_bytes),
+            &ContractCode::from(ROOM_CONTRACT_WASM),
+        );
+
+        RoomData {
+            owner_vk,
+            room_state,
+            self_sk: owner_sk.clone(),
+            contract_key,
+            last_read_message_id: None,
+            secrets,
+            current_secret_version: if private { Some(0) } else { None },
+            last_secret_rotation: if private {
+                Some(get_current_system_time())
+            } else {
+                None
+            },
+            key_migrated_to_delegate: false,
+            self_authorized_member: None,
+            invite_chain: vec![],
+            self_member_info: None,
+            self_nickname: None,
+            previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
+        }
+    }
+
+    /// Push a ban of `target` signed by `banner_sk` (attributed to `banner_id`).
+    fn push_ban(
+        room: &mut RoomData,
+        target: MemberId,
+        banner_id: MemberId,
+        banner_sk: &SigningKey,
+    ) {
+        use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+        let ban = UserBan {
+            owner_member_id: room.owner_vk.into(),
+            banned_at: get_current_system_time(),
+            banned_user: target,
+        };
+        room.room_state
+            .bans
+            .0
+            .push(AuthorizedUserBan::new(ban, banner_id, banner_sk));
+    }
+
+    #[test]
+    fn inert_ban_does_not_block_send_or_participate() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let d_sk = SigningKey::generate(&mut rng);
+        let t_sk = SigningKey::generate(&mut rng);
+        let d_id = MemberId::from(&d_sk.verifying_key());
+        let t_id = MemberId::from(&t_sk.verifying_key());
+
+        let mut room = make_room_owner_d_t(&owner_sk, &d_sk, &t_sk, false);
+        // D — a plain member, NOT a deputy and NOT an ancestor of T — bans T.
+        // The signature verifies (D is a member) but D has no authority over T,
+        // so the ban is INERT and must remove nobody.
+        push_ban(&mut room, t_id, d_id, &d_sk);
+
+        assert!(
+            !room.enforced_banned_member_ids().contains(&t_id),
+            "an unauthorized banner's ban must be inert"
+        );
+
+        // As T, sending / participating must be allowed despite the stored ban.
+        room.self_sk = t_sk;
+        assert_eq!(room.can_send_message(), Ok(()));
+        assert_eq!(room.can_participate(), Ok(()));
+    }
+
+    #[test]
+    fn authorized_ban_blocks_send_and_participate() {
+        // Tautology guard for `inert_ban_...`: an ENFORCED (owner-signed) ban
+        // must still block the target — proving `enforced_banned_member_ids`
+        // isn't just always-empty.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let d_sk = SigningKey::generate(&mut rng);
+        let t_sk = SigningKey::generate(&mut rng);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let t_id = MemberId::from(&t_sk.verifying_key());
+
+        let mut room = make_room_owner_d_t(&owner_sk, &d_sk, &t_sk, false);
+        push_ban(&mut room, t_id, owner_id, &owner_sk);
+
+        assert!(
+            room.enforced_banned_member_ids().contains(&t_id),
+            "an owner ban must enforce"
+        );
+
+        room.self_sk = t_sk;
+        assert_eq!(room.can_send_message(), Err(SendMessageError::UserBanned));
+        assert_eq!(room.can_participate(), Err(SendMessageError::UserBanned));
+    }
+
+    #[test]
+    fn rotate_secret_keeps_inert_ban_target_but_drops_enforced_one() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let d_sk = SigningKey::generate(&mut rng);
+        let t_sk = SigningKey::generate(&mut rng);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let d_id = MemberId::from(&d_sk.verifying_key());
+        let t_id = MemberId::from(&t_sk.verifying_key());
+
+        // Inert-ban case: D's unauthorized ban of T must NOT exclude T from the
+        // rotated secret set.
+        let mut room = make_room_owner_d_t(&owner_sk, &d_sk, &t_sk, true);
+        push_ban(&mut room, t_id, d_id, &d_sk);
+        let delta = room.rotate_secret().expect("owner rotate should succeed");
+        let new_version = delta
+            .current_version
+            .expect("rotation sets current_version");
+        let recipients: std::collections::HashSet<MemberId> = delta
+            .new_encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.secret_version == new_version)
+            .map(|s| s.secret.member_id)
+            .collect();
+        assert!(
+            recipients.contains(&t_id),
+            "inert-ban target must still receive the rotated secret"
+        );
+        assert!(recipients.contains(&d_id));
+
+        // Contrast: an owner (authorized) ban of T DOES exclude T.
+        let mut room2 = make_room_owner_d_t(&owner_sk, &d_sk, &t_sk, true);
+        push_ban(&mut room2, t_id, owner_id, &owner_sk);
+        let delta2 = room2.rotate_secret().expect("owner rotate should succeed");
+        let new_version2 = delta2
+            .current_version
+            .expect("rotation sets current_version");
+        let recipients2: std::collections::HashSet<MemberId> = delta2
+            .new_encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.secret_version == new_version2)
+            .map(|s| s.secret.member_id)
+            .collect();
+        assert!(
+            !recipients2.contains(&t_id),
+            "enforced-ban target must be excluded from the rotated secret"
+        );
+        assert!(recipients2.contains(&d_id));
+    }
+
+    // ------------------------------------------------------------------
+    // #411 round 6 B: deputize/revoke must refresh the cached
+    // `self_member_info` so a later inactivity-rejoin republishes the UPDATED
+    // deputies, not a stale record that would reactivate a revoked grant.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn apply_deputy_change_caches_self_member_info() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let d_sk = SigningKey::generate(&mut rng);
+        let t_sk = SigningKey::generate(&mut rng);
+        let d_id = MemberId::from(&d_sk.verifying_key());
+        let t_id = MemberId::from(&t_sk.verifying_key());
+
+        // Local user is D (a non-owner member with a member_info entry). Use a
+        // private room so the owner-issued current-version secret keeps D and T
+        // through `apply_delta`'s inactivity-prune (see `make_room_owner_d_t`).
+        let mut room = make_room_owner_d_t(&owner_sk, &d_sk, &t_sk, true);
+        room.self_sk = d_sk;
+        assert!(room.self_member_info.is_none());
+
+        // Deputize T: the cached record must carry the new grant.
+        assert!(room.apply_deputy_change(t_id, true));
+        let cached = room.self_member_info.clone().expect("self record cached");
+        assert_eq!(cached.member_info.member_id, d_id);
+        assert_eq!(cached.member_info.deputies, vec![t_id]);
+        // The cache mirrors the just-applied on-state record exactly.
+        let in_state = room
+            .room_state
+            .member_info
+            .member_info
+            .iter()
+            .filter(|i| i.member_info.member_id == d_id)
+            .max_by_key(|i| i.member_info.version)
+            .expect("D has member_info in state");
+        assert_eq!(cached.member_info.version, in_state.member_info.version);
+        assert_eq!(cached.member_info.deputies, in_state.member_info.deputies);
+
+        // Revoke: the cached record must drop the grant, so a rejoin cannot
+        // reactivate revoked authority (#411 round 6 B).
+        assert!(room.apply_deputy_change(t_id, false));
+        let cached2 = room.self_member_info.clone().expect("self record cached");
+        assert!(
+            cached2.member_info.deputies.is_empty(),
+            "revoke must clear the cached deputy grant"
+        );
+        assert!(cached2.member_info.version > cached.member_info.version);
     }
 }
