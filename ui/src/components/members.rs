@@ -297,6 +297,166 @@ fn invite_tree_order(owner_id: MemberId, members: &MembersV1) -> Vec<MemberId> {
     ordered
 }
 
+/// Depth of `id` in the invite tree (owner = 0). `usize::MAX` if `id` is not
+/// connected to the owner (broken chain) or hits a cycle.
+fn invite_depth(
+    id: MemberId,
+    owner_id: MemberId,
+    inviter_of: &HashMap<MemberId, MemberId>,
+) -> usize {
+    let mut d = 0usize;
+    let mut cur = id;
+    let mut guard = HashSet::new();
+    while cur != owner_id {
+        if !guard.insert(cur) {
+            return usize::MAX; // cycle
+        }
+        match inviter_of.get(&cur) {
+            Some(&next) => {
+                d += 1;
+                cur = next;
+            }
+            None => return usize::MAX, // not connected to owner
+        }
+    }
+    d
+}
+
+/// Order the member list as a DISPLAY tree (#410): a deputized member is
+/// re-parented directly under the member who deputized them, so authority reads
+/// top-to-bottom. Owner-deputized members (global mods) rise to the top under
+/// the owner. Rules:
+/// - display-parent = the deputizer highest in the invite tree (min invite
+///   depth; the owner, depth 0, wins), else the member's inviter;
+/// - a repositioned deputy carries their own invite-subtree with them;
+/// - within a parent's children, repositioned deputies list before regular
+///   invitees; each group keeps invite-tree order;
+/// - CYCLE GUARD: if re-parenting a member under their deputizer would make the
+///   member an ancestor of that deputizer (mutual / descendant deputization),
+///   fall back to the inviter (and treat them as a regular invitee).
+///
+/// Display-only: every member appears exactly once; no authority/contract change.
+fn deputy_display_order(
+    owner_id: MemberId,
+    members: &MembersV1,
+    deputizers_of: &HashMap<MemberId, Vec<MemberId>>,
+) -> Vec<MemberId> {
+    let inviter_of: HashMap<MemberId, MemberId> = members
+        .members
+        .iter()
+        .map(|m| (m.member.id(), m.member.invited_by))
+        .collect();
+
+    // Stable base order (invite tree) — used to order sibling groups and break ties.
+    let base_order = invite_tree_order(owner_id, members);
+    let base_rank: HashMap<MemberId, usize> = base_order
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
+
+    // display_parent starts as the inviter; deputization may re-parent it.
+    let mut display_parent: HashMap<MemberId, MemberId> = inviter_of.clone();
+    let mut repositioned: HashSet<MemberId> = HashSet::new();
+
+    // Is `ancestor` an ancestor of `node` in the current display tree?
+    let is_ancestor =
+        |ancestor: MemberId, node: MemberId, dp: &HashMap<MemberId, MemberId>| -> bool {
+            let mut cur = node;
+            let mut guard = HashSet::new();
+            loop {
+                if cur == ancestor {
+                    return true;
+                }
+                if cur == owner_id || !guard.insert(cur) {
+                    return false;
+                }
+                match dp.get(&cur) {
+                    Some(&p) => cur = p,
+                    None => return false,
+                }
+            }
+        };
+
+    // Process top-down (base order) so higher deputizers settle first.
+    for &m in &base_order {
+        if m == owner_id {
+            continue;
+        }
+        let Some(deps) = deputizers_of.get(&m) else {
+            continue;
+        };
+        // Choose the deputizer highest in the invite tree (owner wins), among
+        // those actually connected to the owner. Tie-break by base order.
+        let chosen = deps
+            .iter()
+            .copied()
+            .filter(|&d| invite_depth(d, owner_id, &inviter_of) != usize::MAX)
+            .min_by_key(|&d| {
+                (
+                    invite_depth(d, owner_id, &inviter_of),
+                    *base_rank.get(&d).unwrap_or(&usize::MAX),
+                )
+            });
+        let Some(d) = chosen else {
+            continue;
+        };
+        let inviter = inviter_of.get(&m).copied().unwrap_or(owner_id);
+        if d == inviter {
+            // Deputized by their own inviter: no move, but still a deputy (shown first).
+            repositioned.insert(m);
+        } else if !is_ancestor(m, d, &display_parent) {
+            display_parent.insert(m, d);
+            repositioned.insert(m);
+        }
+        // else: re-parenting would cycle → keep inviter, treat as regular invitee.
+    }
+
+    // Build display children: repositioned (deputies) first, then regular
+    // invitees; each group in invite-tree order.
+    let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+    for &m in &base_order {
+        if m == owner_id {
+            continue;
+        }
+        let p = display_parent.get(&m).copied().unwrap_or(owner_id);
+        children.entry(p).or_default().push(m);
+    }
+    for kids in children.values_mut() {
+        kids.sort_by_key(|&c| {
+            (
+                !repositioned.contains(&c),
+                *base_rank.get(&c).unwrap_or(&usize::MAX),
+            )
+        });
+    }
+
+    // DFS from the owner.
+    let mut ordered = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![owner_id];
+    while let Some(cur) = stack.pop() {
+        if !visited.insert(cur) {
+            continue;
+        }
+        ordered.push(cur);
+        if let Some(kids) = children.get(&cur) {
+            for &kid in kids.iter().rev() {
+                stack.push(kid);
+            }
+        }
+    }
+
+    // Append any members unreachable from the owner (broken chains), in base order.
+    for &m in &base_order {
+        if !visited.contains(&m) {
+            ordered.push(m);
+        }
+    }
+
+    ordered
+}
+
 /// Filter a member's full set of deputizers to those RELEVANT to the viewer
 /// (#410), preserving order: a deputizer who is an ancestor of the viewer (so
 /// their deputy could ban the viewer) or the viewer themselves (the viewer
@@ -336,11 +496,10 @@ pub fn MemberList() -> Element {
 
         let params = ChatRoomParametersV1 { owner: room_owner };
 
-        let ordered_ids = invite_tree_order(owner_id, members);
-
         // Reverse map: for each deputy member, who has deputized them (#410).
         // Built from every member's signed `MemberInfo.deputies`, so the 🛡
-        // badge tooltip can name the appointer(s) rather than a generic label.
+        // badge tooltip can name the appointer(s) rather than a generic label,
+        // and so the list can be ordered by deputizer.
         let mut deputizers_of: std::collections::HashMap<MemberId, Vec<MemberId>> =
             std::collections::HashMap::new();
         for mi in &member_info.member_info {
@@ -349,6 +508,11 @@ pub fn MemberList() -> Element {
                 deputizers_of.entry(*deputy).or_default().push(appointer);
             }
         }
+
+        // Order the list as a DISPLAY tree: a deputized member renders directly
+        // under the member who deputized them (owner-deputized => at the top),
+        // to convey authority visually (#410). Falls back to invite-tree order.
+        let ordered_ids = deputy_display_order(owner_id, members, &deputizers_of);
 
         // The viewer's strict ancestors — the members whose invite subtree
         // contains self, i.e. who could ban self — up to and INCLUDING the owner.
@@ -1197,6 +1361,105 @@ mod tests {
             vec![owner]
         );
         assert!(relevant_deputizers(&[a], &owner_ancestors, owner).is_empty());
+    }
+
+    // Helpers for the display-ordering tests: build a real `MembersV1` (ids are
+    // derived from verifying keys, so we can't fabricate them).
+    fn authed(
+        sk: &SigningKey,
+        inviter_id: MemberId,
+        inviter_sk: &SigningKey,
+        owner_id: MemberId,
+    ) -> AuthorizedMember {
+        use river_core::room_state::member::Member;
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: inviter_id,
+                member_vk: sk.verifying_key(),
+            },
+            inviter_sk,
+        )
+    }
+
+    /// A deputized member renders directly under their deputizer; an
+    /// owner-deputized member (global mod) rises to the top; every member
+    /// appears exactly once.
+    #[test]
+    fn deputy_display_order_places_deputies_under_deputizer() {
+        use rand::rngs::OsRng;
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let a_sk = SigningKey::generate(&mut OsRng);
+        let b_sk = SigningKey::generate(&mut OsRng);
+        let c_sk = SigningKey::generate(&mut OsRng);
+        let d_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let a_id: MemberId = a_sk.verifying_key().into();
+        let b_id: MemberId = b_sk.verifying_key().into();
+        let c_id: MemberId = c_sk.verifying_key().into();
+        let d_id: MemberId = d_sk.verifying_key().into();
+
+        // owner -> A -> B -> D ; owner -> C
+        let members = MembersV1 {
+            members: vec![
+                authed(&a_sk, owner_id, &owner_sk, owner_id),
+                authed(&b_sk, a_id, &a_sk, owner_id),
+                authed(&c_sk, owner_id, &owner_sk, owner_id),
+                authed(&d_sk, b_id, &b_sk, owner_id),
+            ],
+        };
+
+        // owner deputizes C (global mod); A deputizes D.
+        let mut deputizers_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+        deputizers_of.insert(c_id, vec![owner_id]);
+        deputizers_of.insert(d_id, vec![a_id]);
+
+        let order = deputy_display_order(owner_id, &members, &deputizers_of);
+
+        // C (owner-deputized) before owner's invitee A; D re-parented under A.
+        assert_eq!(order, vec![owner_id, c_id, a_id, d_id, b_id]);
+        let uniq: HashSet<MemberId> = order.iter().copied().collect();
+        assert_eq!(uniq.len(), order.len(), "no duplicates");
+        assert_eq!(uniq.len(), 5, "every member appears exactly once");
+    }
+
+    /// Mutual deputization must not create a cycle: the guard falls back to the
+    /// inviter, and every member still appears exactly once.
+    #[test]
+    fn deputy_display_order_cycle_falls_back_to_inviter() {
+        use rand::rngs::OsRng;
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let a_sk = SigningKey::generate(&mut OsRng);
+        let b_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let a_id: MemberId = a_sk.verifying_key().into();
+        let b_id: MemberId = b_sk.verifying_key().into();
+
+        // owner -> A ; owner -> B (siblings), A and B deputize each other.
+        let members = MembersV1 {
+            members: vec![
+                authed(&a_sk, owner_id, &owner_sk, owner_id),
+                authed(&b_sk, owner_id, &owner_sk, owner_id),
+            ],
+        };
+        let mut deputizers_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+        deputizers_of.insert(a_id, vec![b_id]);
+        deputizers_of.insert(b_id, vec![a_id]);
+
+        let order = deputy_display_order(owner_id, &members, &deputizers_of);
+
+        let uniq: HashSet<MemberId> = order.iter().copied().collect();
+        assert_eq!(
+            uniq.len(),
+            order.len(),
+            "cycle guard must not duplicate members"
+        );
+        assert_eq!(
+            uniq.len(),
+            3,
+            "every member (owner, A, B) appears exactly once"
+        );
+        assert_eq!(order[0], owner_id, "owner is the root");
     }
 
     /// Regression test for freenet/river#227 (stored XSS via nickname).
