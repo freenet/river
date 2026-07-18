@@ -8,14 +8,115 @@ use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Maximum number of deputies a single member may list in their `MemberInfo`,
+/// to bound state-bloat abuse (deputy ban authority, #410). A `MemberInfo`
+/// whose `deputies` list exceeds this is rejected by `MemberInfoV1::verify`.
+pub const MAX_DEPUTIES: usize = 64;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct MemberInfoV1 {
     pub member_info: Vec<AuthorizedMemberInfo>,
 }
 
+impl MemberInfoV1 {
+    /// The CANONICAL `member_info` record for `member_id`: the highest-
+    /// `member_info_rank` (higher `version`, else lexicographically-greater
+    /// signature) among ALL records present for that member, or `None` if there
+    /// is none.
+    ///
+    /// LOAD-BEARING (#411 round 8 item A). `verify` deliberately ACCEPTS a state
+    /// carrying more than one record per `member_id` (migration-safety — see its
+    /// comment), and a client can hold such a duplicate-containing full-state GET
+    /// before any cleanup runs. EVERY by-id reader/writer of `member_info` MUST
+    /// go through this selector: a bare first-match `.find()` can read a LOSING
+    /// (e.g. revoked) record, and a WRITER that republishes it at `version + 1`
+    /// would then resurrect that losing record at a HIGHER rank — reactivating
+    /// revoked deputy authority. This returns the SAME record `summarize` /
+    /// `apply_delta` converge on, so reads, writes, enforcement, and anti-entropy
+    /// all agree. (`post_apply_cleanup` additionally collapses duplicates via
+    /// [`Self::dedup_to_canonical`] once cleanup runs, but reads must not depend
+    /// on that having happened yet.)
+    pub fn canonical(&self, member_id: MemberId) -> Option<&AuthorizedMemberInfo> {
+        self.member_info
+            .iter()
+            .filter(|info| info.member_info.member_id == member_id)
+            .max_by_key(|info| member_info_rank(info.member_info.version, &info.signature))
+    }
+
+    /// The deputies currently listed by `member_id`'s CANONICAL signed
+    /// `MemberInfo`, or an empty slice if that member has no info entry or no
+    /// deputies. Routes through [`Self::canonical`] so ban authority matches the
+    /// converged record even in the presence of duplicates (#410, #411 round 8).
+    pub fn deputies_of(&self, member_id: MemberId) -> &[MemberId] {
+        self.canonical(member_id)
+            .map(|info| info.member_info.deputies.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Collapse any duplicate `member_info` records to the SINGLE canonical
+    /// (highest-`member_info_rank`) record per `member_id` (#411 round 8 item C /
+    /// security FINDING 2+3). Because `verify` accepts duplicates, a state can
+    /// hold several records for one member; without this, two peers holding
+    /// different duplicate SETS would diverge byte-for-byte forever (the raw
+    /// `member_info` vectors differ even though every canonical read agrees).
+    /// Dedup is a pure function of the converged state (max by `member_info_rank`)
+    /// so it is deterministic, idempotent, and order-independent; it also bounds
+    /// stored `member_info` to at most one record per member. Owner's record is
+    /// kept like any other (it is just another `member_id`). Runs in
+    /// `post_apply_cleanup`, NEVER in `verify`/`validate_state`, so the
+    /// permissionless migration PUT (which only runs `verify`) is unaffected.
+    pub fn dedup_to_canonical(&mut self) {
+        if self.member_info.len() < 2 {
+            return;
+        }
+        let mut best: HashMap<MemberId, AuthorizedMemberInfo> = HashMap::new();
+        for info in self.member_info.drain(..) {
+            let id = info.member_info.member_id;
+            match best.entry(id) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if member_info_rank(info.member_info.version, &info.signature)
+                        > member_info_rank(e.get().member_info.version, &e.get().signature)
+                    {
+                        e.insert(info);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(info);
+                }
+            }
+        }
+        self.member_info = best.into_values().collect();
+        // Deterministic order (HashMap iteration order is not stable).
+        self.member_info
+            .sort_by_key(|info| info.member_info.member_id);
+    }
+}
+
+/// Total, deterministic ordering used to pick the canonical `MemberInfo` when
+/// two signed records for the SAME member collide (#411 round 4 item B).
+///
+/// Rule: **higher `version` wins; at equal version, the lexicographically-greater
+/// SIGNATURE wins.** Two records with the same member and version but different
+/// content (e.g. different `deputies`) have different signatures — the signature
+/// is over the whole `MemberInfo` — so this breaks the tie deterministically.
+///
+/// It is applied IDENTICALLY in [`ComposableState::apply_delta`] (conflict
+/// resolution), [`ComposableState::delta`], and [`ComposableState::summarize`]
+/// (via the `(version, signature)` summary value), so anti-entropy can DETECT a
+/// same-version content difference and both peers converge on the same record.
+/// Without it, equal-version resolution was order-dependent AND the summary
+/// carried only the version, so anti-entropy saw "same version", sent no
+/// correction, and peers disagreed on ban authority permanently.
+fn member_info_rank(version: u32, signature: &Signature) -> (u32, [u8; 64]) {
+    (version, signature.to_bytes())
+}
+
 impl ComposableState for MemberInfoV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = HashMap<MemberId, u32>;
+    /// `(version, signature)` per member. The signature is the equal-version
+    /// tiebreak discriminator (see [`member_info_rank`]); carrying it lets
+    /// anti-entropy detect a content difference at the SAME version (#411 B).
+    type Summary = HashMap<MemberId, (u32, Signature)>;
     type Delta = Vec<AuthorizedMemberInfo>;
     type Parameters = ChatRoomParametersV1;
 
@@ -27,8 +128,31 @@ impl ComposableState for MemberInfoV1 {
         let members_by_id = parent_state.members.members_by_member_id();
         let owner_id = parameters.owner_id();
 
+        // NOTE (#411 round 7 / Codex P1 #3): `verify` deliberately does NOT reject
+        // a state that carries more than one `member_info` record for the same
+        // member. Rejecting would be migration-UNSAFE — the real Official-room
+        // state is re-PUT to the new contract through `verify`, and if it happens
+        // to contain a duplicate, rejection would strand the room EMPTY. Instead,
+        // duplicates are made HARMLESS by canonicalizing every by-id READER to the
+        // highest-`member_info_rank` record: `deputies_of` (enforcement) and
+        // `summarize` (the anti-entropy advertised value) both select the same
+        // winner, so two peers holding different duplicate SETS still agree on ban
+        // authority AND on the summary, and anti-entropy converges. A reject-in-
+        // `verify` guard could be added later as belt-and-suspenders ONLY once the
+        // real state is confirmed duplicate-free.
+
         for member_info in &self.member_info {
             let member_id = member_info.member_info.member_id;
+
+            // Bound the deputy list to prevent state-bloat abuse (#410).
+            if member_info.member_info.deputies.len() > MAX_DEPUTIES {
+                return Err(format!(
+                    "Member {:?} lists {} deputies, exceeding the maximum of {}",
+                    member_id,
+                    member_info.member_info.deputies.len(),
+                    MAX_DEPUTIES
+                ));
+            }
 
             if member_id == owner_id {
                 // If this is the owner's member info, verify against owner's key
@@ -51,10 +175,31 @@ impl ComposableState for MemberInfoV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.member_info
-            .iter()
-            .map(|info| (info.member_info.member_id, info.member_info.version))
-            .collect()
+        // Carry the signature alongside the version so anti-entropy can detect a
+        // SAME-version content difference and correct it (#411 round 4 B).
+        //
+        // Fold keeping the HIGHEST-`member_info_rank` record per member (#411
+        // round 7 / Codex P1 #3), NOT a plain `.collect()` (which keeps whichever
+        // duplicate was iterated LAST). If a state holds two records for one
+        // member, the advertised `(version, signature)` MUST match the record
+        // `deputies_of` enforces on, or a peer with a different duplicate set
+        // would advertise a different summary and anti-entropy would never
+        // reconcile. Migration-safe: `verify` still accepts duplicates.
+        let mut summary: Self::Summary = HashMap::new();
+        for info in &self.member_info {
+            let candidate = (info.member_info.version, info.signature);
+            summary
+                .entry(info.member_info.member_id)
+                .and_modify(|existing| {
+                    if member_info_rank(candidate.0, &candidate.1)
+                        > member_info_rank(existing.0, &existing.1)
+                    {
+                        *existing = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+        summary
     }
 
     fn delta(
@@ -67,10 +212,19 @@ impl ComposableState for MemberInfoV1 {
             .member_info
             .iter()
             .filter(|info| {
-                // Include if member doesn't exist in old summary OR has a newer version
-                !old_state_summary.contains_key(&info.member_info.member_id)
-                    || info.member_info.version
-                        > *old_state_summary.get(&info.member_info.member_id).unwrap()
+                // Include if the member is absent from the old summary, OR this
+                // record OUTRANKS what the old summary has (higher version, or
+                // equal version with a greater signature). The equal-version arm
+                // is what lets a same-version content difference propagate (#411
+                // round 4 B) — without it, anti-entropy would never send the
+                // correction and peers would disagree on deputies forever.
+                match old_state_summary.get(&info.member_info.member_id) {
+                    None => true,
+                    Some((old_version, old_signature)) => {
+                        member_info_rank(info.member_info.version, &info.signature)
+                            > member_info_rank(*old_version, old_signature)
+                    }
+                }
             })
             .cloned()
             .collect();
@@ -103,6 +257,20 @@ impl ComposableState for MemberInfoV1 {
                     ));
                 }
 
+                // Enforce the deputy-list cap at the DELTA boundary too — `verify`
+                // rejects an over-cap record on stored state, but without this an
+                // over-cap self-signed record would enter state via a delta and
+                // then block new-joiner / migration full-state validation (#410).
+                // SKIP the offending entry (like the removed-member case below)
+                // rather than erroring the whole delta: erroring would let one
+                // malicious over-cap record deadlock every full-state merge that
+                // carries it (the receiver would reject the entire state and never
+                // converge). Skipping is deterministic across peers and drops only
+                // the bad entry.
+                if member_info.member_info.deputies.len() > MAX_DEPUTIES {
+                    continue;
+                }
+
                 // Check if this is the room owner
                 if *member_id == parameters.owner_id() {
                     // If it's the owner, verify against the room owner's key
@@ -119,13 +287,25 @@ impl ComposableState for MemberInfoV1 {
                     member_info.verify_signature_with_key(&member.member.member_vk)?;
                 }
 
-                // Update or add the member info
+                // Update or add the member info. Conflict resolution uses the
+                // total, deterministic `member_info_rank` order (higher version,
+                // else greater signature) so that two DIFFERENT records for the
+                // same member at the SAME version resolve identically regardless
+                // of delta arrival order (#411 round 4 B). Using only
+                // `version >` (as before) left equal-version conflicts
+                // order-dependent, so peers could permanently disagree on
+                // `deputies` (and therefore on ban authority).
                 if let Some(existing_info) = self
                     .member_info
                     .iter_mut()
                     .find(|info| info.member_info.member_id == *member_id)
                 {
-                    if member_info.member_info.version > existing_info.member_info.version {
+                    if member_info_rank(member_info.member_info.version, &member_info.signature)
+                        > member_info_rank(
+                            existing_info.member_info.version,
+                            &existing_info.signature,
+                        )
+                    {
                         *existing_info = member_info.clone();
                     }
                 } else {
@@ -140,9 +320,19 @@ impl ComposableState for MemberInfoV1 {
                 || member_map.contains_key(&info.member_info.member_id)
         });
 
-        // Sort for deterministic ordering (CRDT convergence requirement)
-        self.member_info
-            .sort_by_key(|info| info.member_info.member_id);
+        // Write-side dedup (#411 round 8 Task 2 / item A): the update path above
+        // uses first-match to locate the record to update, so if the state
+        // already held DUPLICATES for a member (a full-state PUT/GET seeds them,
+        // and `verify` accepts them), a delta could update/leave a stale
+        // lower-rank one. Collapse to the single canonical (highest-rank) record
+        // per member here so the STORED vector is duplicate-free after every
+        // apply, not only after `post_apply_cleanup`. Deterministic /
+        // order-independent (max by `member_info_rank`); a no-op on the common
+        // duplicate-free case. Readers still canonicalize and must not depend on
+        // this having run (`MemberInfoV1::canonical`). `dedup_to_canonical` also
+        // sorts for deterministic ordering (CRDT convergence requirement); the
+        // <2-record case it skips is trivially sorted already.
+        self.dedup_to_canonical();
 
         Ok(())
     }
@@ -202,6 +392,22 @@ pub struct MemberInfo {
     pub member_id: MemberId,
     pub version: u32,
     pub preferred_nickname: SealedBytes,
+    /// Members this member has deputized to ban within this member's invite
+    /// subtree (deputy ban authority, #410). Empty for the vast majority of
+    /// members.
+    ///
+    /// LOAD-BEARING: this MUST be the LAST field and MUST keep BOTH
+    /// `#[serde(default)]` (so pre-#410 records — which have no `deputies`
+    /// key — still deserialize) AND `skip_serializing_if = "Vec::is_empty"`
+    /// (so an EMPTY list serializes byte-identically to the old 3-field
+    /// record). `MemberInfo` is INDIVIDUALLY signed over its ciborium bytes
+    /// (`AuthorizedMemberInfo`), so a plain `#[serde(default)]` alone would
+    /// re-serialize every existing member's record with an extra field,
+    /// breaking their signature on migration and stranding every existing
+    /// room. Never reorder the first three fields. Pinned by
+    /// `empty_deputies_serializes_identically_to_legacy_member_info`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deputies: Vec<MemberId>,
 }
 
 impl MemberInfo {
@@ -211,6 +417,7 @@ impl MemberInfo {
             member_id,
             version,
             preferred_nickname: SealedBytes::public(nickname.into_bytes()),
+            deputies: Vec::new(),
         }
     }
 
@@ -232,6 +439,7 @@ impl MemberInfo {
                 secret_version,
                 declared_len,
             ),
+            deputies: Vec::new(),
         }
     }
 }
@@ -245,6 +453,88 @@ mod tests {
 
     fn create_test_member_info(member_id: MemberId) -> MemberInfo {
         MemberInfo::new_public(member_id, 1, "TestUser".to_string())
+    }
+
+    /// LOAD-BEARING regression test (issue #410).
+    ///
+    /// `MemberInfo` is individually signed over its ciborium bytes
+    /// (`AuthorizedMemberInfo::new*` -> `sign_struct`; `verify_signature`
+    /// re-serializes and checks). Adding `deputies` with a PLAIN
+    /// `#[serde(default)]` would make the new WASM re-serialize a 4-field
+    /// struct, changing the bytes and breaking every existing member's
+    /// signature -> `validate_state` rejects the permissionless migration PUT
+    /// -> every existing room migrates to empty. The
+    /// `skip_serializing_if = "Vec::is_empty"` attribute makes an empty
+    /// `deputies` list serialize byte-identically to the old 3-field record,
+    /// so old signatures still verify.
+    ///
+    /// This test constructs the OLD 3-field shape, signs its ciborium bytes,
+    /// and asserts the new `MemberInfo` with an empty `deputies` list (a)
+    /// serializes to byte-identical bytes and (b) still verifies against that
+    /// old signature. It MUST fail if `skip_serializing_if` is dropped.
+    #[test]
+    fn empty_deputies_serializes_identically_to_legacy_member_info() {
+        use crate::util::{sign_struct, verify_struct};
+
+        // Exact mirror of the pre-#410 3-field MemberInfo layout, in order.
+        #[derive(Serialize)]
+        struct OldMemberInfo {
+            member_id: MemberId,
+            version: u32,
+            preferred_nickname: SealedBytes,
+        }
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let member_id: MemberId = signing_key.verifying_key().into();
+        let nickname = SealedBytes::public("LegacyNick".to_string().into_bytes());
+
+        let old = OldMemberInfo {
+            member_id,
+            version: 7,
+            preferred_nickname: nickname.clone(),
+        };
+        // New struct: same first three fields, EMPTY deputies.
+        let new_empty = MemberInfo {
+            member_id,
+            version: 7,
+            preferred_nickname: nickname.clone(),
+            deputies: Vec::new(),
+        };
+
+        // (a) direct byte-identity of the ciborium serialization.
+        let mut old_bytes = Vec::new();
+        ciborium::ser::into_writer(&old, &mut old_bytes).unwrap();
+        let mut new_bytes = Vec::new();
+        ciborium::ser::into_writer(&new_empty, &mut new_bytes).unwrap();
+        assert_eq!(
+            old_bytes, new_bytes,
+            "MemberInfo with empty deputies MUST serialize byte-identically to \
+             the legacy 3-field record; dropping skip_serializing_if breaks this \
+             and strands every existing room (issue #410)"
+        );
+
+        // (b) a signature over the OLD record still verifies against the NEW struct.
+        let signature = sign_struct(&old, &signing_key);
+        assert!(
+            verify_struct(&new_empty, &signature, &signing_key.verifying_key()).is_ok(),
+            "signature over legacy MemberInfo bytes must still verify against the \
+             new struct with empty deputies (proves byte-identical serialization)"
+        );
+
+        // Sanity: a NON-empty deputies list MUST change the bytes (proves the
+        // field really is serialized when populated, so it is not a silent no-op).
+        let with_deputy = MemberInfo {
+            member_id,
+            version: 7,
+            preferred_nickname: nickname,
+            deputies: vec![member_id],
+        };
+        let mut with_deputy_bytes = Vec::new();
+        ciborium::ser::into_writer(&with_deputy, &mut with_deputy_bytes).unwrap();
+        assert_ne!(
+            old_bytes, with_deputy_bytes,
+            "a populated deputies list must change the serialized bytes"
+        );
     }
 
     #[test]
@@ -352,7 +642,7 @@ mod tests {
         let summary = member_info_v1.summarize(&parent_state, &parameters);
         assert_eq!(summary.len(), 1);
         assert!(summary.contains_key(&member_id));
-        assert_eq!(*summary.get(&member_id).unwrap(), 1); // Version should be 1
+        assert_eq!(summary.get(&member_id).unwrap().0, 1); // Version should be 1
     }
 
     #[test]
@@ -366,6 +656,8 @@ mod tests {
 
         let authorized_member_info1 = AuthorizedMemberInfo::new(member_info1, &owner_signing_key);
         let authorized_member_info2 = AuthorizedMemberInfo::new(member_info2, &owner_signing_key);
+        // Capture member1's signature for the summary tiebreak (#411 round 4 B).
+        let sig1 = authorized_member_info1.signature;
 
         let mut member_info_v1 = MemberInfoV1::default();
         member_info_v1.member_info.push(authorized_member_info1);
@@ -376,9 +668,10 @@ mod tests {
             owner: owner_signing_key.verifying_key(),
         };
 
-        // Create a HashMap with member_id1 and version 1
+        // Summary says the peer already holds member1 at (version 1, sig1), so
+        // member1 does not outrank it and only member2 appears in the delta.
         let mut old_summary = HashMap::new();
-        old_summary.insert(member_id1, 1);
+        old_summary.insert(member_id1, (1, sig1));
 
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
 
@@ -582,18 +875,30 @@ mod tests {
         let delta = member_info_v1.delta(&parent_state, &parameters, &HashMap::new());
         assert_eq!(delta.unwrap().len(), 5);
 
-        // Test when all members are old with same version
-        let old_summary: HashMap<MemberId, u32> = member_infos
+        // Test when all members are old with the same (version, signature) —
+        // nothing outranks the summary, so the delta is empty (#411 round 4 B).
+        let old_summary: HashMap<MemberId, (u32, Signature)> = member_infos
             .iter()
-            .map(|info| (info.member_info.member_id, info.member_info.version))
+            .map(|info| {
+                (
+                    info.member_info.member_id,
+                    (info.member_info.version, info.signature),
+                )
+            })
             .collect();
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
         assert!(delta.is_none());
 
         // Test with a mix of new and old members
         let mut old_summary = HashMap::new();
-        old_summary.insert(member_infos[0].member_info.member_id, 1);
-        old_summary.insert(member_infos[1].member_info.member_id, 1);
+        old_summary.insert(
+            member_infos[0].member_info.member_id,
+            (1, member_infos[0].signature),
+        );
+        old_summary.insert(
+            member_infos[1].member_info.member_id,
+            (1, member_infos[1].signature),
+        );
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
         assert_eq!(delta.unwrap().len(), 3);
 
@@ -649,7 +954,7 @@ mod tests {
 
         // Create summary with version 1
         let summary = member_info_state.summarize(&parent_state, &parameters);
-        assert_eq!(*summary.get(&member_id).unwrap(), 1);
+        assert_eq!(summary.get(&member_id).unwrap().0, 1);
 
         // Create delta with version 2
         let mut updated_state = MemberInfoV1::default();
@@ -859,5 +1164,274 @@ mod tests {
             member_info_v1.member_info[0].member_info.member_id,
             owner_id
         );
+    }
+
+    /// #411 round 7 / Codex P1 #3: a state carrying TWO validly-signed
+    /// `member_info` records for the same member (a `grant` at v1 and a `revoke`
+    /// at v2) must READ consistently. `verify` MUST still accept it
+    /// (migration-safety), and BOTH `deputies_of` (enforcement) and `summarize`
+    /// (the anti-entropy advertised value) must select the highest-rank (v2 =
+    /// revoke) record, regardless of vector order — so peers with different
+    /// duplicate sets converge on both enforcement and the summary.
+    #[test]
+    fn duplicate_member_info_reads_canonicalize_to_highest_rank() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = owner_verifying_key.into();
+
+        let member_signing_key = SigningKey::generate(&mut OsRng);
+        let member_verifying_key = member_signing_key.verifying_key();
+        let member_id = member_verifying_key.into();
+
+        let deputy = SigningKey::generate(&mut OsRng).verifying_key().into();
+
+        // grant @ v1: member deputizes `deputy`.
+        let mut grant_mi = MemberInfo::new_public(member_id, 1, "nick".to_string());
+        grant_mi.deputies = vec![deputy];
+        let grant = AuthorizedMemberInfo::new_with_member_key(grant_mi, &member_signing_key);
+
+        // revoke @ v2 (higher rank): member clears their deputies.
+        let mut revoke_mi = MemberInfo::new_public(member_id, 2, "nick".to_string());
+        revoke_mi.deputies = vec![];
+        let revoke = AuthorizedMemberInfo::new_with_member_key(revoke_mi, &member_signing_key);
+        let revoke_summary_value = (2u32, revoke.signature);
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member_verifying_key,
+            },
+            &owner_signing_key,
+        ));
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        for (label, entries) in [
+            ("grant-then-revoke", vec![grant.clone(), revoke.clone()]),
+            ("revoke-then-grant", vec![revoke.clone(), grant.clone()]),
+        ] {
+            let state = MemberInfoV1 {
+                member_info: entries,
+            };
+
+            // Migration-safety: `verify` accepts the duplicate state.
+            assert!(
+                state.verify(&parent_state, &parameters).is_ok(),
+                "verify must ACCEPT a duplicate-member_info state ({label})"
+            );
+
+            // Enforcement reads the highest-rank (revoke @ v2 → no deputies).
+            assert_eq!(
+                state.deputies_of(member_id),
+                &[] as &[MemberId],
+                "deputies_of must return the v2 (revoke) result ({label})"
+            );
+
+            // Anti-entropy advertises the highest-rank (version, signature).
+            let summary = state.summarize(&parent_state, &parameters);
+            assert_eq!(
+                summary.get(&member_id).copied(),
+                Some(revoke_summary_value),
+                "summarize must advertise the v2 (revoke) (version, signature) ({label})"
+            );
+        }
+    }
+
+    /// #411 round 7 / Codex P1 #3: when two records for one member are present,
+    /// `deputies_of` must return the HIGHEST-rank record's deputies (higher
+    /// version, else greater signature) — the same winner `apply_delta` /
+    /// `summarize` converge on — regardless of vector order. A bare `.find()`
+    /// (first) could disagree with the converged state.
+    #[test]
+    fn deputies_of_picks_highest_rank_record() {
+        let member_signing_key = SigningKey::generate(&mut OsRng);
+        let member_id = member_signing_key.verifying_key().into();
+
+        let deputy_x = SigningKey::generate(&mut OsRng).verifying_key().into();
+        let deputy_y = SigningKey::generate(&mut OsRng).verifying_key().into();
+
+        // Lower-version record lists deputy_x; higher-version lists deputy_y.
+        let mut mi_v1 = MemberInfo::new_public(member_id, 1, "nick".to_string());
+        mi_v1.deputies = vec![deputy_x];
+        let low = AuthorizedMemberInfo::new_with_member_key(mi_v1, &member_signing_key);
+
+        let mut mi_v2 = MemberInfo::new_public(member_id, 2, "nick".to_string());
+        mi_v2.deputies = vec![deputy_y];
+        let high = AuthorizedMemberInfo::new_with_member_key(mi_v2, &member_signing_key);
+
+        // Put the LOWER-rank record FIRST so a naive `.find()` would pick it.
+        let member_info_v1 = MemberInfoV1 {
+            member_info: vec![low, high],
+        };
+
+        assert_eq!(
+            member_info_v1.deputies_of(member_id),
+            &[deputy_y],
+            "deputies_of must return the highest-version record's deputies"
+        );
+
+        // Also robust to the reverse vector order.
+        let mut mi_v1b = MemberInfo::new_public(member_id, 1, "nick".to_string());
+        mi_v1b.deputies = vec![deputy_x];
+        let low_b = AuthorizedMemberInfo::new_with_member_key(mi_v1b, &member_signing_key);
+        let mut mi_v2b = MemberInfo::new_public(member_id, 2, "nick".to_string());
+        mi_v2b.deputies = vec![deputy_y];
+        let high_b = AuthorizedMemberInfo::new_with_member_key(mi_v2b, &member_signing_key);
+        let reversed = MemberInfoV1 {
+            member_info: vec![high_b, low_b],
+        };
+        assert_eq!(
+            reversed.deputies_of(member_id),
+            &[deputy_y],
+            "deputies_of result must be independent of vector order"
+        );
+    }
+
+    /// #411 round 8 item A/C: `canonical` selects the highest-rank record and
+    /// `dedup_to_canonical` collapses duplicates to it (owner kept), independent
+    /// of vector order. This is the shared selector EVERY by-id reader/writer
+    /// routes through, plus the post_apply_cleanup dedup.
+    #[test]
+    fn canonical_and_dedup_to_canonical_pick_highest_rank() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+
+        let m_sk = SigningKey::generate(&mut OsRng);
+        let m_id: MemberId = m_sk.verifying_key().into();
+        let n_sk = SigningKey::generate(&mut OsRng);
+        let n_id: MemberId = n_sk.verifying_key().into();
+
+        let dep = SigningKey::generate(&mut OsRng).verifying_key().into();
+        // M: grant @ v1 (deputies=[dep]) and revoke @ v2 (deputies=[]).
+        let mut g = MemberInfo::new_public(m_id, 1, "nick".to_string());
+        g.deputies = vec![dep];
+        let grant = AuthorizedMemberInfo::new_with_member_key(g, &m_sk);
+        let mut r = MemberInfo::new_public(m_id, 2, "nick".to_string());
+        r.deputies = vec![];
+        let revoke = AuthorizedMemberInfo::new_with_member_key(r, &m_sk);
+        // N: single record. Owner: single record.
+        let n_info = AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(n_id, 3, "n".to_string()),
+            &n_sk,
+        );
+        let owner_info = AuthorizedMemberInfo::new(
+            MemberInfo::new_public(owner_id, 1, "o".to_string()),
+            &owner_sk,
+        );
+
+        for order in [
+            vec![
+                grant.clone(),
+                revoke.clone(),
+                n_info.clone(),
+                owner_info.clone(),
+            ],
+            vec![
+                owner_info.clone(),
+                n_info.clone(),
+                revoke.clone(),
+                grant.clone(),
+            ],
+        ] {
+            let mut mi = MemberInfoV1 { member_info: order };
+
+            // canonical picks the v2 revoke for M.
+            assert_eq!(
+                mi.canonical(m_id).map(|c| c.member_info.version),
+                Some(2),
+                "canonical(M) must be the v2 revoke"
+            );
+            assert_eq!(mi.canonical(n_id).map(|c| c.member_info.version), Some(3));
+            assert_eq!(
+                mi.canonical(owner_id).map(|c| c.member_info.version),
+                Some(1)
+            );
+            assert!(mi
+                .canonical(SigningKey::generate(&mut OsRng).verifying_key().into())
+                .is_none());
+
+            // dedup collapses M's duplicate, keeps owner + N, one record each.
+            mi.dedup_to_canonical();
+            assert_eq!(mi.member_info.len(), 3, "exactly one record per member_id");
+            let m_rec = mi
+                .member_info
+                .iter()
+                .find(|i| i.member_info.member_id == m_id)
+                .unwrap();
+            assert_eq!(
+                m_rec.member_info.version, 2,
+                "M's kept record is the revoke"
+            );
+            assert!(
+                m_rec.member_info.deputies.is_empty(),
+                "revoke has no deputies"
+            );
+            assert!(mi
+                .member_info
+                .iter()
+                .any(|i| i.member_info.member_id == owner_id));
+            // Idempotent.
+            let before = mi.clone();
+            mi.dedup_to_canonical();
+            assert_eq!(before, mi, "dedup_to_canonical is idempotent");
+        }
+    }
+
+    /// #411 round 8 Task 2: `apply_delta` collapses a PRE-EXISTING duplicate
+    /// state (seeded by a full-state PUT/GET, which `verify` accepts) to the
+    /// single canonical record per member on the WRITE path — not only later in
+    /// `post_apply_cleanup`. Even an empty delta triggers it.
+    #[test]
+    fn apply_delta_dedups_preexisting_duplicates_to_canonical() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = owner_vk.into();
+
+        let m_sk = SigningKey::generate(&mut OsRng);
+        let m_vk = m_sk.verifying_key();
+        let m_id: MemberId = m_vk.into();
+
+        let dep = SigningKey::generate(&mut OsRng).verifying_key().into();
+        let mut g = MemberInfo::new_public(m_id, 1, "n".to_string());
+        g.deputies = vec![dep];
+        let grant = AuthorizedMemberInfo::new_with_member_key(g, &m_sk);
+        let mut r = MemberInfo::new_public(m_id, 2, "n".to_string());
+        r.deputies = vec![];
+        let revoke = AuthorizedMemberInfo::new_with_member_key(r, &m_sk);
+
+        // Pre-existing duplicate (grant FIRST so a naive first-match would keep it).
+        let mut mi = MemberInfoV1 {
+            member_info: vec![grant, revoke],
+        };
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: m_vk,
+            },
+            &owner_sk,
+        ));
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        // Applying even an empty delta collapses the duplicate on the write path.
+        mi.apply_delta(&parent_state, &params, &None).unwrap();
+
+        let recs: Vec<_> = mi
+            .member_info
+            .iter()
+            .filter(|i| i.member_info.member_id == m_id)
+            .collect();
+        assert_eq!(
+            recs.len(),
+            1,
+            "apply_delta must collapse the pre-existing duplicate on the write path"
+        );
+        assert_eq!(recs[0].member_info.version, 2, "canonical (revoke) kept");
+        assert!(recs[0].member_info.deputies.is_empty());
     }
 }

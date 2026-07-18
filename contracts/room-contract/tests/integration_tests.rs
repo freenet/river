@@ -225,6 +225,7 @@ async fn test_invitation_message_propagation() -> TestResult {
                 member_id: bob_signing_key.verifying_key().into(),
                 version: 0,
                 preferred_nickname: river_core::room_state::privacy::SealedBytes::public("Bob".to_string().into_bytes()),
+                deputies: Vec::new(),
             };
             let authorized_bob_info = river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
                 bob_member_info, &bob_signing_key

@@ -179,9 +179,7 @@ fn group_messages(
         let message_id = message.id();
 
         let author_name = member_info
-            .member_info
-            .iter()
-            .find(|ami| ami.member_info.member_id == author_id)
+            .canonical(author_id)
             .map(|ami| {
                 // Decrypt nickname using version-aware decryption
                 match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, secrets) {

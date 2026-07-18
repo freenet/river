@@ -33,6 +33,7 @@ fn test_invitation_acceptance_initializes_room_state_correctly() -> Result<()> {
         member_id: owner_vk.into(),
         version: 0,
         preferred_nickname: SealedBytes::public("Owner".to_string().into_bytes()),
+        deputies: Vec::new(),
     };
     let auth_owner_info = AuthorizedMemberInfo::new_with_member_key(owner_info, &owner_sk);
     room_state.member_info.member_info.push(auth_owner_info);
@@ -64,6 +65,7 @@ fn test_invitation_acceptance_initializes_room_state_correctly() -> Result<()> {
         member_id: invitee_vk.into(),
         version: 0,
         preferred_nickname: SealedBytes::public("User2".to_string().into_bytes()),
+        deputies: Vec::new(),
     };
     let auth_member_info = AuthorizedMemberInfo::new_with_member_key(member_info, &invitee_sk);
     room_state.member_info.member_info.push(auth_member_info);

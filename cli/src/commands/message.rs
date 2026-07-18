@@ -225,12 +225,13 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let author_str = msg.message.author.to_string();
                             let author_short = author_str.chars().take(8).collect::<String>();
 
-                            // Get nickname if available (decrypted for a private room)
+                            // Get nickname if available (decrypted for a private room).
+                            // `canonical`, not a bare `.find()` (#411 round 8 item A): a
+                            // duplicate-holding state could otherwise display a stale
+                            // (e.g. revoked) record's nickname.
                             let nickname = room_state
                                 .member_info
-                                .member_info
-                                .iter()
-                                .find(|info| info.member_info.member_id == msg.message.author)
+                                .canonical(msg.message.author)
                                 .map(|info| {
                                     crate::api::unseal_nickname_display(
                                         &info.member_info.preferred_nickname,
@@ -308,11 +309,10 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             let author_str = msg.message.author.to_string();
                             let msg_id = msg.id();
 
+                            // `canonical`, not a bare `.find()` (#411 round 8 item A).
                             let nickname = room_state
                                 .member_info
-                                .member_info
-                                .iter()
-                                .find(|info| info.member_info.member_id == msg.message.author)
+                                .canonical(msg.message.author)
                                 .map(|info| {
                                     crate::api::unseal_nickname_display(
                                         &info.member_info.preferred_nickname,

@@ -146,10 +146,51 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                         return SaveOutcome::DeferredNoSecret;
                     };
 
+                    // Read the CANONICAL current member_info record fresh from
+                    // `room_data`, rather than trusting the (possibly stale)
+                    // `member_info` prop captured at render/mount time —
+                    // `verify` accepts duplicate member_info records per
+                    // member_id (migration safety), so a first-match/prop-only
+                    // base can seed this edit from a LOSING (e.g. a
+                    // just-revoked deputy grant) record and republish it at a
+                    // higher version, reactivating revoked authority
+                    // (freenet/river#411 round 8). Fall back to the prop only
+                    // if the canonical lookup comes up empty (e.g. self was
+                    // pruned and no record is in room_state at all yet).
+                    let canonical_base = room_data
+                        .room_state
+                        .member_info
+                        .canonical(member_info.member_info.member_id)
+                        .cloned()
+                        .unwrap_or_else(|| member_info.clone());
+
+                    // Derive the republished version from the higher of the
+                    // canonical room_state version and the cached
+                    // `self_member_info` version — not from the canonical
+                    // base alone. On a stale/reset client the room_state max
+                    // can collide at the SAME version as a still-propagating
+                    // record and lose the signature tiebreak, silently
+                    // no-op'ing the edit (freenet/river#411 round 8).
+                    let cached_version = room_data
+                        .self_member_info
+                        .as_ref()
+                        .filter(|cached| {
+                            cached.member_info.member_id == canonical_base.member_info.member_id
+                        })
+                        .map(|cached| cached.member_info.version)
+                        .unwrap_or(0);
+                    let next_version = canonical_base.member_info.version.max(cached_version) + 1;
+
                     let new_member_info = MemberInfo {
-                        member_id: member_info.member_info.member_id,
-                        version: member_info.member_info.version + 1,
+                        member_id: canonical_base.member_info.member_id,
+                        version: next_version,
                         preferred_nickname: sealed_nickname,
+                        // Preserve existing deputy grants (#410): republishing
+                        // member_info replaces the whole signed record, so
+                        // dropping deputies would silently revoke them.
+                        // Preserved from the CANONICAL base, not the stale
+                        // prop, for the same reason as the version above.
+                        deputies: canonical_base.member_info.deputies.clone(),
                     };
                     let new_authorized_member_info =
                         AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);

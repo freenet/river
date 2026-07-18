@@ -1,10 +1,12 @@
 mod ban_button;
+mod deputy_button;
 mod invited_by_field;
 mod nickname_field;
 
 use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use crate::components::direct_messages::{open_dm_thread, open_invite_via_dm_picker};
 use crate::components::members::member_info_modal::ban_button::BanButton;
+use crate::components::members::member_info_modal::deputy_button::DeputyButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
 use crate::util::ecies::unseal_bytes_with_secrets;
@@ -12,6 +14,28 @@ use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::ChatRoomParametersV1;
+
+/// Whether `viewer` may ban `target` — the Ban-button gate (#410 / #411 round 4
+/// D). Uses [`MembersV1::is_ban_authorized`] (owner / invite-ancestor / deputy),
+/// NOT bare invite-chain ancestry, so a DEPUTY sees the Ban action for members in
+/// their deputizer's subtree. Bare downstream ancestry (`is_downstream`, still
+/// used for the "🔑 Invited by You" relationship tag) would have hidden it.
+fn viewer_can_ban(
+    members: &river_core::room_state::member::MembersV1,
+    member_info: &river_core::room_state::member_info::MemberInfoV1,
+    viewer: MemberId,
+    target: MemberId,
+    owner_id: MemberId,
+) -> bool {
+    let members_by_id = members.members_by_member_id();
+    river_core::room_state::member::MembersV1::is_ban_authorized(
+        viewer,
+        target,
+        &members_by_id,
+        member_info,
+        owner_id,
+    )
+}
 
 #[component]
 pub fn MemberInfoModal() -> Element {
@@ -79,15 +103,16 @@ pub fn MemberInfoModal() -> Element {
         .unwrap_or(0);
 
     // Extract member info and members list
-    let member_info_list = &room_state.room_state.member_info.member_info;
+    let member_info_v1 = &room_state.room_state.member_info;
     let members_list = &room_state.room_state.members.members;
 
     let modal_content = if let Some(member_id) = MEMBER_INFO_MODAL.read().member {
-        // Find the AuthorizedMemberInfo for the given member_id
-        let member_info = match member_info_list
-            .iter()
-            .find(|mi| mi.member_info.member_id == member_id)
-        {
+        // Find the CANONICAL AuthorizedMemberInfo for the given member_id
+        // (highest member_info_rank: version, then signature bytes) — not a
+        // bare first-match. `verify` accepts duplicate member_info records
+        // per member_id (migration safety), so a first-match `.find()` can
+        // read a losing (e.g. revoked) record (freenet/river#411 round 8).
+        let member_info = match member_info_v1.canonical(member_id) {
             Some(mi) => mi,
             None => {
                 error!("Member info not found for member {member_id}");
@@ -140,9 +165,28 @@ pub fn MemberInfoModal() -> Element {
             })
             .unwrap_or(false);
 
+        // Ban authority (#410 / #411 round 4 D). The Ban button is gated on REAL
+        // ban authority — owner / invite-ancestor / deputy — via
+        // `is_ban_authorized`, NOT bare downstream ancestry (`is_downstream`), so a
+        // deputy sees Ban for members in their deputizer's subtree. `is_downstream`
+        // is still used above for the "🔑 Invited by You" relationship tag, which
+        // is a different meaning and must not change.
+        let can_ban = owner_key_signal
+            .as_ref()
+            .map(|owner| {
+                viewer_can_ban(
+                    &room_state.room_state.members,
+                    &room_state.room_state.member_info,
+                    self_member_id,
+                    member_id,
+                    MemberId::from(&*owner),
+                )
+            })
+            .unwrap_or(false);
+
         info!(
-            "Rendering MemberInfoModal for member_id: {:?} is_owner: {:?} is_downstream: {:?}",
-            member_id, is_owner, is_downstream
+            "Rendering MemberInfoModal for member_id: {:?} is_owner: {:?} is_downstream: {:?} can_ban: {:?}",
+            member_id, is_owner, is_downstream, can_ban
         );
 
         // Get the inviter's nickname and ID
@@ -150,9 +194,8 @@ pub fn MemberInfoModal() -> Element {
             (_, true) => ("N/A (Room Owner)".to_string(), None),
             (Some(m), false) => {
                 let inviter_id = m.member.invited_by;
-                let nickname = member_info_list
-                    .iter()
-                    .find(|mi| mi.member_info.member_id == inviter_id)
+                let nickname = member_info_v1
+                    .canonical(inviter_id)
                     .map(|mi| {
                         match unseal_bytes_with_secrets(
                             &mi.member_info.preferred_nickname,
@@ -166,6 +209,48 @@ pub fn MemberInfoModal() -> Element {
                 (nickname, Some(inviter_id))
             }
             _ => ("Unknown".to_string(), None),
+        };
+
+        // Deputy authority gating (#410). Unlike Ban (gated on the TARGET being
+        // downstream), Deputize is gated on the VIEWER holding authority: the
+        // owner, or a member whose own invite subtree is non-empty. The deputy
+        // can be any member, so this shows in any member's modal (except self /
+        // owner as targets); it is hidden entirely for a viewer with an empty
+        // subtree to avoid advertising power they don't have.
+        let viewer_has_authority = {
+            let viewer_is_owner = owner_key_signal
+                .as_ref()
+                .is_some_and(|k| MemberId::from(&*k) == self_member_id);
+            if viewer_is_owner {
+                true
+            } else if let Some(owner) = owner_key_signal.as_ref() {
+                let params = ChatRoomParametersV1 { owner: *owner };
+                room_state.room_state.members.members.iter().any(|m| {
+                    m.member.id() != self_member_id
+                        && room_state
+                            .room_state
+                            .members
+                            .get_invite_chain(m, &params)
+                            .map(|chain| chain.iter().any(|a| a.member.id() == self_member_id))
+                            .unwrap_or(false)
+                })
+            } else {
+                false
+            }
+        };
+        // Whether the target is currently one of the VIEWER's own deputies.
+        let target_is_my_deputy = room_state
+            .room_state
+            .member_info
+            .deputies_of(self_member_id)
+            .contains(&member_id);
+        // Decrypted display nickname for the target (for the deputy action copy).
+        let target_nickname = match unseal_bytes_with_secrets(
+            &member_info.member_info.preferred_nickname,
+            &room_state.secrets,
+        ) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
         };
 
         // Get the member ID string to display
@@ -319,24 +404,28 @@ pub fn MemberInfoModal() -> Element {
                                 inviter_id: inviter_id,
                             }
 
-                            // Check if member is downstream of current user
-                            {
-                                let _current_user_id = {
-                                    current_room_data_signal.read().as_ref()
-                                        .map(|r| r.self_sk.verifying_key())
-                                        .map(|k| MemberId::from(&k))
-                                };
+                            // Ban + Deputize sit in one row (Ban on the left,
+                            // Deputize on the right), matching the DM /
+                            // Share-invite button row above.
+                            div { class: "mt-4 flex items-start gap-3",
+                                BanButton {
+                                    member_to_ban: member_id,
+                                    can_ban: can_ban,
+                                    nickname: member_info.member_info.preferred_nickname.clone()
+                                }
 
-                                rsx! {
-                                    BanButton {
-                                        member_to_ban: member_id,
-                                        is_downstream: is_downstream,
-                                        nickname: member_info.member_info.preferred_nickname.clone()
+                                // Deputize / revoke-deputy (#410). Any non-owner
+                                // member (except self) may be deputized; the action
+                                // hides itself when the viewer lacks authority.
+                                if member_id != self_member_id {
+                                    DeputyButton {
+                                        target: member_id,
+                                        viewer_has_authority: viewer_has_authority,
+                                        target_is_my_deputy: target_is_my_deputy,
+                                        nickname: target_nickname.clone(),
                                     }
-                                    ""
                                 }
                             }
-
                         }
                     }
                     // Close button
@@ -354,4 +443,95 @@ pub fn MemberInfoModal() -> Element {
     };
 
     modal_content
+}
+
+#[cfg(test)]
+mod ban_gate_tests {
+    use super::viewer_can_ban;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersV1};
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+
+    fn member(
+        sk: &SigningKey,
+        inviter_id: MemberId,
+        inviter_sk: &SigningKey,
+        owner_id: MemberId,
+    ) -> AuthorizedMember {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: inviter_id,
+                member_vk: sk.verifying_key(),
+            },
+            inviter_sk,
+        )
+    }
+
+    fn info(sk: &SigningKey, deputies: Vec<MemberId>) -> AuthorizedMemberInfo {
+        let id: MemberId = sk.verifying_key().into();
+        let mut mi = MemberInfo::new_public(id, 0, "n".to_string());
+        mi.deputies = deputies;
+        AuthorizedMemberInfo::new_with_member_key(mi, sk)
+    }
+
+    /// #411 round 4 D: the Ban-button gate uses `is_ban_authorized`, so a deputy
+    /// sees Ban for a target in their deputizer's subtree — which the old bare
+    /// downstream-ancestry gate (`is_downstream`) would have hidden.
+    #[test]
+    fn deputy_can_ban_but_unrelated_cannot() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let d = SigningKey::generate(&mut OsRng); // owner's global-mod deputy
+        let u = SigningKey::generate(&mut OsRng); // unrelated member
+        let v = SigningKey::generate(&mut OsRng); // target (owner's invitee)
+        let owner_id: MemberId = owner.verifying_key().into();
+        let d_id: MemberId = d.verifying_key().into();
+        let u_id: MemberId = u.verifying_key().into();
+        let v_id: MemberId = v.verifying_key().into();
+
+        let members = MembersV1 {
+            members: vec![
+                member(&d, owner_id, &owner, owner_id),
+                member(&u, owner_id, &owner, owner_id),
+                member(&v, owner_id, &owner, owner_id),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                info(&owner, vec![d_id]), // owner deputizes D (global mod)
+                info(&d, vec![]),
+                info(&u, vec![]),
+                info(&v, vec![]),
+            ],
+        };
+
+        // Owner can ban anyone.
+        assert!(viewer_can_ban(
+            &members,
+            &member_info,
+            owner_id,
+            v_id,
+            owner_id
+        ));
+        // D (owner's deputy) can ban V even though D is NOT an ancestor of V, so
+        // the old `is_downstream` gate would have hidden the Ban button.
+        assert!(viewer_can_ban(&members, &member_info, d_id, v_id, owner_id));
+        // An unrelated member cannot ban V.
+        assert!(!viewer_can_ban(
+            &members,
+            &member_info,
+            u_id,
+            v_id,
+            owner_id
+        ));
+        // Nobody can ban the owner.
+        assert!(!viewer_can_ban(
+            &members,
+            &member_info,
+            d_id,
+            owner_id,
+            owner_id
+        ));
+    }
 }

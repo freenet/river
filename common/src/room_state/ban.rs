@@ -1,4 +1,5 @@
-use crate::room_state::member::{AuthorizedMember, MemberId};
+use crate::room_state::member::{AuthorizedMember, MemberId, MembersV1};
+use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, verify_struct};
 use crate::ChatRoomStateV1;
@@ -16,66 +17,65 @@ use std::time::SystemTime;
 /// This structure maintains a list of authorized bans and provides methods
 /// to verify, summarize, and apply changes to the ban list while ensuring
 /// all bans are valid according to room rules.
+///
+/// # Ban validity & the un-ban DoS (#411)
+///
+/// A ban is only honored while its banner is the OWNER or a CURRENT,
+/// signature-validated member: [`Self::ban_is_enforcing`] gates on that, and
+/// [`crate::room_state::ChatRoomStateV1::post_apply_cleanup`] sweeps any ban
+/// whose banner is neither. A member who is a banner is exempt from
+/// inactivity-pruning while they hold a retained ban, so a moderator's bans do
+/// not vanish. The `max_user_bans` FIFO is enforced there too, evicting inert
+/// (currently-unauthorized) bans before enforcing ones, and
+/// [`ComposableState::apply_delta`] bounds a single delta to `max_user_bans`
+/// new bans so a forged flood cannot make signature verification unbounded.
+///
+/// KNOWN, ACCEPTED, self-limiting residuals (Ian confirmed, #411 round 3 D):
+/// 1. A current member can flood bans against ABSENT targets (each such ban is
+///    "enforcing" only because its banner is a member).
+/// 2. Slot-squatting: because of the item-B pruning exemption, a current member
+///    can make themselves PERMANENTLY exempt from inactivity-pruning with a
+///    single junk ban against an absent target — that ban is "enforcing", so it
+///    survives both the non-member-banner sweep and the `max_user_bans`
+///    eviction, and inactivity-prune can no longer reclaim their member slot.
+/// Both are pre-existing/emergent and self-limiting the same way: the flooder /
+/// squatter is a current member, identifiable on every junk ban, and only an
+/// explicit OWNER ban reclaims the slot — banning them makes their bans inert
+/// and sweeps them (freeing the cap and making them prunable again).
+/// Inactivity-prune alone cannot. No code fix; documented deliberately.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
-/// Represents different types of validation errors that can occur with bans
+/// Validation errors that can occur with bans.
+///
+/// Since #410, ban ENFORCEMENT authority (owner / ancestor / deputy) is no
+/// longer decided in `verify` — it is recomputed from converged state in
+/// `ChatRoomStateV1::post_apply_cleanup`. The former invite-chain /
+/// excess-count validation variants were removed with that change; the only
+/// remaining `verify`-time rejection is an orphaned ban whose banner was
+/// themselves banned.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BanValidationError {
-    /// The banned member was not found in the member list
-    MemberNotFound(MemberId),
-
-    /// The banning member was not found in the member list
+    /// The banning member is not in the current member list AND was themselves
+    /// banned — an orphaned ban.
     BannerNotFound(MemberId),
-
-    /// The banning member is not in the invite chain of the banned member
-    NotInInviteChain(MemberId, MemberId),
-
-    /// A circular invite chain was detected
-    SelfInvitationDetected(MemberId),
-
-    /// The inviting member was not found for a member in the chain
-    InviterNotFound(MemberId),
-
-    /// The number of bans exceeds the maximum allowed
-    ExceededMaximumBans,
 }
 
 impl fmt::Display for BanValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BanValidationError::MemberNotFound(id) => {
-                write!(f, "Banned member not found in member list: {:?}", id)
-            }
             BanValidationError::BannerNotFound(id) => {
                 write!(f, "Banning member not found in member list: {:?}", id)
-            }
-            BanValidationError::NotInInviteChain(banner_id, banned_id) => write!(
-                f,
-                "Banner {:?} is not in the invite chain of banned member {:?}",
-                banner_id, banned_id
-            ),
-            BanValidationError::SelfInvitationDetected(id) => {
-                write!(f, "Self-invitation detected for member {:?}", id)
-            }
-            BanValidationError::InviterNotFound(id) => {
-                write!(f, "Inviting member not found for {:?}", id)
-            }
-            BanValidationError::ExceededMaximumBans => {
-                write!(f, "Exceeded maximum number of user bans")
             }
         }
     }
 }
 
 impl BansV1 {
-    /// Validates all bans in the collection and returns a map of invalid bans with errors
-    ///
-    /// This method checks:
-    /// - If the banned member still exists, verifies the banning member is in their invite chain
-    ///   (unless banner is owner). If the banned member was already removed, the ban is valid.
-    /// - If the banning member exists (for non-owner bans where banned member still exists)
-    /// - If the number of bans exceeds the maximum allowed
+    /// Validates the per-ban orphan constraints and returns a map of invalid
+    /// bans with errors. Does NOT enforce the `max_user_bans` ceiling — that is
+    /// a whole-collection concern applied as a hard count check in `verify` and
+    /// enforced (inert-first) in `ChatRoomStateV1::post_apply_cleanup` (#410).
     fn get_invalid_bans(
         &self,
         parent_state: &ChatRoomStateV1,
@@ -96,13 +96,23 @@ impl BansV1 {
             );
         }
 
-        // Check for excess bans
-        self.identify_excess_bans(parent_state, &mut invalid_bans);
-
         invalid_bans
     }
 
-    /// Validates a single ban and adds any validation errors to the invalid_bans map
+    /// Validates a single ban and adds any validation errors to the invalid_bans map.
+    ///
+    /// Note (#410): this does NOT reject a ban merely because the banner is not
+    /// a current ancestor of the target. Authority to ENFORCE a ban (owner /
+    /// ancestor / deputy, including retroactive deputy revocation) is evaluated
+    /// at enforcement time in [`crate::room_state::member::MembersV1::banned_member_ids`]
+    /// (run from `post_apply_cleanup`), NOT here. A ban whose banner has no
+    /// current authority (for example a revoked deputy) is INERT — it removes
+    /// nobody — but must still pass `verify`: a legitimately converged state (a
+    /// previously-banned user who rejoined after their deputy was revoked)
+    /// would otherwise fail validation and break convergence. Keeping ban
+    /// authority out of `verify` is exactly what makes `verify` stable across
+    /// deputy-state changes. Ban SIGNATURES are still verified in `verify`, and
+    /// the orphaned-ban check (banner was themselves banned) is retained.
     fn validate_single_ban(
         &self,
         ban: &AuthorizedUserBan,
@@ -111,143 +121,39 @@ impl BansV1 {
         invalid_bans: &mut HashMap<BanId, BanValidationError>,
         banned_user_ids: &HashSet<MemberId>,
     ) {
-        // Check if banned member exists - if not, that's OK, they've been removed due to the ban.
-        // We can skip the invite chain verification in that case since:
-        // 1. The ban signature verification (done separately) proves authenticity
-        // 2. The ban has already taken effect (member was removed)
-        // 3. The invite chain was valid when the ban was first created and applied
-        let banned_member = match member_map.get(&ban.ban.banned_user) {
-            Some(member) => member,
-            None => {
-                // Banned member already removed - ban is valid, skip further checks
-                return;
-            }
-        };
+        // If the banned member is no longer present they were already removed
+        // (e.g. by this ban, a cascade, or an inactivity prune); nothing left
+        // to enforce, so the ban is valid.
+        if !member_map.contains_key(&ban.ban.banned_user) {
+            return;
+        }
 
-        // Skip banning member verification if banner is room owner
-        if ban.banned_by != parameters.owner_id() {
-            // Check if banning member exists
-            let banning_member = match member_map.get(&ban.banned_by) {
-                Some(member) => member,
-                None => {
-                    // Banner not in members list. Check if they were banned
-                    // (orphaned ban) or just pruned for inactivity (valid ban).
-                    if banned_user_ids.contains(&ban.banned_by) {
-                        // Banner was banned — this ban is orphaned
-                        invalid_bans
-                            .insert(ban.id(), BanValidationError::BannerNotFound(ban.banned_by));
-                    }
-                    // Otherwise banner was pruned for inactivity — ban is still valid
-                    return;
-                }
-            };
+        // Owner bans are always valid.
+        if ban.banned_by == parameters.owner_id() {
+            return;
+        }
 
-            // Verify banning member is in the invite chain of banned member
-            if let Err(error) = self.validate_invite_chain(
-                banned_member,
-                banning_member,
-                member_map,
-                parameters.owner_id(),
-                ban.id(),
-            ) {
-                invalid_bans.insert(ban.id(), error);
-            }
+        // If the banner is not a current member, distinguish an orphaned ban
+        // (the banner was themselves banned) from a still-valid ban by a member
+        // who was merely pruned for inactivity. If the banner IS a current
+        // member the ban is accepted regardless of the banner's current
+        // ancestor/deputy authority (see the doc comment above) — enforcement
+        // decides who is actually removed.
+        if !member_map.contains_key(&ban.banned_by) && banned_user_ids.contains(&ban.banned_by) {
+            // Banner was banned — this ban is orphaned.
+            invalid_bans.insert(ban.id(), BanValidationError::BannerNotFound(ban.banned_by));
         }
     }
 
-    /// Validates that the banning member is in the invite chain of the banned member
-    fn validate_invite_chain(
-        &self,
-        banned_member: &AuthorizedMember,
-        banning_member: &AuthorizedMember,
-        member_map: &HashMap<MemberId, &AuthorizedMember>,
-        owner_id: MemberId,
-        _ban_id: BanId,
-    ) -> Result<(), BanValidationError> {
-        let mut current_member = banned_member;
-        let mut chain = Vec::new();
-
-        while current_member.member.id() != owner_id {
-            chain.push(current_member);
-
-            // If we found the banning member in the chain, the ban is valid
-            if current_member.member.id() == banning_member.member.id() {
-                return Ok(());
-            }
-
-            // Move up the invite chain
-            current_member = match member_map.get(&current_member.member.invited_by) {
-                Some(m) => m,
-                None => {
-                    return Err(BanValidationError::InviterNotFound(
-                        current_member.member.id(),
-                    ));
-                }
-            };
-
-            // Check for circular invite chains
-            if chain.contains(&current_member) {
-                return Err(BanValidationError::SelfInvitationDetected(
-                    current_member.member.id(),
-                ));
-            }
-        }
-
-        // If we reached the owner without finding the banning member, the ban is invalid
-        Err(BanValidationError::NotInInviteChain(
-            banning_member.member.id(),
-            banned_member.member.id(),
-        ))
-    }
-
-    /// Identifies bans that exceed the maximum allowed limit.
-    /// When timestamps are equal, uses BanId as a secondary sort key
-    /// for deterministic ordering (CRDT convergence requirement).
-    fn identify_excess_bans(
+    /// Per-ban validity + signature checks, EXCLUDING the `max_user_bans`
+    /// ceiling. `apply_delta` uses this because it defers cap enforcement to
+    /// `ChatRoomStateV1::post_apply_cleanup` (where the converged member_info is
+    /// available to evict inert bans before enforcing ones); `verify` layers the
+    /// hard count ceiling on top. See #410 review round 1.
+    fn verify_excluding_cap(
         &self,
         parent_state: &ChatRoomStateV1,
-        invalid_bans: &mut HashMap<BanId, BanValidationError>,
-    ) {
-        let max_bans = parent_state.configuration.configuration.max_user_bans;
-        let extra_bans = self.0.len() as isize - max_bans as isize;
-
-        if extra_bans > 0 {
-            // Add oldest extra bans to invalid bans
-            // Sort by timestamp (newest first), with BanId as tie-breaker
-            let mut extra_bans_vec = self.0.clone();
-            extra_bans_vec.sort_by(|a, b| {
-                // Primary: sort by timestamp (will be reversed, so older = later in list)
-                // Secondary: sort by BanId for deterministic tie-breaking
-                a.ban
-                    .banned_at
-                    .cmp(&b.ban.banned_at)
-                    .then_with(|| a.id().cmp(&b.id()))
-            });
-            extra_bans_vec.reverse();
-
-            for ban in extra_bans_vec.iter().take(extra_bans as usize) {
-                invalid_bans.insert(ban.id(), BanValidationError::ExceededMaximumBans);
-            }
-        }
-    }
-}
-
-impl ComposableState for BansV1 {
-    type ParentState = ChatRoomStateV1;
-    type Summary = HashSet<BanId>;
-    type Delta = Vec<AuthorizedUserBan>;
-    type Parameters = ChatRoomParametersV1;
-
-    /// Verifies that all bans in the collection are valid
-    ///
-    /// Checks that:
-    /// - All bans have valid signatures
-    /// - Banning members are authorized to ban (in invite chain)
-    /// - The number of bans doesn't exceed the maximum allowed
-    fn verify(
-        &self,
-        parent_state: &Self::ParentState,
-        parameters: &Self::Parameters,
+        parameters: &ChatRoomParametersV1,
     ) -> Result<(), String> {
         let invalid_bans = self.get_invalid_bans(parent_state, parameters);
         if !invalid_bans.is_empty() {
@@ -258,21 +164,11 @@ impl ComposableState for BansV1 {
             return Err(format!("Invalid bans: {}", error_messages.join(", ")));
         }
 
-        // Check if the number of bans exceeds the maximum allowed
-        if self.0.len() > parent_state.configuration.configuration.max_user_bans {
-            return Err(format!(
-                "Number of bans ({}) exceeds the maximum allowed ({})",
-                self.0.len(),
-                parent_state.configuration.configuration.max_user_bans
-            ));
-        }
-
         let members_by_id = parent_state.members.members_by_member_id();
-
         let owner_vk = parameters.owner;
         let owner_id = parameters.owner_id();
 
-        // Verify signatures for all bans
+        // Verify signatures for all bans.
         for ban in &self.0 {
             if ban.banned_by == owner_id {
                 ban.verify_signature(&owner_vk)
@@ -289,6 +185,125 @@ impl ComposableState for BansV1 {
                 // the ban was first created. post_apply_cleanup will remove
                 // truly orphaned bans (where the banner was banned, not pruned).
             }
+        }
+
+        Ok(())
+    }
+
+    /// Re-verify `ban`'s signature against the banner's CURRENT converged key
+    /// (#411 round 4 item A). Returns `true` iff the banner is the owner or a
+    /// current member AND the stored signature verifies against that banner's
+    /// current verifying key; `false` for a non-member banner (unverifiable) or a
+    /// signature that does not match — a forged/replayed ban.
+    ///
+    /// This closes the SAME-DELTA replay bypass. Field order applies `bans`
+    /// before `members`, so `verify` SKIPS the signature check for a banner that
+    /// is absent from the parent state at bans-apply time (see
+    /// `verify_excluding_cap`). A single delta that re-adds a pruned deputy via
+    /// their PUBLIC, replayable `AuthorizedMember` AND carries a garbage-signature
+    /// ban attributed to that deputy would otherwise have the ban ENFORCED by
+    /// `post_apply_cleanup` once the deputy is a current member (the retained
+    /// deputy grant authorizes it) — a ban forged without the deputy's private
+    /// key. ENFORCEMENT re-checks the signature against the converged key, so the
+    /// apply-time skip no longer matters. It can never false-reject a genuine
+    /// ban: a `MemberId` is the hash of its verifying key, so a current member's
+    /// key is exactly the one that produced their id, and a ban legitimately
+    /// signed by that member always verifies.
+    ///
+    /// `verify` itself is deliberately NOT tightened (that would strand the
+    /// Official room's migration PUT, which carries legitimately sig-skipped
+    /// non-member-banner bans); the check lives only in enforcement.
+    pub fn ban_signature_matches_current_key(
+        ban: &AuthorizedUserBan,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        owner_id: MemberId,
+        owner_vk: &VerifyingKey,
+    ) -> bool {
+        let banner = ban.banned_by;
+        let vk = if banner == owner_id {
+            *owner_vk
+        } else if let Some(member) = members_by_id.get(&banner) {
+            member.member.member_vk
+        } else {
+            // Non-member banner: unverifiable here (key unavailable). Treated as
+            // not-matching so callers classify it inert / sweep it.
+            return false;
+        };
+        ban.verify_signature(&vk).is_ok()
+    }
+
+    /// Whether `ban` is currently ENFORCING (worth keeping under `max_user_bans`
+    /// pressure) rather than INERT (evicted first). Pure function of the
+    /// converged `(members + member_info)` state (#410 review round 1).
+    ///
+    /// - The banner must be the owner or a current member AND the ban's signature
+    ///   must verify against that banner's CURRENT key
+    ///   ([`Self::ban_signature_matches_current_key`], #411 round 4 A). A
+    ///   non-member banner, or a forged/replayed ban whose signature does not
+    ///   match the converged key, is inert.
+    /// - If the target is a **current member**, the ban is enforcing iff its
+    ///   banner is currently authorized to ban it
+    ///   ([`MembersV1::is_ban_authorized`]). A forged ban on a present member,
+    ///   or a revoked-deputy ban whose target rejoined, is inert.
+    /// - If the target is **absent** (already removed/pruned), keep the ban (its
+    ///   banner is a signature-verified owner/member): a real enforcing ban.
+    pub fn ban_is_enforcing(
+        ban: &AuthorizedUserBan,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        member_info: &MemberInfoV1,
+        owner_id: MemberId,
+        owner_vk: &VerifyingKey,
+    ) -> bool {
+        let banner = ban.banned_by;
+        // A ban can only enforce while its banner is the owner or a current
+        // member (#411 round 3). A non-member banner ID — a stale/pruned deputy,
+        // or a forged one — must NOT make a ban enforcing, and such bans are
+        // swept from state entirely in `post_apply_cleanup`.
+        if banner != owner_id && !members_by_id.contains_key(&banner) {
+            return false;
+        }
+        // Re-verify the signature against the banner's CURRENT converged key
+        // (#411 round 4 A). Closes the same-delta pruned-deputy-replay bypass:
+        // `verify` skipped this at apply time because the banner was absent then.
+        if !Self::ban_signature_matches_current_key(ban, members_by_id, owner_id, owner_vk) {
+            return false;
+        }
+        let target = ban.ban.banned_user;
+        if members_by_id.contains_key(&target) {
+            MembersV1::is_ban_authorized(banner, target, members_by_id, member_info, owner_id)
+        } else {
+            // Target already removed and the banner is a signature-verified owner
+            // or current member (checked above): a real enforcing ban worth keeping.
+            true
+        }
+    }
+}
+
+impl ComposableState for BansV1 {
+    type ParentState = ChatRoomStateV1;
+    type Summary = HashSet<BanId>;
+    type Delta = Vec<AuthorizedUserBan>;
+    type Parameters = ChatRoomParametersV1;
+
+    /// Verifies that all bans in the collection are valid:
+    /// - per-ban orphan constraints hold and all signatures are valid
+    ///   (`verify_excluding_cap`), AND
+    /// - the number of bans does not exceed `max_user_bans` (the hard ceiling
+    ///   on stored state; a legitimately-produced state is already ≤ the cap
+    ///   because `post_apply_cleanup` evicts inert-first down to it).
+    fn verify(
+        &self,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+    ) -> Result<(), String> {
+        self.verify_excluding_cap(parent_state, parameters)?;
+
+        if self.0.len() > parent_state.configuration.configuration.max_user_bans {
+            return Err(format!(
+                "Number of bans ({}) exceeds the maximum allowed ({})",
+                self.0.len(),
+                parent_state.configuration.configuration.max_user_bans
+            ));
         }
 
         Ok(())
@@ -329,15 +344,25 @@ impl ComposableState for BansV1 {
         }
     }
 
-    /// Applies changes from a delta to the current ban state
+    /// Applies changes from a delta to the current ban state.
     ///
     /// This method:
     /// - Checks for duplicate bans
-    /// - Verifies all new bans are valid
+    /// - Verifies all new bans are valid (per-ban + signatures), EXCLUDING the
+    ///   `max_user_bans` ceiling
     /// - Adds the new bans to the collection
-    /// - Removes oldest bans if the total exceeds max_user_bans
     ///
-    /// Returns an error if any ban in the delta is invalid or already exists
+    /// It deliberately does NOT enforce `max_user_bans` here. The cap is
+    /// enforced in `ChatRoomStateV1::post_apply_cleanup`, which evicts INERT
+    /// (currently-unauthorized) bans before enforcing ones — using the converged
+    /// `member_info`, which is not yet available at this point in the field-apply
+    /// order. Capping here (by oldest, as before) would let a flood of
+    /// forged/inert bans evict the real moderator bans and un-ban spammers
+    /// (#410 review round 1). The transient over-cap set is capped by
+    /// post_apply_cleanup at the end of the same whole-state apply; `verify`
+    /// still rejects any stored state that is over the cap.
+    ///
+    /// Returns an error if any ban in the delta is invalid or already exists.
     fn apply_delta(
         &mut self,
         parent_state: &Self::ParentState,
@@ -345,6 +370,31 @@ impl ComposableState for BansV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(delta) = delta {
+            // Bound the number of NEW bans a single delta may carry (#411 round
+            // 3 item C). Since post_apply_cleanup caps stored state at
+            // `max_user_bans`, ANY legitimate peer's ban list — and therefore
+            // any legitimate delta (a summary-diff against another peer) — holds
+            // at most `max_user_bans` bans. A larger delta can only be a forged
+            // flood; rejecting it bounds the O(N) signature-verification work
+            // below (round 2 removed the pre-verify cap that used to do this).
+            // Deterministic across peers, so it does not affect convergence: a
+            // legitimate delta is never over the bound, and a flood is rejected
+            // identically everywhere.
+            //
+            // Transient skew during a `max_user_bans` REDUCTION: config applies
+            // before bans in field order, so a peer that has already applied the
+            // lower (monotonic) cap may briefly reject a ban-only delta from a
+            // peer still lagging on the old higher cap. Self-heals once the
+            // config converges (the lagging peer re-derives a within-bound delta).
+            let max_bans = parent_state.configuration.configuration.max_user_bans;
+            if delta.len() > max_bans {
+                return Err(format!(
+                    "Ban delta of {} exceeds max_user_bans ({}); refusing to process a flood",
+                    delta.len(),
+                    max_bans
+                ));
+            }
+
             // Check for duplicate bans
             let existing_ban_ids: std::collections::HashSet<_> =
                 self.0.iter().map(|ban| ban.id()).collect();
@@ -354,32 +404,13 @@ impl ComposableState for BansV1 {
                 }
             }
 
-            // Create a temporary BansV1 with the new bans
+            // Create a temporary BansV1 with the new bans and validate WITHOUT
+            // the max-cap ceiling (deferred to post_apply_cleanup).
             let mut temp_bans = self.clone();
             temp_bans.0.extend(delta.iter().cloned());
-
-            // Remove oldest bans if we exceed the limit
-            let max_bans = parent_state.configuration.configuration.max_user_bans;
-            if temp_bans.0.len() > max_bans {
-                // Sort by banned_at time (oldest first), with BanId tie-breaking
-                // for deterministic ordering (CRDT convergence requirement)
-                temp_bans.0.sort_by(|a, b| {
-                    a.ban
-                        .banned_at
-                        .cmp(&b.ban.banned_at)
-                        .then_with(|| a.id().cmp(&b.id()))
-                });
-                // Remove oldest bans to get back to the limit
-                let to_remove = temp_bans.0.len() - max_bans;
-                temp_bans.0.drain(0..to_remove);
-            }
-
-            // Verify the temporary room_state (excluding the max_bans check since we just enforced it)
-            if let Err(e) = temp_bans.verify(parent_state, parameters) {
+            if let Err(e) = temp_bans.verify_excluding_cap(parent_state, parameters) {
                 return Err(format!("Invalid delta: {}", e));
             }
-
-            // If verification passes, update the actual room_state
             self.0 = temp_bans.0;
         }
 
@@ -791,13 +822,18 @@ mod tests {
         );
         assert_eq!(bans.0[0], new_ban, "Applied ban should match the new ban");
 
-        // Test 2: Apply delta exceeding max_user_bans - should succeed by removing oldest bans
+        // Test 2: A delta that pushes past max_user_bans NO LONGER caps here.
+        // The cap moved to `ChatRoomStateV1::post_apply_cleanup` so it can evict
+        // INERT-before-enforcing bans using the converged member_info (#410
+        // review round 1). `apply_delta` accumulates all valid bans; the
+        // whole-state cleanup enforces the ceiling. (State-level capping +
+        // inert-first eviction are covered by the DoS test in
+        // `common/tests/deputy_ban_test.rs`.)
         let mut many_bans = Vec::new();
         for i in 0..5 {
             many_bans.push(AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    // Give each ban a different timestamp so we can verify oldest are removed
                     banned_at: SystemTime::now() + Duration::from_secs(i as u64 + 10),
                     banned_user: member_id,
                 },
@@ -809,19 +845,18 @@ mod tests {
         assert!(
             bans.apply_delta(&state, &params, &delta_exceeding_max)
                 .is_ok(),
-            "Delta exceeding max_user_bans should succeed by removing oldest: {:?}",
+            "Applying more bans should succeed: {:?}",
             bans.apply_delta(&state, &params, &delta_exceeding_max)
                 .err()
         );
         assert_eq!(
             bans.0.len(),
-            5,
-            "Bans should be at max_user_bans limit after removing oldest"
+            6,
+            "apply_delta accumulates without capping (cap is enforced in post_apply_cleanup)"
         );
-        // The original new_ban (the oldest) should have been removed
         assert!(
-            !bans.0.contains(&new_ban),
-            "Oldest ban should have been removed"
+            bans.0.contains(&new_ban),
+            "apply_delta must NOT drop the oldest ban — evicting is post_apply_cleanup's job"
         );
 
         // Test 3: Apply invalid delta (duplicate ban) - use one of the bans still in the list
@@ -834,11 +869,11 @@ mod tests {
         );
         assert_eq!(
             bans.0.len(),
-            5,
+            6,
             "State should not change after applying duplicate ban"
         );
 
-        // Test 4: Adding more bans should evict oldest ones but keep max_user_bans
+        // Test 4: More valid bans keep accumulating (still no cap at this level).
         let mut additional_bans = Vec::new();
         for i in 0..2 {
             additional_bans.push(AuthorizedUserBan::new(
@@ -854,13 +889,13 @@ mod tests {
         assert!(
             bans.apply_delta(&state, &params, &Some(additional_bans))
                 .is_ok(),
-            "Applying more bans should succeed by evicting oldest: {:?}",
+            "Applying more bans should succeed: {:?}",
             bans.apply_delta(&state, &params, &Some(Vec::new())).err()
         );
         assert_eq!(
             bans.0.len(),
-            5,
-            "State should still have max number of bans after evicting oldest"
+            8,
+            "apply_delta keeps accumulating; the cap is enforced by post_apply_cleanup"
         );
     }
 

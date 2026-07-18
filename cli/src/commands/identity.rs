@@ -116,12 +116,10 @@ async fn export_identity(
     let (member_info, room_name) = match api_client.get_room(&room_owner_key, false).await {
         Ok(room_state) => {
             let self_id = MemberId::from(&signing_key.verifying_key());
-            let info = room_state
-                .member_info
-                .member_info
-                .iter()
-                .find(|i| i.member_info.member_id == self_id)
-                .cloned();
+            // `canonical`, not a bare `.find()` (#411 round 8 item A): a state
+            // can hold more than one member_info record for self, and a bare
+            // first-match could export a losing (revoked) duplicate.
+            let info = room_state.member_info.canonical(self_id).cloned();
             let name = match &room_state.configuration.configuration.display.name {
                 river_core::room_state::privacy::SealedBytes::Public { value } => {
                     Some(String::from_utf8_lossy(value).to_string())

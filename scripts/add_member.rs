@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
         member_id: github_bot_id,
         version: 0,
         preferred_nickname: SealedBytes::public("GitHub Bot".to_string().into_bytes()),
+        deputies: Vec::new(),
     };
     let authorized_member_info = AuthorizedMemberInfo::new(member_info, &github_bot_sk);
 

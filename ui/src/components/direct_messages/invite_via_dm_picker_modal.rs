@@ -173,9 +173,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                 room_data
                     .room_state
                     .member_info
-                    .member_info
-                    .iter()
-                    .find(|mi| mi.member_info.member_id == target_peer)
+                    .canonical(target_peer)
                     .map(|mi| {
                         match unseal_bytes_with_secrets(&mi.member_info.preferred_nickname, secrets)
                         {

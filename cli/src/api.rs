@@ -184,11 +184,18 @@ fn decrypt_private_body_text(
 /// private-room nicknames). Plain text without tokens is returned unchanged.
 pub(crate) fn render_mentions_for_terminal(room_state: &ChatRoomStateV1, text: &str) -> String {
     river_core::mention::render_plaintext(text, |r| {
+        // Resolve the mention token to a member_id first (identity lookup,
+        // not a content read — safe to leave as a bare `.find()`), then fetch
+        // that member's CANONICAL record for the nickname. A bare `.find()`
+        // straight to the nickname could return a losing (e.g. stale) duplicate
+        // record if the state holds more than one (#411 round 8 item A).
         room_state
             .member_info
             .member_info
             .iter()
             .find(|info| r.matches(info.member_info.member_id))
+            .map(|info| info.member_info.member_id)
+            .and_then(|id| room_state.member_info.canonical(id))
             .and_then(|info| info.member_info.preferred_nickname.as_public_bytes())
             .map(|bytes| String::from_utf8_lossy(bytes).to_string())
     })
@@ -701,6 +708,7 @@ fn build_new_room_state(
         member_id: owner_vk.into(),
         version: 0,
         preferred_nickname: seal(nickname.as_bytes()),
+        deputies: Vec::new(),
     };
     room_state
         .member_info
@@ -1856,6 +1864,7 @@ impl ApiClient {
                                 member_id: self_id,
                                 version: 0,
                                 preferred_nickname: sealed,
+                                deputies: Vec::new(),
                             };
                             let authorized_info = river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
                                 member_info, signing_key,
@@ -2455,11 +2464,13 @@ impl ApiClient {
 
         // Build member_info delta
         let self_id = MemberId::from(&self_vk);
+        // Route through `canonical` (#411 round 8 item A): a bare `.find()`
+        // could read a losing (revoked) duplicate record and rebuild the
+        // rejoin member_info from its version, understating the true version
+        // and letting a stale record win the next apply_delta rank comparison.
         let existing_version = room_state
             .member_info
-            .member_info
-            .iter()
-            .find(|i| i.member_info.member_id == self_id)
+            .canonical(self_id)
             .map(|i| i.member_info.version)
             .unwrap_or(0);
 
@@ -2479,6 +2490,10 @@ impl ApiClient {
             member_id: self_id,
             version: existing_version,
             preferred_nickname,
+            // A rejoining member was pruned for inactivity, so their previous
+            // member_info (and any deputy grants) was already cleaned up; they
+            // re-appoint deputies after rejoining if desired. (#410)
+            deputies: Vec::new(),
         };
         let authorized_info = AuthorizedMemberInfo::new_with_member_key(member_info, signing_key);
 
@@ -3128,9 +3143,7 @@ impl ApiClient {
         // "[Encrypted: N bytes, vN]" to every reader (including the UI) forever.
         let target_author_name = room_state
             .member_info
-            .member_info
-            .iter()
-            .find(|info| info.member_info.member_id == target_msg.message.author)
+            .canonical(target_msg.message.author)
             .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, &secrets))
             .unwrap_or_else(|| target_msg.message.author.to_string());
 
@@ -3567,9 +3580,7 @@ impl ApiClient {
         let author_str = msg.message.author.to_string();
         let nickname = room_state
             .member_info
-            .member_info
-            .iter()
-            .find(|info| info.member_info.member_id == msg.message.author)
+            .canonical(msg.message.author)
             .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
         let datetime: DateTime<Utc> = msg.message.time.into();
 
@@ -3633,9 +3644,7 @@ impl ApiClient {
         let author_str = msg.message.author.to_string();
         let nickname = room_state
             .member_info
-            .member_info
-            .iter()
-            .find(|info| info.member_info.member_id == msg.message.author)
+            .canonical(msg.message.author)
             .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
         let datetime: DateTime<Utc> = msg.message.time.into();
 
@@ -3706,9 +3715,7 @@ impl ApiClient {
                 // Get nickname if available (decrypted for a private room)
                 let nickname = room_state
                     .member_info
-                    .member_info
-                    .iter()
-                    .find(|info| info.member_info.member_id == msg.message.author)
+                    .canonical(msg.message.author)
                     .map(|info| {
                         unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
                     })
@@ -3755,9 +3762,7 @@ impl ApiClient {
 
                 let nickname = room_state
                     .member_info
-                    .member_info
-                    .iter()
-                    .find(|info| info.member_info.member_id == msg.message.author)
+                    .canonical(msg.message.author)
                     .map(|info| {
                         unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
                     });
@@ -3844,40 +3849,47 @@ impl ApiClient {
         )
         .map_err(|e| anyhow!(e))?;
 
-        // Find our current member info to get the version
-        let current_version = room_state
-            .member_info
-            .member_info
-            .iter()
-            .find(|info| info.member_info.member_id == my_member_id)
-            .map(|info| info.member_info.version)
+        // Find our current member info to get the version AND our existing
+        // deputy grants — republishing member_info replaces the whole signed
+        // record, so we must carry `deputies` forward or a nickname change would
+        // silently revoke every deputy we appointed (#410). Routes through the
+        // shared `resolve_own_member_info_base` (canonical, #411 round 8 item A)
+        // so a duplicate-holding state can't resurrect a revoked record.
+        let current_self_info = resolve_own_member_info_base(&room_state, my_member_id);
+        let current_version = current_self_info
+            .as_ref()
+            .map(|info| info.version)
             .unwrap_or(0);
+        let existing_deputies = current_self_info
+            .map(|info| info.deputies)
+            .unwrap_or_default();
 
         // Create new member info with incremented version
         let new_member_info = MemberInfo {
             member_id: my_member_id,
             version: current_version + 1,
             preferred_nickname: sealed_nickname,
+            deputies: existing_deputies,
         };
 
         // Sign with our member key
         let authorized_member_info =
             AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
 
-        // Update local state first
-        if let Some(existing_info) = room_state
+        // Update local state first. Drop ALL existing records for our own
+        // member_id (not just the first match) before pushing the new one — the
+        // new record's version (`current_version + 1`) strictly outranks any
+        // existing duplicate, so this collapses to the same single canonical
+        // record `dedup_to_canonical` would converge on, rather than leaving a
+        // stale duplicate sitting in local state alongside the new republish.
+        room_state
             .member_info
             .member_info
-            .iter_mut()
-            .find(|info| info.member_info.member_id == my_member_id)
-        {
-            *existing_info = authorized_member_info.clone();
-        } else {
-            room_state
-                .member_info
-                .member_info
-                .push(authorized_member_info.clone());
-        }
+            .retain(|info| info.member_info.member_id != my_member_id);
+        room_state
+            .member_info
+            .member_info
+            .push(authorized_member_info.clone());
 
         // Save the updated state locally
         self.storage
@@ -4000,47 +4012,25 @@ impl ApiClient {
             return Err(anyhow!("Cannot ban the room owner"));
         }
 
-        // Verify authorization: must be room owner OR in the invite chain of the banned member
+        // Verify authorization using the SAME `is_ban_authorized` predicate the
+        // contract enforces (owner OR strict-ancestor-of-target OR
+        // deputy-of-an-ancestor, including the "can't ban your deputizer"
+        // guardrail), so client-side rejection stays in lockstep with
+        // on-contract enforcement (#410).
         if my_member_id != owner_member_id {
-            // Build a map of member IDs to their AuthorizedMember for invite chain traversal
-            let members_by_id: std::collections::HashMap<_, _> = room_state
-                .members
-                .members
-                .iter()
-                .map(|m| (m.member.id(), m))
-                .collect();
-
-            // Find the banned member in the members list
-            let banned_member = members_by_id.get(&banned_member_id).ok_or_else(|| {
-                anyhow!(
-                    "Banned member not found in members list (may already be banned or removed)"
-                )
-            })?;
-
-            // Walk up the invite chain from the banned member to verify authorization
-            let mut current_id = banned_member.member.invited_by;
-            let mut found_in_chain = false;
-            let mut visited = std::collections::HashSet::new();
-
-            while current_id != owner_member_id {
-                if current_id == my_member_id {
-                    found_in_chain = true;
-                    break;
-                }
-
-                if !visited.insert(current_id) {
-                    return Err(anyhow!("Circular invite chain detected"));
-                }
-
-                let inviter = members_by_id
-                    .get(&current_id)
-                    .ok_or_else(|| anyhow!("Invite chain broken: inviter not found"))?;
-                current_id = inviter.member.invited_by;
-            }
-
-            if !found_in_chain {
+            let members_by_id = room_state.members.members_by_member_id();
+            let authorized = river_core::room_state::member::MembersV1::is_ban_authorized(
+                my_member_id,
+                banned_member_id,
+                &members_by_id,
+                &room_state.member_info,
+                owner_member_id,
+            );
+            if !authorized {
                 return Err(anyhow!(
-                    "Not authorized to ban this member. You can only ban members you invited (directly or indirectly)."
+                    "Not authorized to ban this member. You can ban members you invited \
+                     (directly or indirectly), or members within a subtree you have been \
+                     deputized over."
                 ));
             }
         }
@@ -4105,6 +4095,136 @@ impl ApiClient {
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }
+    }
+
+    /// Deputize a member (#410): grant them authority to ban within the
+    /// caller's invite subtree. Implemented by republishing the caller's own
+    /// `MemberInfo` at `version + 1` with the target added to `deputies`.
+    pub async fn deputize(
+        &self,
+        room_owner_key: &VerifyingKey,
+        member_id_short: &str,
+    ) -> Result<()> {
+        self.update_own_deputies(room_owner_key, member_id_short, true)
+            .await
+    }
+
+    /// Revoke a member's deputy authority (#410). Their prior bans stop
+    /// enforcing on the contract once this republish converges. Implemented by
+    /// republishing the caller's own `MemberInfo` at `version + 1` with the
+    /// target removed from `deputies`.
+    pub async fn revoke_deputy(
+        &self,
+        room_owner_key: &VerifyingKey,
+        member_id_short: &str,
+    ) -> Result<()> {
+        self.update_own_deputies(room_owner_key, member_id_short, false)
+            .await
+    }
+
+    /// Shared implementation for [`Self::deputize`] / [`Self::revoke_deputy`].
+    /// Republishes the caller's own signed `MemberInfo` at `version + 1` with
+    /// `target` added (`add = true`) or removed (`add = false`) from the
+    /// `deputies` list, preserving the existing sealed nickname, and sends it as
+    /// a `member_info`-only delta.
+    async fn update_own_deputies(
+        &self,
+        room_owner_key: &VerifyingKey,
+        member_id_short: &str,
+        add: bool,
+    ) -> Result<()> {
+        use river_core::room_state::member_info::MAX_DEPUTIES;
+
+        let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
+            anyhow!("Room not found. You must be a member of the room to manage deputies.")
+        })?;
+        let (signing_key, _stored_state, _contract_key_str) = room_data;
+
+        let room_state = self.get_room(room_owner_key, false).await?;
+
+        let my_member_id: MemberId = signing_key.verifying_key().into();
+        let owner_member_id: MemberId = room_owner_key.into();
+
+        // Load the caller's current signed member_info FIRST: we must preserve the
+        // (already-sealed) nickname and version-continuity when republishing, and
+        // the revoke path resolves the target against the caller's OWN deputies
+        // list (below). Routes through the shared `resolve_own_member_info_base`
+        // (canonical, #411 round 8 item A) so a duplicate-holding state can't
+        // resurrect a revoked record's deputies at a higher rank.
+        let current_self_info = resolve_own_member_info_base(&room_state, my_member_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "You don't have a member_info entry in this room yet. \
+                     Set your nickname first (`member set-nickname`), then retry."
+                )
+            })?;
+        let current_version = current_self_info.version;
+        let preferred_nickname = current_self_info.preferred_nickname.clone();
+        let mut deputies = current_self_info.deputies.clone();
+
+        // Resolve the target's full MemberId from the short id. Primary: the
+        // member_info list (a present member), same lookup as `ban_member`.
+        // Revoke fallback (#411 round 4 C): a deputy pruned for inactivity has no
+        // member_info but still sits in the caller's signed `deputies` list, so
+        // the primary lookup can't find them — match the short id against the
+        // caller's own deputies too, so the lingering grant can be revoked
+        // (otherwise it silently reactivates if the deputy's membership is later
+        // replayed).
+        let target = resolve_deputy_target(
+            &room_state.member_info.member_info,
+            &deputies,
+            member_id_short,
+            !add, // allow the own-deputies fallback only when revoking
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "Member '{}' not found. Use 'member list' to see member IDs.",
+                member_id_short
+            )
+        })?;
+
+        if target == my_member_id {
+            return Err(anyhow!("You cannot deputize yourself"));
+        }
+        if target == owner_member_id {
+            return Err(anyhow!(
+                "The room owner already has full authority; deputizing them is a no-op"
+            ));
+        }
+
+        if add {
+            if deputies.contains(&target) {
+                info!("Member is already a deputy; nothing to do");
+                return Ok(());
+            }
+            if deputies.len() >= MAX_DEPUTIES {
+                return Err(anyhow!(
+                    "You already have the maximum of {} deputies",
+                    MAX_DEPUTIES
+                ));
+            }
+            deputies.push(target);
+        } else if let Some(pos) = deputies.iter().position(|d| *d == target) {
+            deputies.remove(pos);
+        } else {
+            info!("Member is not currently a deputy; nothing to do");
+            return Ok(());
+        }
+
+        let new_member_info = MemberInfo {
+            member_id: my_member_id,
+            version: current_version + 1,
+            preferred_nickname,
+            deputies,
+        };
+        let authorized_member_info =
+            AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
+
+        let delta = ChatRoomStateV1Delta {
+            member_info: Some(vec![authorized_member_info]),
+            ..Default::default()
+        };
+        self.send_delta(room_owner_key, delta).await
     }
 
     /// Update room configuration. Only the room owner can do this.
@@ -4451,6 +4571,205 @@ impl ApiClient {
                 }
             }
         }
+    }
+}
+
+/// Resolve the caller's own CANONICAL `member_info` record to republish from —
+/// the shared base for `set_nickname`'s nickname change and
+/// `update_own_deputies`'s deputy add/revoke. Returns a clone of the winning
+/// `MemberInfo` (version, nickname, deputies) so callers can freely rebuild
+/// one field.
+///
+/// Routes through `MemberInfoV1::canonical`, NOT a bare `.find()` (#411 round
+/// 8 item A): `verify` deliberately ACCEPTS a state carrying more than one
+/// `member_info` record for the same member (migration-safety), so a client
+/// can hold such a duplicate-containing state before cleanup runs. A bare
+/// first-match `.find()` could then read a LOSING (e.g. revoked) record, and
+/// republishing it at `version + 1` would resurrect that losing record at a
+/// HIGHER rank — reactivating revoked deputy authority. `canonical` always
+/// selects the highest-`member_info_rank` record, matching what
+/// `apply_delta` / `summarize` converge on.
+fn resolve_own_member_info_base(
+    room_state: &ChatRoomStateV1,
+    member_id: MemberId,
+) -> Option<MemberInfo> {
+    room_state
+        .member_info
+        .canonical(member_id)
+        .map(|info| info.member_info.clone())
+}
+
+/// Resolve a `member set-deputy` / `revoke-deputy` short id to a full `MemberId`.
+///
+/// Primary: a present member, matched via their `member_info` (same rule as
+/// `ban_member` — full-string prefix, or a case-insensitive first-8-chars match).
+/// Revoke fallback (#411 round 4 C): when `allow_deputy_fallback` is set (the
+/// revoke path), also match the caller's OWN `deputies`, so a deputy who was
+/// pruned for inactivity — their `member_info` is gone but their id still sits in
+/// the caller's signed deputies list — can still be revoked.
+fn resolve_deputy_target(
+    member_infos: &[AuthorizedMemberInfo],
+    own_deputies: &[MemberId],
+    member_id_short: &str,
+    allow_deputy_fallback: bool,
+) -> Option<MemberId> {
+    let matches = |id: &MemberId| {
+        let s = id.to_string();
+        s.starts_with(member_id_short) || s[..8.min(s.len())].eq_ignore_ascii_case(member_id_short)
+    };
+    member_infos
+        .iter()
+        .map(|info| info.member_info.member_id)
+        .find(|id| matches(id))
+        .or_else(|| {
+            if allow_deputy_fallback {
+                own_deputies.iter().copied().find(|id| matches(id))
+            } else {
+                None
+            }
+        })
+}
+
+#[cfg(test)]
+mod deputy_resolve_tests {
+    use super::resolve_deputy_target;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member::MemberId;
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+
+    fn info(sk: &SigningKey) -> AuthorizedMemberInfo {
+        let id: MemberId = sk.verifying_key().into();
+        AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(id, 0, "n".to_string()),
+            sk,
+        )
+    }
+
+    fn short(id: &MemberId) -> String {
+        let s = id.to_string();
+        s[..8.min(s.len())].to_string()
+    }
+
+    /// #411 round 4 C: revoke can resolve a pruned deputy (no member_info) from
+    /// the caller's own deputies list; deputize cannot resolve a non-member.
+    #[test]
+    fn revoke_resolves_pruned_deputy_from_own_deputies_list() {
+        // Distinct fixed seeds → distinct keys (the cli crate's dalek does not
+        // enable the `rand` `generate` helper; mirrors the other cli tests).
+        let present = SigningKey::from_bytes(&[7u8; 32]);
+        let pruned_deputy = SigningKey::from_bytes(&[9u8; 32]);
+        let present_id: MemberId = present.verifying_key().into();
+        let pruned_id: MemberId = pruned_deputy.verifying_key().into();
+
+        // Only the present member has a member_info entry; the pruned deputy's
+        // member_info is gone but their id still sits in own_deputies.
+        let member_infos = vec![info(&present)];
+        let own_deputies = vec![pruned_id];
+
+        // A present member resolves via the primary lookup in both modes.
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &short(&present_id), false),
+            Some(present_id)
+        );
+
+        // The pruned deputy is NOT resolvable when deputizing (no member_info)...
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &short(&pruned_id), false),
+            None,
+            "deputize must not resolve a non-member"
+        );
+        // ...but IS resolvable when revoking (fallback to the caller's deputies).
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &short(&pruned_id), true),
+            Some(pruned_id),
+            "revoke resolves a pruned deputy from the caller's own deputies list"
+        );
+
+        // An unknown short id resolves to nothing even with the fallback.
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, "zzzzzzzz", true),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_own_member_info_base_tests {
+    use super::resolve_own_member_info_base;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member::MemberId;
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+    use river_core::room_state::ChatRoomStateV1;
+
+    /// #411 round 8 item A (CLI Fix A): `set_nickname` and `update_own_deputies`
+    /// republish the caller's OWN `member_info` at `version + 1`, carrying
+    /// forward the previous `deputies` list. `MemberInfoV1::verify`
+    /// deliberately ACCEPTS a state carrying more than one `member_info`
+    /// record for the same member (migration-safety), so a client can hold
+    /// such a duplicate-containing state before cleanup runs — e.g. a `grant`
+    /// at v1 (deputies=[D]) and a `revoke` at v2 (deputies=[]).
+    ///
+    /// A bare first-match `.find()` over the raw vector could read the
+    /// `grant` (if it happens to come first) and republish `deputies=[D]` at
+    /// v3 — RESURRECTING revoked deputy authority at a rank higher than the
+    /// revoke. `resolve_own_member_info_base` MUST always select the
+    /// CANONICAL (highest-rank) record — the revoke — regardless of vector
+    /// order, so the republish base is version 2 / deputies=[], and any
+    /// `version + 1` built from it is 3, never resurrecting the grant.
+    ///
+    /// This test FAILS if `resolve_own_member_info_base` is reverted to a
+    /// bare `.find(|info| info.member_info.member_id == member_id)` in the
+    /// "grant-then-revoke" vector order (the first match would be the grant).
+    #[test]
+    fn republish_base_reads_canonical_revoke_not_first_match_grant() {
+        let member_sk = SigningKey::from_bytes(&[21u8; 32]);
+        let member_id: MemberId = member_sk.verifying_key().into();
+        let deputy_id: MemberId = SigningKey::from_bytes(&[22u8; 32]).verifying_key().into();
+
+        // grant @ v1: deputies=[deputy_id].
+        let mut grant_mi = MemberInfo::new_public(member_id, 1, "nick".to_string());
+        grant_mi.deputies = vec![deputy_id];
+        let grant = AuthorizedMemberInfo::new_with_member_key(grant_mi, &member_sk);
+
+        // revoke @ v2 (higher rank): deputies cleared.
+        let mut revoke_mi = MemberInfo::new_public(member_id, 2, "nick".to_string());
+        revoke_mi.deputies = vec![];
+        let revoke = AuthorizedMemberInfo::new_with_member_key(revoke_mi, &member_sk);
+
+        for (label, entries) in [
+            ("grant-then-revoke", vec![grant.clone(), revoke.clone()]),
+            ("revoke-then-grant", vec![revoke.clone(), grant.clone()]),
+        ] {
+            let state = ChatRoomStateV1 {
+                member_info: MemberInfoV1 {
+                    member_info: entries,
+                },
+                ..Default::default()
+            };
+
+            let base = resolve_own_member_info_base(&state, member_id)
+                .unwrap_or_else(|| panic!("expected a base record ({label})"));
+
+            assert_eq!(
+                base.version, 2,
+                "republish base must be the v2 revoke, not the v1 grant ({label})"
+            );
+            assert!(
+                base.deputies.is_empty(),
+                "republish base must carry the revoke's EMPTY deputies, never \
+                 resurrecting the grant's [deputy] ({label})"
+            );
+        }
+    }
+
+    /// No `member_info` at all for this member → no base (both writers treat
+    /// this as version 0 / empty deputies, or an error for
+    /// `update_own_deputies`).
+    #[test]
+    fn no_member_info_returns_none() {
+        let state = ChatRoomStateV1::default();
+        let member_id: MemberId = SigningKey::from_bytes(&[23u8; 32]).verifying_key().into();
+        assert!(resolve_own_member_info_base(&state, member_id).is_none());
     }
 }
 
@@ -5892,6 +6211,7 @@ mod mention_cli_tests {
                 member_id: member_id(sk),
                 version: i as u32,
                 preferred_nickname: nickname.clone(),
+                deputies: Vec::new(),
             };
             state
                 .member_info

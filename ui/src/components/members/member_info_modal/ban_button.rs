@@ -10,7 +10,7 @@ use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
 #[component]
-pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String) -> Element {
+pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> Element {
     // Memos
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
         CURRENT_ROOM
@@ -165,11 +165,11 @@ pub fn BanButton(member_to_ban: MemberId, is_downstream: bool, nickname: String)
         }
     };
 
-    if is_downstream {
+    if can_ban {
         rsx! {
-            div { class: "mt-4",
+            div {
                 button {
-                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors",
+                    class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-medium rounded-lg transition-colors whitespace-nowrap",
                     onclick: move |_| show_confirmation.set(true),
                     "Ban User"
                 }

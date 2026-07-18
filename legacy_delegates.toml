@@ -183,3 +183,10 @@ description = "Before freenet-stdlib 0.6.0 -> 0.8.3 bump (dogfood): last stdlib-
 date = "2026-07-10"
 delegate_key = "3e0e07376681429abeab623c85b28fee3e0dffddc4f81601cb08e175310eda80"
 code_hash = "8bb5d06fa060b74825355a3e253f006b90f26bdfebe88ed2aa2db2e8e351cc8d"
+
+[[entry]]
+version = "V26"
+description = "Before adding MemberInfo.deputies field (deputy ban authority, #410): last pre-deputy chat-delegate generation"
+date = "2026-07-16"
+delegate_key = "b61dc292c952f5ec48f870a0f9829090968a7d03669671f619487f0b5aca8633"
+code_hash = "d91e33fcf47b4863b996fbf6bb8d782b2250a0e5037fb8dc7a030b60ac1c4de1"

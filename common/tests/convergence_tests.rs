@@ -866,8 +866,6 @@ fn test_message_convergence_stress_100_messages() {
 /// Stress test: Multiple bans with same timestamps
 #[test]
 fn test_ban_convergence_stress_same_timestamps() {
-    use std::collections::HashSet;
-
     let owner_signing_key = SigningKey::generate(&mut OsRng);
     let owner_verifying_key = owner_signing_key.verifying_key();
     let owner_id: MemberId = owner_verifying_key.into();
@@ -907,50 +905,40 @@ fn test_ban_convergence_stress_same_timestamps() {
         owner: owner_verifying_key,
     };
 
-    // Helper to extract BanIds from error message
-    fn extract_ban_ids(err: &str) -> HashSet<String> {
-        // Error format: "Invalid bans: BanId(FastHash(123)): ..., BanId(FastHash(456)): ..."
-        err.split("BanId(FastHash(")
-            .skip(1)
-            .filter_map(|s| s.split("))").next())
-            .map(|s| s.to_string())
-            .collect()
-    }
+    // The `max_user_bans` cap is now enforced deterministically in
+    // `post_apply_cleanup` (sort by (enforcing, banned_at, ban_id); #410 review
+    // round 1) instead of by the removed `identify_excess_bans`. Three orderings
+    // of the same 15 same-timestamp bans must converge to the SAME capped set of
+    // 10 — the same order-independence the original test guarded, now via the
+    // deterministic ban-id tie-break in the eviction sort.
+    let build = |ordered: Vec<AuthorizedUserBan>| {
+        let mut s = parent_state.clone();
+        s.bans = BansV1(ordered);
+        s.post_apply_cleanup(&parameters).unwrap();
+        s.bans
+    };
 
-    // State A: Original order
-    let bans_a = BansV1(bans.clone());
-
-    // State B: Reversed order
+    let bans_a = build(bans.clone());
     let mut reversed = bans.clone();
     reversed.reverse();
-    let bans_b = BansV1(reversed);
-
-    // State C: Rotated order
+    let bans_b = build(reversed);
     let mut rotated = bans.clone();
     rotated.rotate_left(7);
-    let bans_c = BansV1(rotated);
-
-    // All should fail verification identifying the same excess bans
-    let err_a = bans_a.verify(&parent_state, &parameters).unwrap_err();
-    let err_b = bans_b.verify(&parent_state, &parameters).unwrap_err();
-    let err_c = bans_c.verify(&parent_state, &parameters).unwrap_err();
-
-    // Extract the BanIds from each error (the error message order may vary due to HashMap)
-    let ids_a = extract_ban_ids(&err_a);
-    let ids_b = extract_ban_ids(&err_b);
-    let ids_c = extract_ban_ids(&err_c);
+    let bans_c = build(rotated);
 
     assert_eq!(
-        ids_a, ids_b,
-        "CONVERGENCE FAILURE: State A and B identified different excess bans"
+        bans_a, bans_b,
+        "CONVERGENCE FAILURE: orderings A and B capped to different ban sets"
     );
     assert_eq!(
-        ids_b, ids_c,
-        "CONVERGENCE FAILURE: State B and C identified different excess bans"
+        bans_b, bans_c,
+        "CONVERGENCE FAILURE: orderings B and C capped to different ban sets"
     );
-
-    // Verify we identified exactly 5 excess bans
-    assert_eq!(ids_a.len(), 5, "Should identify exactly 5 excess bans");
+    assert_eq!(
+        bans_a.0.len(),
+        10,
+        "post_apply_cleanup must cap to max_user_bans (10)"
+    );
 }
 
 // =============================================================================
@@ -1666,8 +1654,6 @@ fn test_regression_member_excess_removal_tiebreak() {
 /// After fix: Secondary sort by BanId provides deterministic ordering
 #[test]
 fn test_regression_ban_excess_identification() {
-    use std::collections::HashSet;
-
     let owner_signing_key = SigningKey::generate(&mut OsRng);
     let owner_verifying_key = owner_signing_key.verifying_key();
     let owner_id: MemberId = owner_verifying_key.into();
@@ -1714,39 +1700,33 @@ fn test_regression_ban_excess_identification() {
     // NEW BEHAVIOR (after fix):
     // Secondary sort by BanId ensures deterministic identification of excess bans.
 
-    // Helper to extract BanIds from error message
-    fn extract_ban_ids(err: &str) -> HashSet<String> {
-        err.split("BanId(FastHash(")
-            .skip(1)
-            .filter_map(|s| s.split("))").next())
-            .map(|s| s.to_string())
-            .collect()
-    }
-
-    // Collect the sets of identified excess bans from multiple orderings
-    let mut ban_id_sets: Vec<HashSet<String>> = Vec::new();
-
+    // Capping now happens deterministically in `post_apply_cleanup` (sort by
+    // (enforcing, banned_at, ban_id); #410 review round 1) rather than in the
+    // removed `identify_excess_bans`. Every rotation of the same 8 same-timestamp
+    // bans must cap to the SAME set of 5 — the ban-id tie-break keeps it
+    // deterministic, which is the regression this test guards.
+    let mut capped_sets: Vec<BansV1> = Vec::new();
     for rotation in 0..8 {
         let mut rotated = bans.clone();
         rotated.rotate_left(rotation);
-        let bans_state = BansV1(rotated);
-        let err = bans_state.verify(&parent_state, &parameters).unwrap_err();
-        ban_id_sets.push(extract_ban_ids(&err));
+        let mut state = parent_state.clone();
+        state.bans = BansV1(rotated);
+        state.post_apply_cleanup(&parameters).unwrap();
+        capped_sets.push(state.bans);
     }
 
-    // All sets should identify the same BanIds as excess
-    let first = &ban_id_sets[0];
-    for (i, ban_ids) in ban_id_sets.iter().enumerate().skip(1) {
+    let first = &capped_sets[0];
+    for (i, capped) in capped_sets.iter().enumerate().skip(1) {
         assert_eq!(
-            first, ban_ids,
-            "REGRESSION: Ban excess identification is non-deterministic!\n\
-             Rotation {} identified different excess bans. This would have failed before the fix.",
+            first, capped,
+            "REGRESSION: ban capping is non-deterministic!\n\
+             Rotation {} capped to a different set. This would have failed before the fix.",
             i
         );
     }
 
-    // Verify we identified exactly 3 excess bans (8 - 5 = 3)
-    assert_eq!(first.len(), 3, "Should identify exactly 3 excess bans");
+    // 8 bans capped to max_user_bans (5).
+    assert_eq!(first.0.len(), 5, "Should cap to exactly 5 bans");
 }
 
 /// Regression test: Message pruning order
