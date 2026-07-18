@@ -322,12 +322,14 @@ fn invite_depth(
     d
 }
 
-/// Order the member list as a DISPLAY tree (#410): a deputized member is
-/// re-parented directly under the member who deputized them, so authority reads
-/// top-to-bottom. Owner-deputized members (global mods) rise to the top under
-/// the owner. Rules:
-/// - display-parent = the deputizer highest in the invite tree (min invite
-///   depth; the owner, depth 0, wins), else the member's inviter;
+/// Order the member list as a DISPLAY tree (#410), VIEWER-SCOPED to authority
+/// that can reach the viewer: a member is re-parented under a deputizer only if
+/// that deputizer is in `viewer_ancestors` (a strict ancestor of the viewer, so
+/// their deputy could ban the viewer). This is the SAME "can ban the viewer"
+/// condition the 🛡 badge uses. Rules:
+/// - display-parent = the deputizer in `viewer_ancestors` highest in the invite
+///   tree (min invite depth; the owner, depth 0, wins), else the member's
+///   inviter (unchanged position);
 /// - a repositioned deputy carries their own invite-subtree with them;
 /// - within a parent's children, repositioned deputies list before regular
 ///   invitees; each group keeps invite-tree order;
@@ -335,11 +337,17 @@ fn invite_depth(
 ///   member an ancestor of that deputizer (mutual / descendant deputization),
 ///   fall back to the inviter (and treat them as a regular invitee).
 ///
+/// So an owner-deputized global mod rises to the top for every viewer who can be
+/// banned by them (i.e. every non-owner; the owner's `viewer_ancestors` is empty
+/// so they see a plain invite tree); a non-owner A's deputy rises under A only
+/// for viewers in A's subtree.
+///
 /// Display-only: every member appears exactly once; no authority/contract change.
 fn deputy_display_order(
     owner_id: MemberId,
     members: &MembersV1,
     deputizers_of: &HashMap<MemberId, Vec<MemberId>>,
+    viewer_ancestors: &HashSet<MemberId>,
 ) -> Vec<MemberId> {
     let inviter_of: HashMap<MemberId, MemberId> = members
         .members
@@ -386,12 +394,14 @@ fn deputy_display_order(
         let Some(deps) = deputizers_of.get(&m) else {
             continue;
         };
-        // Choose the deputizer highest in the invite tree (owner wins), among
-        // those actually connected to the owner. Tie-break by base order.
+        // Only consider deputizers who can ban the VIEWER (a strict ancestor of
+        // the viewer). Among those, choose the one highest in the invite tree
+        // (owner wins). Tie-break by base order. If none can ban the viewer, the
+        // member keeps their normal invite-tree position.
         let chosen = deps
             .iter()
             .copied()
-            .filter(|&d| invite_depth(d, owner_id, &inviter_of) != usize::MAX)
+            .filter(|&d| viewer_ancestors.contains(&d))
             .min_by_key(|&d| {
                 (
                     invite_depth(d, owner_id, &inviter_of),
@@ -457,22 +467,21 @@ fn deputy_display_order(
     ordered
 }
 
-/// Filter a member's full set of deputizers to those RELEVANT to the viewer
-/// (#410), preserving order: a deputizer who is an ancestor of the viewer (so
-/// their deputy could ban the viewer) or the viewer themselves (the viewer
-/// appointed this deputy). Drives which members get the 🛡 badge and whose
-/// names its tooltip lists. `viewer_ancestors` includes the owner (an ancestor
-/// of everyone), so a deputy of the owner — a global moderator — is relevant to
-/// every viewer.
+/// Filter a member's full set of deputizers to those whose deputy could ban the
+/// VIEWER (#410), preserving order: a deputizer that is a strict ancestor of the
+/// viewer (`viewer_ancestors`). Drives which members get the 🛡 badge and whose
+/// names its tooltip lists — the shield shows strictly when the deputy has power
+/// over the viewer. `viewer_ancestors` includes the owner for every non-owner
+/// viewer (so a global moderator is relevant to everyone who can be banned), and
+/// is EMPTY for the owner (unbannable → the owner sees no shields).
 fn relevant_deputizers(
     deputizers: &[MemberId],
     viewer_ancestors: &std::collections::HashSet<MemberId>,
-    viewer_id: MemberId,
 ) -> Vec<MemberId> {
     deputizers
         .iter()
         .copied()
-        .filter(|id| viewer_ancestors.contains(id) || *id == viewer_id)
+        .filter(|id| viewer_ancestors.contains(id))
         .collect()
 }
 
@@ -509,19 +518,18 @@ pub fn MemberList() -> Element {
             }
         }
 
-        // Order the list as a DISPLAY tree: a deputized member renders directly
-        // under the member who deputized them (owner-deputized => at the top),
-        // to convey authority visually (#410). Falls back to invite-tree order.
-        let ordered_ids = deputy_display_order(owner_id, members, &deputizers_of);
-
-        // The viewer's strict ancestors — the members whose invite subtree
-        // contains self, i.e. who could ban self — up to and INCLUDING the owner.
-        // `self` is NOT included. Used to scope the 🛡 badge to viewer-relevance
-        // (#410): a member is shown as a deputy only if one of THESE deputized
-        // them (their deputy could ban self) or the viewer appointed them.
+        // The viewer's STRICT ancestors — the members whose invite subtree
+        // contains self, i.e. who could ban self. `self` is NOT included, and it
+        // is EMPTY when the viewer is the owner (nobody can ban the owner). Used
+        // as the single "can ban the viewer" condition for BOTH the 🛡 badge
+        // (a deputy of one of these) and the display ordering below (#410).
         let self_ancestors: std::collections::HashSet<MemberId> = {
             let mut set = std::collections::HashSet::new();
-            set.insert(owner_id); // the owner is an ancestor of everyone
+            // The owner is a strict ancestor of every non-owner (but not of
+            // themselves — hence the guard, so the owner's set stays empty).
+            if self_member_id != owner_id {
+                set.insert(owner_id);
+            }
             let invited_by: std::collections::HashMap<MemberId, MemberId> = members
                 .members
                 .iter()
@@ -542,6 +550,13 @@ pub fn MemberList() -> Element {
             }
             set
         };
+
+        // Order the list as a DISPLAY tree, VIEWER-SCOPED: a member renders under
+        // a deputizer only if that deputizer could ban the viewer (is in
+        // `self_ancestors`) — so a global mod rises to the top for everyone who
+        // can be banned by them, a non-owner's deputy rises only within that
+        // member's subtree, and the owner sees a plain invite tree (#410).
+        let ordered_ids = deputy_display_order(owner_id, members, &deputizers_of, &self_ancestors);
 
         // Resolve an appointer's id to a display name (owner -> "room owner",
         // self -> "you").
@@ -609,19 +624,17 @@ pub fn MemberList() -> Element {
                 } else {
                     is_in_your_network(member_id, members, self_member_id)
                 },
-                // Scope to viewer-relevance (#410): only show/name deputizers
-                // whose authority reaches the viewer — an ancestor of self (so
-                // their deputy could ban self), or self themselves (self
-                // appointed this deputy). A deputy of some unrelated subtree is
-                // hidden; a deputy of the OWNER (a global mod) shows to everyone
-                // because the owner is in every viewer's ancestor set.
+                // The 🛡 badge shows strictly when a deputy could ban the viewer
+                // (#410): only deputizers that are strict ancestors of self. A
+                // deputy of the OWNER (global mod) shows to every non-owner; a
+                // deputy of an unrelated subtree is hidden; the OWNER (empty
+                // ancestor set) sees no shields.
                 deputized_by: relevant_deputizers(
                     deputizers_of
                         .get(&member_id)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]),
                     &self_ancestors,
-                    self_member_id,
                 )
                 .into_iter()
                 .map(&name_of)
@@ -1319,48 +1332,40 @@ mod tests {
         }
     }
 
-    /// The 🛡 deputy badge is scoped to viewer-relevance (#410): a deputy is
-    /// shown to the viewer only if an ancestor of the viewer (owner included) or
-    /// the viewer themselves appointed them.
+    /// The 🛡 deputy badge shows STRICTLY when a deputy could ban the viewer
+    /// (#410): only deputizers that are strict ancestors of the viewer. The
+    /// "you appointed them" clause is gone, and the owner (empty ancestor set)
+    /// sees no shields.
     #[test]
     fn relevant_deputizers_scopes_to_viewer() {
         use freenet_scaffold::util::FastHash;
         let mid = |n: i64| MemberId(FastHash(n));
         let owner = mid(1);
-        let a = mid(2); // an ancestor of the viewer
+        let a = mid(2); // a strict ancestor of the viewer
         let viewer = mid(4);
         let unrelated = mid(9); // a member in some OTHER subtree
-                                // viewer's ancestors always include the owner.
         let ancestors: std::collections::HashSet<MemberId> = [owner, a].into_iter().collect();
 
-        // Deputy of the OWNER (global mod) → relevant to any viewer.
+        // Deputy of the OWNER (global mod) → could ban the viewer.
+        assert_eq!(relevant_deputizers(&[owner], &ancestors), vec![owner]);
+        // Deputy of a strict ancestor of the viewer → could ban the viewer.
+        assert_eq!(relevant_deputizers(&[a], &ancestors), vec![a]);
+        // Deputy of an unrelated member → cannot ban the viewer → hidden.
+        assert!(relevant_deputizers(&[unrelated], &ancestors).is_empty());
+        // A deputy the VIEWER appointed but who is NOT an ancestor of the viewer
+        // cannot ban the viewer → now hidden (the self clause was dropped).
+        assert!(relevant_deputizers(&[viewer], &ancestors).is_empty());
+        // Mixed input keeps only the deputizers that can ban the viewer.
         assert_eq!(
-            relevant_deputizers(&[owner], &ancestors, viewer),
+            relevant_deputizers(&[owner, unrelated, viewer], &ancestors),
             vec![owner]
-        );
-        // Deputy of an ancestor of the viewer → relevant.
-        assert_eq!(relevant_deputizers(&[a], &ancestors, viewer), vec![a]);
-        // Deputy of an unrelated member (not an ancestor, not self) → hidden.
-        assert!(relevant_deputizers(&[unrelated], &ancestors, viewer).is_empty());
-        // Deputy the viewer appointed themselves → relevant ("you").
-        assert_eq!(
-            relevant_deputizers(&[viewer], &ancestors, viewer),
-            vec![viewer]
-        );
-        // Mixed input keeps only the relevant deputizers, in order.
-        assert_eq!(
-            relevant_deputizers(&[owner, unrelated, viewer], &ancestors, viewer),
-            vec![owner, viewer]
         );
 
-        // Owner viewing: their ancestor set is just {owner} and self == owner, so
-        // only owner-appointed deputies are relevant.
-        let owner_ancestors: std::collections::HashSet<MemberId> = [owner].into_iter().collect();
-        assert_eq!(
-            relevant_deputizers(&[owner], &owner_ancestors, owner),
-            vec![owner]
-        );
-        assert!(relevant_deputizers(&[a], &owner_ancestors, owner).is_empty());
+        // Owner viewing: strict ancestor set is EMPTY → the owner is unbannable
+        // → no shields at all.
+        let empty: std::collections::HashSet<MemberId> = std::collections::HashSet::new();
+        assert!(relevant_deputizers(&[owner], &empty).is_empty());
+        assert!(relevant_deputizers(&[a, owner], &empty).is_empty());
     }
 
     // Helpers for the display-ordering tests: build a real `MembersV1` (ids are
@@ -1382,11 +1387,10 @@ mod tests {
         )
     }
 
-    /// A deputized member renders directly under their deputizer; an
-    /// owner-deputized member (global mod) rises to the top; every member
-    /// appears exactly once.
+    /// For a viewer in A's subtree: an owner-deputized global mod rises to the
+    /// top, and A's deputy re-parents directly under A. Every member once.
     #[test]
-    fn deputy_display_order_places_deputies_under_deputizer() {
+    fn deputy_display_order_places_relevant_deputies_under_deputizer() {
         use rand::rngs::OsRng;
         let owner_sk = SigningKey::generate(&mut OsRng);
         let a_sk = SigningKey::generate(&mut OsRng);
@@ -1414,7 +1418,10 @@ mod tests {
         deputizers_of.insert(c_id, vec![owner_id]);
         deputizers_of.insert(d_id, vec![a_id]);
 
-        let order = deputy_display_order(owner_id, &members, &deputizers_of);
+        // Viewer is B (in A's subtree): ancestors = {owner, A}. Both C's and D's
+        // deputizers (owner, A) can ban the viewer, so both reposition.
+        let viewer_ancestors: HashSet<MemberId> = [owner_id, a_id].into_iter().collect();
+        let order = deputy_display_order(owner_id, &members, &deputizers_of, &viewer_ancestors);
 
         // C (owner-deputized) before owner's invitee A; D re-parented under A.
         assert_eq!(order, vec![owner_id, c_id, a_id, d_id, b_id]);
@@ -1423,30 +1430,110 @@ mod tests {
         assert_eq!(uniq.len(), 5, "every member appears exactly once");
     }
 
-    /// Mutual deputization must not create a cycle: the guard falls back to the
-    /// inviter, and every member still appears exactly once.
+    /// Viewer-scoped: a deputy whose deputizer CANNOT ban the viewer keeps their
+    /// normal invite-tree position (not repositioned). Same room as above, but
+    /// the viewer is C (a direct child of owner, ancestors = {owner}); A is not
+    /// an ancestor of C, so A's deputy D stays under its inviter B.
+    #[test]
+    fn deputy_display_order_is_viewer_scoped() {
+        use rand::rngs::OsRng;
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let a_sk = SigningKey::generate(&mut OsRng);
+        let b_sk = SigningKey::generate(&mut OsRng);
+        let c_sk = SigningKey::generate(&mut OsRng);
+        let d_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let a_id: MemberId = a_sk.verifying_key().into();
+        let b_id: MemberId = b_sk.verifying_key().into();
+        let c_id: MemberId = c_sk.verifying_key().into();
+        let d_id: MemberId = d_sk.verifying_key().into();
+
+        let members = MembersV1 {
+            members: vec![
+                authed(&a_sk, owner_id, &owner_sk, owner_id),
+                authed(&b_sk, a_id, &a_sk, owner_id),
+                authed(&c_sk, owner_id, &owner_sk, owner_id),
+                authed(&d_sk, b_id, &b_sk, owner_id),
+            ],
+        };
+        let mut deputizers_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+        deputizers_of.insert(c_id, vec![owner_id]);
+        deputizers_of.insert(d_id, vec![a_id]);
+
+        // Viewer C: ancestors = {owner}. Owner can ban C (C repositions to top),
+        // but A cannot (A ∉ {owner}), so D is NOT repositioned — it stays under B.
+        let viewer_ancestors: HashSet<MemberId> = [owner_id].into_iter().collect();
+        let order = deputy_display_order(owner_id, &members, &deputizers_of, &viewer_ancestors);
+
+        // C at top (global mod), then A, then A's invite-subtree B -> D unchanged.
+        assert_eq!(order, vec![owner_id, c_id, a_id, b_id, d_id]);
+        let pos = |id: MemberId| order.iter().position(|&x| x == id).unwrap();
+        assert!(
+            pos(b_id) < pos(d_id),
+            "D stays under B (not repositioned under A)"
+        );
+        assert_eq!(order.iter().copied().collect::<HashSet<_>>().len(), 5);
+    }
+
+    /// The owner sees a PLAIN invite tree: their strict-ancestor set is empty, so
+    /// nothing repositions (no deputy can ban the owner).
+    #[test]
+    fn deputy_display_order_owner_view_is_plain() {
+        use rand::rngs::OsRng;
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let a_sk = SigningKey::generate(&mut OsRng);
+        let c_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let a_id: MemberId = a_sk.verifying_key().into();
+        let c_id: MemberId = c_sk.verifying_key().into();
+
+        let members = MembersV1 {
+            members: vec![
+                authed(&a_sk, owner_id, &owner_sk, owner_id),
+                authed(&c_sk, owner_id, &owner_sk, owner_id),
+            ],
+        };
+        let mut deputizers_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+        deputizers_of.insert(c_id, vec![owner_id]); // C is a global mod
+
+        // Owner's strict-ancestor set is empty → nothing repositions.
+        let empty: HashSet<MemberId> = HashSet::new();
+        let order = deputy_display_order(owner_id, &members, &deputizers_of, &empty);
+
+        // Plain invite-tree order (members were added A then C).
+        assert_eq!(order, vec![owner_id, a_id, c_id]);
+    }
+
+    /// Mutual/descendant deputization must not create a cycle: the guard falls
+    /// back to the inviter, and every member appears exactly once.
     #[test]
     fn deputy_display_order_cycle_falls_back_to_inviter() {
         use rand::rngs::OsRng;
         let owner_sk = SigningKey::generate(&mut OsRng);
         let a_sk = SigningKey::generate(&mut OsRng);
         let b_sk = SigningKey::generate(&mut OsRng);
+        let v_sk = SigningKey::generate(&mut OsRng);
         let owner_id: MemberId = owner_sk.verifying_key().into();
         let a_id: MemberId = a_sk.verifying_key().into();
         let b_id: MemberId = b_sk.verifying_key().into();
+        let v_id: MemberId = v_sk.verifying_key().into();
 
-        // owner -> A ; owner -> B (siblings), A and B deputize each other.
+        // owner -> A -> B -> V ; B (a descendant) deputizes A (its ancestor).
         let members = MembersV1 {
             members: vec![
                 authed(&a_sk, owner_id, &owner_sk, owner_id),
-                authed(&b_sk, owner_id, &owner_sk, owner_id),
+                authed(&b_sk, a_id, &a_sk, owner_id),
+                authed(&v_sk, b_id, &b_sk, owner_id),
             ],
         };
         let mut deputizers_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
         deputizers_of.insert(a_id, vec![b_id]);
-        deputizers_of.insert(b_id, vec![a_id]);
 
-        let order = deputy_display_order(owner_id, &members, &deputizers_of);
+        // Viewer V: ancestors = {owner, A, B}. B (∈ ancestors) deputized A, but
+        // re-parenting A under B would cycle (A is B's ancestor) → guard keeps A
+        // under the owner.
+        let viewer_ancestors: HashSet<MemberId> = [owner_id, a_id, b_id].into_iter().collect();
+        let order = deputy_display_order(owner_id, &members, &deputizers_of, &viewer_ancestors);
 
         let uniq: HashSet<MemberId> = order.iter().copied().collect();
         assert_eq!(
@@ -1456,10 +1543,15 @@ mod tests {
         );
         assert_eq!(
             uniq.len(),
-            3,
-            "every member (owner, A, B) appears exactly once"
+            4,
+            "every member (owner, A, B, V) appears exactly once"
         );
         assert_eq!(order[0], owner_id, "owner is the root");
+        let pos = |id: MemberId| order.iter().position(|&x| x == id).unwrap();
+        assert!(
+            pos(a_id) < pos(b_id),
+            "A stays above B (cycle guard kept A under owner)"
+        );
     }
 
     /// Regression test for freenet/river#227 (stored XSS via nickname).
