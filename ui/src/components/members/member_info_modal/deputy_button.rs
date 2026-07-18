@@ -13,6 +13,30 @@ use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS};
 use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
 
+/// Whether the DeputyButton renders at all (vs hiding entirely).
+///
+/// - The room OWNER is never a deputy target (they already have full authority),
+///   so always hide for them.
+/// - Otherwise: **Deputize** (target is not yet my deputy) requires the viewer to
+///   hold authority (a non-empty invite subtree) — offering it to a viewer who
+///   can ban nobody advertises power they don't have. But **Revoke** of an
+///   EXISTING deputy must ALWAYS be available, even when the viewer's subtree is
+///   now empty. The exact case (#411 round 9 / Codex P2): a deputy bans the
+///   appointer's LAST active descendant, so `viewer_has_authority` flips false;
+///   without this the whole button (including Revoke) disappears and the
+///   appointer can never un-deputize them precisely after that moderation
+///   action. So an existing deputy shows the Revoke branch regardless of subtree.
+fn deputy_button_visible(
+    viewer_has_authority: bool,
+    target_is_my_deputy: bool,
+    target_is_owner: bool,
+) -> bool {
+    if target_is_owner {
+        return false;
+    }
+    viewer_has_authority || target_is_my_deputy
+}
+
 #[component]
 pub fn DeputyButton(
     target: MemberId,
@@ -20,20 +44,18 @@ pub fn DeputyButton(
     target_is_my_deputy: bool,
     nickname: String,
 ) -> Element {
-    // Anti-confusion: a viewer with an empty invite subtree can ban nobody, so
-    // offering them "Deputize" advertises power they don't have. Also never
-    // offer to deputize the room OWNER — they already have full authority and
-    // the contract treats it as a no-op (belt-and-suspenders: the modal already
-    // only mounts this for non-owner targets, #410 review round 1). Hide
-    // entirely in either case. `try_read()` for signal safety
-    // (dioxus-signal-safety): on a concurrent borrow, hide rather than panic.
+    // Visibility gate (see `deputy_button_visible`): hide for the owner, and
+    // hide the Deputize offer when the viewer has no authority — but ALWAYS keep
+    // Revoke available for an existing deputy even with an empty subtree (#411
+    // round 9). `try_read()` for signal safety (dioxus-signal-safety): on a
+    // concurrent borrow, hide rather than panic.
     let Ok(owner_key) = CURRENT_ROOM.try_read().map(|c| c.owner_key) else {
         return rsx! { "" };
     };
     let target_is_owner = owner_key
         .map(|k| MemberId::from(&k) == target)
         .unwrap_or(false);
-    if !viewer_has_authority || target_is_owner {
+    if !deputy_button_visible(viewer_has_authority, target_is_my_deputy, target_is_owner) {
         return rsx! { "" };
     }
 
@@ -96,5 +118,29 @@ pub fn DeputyButton(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deputy_button_visible;
+
+    /// #411 round 9 / Codex P2: an existing deputy must remain revocable even
+    /// when the viewer's invite subtree is now empty; Deputize still needs
+    /// authority; the owner is never a deputy target.
+    #[test]
+    fn deputy_button_gate() {
+        // Empty subtree + target IS my deputy -> Revoke must stay shown.
+        assert!(deputy_button_visible(false, true, false));
+        // Empty subtree + NOT my deputy -> hidden (no Deputize without authority).
+        assert!(!deputy_button_visible(false, false, false));
+        // Has authority + not my deputy -> Deputize shown.
+        assert!(deputy_button_visible(true, false, false));
+        // Has authority + is my deputy -> shown (Revoke).
+        assert!(deputy_button_visible(true, true, false));
+        // Owner target -> always hidden, regardless of the other flags.
+        assert!(!deputy_button_visible(true, false, true));
+        assert!(!deputy_button_visible(true, true, true));
+        assert!(!deputy_button_visible(false, true, true));
     }
 }
