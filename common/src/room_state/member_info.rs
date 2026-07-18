@@ -320,9 +320,19 @@ impl ComposableState for MemberInfoV1 {
                 || member_map.contains_key(&info.member_info.member_id)
         });
 
-        // Sort for deterministic ordering (CRDT convergence requirement)
-        self.member_info
-            .sort_by_key(|info| info.member_info.member_id);
+        // Write-side dedup (#411 round 8 Task 2 / item A): the update path above
+        // uses first-match to locate the record to update, so if the state
+        // already held DUPLICATES for a member (a full-state PUT/GET seeds them,
+        // and `verify` accepts them), a delta could update/leave a stale
+        // lower-rank one. Collapse to the single canonical (highest-rank) record
+        // per member here so the STORED vector is duplicate-free after every
+        // apply, not only after `post_apply_cleanup`. Deterministic /
+        // order-independent (max by `member_info_rank`); a no-op on the common
+        // duplicate-free case. Readers still canonicalize and must not depend on
+        // this having run (`MemberInfoV1::canonical`). `dedup_to_canonical` also
+        // sorts for deterministic ordering (CRDT convergence requirement); the
+        // <2-record case it skips is trivially sorted already.
+        self.dedup_to_canonical();
 
         Ok(())
     }
@@ -1368,5 +1378,60 @@ mod tests {
             mi.dedup_to_canonical();
             assert_eq!(before, mi, "dedup_to_canonical is idempotent");
         }
+    }
+
+    /// #411 round 8 Task 2: `apply_delta` collapses a PRE-EXISTING duplicate
+    /// state (seeded by a full-state PUT/GET, which `verify` accepts) to the
+    /// single canonical record per member on the WRITE path — not only later in
+    /// `post_apply_cleanup`. Even an empty delta triggers it.
+    #[test]
+    fn apply_delta_dedups_preexisting_duplicates_to_canonical() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = owner_vk.into();
+
+        let m_sk = SigningKey::generate(&mut OsRng);
+        let m_vk = m_sk.verifying_key();
+        let m_id: MemberId = m_vk.into();
+
+        let dep = SigningKey::generate(&mut OsRng).verifying_key().into();
+        let mut g = MemberInfo::new_public(m_id, 1, "n".to_string());
+        g.deputies = vec![dep];
+        let grant = AuthorizedMemberInfo::new_with_member_key(g, &m_sk);
+        let mut r = MemberInfo::new_public(m_id, 2, "n".to_string());
+        r.deputies = vec![];
+        let revoke = AuthorizedMemberInfo::new_with_member_key(r, &m_sk);
+
+        // Pre-existing duplicate (grant FIRST so a naive first-match would keep it).
+        let mut mi = MemberInfoV1 {
+            member_info: vec![grant, revoke],
+        };
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: m_vk,
+            },
+            &owner_sk,
+        ));
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        // Applying even an empty delta collapses the duplicate on the write path.
+        mi.apply_delta(&parent_state, &params, &None).unwrap();
+
+        let recs: Vec<_> = mi
+            .member_info
+            .iter()
+            .filter(|i| i.member_info.member_id == m_id)
+            .collect();
+        assert_eq!(
+            recs.len(),
+            1,
+            "apply_delta must collapse the pre-existing duplicate on the write path"
+        );
+        assert_eq!(recs[0].member_info.version, 2, "canonical (revoke) kept");
+        assert!(recs[0].member_info.deputies.is_empty());
     }
 }

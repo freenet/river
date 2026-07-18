@@ -130,7 +130,8 @@ impl ChatRoomStateV1 {
         //     attacker-signed, future-datable field — so a member can mint many
         //     newest-dated "enforcing" bans that outrank and evict genuine ones.
         //     The substantive fix (an authorization-aware / non-attacker-ordered
-        //     cap) is deferred pending Ian's decision; tracked separately.
+        //     cap) is deferred pending Ian's decision; tracked in
+        //     freenet/river#413 (Limitation 2).
         //
         //     CONVERGENCE HONESTY: the enforcing/inert classification is a
         //     deterministic function of the member set it runs against, but that
@@ -139,8 +140,11 @@ impl ChatRoomStateV1 {
         //     sensitive). So two peers applying the same delta multiset in a
         //     different order can evict DIFFERENT bans and NOT be byte-equal
         //     without a further exchange; anti-entropy `merge` reconciles them to
-        //     the same top-set (pinned by `cap_eviction_reconciles_via_merge`).
-        //     Do NOT claim the eviction is order-independent per delta.
+        //     the same top-set (River's ban summary is a full BanId set, so
+        //     anti-entropy always converges — pinned by
+        //     `cap_eviction_reconciles_via_merge`; tracked in freenet/river#413,
+        //     Limitation 1). Do NOT claim the eviction is order-independent per
+        //     delta.
         //     `verify`'s hard cap ceiling still rejects any stored state left over
         //     the cap. The signature sweep (step 5) still runs AFTER enforcement
         //     to drop bans orphaned by a banner's removal, and only removes bans,

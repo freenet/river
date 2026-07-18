@@ -1731,10 +1731,15 @@ fn post_apply_cleanup_is_idempotent_for_garbage_sig_member_banner() {
 /// further exchange — it classifies `ban_is_enforcing` on the INTERMEDIATE
 /// (pre-step-0) member set, which is arrival-order sensitive (cascade removal).
 /// This is a KNOWN, PRE-EXISTING limitation (reproduces with the cap at the
-/// round-6 5b position too); the substantive fix is deferred pending Ian. What
-/// we DO guarantee — and what this test pins — is that anti-entropy `merge`
-/// reconciles the two orders to the SAME state. If a future change makes the
-/// eviction order-independent per delta, revisit the softened cap comment in
+/// round-6 5b position too); the substantive fix is deferred to
+/// freenet/river#413. River accepts eventual-consistency-via-anti-entropy here
+/// (Ian's decision, direction b): the ban summary is a full BanId set, so
+/// anti-entropy always reconciles. What we DO guarantee — and what this test
+/// pins — is that the anti-entropy `merge` exchange reconciles the two delta
+/// orders to the SAME final (bans, members, member_info). This is NOT a strict
+/// per-order byte-equality test (that property does not hold and is not what
+/// River guarantees). If a future change (per #413) makes the eviction
+/// order-independent per delta, revisit the softened cap comment in
 /// `room_state.rs` and this test.
 ///
 /// Scenario: owner -> A -> B -> C (all with joins); C floods two bans of absent
@@ -1817,11 +1822,25 @@ fn cap_eviction_reconciles_via_merge() {
         d_c2.clone(),
     ]);
 
-    // Anti-entropy merge (both directions) MUST reconcile the two orders.
-    let s1 = peer1.clone();
-    let s2 = peer2.clone();
-    peer1.merge(&s1, &p, &s2).unwrap();
-    peer2.merge(&s2, &p, &s1).unwrap();
+    // Anti-entropy exchange (both directions) run to a FIXPOINT MUST reconcile
+    // the two orders. Each round: every peer merges the other's snapshot; repeat
+    // until neither changes. River's ban summary is a full BanId set, so this
+    // always converges (Ian's direction-b decision; #413).
+    let mut rounds = 0;
+    loop {
+        let s1 = peer1.clone();
+        let s2 = peer2.clone();
+        peer1.merge(&s1, &p, &s2).unwrap();
+        peer2.merge(&s2, &p, &s1).unwrap();
+        rounds += 1;
+        if (peer1.bans == s1.bans && peer2.bans == s2.bans) || rounds > 8 {
+            break;
+        }
+    }
+    assert!(
+        rounds <= 8,
+        "anti-entropy must reach a fixpoint (bounded rounds)"
+    );
 
     assert_eq!(
         peer1.bans, peer2.bans,
