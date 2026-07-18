@@ -1321,7 +1321,7 @@ fn inert_member_ban_eviction_converges_across_delta_order() {
 /// `verify` rejection, or (b) drops `skip_serializing_if` on `deputies` (old
 /// member_info signatures would then stop verifying).
 #[test]
-fn migration_compat_new_verify_accepts_old_generation_state() {
+fn new_verify_accepts_legacy_state_with_nonmember_banner_bans() {
     use river_core::room_state::privacy::SealedBytes;
 
     let owner = Peer::new();
