@@ -177,6 +177,23 @@ impl ChatRoomStateV1 {
                 }
             }
 
+            // A member who is the BANNER of any currently-retained ban is exempt
+            // from inactivity-prune (#411 round 3 item B). Otherwise an inactive
+            // moderator's bans would vanish (a banner pruned to non-member has
+            // their bans swept in step 5). Mirrors the `encrypted_secrets`
+            // exemption, is a pure function of converged state, and is bounded by
+            // the `max_user_bans` FIFO cap. Runs BEFORE the invite-chain walk so
+            // the banner's ancestors are kept too (a kept member needs a valid
+            // chain). The owner can still explicitly ban an abusive banner —
+            // banning is separate from inactivity-prune, and a banned banner's
+            // bans are then swept in step 5.
+            for ban in &self.bans.0 {
+                let banner = ban.banned_by;
+                if banner != owner_id && members_by_id.contains_key(&banner) {
+                    required_ids.insert(banner);
+                }
+            }
+
             // Walk invite chains upward, adding all ancestors (stop at owner)
             let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
             while let Some(member_id) = to_process.pop() {
@@ -221,23 +238,20 @@ impl ChatRoomStateV1 {
             m.message.author == owner_id || current_member_ids.contains(&m.message.author)
         });
 
-        // 5. Clean orphaned bans: only remove if banner was BANNED (not just pruned)
-        // A ban is orphaned when:
-        // - The banner is not the owner AND
-        // - The banner is not in the current members list AND
-        // - The banner IS in the banned users set (i.e., they were banned, not pruned)
-        let banned_user_ids: HashSet<MemberId> =
-            self.bans.0.iter().map(|b| b.ban.banned_user).collect();
-        // `current_member_ids` was computed in step 4b above (nothing between
-        // there and here changes the member set).
-
-        self.bans.0.retain(|ban| {
-            // Keep if: banner is owner, OR banner is still a member, OR banner is NOT banned
-            // (not banned = pruned for inactivity, their bans should persist)
-            ban.banned_by == owner_id
-                || current_member_ids.contains(&ban.banned_by)
-                || !banned_user_ids.contains(&ban.banned_by)
-        });
+        // 5. Sweep any ban whose banner is neither the OWNER nor a CURRENT
+        //    member (#411 round 3 item A.3). Nothing unvalidated stays in state
+        //    (AGENTS.md State Authorization Rule): `verify` skips signature
+        //    verification for non-member banners, and `is_ban_authorized` grants
+        //    nothing to a non-member banner, so a ban by a non-member is both
+        //    unverifiable and inert — a stale/pruned deputy ID or a forged
+        //    banner. Removing them here (against CONVERGED state, keeping `verify`
+        //    stable) subsumes the older "banner was banned" orphaned-ban sweep.
+        //    Real member-banners were kept present by the item-B exemption above,
+        //    so their bans survive. `current_member_ids` was computed in step 4b
+        //    (nothing between there and here changes the member set).
+        self.bans
+            .0
+            .retain(|ban| ban.banned_by == owner_id || current_member_ids.contains(&ban.banned_by));
 
         // 5b. Enforce `max_user_bans`, evicting INERT (currently-unauthorized)
         //     bans BEFORE enforcing ones. This defends the un-ban DoS: the
@@ -255,15 +269,14 @@ impl ChatRoomStateV1 {
             let members_by_id = self.members.members_by_member_id();
             // Order so the entries to DROP come first: inert-before-enforcing,
             // then oldest-before-newest, then ban id (fully deterministic).
-            self.bans.0.sort_by(|a, b| {
-                let a_enf =
-                    BansV1::ban_is_enforcing(a, &members_by_id, &self.member_info, owner_id);
-                let b_enf =
-                    BansV1::ban_is_enforcing(b, &members_by_id, &self.member_info, owner_id);
-                a_enf
-                    .cmp(&b_enf) // false (inert) sorts first → dropped first
-                    .then_with(|| a.ban.banned_at.cmp(&b.ban.banned_at))
-                    .then_with(|| a.id().cmp(&b.id()))
+            // `sort_by_cached_key` computes `ban_is_enforcing` at most ONCE per
+            // ban (not O(n log n) times inside a comparator) — #411 round 3 C.
+            self.bans.0.sort_by_cached_key(|ban| {
+                (
+                    BansV1::ban_is_enforcing(ban, &members_by_id, &self.member_info, owner_id),
+                    ban.ban.banned_at,
+                    ban.id(),
+                )
             });
             let to_remove = self.bans.0.len() - max_bans;
             self.bans.0.drain(0..to_remove);
@@ -866,8 +879,13 @@ mod tests {
         );
     }
 
+    /// #411 round 3 item B: a member who is the banner of a retained ban is
+    /// EXEMPT from inactivity-pruning, so their ban does not vanish. (Before
+    /// round 3 the banner was pruned and the ban persisted anyway; now the ban
+    /// persists BECAUSE the banner is kept present, which is what keeps it valid
+    /// under the round-3 "banner must be a current member" sweep.)
     #[test]
-    fn test_ban_persists_after_banner_pruned() {
+    fn test_banner_exempt_from_inactivity_prune_so_ban_persists() {
         let rng = &mut rand::thread_rng();
         let owner_sk = SigningKey::generate(rng);
         let owner_vk = owner_sk.verifying_key();
@@ -910,7 +928,8 @@ mod tests {
         };
         let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
 
-        // A has no messages → will be pruned
+        // A has no messages, but A is the banner of a retained ban → exempt
+        // from inactivity-prune (round 3 item B).
         let mut state = ChatRoomStateV1 {
             configuration: auth_config,
             members: MembersV1 {
@@ -922,10 +941,15 @@ mod tests {
 
         state.post_apply_cleanup(&params).unwrap();
 
-        // A should be pruned (no messages)
-        assert!(state.members.members.is_empty(), "A should be pruned");
+        // A is KEPT (exempt as a banner), not pruned.
+        assert_eq!(
+            state.members.members.len(),
+            1,
+            "A should be exempt from prune"
+        );
+        assert_eq!(state.members.members[0].member.id(), a_id);
 
-        // A's ban of C should persist (A was pruned, not banned)
+        // A's ban of C persists (banner A is still a current member).
         assert_eq!(state.bans.0.len(), 1, "Ban should persist");
         assert_eq!(state.bans.0[0].ban.banned_user, c_id);
         assert_eq!(state.bans.0[0].banned_by, a_id);

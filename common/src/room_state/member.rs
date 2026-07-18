@@ -335,11 +335,25 @@ impl MembersV1 {
         }
 
         // 2. Genuine strict ancestor — absolute (cannot be self-immunized away).
+        //    The chain walk above only reaches PRESENT members, so this grant
+        //    already implies the banner is a current member.
         if strict_ancestors.contains(&banner) {
             return true;
         }
-        // 3. Owner-appointed global moderator — absolute.
-        if member_info.deputies_of(owner_id).contains(&banner) {
+
+        // Deputy authority (steps 3 & 5) is granted to a banner ID only while
+        // that banner is a CURRENT, signature-validated member (#411 round 3).
+        // Otherwise a deputy who gets pruned leaves a stale non-member ID in
+        // some `deputies` list, and any outsider could forge a ban
+        // `banner=<stale id>` with a garbage signature (which `verify` skips for
+        // non-member banners) and have it honored as authorized — removing an
+        // arbitrary member + subtree. Requiring current membership closes that:
+        // a stale/forged deputy ID grants nothing, and a present member's ban
+        // signature is verified in `verify`.
+        let banner_is_member = members_by_id.contains_key(&banner);
+
+        // 3. Owner-appointed global moderator — absolute (among members).
+        if banner_is_member && member_info.deputies_of(owner_id).contains(&banner) {
             return true;
         }
         // 4. Guardrail: a deputy cannot ban a member who currently deputizes
@@ -349,12 +363,14 @@ impl MembersV1 {
             return false;
         }
         // 5. Deputy authority via a strict NON-owner ancestor of target.
-        for a in &strict_ancestors {
-            if *a == owner_id {
-                continue; // the owner's grant is handled absolutely in (3)
-            }
-            if member_info.deputies_of(*a).contains(&banner) {
-                return true;
+        if banner_is_member {
+            for a in &strict_ancestors {
+                if *a == owner_id {
+                    continue; // the owner's grant is handled absolutely in (3)
+                }
+                if member_info.deputies_of(*a).contains(&banner) {
+                    return true;
+                }
             }
         }
         false

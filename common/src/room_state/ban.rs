@@ -17,6 +17,25 @@ use std::time::SystemTime;
 /// This structure maintains a list of authorized bans and provides methods
 /// to verify, summarize, and apply changes to the ban list while ensuring
 /// all bans are valid according to room rules.
+///
+/// # Ban validity & the un-ban DoS (#411)
+///
+/// A ban is only honored while its banner is the OWNER or a CURRENT,
+/// signature-validated member: [`Self::ban_is_enforcing`] gates on that, and
+/// [`crate::room_state::ChatRoomStateV1::post_apply_cleanup`] sweeps any ban
+/// whose banner is neither. A member who is a banner is exempt from
+/// inactivity-pruning while they hold a retained ban, so a moderator's bans do
+/// not vanish. The `max_user_bans` FIFO is enforced there too, evicting inert
+/// (currently-unauthorized) bans before enforcing ones, and
+/// [`ComposableState::apply_delta`] bounds a single delta to `max_user_bans`
+/// new bans so a forged flood cannot make signature verification unbounded.
+///
+/// KNOWN, ACCEPTED, self-limiting residual (Ian confirmed, #411 round 3 D): a
+/// current member can still flood bans against ABSENT targets (each such ban is
+/// "enforcing" only because its banner is a member). This is pre-existing and
+/// self-limiting — the flooder is a current member, identifiable on every junk
+/// ban, and banning THEM makes their bans inert and sweeps them (freeing the
+/// cap). No code fix; documented deliberately.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
@@ -184,16 +203,20 @@ impl BansV1 {
         owner_id: MemberId,
     ) -> bool {
         let banner = ban.banned_by;
+        // A ban can only enforce while its banner is the owner or a current
+        // member (#411 round 3). A non-member banner ID — a stale/pruned deputy,
+        // or a forged one — must NOT make a ban enforcing, and such bans are
+        // swept from state entirely in `post_apply_cleanup`.
+        if banner != owner_id && !members_by_id.contains_key(&banner) {
+            return false;
+        }
         let target = ban.ban.banned_user;
         if members_by_id.contains_key(&target) {
             MembersV1::is_ban_authorized(banner, target, members_by_id, member_info, owner_id)
         } else {
-            banner == owner_id
-                || members_by_id.contains_key(&banner)
-                || member_info
-                    .member_info
-                    .iter()
-                    .any(|mi| mi.member_info.deputies.contains(&banner))
+            // Target already removed and the banner is the owner or a current
+            // member (checked above): a real enforcing ban worth keeping.
+            true
         }
     }
 }
@@ -289,6 +312,25 @@ impl ComposableState for BansV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         if let Some(delta) = delta {
+            // Bound the number of NEW bans a single delta may carry (#411 round
+            // 3 item C). Since post_apply_cleanup caps stored state at
+            // `max_user_bans`, ANY legitimate peer's ban list — and therefore
+            // any legitimate delta (a summary-diff against another peer) — holds
+            // at most `max_user_bans` bans. A larger delta can only be a forged
+            // flood; rejecting it bounds the O(N) signature-verification work
+            // below (round 2 removed the pre-verify cap that used to do this).
+            // Deterministic across peers, so it does not affect convergence: a
+            // legitimate delta is never over the bound, and a flood is rejected
+            // identically everywhere.
+            let max_bans = parent_state.configuration.configuration.max_user_bans;
+            if delta.len() > max_bans {
+                return Err(format!(
+                    "Ban delta of {} exceeds max_user_bans ({}); refusing to process a flood",
+                    delta.len(),
+                    max_bans
+                ));
+            }
+
             // Check for duplicate bans
             let existing_ban_ids: std::collections::HashSet<_> =
                 self.0.iter().map(|ban| ban.id()).collect();

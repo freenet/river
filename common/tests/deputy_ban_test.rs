@@ -921,13 +921,15 @@ fn config_max_bans(owner: &Peer, max_user_bans: usize) -> AuthorizedConfiguratio
     )
 }
 
-/// A flood of forged/inert bans over `max_user_bans` must NOT evict the real,
-/// enforcing moderator bans — the real bans survive AND still keep the spammers
-/// out. The real bans are made OLDER than the forged flood, so the previous
-/// oldest-first eviction WOULD have dropped them (this test fails under that
-/// policy and passes under inert-first eviction).
+// ===================================================================
+// Round-3: ban valid only while banner is owner/current member (#411)
+// ===================================================================
+
+/// A ban whose banner is a NON-member (a forged/random id) is SWEPT from state
+/// entirely by post_apply_cleanup — not merely evicted under the cap. Real
+/// owner/member bans survive and still enforce.
 #[test]
-fn forged_ban_flood_does_not_evict_enforcing_bans() {
+fn forged_non_member_banner_bans_are_swept() {
     let owner = Peer::new();
     let a = Peer::new();
     let s1 = Peer::new();
@@ -935,40 +937,34 @@ fn forged_ban_flood_does_not_evict_enforcing_bans() {
     let owner_id = owner.id;
     let p = params(&owner);
 
-    let members = vec![
-        member(&a, owner_id, &owner.sk, owner_id),
-        member(&s1, owner_id, &owner.sk, owner_id),
-        member(&s2, owner_id, &owner.sk, owner_id),
-    ];
-    let infos = vec![
-        info(&a, 0, vec![]),
-        info(&s1, 0, vec![]),
-        info(&s2, 0, vec![]),
-    ];
-    let msgs = vec![join(&a, owner_id), join(&s1, owner_id), join(&s2, owner_id)];
-
-    // Two real enforcing owner bans, made OLDEST (secs 1, 2).
     let real1 = ban_at(s1.id, &owner, owner_id, 1);
     let real2 = ban_at(s2.id, &owner, owner_id, 2);
-
-    // Five FORGED inert bans by fresh NON-member keys targeting present member A,
-    // all NEWER (secs 100+). is_ban_authorized(fake, A) == false -> inert.
+    // Five forged bans by fresh NON-member keys targeting present member A.
     let forged: Vec<AuthorizedUserBan> = (0..5)
         .map(|i| ban_at(a.id, &Peer::new(), owner_id, 100 + i))
         .collect();
-
-    // Order the stored list forged-first so an oldest-first cap would drop the
-    // (older) real bans.
-    let mut all = forged.clone();
+    let mut all = forged;
     all.push(real1.clone());
     all.push(real2.clone());
 
     let mut state = ChatRoomStateV1 {
         configuration: config_max_bans(&owner, 4),
-        members: MembersV1 { members },
-        member_info: MemberInfoV1 { member_info: infos },
+        members: MembersV1 {
+            members: vec![
+                member(&a, owner_id, &owner.sk, owner_id),
+                member(&s1, owner_id, &owner.sk, owner_id),
+                member(&s2, owner_id, &owner.sk, owner_id),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![
+                info(&a, 0, vec![]),
+                info(&s1, 0, vec![]),
+                info(&s2, 0, vec![]),
+            ],
+        },
         recent_messages: MessagesV1 {
-            messages: msgs,
+            messages: vec![join(&a, owner_id), join(&s1, owner_id), join(&s2, owner_id)],
             ..Default::default()
         },
         bans: BansV1(all),
@@ -977,37 +973,241 @@ fn forged_ban_flood_does_not_evict_enforcing_bans() {
 
     state.post_apply_cleanup(&p).unwrap();
 
-    assert_eq!(state.bans.0.len(), 4, "bans capped to max_user_bans");
-    assert!(
-        state.bans.0.contains(&real1),
-        "the real (older) enforcing ban of S1 must survive the forged flood"
+    assert_eq!(
+        state.bans.0.len(),
+        2,
+        "forged non-member-banner bans are swept; only the 2 real owner bans remain"
     );
     assert!(
-        state.bans.0.contains(&real2),
-        "the real (older) enforcing ban of S2 must survive the forged flood"
+        state.bans.0.contains(&real1) && state.bans.0.contains(&real2),
+        "real bans survive"
     );
     let ids = member_ids(&state);
     assert!(
         !ids.contains(&s1.id) && !ids.contains(&s2.id),
-        "the enforcing bans still enforce — S1 and S2 stay removed"
+        "real bans still enforce"
     );
-    assert!(
-        ids.contains(&a.id),
-        "A (target of the inert forged bans) stays a member"
-    );
-    state
-        .verify(&state, &p)
-        .expect("capped post-cleanup state must verify");
+    assert!(ids.contains(&a.id), "A (forged targets) stays a member");
+    state.verify(&state, &p).expect("state verifies");
 }
 
-/// The inert-first eviction is deterministic across delta order: two peers that
-/// receive the real + forged bans in opposite orders and then anti-entropy
-/// merge converge to the same capped ban set.
+/// A forged ban BY a stale/pruned deputy id (the deputy was removed from the
+/// members list but still appears in a `deputies` list) grants nothing and is
+/// swept — the victim survives. Closes the round-2 gap where a non-member
+/// deputy id was honored as an authorized banner.
 #[test]
-fn inert_ban_eviction_converges_across_delta_order() {
+fn stale_deputy_forged_ban_is_swept_and_not_enforcing() {
+    let owner = Peer::new();
+    let a = Peer::new();
+    let b = Peer::new(); // deputy of A, but NOT a current member
+    let v = Peer::new(); // victim, in A's subtree
+    let owner_id = owner.id;
+
+    let mut state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![
+                member(&a, owner_id, &owner.sk, owner_id),
+                member(&v, a.id, &a.sk, owner_id),
+            ], // B is intentionally NOT a member
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![info(&a, 1, vec![b.id]), info(&v, 0, vec![])], // A deputizes the stale id B
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&a, owner_id), join(&v, owner_id)],
+            ..Default::default()
+        },
+        // Forged ban BY the stale deputy id B (signed with B's key; B is not a member).
+        bans: BansV1(vec![ban(v.id, &b, owner_id)]),
+        ..Default::default()
+    };
+
+    state.post_apply_cleanup(&params(&owner)).unwrap();
+
+    assert!(
+        member_ids(&state).contains(&v.id),
+        "victim V survives a forged ban by a stale non-member deputy id"
+    );
+    assert!(
+        state.bans.0.is_empty(),
+        "the forged non-member-banner ban is swept from state"
+    );
+    state
+        .verify(&state, &params(&owner))
+        .expect("state verifies");
+}
+
+/// A ban with a GARBAGE signature from a PRESENT member is rejected by `verify`
+/// (the banner's key is available, so the signature is checked).
+#[test]
+fn garbage_sig_ban_from_present_member_rejected_by_verify() {
+    let owner = Peer::new();
+    let m = Peer::new();
+    let t = Peer::new();
+    let owner_id = owner.id;
+
+    let state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![
+                member(&m, owner_id, &owner.sk, owner_id),
+                member(&t, m.id, &m.sk, owner_id),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![info(&m, 0, vec![]), info(&t, 0, vec![])],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&m, owner_id), join(&t, owner_id)],
+            ..Default::default()
+        },
+        bans: BansV1(vec![AuthorizedUserBan::with_signature(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::now(),
+                banned_user: t.id,
+            },
+            m.id,
+            ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+        )]),
+        ..Default::default()
+    };
+
+    let err = state
+        .verify(&state, &params(&owner))
+        .expect_err("garbage-sig ban from a present member must be rejected");
+    assert!(
+        err.to_lowercase().contains("signature") || err.contains("Invalid ban"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Inert bans by CURRENT-MEMBER banners are not swept (banner is a member) but
+/// are evicted BEFORE enforcing bans when over the cap.
+#[test]
+fn inert_member_bans_evicted_before_enforcing_bans() {
     let owner = Peer::new();
     let a = Peer::new();
     let s1 = Peer::new();
+    let s2 = Peer::new();
+    let mods: Vec<Peer> = (0..5).map(|_| Peer::new()).collect();
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    let mut members = vec![
+        member(&a, owner_id, &owner.sk, owner_id),
+        member(&s1, owner_id, &owner.sk, owner_id),
+        member(&s2, owner_id, &owner.sk, owner_id),
+    ];
+    let mut infos = vec![
+        info(&a, 0, vec![]),
+        info(&s1, 0, vec![]),
+        info(&s2, 0, vec![]),
+    ];
+    for mm in &mods {
+        members.push(member(mm, owner_id, &owner.sk, owner_id));
+        infos.push(info(mm, 0, vec![]));
+    }
+
+    // Real enforcing owner bans (oldest).
+    let real1 = ban_at(s1.id, &owner, owner_id, 1);
+    let real2 = ban_at(s2.id, &owner, owner_id, 2);
+    // Inert bans by MEMBER banners (each mod bans A, outside their authority).
+    let inert: Vec<AuthorizedUserBan> = mods
+        .iter()
+        .enumerate()
+        .map(|(i, mm)| ban_at(a.id, mm, owner_id, 100 + i as u64))
+        .collect();
+
+    let mut all = inert;
+    all.push(real1.clone());
+    all.push(real2.clone());
+
+    let mut state = ChatRoomStateV1 {
+        configuration: config_max_bans(&owner, 4),
+        members: MembersV1 { members },
+        member_info: MemberInfoV1 { member_info: infos },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&a, owner_id)],
+            ..Default::default()
+        },
+        bans: BansV1(all),
+        ..Default::default()
+    };
+
+    state.post_apply_cleanup(&p).unwrap();
+
+    assert_eq!(state.bans.0.len(), 4, "capped to max_user_bans");
+    assert!(
+        state.bans.0.contains(&real1) && state.bans.0.contains(&real2),
+        "the enforcing owner bans survive the inert member-ban flood"
+    );
+    let ids = member_ids(&state);
+    assert!(
+        !ids.contains(&s1.id) && !ids.contains(&s2.id),
+        "enforcing bans still enforce"
+    );
+    assert!(
+        ids.contains(&a.id),
+        "A stays (inert bans do not remove them)"
+    );
+    state.verify(&state, &p).expect("state verifies");
+}
+
+/// A member is exempt from inactivity-prune while they hold a retained ban;
+/// once their bans are gone they become prunable again.
+#[test]
+fn banner_prunable_once_their_bans_are_gone() {
+    let owner = Peer::new();
+    let m = Peer::new();
+    let c = Peer::new();
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    let mut state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![member(&m, owner_id, &owner.sk, owner_id)],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![info(&m, 0, vec![])],
+        },
+        // M has NO messages; only being a banner keeps them present.
+        bans: BansV1(vec![ban(c.id, &m, owner_id)]),
+        ..Default::default()
+    };
+
+    state.post_apply_cleanup(&p).unwrap();
+    assert!(
+        member_ids(&state).contains(&m.id),
+        "M is exempt from prune while a banner"
+    );
+    assert_eq!(
+        state.bans.0.len(),
+        1,
+        "M's ban is retained (banner is a current member)"
+    );
+
+    // Remove M's ban; M is now a plain inactive member.
+    state.bans.0.clear();
+    state.post_apply_cleanup(&p).unwrap();
+    assert!(
+        !member_ids(&state).contains(&m.id),
+        "once M's bans are gone, M is prunable again"
+    );
+}
+
+/// Convergence: inert member-ban eviction is deterministic across delta order
+/// and anti-entropy merge (both peers reach identical members + bans).
+#[test]
+fn inert_member_ban_eviction_converges_across_delta_order() {
+    let owner = Peer::new();
+    let a = Peer::new();
+    let s1 = Peer::new();
+    let m1 = Peer::new();
+    let m2 = Peer::new();
+    let m3 = Peer::new();
     let owner_id = owner.id;
     let p = params(&owner);
 
@@ -1017,49 +1217,66 @@ fn inert_ban_eviction_converges_across_delta_order() {
             members: vec![
                 member(&a, owner_id, &owner.sk, owner_id),
                 member(&s1, owner_id, &owner.sk, owner_id),
+                member(&m1, owner_id, &owner.sk, owner_id),
+                member(&m2, owner_id, &owner.sk, owner_id),
+                member(&m3, owner_id, &owner.sk, owner_id),
             ],
         },
         member_info: MemberInfoV1 {
-            member_info: vec![info(&a, 0, vec![]), info(&s1, 0, vec![])],
+            member_info: vec![
+                info(&a, 0, vec![]),
+                info(&s1, 0, vec![]),
+                info(&m1, 0, vec![]),
+                info(&m2, 0, vec![]),
+                info(&m3, 0, vec![]),
+            ],
         },
         recent_messages: MessagesV1 {
-            messages: vec![join(&a, owner_id), join(&s1, owner_id)],
+            messages: vec![
+                join(&a, owner_id),
+                join(&s1, owner_id),
+                join(&m1, owner_id),
+                join(&m2, owner_id),
+                join(&m3, owner_id),
+            ],
             ..Default::default()
         },
         ..Default::default()
     };
 
     let real = ban_at(s1.id, &owner, owner_id, 1); // enforcing, oldest
-    let forged: Vec<AuthorizedUserBan> = (0..4)
-        .map(|i| ban_at(a.id, &Peer::new(), owner_id, 100 + i))
-        .collect();
-
+                                                   // Three inert bans by MEMBER banners (delta size 3 == max_user_bans, allowed).
+    let inert = vec![
+        ban_at(a.id, &m1, owner_id, 100),
+        ban_at(a.id, &m2, owner_id, 101),
+        ban_at(a.id, &m3, owner_id, 102),
+    ];
     let real_delta = river_core::room_state::ChatRoomStateV1Delta {
         bans: Some(vec![real.clone()]),
         ..Default::default()
     };
-    let forged_delta = river_core::room_state::ChatRoomStateV1Delta {
-        bans: Some(forged.clone()),
+    let inert_delta = river_core::room_state::ChatRoomStateV1Delta {
+        bans: Some(inert),
         ..Default::default()
     };
 
-    // Peer 1: forged first, then real.
+    // Peer 1: inert first, then real.
     let mut peer1 = baseline.clone();
     peer1
-        .apply_delta(&baseline.clone(), &p, &Some(forged_delta.clone()))
+        .apply_delta(&baseline.clone(), &p, &Some(inert_delta.clone()))
         .unwrap();
-    let m1 = peer1.clone();
+    let m = peer1.clone();
     peer1
-        .apply_delta(&m1, &p, &Some(real_delta.clone()))
+        .apply_delta(&m, &p, &Some(real_delta.clone()))
         .unwrap();
 
-    // Peer 2: real first, then forged.
+    // Peer 2: real first, then inert.
     let mut peer2 = baseline.clone();
     peer2
         .apply_delta(&baseline.clone(), &p, &Some(real_delta))
         .unwrap();
-    let m2 = peer2.clone();
-    peer2.apply_delta(&m2, &p, &Some(forged_delta)).unwrap();
+    let m = peer2.clone();
+    peer2.apply_delta(&m, &p, &Some(inert_delta)).unwrap();
 
     // Anti-entropy merge.
     let snap1 = peer1.clone();
@@ -1070,6 +1287,10 @@ fn inert_ban_eviction_converges_across_delta_order() {
     assert_eq!(
         peer1.bans, peer2.bans,
         "capped ban sets converge across delta order"
+    );
+    assert_eq!(
+        peer1.members, peer2.members,
+        "member sets converge across delta order"
     );
     assert!(
         peer1.bans.0.contains(&real),
