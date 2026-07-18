@@ -1650,3 +1650,78 @@ fn equal_version_member_info_diff_detected_by_anti_entropy() {
     peer1.verify(&peer1, &p).expect("peer1 verifies");
     peer2.verify(&peer2, &p).expect("peer2 verifies");
 }
+
+/// #411 round 5 — `post_apply_cleanup` must be IDEMPOTENT.
+///
+/// Round 4's step-5 sweep drops a current-member-banner ban whose signature
+/// fails, but the inactivity-prune banner-EXEMPTION still kept the banner on a
+/// bare membership check. So a content-free member P (no message / DM / current
+/// secret, not an ancestor) held SOLELY by a single GARBAGE-SIG ban Z would be
+/// KEPT on the first pass (exempted) while Z is swept, then PRUNED on a second
+/// pass (no ban left) — `cleanup(S) != cleanup(cleanup(S))`. Because Freenet runs
+/// cleanup a variable number of times and full-state PUTs bypass it via `verify`,
+/// that non-idempotence diverges the member set permanently. The fix gates the
+/// exemption on the SAME `ban_signature_matches_current_key` predicate the sweep
+/// uses, so P is pruned and Z swept together on the FIRST pass.
+///
+/// This exercises the exemption-ONLY path: unlike
+/// `same_delta_replayed_deputy_forged_ban_is_inert_and_swept` (whose forged
+/// banner has a join message and is kept by the message-author rule), P has NO
+/// content, so only the banner exemption could keep them.
+#[test]
+fn post_apply_cleanup_is_idempotent_for_garbage_sig_member_banner() {
+    let owner = Peer::new();
+    let p_member = Peer::new(); // content-free member; banner of a garbage-sig ban
+    let absent = Peer::new(); // ban target, never a member
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    // Garbage-signature ban authored by P against an ABSENT target.
+    let z = AuthorizedUserBan::with_signature(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now(),
+            banned_user: absent.id,
+        },
+        p_member.id,
+        ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+    );
+
+    // P is a member with member_info but NO message / DM / secret, and nobody is
+    // invited by P — so ONLY the banner exemption could keep them.
+    let state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![member(&p_member, owner_id, &owner.sk, owner_id)],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![info(&p_member, 0, vec![])],
+        },
+        recent_messages: MessagesV1::default(),
+        bans: BansV1(vec![z]),
+        ..Default::default()
+    };
+
+    let mut once = state.clone();
+    once.post_apply_cleanup(&p).unwrap();
+
+    let mut twice = once.clone();
+    twice.post_apply_cleanup(&p).unwrap();
+
+    // The FIRST pass already reaches the fixed point: P pruned, Z swept.
+    assert!(
+        !member_ids(&once).contains(&p_member.id),
+        "the content-free garbage-sig banner is pruned on the FIRST pass"
+    );
+    assert!(
+        once.bans.0.is_empty(),
+        "the garbage-sig ban is swept on the FIRST pass"
+    );
+    // Idempotence: a second pass changes nothing.
+    assert_eq!(
+        once, twice,
+        "post_apply_cleanup must be idempotent — no P-present/Z-absent state a \
+         second pass would change (member-set divergence otherwise)"
+    );
+    once.verify(&once, &p).expect("cleaned state verifies");
+}

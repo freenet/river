@@ -177,19 +177,41 @@ impl ChatRoomStateV1 {
                 }
             }
 
-            // A member who is the BANNER of any currently-retained ban is exempt
-            // from inactivity-prune (#411 round 3 item B). Otherwise an inactive
-            // moderator's bans would vanish (a banner pruned to non-member has
-            // their bans swept in step 5). Mirrors the `encrypted_secrets`
-            // exemption, is a pure function of converged state, and is bounded by
-            // the `max_user_bans` FIFO cap. Runs BEFORE the invite-chain walk so
-            // the banner's ancestors are kept too (a kept member needs a valid
-            // chain). The owner can still explicitly ban an abusive banner —
-            // banning is separate from inactivity-prune, and a banned banner's
-            // bans are then swept in step 5.
+            // A member who is the BANNER of a ban that will SURVIVE the step-5
+            // sweep is exempt from inactivity-prune (#411 round 3 item B).
+            // Otherwise an inactive moderator's bans would vanish (a banner pruned
+            // to non-member has their bans swept in step 5). Mirrors the
+            // `encrypted_secrets` exemption, is a pure function of converged state,
+            // and is bounded by the `max_user_bans` FIFO cap. Runs BEFORE the
+            // invite-chain walk so the banner's ancestors are kept too (a kept
+            // member needs a valid chain). The owner can still explicitly ban an
+            // abusive banner — banning is separate from inactivity-prune, and a
+            // banned banner's bans are then swept in step 5.
+            //
+            // IDEMPOTENCE (#411 round 4/5): the exemption MUST use the SAME
+            // predicate as the step-5 sweep — `ban_signature_matches_current_key`,
+            // NOT a bare `contains_key`. Round 4 made the sweep drop a
+            // current-member-banner ban whose signature FAILS; if the exemption
+            // still kept the banner on a bare membership check, a content-free
+            // member P held solely by a garbage-sig ban Z would be KEPT on pass 1
+            // (exempted) while Z is swept, then PRUNED on pass 2 (no ban left) —
+            // so `cleanup(S) != cleanup(cleanup(S))`. Because Freenet runs
+            // post_apply_cleanup a variable number of times (and full-state PUTs
+            // bypass it via verify), that non-idempotence diverges the member set
+            // permanently. Gating on the sweep predicate makes exemption ⟺
+            // retention: a banner is exempted iff its ban actually survives. No
+            // circularity — a sig-matching banner is added to `required_ids`, so it
+            // survives step 3 to step 5, where the same predicate keeps its ban.
             for ban in &self.bans.0 {
                 let banner = ban.banned_by;
-                if banner != owner_id && members_by_id.contains_key(&banner) {
+                if banner != owner_id
+                    && BansV1::ban_signature_matches_current_key(
+                        ban,
+                        &members_by_id,
+                        owner_id,
+                        &parameters.owner,
+                    )
+                {
                     required_ids.insert(banner);
                 }
             }
