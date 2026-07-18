@@ -6,7 +6,7 @@ use crate::util::{sign_struct, verify_struct};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum number of deputies a single member may list in their `MemberInfo`,
 /// to bound state-bloat abuse (deputy ban authority, #410). A `MemberInfo`
@@ -25,10 +25,20 @@ impl MemberInfoV1 {
     /// Deputies are a member's authenticated statement (their own signed
     /// `MemberInfo`) that the listed members may ban within the deputizing
     /// member's invite subtree (#410).
+    ///
+    /// If two records for the same member are ever present at once, pick the
+    /// **highest-rank** one (`member_info_rank`: higher version, else greater
+    /// signature) — the SAME winner `summarize`/`apply_delta` converge on. A
+    /// bare `.find()` (first) could return a lower-rank record and disagree with
+    /// what anti-entropy propagates, permanently diverging ban authority from
+    /// the converged state (#411 round 7 / Codex P1 #3). `verify` now rejects
+    /// duplicates outright, so this only guards a transient in-memory state
+    /// mid-apply; it makes lookup consistent with the wire layer regardless.
     pub fn deputies_of(&self, member_id: MemberId) -> &[MemberId] {
         self.member_info
             .iter()
-            .find(|info| info.member_info.member_id == member_id)
+            .filter(|info| info.member_info.member_id == member_id)
+            .max_by_key(|info| member_info_rank(info.member_info.version, &info.signature))
             .map(|info| info.member_info.deputies.as_slice())
             .unwrap_or(&[])
     }
@@ -69,6 +79,25 @@ impl ComposableState for MemberInfoV1 {
     ) -> Result<(), String> {
         let members_by_id = parent_state.members.members_by_member_id();
         let owner_id = parameters.owner_id();
+
+        // Reject a state carrying more than one `member_info` record for the same
+        // member (#411 round 7 / Codex P1 #3). Two validly-signed records for one
+        // `member_id` make `deputies_of` (which reads ONE record) and
+        // `summarize`/`apply_delta` (LWW by `member_info_rank`) disagree on that
+        // member's deputies, so ban ENFORCEMENT and ANTI-ENTROPY permanently
+        // diverge. Migration-safe: `apply_delta` keeps at most one entry per
+        // member (it updates-or-inserts by `member_id`), so every legitimately
+        // produced state — including the Official room's migration PUT — already
+        // has <=1 per member and still verifies.
+        let mut seen_member_ids: HashSet<MemberId> = HashSet::new();
+        for member_info in &self.member_info {
+            if !seen_member_ids.insert(member_info.member_info.member_id) {
+                return Err(format!(
+                    "Duplicate member_info for member: {:?}",
+                    member_info.member_info.member_id
+                ));
+            }
+        }
 
         for member_info in &self.member_info {
             let member_id = member_info.member_info.member_id;
@@ -1068,6 +1097,123 @@ mod tests {
         assert_eq!(
             member_info_v1.member_info[0].member_info.member_id,
             owner_id
+        );
+    }
+
+    /// #411 round 7 / Codex P1 #3: a state carrying TWO validly-signed
+    /// `member_info` records for the SAME member must be rejected by `verify`.
+    /// Otherwise `deputies_of` (one record) and `summarize`/`apply_delta` (LWW)
+    /// disagree on that member's deputies, diverging ban authority from
+    /// anti-entropy.
+    #[test]
+    fn verify_rejects_duplicate_member_info() {
+        let owner_signing_key = SigningKey::generate(&mut OsRng);
+        let owner_verifying_key = owner_signing_key.verifying_key();
+        let owner_id = owner_verifying_key.into();
+
+        let member_signing_key = SigningKey::generate(&mut OsRng);
+        let member_verifying_key = member_signing_key.verifying_key();
+        let member_id = member_verifying_key.into();
+
+        // Two DIFFERENT but individually-valid records for the same member
+        // (distinct versions → distinct signatures → both self-signed).
+        let info_a = AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(member_id, 1, "NickA".to_string()),
+            &member_signing_key,
+        );
+        let info_b = AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(member_id, 2, "NickB".to_string()),
+            &member_signing_key,
+        );
+
+        let member_info_v1 = MemberInfoV1 {
+            member_info: vec![info_a, info_b],
+        };
+
+        let mut parent_state = ChatRoomStateV1::default();
+        parent_state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member_verifying_key,
+            },
+            &owner_signing_key,
+        ));
+
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_verifying_key,
+        };
+
+        let result = member_info_v1.verify(&parent_state, &parameters);
+        assert!(
+            result.is_err(),
+            "verify must reject duplicate member_info for one member"
+        );
+        assert!(
+            result.unwrap_err().contains("Duplicate member_info"),
+            "error should name the duplicate"
+        );
+
+        // Sanity: a single record for that member still verifies.
+        let single = MemberInfoV1 {
+            member_info: vec![AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo::new_public(member_id, 2, "NickB".to_string()),
+                &member_signing_key,
+            )],
+        };
+        assert!(
+            single.verify(&parent_state, &parameters).is_ok(),
+            "a single member_info record must still verify"
+        );
+    }
+
+    /// #411 round 7 / Codex P1 #3: when two records for one member are present,
+    /// `deputies_of` must return the HIGHEST-rank record's deputies (higher
+    /// version, else greater signature) — the same winner `apply_delta` /
+    /// `summarize` converge on — regardless of vector order. A bare `.find()`
+    /// (first) could disagree with the converged state.
+    #[test]
+    fn deputies_of_picks_highest_rank_record() {
+        let member_signing_key = SigningKey::generate(&mut OsRng);
+        let member_id = member_signing_key.verifying_key().into();
+
+        let deputy_x = SigningKey::generate(&mut OsRng).verifying_key().into();
+        let deputy_y = SigningKey::generate(&mut OsRng).verifying_key().into();
+
+        // Lower-version record lists deputy_x; higher-version lists deputy_y.
+        let mut mi_v1 = MemberInfo::new_public(member_id, 1, "nick".to_string());
+        mi_v1.deputies = vec![deputy_x];
+        let low = AuthorizedMemberInfo::new_with_member_key(mi_v1, &member_signing_key);
+
+        let mut mi_v2 = MemberInfo::new_public(member_id, 2, "nick".to_string());
+        mi_v2.deputies = vec![deputy_y];
+        let high = AuthorizedMemberInfo::new_with_member_key(mi_v2, &member_signing_key);
+
+        // Put the LOWER-rank record FIRST so a naive `.find()` would pick it.
+        let member_info_v1 = MemberInfoV1 {
+            member_info: vec![low, high],
+        };
+
+        assert_eq!(
+            member_info_v1.deputies_of(member_id),
+            &[deputy_y],
+            "deputies_of must return the highest-version record's deputies"
+        );
+
+        // Also robust to the reverse vector order.
+        let mut mi_v1b = MemberInfo::new_public(member_id, 1, "nick".to_string());
+        mi_v1b.deputies = vec![deputy_x];
+        let low_b = AuthorizedMemberInfo::new_with_member_key(mi_v1b, &member_signing_key);
+        let mut mi_v2b = MemberInfo::new_public(member_id, 2, "nick".to_string());
+        mi_v2b.deputies = vec![deputy_y];
+        let high_b = AuthorizedMemberInfo::new_with_member_key(mi_v2b, &member_signing_key);
+        let reversed = MemberInfoV1 {
+            member_info: vec![high_b, low_b],
+        };
+        assert_eq!(
+            reversed.deputies_of(member_id),
+            &[deputy_y],
+            "deputies_of result must be independent of vector order"
         );
     }
 }

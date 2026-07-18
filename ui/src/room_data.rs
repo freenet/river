@@ -540,18 +540,43 @@ impl RoomData {
         )
     }
 
+    /// Whether SELF is ENFORCED-banned. Unlike `enforced_banned_member_ids`
+    /// (which reads only the live members list), this reconstructs self's invite
+    /// ancestry from the stored `self_authorized_member` when self has ALREADY
+    /// been removed from `members` (a prior ban+prune). Without it, a still-active
+    /// deputy/ancestor ban of a removed self is misclassified INERT, so the UI
+    /// reads self as un-banned and flaps a rejoin the contract immediately
+    /// re-bans (freenet/river#411 round 7 / Codex P2 #5).
+    fn is_self_enforced_banned(&self) -> bool {
+        let self_id = MemberId::from(&self.self_sk.verifying_key());
+        let mut members = self.room_state.members.clone();
+        if !members.members.iter().any(|m| m.member.id() == self_id) {
+            if let Some(self_member) = &self.self_authorized_member {
+                members.members.push(self_member.clone());
+            }
+        }
+        members
+            .banned_member_ids(
+                &self.room_state.bans,
+                &self.room_state.member_info,
+                &self.parameters(),
+            )
+            .contains(&self_id)
+    }
+
     /// Check if the user can send a message in the room.
     /// A user is considered a member if they are the owner, are in the active
     /// members list, or have a stored invitation (self_authorized_member).
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
         let verifying_key = self.self_sk.verifying_key();
-        let member_id = MemberId::from(&verifying_key);
 
         // Check if banned first — using the ENFORCING banned set (deputy-aware),
         // not the raw bans list. An inert ban (revoked-deputy tombstone,
         // unauthorized banner) removes nobody, so a member it names must NOT be
-        // blocked here (freenet/river#411 round 6).
-        if self.enforced_banned_member_ids().contains(&member_id) {
+        // blocked here (freenet/river#411 round 6). `is_self_enforced_banned`
+        // reconstructs self's invite ancestry when self has already been
+        // pruned from the live members list (freenet/river#411 round 7).
+        if self.is_self_enforced_banned() {
             return Err(SendMessageError::UserBanned);
         }
 
@@ -583,12 +608,13 @@ impl RoomData {
     /// Returns Ok if user is not banned AND (is owner OR has self_authorized_member OR is in members list).
     pub fn can_participate(&self) -> Result<(), SendMessageError> {
         let verifying_key = self.self_sk.verifying_key();
-        let member_id = MemberId::from(&verifying_key);
 
         // Check if banned first — using the ENFORCING banned set (deputy-aware),
         // not the raw bans list; an inert ban removes nobody (freenet/river#411
-        // round 6). See `enforced_banned_member_ids`.
-        if self.enforced_banned_member_ids().contains(&member_id) {
+        // round 6). See `enforced_banned_member_ids`. `is_self_enforced_banned`
+        // reconstructs self's invite ancestry when self has already been
+        // pruned from the live members list (freenet/river#411 round 7).
+        if self.is_self_enforced_banned() {
             return Err(SendMessageError::UserBanned);
         }
 
@@ -5133,6 +5159,117 @@ mod tests {
             "enforced-ban target must be excluded from the rotated secret"
         );
         assert!(recipients2.contains(&d_id));
+    }
+
+    // ------------------------------------------------------------------
+    // #411 round 7 / Codex P2 #5: a deputy/ancestor ban of an ALREADY-REMOVED
+    // self must still be classified ENFORCED. `enforced_banned_member_ids`
+    // walks the invite chain via the LIVE members list only, so once self has
+    // been pruned from `members` (a prior ban+prune), `is_ban_authorized`
+    // cannot reconstruct self's ancestry (the walk starts at
+    // `members_by_id.get(&self)`, which returns `None`) and a non-owner
+    // (deputy/ancestor) ban of self misreads as inert — `can_send_message`
+    // then wrongly allows a rejoin that the contract immediately re-bans (a
+    // flap). `is_self_enforced_banned` must reconstruct self's ancestry from
+    // `self_authorized_member` to catch this.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ancestor_ban_of_already_removed_self_is_enforced() {
+        use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let d_sk = SigningKey::generate(&mut rng);
+        let d_vk = d_sk.verifying_key();
+        let d_id = MemberId::from(&d_vk);
+        let s_sk = SigningKey::generate(&mut rng);
+        let s_vk = s_sk.verifying_key();
+        let s_id = MemberId::from(&s_vk);
+
+        let mut config = Configuration {
+            owner_member_id: owner_id,
+            ..Configuration::default()
+        };
+        config.configuration_version = 1;
+        let mut room_state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(config, &owner_sk),
+            ..Default::default()
+        };
+
+        // D is invited by the owner and stays a LIVE member.
+        let d_member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: d_vk,
+        };
+        room_state
+            .members
+            .members
+            .push(AuthorizedMember::new(d_member, &owner_sk));
+
+        // S is invited by D (D is S's strict ancestor / inviter), but S has
+        // ALREADY been removed from the live members list (simulating a
+        // prior ban+prune) — only `self_authorized_member` remembers the
+        // invite chain now.
+        let s_member = Member {
+            owner_member_id: owner_id,
+            invited_by: d_id,
+            member_vk: s_vk,
+        };
+        let s_authorized_member = AuthorizedMember::new(s_member, &d_sk);
+
+        // D bans S. D is S's strict ancestor, so this ban is authorized
+        // (enforcing) regardless of deputies.
+        let ban = UserBan {
+            owner_member_id: owner_id,
+            banned_at: get_current_system_time(),
+            banned_user: s_id,
+        };
+        room_state
+            .bans
+            .0
+            .push(AuthorizedUserBan::new(ban, d_id, &d_sk));
+
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+        let params_bytes = to_cbor_vec(&params);
+        let contract_key = ContractKey::from_params_and_code(
+            Parameters::from(params_bytes),
+            &ContractCode::from(ROOM_CONTRACT_WASM),
+        );
+
+        let room = RoomData {
+            owner_vk,
+            room_state,
+            self_sk: s_sk,
+            contract_key,
+            last_read_message_id: None,
+            secrets: HashMap::new(),
+            current_secret_version: None,
+            last_secret_rotation: None,
+            key_migrated_to_delegate: false,
+            self_authorized_member: Some(s_authorized_member),
+            invite_chain: vec![],
+            self_member_info: None,
+            self_nickname: None,
+            previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
+        };
+
+        // Sanity check pinning the bug: the raw live-members-only view
+        // (`enforced_banned_member_ids`) can't see S's ancestry once S is
+        // absent from `room_state.members`, so it misclassifies this
+        // genuinely-authorized ban as inert. `can_send_message` /
+        // `can_participate` must NOT rely on this alone.
+        assert!(
+            !room.enforced_banned_member_ids().contains(&s_id),
+            "sanity: the raw live-members view can't see S's ancestry"
+        );
+
+        assert_eq!(room.can_send_message(), Err(SendMessageError::UserBanned));
+        assert_eq!(room.can_participate(), Err(SendMessageError::UserBanned));
     }
 
     // ------------------------------------------------------------------

@@ -84,6 +84,14 @@ impl ChatRoomStateV1 {
     /// Bans are only removed if the banner was themselves BANNED (orphaned ban).
     /// If the banner was merely pruned for inactivity, their bans persist.
     ///
+    /// IDEMPOTENCE / CONVERGENCE INVARIANT: this function MUST be idempotent
+    /// (`cleanup(S) == cleanup(cleanup(S))`) and a pure function of the converged
+    /// state, because Freenet runs it a variable number of times across peers
+    /// (and full-state PUTs bypass it via `verify`). The `max_user_bans` cap is
+    /// therefore applied at the TOP (step 0-cap) so ban enforcement and the
+    /// banner-prune exemption read the FINAL surviving ban set — see the block
+    /// comments below and #411 round 7 / Codex P1 #1+#2.
+    ///
     /// Direct-message sweep: after pruning, any DM whose sender or
     /// recipient is now non-member or banned is dropped. Without this,
     /// adding a ban for a DM participant would silently make every
@@ -93,7 +101,66 @@ impl ChatRoomStateV1 {
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
 
-        // 0. Enforce bans from the CONVERGED state, deputy-aware (#410).
+        // 0-cap. Enforce `max_user_bans` FIRST — BEFORE ban enforcement (step 0)
+        //     and the banner inactivity-prune exemption (step 2) — so both read
+        //     the FINAL surviving (post-cap) ban set (#411 round 7 / Codex P1
+        //     #1+#2). Running the cap here, on the converged pre-enforcement
+        //     state, is what keeps `post_apply_cleanup` IDEMPOTENT and identical
+        //     across peers:
+        //       * #1: an over-cap ban that WILL be evicted must not one-shot a
+        //         member removal at step 0 that the capped converged state
+        //         cannot reproduce — a peer that only ever sees the capped state
+        //         (e.g. via a full-state PUT that bypasses cleanup) would keep
+        //         that member, so removing it here would diverge the member set.
+        //       * #2: a banner whose ban the cap evicts must NOT be exempted
+        //         from inactivity-prune at step 2. If it were (as when the cap
+        //         ran last), the banner is kept on pass 1 but its ban is then
+        //         evicted, so pass 2 prunes it — `cleanup(S) != cleanup(cleanup(S))`,
+        //         which permanently diverges peers that run cleanup a different
+        //         number of times.
+        //     Eviction drops INERT (currently-unauthorized) bans before
+        //     enforcing ones, defending the un-ban DoS: the relaxed `verify`
+        //     accepts forged/inert bans, and a flood of them over the cap would
+        //     otherwise evict the real moderator bans that keep spammers out
+        //     (#410 review round 1). The enforcing/inert classification and the
+        //     tie-break sort key are a pure function of the converged state (all
+        //     members still present, converged `member_info`), so every peer
+        //     evicts an identical set; `verify`'s hard cap ceiling still rejects
+        //     any stored state left over the cap. The signature sweep (step 5)
+        //     still runs AFTER enforcement to drop bans orphaned by a banner's
+        //     removal, and only removes bans, so the ban count stays <= the cap.
+        let max_bans = self.configuration.configuration.max_user_bans;
+        if self.bans.0.len() > max_bans {
+            let members_by_id = self.members.members_by_member_id();
+            // Order so the entries to DROP come first: inert-before-enforcing,
+            // then oldest-before-newest, then ban id (fully deterministic).
+            // `sort_by_cached_key` computes `ban_is_enforcing` at most ONCE per
+            // ban (not O(n log n) times inside a comparator) — #411 round 3 C.
+            self.bans.0.sort_by_cached_key(|ban| {
+                (
+                    BansV1::ban_is_enforcing(
+                        ban,
+                        &members_by_id,
+                        &self.member_info,
+                        owner_id,
+                        &parameters.owner,
+                    ),
+                    ban.ban.banned_at,
+                    ban.id(),
+                )
+            });
+            let to_remove = self.bans.0.len() - max_bans;
+            self.bans.0.drain(0..to_remove);
+            // Restore the canonical (banned_at, id) stored order.
+            self.bans.0.sort_by(|a, b| {
+                a.ban
+                    .banned_at
+                    .cmp(&b.ban.banned_at)
+                    .then_with(|| a.id().cmp(&b.id()))
+            });
+        }
+
+        // 0. Enforce bans from the CONVERGED (now capped) state, deputy-aware (#410).
         //
         // `MembersV1::apply_delta` already removed members banned by the owner
         // or an ancestor, but it ran BEFORE the sibling `member_info` field
@@ -181,12 +248,16 @@ impl ChatRoomStateV1 {
             // sweep is exempt from inactivity-prune (#411 round 3 item B).
             // Otherwise an inactive moderator's bans would vanish (a banner pruned
             // to non-member has their bans swept in step 5). Mirrors the
-            // `encrypted_secrets` exemption, is a pure function of converged state,
-            // and is bounded by the `max_user_bans` FIFO cap. Runs BEFORE the
-            // invite-chain walk so the banner's ancestors are kept too (a kept
-            // member needs a valid chain). The owner can still explicitly ban an
-            // abusive banner — banning is separate from inactivity-prune, and a
-            // banned banner's bans are then swept in step 5.
+            // `encrypted_secrets` exemption and is a pure function of converged
+            // state. `self.bans.0` was ALREADY capped to `max_user_bans` at step
+            // 0-cap (top of this function), so this loop iterates only the
+            // surviving bans: a banner whose ban the cap evicted is NOT exempted
+            // here, so it is not kept on pass 1 and then pruned on pass 2 (#411
+            // round 7 / Codex P1 #2 — the cap MUST precede this exemption).
+            // Runs BEFORE the invite-chain walk so the banner's ancestors are
+            // kept too (a kept member needs a valid chain). The owner can still
+            // explicitly ban an abusive banner — banning is separate from
+            // inactivity-prune, and a banned banner's bans are then swept in step 5.
             //
             // IDEMPOTENCE (#411 round 4/5): the exemption MUST use the SAME
             // predicate as the step-5 sweep — `ban_signature_matches_current_key`,
@@ -251,14 +322,22 @@ impl ChatRoomStateV1 {
         //     after the recent_messages field has been applied) would otherwise
         //     leave orphaned messages that fail `MessagesV1::verify`
         //     ("Message author not found"). Owner-authored messages are always
-        //     valid. `MessagesV1::actions_state` is a `#[serde(skip)]` computed
-        //     cache (rebuilt on the next apply_delta, and by the UI's private
-        //     rebuild), so it is intentionally not recomputed here.
+        //     valid.
         let current_member_ids: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
         self.recent_messages.messages.retain(|m| {
             m.message.author == owner_id || current_member_ids.contains(&m.message.author)
         });
+
+        // Rebuild the PUBLIC `actions_state` cache now that removed authors'
+        // messages are gone (#411 round 7 / Codex P2 #4). `MessagesV1::apply_delta`
+        // already rebuilt this cache, but it ran BEFORE the sweep above, so a
+        // deputy-banned member's edit/delete/reaction would linger in the cache
+        // (e.g. their reaction still rendered on a message). The UI's private
+        // rebuild (`rebuild_actions_state_with_decrypted`) is a no-op for a public
+        // room, so nothing else recomputes it. This is the same public-only rebuild
+        // `apply_delta` runs; the UI re-runs its private rebuild after apply.
+        self.recent_messages.rebuild_actions_state();
 
         // 5. Sweep any ban that is not backed by a signature-verified authority
         //    (#411 round 3 item A.3 + round 4 item A). Nothing unvalidated stays
@@ -289,47 +368,10 @@ impl ChatRoomStateV1 {
             )
         });
 
-        // 5b. Enforce `max_user_bans`, evicting INERT (currently-unauthorized)
-        //     bans BEFORE enforcing ones. This defends the un-ban DoS: the
-        //     relaxed `verify` accepts forged/inert bans, and a flood of them
-        //     over the cap would otherwise evict the real moderator bans that
-        //     keep spammers out (#410 review round 1). Eviction runs HERE (not
-        //     in `BansV1::apply_delta`, which sees a stale/empty `member_info`
-        //     due to field-apply order) so the enforcing/inert classification
-        //     uses the CONVERGED state; the classification and the tie-break sort
-        //     key are a pure function of that state, so every peer evicts an
-        //     identical set. `verify`'s hard cap ceiling still rejects any stored
-        //     state left over the cap.
-        let max_bans = self.configuration.configuration.max_user_bans;
-        if self.bans.0.len() > max_bans {
-            let members_by_id = self.members.members_by_member_id();
-            // Order so the entries to DROP come first: inert-before-enforcing,
-            // then oldest-before-newest, then ban id (fully deterministic).
-            // `sort_by_cached_key` computes `ban_is_enforcing` at most ONCE per
-            // ban (not O(n log n) times inside a comparator) — #411 round 3 C.
-            self.bans.0.sort_by_cached_key(|ban| {
-                (
-                    BansV1::ban_is_enforcing(
-                        ban,
-                        &members_by_id,
-                        &self.member_info,
-                        owner_id,
-                        &parameters.owner,
-                    ),
-                    ban.ban.banned_at,
-                    ban.id(),
-                )
-            });
-            let to_remove = self.bans.0.len() - max_bans;
-            self.bans.0.drain(0..to_remove);
-            // Restore the canonical (banned_at, id) stored order.
-            self.bans.0.sort_by(|a, b| {
-                a.ban
-                    .banned_at
-                    .cmp(&b.ban.banned_at)
-                    .then_with(|| a.id().cmp(&b.id()))
-            });
-        }
+        // (The `max_user_bans` cap runs at the TOP of this function now — step
+        // "0-cap" — so ban enforcement and the banner exemption read the final
+        // surviving ban set. This signature sweep only shrinks the set further,
+        // so the count stays <= the cap. See #411 round 7 / Codex P1 #1+#2.)
 
         // 6. Sweep DMs whose participants are no longer current members
         //    or are ENFORCED-banned. Without this, a fresh ban (or member-prune)
@@ -995,6 +1037,449 @@ mod tests {
         assert_eq!(state.bans.0.len(), 1, "Ban should persist");
         assert_eq!(state.bans.0[0].ban.banned_user, c_id);
         assert_eq!(state.bans.0[0].banned_by, a_id);
+    }
+
+    /// #411 round 7 / Codex P1 #1: an over-cap ban that WILL be evicted by the
+    /// `max_user_bans` cap must NOT one-shot-remove its target. If enforcement
+    /// ran before the cap (the bug), the evicted ban would still have removed a
+    /// member the capped converged state cannot reproduce — so a peer that only
+    /// ever sees the capped state keeps that member and the two diverge.
+    #[test]
+    fn over_cap_ban_does_not_one_shot_remove() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        // Only ONE ban may survive.
+        let config = Configuration {
+            max_members: 10,
+            max_user_bans: 1,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        // Present member T with a message, so T is retained unless banned.
+        let t_sk = SigningKey::generate(rng);
+        let t_vk = t_sk.verifying_key();
+        let t_id = MemberId::from(&t_vk);
+        let member_t = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: t_vk,
+            },
+            &owner_sk,
+        );
+        let msg_t = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: t_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("hi".to_string()),
+            },
+            &t_sk,
+        );
+
+        let base = SystemTime::now();
+        // Ban of the PRESENT member T, OLDEST → evicted by the cap.
+        let ban_t = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: base,
+                banned_user: t_id,
+            },
+            owner_id,
+            &owner_sk,
+        );
+        // Ban of an ABSENT user, NEWER → survives the cap.
+        let absent = MemberId::from(&SigningKey::generate(rng).verifying_key());
+        let ban_absent = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: base + std::time::Duration::from_secs(10),
+                banned_user: absent,
+            },
+            owner_id,
+            &owner_sk,
+        );
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_t],
+            },
+            recent_messages: MessagesV1 {
+                messages: vec![msg_t],
+                ..Default::default()
+            },
+            bans: BansV1(vec![ban_t, ban_absent]),
+            ..Default::default()
+        };
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        assert!(
+            state.members.members.iter().any(|m| m.member.id() == t_id),
+            "an over-cap ban that gets evicted must NOT one-shot-remove its target"
+        );
+        assert_eq!(state.bans.0.len(), 1, "capped to max_user_bans");
+        assert!(
+            state.bans.0.iter().any(|b| b.ban.banned_user == absent),
+            "the surviving ban is the newer absent-target one"
+        );
+    }
+
+    /// #411 round 7 / Codex P1 #2: a banner whose ban the `max_user_bans` cap
+    /// evicts must lose their prune exemption on the SAME pass. If the cap ran
+    /// AFTER the exemption (the bug), the banner is kept on pass 1 and pruned on
+    /// pass 2 — `cleanup(S) != cleanup(cleanup(S))` — permanently diverging peers
+    /// that run cleanup a different number of times.
+    #[test]
+    fn cleanup_is_idempotent_over_cap_evicted_ban() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let config = Configuration {
+            max_members: 10,
+            max_user_bans: 2,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        // Member B: a current member with NO message/DM/secret — only being a
+        // retained banner could keep them from the inactivity prune.
+        let b_sk = SigningKey::generate(rng);
+        let b_vk = b_sk.verifying_key();
+        let b_id = MemberId::from(&b_vk);
+        let member_b = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: b_vk,
+            },
+            &owner_sk,
+        );
+
+        let base = SystemTime::now();
+        // Two owner bans against ABSENT targets, NEWER → survive the cap.
+        let absent1 = MemberId::from(&SigningKey::generate(rng).verifying_key());
+        let absent2 = MemberId::from(&SigningKey::generate(rng).verifying_key());
+        let owner_ban1 = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: base + std::time::Duration::from_secs(10),
+                banned_user: absent1,
+            },
+            owner_id,
+            &owner_sk,
+        );
+        let owner_ban2 = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: base + std::time::Duration::from_secs(11),
+                banned_user: absent2,
+            },
+            owner_id,
+            &owner_sk,
+        );
+        // B's ban against an ABSENT target, OLDEST → evicted by the cap. It is
+        // "enforcing" (member banner, absent target) so ONLY the cap removes it.
+        let c_id = MemberId::from(&SigningKey::generate(rng).verifying_key());
+        let ban_c_by_b = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: base,
+                banned_user: c_id,
+            },
+            b_id,
+            &b_sk,
+        );
+
+        let state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_b],
+            },
+            bans: BansV1(vec![ban_c_by_b, owner_ban1, owner_ban2]),
+            ..Default::default()
+        };
+
+        let mut once = state.clone();
+        once.post_apply_cleanup(&params).unwrap();
+
+        // B's ban is cap-evicted, so B is NOT exempted and is pruned on pass 1.
+        assert!(
+            !once.members.members.iter().any(|m| m.member.id() == b_id),
+            "over-cap-evicted banner B must be pruned on the FIRST cleanup pass"
+        );
+        assert_eq!(once.bans.0.len(), 2, "capped to max_user_bans");
+
+        // Idempotence: a second pass changes nothing.
+        let mut twice = once.clone();
+        twice.post_apply_cleanup(&params).unwrap();
+        assert_eq!(once, twice, "post_apply_cleanup must be idempotent");
+    }
+
+    /// #411 round 7 / Codex P2 #4: after a deputy-banned member's messages are
+    /// swept in cleanup, the PUBLIC `actions_state` cache must be rebuilt so
+    /// their reaction no longer lingers (the UI's private rebuild is a no-op for
+    /// a public room).
+    #[test]
+    fn banned_member_reaction_removed_from_actions_state_cache() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let config = Configuration {
+            max_members: 10,
+            max_user_bans: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        // M authors a message; R reacts to it. Both are members.
+        let m_sk = SigningKey::generate(rng);
+        let m_vk = m_sk.verifying_key();
+        let m_id = MemberId::from(&m_vk);
+        let r_sk = SigningKey::generate(rng);
+        let r_vk = r_sk.verifying_key();
+        let r_id = MemberId::from(&r_vk);
+        let member_m = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: m_vk,
+            },
+            &owner_sk,
+        );
+        let member_r = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: r_vk,
+            },
+            &owner_sk,
+        );
+
+        let msg1 = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: m_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("hello".to_string()),
+            },
+            &m_sk,
+        );
+        let msg1_id = msg1.id();
+        let reaction = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: r_id,
+                time: SystemTime::now() + std::time::Duration::from_secs(1),
+                content: RoomMessageBody::reaction(msg1_id.clone(), "👍".to_string()),
+            },
+            &r_sk,
+        );
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_m, member_r],
+            },
+            recent_messages: MessagesV1 {
+                messages: vec![msg1.clone(), reaction],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Populate the actions_state cache as `apply_delta` would, WITH R present.
+        state.recent_messages.rebuild_actions_state();
+        assert!(
+            state
+                .recent_messages
+                .reactions(&msg1_id)
+                .and_then(|r| r.get("👍"))
+                .is_some_and(|v| v.contains(&r_id)),
+            "sanity: R's reaction is present in the cache before the ban"
+        );
+
+        // Owner bans R; cleanup removes R + their reaction message.
+        state.bans.0.push(AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::now(),
+                banned_user: r_id,
+            },
+            owner_id,
+            &owner_sk,
+        ));
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        assert!(
+            !state.members.members.iter().any(|m| m.member.id() == r_id),
+            "R is banned and removed"
+        );
+        let lingers = state
+            .recent_messages
+            .reactions(&msg1_id)
+            .and_then(|r| r.get("👍"))
+            .is_some_and(|v| v.contains(&r_id));
+        assert!(
+            !lingers,
+            "the banned member's reaction must be gone from the rebuilt public \
+             actions_state cache"
+        );
+    }
+
+    /// #411 round 7: `post_apply_cleanup` must be idempotent on adversarial
+    /// states (running it twice yields the same state), otherwise peers that run
+    /// cleanup a different number of times diverge.
+    #[test]
+    fn post_apply_cleanup_is_idempotent_on_adversarial_states() {
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let cfg = |max_bans: usize| {
+            AuthorizedConfigurationV1::new(
+                Configuration {
+                    max_members: 50,
+                    max_user_bans: max_bans,
+                    max_recent_messages: 100,
+                    ..Default::default()
+                },
+                &owner_sk,
+            )
+        };
+        let owner_member = |vk| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: vk,
+                },
+                &owner_sk,
+            )
+        };
+        let assert_idem = |state: &ChatRoomStateV1, label: &str| {
+            let mut once = state.clone();
+            once.post_apply_cleanup(&params).unwrap();
+            let mut twice = once.clone();
+            twice.post_apply_cleanup(&params).unwrap();
+            assert_eq!(once, twice, "post_apply_cleanup not idempotent: {}", label);
+        };
+
+        // State A: five member-banners of ABSENT targets, over a cap of 2. Three
+        // are cap-evicted (losing their exemption); two survive.
+        {
+            let banners: Vec<SigningKey> = (0..5).map(|_| SigningKey::generate(rng)).collect();
+            let members: Vec<AuthorizedMember> = banners
+                .iter()
+                .map(|sk| owner_member(sk.verifying_key()))
+                .collect();
+            let base = SystemTime::now();
+            let bans: Vec<AuthorizedUserBan> = banners
+                .iter()
+                .enumerate()
+                .map(|(i, sk)| {
+                    let absent = MemberId::from(&SigningKey::generate(rng).verifying_key());
+                    AuthorizedUserBan::new(
+                        UserBan {
+                            owner_member_id: owner_id,
+                            banned_at: base + std::time::Duration::from_secs(i as u64),
+                            banned_user: absent,
+                        },
+                        MemberId::from(&sk.verifying_key()),
+                        sk,
+                    )
+                })
+                .collect();
+            let state = ChatRoomStateV1 {
+                configuration: cfg(2),
+                members: MembersV1 { members },
+                bans: BansV1(bans),
+                ..Default::default()
+            };
+            assert_idem(&state, "member-banners over cap");
+        }
+
+        // State B: owner cascade-bans A (who had banned B), plus an over-cap
+        // flood of inert member bans against a present member X.
+        {
+            let a_sk = SigningKey::generate(rng);
+            let a_id = MemberId::from(&a_sk.verifying_key());
+            let b_id = MemberId::from(&SigningKey::generate(rng).verifying_key());
+            let x_sk = SigningKey::generate(rng);
+            let x_id = MemberId::from(&x_sk.verifying_key());
+            let flood_banners: Vec<SigningKey> =
+                (0..4).map(|_| SigningKey::generate(rng)).collect();
+
+            let mut members = vec![
+                owner_member(a_sk.verifying_key()),
+                owner_member(x_sk.verifying_key()),
+            ];
+            for sk in &flood_banners {
+                members.push(owner_member(sk.verifying_key()));
+            }
+
+            let base = SystemTime::now();
+            let mut bans = vec![
+                // A banned B (A is a member banner; B absent).
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner_id,
+                        banned_at: base,
+                        banned_user: b_id,
+                    },
+                    a_id,
+                    &a_sk,
+                ),
+                // Owner bans A (cascade removes A → A's ban of B is orphaned).
+                AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner_id,
+                        banned_at: base + std::time::Duration::from_secs(1),
+                        banned_user: a_id,
+                    },
+                    owner_id,
+                    &owner_sk,
+                ),
+            ];
+            // Inert flood: each floods a ban of present member X (no authority).
+            for (i, sk) in flood_banners.iter().enumerate() {
+                bans.push(AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner_id,
+                        banned_at: base + std::time::Duration::from_secs(100 + i as u64),
+                        banned_user: x_id,
+                    },
+                    MemberId::from(&sk.verifying_key()),
+                    sk,
+                ));
+            }
+
+            let state = ChatRoomStateV1 {
+                configuration: cfg(3),
+                members: MembersV1 { members },
+                bans: BansV1(bans),
+                ..Default::default()
+            };
+            assert_idem(&state, "owner cascade + inert flood over cap");
+        }
     }
 
     #[test]
