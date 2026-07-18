@@ -1303,3 +1303,107 @@ fn inert_member_ban_eviction_converges_across_delta_order() {
     peer1.verify(&peer1, &p).expect("converged peer1 verifies");
     peer2.verify(&peer2, &p).expect("converged peer2 verifies");
 }
+
+// ===================================================================
+// Migration compatibility (Ian's hard constraint, #411)
+// ===================================================================
+
+/// Re-PUTting an OLD-generation room state to the NEW contract runs ONLY
+/// `verify` (validate_state), NOT post_apply_cleanup. The new `verify` MUST
+/// accept an old state — otherwise the Official room's migration PUT is refused
+/// and the room strands EMPTY. Old states legitimately contain (a) `member_info`
+/// WITHOUT the `deputies` field (old serialization) and (b) bans by NON-member
+/// (pruned) banners that the old code sig-skipped and accepted. The round-3
+/// "a ban is only valid while its banner is a current member" rule is a
+/// post_apply_cleanup REMOVAL, never a `verify` rejection.
+///
+/// This test FAILS if someone (a) turns the banner-membership check into a
+/// `verify` rejection, or (b) drops `skip_serializing_if` on `deputies` (old
+/// member_info signatures would then stop verifying).
+#[test]
+fn migration_compat_new_verify_accepts_old_generation_state() {
+    use river_core::room_state::privacy::SealedBytes;
+
+    let owner = Peer::new();
+    let a = Peer::new();
+    let b = Peer::new();
+    // A banner that was a member in the old room but has since been pruned for
+    // inactivity: NOT in the members list now, and NOT itself banned.
+    let pruned_banner = Peer::new();
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    // Build an OLD-style AuthorizedMemberInfo: sign over the pre-deputy 3-field
+    // ciborium bytes (what an old client actually signed), then wrap the new
+    // (empty-deputies) struct with that signature. Verifies iff empty `deputies`
+    // serialize byte-identically to the old record.
+    let old_info = |who: &Peer| -> AuthorizedMemberInfo {
+        #[derive(serde::Serialize)]
+        struct OldMemberInfo {
+            member_id: MemberId,
+            version: u32,
+            preferred_nickname: SealedBytes,
+        }
+        let nick = SealedBytes::public(b"nick".to_vec());
+        let old = OldMemberInfo {
+            member_id: who.id,
+            version: 0,
+            preferred_nickname: nick.clone(),
+        };
+        let sig = river_core::util::sign_struct(&old, &who.sk);
+        let new_mi = MemberInfo {
+            member_id: who.id,
+            version: 0,
+            preferred_nickname: nick,
+            deputies: vec![],
+        };
+        AuthorizedMemberInfo::with_signature(new_mi, sig)
+    };
+
+    let state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![
+                member(&a, owner_id, &owner.sk, owner_id),
+                member(&b, a.id, &a.sk, owner_id),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![old_info(&a), old_info(&b)],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&a, owner_id), join(&b, owner_id)],
+            ..Default::default()
+        },
+        bans: BansV1(vec![
+            // (a) ban by a PRESENT member — new verify checks the signature.
+            ban(b.id, &a, owner_id),
+            // (b) ban by a NON-member (pruned, not banned) banner — old code
+            // sig-SKIPPED + accepted; new verify must NOT reject it (removal is
+            // post_apply_cleanup's job).
+            ban(a.id, &pruned_banner, owner_id),
+        ]),
+        ..Default::default()
+    };
+
+    state.verify(&state, &p).expect(
+        "new verify MUST accept an old-generation state (old member_info without \
+         deputies + bans by non-member banners); rejecting it strands the Official room",
+    );
+
+    // Show the two-phase design: the non-member-banner ban is removed by
+    // post_apply_cleanup (NOT verify), and the resulting state still verifies.
+    let mut cleaned = state.clone();
+    cleaned.post_apply_cleanup(&p).unwrap();
+    assert!(
+        !cleaned
+            .bans
+            .0
+            .iter()
+            .any(|bn| bn.banned_by == pruned_banner.id),
+        "the non-member-banner ban is swept by post_apply_cleanup"
+    );
+    cleaned
+        .verify(&cleaned, &p)
+        .expect("post-cleanup state still verifies");
+}
