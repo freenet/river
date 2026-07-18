@@ -30,12 +30,19 @@ use std::time::SystemTime;
 /// [`ComposableState::apply_delta`] bounds a single delta to `max_user_bans`
 /// new bans so a forged flood cannot make signature verification unbounded.
 ///
-/// KNOWN, ACCEPTED, self-limiting residual (Ian confirmed, #411 round 3 D): a
-/// current member can still flood bans against ABSENT targets (each such ban is
-/// "enforcing" only because its banner is a member). This is pre-existing and
-/// self-limiting — the flooder is a current member, identifiable on every junk
-/// ban, and banning THEM makes their bans inert and sweeps them (freeing the
-/// cap). No code fix; documented deliberately.
+/// KNOWN, ACCEPTED, self-limiting residuals (Ian confirmed, #411 round 3 D):
+/// 1. A current member can flood bans against ABSENT targets (each such ban is
+///    "enforcing" only because its banner is a member).
+/// 2. Slot-squatting: because of the item-B pruning exemption, a current member
+///    can make themselves PERMANENTLY exempt from inactivity-pruning with a
+///    single junk ban against an absent target — that ban is "enforcing", so it
+///    survives both the non-member-banner sweep and the `max_user_bans`
+///    eviction, and inactivity-prune can no longer reclaim their member slot.
+/// Both are pre-existing/emergent and self-limiting the same way: the flooder /
+/// squatter is a current member, identifiable on every junk ban, and only an
+/// explicit OWNER ban reclaims the slot — banning them makes their bans inert
+/// and sweeps them (freeing the cap and making them prunable again).
+/// Inactivity-prune alone cannot. No code fix; documented deliberately.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
@@ -322,6 +329,12 @@ impl ComposableState for BansV1 {
             // Deterministic across peers, so it does not affect convergence: a
             // legitimate delta is never over the bound, and a flood is rejected
             // identically everywhere.
+            //
+            // Transient skew during a `max_user_bans` REDUCTION: config applies
+            // before bans in field order, so a peer that has already applied the
+            // lower (monotonic) cap may briefly reject a ban-only delta from a
+            // peer still lagging on the old higher cap. Self-heals once the
+            // config converges (the lagging peer re-derives a within-bound delta).
             let max_bans = parent_state.configuration.configuration.max_user_bans;
             if delta.len() > max_bans {
                 return Err(format!(
