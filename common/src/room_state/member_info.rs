@@ -19,30 +19,76 @@ pub struct MemberInfoV1 {
 }
 
 impl MemberInfoV1 {
-    /// The deputies currently listed by `member_id`'s own signed `MemberInfo`,
-    /// or an empty slice if that member has no info entry or no deputies.
+    /// The CANONICAL `member_info` record for `member_id`: the highest-
+    /// `member_info_rank` (higher `version`, else lexicographically-greater
+    /// signature) among ALL records present for that member, or `None` if there
+    /// is none.
     ///
-    /// Deputies are a member's authenticated statement (their own signed
-    /// `MemberInfo`) that the listed members may ban within the deputizing
-    /// member's invite subtree (#410).
-    ///
-    /// If two records for the same member are ever present at once, pick the
-    /// **highest-rank** one (`member_info_rank`: higher version, else greater
-    /// signature) — the SAME winner `summarize`/`apply_delta` converge on. A
-    /// bare `.find()` (first) could return a lower-rank record and disagree with
-    /// what anti-entropy propagates, permanently diverging ban authority from
-    /// the converged state (#411 round 7 / Codex P1 #3). `verify` deliberately
-    /// does NOT reject duplicates (migration-safety — see its comment), so this
-    /// canonicalization is what makes a duplicate HARMLESS: enforcement here and
-    /// the `summarize` advertised value select the same record, so peers with
-    /// different duplicate sets still converge.
-    pub fn deputies_of(&self, member_id: MemberId) -> &[MemberId] {
+    /// LOAD-BEARING (#411 round 8 item A). `verify` deliberately ACCEPTS a state
+    /// carrying more than one record per `member_id` (migration-safety — see its
+    /// comment), and a client can hold such a duplicate-containing full-state GET
+    /// before any cleanup runs. EVERY by-id reader/writer of `member_info` MUST
+    /// go through this selector: a bare first-match `.find()` can read a LOSING
+    /// (e.g. revoked) record, and a WRITER that republishes it at `version + 1`
+    /// would then resurrect that losing record at a HIGHER rank — reactivating
+    /// revoked deputy authority. This returns the SAME record `summarize` /
+    /// `apply_delta` converge on, so reads, writes, enforcement, and anti-entropy
+    /// all agree. (`post_apply_cleanup` additionally collapses duplicates via
+    /// [`Self::dedup_to_canonical`] once cleanup runs, but reads must not depend
+    /// on that having happened yet.)
+    pub fn canonical(&self, member_id: MemberId) -> Option<&AuthorizedMemberInfo> {
         self.member_info
             .iter()
             .filter(|info| info.member_info.member_id == member_id)
             .max_by_key(|info| member_info_rank(info.member_info.version, &info.signature))
+    }
+
+    /// The deputies currently listed by `member_id`'s CANONICAL signed
+    /// `MemberInfo`, or an empty slice if that member has no info entry or no
+    /// deputies. Routes through [`Self::canonical`] so ban authority matches the
+    /// converged record even in the presence of duplicates (#410, #411 round 8).
+    pub fn deputies_of(&self, member_id: MemberId) -> &[MemberId] {
+        self.canonical(member_id)
             .map(|info| info.member_info.deputies.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Collapse any duplicate `member_info` records to the SINGLE canonical
+    /// (highest-`member_info_rank`) record per `member_id` (#411 round 8 item C /
+    /// security FINDING 2+3). Because `verify` accepts duplicates, a state can
+    /// hold several records for one member; without this, two peers holding
+    /// different duplicate SETS would diverge byte-for-byte forever (the raw
+    /// `member_info` vectors differ even though every canonical read agrees).
+    /// Dedup is a pure function of the converged state (max by `member_info_rank`)
+    /// so it is deterministic, idempotent, and order-independent; it also bounds
+    /// stored `member_info` to at most one record per member. Owner's record is
+    /// kept like any other (it is just another `member_id`). Runs in
+    /// `post_apply_cleanup`, NEVER in `verify`/`validate_state`, so the
+    /// permissionless migration PUT (which only runs `verify`) is unaffected.
+    pub fn dedup_to_canonical(&mut self) {
+        if self.member_info.len() < 2 {
+            return;
+        }
+        let mut best: HashMap<MemberId, AuthorizedMemberInfo> = HashMap::new();
+        for info in self.member_info.drain(..) {
+            let id = info.member_info.member_id;
+            match best.entry(id) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if member_info_rank(info.member_info.version, &info.signature)
+                        > member_info_rank(e.get().member_info.version, &e.get().signature)
+                    {
+                        e.insert(info);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(info);
+                }
+            }
+        }
+        self.member_info = best.into_values().collect();
+        // Deterministic order (HashMap iteration order is not stable).
+        self.member_info
+            .sort_by_key(|info| info.member_info.member_id);
     }
 }
 
@@ -1232,5 +1278,95 @@ mod tests {
             &[deputy_y],
             "deputies_of result must be independent of vector order"
         );
+    }
+
+    /// #411 round 8 item A/C: `canonical` selects the highest-rank record and
+    /// `dedup_to_canonical` collapses duplicates to it (owner kept), independent
+    /// of vector order. This is the shared selector EVERY by-id reader/writer
+    /// routes through, plus the post_apply_cleanup dedup.
+    #[test]
+    fn canonical_and_dedup_to_canonical_pick_highest_rank() {
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+
+        let m_sk = SigningKey::generate(&mut OsRng);
+        let m_id: MemberId = m_sk.verifying_key().into();
+        let n_sk = SigningKey::generate(&mut OsRng);
+        let n_id: MemberId = n_sk.verifying_key().into();
+
+        let dep = SigningKey::generate(&mut OsRng).verifying_key().into();
+        // M: grant @ v1 (deputies=[dep]) and revoke @ v2 (deputies=[]).
+        let mut g = MemberInfo::new_public(m_id, 1, "nick".to_string());
+        g.deputies = vec![dep];
+        let grant = AuthorizedMemberInfo::new_with_member_key(g, &m_sk);
+        let mut r = MemberInfo::new_public(m_id, 2, "nick".to_string());
+        r.deputies = vec![];
+        let revoke = AuthorizedMemberInfo::new_with_member_key(r, &m_sk);
+        // N: single record. Owner: single record.
+        let n_info = AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(n_id, 3, "n".to_string()),
+            &n_sk,
+        );
+        let owner_info = AuthorizedMemberInfo::new(
+            MemberInfo::new_public(owner_id, 1, "o".to_string()),
+            &owner_sk,
+        );
+
+        for order in [
+            vec![
+                grant.clone(),
+                revoke.clone(),
+                n_info.clone(),
+                owner_info.clone(),
+            ],
+            vec![
+                owner_info.clone(),
+                n_info.clone(),
+                revoke.clone(),
+                grant.clone(),
+            ],
+        ] {
+            let mut mi = MemberInfoV1 { member_info: order };
+
+            // canonical picks the v2 revoke for M.
+            assert_eq!(
+                mi.canonical(m_id).map(|c| c.member_info.version),
+                Some(2),
+                "canonical(M) must be the v2 revoke"
+            );
+            assert_eq!(mi.canonical(n_id).map(|c| c.member_info.version), Some(3));
+            assert_eq!(
+                mi.canonical(owner_id).map(|c| c.member_info.version),
+                Some(1)
+            );
+            assert!(mi
+                .canonical(SigningKey::generate(&mut OsRng).verifying_key().into())
+                .is_none());
+
+            // dedup collapses M's duplicate, keeps owner + N, one record each.
+            mi.dedup_to_canonical();
+            assert_eq!(mi.member_info.len(), 3, "exactly one record per member_id");
+            let m_rec = mi
+                .member_info
+                .iter()
+                .find(|i| i.member_info.member_id == m_id)
+                .unwrap();
+            assert_eq!(
+                m_rec.member_info.version, 2,
+                "M's kept record is the revoke"
+            );
+            assert!(
+                m_rec.member_info.deputies.is_empty(),
+                "revoke has no deputies"
+            );
+            assert!(mi
+                .member_info
+                .iter()
+                .any(|i| i.member_info.member_id == owner_id));
+            // Idempotent.
+            let before = mi.clone();
+            mi.dedup_to_canonical();
+            assert_eq!(before, mi, "dedup_to_canonical is idempotent");
+        }
     }
 }

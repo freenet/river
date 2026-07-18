@@ -103,15 +103,16 @@ pub fn MemberInfoModal() -> Element {
         .unwrap_or(0);
 
     // Extract member info and members list
-    let member_info_list = &room_state.room_state.member_info.member_info;
+    let member_info_v1 = &room_state.room_state.member_info;
     let members_list = &room_state.room_state.members.members;
 
     let modal_content = if let Some(member_id) = MEMBER_INFO_MODAL.read().member {
-        // Find the AuthorizedMemberInfo for the given member_id
-        let member_info = match member_info_list
-            .iter()
-            .find(|mi| mi.member_info.member_id == member_id)
-        {
+        // Find the CANONICAL AuthorizedMemberInfo for the given member_id
+        // (highest member_info_rank: version, then signature bytes) — not a
+        // bare first-match. `verify` accepts duplicate member_info records
+        // per member_id (migration safety), so a first-match `.find()` can
+        // read a losing (e.g. revoked) record (freenet/river#411 round 8).
+        let member_info = match member_info_v1.canonical(member_id) {
             Some(mi) => mi,
             None => {
                 error!("Member info not found for member {member_id}");
@@ -193,9 +194,8 @@ pub fn MemberInfoModal() -> Element {
             (_, true) => ("N/A (Room Owner)".to_string(), None),
             (Some(m), false) => {
                 let inviter_id = m.member.invited_by;
-                let nickname = member_info_list
-                    .iter()
-                    .find(|mi| mi.member_info.member_id == inviter_id)
+                let nickname = member_info_v1
+                    .canonical(inviter_id)
                     .map(|mi| {
                         match unseal_bytes_with_secrets(
                             &mi.member_info.preferred_nickname,

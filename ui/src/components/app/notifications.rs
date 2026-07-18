@@ -480,9 +480,7 @@ pub fn notify_new_messages(
 
     // Get sender name
     let sender_name = member_info
-        .member_info
-        .iter()
-        .find(|ami| ami.member_info.member_id == msg.message.author)
+        .canonical(msg.message.author)
         .map(|ami| {
             match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, room_secrets) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),

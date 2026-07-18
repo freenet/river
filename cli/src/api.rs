@@ -184,11 +184,18 @@ fn decrypt_private_body_text(
 /// private-room nicknames). Plain text without tokens is returned unchanged.
 pub(crate) fn render_mentions_for_terminal(room_state: &ChatRoomStateV1, text: &str) -> String {
     river_core::mention::render_plaintext(text, |r| {
+        // Resolve the mention token to a member_id first (identity lookup,
+        // not a content read — safe to leave as a bare `.find()`), then fetch
+        // that member's CANONICAL record for the nickname. A bare `.find()`
+        // straight to the nickname could return a losing (e.g. stale) duplicate
+        // record if the state holds more than one (#411 round 8 item A).
         room_state
             .member_info
             .member_info
             .iter()
             .find(|info| r.matches(info.member_info.member_id))
+            .map(|info| info.member_info.member_id)
+            .and_then(|id| room_state.member_info.canonical(id))
             .and_then(|info| info.member_info.preferred_nickname.as_public_bytes())
             .map(|bytes| String::from_utf8_lossy(bytes).to_string())
     })
@@ -2457,11 +2464,13 @@ impl ApiClient {
 
         // Build member_info delta
         let self_id = MemberId::from(&self_vk);
+        // Route through `canonical` (#411 round 8 item A): a bare `.find()`
+        // could read a losing (revoked) duplicate record and rebuild the
+        // rejoin member_info from its version, understating the true version
+        // and letting a stale record win the next apply_delta rank comparison.
         let existing_version = room_state
             .member_info
-            .member_info
-            .iter()
-            .find(|i| i.member_info.member_id == self_id)
+            .canonical(self_id)
             .map(|i| i.member_info.version)
             .unwrap_or(0);
 
@@ -3134,9 +3143,7 @@ impl ApiClient {
         // "[Encrypted: N bytes, vN]" to every reader (including the UI) forever.
         let target_author_name = room_state
             .member_info
-            .member_info
-            .iter()
-            .find(|info| info.member_info.member_id == target_msg.message.author)
+            .canonical(target_msg.message.author)
             .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, &secrets))
             .unwrap_or_else(|| target_msg.message.author.to_string());
 
@@ -3573,9 +3580,7 @@ impl ApiClient {
         let author_str = msg.message.author.to_string();
         let nickname = room_state
             .member_info
-            .member_info
-            .iter()
-            .find(|info| info.member_info.member_id == msg.message.author)
+            .canonical(msg.message.author)
             .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
         let datetime: DateTime<Utc> = msg.message.time.into();
 
@@ -3639,9 +3644,7 @@ impl ApiClient {
         let author_str = msg.message.author.to_string();
         let nickname = room_state
             .member_info
-            .member_info
-            .iter()
-            .find(|info| info.member_info.member_id == msg.message.author)
+            .canonical(msg.message.author)
             .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
         let datetime: DateTime<Utc> = msg.message.time.into();
 
@@ -3712,9 +3715,7 @@ impl ApiClient {
                 // Get nickname if available (decrypted for a private room)
                 let nickname = room_state
                     .member_info
-                    .member_info
-                    .iter()
-                    .find(|info| info.member_info.member_id == msg.message.author)
+                    .canonical(msg.message.author)
                     .map(|info| {
                         unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
                     })
@@ -3761,9 +3762,7 @@ impl ApiClient {
 
                 let nickname = room_state
                     .member_info
-                    .member_info
-                    .iter()
-                    .find(|info| info.member_info.member_id == msg.message.author)
+                    .canonical(msg.message.author)
                     .map(|info| {
                         unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
                     });
@@ -3853,17 +3852,16 @@ impl ApiClient {
         // Find our current member info to get the version AND our existing
         // deputy grants — republishing member_info replaces the whole signed
         // record, so we must carry `deputies` forward or a nickname change would
-        // silently revoke every deputy we appointed (#410).
-        let current_self_info = room_state
-            .member_info
-            .member_info
-            .iter()
-            .find(|info| info.member_info.member_id == my_member_id);
+        // silently revoke every deputy we appointed (#410). Routes through the
+        // shared `resolve_own_member_info_base` (canonical, #411 round 8 item A)
+        // so a duplicate-holding state can't resurrect a revoked record.
+        let current_self_info = resolve_own_member_info_base(&room_state, my_member_id);
         let current_version = current_self_info
-            .map(|info| info.member_info.version)
+            .as_ref()
+            .map(|info| info.version)
             .unwrap_or(0);
         let existing_deputies = current_self_info
-            .map(|info| info.member_info.deputies.clone())
+            .map(|info| info.deputies)
             .unwrap_or_default();
 
         // Create new member info with incremented version
@@ -3878,20 +3876,20 @@ impl ApiClient {
         let authorized_member_info =
             AuthorizedMemberInfo::new_with_member_key(new_member_info, &signing_key);
 
-        // Update local state first
-        if let Some(existing_info) = room_state
+        // Update local state first. Drop ALL existing records for our own
+        // member_id (not just the first match) before pushing the new one — the
+        // new record's version (`current_version + 1`) strictly outranks any
+        // existing duplicate, so this collapses to the same single canonical
+        // record `dedup_to_canonical` would converge on, rather than leaving a
+        // stale duplicate sitting in local state alongside the new republish.
+        room_state
             .member_info
             .member_info
-            .iter_mut()
-            .find(|info| info.member_info.member_id == my_member_id)
-        {
-            *existing_info = authorized_member_info.clone();
-        } else {
-            room_state
-                .member_info
-                .member_info
-                .push(authorized_member_info.clone());
-        }
+            .retain(|info| info.member_info.member_id != my_member_id);
+        room_state
+            .member_info
+            .member_info
+            .push(authorized_member_info.clone());
 
         // Save the updated state locally
         self.storage
@@ -4150,21 +4148,19 @@ impl ApiClient {
         // Load the caller's current signed member_info FIRST: we must preserve the
         // (already-sealed) nickname and version-continuity when republishing, and
         // the revoke path resolves the target against the caller's OWN deputies
-        // list (below).
-        let current_self_info = room_state
-            .member_info
-            .member_info
-            .iter()
-            .find(|info| info.member_info.member_id == my_member_id)
+        // list (below). Routes through the shared `resolve_own_member_info_base`
+        // (canonical, #411 round 8 item A) so a duplicate-holding state can't
+        // resurrect a revoked record's deputies at a higher rank.
+        let current_self_info = resolve_own_member_info_base(&room_state, my_member_id)
             .ok_or_else(|| {
                 anyhow!(
                     "You don't have a member_info entry in this room yet. \
                      Set your nickname first (`member set-nickname`), then retry."
                 )
             })?;
-        let current_version = current_self_info.member_info.version;
-        let preferred_nickname = current_self_info.member_info.preferred_nickname.clone();
-        let mut deputies = current_self_info.member_info.deputies.clone();
+        let current_version = current_self_info.version;
+        let preferred_nickname = current_self_info.preferred_nickname.clone();
+        let mut deputies = current_self_info.deputies.clone();
 
         // Resolve the target's full MemberId from the short id. Primary: the
         // member_info list (a present member), same lookup as `ban_member`.
@@ -4578,6 +4574,31 @@ impl ApiClient {
     }
 }
 
+/// Resolve the caller's own CANONICAL `member_info` record to republish from —
+/// the shared base for `set_nickname`'s nickname change and
+/// `update_own_deputies`'s deputy add/revoke. Returns a clone of the winning
+/// `MemberInfo` (version, nickname, deputies) so callers can freely rebuild
+/// one field.
+///
+/// Routes through `MemberInfoV1::canonical`, NOT a bare `.find()` (#411 round
+/// 8 item A): `verify` deliberately ACCEPTS a state carrying more than one
+/// `member_info` record for the same member (migration-safety), so a client
+/// can hold such a duplicate-containing state before cleanup runs. A bare
+/// first-match `.find()` could then read a LOSING (e.g. revoked) record, and
+/// republishing it at `version + 1` would resurrect that losing record at a
+/// HIGHER rank — reactivating revoked deputy authority. `canonical` always
+/// selects the highest-`member_info_rank` record, matching what
+/// `apply_delta` / `summarize` converge on.
+fn resolve_own_member_info_base(
+    room_state: &ChatRoomStateV1,
+    member_id: MemberId,
+) -> Option<MemberInfo> {
+    room_state
+        .member_info
+        .canonical(member_id)
+        .map(|info| info.member_info.clone())
+}
+
 /// Resolve a `member set-deputy` / `revoke-deputy` short id to a full `MemberId`.
 ///
 /// Primary: a present member, matched via their `member_info` (same rule as
@@ -4669,6 +4690,86 @@ mod deputy_resolve_tests {
             resolve_deputy_target(&member_infos, &own_deputies, "zzzzzzzz", true),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod resolve_own_member_info_base_tests {
+    use super::resolve_own_member_info_base;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member::MemberId;
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+    use river_core::room_state::ChatRoomStateV1;
+
+    /// #411 round 8 item A (CLI Fix A): `set_nickname` and `update_own_deputies`
+    /// republish the caller's OWN `member_info` at `version + 1`, carrying
+    /// forward the previous `deputies` list. `MemberInfoV1::verify`
+    /// deliberately ACCEPTS a state carrying more than one `member_info`
+    /// record for the same member (migration-safety), so a client can hold
+    /// such a duplicate-containing state before cleanup runs — e.g. a `grant`
+    /// at v1 (deputies=[D]) and a `revoke` at v2 (deputies=[]).
+    ///
+    /// A bare first-match `.find()` over the raw vector could read the
+    /// `grant` (if it happens to come first) and republish `deputies=[D]` at
+    /// v3 — RESURRECTING revoked deputy authority at a rank higher than the
+    /// revoke. `resolve_own_member_info_base` MUST always select the
+    /// CANONICAL (highest-rank) record — the revoke — regardless of vector
+    /// order, so the republish base is version 2 / deputies=[], and any
+    /// `version + 1` built from it is 3, never resurrecting the grant.
+    ///
+    /// This test FAILS if `resolve_own_member_info_base` is reverted to a
+    /// bare `.find(|info| info.member_info.member_id == member_id)` in the
+    /// "grant-then-revoke" vector order (the first match would be the grant).
+    #[test]
+    fn republish_base_reads_canonical_revoke_not_first_match_grant() {
+        let member_sk = SigningKey::from_bytes(&[21u8; 32]);
+        let member_id: MemberId = member_sk.verifying_key().into();
+        let deputy_id: MemberId = SigningKey::from_bytes(&[22u8; 32]).verifying_key().into();
+
+        // grant @ v1: deputies=[deputy_id].
+        let mut grant_mi = MemberInfo::new_public(member_id, 1, "nick".to_string());
+        grant_mi.deputies = vec![deputy_id];
+        let grant = AuthorizedMemberInfo::new_with_member_key(grant_mi, &member_sk);
+
+        // revoke @ v2 (higher rank): deputies cleared.
+        let mut revoke_mi = MemberInfo::new_public(member_id, 2, "nick".to_string());
+        revoke_mi.deputies = vec![];
+        let revoke = AuthorizedMemberInfo::new_with_member_key(revoke_mi, &member_sk);
+
+        for (label, entries) in [
+            ("grant-then-revoke", vec![grant.clone(), revoke.clone()]),
+            ("revoke-then-grant", vec![revoke.clone(), grant.clone()]),
+        ] {
+            let state = ChatRoomStateV1 {
+                member_info: MemberInfoV1 {
+                    member_info: entries,
+                },
+                ..Default::default()
+            };
+
+            let base = resolve_own_member_info_base(&state, member_id)
+                .unwrap_or_else(|| panic!("expected a base record ({label})"));
+
+            assert_eq!(
+                base.version, 2,
+                "republish base must be the v2 revoke, not the v1 grant ({label})"
+            );
+            assert!(
+                base.deputies.is_empty(),
+                "republish base must carry the revoke's EMPTY deputies, never \
+                 resurrecting the grant's [deputy] ({label})"
+            );
+        }
+    }
+
+    /// No `member_info` at all for this member → no base (both writers treat
+    /// this as version 0 / empty deputies, or an error for
+    /// `update_own_deputies`).
+    #[test]
+    fn no_member_info_returns_none() {
+        let state = ChatRoomStateV1::default();
+        let member_id: MemberId = SigningKey::from_bytes(&[23u8; 32]).verifying_key().into();
+        assert!(resolve_own_member_info_base(&state, member_id).is_none());
     }
 }
 

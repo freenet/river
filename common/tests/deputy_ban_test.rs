@@ -1725,3 +1725,121 @@ fn post_apply_cleanup_is_idempotent_for_garbage_sig_member_banner() {
     );
     once.verify(&once, &p).expect("cleaned state verifies");
 }
+
+/// #411 round 8 (convergence re-review item 2 / cap comment gate): the
+/// `max_user_bans` 0-cap eviction is NOT byte-equal across delta order without a
+/// further exchange — it classifies `ban_is_enforcing` on the INTERMEDIATE
+/// (pre-step-0) member set, which is arrival-order sensitive (cascade removal).
+/// This is a KNOWN, PRE-EXISTING limitation (reproduces with the cap at the
+/// round-6 5b position too); the substantive fix is deferred pending Ian. What
+/// we DO guarantee — and what this test pins — is that anti-entropy `merge`
+/// reconciles the two orders to the SAME state. If a future change makes the
+/// eviction order-independent per delta, revisit the softened cap comment in
+/// `room_state.rs` and this test.
+///
+/// Scenario: owner -> A -> B -> C (all with joins); C floods two bans of absent
+/// targets; owner has one legit ban X of an absent target; owner then bans A
+/// (cascade removes A,B,C). max_user_bans = 2, per-delta ban count <= 2.
+#[test]
+fn cap_eviction_reconciles_via_merge() {
+    use river_core::room_state::member::MembersDelta;
+    use river_core::room_state::ChatRoomStateV1Delta;
+
+    let owner = Peer::new();
+    let a = Peer::new();
+    let b = Peer::new();
+    let c = Peer::new();
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    let d_members = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![
+            member(&a, owner_id, &owner.sk, owner_id),
+            member(&b, a.id, &a.sk, owner_id),
+            member(&c, b.id, &b.sk, owner_id),
+        ])),
+        member_info: Some(vec![
+            info(&a, 0, vec![]),
+            info(&b, 0, vec![]),
+            info(&c, 0, vec![]),
+        ]),
+        recent_messages: Some(vec![
+            join(&a, owner_id),
+            join(&b, owner_id),
+            join(&c, owner_id),
+        ]),
+        ..Default::default()
+    };
+
+    let x = Peer::new();
+    let td1 = Peer::new();
+    let td2 = Peer::new();
+    let ban_x = ban_at(x.id, &owner, owner_id, 10);
+    let c_ban1 = ban_at(td1.id, &c, owner_id, 50);
+    let c_ban2 = ban_at(td2.id, &c, owner_id, 60);
+    let owner_ban_a = ban_at(a.id, &owner, owner_id, 100);
+
+    let d_x_c1 = ChatRoomStateV1Delta {
+        bans: Some(vec![ban_x.clone(), c_ban1.clone()]),
+        ..Default::default()
+    };
+    let d_c2 = ChatRoomStateV1Delta {
+        bans: Some(vec![c_ban2.clone()]),
+        ..Default::default()
+    };
+    let d_owner_a = ChatRoomStateV1Delta {
+        bans: Some(vec![owner_ban_a.clone()]),
+        ..Default::default()
+    };
+
+    let apply_seq = |deltas: &[ChatRoomStateV1Delta]| -> ChatRoomStateV1 {
+        let mut state = ChatRoomStateV1 {
+            configuration: config_max_bans(&owner, 2),
+            ..Default::default()
+        };
+        for d in deltas {
+            let prev = state.clone();
+            state.apply_delta(&prev, &p, &Some(d.clone())).unwrap();
+        }
+        state
+    };
+
+    let mut peer1 = apply_seq(&[
+        d_members.clone(),
+        d_x_c1.clone(),
+        d_c2.clone(),
+        d_owner_a.clone(),
+    ]);
+    let mut peer2 = apply_seq(&[
+        d_members.clone(),
+        d_owner_a.clone(),
+        d_x_c1.clone(),
+        d_c2.clone(),
+    ]);
+
+    // Anti-entropy merge (both directions) MUST reconcile the two orders.
+    let s1 = peer1.clone();
+    let s2 = peer2.clone();
+    peer1.merge(&s1, &p, &s2).unwrap();
+    peer2.merge(&s2, &p, &s1).unwrap();
+
+    assert_eq!(
+        peer1.bans, peer2.bans,
+        "bans converge after anti-entropy merge"
+    );
+    assert_eq!(
+        peer1.members, peer2.members,
+        "members converge after anti-entropy merge"
+    );
+    assert_eq!(
+        peer1.member_info, peer2.member_info,
+        "member_info converges after anti-entropy merge"
+    );
+    // The legit owner ban X survives the reconciled state.
+    assert!(
+        peer1.bans.0.iter().any(|bn| bn.ban.banned_user == x.id),
+        "the legit owner ban X is present in the converged state"
+    );
+    peer1.verify(&peer1, &p).expect("converged peer1 verifies");
+    peer2.verify(&peer2, &p).expect("converged peer2 verifies");
+}

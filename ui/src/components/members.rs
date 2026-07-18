@@ -513,11 +513,26 @@ pub fn MemberList() -> Element {
         // Built from every member's signed `MemberInfo.deputies`, so the 🛡
         // badge tooltip can name the appointer(s) rather than a generic label,
         // and so the list can be ordered by deputizer.
+        //
+        // Routed through each member_id's CANONICAL record (highest
+        // member_info_rank), not a raw scan of `member_info.member_info` —
+        // `verify` accepts duplicate member_info records per member_id
+        // (migration safety), and unioning deputies across ALL of a member's
+        // duplicate records (rather than reading only the converged/canonical
+        // one) can keep a revoked deputy grant showing here even after the
+        // revoke has won (freenet/river#411 round 8).
         let mut deputizers_of: std::collections::HashMap<MemberId, Vec<MemberId>> =
             std::collections::HashMap::new();
-        for mi in &member_info.member_info {
-            let appointer = mi.member_info.member_id;
-            for deputy in &mi.member_info.deputies {
+        let member_ids_with_info: std::collections::HashSet<MemberId> = member_info
+            .member_info
+            .iter()
+            .map(|mi| mi.member_info.member_id)
+            .collect();
+        for appointer in member_ids_with_info {
+            let Some(canonical) = member_info.canonical(appointer) else {
+                continue;
+            };
+            for deputy in &canonical.member_info.deputies {
                 deputizers_of.entry(*deputy).or_default().push(appointer);
             }
         }
@@ -585,9 +600,7 @@ pub fn MemberList() -> Element {
                 return "you".to_string();
             }
             member_info
-                .member_info
-                .iter()
-                .find(|mi| mi.member_info.member_id == id)
+                .canonical(id)
                 .map(|mi| {
                     match unseal_bytes_with_secrets(
                         &mi.member_info.preferred_nickname,
@@ -606,9 +619,7 @@ pub fn MemberList() -> Element {
             let is_owner = member_id == owner_id;
 
             let nickname = member_info
-                .member_info
-                .iter()
-                .find(|mi| mi.member_info.member_id == member_id)
+                .canonical(member_id)
                 .map(|mi| {
                     match unseal_bytes_with_secrets(
                         &mi.member_info.preferred_nickname,
@@ -850,16 +861,17 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                             .ok()
                             .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
 
-                        // Look up member_info from cached or current state
+                        // Look up member_info from cached or current state.
+                        // Routed through `canonical` (highest member_info_rank:
+                        // version, then signature bytes), not a version-only
+                        // `max_by_key`, so a same-version duplicate can't export
+                        // the losing record (freenet/river#411 round 8).
                         let member_info = room_data.self_member_info.clone().or_else(|| {
                             let member_id = MemberId::from(&verifying_key);
                             room_data
                                 .room_state
                                 .member_info
-                                .member_info
-                                .iter()
-                                .filter(|i| i.member_info.member_id == member_id)
-                                .max_by_key(|i| i.member_info.version)
+                                .canonical(member_id)
                                 .cloned()
                         });
 

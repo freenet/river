@@ -119,16 +119,32 @@ impl ChatRoomStateV1 {
         //         which permanently diverges peers that run cleanup a different
         //         number of times.
         //     Eviction drops INERT (currently-unauthorized) bans before
-        //     enforcing ones, defending the un-ban DoS: the relaxed `verify`
-        //     accepts forged/inert bans, and a flood of them over the cap would
-        //     otherwise evict the real moderator bans that keep spammers out
-        //     (#410 review round 1). The enforcing/inert classification and the
-        //     tie-break sort key are a pure function of the converged state (all
-        //     members still present, converged `member_info`), so every peer
-        //     evicts an identical set; `verify`'s hard cap ceiling still rejects
-        //     any stored state left over the cap. The signature sweep (step 5)
-        //     still runs AFTER enforcement to drop bans orphaned by a banner's
-        //     removal, and only removes bans, so the ban count stays <= the cap.
+        //     enforcing ones (#410 review round 1). This bounds an INERT flood
+        //     (forged / revoked-deputy bans, which `verify` accepts) — those are
+        //     evicted first, so a flood of them cannot push real moderator bans
+        //     out of the cap. It does NOT fully defend the un-ban DoS: an
+        //     ENFORCING-absent-target flood still evicts real bans, because a ban
+        //     by a current member of an ABSENT target classifies "enforcing"
+        //     WITHOUT any authorization check (`ban_is_enforcing` returns true for
+        //     a member-banner + absent target), and `banned_at` is an
+        //     attacker-signed, future-datable field — so a member can mint many
+        //     newest-dated "enforcing" bans that outrank and evict genuine ones.
+        //     The substantive fix (an authorization-aware / non-attacker-ordered
+        //     cap) is deferred pending Ian's decision; tracked separately.
+        //
+        //     CONVERGENCE HONESTY: the enforcing/inert classification is a
+        //     deterministic function of the member set it runs against, but that
+        //     member set is the INTERMEDIATE (pre-step-0) set as `apply_delta`
+        //     left it, which is order-dependent (cascade removal is arrival-order
+        //     sensitive). So two peers applying the same delta multiset in a
+        //     different order can evict DIFFERENT bans and NOT be byte-equal
+        //     without a further exchange; anti-entropy `merge` reconciles them to
+        //     the same top-set (pinned by `cap_eviction_reconciles_via_merge`).
+        //     Do NOT claim the eviction is order-independent per delta.
+        //     `verify`'s hard cap ceiling still rejects any stored state left over
+        //     the cap. The signature sweep (step 5) still runs AFTER enforcement
+        //     to drop bans orphaned by a banner's removal, and only removes bans,
+        //     so the ban count stays <= the cap.
         let max_bans = self.configuration.configuration.max_user_bans;
         if self.bans.0.len() > max_bans {
             let members_by_id = self.members.members_by_member_id();
@@ -312,6 +328,19 @@ impl ChatRoomStateV1 {
             info.member_info.member_id == owner_id
                 || required_ids.contains(&info.member_info.member_id)
         });
+
+        // 4a. Collapse duplicate member_info records to the single canonical
+        //     (highest-rank) one per member (#411 round 8 item C / security
+        //     FINDING 2+3). `verify` accepts duplicate records (migration-safety),
+        //     so a peer can hold several records for one member; without this,
+        //     two peers with different duplicate SETS would diverge byte-for-byte
+        //     forever (the raw `member_info` vectors differ even though every
+        //     canonical read agrees). Dedup is a pure function of the converged
+        //     state, so it is deterministic, idempotent, and order-independent,
+        //     and bounds stored `member_info` to <= one record per member. Runs
+        //     here (post_apply_cleanup), never in verify/validate_state, so the
+        //     permissionless migration PUT is unaffected.
+        self.member_info.dedup_to_canonical();
 
         // 4b. Sweep recent messages authored by members removed above (deputy-
         //     authorized ban cascade or inactivity prune).
@@ -2135,6 +2164,102 @@ mod tests {
                 .verify(&buggy_full_state, &parameters)
                 .is_err(),
             "a `..Default::default()` full-state upgrade must fail verification (the #127 bug)"
+        );
+    }
+
+    /// #411 round 8 item C: a state carrying DUPLICATE member_info records for a
+    /// member (which `verify` accepts) is collapsed by `post_apply_cleanup` to
+    /// exactly one canonical (highest-rank) record per member — killing the
+    /// duplicate-SET byte-divergence between peers and bounding stored size.
+    #[test]
+    fn post_apply_cleanup_dedups_member_info_to_canonical() {
+        use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+
+        let rng = &mut rand::thread_rng();
+        let owner_sk = SigningKey::generate(rng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let config = Configuration {
+            max_members: 10,
+            max_recent_messages: 100,
+            ..Default::default()
+        };
+        let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
+
+        // Member M kept present (has a message), with TWO member_info records:
+        // grant @ v1 (a deputy) and revoke @ v2 (empty).
+        let m_sk = SigningKey::generate(rng);
+        let m_vk = m_sk.verifying_key();
+        let m_id = MemberId::from(&m_vk);
+        let member_m = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: m_vk,
+            },
+            &owner_sk,
+        );
+        let msg_m = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: m_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("hi".to_string()),
+            },
+            &m_sk,
+        );
+
+        let dep = MemberId::from(&SigningKey::generate(rng).verifying_key());
+        let mut g = MemberInfo::new_public(m_id, 1, "nick".to_string());
+        g.deputies = vec![dep];
+        let grant = AuthorizedMemberInfo::new_with_member_key(g, &m_sk);
+        let mut r = MemberInfo::new_public(m_id, 2, "nick".to_string());
+        r.deputies = vec![];
+        let revoke = AuthorizedMemberInfo::new_with_member_key(r, &m_sk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: auth_config,
+            members: MembersV1 {
+                members: vec![member_m],
+            },
+            member_info: MemberInfoV1 {
+                // Duplicate: grant FIRST so a naive first-match would keep it.
+                member_info: vec![grant, revoke],
+            },
+            recent_messages: MessagesV1 {
+                messages: vec![msg_m],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        state.post_apply_cleanup(&params).unwrap();
+
+        let recs: Vec<_> = state
+            .member_info
+            .member_info
+            .iter()
+            .filter(|i| i.member_info.member_id == m_id)
+            .collect();
+        assert_eq!(
+            recs.len(),
+            1,
+            "exactly one member_info record for M after cleanup"
+        );
+        assert_eq!(
+            recs[0].member_info.version, 2,
+            "the surviving record is the v2 revoke"
+        );
+        assert!(
+            recs[0].member_info.deputies.is_empty(),
+            "the canonical (revoke) record has no deputies — revoked authority is not resurrected"
+        );
+        assert_eq!(
+            state.member_info.deputies_of(m_id),
+            &[] as &[MemberId],
+            "deputies_of agrees with the deduped canonical record"
         );
     }
 }
