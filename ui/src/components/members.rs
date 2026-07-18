@@ -297,6 +297,25 @@ fn invite_tree_order(owner_id: MemberId, members: &MembersV1) -> Vec<MemberId> {
     ordered
 }
 
+/// Filter a member's full set of deputizers to those RELEVANT to the viewer
+/// (#410), preserving order: a deputizer who is an ancestor of the viewer (so
+/// their deputy could ban the viewer) or the viewer themselves (the viewer
+/// appointed this deputy). Drives which members get the 🛡 badge and whose
+/// names its tooltip lists. `viewer_ancestors` includes the owner (an ancestor
+/// of everyone), so a deputy of the owner — a global moderator — is relevant to
+/// every viewer.
+fn relevant_deputizers(
+    deputizers: &[MemberId],
+    viewer_ancestors: &std::collections::HashSet<MemberId>,
+    viewer_id: MemberId,
+) -> Vec<MemberId> {
+    deputizers
+        .iter()
+        .copied()
+        .filter(|id| viewer_ancestors.contains(id) || *id == viewer_id)
+        .collect()
+}
+
 #[component]
 pub fn MemberList() -> Element {
     let mut invite_modal_active = use_signal(|| false);
@@ -331,10 +350,43 @@ pub fn MemberList() -> Element {
             }
         }
 
-        // Resolve an appointer's id to a display name (owner -> "room owner").
+        // The viewer's strict ancestors — the members whose invite subtree
+        // contains self, i.e. who could ban self — up to and INCLUDING the owner.
+        // `self` is NOT included. Used to scope the 🛡 badge to viewer-relevance
+        // (#410): a member is shown as a deputy only if one of THESE deputized
+        // them (their deputy could ban self) or the viewer appointed them.
+        let self_ancestors: std::collections::HashSet<MemberId> = {
+            let mut set = std::collections::HashSet::new();
+            set.insert(owner_id); // the owner is an ancestor of everyone
+            let invited_by: std::collections::HashMap<MemberId, MemberId> = members
+                .members
+                .iter()
+                .map(|m| (m.member.id(), m.member.invited_by))
+                .collect();
+            let mut guard = std::collections::HashSet::new();
+            guard.insert(self_member_id);
+            let mut cur = invited_by.get(&self_member_id).copied();
+            while let Some(c) = cur {
+                if !guard.insert(c) {
+                    break; // cycle guard
+                }
+                set.insert(c);
+                if c == owner_id {
+                    break;
+                }
+                cur = invited_by.get(&c).copied();
+            }
+            set
+        };
+
+        // Resolve an appointer's id to a display name (owner -> "room owner",
+        // self -> "you").
         let name_of = |id: MemberId| -> String {
             if id == owner_id {
                 return "room owner".to_string();
+            }
+            if id == self_member_id {
+                return "you".to_string();
             }
             member_info
                 .member_info
@@ -393,10 +445,23 @@ pub fn MemberList() -> Element {
                 } else {
                     is_in_your_network(member_id, members, self_member_id)
                 },
-                deputized_by: deputizers_of
-                    .get(&member_id)
-                    .map(|ids| ids.iter().map(|id| name_of(*id)).collect())
-                    .unwrap_or_default(),
+                // Scope to viewer-relevance (#410): only show/name deputizers
+                // whose authority reaches the viewer — an ancestor of self (so
+                // their deputy could ban self), or self themselves (self
+                // appointed this deputy). A deputy of some unrelated subtree is
+                // hidden; a deputy of the OWNER (a global mod) shows to everyone
+                // because the owner is in every viewer's ancestor set.
+                deputized_by: relevant_deputizers(
+                    deputizers_of
+                        .get(&member_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    &self_ancestors,
+                    self_member_id,
+                )
+                .into_iter()
+                .map(|id| name_of(id))
+                .collect(),
             };
 
             all_members.push((member_display_parts(&member_display), member_id));
@@ -1088,6 +1153,50 @@ mod tests {
             in_your_network: false,
             deputized_by: Vec::new(),
         }
+    }
+
+    /// The 🛡 deputy badge is scoped to viewer-relevance (#410): a deputy is
+    /// shown to the viewer only if an ancestor of the viewer (owner included) or
+    /// the viewer themselves appointed them.
+    #[test]
+    fn relevant_deputizers_scopes_to_viewer() {
+        use freenet_scaffold::util::FastHash;
+        let mid = |n: i64| MemberId(FastHash(n));
+        let owner = mid(1);
+        let a = mid(2); // an ancestor of the viewer
+        let viewer = mid(4);
+        let unrelated = mid(9); // a member in some OTHER subtree
+                                // viewer's ancestors always include the owner.
+        let ancestors: std::collections::HashSet<MemberId> = [owner, a].into_iter().collect();
+
+        // Deputy of the OWNER (global mod) → relevant to any viewer.
+        assert_eq!(
+            relevant_deputizers(&[owner], &ancestors, viewer),
+            vec![owner]
+        );
+        // Deputy of an ancestor of the viewer → relevant.
+        assert_eq!(relevant_deputizers(&[a], &ancestors, viewer), vec![a]);
+        // Deputy of an unrelated member (not an ancestor, not self) → hidden.
+        assert!(relevant_deputizers(&[unrelated], &ancestors, viewer).is_empty());
+        // Deputy the viewer appointed themselves → relevant ("you").
+        assert_eq!(
+            relevant_deputizers(&[viewer], &ancestors, viewer),
+            vec![viewer]
+        );
+        // Mixed input keeps only the relevant deputizers, in order.
+        assert_eq!(
+            relevant_deputizers(&[owner, unrelated, viewer], &ancestors, viewer),
+            vec![owner, viewer]
+        );
+
+        // Owner viewing: their ancestor set is just {owner} and self == owner, so
+        // only owner-appointed deputies are relevant.
+        let owner_ancestors: std::collections::HashSet<MemberId> = [owner].into_iter().collect();
+        assert_eq!(
+            relevant_deputizers(&[owner], &owner_ancestors, owner),
+            vec![owner]
+        );
+        assert!(relevant_deputizers(&[a], &owner_ancestors, owner).is_empty());
     }
 
     /// Regression test for freenet/river#227 (stored XSS via nickname).
