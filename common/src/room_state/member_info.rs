@@ -34,9 +34,31 @@ impl MemberInfoV1 {
     }
 }
 
+/// Total, deterministic ordering used to pick the canonical `MemberInfo` when
+/// two signed records for the SAME member collide (#411 round 4 item B).
+///
+/// Rule: **higher `version` wins; at equal version, the lexicographically-greater
+/// SIGNATURE wins.** Two records with the same member and version but different
+/// content (e.g. different `deputies`) have different signatures — the signature
+/// is over the whole `MemberInfo` — so this breaks the tie deterministically.
+///
+/// It is applied IDENTICALLY in [`ComposableState::apply_delta`] (conflict
+/// resolution), [`ComposableState::delta`], and [`ComposableState::summarize`]
+/// (via the `(version, signature)` summary value), so anti-entropy can DETECT a
+/// same-version content difference and both peers converge on the same record.
+/// Without it, equal-version resolution was order-dependent AND the summary
+/// carried only the version, so anti-entropy saw "same version", sent no
+/// correction, and peers disagreed on ban authority permanently.
+fn member_info_rank(version: u32, signature: &Signature) -> (u32, [u8; 64]) {
+    (version, signature.to_bytes())
+}
+
 impl ComposableState for MemberInfoV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = HashMap<MemberId, u32>;
+    /// `(version, signature)` per member. The signature is the equal-version
+    /// tiebreak discriminator (see [`member_info_rank`]); carrying it lets
+    /// anti-entropy detect a content difference at the SAME version (#411 B).
+    type Summary = HashMap<MemberId, (u32, Signature)>;
     type Delta = Vec<AuthorizedMemberInfo>;
     type Parameters = ChatRoomParametersV1;
 
@@ -82,9 +104,16 @@ impl ComposableState for MemberInfoV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
+        // Carry the signature alongside the version so anti-entropy can detect a
+        // SAME-version content difference and correct it (#411 round 4 B).
         self.member_info
             .iter()
-            .map(|info| (info.member_info.member_id, info.member_info.version))
+            .map(|info| {
+                (
+                    info.member_info.member_id,
+                    (info.member_info.version, info.signature),
+                )
+            })
             .collect()
     }
 
@@ -98,10 +127,19 @@ impl ComposableState for MemberInfoV1 {
             .member_info
             .iter()
             .filter(|info| {
-                // Include if member doesn't exist in old summary OR has a newer version
-                !old_state_summary.contains_key(&info.member_info.member_id)
-                    || info.member_info.version
-                        > *old_state_summary.get(&info.member_info.member_id).unwrap()
+                // Include if the member is absent from the old summary, OR this
+                // record OUTRANKS what the old summary has (higher version, or
+                // equal version with a greater signature). The equal-version arm
+                // is what lets a same-version content difference propagate (#411
+                // round 4 B) — without it, anti-entropy would never send the
+                // correction and peers would disagree on deputies forever.
+                match old_state_summary.get(&info.member_info.member_id) {
+                    None => true,
+                    Some((old_version, old_signature)) => {
+                        member_info_rank(info.member_info.version, &info.signature)
+                            > member_info_rank(*old_version, old_signature)
+                    }
+                }
             })
             .cloned()
             .collect();
@@ -164,13 +202,25 @@ impl ComposableState for MemberInfoV1 {
                     member_info.verify_signature_with_key(&member.member.member_vk)?;
                 }
 
-                // Update or add the member info
+                // Update or add the member info. Conflict resolution uses the
+                // total, deterministic `member_info_rank` order (higher version,
+                // else greater signature) so that two DIFFERENT records for the
+                // same member at the SAME version resolve identically regardless
+                // of delta arrival order (#411 round 4 B). Using only
+                // `version >` (as before) left equal-version conflicts
+                // order-dependent, so peers could permanently disagree on
+                // `deputies` (and therefore on ban authority).
                 if let Some(existing_info) = self
                     .member_info
                     .iter_mut()
                     .find(|info| info.member_info.member_id == *member_id)
                 {
-                    if member_info.member_info.version > existing_info.member_info.version {
+                    if member_info_rank(member_info.member_info.version, &member_info.signature)
+                        > member_info_rank(
+                            existing_info.member_info.version,
+                            &existing_info.signature,
+                        )
+                    {
                         *existing_info = member_info.clone();
                     }
                 } else {
@@ -497,7 +547,7 @@ mod tests {
         let summary = member_info_v1.summarize(&parent_state, &parameters);
         assert_eq!(summary.len(), 1);
         assert!(summary.contains_key(&member_id));
-        assert_eq!(*summary.get(&member_id).unwrap(), 1); // Version should be 1
+        assert_eq!(summary.get(&member_id).unwrap().0, 1); // Version should be 1
     }
 
     #[test]
@@ -511,6 +561,8 @@ mod tests {
 
         let authorized_member_info1 = AuthorizedMemberInfo::new(member_info1, &owner_signing_key);
         let authorized_member_info2 = AuthorizedMemberInfo::new(member_info2, &owner_signing_key);
+        // Capture member1's signature for the summary tiebreak (#411 round 4 B).
+        let sig1 = authorized_member_info1.signature;
 
         let mut member_info_v1 = MemberInfoV1::default();
         member_info_v1.member_info.push(authorized_member_info1);
@@ -521,9 +573,10 @@ mod tests {
             owner: owner_signing_key.verifying_key(),
         };
 
-        // Create a HashMap with member_id1 and version 1
+        // Summary says the peer already holds member1 at (version 1, sig1), so
+        // member1 does not outrank it and only member2 appears in the delta.
         let mut old_summary = HashMap::new();
-        old_summary.insert(member_id1, 1);
+        old_summary.insert(member_id1, (1, sig1));
 
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
 
@@ -727,18 +780,30 @@ mod tests {
         let delta = member_info_v1.delta(&parent_state, &parameters, &HashMap::new());
         assert_eq!(delta.unwrap().len(), 5);
 
-        // Test when all members are old with same version
-        let old_summary: HashMap<MemberId, u32> = member_infos
+        // Test when all members are old with the same (version, signature) —
+        // nothing outranks the summary, so the delta is empty (#411 round 4 B).
+        let old_summary: HashMap<MemberId, (u32, Signature)> = member_infos
             .iter()
-            .map(|info| (info.member_info.member_id, info.member_info.version))
+            .map(|info| {
+                (
+                    info.member_info.member_id,
+                    (info.member_info.version, info.signature),
+                )
+            })
             .collect();
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
         assert!(delta.is_none());
 
         // Test with a mix of new and old members
         let mut old_summary = HashMap::new();
-        old_summary.insert(member_infos[0].member_info.member_id, 1);
-        old_summary.insert(member_infos[1].member_info.member_id, 1);
+        old_summary.insert(
+            member_infos[0].member_info.member_id,
+            (1, member_infos[0].signature),
+        );
+        old_summary.insert(
+            member_infos[1].member_info.member_id,
+            (1, member_infos[1].signature),
+        );
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
         assert_eq!(delta.unwrap().len(), 3);
 
@@ -794,7 +859,7 @@ mod tests {
 
         // Create summary with version 1
         let summary = member_info_state.summarize(&parent_state, &parameters);
-        assert_eq!(*summary.get(&member_id).unwrap(), 1);
+        assert_eq!(summary.get(&member_id).unwrap().0, 1);
 
         // Create delta with version 2
         let mut updated_state = MemberInfoV1::default();

@@ -1407,3 +1407,246 @@ fn new_verify_accepts_legacy_state_with_nonmember_banner_bans() {
         .verify(&cleaned, &p)
         .expect("post-cleanup state still verifies");
 }
+
+// ===================================================================
+// Round 4 — signature-bypass and equal-version convergence (Codex)
+// ===================================================================
+
+/// #411 round 4 A — same-delta pruned-deputy REPLAY forgery.
+///
+/// A pruned deputy D's PUBLIC `AuthorizedMember` (replayable by anyone, since it
+/// is signed by D's inviter, not D) is re-added as a member in the SAME delta
+/// that carries a GARBAGE-signature ban attributed to D. Field order applies
+/// `bans` before `members`, so `verify` SKIPS the ban's signature at apply time
+/// (D is absent then). Without the enforcement-time re-check, `post_apply_cleanup`
+/// would see D as a current member, honor D's retained owner-global-mod grant,
+/// and remove the victim via a ban D never signed. The fix re-verifies the ban's
+/// signature against the banner's CURRENT converged key during enforcement, so
+/// the forged ban is inert (victim survives) AND is swept from state. A
+/// validly-signed present-member ban in the SAME state still enforces.
+#[test]
+fn same_delta_replayed_deputy_forged_ban_is_inert_and_swept() {
+    let owner = Peer::new();
+    let d = Peer::new(); // pruned deputy, replayed as a member; owner's global mod
+    let v = Peer::new(); // victim of the forged ban
+    let m = Peer::new(); // legit banner (owner's invitee)
+    let t = Peer::new(); // legit ban target, in M's subtree
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    // GARBAGE-signature ban attributed to D against V (D never signed it).
+    let forged = AuthorizedUserBan::with_signature(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::now(),
+            banned_user: v.id,
+        },
+        d.id,
+        ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+    );
+    // A real, validly-signed ban by present member M of T (M is T's ancestor).
+    let real = ban(t.id, &m, owner_id);
+
+    let mut state = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![
+                // D re-added via the replayed public AuthorizedMember.
+                member(&d, owner_id, &owner.sk, owner_id),
+                member(&v, owner_id, &owner.sk, owner_id),
+                member(&m, owner_id, &owner.sk, owner_id),
+                member(&t, m.id, &m.sk, owner_id),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![
+                info(&owner, 1, vec![d.id]), // owner deputizes D (global mod)
+                info(&d, 0, vec![]),
+                info(&v, 0, vec![]),
+                info(&m, 0, vec![]),
+                info(&t, 0, vec![]),
+            ],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![
+                join(&d, owner_id),
+                join(&v, owner_id),
+                join(&m, owner_id),
+                join(&t, owner_id),
+            ],
+            ..Default::default()
+        },
+        bans: BansV1(vec![forged.clone(), real.clone()]),
+        ..Default::default()
+    };
+
+    state.post_apply_cleanup(&p).unwrap();
+
+    let ids = member_ids(&state);
+    assert!(
+        ids.contains(&v.id),
+        "victim survives the forged ban (signature re-checked at enforcement)"
+    );
+    assert!(
+        !ids.contains(&t.id),
+        "the validly-signed present-member ban still enforces"
+    );
+    assert!(
+        !state.bans.0.iter().any(|bn| bn.banned_by == d.id),
+        "the forged garbage-sig ban is swept from state"
+    );
+    assert!(
+        state.bans.0.iter().any(|bn| bn.banned_by == m.id),
+        "the valid present-member ban is retained"
+    );
+    state
+        .verify(&state, &p)
+        .expect("cleaned state verifies (no unvalidated ban remains)");
+}
+
+/// #411 round 4 B — equal-version `MemberInfo` conflict resolves deterministically
+/// regardless of apply order (the `apply_delta` tiebreak half of the fix).
+#[test]
+fn equal_version_member_info_resolves_deterministically_across_apply_order() {
+    let owner = Peer::new();
+    let m = Peer::new();
+    let x = Peer::new();
+    let y = Peer::new();
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    // Two self-signed records for M at the SAME version but different deputies —
+    // hence different signatures.
+    let ra = info(&m, 1, vec![x.id]);
+    let rb = info(&m, 1, vec![y.id]);
+    assert_ne!(ra, rb, "the two equal-version records must actually differ");
+
+    let baseline = ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![member(&m, owner_id, &owner.sk, owner_id)],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&m, owner_id)],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let da = river_core::room_state::ChatRoomStateV1Delta {
+        member_info: Some(vec![ra.clone()]),
+        ..Default::default()
+    };
+    let db = river_core::room_state::ChatRoomStateV1Delta {
+        member_info: Some(vec![rb.clone()]),
+        ..Default::default()
+    };
+
+    // Peer1 applies RA then RB; Peer2 applies RB then RA.
+    let mut peer1 = baseline.clone();
+    peer1
+        .apply_delta(&baseline.clone(), &p, &Some(da.clone()))
+        .unwrap();
+    let mid = peer1.clone();
+    peer1.apply_delta(&mid, &p, &Some(db.clone())).unwrap();
+
+    let mut peer2 = baseline.clone();
+    peer2.apply_delta(&baseline.clone(), &p, &Some(db)).unwrap();
+    let mid = peer2.clone();
+    peer2.apply_delta(&mid, &p, &Some(da)).unwrap();
+
+    assert_eq!(
+        peer1.member_info, peer2.member_info,
+        "equal-version conflict must resolve identically regardless of apply order"
+    );
+    // Canonical winner: higher version (equal here), else greater signature.
+    let winner = if ra.signature.to_bytes() > rb.signature.to_bytes() {
+        &ra
+    } else {
+        &rb
+    };
+    let got = peer1
+        .member_info
+        .member_info
+        .iter()
+        .find(|i| i.member_info.member_id == m.id)
+        .unwrap();
+    assert_eq!(got, winner, "resolves to the greater-signature record");
+    peer1.verify(&peer1, &p).expect("peer1 verifies");
+}
+
+/// #411 round 4 B — a same-version content difference is DETECTED and corrected
+/// by anti-entropy (the `summarize` discriminator half of the fix). Each peer has
+/// only ONE of the two equal-version records; because the summary now carries the
+/// signature, the merge transfers the canonical winner and both converge. If
+/// `summarize` regressed to version-only, the delta would be empty and the peers
+/// would disagree on ban authority forever.
+#[test]
+fn equal_version_member_info_diff_detected_by_anti_entropy() {
+    let owner = Peer::new();
+    let m = Peer::new();
+    let x = Peer::new();
+    let y = Peer::new();
+    let owner_id = owner.id;
+    let p = params(&owner);
+
+    let ra = info(&m, 1, vec![x.id]);
+    let rb = info(&m, 1, vec![y.id]);
+    assert_ne!(ra, rb, "the two equal-version records must actually differ");
+
+    let base = |mi: AuthorizedMemberInfo| ChatRoomStateV1 {
+        configuration: config(&owner),
+        members: MembersV1 {
+            members: vec![member(&m, owner_id, &owner.sk, owner_id)],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![mi],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![join(&m, owner_id)],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut peer1 = base(ra.clone()); // only ever saw RA
+    let mut peer2 = base(rb.clone()); // only ever saw RB
+    assert_ne!(
+        peer1.member_info, peer2.member_info,
+        "precondition: the peers start out disagreeing"
+    );
+
+    // The summary MUST expose the equal-version content difference, so at least
+    // one direction produces a non-empty delta (the winner → loser correction).
+    let s1 = peer1.summarize(&peer1, &p);
+    let s2 = peer2.summarize(&peer2, &p);
+    assert!(
+        peer2.delta(&peer1, &p, &s1).is_some() || peer1.delta(&peer2, &p, &s2).is_some(),
+        "anti-entropy must DETECT the equal-version deputies difference"
+    );
+
+    // Anti-entropy merge, both directions.
+    let snap1 = peer1.clone();
+    let snap2 = peer2.clone();
+    peer1.merge(&snap1, &p, &snap2).unwrap();
+    peer2.merge(&snap2, &p, &snap1).unwrap();
+
+    assert_eq!(
+        peer1.member_info, peer2.member_info,
+        "peers converge on the SAME MemberInfo record after anti-entropy"
+    );
+    let winner = if ra.signature.to_bytes() > rb.signature.to_bytes() {
+        &ra
+    } else {
+        &rb
+    };
+    let got = peer1
+        .member_info
+        .member_info
+        .iter()
+        .find(|i| i.member_info.member_id == m.id)
+        .unwrap();
+    assert_eq!(got, winner, "both converge to the greater-signature record");
+    peer1.verify(&peer1, &p).expect("peer1 verifies");
+    peer2.verify(&peer2, &p).expect("peer2 verifies");
+}

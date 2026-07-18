@@ -238,20 +238,34 @@ impl ChatRoomStateV1 {
             m.message.author == owner_id || current_member_ids.contains(&m.message.author)
         });
 
-        // 5. Sweep any ban whose banner is neither the OWNER nor a CURRENT
-        //    member (#411 round 3 item A.3). Nothing unvalidated stays in state
-        //    (AGENTS.md State Authorization Rule): `verify` skips signature
-        //    verification for non-member banners, and `is_ban_authorized` grants
-        //    nothing to a non-member banner, so a ban by a non-member is both
-        //    unverifiable and inert — a stale/pruned deputy ID or a forged
-        //    banner. Removing them here (against CONVERGED state, keeping `verify`
-        //    stable) subsumes the older "banner was banned" orphaned-ban sweep.
-        //    Real member-banners were kept present by the item-B exemption above,
-        //    so their bans survive. `current_member_ids` was computed in step 4b
-        //    (nothing between there and here changes the member set).
-        self.bans
-            .0
-            .retain(|ban| ban.banned_by == owner_id || current_member_ids.contains(&ban.banned_by));
+        // 5. Sweep any ban that is not backed by a signature-verified authority
+        //    (#411 round 3 item A.3 + round 4 item A). Nothing unvalidated stays
+        //    in state (AGENTS.md State Authorization Rule). A ban is kept only if
+        //    `ban_signature_matches_current_key` holds: the banner is the OWNER or
+        //    a CURRENT member AND the stored signature verifies against that
+        //    banner's CURRENT converged key. This drops two classes:
+        //    (a) non-member banners — a stale/pruned deputy ID or forged banner,
+        //        whose signature `verify` skipped and whom `is_ban_authorized`
+        //        grants nothing (round 3); and
+        //    (b) current-member banners whose signature does NOT match the
+        //        converged key — the same-delta pruned-deputy REPLAY forgery,
+        //        where a public `AuthorizedMember` was replayed to make the banner
+        //        a member while `verify` skipped the garbage ban signature at
+        //        apply time (round 4). Enforcement (step 0 / `banned_member_ids`)
+        //        already refuses to act on such a ban; this sweeps it from state.
+        //    Real member-banners with valid signatures were kept present by the
+        //    item-B exemption above, so their bans survive. Runs against CONVERGED
+        //    state, keeping `verify` stable (migration-safe). `members_by_id` is
+        //    rebuilt here because the sweep needs each banner's `member_vk`.
+        let members_by_id_for_ban_sweep = self.members.members_by_member_id();
+        self.bans.0.retain(|ban| {
+            BansV1::ban_signature_matches_current_key(
+                ban,
+                &members_by_id_for_ban_sweep,
+                owner_id,
+                &parameters.owner,
+            )
+        });
 
         // 5b. Enforce `max_user_bans`, evicting INERT (currently-unauthorized)
         //     bans BEFORE enforcing ones. This defends the un-ban DoS: the
@@ -273,7 +287,13 @@ impl ChatRoomStateV1 {
             // ban (not O(n log n) times inside a comparator) — #411 round 3 C.
             self.bans.0.sort_by_cached_key(|ban| {
                 (
-                    BansV1::ban_is_enforcing(ban, &members_by_id, &self.member_info, owner_id),
+                    BansV1::ban_is_enforcing(
+                        ban,
+                        &members_by_id,
+                        &self.member_info,
+                        owner_id,
+                        &parameters.owner,
+                    ),
                     ban.ban.banned_at,
                     ban.id(),
                 )

@@ -190,24 +190,69 @@ impl BansV1 {
         Ok(())
     }
 
+    /// Re-verify `ban`'s signature against the banner's CURRENT converged key
+    /// (#411 round 4 item A). Returns `true` iff the banner is the owner or a
+    /// current member AND the stored signature verifies against that banner's
+    /// current verifying key; `false` for a non-member banner (unverifiable) or a
+    /// signature that does not match — a forged/replayed ban.
+    ///
+    /// This closes the SAME-DELTA replay bypass. Field order applies `bans`
+    /// before `members`, so `verify` SKIPS the signature check for a banner that
+    /// is absent from the parent state at bans-apply time (see
+    /// `verify_excluding_cap`). A single delta that re-adds a pruned deputy via
+    /// their PUBLIC, replayable `AuthorizedMember` AND carries a garbage-signature
+    /// ban attributed to that deputy would otherwise have the ban ENFORCED by
+    /// `post_apply_cleanup` once the deputy is a current member (the retained
+    /// deputy grant authorizes it) — a ban forged without the deputy's private
+    /// key. ENFORCEMENT re-checks the signature against the converged key, so the
+    /// apply-time skip no longer matters. It can never false-reject a genuine
+    /// ban: a `MemberId` is the hash of its verifying key, so a current member's
+    /// key is exactly the one that produced their id, and a ban legitimately
+    /// signed by that member always verifies.
+    ///
+    /// `verify` itself is deliberately NOT tightened (that would strand the
+    /// Official room's migration PUT, which carries legitimately sig-skipped
+    /// non-member-banner bans); the check lives only in enforcement.
+    pub fn ban_signature_matches_current_key(
+        ban: &AuthorizedUserBan,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        owner_id: MemberId,
+        owner_vk: &VerifyingKey,
+    ) -> bool {
+        let banner = ban.banned_by;
+        let vk = if banner == owner_id {
+            *owner_vk
+        } else if let Some(member) = members_by_id.get(&banner) {
+            member.member.member_vk
+        } else {
+            // Non-member banner: unverifiable here (key unavailable). Treated as
+            // not-matching so callers classify it inert / sweep it.
+            return false;
+        };
+        ban.verify_signature(&vk).is_ok()
+    }
+
     /// Whether `ban` is currently ENFORCING (worth keeping under `max_user_bans`
     /// pressure) rather than INERT (evicted first). Pure function of the
     /// converged `(members + member_info)` state (#410 review round 1).
     ///
+    /// - The banner must be the owner or a current member AND the ban's signature
+    ///   must verify against that banner's CURRENT key
+    ///   ([`Self::ban_signature_matches_current_key`], #411 round 4 A). A
+    ///   non-member banner, or a forged/replayed ban whose signature does not
+    ///   match the converged key, is inert.
     /// - If the target is a **current member**, the ban is enforcing iff its
     ///   banner is currently authorized to ban it
     ///   ([`MembersV1::is_ban_authorized`]). A forged ban on a present member,
     ///   or a revoked-deputy ban whose target rejoined, is inert.
-    /// - If the target is **absent** (already removed/pruned), keep the ban only
-    ///   if its banner is a legitimate authority holder — the owner, a current
-    ///   member, or a member currently listed as a deputy by someone. A forged
-    ///   ban by a non-member fake id who is nobody's deputy is inert and evicted
-    ///   first, which is what defends the un-ban DoS.
+    /// - If the target is **absent** (already removed/pruned), keep the ban (its
+    ///   banner is a signature-verified owner/member): a real enforcing ban.
     pub fn ban_is_enforcing(
         ban: &AuthorizedUserBan,
         members_by_id: &HashMap<MemberId, &AuthorizedMember>,
         member_info: &MemberInfoV1,
         owner_id: MemberId,
+        owner_vk: &VerifyingKey,
     ) -> bool {
         let banner = ban.banned_by;
         // A ban can only enforce while its banner is the owner or a current
@@ -217,12 +262,18 @@ impl BansV1 {
         if banner != owner_id && !members_by_id.contains_key(&banner) {
             return false;
         }
+        // Re-verify the signature against the banner's CURRENT converged key
+        // (#411 round 4 A). Closes the same-delta pruned-deputy-replay bypass:
+        // `verify` skipped this at apply time because the banner was absent then.
+        if !Self::ban_signature_matches_current_key(ban, members_by_id, owner_id, owner_vk) {
+            return false;
+        }
         let target = ban.ban.banned_user;
         if members_by_id.contains_key(&target) {
             MembersV1::is_ban_authorized(banner, target, members_by_id, member_info, owner_id)
         } else {
-            // Target already removed and the banner is the owner or a current
-            // member (checked above): a real enforcing ban worth keeping.
+            // Target already removed and the banner is a signature-verified owner
+            // or current member (checked above): a real enforcing ban worth keeping.
             true
         }
     }

@@ -254,6 +254,22 @@ impl MembersV1 {
         let members_by_id = self.members_by_member_id();
         let mut banned_ids = HashSet::new();
         for ban in &bans_v1.0 {
+            // A ban only enforces if its signature verifies against the banner's
+            // CURRENT converged key (#411 round 4 A). `verify` skips the signature
+            // for a banner absent at bans-apply time (bans apply before members),
+            // so a delta that re-adds a pruned deputy via their public
+            // `AuthorizedMember` AND carries a garbage-signature ban attributed to
+            // them must be re-checked here — otherwise the retained deputy grant
+            // would remove members via a ban forged without the deputy's key. This
+            // never rejects a genuine ban (a member's id is the hash of their key).
+            if !BansV1::ban_signature_matches_current_key(
+                ban,
+                &members_by_id,
+                owner_id,
+                &parameters.owner,
+            ) {
+                continue;
+            }
             if Self::is_ban_authorized(
                 ban.banned_by,
                 ban.ban.banned_user,

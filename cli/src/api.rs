@@ -4147,36 +4147,10 @@ impl ApiClient {
         let my_member_id: MemberId = signing_key.verifying_key().into();
         let owner_member_id: MemberId = room_owner_key.into();
 
-        // Resolve the target's full MemberId from the short id (same lookup as
-        // ban_member).
-        let target = room_state
-            .member_info
-            .member_info
-            .iter()
-            .find(|info| {
-                let s = info.member_info.member_id.to_string();
-                s.starts_with(member_id_short)
-                    || s[..8.min(s.len())].eq_ignore_ascii_case(member_id_short)
-            })
-            .map(|info| info.member_info.member_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Member '{}' not found. Use 'member list' to see member IDs.",
-                    member_id_short
-                )
-            })?;
-
-        if target == my_member_id {
-            return Err(anyhow!("You cannot deputize yourself"));
-        }
-        if target == owner_member_id {
-            return Err(anyhow!(
-                "The room owner already has full authority; deputizing them is a no-op"
-            ));
-        }
-
-        // Load the caller's current signed member_info: we must preserve the
-        // (already-sealed) nickname and version-continuity when republishing.
+        // Load the caller's current signed member_info FIRST: we must preserve the
+        // (already-sealed) nickname and version-continuity when republishing, and
+        // the revoke path resolves the target against the caller's OWN deputies
+        // list (below).
         let current_self_info = room_state
             .member_info
             .member_info
@@ -4191,6 +4165,36 @@ impl ApiClient {
         let current_version = current_self_info.member_info.version;
         let preferred_nickname = current_self_info.member_info.preferred_nickname.clone();
         let mut deputies = current_self_info.member_info.deputies.clone();
+
+        // Resolve the target's full MemberId from the short id. Primary: the
+        // member_info list (a present member), same lookup as `ban_member`.
+        // Revoke fallback (#411 round 4 C): a deputy pruned for inactivity has no
+        // member_info but still sits in the caller's signed `deputies` list, so
+        // the primary lookup can't find them — match the short id against the
+        // caller's own deputies too, so the lingering grant can be revoked
+        // (otherwise it silently reactivates if the deputy's membership is later
+        // replayed).
+        let target = resolve_deputy_target(
+            &room_state.member_info.member_info,
+            &deputies,
+            member_id_short,
+            !add, // allow the own-deputies fallback only when revoking
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "Member '{}' not found. Use 'member list' to see member IDs.",
+                member_id_short
+            )
+        })?;
+
+        if target == my_member_id {
+            return Err(anyhow!("You cannot deputize yourself"));
+        }
+        if target == owner_member_id {
+            return Err(anyhow!(
+                "The room owner already has full authority; deputizing them is a no-op"
+            ));
+        }
 
         if add {
             if deputies.contains(&target) {
@@ -4571,6 +4575,100 @@ impl ApiClient {
                 }
             }
         }
+    }
+}
+
+/// Resolve a `member set-deputy` / `revoke-deputy` short id to a full `MemberId`.
+///
+/// Primary: a present member, matched via their `member_info` (same rule as
+/// `ban_member` — full-string prefix, or a case-insensitive first-8-chars match).
+/// Revoke fallback (#411 round 4 C): when `allow_deputy_fallback` is set (the
+/// revoke path), also match the caller's OWN `deputies`, so a deputy who was
+/// pruned for inactivity — their `member_info` is gone but their id still sits in
+/// the caller's signed deputies list — can still be revoked.
+fn resolve_deputy_target(
+    member_infos: &[AuthorizedMemberInfo],
+    own_deputies: &[MemberId],
+    member_id_short: &str,
+    allow_deputy_fallback: bool,
+) -> Option<MemberId> {
+    let matches = |id: &MemberId| {
+        let s = id.to_string();
+        s.starts_with(member_id_short) || s[..8.min(s.len())].eq_ignore_ascii_case(member_id_short)
+    };
+    member_infos
+        .iter()
+        .map(|info| info.member_info.member_id)
+        .find(|id| matches(id))
+        .or_else(|| {
+            if allow_deputy_fallback {
+                own_deputies.iter().copied().find(|id| matches(id))
+            } else {
+                None
+            }
+        })
+}
+
+#[cfg(test)]
+mod deputy_resolve_tests {
+    use super::resolve_deputy_target;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member::MemberId;
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+
+    fn info(sk: &SigningKey) -> AuthorizedMemberInfo {
+        let id: MemberId = sk.verifying_key().into();
+        AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(id, 0, "n".to_string()),
+            sk,
+        )
+    }
+
+    fn short(id: &MemberId) -> String {
+        let s = id.to_string();
+        s[..8.min(s.len())].to_string()
+    }
+
+    /// #411 round 4 C: revoke can resolve a pruned deputy (no member_info) from
+    /// the caller's own deputies list; deputize cannot resolve a non-member.
+    #[test]
+    fn revoke_resolves_pruned_deputy_from_own_deputies_list() {
+        // Distinct fixed seeds → distinct keys (the cli crate's dalek does not
+        // enable the `rand` `generate` helper; mirrors the other cli tests).
+        let present = SigningKey::from_bytes(&[7u8; 32]);
+        let pruned_deputy = SigningKey::from_bytes(&[9u8; 32]);
+        let present_id: MemberId = present.verifying_key().into();
+        let pruned_id: MemberId = pruned_deputy.verifying_key().into();
+
+        // Only the present member has a member_info entry; the pruned deputy's
+        // member_info is gone but their id still sits in own_deputies.
+        let member_infos = vec![info(&present)];
+        let own_deputies = vec![pruned_id];
+
+        // A present member resolves via the primary lookup in both modes.
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &short(&present_id), false),
+            Some(present_id)
+        );
+
+        // The pruned deputy is NOT resolvable when deputizing (no member_info)...
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &short(&pruned_id), false),
+            None,
+            "deputize must not resolve a non-member"
+        );
+        // ...but IS resolvable when revoking (fallback to the caller's deputies).
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &short(&pruned_id), true),
+            Some(pruned_id),
+            "revoke resolves a pruned deputy from the caller's own deputies list"
+        );
+
+        // An unknown short id resolves to nothing even with the fallback.
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, "zzzzzzzz", true),
+            None
+        );
     }
 }
 

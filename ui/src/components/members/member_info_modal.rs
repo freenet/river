@@ -15,6 +15,28 @@ use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::ChatRoomParametersV1;
 
+/// Whether `viewer` may ban `target` — the Ban-button gate (#410 / #411 round 4
+/// D). Uses [`MembersV1::is_ban_authorized`] (owner / invite-ancestor / deputy),
+/// NOT bare invite-chain ancestry, so a DEPUTY sees the Ban action for members in
+/// their deputizer's subtree. Bare downstream ancestry (`is_downstream`, still
+/// used for the "🔑 Invited by You" relationship tag) would have hidden it.
+fn viewer_can_ban(
+    members: &river_core::room_state::member::MembersV1,
+    member_info: &river_core::room_state::member_info::MemberInfoV1,
+    viewer: MemberId,
+    target: MemberId,
+    owner_id: MemberId,
+) -> bool {
+    let members_by_id = members.members_by_member_id();
+    river_core::room_state::member::MembersV1::is_ban_authorized(
+        viewer,
+        target,
+        &members_by_id,
+        member_info,
+        owner_id,
+    )
+}
+
 #[component]
 pub fn MemberInfoModal() -> Element {
     // Memos
@@ -142,9 +164,28 @@ pub fn MemberInfoModal() -> Element {
             })
             .unwrap_or(false);
 
+        // Ban authority (#410 / #411 round 4 D). The Ban button is gated on REAL
+        // ban authority — owner / invite-ancestor / deputy — via
+        // `is_ban_authorized`, NOT bare downstream ancestry (`is_downstream`), so a
+        // deputy sees Ban for members in their deputizer's subtree. `is_downstream`
+        // is still used above for the "🔑 Invited by You" relationship tag, which
+        // is a different meaning and must not change.
+        let can_ban = owner_key_signal
+            .as_ref()
+            .map(|owner| {
+                viewer_can_ban(
+                    &room_state.room_state.members,
+                    &room_state.room_state.member_info,
+                    self_member_id,
+                    member_id,
+                    MemberId::from(&*owner),
+                )
+            })
+            .unwrap_or(false);
+
         info!(
-            "Rendering MemberInfoModal for member_id: {:?} is_owner: {:?} is_downstream: {:?}",
-            member_id, is_owner, is_downstream
+            "Rendering MemberInfoModal for member_id: {:?} is_owner: {:?} is_downstream: {:?} can_ban: {:?}",
+            member_id, is_owner, is_downstream, can_ban
         );
 
         // Get the inviter's nickname and ID
@@ -369,7 +410,7 @@ pub fn MemberInfoModal() -> Element {
                             div { class: "mt-4 flex items-start gap-3",
                                 BanButton {
                                     member_to_ban: member_id,
-                                    is_downstream: is_downstream,
+                                    can_ban: can_ban,
                                     nickname: member_info.member_info.preferred_nickname.clone()
                                 }
 
@@ -402,4 +443,95 @@ pub fn MemberInfoModal() -> Element {
     };
 
     modal_content
+}
+
+#[cfg(test)]
+mod ban_gate_tests {
+    use super::viewer_can_ban;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersV1};
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+
+    fn member(
+        sk: &SigningKey,
+        inviter_id: MemberId,
+        inviter_sk: &SigningKey,
+        owner_id: MemberId,
+    ) -> AuthorizedMember {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: inviter_id,
+                member_vk: sk.verifying_key(),
+            },
+            inviter_sk,
+        )
+    }
+
+    fn info(sk: &SigningKey, deputies: Vec<MemberId>) -> AuthorizedMemberInfo {
+        let id: MemberId = sk.verifying_key().into();
+        let mut mi = MemberInfo::new_public(id, 0, "n".to_string());
+        mi.deputies = deputies;
+        AuthorizedMemberInfo::new_with_member_key(mi, sk)
+    }
+
+    /// #411 round 4 D: the Ban-button gate uses `is_ban_authorized`, so a deputy
+    /// sees Ban for a target in their deputizer's subtree — which the old bare
+    /// downstream-ancestry gate (`is_downstream`) would have hidden.
+    #[test]
+    fn deputy_can_ban_but_unrelated_cannot() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let d = SigningKey::generate(&mut OsRng); // owner's global-mod deputy
+        let u = SigningKey::generate(&mut OsRng); // unrelated member
+        let v = SigningKey::generate(&mut OsRng); // target (owner's invitee)
+        let owner_id: MemberId = owner.verifying_key().into();
+        let d_id: MemberId = d.verifying_key().into();
+        let u_id: MemberId = u.verifying_key().into();
+        let v_id: MemberId = v.verifying_key().into();
+
+        let members = MembersV1 {
+            members: vec![
+                member(&d, owner_id, &owner, owner_id),
+                member(&u, owner_id, &owner, owner_id),
+                member(&v, owner_id, &owner, owner_id),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                info(&owner, vec![d_id]), // owner deputizes D (global mod)
+                info(&d, vec![]),
+                info(&u, vec![]),
+                info(&v, vec![]),
+            ],
+        };
+
+        // Owner can ban anyone.
+        assert!(viewer_can_ban(
+            &members,
+            &member_info,
+            owner_id,
+            v_id,
+            owner_id
+        ));
+        // D (owner's deputy) can ban V even though D is NOT an ancestor of V, so
+        // the old `is_downstream` gate would have hidden the Ban button.
+        assert!(viewer_can_ban(&members, &member_info, d_id, v_id, owner_id));
+        // An unrelated member cannot ban V.
+        assert!(!viewer_can_ban(
+            &members,
+            &member_info,
+            u_id,
+            v_id,
+            owner_id
+        ));
+        // Nobody can ban the owner.
+        assert!(!viewer_can_ban(
+            &members,
+            &member_info,
+            d_id,
+            owner_id,
+            owner_id
+        ));
+    }
 }
