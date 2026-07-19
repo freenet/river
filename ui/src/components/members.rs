@@ -1391,12 +1391,13 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
     // `ROOMS_LOAD_STATE == Loaded` throughout). `saw_fetch_failure()` and
     // `rooms_recovery_in_progress()` are read alongside (non-signal sources).
     let _ = ROOMS.try_read(); // subscribe: re-render when recovery hydrates rooms
+    let saw_fetch_failure = crate::components::app::chat_delegate::saw_fetch_failure();
     let rooms_hydrated = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
         .try_read()
         .map(|g| {
             rooms_load_is_authoritative(
                 *g,
-                crate::components::app::chat_delegate::saw_fetch_failure(),
+                saw_fetch_failure,
                 crate::components::app::chat_delegate::rooms_recovery_in_progress(),
             )
         })
@@ -1594,10 +1595,34 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     // state — so the Import button waits for hydration
                     // (freenet/river#414 redesign).
                     if !rooms_hydrated {
-                        div {
-                            "data-testid": "import-identity-loading-rooms",
-                            class: "mt-3 text-sm text-text-muted",
-                            "Loading your rooms\u{2026} the import will be available in a moment."
+                        if saw_fetch_failure {
+                            // A partial load FAILED: the rail shows `List` (some
+                            // room exists) so its own Retry control is hidden, and
+                            // without a way out the import would be blocked
+                            // indefinitely. Give the user a working retry that
+                            // re-fires the load; the gate clears reactively once
+                            // the missing rooms hydrate (freenet/river#414 round-10 P2).
+                            div {
+                                "data-testid": "import-identity-load-failed",
+                                class: "mt-3 text-sm text-amber-400",
+                                "Some rooms didn't finish loading, so importing is paused to avoid overwriting one. Retry loading your rooms to continue."
+                            }
+                            div { class: "flex justify-end mt-2",
+                                button {
+                                    "data-testid": "import-identity-retry-load",
+                                    class: "px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-xs rounded-lg transition-colors border border-border",
+                                    onclick: move |_| {
+                                        crate::components::app::chat_delegate::retry_rooms_load();
+                                    },
+                                    "Retry loading rooms"
+                                }
+                            }
+                        } else {
+                            div {
+                                "data-testid": "import-identity-loading-rooms",
+                                class: "mt-3 text-sm text-text-muted",
+                                "Loading your rooms\u{2026} the import will be available in a moment."
+                            }
                         }
                     }
                     div { class: "flex justify-end gap-3 mt-4",
@@ -2656,6 +2681,30 @@ mod tests {
         assert!(
             prod.contains("disabled: !rooms_hydrated"),
             "the Import button must be disabled until the room set is fully loaded (#414 redesign)"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414, Codex round-10 P2): a PARTIAL load
+    /// failure (rail shows `List`, so its own Retry is hidden) must give the
+    /// import modal a working way out — a "Retry loading rooms" control that
+    /// re-fires the load — so imports aren't blocked indefinitely. Guarded on
+    /// `saw_fetch_failure` so it only appears for a real failure.
+    #[test]
+    fn gated_import_offers_retry_on_partial_load_failure() {
+        let prod = production_source();
+        assert!(
+            prod.contains("if saw_fetch_failure {"),
+            "the gated import state must distinguish a partial-load FAILURE from \
+             a still-loading state (freenet/river#414 round-10 P2)"
+        );
+        assert!(
+            prod.contains("chat_delegate::retry_rooms_load();"),
+            "the partial-load-failure state must wire a Retry button to \
+             retry_rooms_load (freenet/river#414 round-10 P2)"
+        );
+        assert!(
+            prod.contains("import-identity-retry-load"),
+            "the Retry control needs a stable data-testid (import-identity-retry-load)"
         );
     }
 

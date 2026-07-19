@@ -4404,6 +4404,13 @@ pub fn prune_dm_state_for_room(owner_vk: ed25519_dalek::VerifyingKey, new_member
     // DM state. Must run before the has-nothing-cached early return below.
     record_dm_prune_tombstone(owner_vk, new_member_id);
 
+    // Re-seed `DM_LAST_SEEN` for the NEW identity (freenet/river#414 round-10 P2):
+    // that map is keyed only by `(room, peer)`, so the OLD identity's last-seen
+    // cutoffs would otherwise carry over and wrongly suppress unread badges for
+    // messages the new identity has never seen. Runs before the early return —
+    // it does not depend on the outbound-DM cache being populated.
+    crate::components::direct_messages::reseed_dm_last_seen_for_room(owner_vk);
+
     // `try_read` so we cooperate with any in-flight write; skip the whole
     // defer path when there is nothing cached for this room.
     let has_entries = {

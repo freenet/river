@@ -555,6 +555,50 @@ pub(crate) fn compute_dm_last_seen(
     updates
 }
 
+/// Re-seed [`DM_LAST_SEEN`] for a single room after an identity swap
+/// (freenet/river#414 round-10 P2).
+///
+/// `DM_LAST_SEEN` is keyed only by `(room, peer)`, so the OLD identity's
+/// last-seen cutoffs would carry over to the NEW identity's threads and wrongly
+/// suppress unread badges for messages the new identity has never seen. This
+/// drops the room's stale cutoffs and re-seeds them from the NEW identity's
+/// inbound DMs (`compute_dm_last_seen` keys on `room_data.self_sk`, which is now
+/// the swapped-in identity) — the same "don't flood history as unread" seed
+/// logic `seed_dm_last_seen_if_needed` uses, scoped to one room. Reads the
+/// CURRENT (post-swap) rooms snapshot, so the caller must run it AFTER the swap
+/// has updated `self_sk`. Signal-safe: the `DM_LAST_SEEN` mutation is deferred.
+pub fn reseed_dm_last_seen_for_room(owner_vk: VerifyingKey) {
+    let updates = {
+        let Ok(rooms) = crate::components::app::ROOMS.try_read() else {
+            return;
+        };
+        compute_dm_last_seen(&rooms)
+    };
+    crate::util::defer(move || {
+        DM_LAST_SEEN.with_mut(|seen| {
+            apply_dm_last_seen_reseed(seen, owner_vk, &updates);
+        });
+    });
+}
+
+/// Pure re-seed step for [`reseed_dm_last_seen_for_room`]: drop every existing
+/// last-seen cutoff for `owner_vk` (the replaced identity's) and set the new
+/// identity's from `updates` (already computed by `compute_dm_last_seen`, so
+/// keyed on the swapped-in `self_sk`), leaving other rooms untouched. Pure so
+/// the re-seed is unit-testable without the `ROOMS`/`DM_LAST_SEEN` signals.
+pub(crate) fn apply_dm_last_seen_reseed(
+    seen: &mut HashMap<(VerifyingKey, MemberId), u64>,
+    owner_vk: VerifyingKey,
+    updates: &HashMap<(VerifyingKey, MemberId), u64>,
+) {
+    seen.retain(|(room, _), _| *room != owner_vk);
+    for ((room, peer), ts) in updates {
+        if *room == owner_vk {
+            seen.insert((*room, *peer), *ts);
+        }
+    }
+}
+
 /// Initialise [`DM_LAST_SEEN`] from current room state so previously-existing
 /// inbound DMs don't show up as "unread" every time the page reloads.
 ///
@@ -737,6 +781,42 @@ mod tests {
     fn compute_dm_last_seen_returns_empty_for_empty_rooms() {
         let updates = compute_dm_last_seen(&empty_rooms());
         assert!(updates.is_empty());
+    }
+
+    /// freenet/river#414 (Codex round-10 P2): on an identity swap, the room's
+    /// stale last-seen cutoffs (the OLD identity's) must be dropped and replaced
+    /// by the NEW identity's, so unread badges reflect the new identity's actual
+    /// seen-state — while OTHER rooms are untouched.
+    #[test]
+    fn apply_dm_last_seen_reseed_replaces_room_only() {
+        let room_a = fixed_sk(1).verifying_key();
+        let room_b = fixed_sk(2).verifying_key();
+        let old_peer: MemberId = (&fixed_sk(3).verifying_key()).into();
+        let new_peer: MemberId = (&fixed_sk(4).verifying_key()).into();
+        let other_peer: MemberId = (&fixed_sk(5).verifying_key()).into();
+
+        let mut seen: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
+        // Room A: the OLD identity's cutoffs.
+        seen.insert((room_a, old_peer), 100);
+        // Room B: an unrelated room's cutoff (must survive).
+        seen.insert((room_b, other_peer), 50);
+
+        // The NEW identity's computed last-seen for room A only.
+        let mut updates: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
+        updates.insert((room_a, new_peer), 200);
+        // (compute_dm_last_seen also returns other rooms; the helper must ignore them.)
+        updates.insert((room_b, other_peer), 999);
+
+        apply_dm_last_seen_reseed(&mut seen, room_a, &updates);
+
+        // Room A's OLD-identity cutoff is gone; the NEW identity's is seeded.
+        assert!(
+            !seen.contains_key(&(room_a, old_peer)),
+            "the replaced identity's last-seen must be dropped"
+        );
+        assert_eq!(seen.get(&(room_a, new_peer)), Some(&200));
+        // Room B is untouched (NOT overwritten by the ignored update).
+        assert_eq!(seen.get(&(room_b, other_peer)), Some(&50));
     }
 
     #[test]

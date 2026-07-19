@@ -1123,9 +1123,20 @@ pub async fn handle_get_response(
                                 crate::signing::migrate_signing_key(room_key, &self_sk, false)
                                     .await;
                             if result != crate::signing::MigrationResult::Failed {
+                                let migrated_key = self_sk.clone();
                                 crate::util::defer(move || {
                                     ROOMS.with_mut(|rooms| {
                                         if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                                            // Only mark migrated for the identity that
+                                            // actually completed: an overwrite may have
+                                            // replaced `self_sk` while this migration ran,
+                                            // and marking the room migrated + sanitizing
+                                            // for a superseded key would strand the new
+                                            // identity (freenet/river#414, round-10 P2 —
+                                            // the guard the other 3 callbacks already have).
+                                            if room_data.self_sk != migrated_key {
+                                                return;
+                                            }
                                             room_data.key_migrated_to_delegate = true;
                                             let params = ChatRoomParametersV1 { owner: owner_vk };
                                             let removed =
@@ -2205,6 +2216,27 @@ mod tests {
             src.contains("is_probe_instance(key.id())"),
             "handle_get_response must route legacy-key GET responses into the \
              probe handler via is_probe_instance (freenet/river#292)."
+        );
+    }
+
+    /// freenet/river#414 round-10 P2 — source-grep pin: the post-GET migration
+    /// completion callback must guard `key_migrated_to_delegate = true` +
+    /// `remove_unverifiable_messages` on the captured key still matching the
+    /// room's CURRENT `self_sk`, exactly like the other three migration
+    /// callbacks. Without it, an identity overwrite mid-migration marks the NEW
+    /// RoomData migrated (and sanitizes it) for a superseded key.
+    #[test]
+    fn post_get_migration_callback_guards_on_current_self_sk() {
+        let full = include_str!("get_response.rs");
+        let src = full
+            .split("mod tests {")
+            .next()
+            .expect("get_response.rs must have production code before `mod tests`");
+        assert!(
+            src.contains("if room_data.self_sk != migrated_key {"),
+            "the post-GET migration completion callback must discard a stale-key \
+             result (room_data.self_sk != migrated_key) before marking migrated \
+             (freenet/river#414 round-10 P2)."
         );
     }
 
