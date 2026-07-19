@@ -1163,24 +1163,31 @@ fn swap_room_identity_in_place(
 /// "no room" on an incomplete view would route a real, populated room to the
 /// build-empty NEW path and overwrite its populated persisted slot (data loss).
 ///
-/// Requires BOTH (Codex round-6 P1-1):
+/// Requires ALL of (Codex round-6 P1-1, round-9 P1):
 /// - the startup delegate load RESOLVED (`Loaded`) — `Loading`/`Migrating` mean
-///   "we don't know the set yet"; `LoadFailed` means a known room failed; and
+///   "we don't know the set yet"; `LoadFailed` means a known room failed;
 /// - NO listed room's fetch failed (`!saw_fetch_failure`). `per_room_terminal`
 ///   resolves to `Loaded` the instant ≥1 room materialized even if OTHER listed
 ///   rooms failed to hydrate, so `Loaded` alone is not "complete". A room absent
-///   from `ROOMS` because its fetch failed would be misclassified as new.
+///   from `ROOMS` because its fetch failed would be misclassified as new; and
+/// - the freenet/river#345 RECOVERY is not in progress (`!recovery_in_progress`).
+///   The interrupted-legacy-migration recovery sets `Loaded` (to render the
+///   partial list) BEFORE background workers restore rooms still missing from the
+///   partial per-room index. Importing for one of those in that window would
+///   overwrite its recovered slot with empty state. So we wait for recovery too.
 ///
-/// If a fetch failed, the caller refuses the import ("some rooms didn't finish
-/// loading — retry") rather than risk classifying a real room as new.
+/// If any condition fails the caller refuses the import ("some rooms didn't
+/// finish loading — retry") rather than risk classifying a real room as new.
 fn rooms_load_is_authoritative(
     state: crate::components::app::chat_delegate::RoomsLoadState,
     saw_fetch_failure: bool,
+    recovery_in_progress: bool,
 ) -> bool {
     matches!(
         state,
         crate::components::app::chat_delegate::RoomsLoadState::Loaded
     ) && !saw_fetch_failure
+        && !recovery_in_progress
 }
 
 /// Complete an identity import (freenet/river#414 redesign).
@@ -1278,8 +1285,15 @@ fn complete_identity_import(
         // wrongly hide threads for) the new identity — symmetric to the CLI
         // `identity import --force` prune (freenet/river#414). Only on a real
         // key change; a brand-new import or a same-key re-import prunes nothing.
+        // The tombstone is keyed to the NEW identity's MemberId so a late DM
+        // response drops entries authored by any replaced identity, regardless of
+        // their timestamp (freenet/river#414 round-9 P2).
         if identity_changed {
-            crate::components::app::chat_delegate::prune_dm_state_for_room(owner_key);
+            let new_member_id = MemberId::from(&new_sk.verifying_key());
+            crate::components::app::chat_delegate::prune_dm_state_for_room(
+                owner_key,
+                new_member_id,
+            );
         }
 
         CURRENT_ROOM.with_mut(|current| {
@@ -1367,19 +1381,23 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
         return rsx! {};
     }
 
-    // Reactive hydration gate (freenet/river#414 redesign, Codex round-6 P1-1):
-    // the room set must be COMPLETELY loaded before the Import button is enabled,
-    // so the new-vs-overwrite decision is never made on an incomplete view (which
-    // would build-empty over a real room). Reading `ROOMS_LOAD_STATE` here
-    // subscribes the modal, so it re-renders — and the button enables — the
-    // moment the load resolves; `saw_fetch_failure()` is read alongside so a
-    // partial load (some listed rooms failed) keeps the button disabled.
+    // Reactive hydration gate (freenet/river#414 redesign, Codex round-6 P1-1 +
+    // round-9 P1): the room set must be COMPLETELY loaded AND not mid-recovery
+    // before the Import button is enabled, so the new-vs-overwrite decision is
+    // never made on an incomplete view (which would build-empty over a real
+    // room). Reading `ROOMS_LOAD_STATE` here subscribes the modal so it re-renders
+    // when the load resolves; a `ROOMS.try_read()` touch adds a subscription so it
+    // ALSO re-renders when #345 recovery hydrates a room (recovery leaves
+    // `ROOMS_LOAD_STATE == Loaded` throughout). `saw_fetch_failure()` and
+    // `rooms_recovery_in_progress()` are read alongside (non-signal sources).
+    let _ = ROOMS.try_read(); // subscribe: re-render when recovery hydrates rooms
     let rooms_hydrated = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
         .try_read()
         .map(|g| {
             rooms_load_is_authoritative(
                 *g,
                 crate::components::app::chat_delegate::saw_fetch_failure(),
+                crate::components::app::chat_delegate::rooms_recovery_in_progress(),
             )
         })
         .unwrap_or(false);
@@ -1405,25 +1423,27 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                 let owner_key = export.room_owner;
 
                 // Safety-critical (freenet/river#414 redesign, Codex round-6
-                // P1-1): NEVER decide new-vs-overwrite on an incompletely-loaded
-                // room set — a false "no room" would route a real, populated room
-                // to the build-empty NEW path and overwrite its populated
-                // persisted slot. This requires a COMPLETE load (resolved AND no
-                // listed room's fetch failed); a partial load could be missing the
-                // very room being imported. The Import button is disabled until
-                // then (see `rooms_hydrated` in the render); this is the
-                // defense-in-depth net against a click landing before the render
-                // has re-disabled the button.
+                // P1-1 + round-9 P1): NEVER decide new-vs-overwrite on an
+                // incompletely-loaded OR mid-recovery room set — a false "no room"
+                // would route a real, populated room to the build-empty NEW path
+                // and overwrite its populated persisted slot. This requires a
+                // COMPLETE load (resolved AND no listed room's fetch failed) AND
+                // that the #345 recovery has finished; a partial load / pending
+                // recovery could be missing the very room being imported. The
+                // Import button is disabled until then (see `rooms_hydrated`); this
+                // is the defense-in-depth net against a click landing before the
+                // render has re-disabled the button.
                 let load_state = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
                     .try_read()
                     .map(|g| *g)
                     .unwrap_or(crate::components::app::chat_delegate::RoomsLoadState::Loading);
                 let saw_failure = crate::components::app::chat_delegate::saw_fetch_failure();
-                if !rooms_load_is_authoritative(load_state, saw_failure) {
+                let recovery = crate::components::app::chat_delegate::rooms_recovery_in_progress();
+                if !rooms_load_is_authoritative(load_state, saw_failure, recovery) {
                     crate::util::defer(move || {
                         error_msg.set(Some(
-                            "Some rooms didn't finish loading — retry loading your rooms \
-                             before importing an identity."
+                            "Still finishing loading your rooms — please wait a moment and \
+                             try again."
                                 .to_string(),
                         ));
                         success_msg.set(None);
@@ -1950,33 +1970,54 @@ mod tests {
         );
     }
 
-    /// freenet/river#414 REDESIGN (safety-critical, Codex round-6 P1-1): the
-    /// new-vs-overwrite decision is authoritative ONLY on a COMPLETE load —
-    /// `Loaded` AND no listed room's fetch failed. `Loaded` alone is
-    /// insufficient because `per_room_terminal` resolves to `Loaded` the instant
-    /// ≥1 room materialized, even if other listed rooms failed to hydrate (so a
-    /// room could be missing from the map and get misclassified as new).
+    /// freenet/river#414 REDESIGN (safety-critical, Codex round-6 P1-1 + round-9
+    /// P1): the new-vs-overwrite decision is authoritative ONLY on a COMPLETE load
+    /// — `Loaded` AND no listed room's fetch failed AND the #345 recovery is not
+    /// in progress. `Loaded` alone is insufficient (`per_room_terminal` resolves
+    /// to `Loaded` the instant ≥1 room materialized, and recovery sets `Loaded`
+    /// before restoring still-missing rooms), so a room could be missing from the
+    /// map and get misclassified as new.
     #[test]
     fn rooms_load_authoritative_requires_complete_load() {
         use crate::components::app::chat_delegate::RoomsLoadState;
-        // Complete load: Loaded AND no fetch failure → authoritative.
-        assert!(rooms_load_is_authoritative(RoomsLoadState::Loaded, false));
-        // Loaded but a listed room's fetch failed → NOT authoritative (data-loss
-        // guard: the missing room could be the one being imported).
-        assert!(!rooms_load_is_authoritative(RoomsLoadState::Loaded, true));
-        // Unresolved / failed / migrating are never authoritative, fetch flag
-        // notwithstanding.
-        assert!(!rooms_load_is_authoritative(RoomsLoadState::Loading, false));
+        // Complete load: Loaded, no fetch failure, no recovery → authoritative.
+        assert!(rooms_load_is_authoritative(
+            RoomsLoadState::Loaded,
+            false,
+            false
+        ));
+        // Loaded but a listed room's fetch failed → NOT authoritative.
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::Loaded,
+            true,
+            false
+        ));
+        // Loaded but the #345 recovery is still in progress → NOT authoritative
+        // (a still-missing room could be the one being imported = data loss).
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::Loaded,
+            false,
+            true
+        ));
+        // Unresolved / failed / migrating are never authoritative.
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::Loading,
+            false,
+            false
+        ));
         assert!(!rooms_load_is_authoritative(
             RoomsLoadState::Migrating,
+            false,
             false
         ));
         assert!(!rooms_load_is_authoritative(
             RoomsLoadState::LoadFailed,
+            false,
             false
         ));
         assert!(!rooms_load_is_authoritative(
             RoomsLoadState::LoadFailed,
+            true,
             true
         ));
     }
@@ -2608,9 +2649,9 @@ mod tests {
     fn handle_import_gates_on_hydration() {
         let prod = production_source();
         assert!(
-            prod.contains("if !rooms_load_is_authoritative(load_state, saw_failure)"),
-            "handle_import must refuse to decide on an incompletely-loaded room set \
-             (#414 redesign, Codex round-6 P1-1)"
+            prod.contains("if !rooms_load_is_authoritative(load_state, saw_failure, recovery)"),
+            "handle_import must refuse to decide on an incompletely-loaded or \
+             mid-recovery room set (#414 redesign, Codex round-6 P1-1 + round-9 P1)"
         );
         assert!(
             prod.contains("disabled: !rooms_hydrated"),
@@ -2668,11 +2709,17 @@ mod tests {
     /// `prune_dm_state_for_room` wiring from the deferred signal block.
     #[test]
     fn complete_identity_import_prunes_dm_state_on_key_change() {
-        let prod = production_source();
+        // Whitespace-normalized so the multi-line call (owner_key + new_member_id)
+        // is matched regardless of rustfmt wrapping.
+        let prod = production_source()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            prod.contains("prune_dm_state_for_room(owner_key)"),
-            "complete_identity_import must prune the old identity's DM state on an \
-             overwrite that changes self_sk (freenet/river#414)"
+            prod.contains("prune_dm_state_for_room( owner_key, new_member_id, )")
+                || prod.contains("prune_dm_state_for_room(owner_key, new_member_id)"),
+            "complete_identity_import must prune the old identity's DM state (keyed to \
+             the NEW MemberId) on an overwrite that changes self_sk (freenet/river#414)"
         );
         // Gated on the key actually changing.
         assert!(
