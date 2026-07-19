@@ -1076,21 +1076,40 @@ fn swap_room_identity_in_place(
     existing.invite_chain = export.invite_chain;
     existing.self_member_info = export.member_info;
     existing.self_nickname = export.self_nickname;
-    // Drop the OLD identity's decrypt access: its in-memory decrypted secrets
-    // and the derived version pointers. These are `#[serde(skip)]` runtime
-    // caches; the new identity's are rebuilt from the kept state below.
-    existing.secrets.clear();
-    existing.current_secret_version = None;
-    existing.last_secret_rotation = None;
-    // REPLACE (do not union) the invitation-carried room secrets with the new
-    // identity's, so the old identity's invitation secrets can't grant the new
-    // identity read access to a version it holds no contract blob for.
-    existing.invitation_secrets = export.invitation_secrets;
-    // The new key has not been stored in the delegate yet.
+
+    if key_changed {
+        // DIFFERENT identity (a genuine swap): do NOT carry the OLD identity's
+        // decrypt access forward. Clear the in-memory decrypted secrets and the
+        // derived version pointers (`#[serde(skip)]` runtime caches, rebuilt
+        // below), and REPLACE the invitation-carried secrets with the new
+        // identity's — so an A-only version B has no contract blob for cannot
+        // remain readable by B (Codex round-6 P1-2).
+        existing.secrets.clear();
+        existing.current_secret_version = None;
+        existing.last_secret_rotation = None;
+        existing.invitation_secrets = export.invitation_secrets;
+    } else {
+        // SAME identity re-import (the user re-importing their OWN token, e.g. a
+        // legacy/stale one). Clearing/replacing here is DATA LOSS: the token's
+        // `invitation_secrets` may be empty or incomplete (exported before the
+        // owner's `encrypted_secrets` backfill arrived), and for a private room
+        // still awaiting that backfill the existing `invitation_secrets` map can
+        // be the ONLY copy of the room key — wiping it would make history
+        // permanently unreadable. So PRESERVE the existing decrypted caches and
+        // MERGE the token's secrets in, keeping the existing value on collision
+        // (Codex round-7).
+        for (version, secret) in export.invitation_secrets {
+            existing.invitation_secrets.entry(version).or_insert(secret);
+        }
+    }
+
+    // The (re)imported key has not been stored in the delegate yet.
     existing.key_migrated_to_delegate = false;
-    // Recompute in-memory decrypted secrets for the NEW identity's access
-    // (private rooms) from the KEPT room_state — local, no network fetch — then
-    // re-derive the action cache (edits/deletes/reactions) under those secrets.
+    // Recompute the in-memory decrypted secrets from the KEPT room_state — local,
+    // no network fetch — then re-derive the action cache (edits/deletes/reactions)
+    // under those secrets. For a same-key re-import this only tops up (repopulate
+    // never overwrites an existing decrypted version); for a genuine swap it
+    // rebuilds exactly what the new identity can decrypt.
     existing.repopulate_secrets_from_state();
     existing.rebuild_private_actions_state();
     key_changed
@@ -1728,6 +1747,51 @@ mod tests {
         );
         // …and only the NEW identity's v0 remains (folded into secrets by repopulate).
         assert_eq!(existing.secrets.get(&0u32), Some(&[0x33u8; 32]));
+    }
+
+    /// freenet/river#414 (Codex round 7): a SAME-key re-import (the user
+    /// re-importing their OWN identity from a legacy/stale token whose
+    /// `invitation_secrets` may be empty) must PRESERVE the existing secrets, not
+    /// clear+replace them. For a private room still awaiting the owner backfill,
+    /// the existing `invitation_secrets` map can be the ONLY copy of the room key
+    /// — wiping it would make history permanently unreadable.
+    #[test]
+    fn same_key_reimport_preserves_existing_secrets() {
+        let owner_sk = SigningKey::from_bytes(&[81u8; 32]);
+        // The SAME signing key for both the existing room and the re-import.
+        let self_sk = SigningKey::from_bytes(&[82u8; 32]);
+
+        // Existing PRIVATE room where the (same) identity holds the ONLY copy of
+        // the room key at v7, plus its decrypted secret in memory.
+        let mut existing = build_imported_room_data(export_for(&owner_sk, &self_sk));
+        existing.room_state.configuration.configuration.privacy_mode =
+            river_core::room_state::privacy::PrivacyMode::Private;
+        existing.invitation_secrets.insert(7u32, [0x44u8; 32]);
+        existing.secrets.insert(7u32, [0x44u8; 32]);
+        existing.current_secret_version = Some(7);
+
+        // Re-import the SAME identity from a stale token with EMPTY secrets.
+        let export = export_for(&owner_sk, &self_sk);
+        assert!(
+            export.invitation_secrets.is_empty(),
+            "precondition: the stale token carries no invitation secrets"
+        );
+
+        let key_changed = swap_room_identity_in_place(&mut existing, export);
+
+        assert!(!key_changed, "same key must report no change");
+        // The room key (v7) survives — history stays readable.
+        assert_eq!(
+            existing.invitation_secrets.get(&7u32),
+            Some(&[0x44u8; 32]),
+            "same-key re-import must PRESERVE the existing invitation secret \
+             (it can be the only copy of the room key)"
+        );
+        assert_eq!(
+            existing.secrets.get(&7u32),
+            Some(&[0x44u8; 32]),
+            "same-key re-import must NOT clear the decrypted secret cache"
+        );
     }
 
     /// freenet/river#414 REDESIGN (safety-critical, Codex round-6 P1-1): the

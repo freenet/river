@@ -562,6 +562,25 @@ impl Storage {
             }
             let identity_changed = old_key.is_some_and(|k| k != signing_key.to_bytes());
 
+            // Same-key re-import over an existing room (`was_overwrite &&
+            // !identity_changed`): PRESERVE the stored invitation secrets by
+            // merging them into the incoming map, existing wins on collision. The
+            // incoming token's map may be empty/incomplete (a legacy/stale export
+            // taken before the owner's `encrypted_secrets` backfill arrived), and
+            // for a private room still awaiting that backfill the stored map can be
+            // the ONLY copy of the room key — overwriting it with the token's empty
+            // map would make history permanently unreadable (Codex round-7). A
+            // genuine identity change instead REPLACES: the old identity's secrets
+            // must not carry forward to the new one.
+            let mut invitation_secrets = invitation_secrets;
+            if was_overwrite && !identity_changed {
+                if let Some(old) = storage.rooms.get(&owner_key_str) {
+                    for (version, secret) in &old.invitation_secrets {
+                        invitation_secrets.entry(*version).or_insert(*secret);
+                    }
+                }
+            }
+
             // Build the FULL record in one shot (matches the fields
             // `add_room_with_invitation_secrets` + `store_authorized_member` +
             // `update_self_nickname` would set across three separate locks).
@@ -2074,6 +2093,110 @@ mod tests {
             }
         );
         assert!(storage.get_room(&fresh_owner_vk).unwrap().is_some());
+    }
+
+    /// freenet/river#414 (Codex round 7): a SAME-key `--force` re-import must
+    /// RETAIN the stored `invitation_secrets` (merging the token's map in,
+    /// existing wins) — the token may be a legacy/stale export with an empty map,
+    /// and for a private room awaiting the owner backfill the stored map can be
+    /// the only copy of the room key. A DIFFERENT-key `--force` still REPLACES.
+    #[test]
+    fn import_room_atomic_same_key_preserves_invitation_secrets() {
+        use river_core::room_state::member::Member;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let key = expected_contract_key(&owner_vk);
+        let member_for = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_vk.into(),
+                    invited_by: owner_vk.into(),
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+
+        // Store the room under `identity` with the ONLY copy of the room key at v3.
+        let identity = create_test_signing_key();
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(3u32, [0x55u8; 32]);
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                secrets,
+                &member_for(&identity),
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+
+        // --force re-import of the SAME identity from a token with EMPTY secrets.
+        let outcome = storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ImportOutcome::Imported {
+                was_overwrite: true,
+                identity_changed: false,
+            }
+        );
+        assert_eq!(
+            storage
+                .get_invitation_secrets(&owner_vk)
+                .unwrap()
+                .get(&3u32),
+            Some(&[0x55u8; 32]),
+            "same-key --force re-import must RETAIN the stored invitation secret \
+             (only copy of the room key)"
+        );
+
+        // A DIFFERENT-key --force re-import REPLACES (drops the old secret).
+        let new_identity = create_test_signing_key();
+        let outcome = storage
+            .import_room_atomic(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&new_identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ImportOutcome::Imported {
+                was_overwrite: true,
+                identity_changed: true,
+            }
+        );
+        assert!(
+            storage
+                .get_invitation_secrets(&owner_vk)
+                .unwrap()
+                .is_empty(),
+            "different-key --force re-import must REPLACE (drop the old identity's secrets)"
+        );
     }
 
     /// Regression for issue freenet/river#307 (lost-update race).
