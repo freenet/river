@@ -261,6 +261,24 @@ impl Storage {
         self.signing_key_override.is_some()
     }
 
+    /// The RAW persisted `signing_key_bytes` for a room, ignoring any
+    /// `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` override that
+    /// [`Self::get_room`]'s `resolve_signing_key` would apply.
+    ///
+    /// Used by `identity import --force` to decide whether the imported key
+    /// actually changes the stored identity (freenet/river#414): comparing
+    /// against the override-resolved key would misjudge a real change as
+    /// unchanged (skipping the DM prune) or an unchanged identity as changed
+    /// (pruning wrongly). Returns `None` when no room is stored for `owner_vk`.
+    pub fn persisted_signing_key_bytes(&self, owner_vk: &VerifyingKey) -> Result<Option<[u8; 32]>> {
+        let storage = self.load_rooms()?;
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        Ok(storage
+            .rooms
+            .get(&owner_key_str)
+            .map(|r| r.signing_key_bytes))
+    }
+
     /// Load all stored rooms, regenerating each room's contract key to match the
     /// currently-bundled WASM (and persisting the regeneration).
     ///
@@ -1723,6 +1741,66 @@ mod tests {
                 .any(|e| e.room_owner_vk == owner_vk.to_bytes()),
             "an unchanged-key re-import must NOT prune the DM cache"
         );
+    }
+
+    /// freenet/river#414 (Codex round 5): `persisted_signing_key_bytes` returns
+    /// the RAW stored key, NOT the `--signing-key` override that `get_room`
+    /// resolves. The `identity import --force` DM-prune decision (`identity_changed`)
+    /// depends on this — comparing against the override would misjudge whether
+    /// the identity actually changed.
+    #[test]
+    fn persisted_signing_key_bytes_ignores_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().to_str().unwrap();
+
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let stored_identity = create_test_signing_key();
+        let override_identity = create_test_signing_key();
+        assert_ne!(stored_identity.to_bytes(), override_identity.to_bytes());
+
+        // Persist the room under `stored_identity` (no override active).
+        let storage = Storage::new(Some(dir)).unwrap();
+        let key = expected_contract_key(&owner_vk);
+        storage
+            .add_room(
+                &owner_vk,
+                &stored_identity,
+                create_test_state(&owner_sk),
+                &key,
+            )
+            .unwrap();
+
+        // Re-open the SAME dir with an override selecting a DIFFERENT identity.
+        let overridden =
+            Storage::new_with_override(Some(dir), Some(override_identity.clone())).unwrap();
+
+        // get_room resolves to the override…
+        let (resolved, _, _) = overridden.get_room(&owner_vk).unwrap().unwrap();
+        assert_eq!(
+            resolved.to_bytes(),
+            override_identity.to_bytes(),
+            "get_room applies the --signing-key override"
+        );
+
+        // …but persisted_signing_key_bytes returns the RAW stored key, so the
+        // import DM-prune decision compares against the real stored identity.
+        let persisted = overridden
+            .persisted_signing_key_bytes(&owner_vk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted,
+            stored_identity.to_bytes(),
+            "persisted key must ignore the override"
+        );
+
+        // Absent room → None.
+        let absent = create_test_signing_key().verifying_key();
+        assert!(overridden
+            .persisted_signing_key_bytes(&absent)
+            .unwrap()
+            .is_none());
     }
 
     /// Regression for issue freenet/river#307 (lost-update race).

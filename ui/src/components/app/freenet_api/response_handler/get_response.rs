@@ -765,6 +765,15 @@ pub async fn handle_get_response(
                                 let mut sanitized = false;
                                 ROOMS.with_mut(|rooms| {
                                     if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                                        // Only mark migrated for the identity that
+                                        // actually completed: an overwrite may have
+                                        // replaced `self_sk` while this migration ran,
+                                        // and marking the room migrated for a
+                                        // superseded key would strand the new identity
+                                        // (freenet/river#414).
+                                        if room_data.self_sk != signing_key_clone {
+                                            return;
+                                        }
                                         room_data.key_migrated_to_delegate = true;
                                         let params = river_core::room_state::ChatRoomParametersV1 {
                                             owner: owner_vk,

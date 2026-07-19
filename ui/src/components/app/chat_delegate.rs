@@ -3305,6 +3305,23 @@ fn reconcile_room_present(
                 // (local-authoritative), don't merge the other identity's
                 // state, and don't fail the whole save (M1 fix: scoped to this
                 // one room rather than wedging all persistence).
+                //
+                // KNOWN LIMITATION — multi-tab identity-overwrite reversal
+                // (freenet/river#420). This branch is last-writer-wins: it keeps
+                // whichever identity the SAVING session holds, with no way to
+                // tell which of the two identities is NEWER. So after a user
+                // replaces a room identity (freenet/river#414,
+                // `members.rs::complete_identity_import`), a second tab/device
+                // still holding the OLD identity will write it back here as its
+                // local copy on its next save, and on the next cold load the
+                // stale identity can win — silently undoing the replacement. The
+                // proper fix is a persisted, monotonically-increasing
+                // identity-generation counter on the per-room slot so this
+                // branch can adopt the higher generation instead of the last
+                // writer; that is a delegate/persisted-state change tracked in
+                // #420 and out of scope for the #414 escape hatch. Until then the
+                // overwrite-confirm dialog tells the user to close other sessions
+                // for the room first.
                 local.clone()
             } else {
                 let mut m = local.clone();
@@ -4113,6 +4130,59 @@ pub fn prune_outbound_dms_for_purges() {
         crate::util::safe_spawn_local(async {
             if let Err(e) = save_outbound_dms_to_delegate().await {
                 warn!("Failed to persist pruned outbound DM cache: {}", e);
+            }
+        });
+    });
+}
+
+/// Drop every cached outbound-DM plaintext entry and archived-thread entry for
+/// `owner_vk`'s room from the in-memory `OUTBOUND_DMS` / `HIDDEN_DM_THREADS`
+/// signals and persist the trimmed store.
+///
+/// The UI counterpart of the CLI `identity import --force` prune
+/// (freenet/river#414): when an identity overwrite swaps `self_sk` for a room,
+/// the OLD identity's outbound-DM plaintext and archive state must not leak into
+/// (or wrongly hide threads for) the NEW identity. Call ONLY when the key
+/// actually changed.
+///
+/// Signal-safe: all mutation runs inside `crate::util::defer()`; the delegate
+/// persist is a coalesced `safe_spawn_local`. No-op (skips the whole
+/// defer/with_mut) when nothing is cached for the room.
+pub fn prune_dm_state_for_room(owner_vk: ed25519_dalek::VerifyingKey) {
+    use crate::components::direct_messages::{HIDDEN_DM_THREADS, OUTBOUND_DMS};
+
+    // `try_read` so we cooperate with any in-flight write; skip the whole
+    // defer path when there is nothing cached for this room.
+    let has_entries = {
+        let Ok(cache) = OUTBOUND_DMS.try_read() else {
+            return;
+        };
+        cache.by_token.keys().any(|(room, _, _)| *room == owner_vk)
+    };
+    let has_hidden = {
+        let Ok(hidden) = HIDDEN_DM_THREADS.try_read() else {
+            return;
+        };
+        hidden.keys().any(|(room, _)| *room == owner_vk)
+    };
+    if !has_entries && !has_hidden {
+        return;
+    }
+
+    crate::util::defer(move || {
+        OUTBOUND_DMS.with_mut(|cache| {
+            cache.by_token.retain(|(room, _, _), _| *room != owner_vk);
+        });
+        HIDDEN_DM_THREADS.with_mut(|hidden| {
+            hidden.retain(|(room, _), _| *room != owner_vk);
+        });
+        info!("Pruned outbound-DM cache + archive state for a replaced room identity");
+        crate::util::safe_spawn_local(async {
+            if let Err(e) = save_outbound_dms_to_delegate().await {
+                warn!(
+                    "Failed to persist pruned DM state after identity replace: {}",
+                    e
+                );
             }
         });
     });

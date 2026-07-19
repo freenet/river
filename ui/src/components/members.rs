@@ -1072,8 +1072,27 @@ fn complete_identity_import(
 
     // Defer signal mutations to a clean execution context to prevent RefCell
     // re-entrant borrow panics.
+    //
+    // KNOWN LIMITATION — multi-tab reversal (freenet/river#420). This overwrite
+    // updates THIS session's identity and re-saves the per-room delegate slot,
+    // but a SECOND tab/device for the same room still holding the OLD identity
+    // will write it back as `RoomSlot::Present` on its next save.
+    // `chat_delegate::reconcile_room_present` is local-authoritative on a
+    // self_sk conflict (last-writer-wins; there is no identity generation to
+    // decide which is newer), so on the next cold load a stale tab can silently
+    // undo the replacement. Full multi-tab identity coordination is out of scope
+    // for this get-unstuck escape hatch; the proper fix is a persisted
+    // identity-generation counter (see #420). The confirm dialog tells the user
+    // to close other tabs/devices first, which avoids the reversal in practice.
     crate::util::defer(move || {
+        // Whether this import REPLACES a DIFFERENT identity already stored for
+        // the room (computed inside the same borrow that inserts, so a transient
+        // read failure can't abort the import). Drives the DM-state prune below.
+        let mut identity_changed = false;
         ROOMS.with_mut(|rooms| {
+            if let Some(existing) = rooms.map.get(&owner_key) {
+                identity_changed = existing.self_sk != signing_key_for_migration;
+            }
             // Record the explicit rejoin so the per-room save overwrites a
             // remote `Tombstone` slot with `Present` rather than adopting the
             // leave (freenet/river#345 round-9), then insert (replacing any
@@ -1081,6 +1100,15 @@ fn complete_identity_import(
             crate::components::app::chat_delegate::mark_room_rejoined(owner_key);
             apply_imported_room(rooms, room_data);
         });
+
+        // Overwriting a DIFFERENT identity: prune the OLD identity's cached
+        // outbound-DM plaintext + archive state so it doesn't leak into (or
+        // wrongly hide threads for) the new identity — symmetric to the CLI
+        // `identity import --force` prune (freenet/river#414). Only on a real
+        // key change; a brand-new import or a same-key re-import prunes nothing.
+        if identity_changed {
+            crate::components::app::chat_delegate::prune_dm_state_for_room(owner_key);
+        }
 
         CURRENT_ROOM.with_mut(|current| {
             current.owner_key = Some(owner_key);
@@ -1301,6 +1329,14 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                         "data-testid": "import-identity-replace-warning",
                         class: "mt-3 text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3",
                         "This room already has an identity. Importing will REPLACE it \u{2014} you'll lose access to your current identity for this room unless you've exported it first."
+                    }
+                    // Multi-tab reversal caveat (freenet/river#420): another
+                    // session still on the old identity can write it back and undo
+                    // the switch on next load, so tell the user to close them first.
+                    div {
+                        "data-testid": "import-identity-replace-multitab-warning",
+                        class: "mt-2 text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3",
+                        "Close any other tabs or devices open to this room first. A session still using the old identity can write it back and undo the switch."
                     }
                     div { class: "flex justify-end gap-3 mt-4",
                         button {
@@ -2090,6 +2126,42 @@ mod tests {
             !normalized.contains("token_input.set(e.value()); pending_import.set(None);"),
             "the token oninput must not clear pending_import synchronously right \
              after setting the value (freenet/river#414) — defer the clear"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414, Codex round 5): the UI overwrite path
+    /// must prune the OLD identity's DM state when the imported key changes,
+    /// symmetric to the CLI `--force` prune. Catches a refactor that drops the
+    /// `prune_dm_state_for_room` wiring from the deferred signal block.
+    #[test]
+    fn complete_identity_import_prunes_dm_state_on_key_change() {
+        let prod = production_source();
+        assert!(
+            prod.contains("prune_dm_state_for_room(owner_key)"),
+            "complete_identity_import must prune the old identity's DM state on an \
+             overwrite that changes self_sk (freenet/river#414)"
+        );
+        // Gated on the key actually changing.
+        assert!(
+            prod.contains("if identity_changed {"),
+            "the DM-state prune must be gated on the identity actually changing"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#420): the overwrite-confirm dialog must
+    /// carry the multi-tab reversal warning telling the user to close other
+    /// sessions for the room first (the documented limitation of the #414
+    /// escape hatch).
+    #[test]
+    fn overwrite_confirm_dialog_warns_about_multitab_reversal() {
+        let prod = production_source();
+        assert!(
+            prod.contains("import-identity-replace-multitab-warning"),
+            "the confirm dialog must show the multi-tab reversal warning (#420)"
+        );
+        assert!(
+            prod.contains("Close any other tabs or devices open to this room first"),
+            "the multi-tab warning must tell the user to close other sessions first"
         );
     }
 

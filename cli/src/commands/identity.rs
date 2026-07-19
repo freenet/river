@@ -218,16 +218,22 @@ async fn import_identity(
     // opted in to replacing it with --force/--overwrite (freenet/river#414).
     // Replacing rewrites the stored signing key, so the previous identity is
     // lost locally unless it was exported first.
-    let existing_room = api_client.storage().get_room(&export.room_owner)?;
-    let room_exists = existing_room.is_some();
+    // Compare against the RAW persisted key on disk, NOT `get_room`'s
+    // override-resolved key: with `--signing-key-file` / `RIVER_SIGNING_KEY_FILE`
+    // active, the resolved key is the override, so a real identity change could
+    // look unchanged (skipping the DM prune) or an unchanged identity could look
+    // changed (pruning wrongly). The persisted `signing_key_bytes` is the actual
+    // stored identity being replaced (freenet/river#414).
+    let persisted_old_key = api_client
+        .storage()
+        .persisted_signing_key_bytes(&export.room_owner)?;
+    let room_exists = persisted_old_key.is_some();
     // Whether --force is actually swapping to a DIFFERENT identity. Used below
-    // to prune the old identity's per-room DM cache. (Compares the resolved
-    // stored key; in the normal no-`--signing-key` case this is exactly the
-    // stored identity. If they differ, the outbound-DM plaintext / archived
-    // threads belong to the old identity and must not leak into the new one.)
-    let identity_changed = existing_room
-        .as_ref()
-        .is_some_and(|(old_sk, _, _)| old_sk != &export.signing_key);
+    // to prune the old identity's per-room DM cache: if they differ, the
+    // outbound-DM plaintext / archived threads belong to the old identity and
+    // must not leak into the new one.
+    let identity_changed =
+        persisted_old_key.is_some_and(|old| old != export.signing_key.to_bytes());
     if let Some(refusal) = import_overwrite_refusal(room_exists, force, &room_key_str) {
         return Err(anyhow!(refusal));
     }

@@ -221,6 +221,34 @@ fn migration_lock_for(room_key: &RoomKey) -> std::sync::Arc<futures::lock::Mutex
         .clone()
 }
 
+/// Whether a migration of `migrating_key` is STALE and must be skipped.
+///
+/// A migration is stale when the room is still tracked locally but its CURRENT
+/// identity (`current_self_sk`) is a DIFFERENT key than the one being migrated.
+/// This is the delayed-old-key case (freenet/river#414): a migration queued
+/// from a pre-overwrite `LoadRooms` (whose room `Rooms::merge` then skipped)
+/// can acquire the per-room lock AFTER the new identity's migration and store
+/// the OLD key, clobbering the delegate. The per-room lock only serializes; it
+/// does not stop a late old-key migration from winning, so we reject it here.
+///
+/// `None` (room not tracked) is NOT stale: a brand-new import can legitimately
+/// run its migration before/without a `ROOMS` entry, and there is no newer
+/// identity to conflict with.
+fn migration_is_stale(current_self_sk: Option<&SigningKey>, migrating_key: &SigningKey) -> bool {
+    matches!(current_self_sk, Some(current) if current != migrating_key)
+}
+
+/// The room's CURRENT local signing identity, if the room is tracked in
+/// `ROOMS`. Read via `try_read()` per the signal-safety rules; `None` when the
+/// room isn't tracked, the key bytes are invalid, or `ROOMS` is mid-write.
+/// Used by [`migrate_signing_key`] to reject a stale migration (#414).
+fn current_room_self_sk(room_key: &RoomKey) -> Option<SigningKey> {
+    use dioxus::prelude::ReadableExt;
+    let owner_vk = VerifyingKey::from_bytes(room_key).ok()?;
+    let rooms = crate::components::app::ROOMS.try_read().ok()?;
+    rooms.map.get(&owner_vk).map(|rd| rd.self_sk.clone())
+}
+
 /// Migrate a signing key to the delegate if not already present.
 ///
 /// Returns a `MigrationResult` indicating what happened:
@@ -262,6 +290,20 @@ pub async fn migrate_signing_key(room_key: RoomKey, signing_key: &SigningKey) ->
             false
         }
     };
+
+    // Reject a STALE migration before storing (freenet/river#414): if the
+    // room's current local identity is a DIFFERENT key than the one this call
+    // is migrating, a newer overwrite already replaced it since this migration
+    // was queued. Storing the old key here would clobber the delegate with the
+    // wrong identity — the per-room lock serializes migrations but does not stop
+    // a late old-key migration from winning. Skip it.
+    if migration_is_stale(current_room_self_sk(&room_key).as_ref(), signing_key) {
+        warn!(
+            "Skipping stale signing-key migration — the room's identity changed \
+             since this migration was queued (freenet/river#414)"
+        );
+        return MigrationResult::Failed;
+    }
 
     // Store the key
     match store_signing_key(room_key, signing_key).await {
@@ -525,6 +567,48 @@ mod tests {
         assert!(
             a2.try_lock().is_some(),
             "releasing the lock must let the next same-room migration proceed"
+        );
+    }
+
+    /// freenet/river#414 (Codex round 5): serializing migrations is not enough —
+    /// a delayed OLD-key migration can still acquire the lock after the new one.
+    /// `migrate_signing_key` rejects a migration whose key no longer matches the
+    /// room's CURRENT identity. Pin that decision.
+    #[test]
+    fn migration_is_stale_rejects_superseded_key() {
+        let new_key = SigningKey::from_bytes(&[9u8; 32]);
+        let old_key = SigningKey::from_bytes(&[8u8; 32]);
+        assert_ne!(new_key.to_bytes(), old_key.to_bytes());
+
+        // Room now holds `new_key`: a migration for the OLD key is stale.
+        assert!(
+            migration_is_stale(Some(&new_key), &old_key),
+            "an old key must be rejected once the room's identity has moved on"
+        );
+        // Migrating the CURRENT key is fine.
+        assert!(
+            !migration_is_stale(Some(&new_key), &new_key),
+            "migrating the room's current identity is never stale"
+        );
+        // Untracked room (brand-new import): never stale.
+        assert!(
+            !migration_is_stale(None, &new_key),
+            "a not-yet-tracked room has no newer identity to conflict with"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414, Codex round 5): `migrate_signing_key`
+    /// must actually consult `migration_is_stale` (against the room's current
+    /// identity) and abort before storing — the pure-helper test above does not
+    /// prove the reject is wired into the store path.
+    #[test]
+    fn migrate_signing_key_wires_staleness_reject() {
+        let src = include_str!("signing.rs");
+        let marker = "#[cfg(test)]";
+        let prod = &src[..src.find(marker).expect("signing.rs has a test module")];
+        assert!(
+            prod.contains("if migration_is_stale(current_room_self_sk(&room_key).as_ref()"),
+            "migrate_signing_key must reject a stale migration before storing (#414)"
         );
     }
 
