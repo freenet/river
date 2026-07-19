@@ -628,6 +628,8 @@ impl ResponseHandler {
 /// single wave. Waves run sequentially, so each wave also gets a fresh response
 /// timeout — a slow first-time delegate WASM compile can't time out later rooms.
 const ROOM_LOAD_CONCURRENCY: usize = 16;
+// `slice::chunks(0)` panics; pin the wave size as a valid chunk at compile time.
+const _: () = assert!(ROOM_LOAD_CONCURRENCY > 0);
 
 /// Per-room room load (freenet/river#345 / #65). Reconstructs the in-memory
 /// `Rooms` from the current delegate's `room:<vk>` slot keys (+ `rooms_meta`)
