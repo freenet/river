@@ -1086,6 +1086,15 @@ fn complete_identity_import(
             current.owner_key = Some(owner_key);
         });
 
+        // If this import REPLACED an already-tracked room (an overwrite of a
+        // Subscribed room), reset its sync entry so it takes the same GET-first
+        // fetch a brand-new import gets, instead of `needs_to_send_update`
+        // shipping a bogus delta off the now-empty placeholder state
+        // (freenet/river#414). No-op for a brand-new import (not yet tracked),
+        // which is already on the GET-first path.
+        crate::components::app::sync_info::SYNC_INFO
+            .with_mut(|sync_info| sync_info.reset_room_for_resync(&owner_key));
+
         crate::components::app::mark_needs_sync(owner_key);
 
         // Migrate signing key to delegate in background
@@ -2021,6 +2030,23 @@ mod tests {
             "MemberList must render the nickname as a Dioxus text node \
              (`span {{ \"{{parts.nickname}}\" }}`). Concatenating it into \
              an HTML string reopens freenet/river#227."
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414): `complete_identity_import` MUST
+    /// reset the room's sync entry via `reset_room_for_resync` so an overwrite
+    /// of an already-`Subscribed` room re-GETs full state instead of shipping a
+    /// bogus delta off the empty placeholder. Catches a refactor that drops the
+    /// reset (which unit tests on the pure helpers alone would not notice, since
+    /// the wiring lives in the deferred signal block).
+    #[test]
+    fn complete_identity_import_resets_sync_for_overwrite() {
+        let prod = production_source();
+        assert!(
+            prod.contains("reset_room_for_resync"),
+            "complete_identity_import must call SYNC_INFO.reset_room_for_resync \
+             so an overwrite import re-GETs full state (freenet/river#414); \
+             without it a Subscribed room ships a delta off empty state."
         );
     }
 

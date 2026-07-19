@@ -129,6 +129,35 @@ impl SyncInfo {
         }
     }
 
+    /// Reset an already-tracked room to the fresh-import (GET-first) sync path.
+    ///
+    /// Used when an imported identity OVERWRITES a room that is already tracked
+    /// (freenet/river#414). The previous identity may have driven the room to
+    /// [`RoomSyncStatus::Subscribed`] with a populated `last_synced_state`. If
+    /// it stays that way, the overwrite's empty placeholder `RoomData` looks
+    /// like a LOCAL EDIT to [`Self::needs_to_send_update`], which would ship a
+    /// bogus delta computed off the OLD state and never re-GET the room for the
+    /// new identity (the GET-first branch in `room_synchronizer` only runs for
+    /// `Disconnected` rooms). Resetting to `Disconnected` with no
+    /// `last_synced_state` makes [`Self::rooms_awaiting_subscription`] pick the
+    /// room up and — because the imported `RoomData` is
+    /// `is_awaiting_initial_sync()` — take the GET-first branch, exactly like a
+    /// brand-new import.
+    ///
+    /// Returns `true` if a tracked room was reset, `false` if the room was not
+    /// registered — a brand-new import is already on the GET-first path, so the
+    /// caller may invoke this unconditionally.
+    pub fn reset_room_for_resync(&mut self, owner_key: &VerifyingKey) -> bool {
+        let Some(sync_info) = self.map.get_mut(owner_key) else {
+            return false;
+        };
+        sync_info.sync_status = RoomSyncStatus::Disconnected;
+        sync_info.last_synced_state = None;
+        sync_info.subscribing_since = None;
+        sync_info.failed_sync_attempts = 0;
+        true
+    }
+
     /// Record a failed sync attempt for a room and decide whether to keep
     /// retrying or give up (freenet/river#290).
     ///
@@ -460,6 +489,54 @@ mod tests {
             si.map.get(&owner).unwrap().sync_status,
             RoomSyncStatus::Subscribed,
             "touch must never change the status"
+        );
+    }
+
+    /// freenet/river#414: overwriting an identity for an ALREADY-`Subscribed`
+    /// room must reset that room to the GET-first path (`Disconnected`, no
+    /// `last_synced_state`) so the imported identity re-fetches full state,
+    /// rather than leaving it `Subscribed` where `needs_to_send_update` would
+    /// ship a bogus delta off the overwrite's empty placeholder state.
+    #[test]
+    fn reset_room_for_resync_restores_get_first_path() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(21);
+
+        // A room the previous identity already drove to Subscribed, with a
+        // populated last-synced baseline and a failure streak.
+        si.register_new_room(owner);
+        si.update_sync_status(&owner, RoomSyncStatus::Subscribed);
+        si.update_last_synced_state(&owner, &ChatRoomStateV1::default());
+        si.map.get_mut(&owner).unwrap().failed_sync_attempts = 3;
+        assert_eq!(
+            si.map.get(&owner).unwrap().sync_status,
+            RoomSyncStatus::Subscribed
+        );
+        assert!(si.map.get(&owner).unwrap().last_synced_state.is_some());
+
+        // Overwrite import resets it to the fresh-import GET-first state.
+        assert!(
+            si.reset_room_for_resync(&owner),
+            "a tracked room must report it was reset"
+        );
+        let info = si.map.get(&owner).unwrap();
+        assert_eq!(
+            info.sync_status,
+            RoomSyncStatus::Disconnected,
+            "reset must return the room to Disconnected so rooms_awaiting_subscription re-GETs it"
+        );
+        assert!(
+            info.last_synced_state.is_none(),
+            "reset must clear the stale baseline so no delta is computed off empty state"
+        );
+        assert!(info.subscribing_since.is_none());
+        assert_eq!(info.failed_sync_attempts, 0);
+
+        // A brand-new import (room not tracked) is already GET-first: no-op.
+        let fresh = test_owner(22);
+        assert!(
+            !si.reset_room_for_resync(&fresh),
+            "an untracked room needs no reset (already on the GET-first path)"
         );
     }
 
