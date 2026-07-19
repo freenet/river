@@ -1153,7 +1153,7 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // freenet/river#397 Codex review 2/4 (P1): the legacy index is NON-EMPTY, so
     // rooms provably exist under the old delegate key. Announce `Migrating`
     // BEFORE the sequential fetch loop below — otherwise the state stays
-    // `Loading` through the whole fetch window and the 30s backstop could flip it
+    // `Loading` through the whole fetch window and the 60s backstop could flip it
     // to a terminal despite that positive evidence. `Migrating` is not rescued
     // early by the backstop. On an all-empty/all-failed result this writes NOTHING
     // to the global state (a single legacy probe is not authoritative — concurrent
@@ -1241,7 +1241,7 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
         // single legacy delegate finding nothing is NOT authoritative — other
         // concurrent legacy probes may still have rooms, and writing `Loaded` from
         // one empty probe could stomp a peer probe that is mid-`Migrating`. The
-        // universal 30s backstop resolves the all-nothing case; a probe that DOES
+        // universal 60s backstop resolves the all-nothing case; a probe that DOES
         // find rooms sets `Migrating` and hydrates (`room_count > 0` → `List`).
         return;
     }

@@ -1262,6 +1262,30 @@ mod tests {
         );
     }
 
+    /// freenet/river#417 follow-up: the empty-load quiescence window is calibrated
+    /// to the ~1-RTT legacy-probe response burst (all in by ~490 ms on a fast
+    /// link), because it was measured as ~89% of a brand-new user's cold-load
+    /// time-to-"No rooms yet" on try.freenet.org. Guard BOTH directions:
+    /// - too LARGE re-introduces the old ~4 s new-user cold-load pad (was 4_000 ms);
+    /// - too SMALL re-opens the #397 anti-flash margin — the anti-flash protection
+    ///   is timing-dependent (a delegate-bump migrator's late legacy response must
+    ///   arrive before this window elapses, else the rail flashes "No rooms yet"
+    ///   then self-corrects), so the window must keep a comfortable margin over
+    ///   browser↔node RTT for that cohort.
+    #[test]
+    fn load_idle_window_stays_calibrated() {
+        assert!(
+            (1_000..=2_500).contains(&LOAD_IDLE_MS),
+            "LOAD_IDLE_MS ({LOAD_IDLE_MS}ms) must stay calibrated to the legacy-probe \
+             burst: small enough not to pad the new-user cold-load, large enough to \
+             keep the #397 anti-flash margin over RTT for delegate-bump migrators"
+        );
+        assert!(
+            LOAD_IDLE_MS < LOAD_HARD_MAX_MS,
+            "idle window must stay well below the last-resort hard-max backstop"
+        );
+    }
+
     /// freenet/river#397 Codex review 5: the UNIVERSAL backstop resolves EVERY
     /// non-terminal state to a terminal, and a stalled `Migrating` (which we set
     /// ONLY after a non-empty index proved rooms exist) resolves to `LoadFailed`,
@@ -4742,7 +4766,7 @@ pub(crate) fn mark_fetch_failure() {
 /// given the CURRENT state and whether any known-rooms fetch failed. Pure, so
 /// every branch is unit-testable. freenet/river#397 Codex review 4/5:
 /// - `Migrating` → `LoadFailed`. We only ever set `Migrating` after a non-empty
-///   index PROVED rooms exist, so a migration still running at the 30s deadline
+///   index PROVED rooms exist, so a migration still running at the 60s deadline
 ///   is a stall of a known-non-empty load — an honest error+retry, NOT Empty.
 ///   It self-corrects to `List` if the migration later completes and hydrates
 ///   rooms (a non-empty `ROOMS` outranks the load state).
@@ -4821,8 +4845,28 @@ pub(crate) static LOAD_ACTIVITY_GEN: AtomicU32 = AtomicU32::new(0);
 /// Quiescence window: once the last worker settles with an empty result and no
 /// fetch failure, wait this long for a late (fire-and-forget legacy) response
 /// before resolving to Empty. A new worker starting (activity-gen bump) cancels
-/// it. Short because delegate ops are node-local (sub-second).
-const LOAD_IDLE_MS: u64 = 4_000;
+/// it.
+///
+/// This bounds how long a GENUINELY-empty (new-user) load shows "Loading…"
+/// before "No rooms yet" — measured as ~89% of a brand-new user's cold-load
+/// time-to-settled on try.freenet.org (freenet/river#417 follow-up; the app
+/// shell is already interactive at ~240 ms). It was 4_000 ms; recalibrated
+/// toward the actual legacy-probe response burst (~72 fire-and-forget probes over
+/// 24 delegate generations, measured ~130 ms spread, all in by ~490 ms on a fast
+/// link).
+///
+/// The FLOOR is set by the one cohort that can flash: a returning user whose
+/// CURRENT delegate is empty but a LEGACY delegate still has data (the first load
+/// after a delegate-WASM key bump — the #397 case). Their data-bearing legacy
+/// response spawns a migrate worker that cancels this timer, but only once the
+/// response ARRIVES — so the anti-flash protection is timing-dependent, not
+/// structural: if this window elapses first, the rail briefly shows "No rooms
+/// yet" then self-corrects to the room list (cosmetic, no data loss). 1_500 ms
+/// keeps a ~3x margin over the ~490 ms fast-link burst (covering ~1 s of extra
+/// browser↔node RTT for a distant user) while still cutting the new-user
+/// cold-load-to-settled from ~4.5 s to ~2 s. Brand-new users get no legacy
+/// response at all, so they resolve Empty with zero flash risk regardless.
+const LOAD_IDLE_MS: u64 = 1_500;
 
 /// Absolute last-resort safety net (defense-in-depth for invariant 2). The
 /// progress-tracked idle resolution terminates first in practice; this only
