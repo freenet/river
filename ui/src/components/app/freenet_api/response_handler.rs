@@ -9,16 +9,17 @@ mod update_response;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    arm_legacy_migration_recovery, cas_store_correlation_key, clear_legacy_migration_in_progress,
-    complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
-    complete_pending_signing_key_request, decide_legacy_migration_action,
-    decide_per_room_load_action, fire_legacy_migration_request, get_versioned_correlation_key,
-    hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
-    is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
-    per_room_terminal, prune_outbound_dms_for_purges, room_storage_key,
-    save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
-    send_delegate_request_to, set_load_state_if_current, LegacyMigrationAction, LoadWorkerGuard,
+    arm_legacy_migration_recovery, await_delegate_response, cas_store_correlation_key,
+    clear_legacy_migration_in_progress, complete_pending_public_key_request,
+    complete_pending_request, complete_pending_sign_request, complete_pending_signing_key_request,
+    decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
+    fire_legacy_migration_request, get_versioned_correlation_key, hydrate_hidden_dm_threads,
+    hydrate_outbound_dms_cache, is_legacy_delegate_key, is_legacy_migration_in_progress,
+    legacy_scoped_correlation, load_state_after_probe_legacy, mark_legacy_migration_done,
+    mark_legacy_migration_in_progress, parse_room_storage_key, per_room_terminal,
+    prune_outbound_dms_for_purges, room_storage_key, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, send_delegate_request, send_delegate_request_to,
+    set_load_state_if_current, LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest,
     RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
@@ -613,6 +614,23 @@ impl ResponseHandler {
     }
 }
 
+/// How many per-room delegate GETs to keep in flight at once during the startup
+/// room load (freenet/river#417 + PR #419 review).
+///
+/// The concurrent fan-out collapses N serial round-trips into ~ceil(N / this),
+/// but MUST stay well under the node's per-queue admission cap: delegate
+/// requests land in the freenet-core `FairEventQueue` `Default` queue, whose
+/// per-tier cap is `MAX_QUEUED_PER_CONTRACT` (100), and admission past it is
+/// REJECTED (the waiter then fails / times out, failing that room's load). 16
+/// leaves comfortable headroom for the cap AND for the other startup delegate
+/// traffic sharing that queue (RegisterDelegate, the outbound-DM load, signing
+/// requests), while still turning a typical (<16-room) account's load into a
+/// single wave. Waves run sequentially, so each wave also gets a fresh response
+/// timeout — a slow first-time delegate WASM compile can't time out later rooms.
+const ROOM_LOAD_CONCURRENCY: usize = 16;
+// `slice::chunks(0)` panics; pin the wave size as a valid chunk at compile time.
+const _: () = assert!(ROOM_LOAD_CONCURRENCY > 0);
+
 /// Per-room room load (freenet/river#345 / #65). Reconstructs the in-memory
 /// `Rooms` from the current delegate's `room:<vk>` slot keys (+ `rooms_meta`)
 /// discovered by a `ListRequest`, then hands the assembled value to the shared
@@ -638,6 +656,10 @@ impl ResponseHandler {
 /// * **nothing** → empty current delegate: probe the legacy delegates (the old
 ///   WASM-key migration path), exactly as the old empty-`rooms_data` GetResponse
 ///   did.
+///
+/// The per-room slot GETs are fanned out CONCURRENTLY in waves of
+/// [`ROOM_LOAD_CONCURRENCY`] (freenet/river#417) to collapse N serial delegate
+/// round-trips into ~ceil(N / ROOM_LOAD_CONCURRENCY).
 async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
     // Progress-tracked termination (freenet/river#397 review 6): this awaited
     // worker holds a guard for its whole lifetime, so on EVERY exit path the
@@ -669,7 +691,10 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // Initial load: owns the display state (recovery = false).
             migrate_current_blob_to_per_room(false).await;
         }
-        LoadPlan::PerRoom { room_vks, has_meta } => {
+        LoadPlan::PerRoom {
+            mut room_vks,
+            has_meta,
+        } => {
             // Was a prior legacy migration interrupted before it finished writing
             // every per-room key? If so, the set we're about to load may be
             // missing rooms the legacy delegate still holds, and we must NOT mark
@@ -684,15 +709,36 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                 mark_legacy_migration_done();
             }
 
+            // Defensive dedup (PR #419 review): the concurrent fan-out registers
+            // every per-room waiter under its bare `room_storage_key` in the
+            // single-waiter `PENDING_REQUESTS` map, so a duplicate `vk` would
+            // clobber its own sibling waiter (the second register drops the
+            // first's oneshot) and spuriously mark a fetch failure for a room that
+            // actually loaded. The delegate's key index is unique by construction,
+            // but the OLD serial loop was robust to a dup (each GET completed
+            // before the next registered) and the fan-out is not — so restore that
+            // robustness cheaply. Order-preserving.
+            {
+                let mut seen = std::collections::HashSet::with_capacity(room_vks.len());
+                room_vks.retain(|vk| seen.insert(vk.to_bytes()));
+            }
+
             // Concurrency note: a WebSocket reconnect re-fires `ListRequest`, so
             // two `load_rooms_per_room` tasks can briefly overlap. The per-room
             // GETs register under bare-key correlation in the single-waiter
-            // `PENDING_REQUESTS` map, so the second load's GET for a shared key
-            // orphans the first's oneshot (that room logs an error and is skipped
-            // in THAT pass). No permanent loss: each response is delivered to one
-            // load and `Rooms::merge` is a union, so across the overlapping
-            // passes every room still lands in ROOMS. (Load-vs-SAVE never
-            // collides — those use distinct prefixed correlation keys.)
+            // `PENDING_REQUESTS` map, so the second (newer) load's GET for a shared
+            // key orphans the first's oneshot. With the concurrent fan-out below,
+            // a whole wave of the older pass's waiters can be orphaned at once
+            // (vs. one-at-a-time in the old serial loop). This stays safe because
+            // the reconnect goes through `set_up_chat_delegate()`, which calls
+            // `begin_load_attempt()` (bumping `LOAD_ATTEMPT_GEN`) BEFORE firing the
+            // new `ListRequest` — so by the time the newer pass can orphan the
+            // older pass's waiters, the older pass is already superseded and its
+            // `worker.set_load_state(...)` / `worker.mark_fetch_failure()` writes
+            // no-op (`load_attempt_is_current`). No permanent loss and no false
+            // `LoadFailed` flash: the newer pass loads every room and `Rooms::merge`
+            // is a union. (Load-vs-SAVE never collides — distinct prefixed
+            // correlation keys.)
             info!("Loading {} per-room slot(s) from delegate", room_vks.len());
             // freenet/river#397 Codex review 4: the index PROVED these rooms
             // exist. Track whether any LISTED room failed to materialize (a
@@ -703,12 +749,53 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             let listed_count = room_vks.len();
             let mut had_fetch_error = false;
             let mut slots: Vec<(ed25519_dalek::VerifyingKey, RoomSlot)> = Vec::new();
-            for vk in room_vks {
-                match send_delegate_request(ChatDelegateRequestMsg::GetRequest {
-                    key: ChatDelegateKey::new(room_storage_key(&vk)),
-                })
-                .await
-                {
+            // Bounded concurrency (freenet/river#417 + PR #419 review): fan the
+            // per-room GETs out in WAVES of `ROOM_LOAD_CONCURRENCY`. Firing all N
+            // at once would collapse N round-trips into 1, but a large account (or
+            // a node whose delegate queue is already busy) could overflow the
+            // node's `FairEventQueue` `Default`-queue cap and get rooms rejected —
+            // a regression the serial loop couldn't hit (see `ROOM_LOAD_CONCURRENCY`).
+            // Waves keep in-flight requests under that cap while still collapsing
+            // N serial round-trips into ~ceil(N / ROOM_LOAD_CONCURRENCY).
+            //
+            // Within a wave, every request is ENQUEUED (the synchronous WS send is
+            // the only `WEB_API` borrow, kept strictly non-overlapping) BEFORE any
+            // response is awaited via `join_all` — so no second `WEB_API` borrow
+            // can interleave across an await (a `RefCell` double-borrow panic in
+            // single-threaded WASM). An enqueue (send) failure is a transport
+            // failure, funneled into the per-room `Err` fold arm below so there is
+            // a single per-room failure-handling site.
+            let mut per_room_responses: Vec<(
+                ed25519_dalek::VerifyingKey,
+                Result<ChatDelegateResponseMsg, String>,
+            )> = Vec::with_capacity(listed_count);
+            for wave in room_vks.chunks(ROOM_LOAD_CONCURRENCY) {
+                let mut pending_slots: Vec<(ed25519_dalek::VerifyingKey, PendingDelegateRequest)> =
+                    Vec::with_capacity(wave.len());
+                for vk in wave {
+                    match enqueue_delegate_request(ChatDelegateRequestMsg::GetRequest {
+                        key: ChatDelegateKey::new(room_storage_key(vk)),
+                    })
+                    .await
+                    {
+                        Ok(pending) => pending_slots.push((*vk, pending)),
+                        // The WS send failed (connection down): record as a
+                        // per-room `Err` so it flows through the single failure
+                        // arm below.
+                        Err(e) => per_room_responses.push((*vk, Err(e))),
+                    }
+                }
+                // Await this wave's responses concurrently — ~1 round-trip per
+                // wave instead of one per room.
+                per_room_responses.extend(
+                    futures::future::join_all(pending_slots.into_iter().map(
+                        |(vk, pending)| async move { (vk, await_delegate_response(pending).await) },
+                    ))
+                    .await,
+                );
+            }
+            for (vk, response) in per_room_responses {
+                match response {
                     Ok(ChatDelegateResponseMsg::GetResponse {
                         value: Some(bytes), ..
                     }) => match from_reader::<RoomSlot, _>(&bytes[..]) {
@@ -2509,6 +2596,76 @@ mod tests {
             !after_none.contains("had_fetch_error = true;")
                 && !after_none.contains("mark_fetch_failure()"),
             "a definitive `value: None` is a legitimate skip, not a fetch failure"
+        );
+    }
+
+    /// freenet/river#417: the startup room load must fan the per-room delegate
+    /// GETs out CONCURRENTLY — enqueue every request in a wave first (synchronous
+    /// WS send), then await that wave's responses together via `join_all` —
+    /// rather than awaiting each in a serial `for … .await`. That collapses
+    /// wall-clock from N round-trips to ~ceil(N / ROOM_LOAD_CONCURRENCY). Pin the
+    /// wiring by source-grep (this repo's convention), scoped to the per-room load
+    /// region so the trailing single meta GET (which legitimately still uses
+    /// `send_delegate_request`) is excluded.
+    #[test]
+    fn per_room_load_fans_out_concurrently() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let start = production
+            .find("Loading {} per-room slot(s) from delegate")
+            .expect("per-room fetch loop marker must exist");
+        let end = production[start..]
+            .find("let meta = if has_meta")
+            .map(|i| start + i)
+            .expect("the per-room loop must be followed by the meta load");
+        let region = &production[start..end];
+
+        // Requests are ENQUEUED (send-only) and their responses awaited
+        // CONCURRENTLY via join_all — not a combined serial send+await.
+        let enqueue_pos = region
+            .find("enqueue_delegate_request(")
+            .expect("per-room GETs must be enqueued (send) before awaiting");
+        let join_pos = region
+            .find("join_all(")
+            .expect("per-room responses must be awaited concurrently via join_all");
+        assert!(
+            region.contains("await_delegate_response("),
+            "per-room responses must be awaited via the split await_delegate_response"
+        );
+        // Borrow-safety (the PR's one real landmine): the `WEB_API`-borrowing
+        // enqueue must run BEFORE the concurrent await phase, and must NOT appear
+        // INSIDE the join_all fan-out — otherwise two enqueues would interleave
+        // across an await and double-borrow `WEB_API` (a RefCell panic in
+        // single-threaded WASM). These two assertions pin exactly that ordering,
+        // so a refactor to the tempting single-loop shape
+        // `join_all(map(|vk| async { enqueue(vk).await?; await_response(...).await }))`
+        // (which re-introduces the landmine) fails CI even though it still uses
+        // enqueue + join_all.
+        assert!(
+            enqueue_pos < join_pos,
+            "per-room GETs must be enqueued (WEB_API send) BEFORE the join_all await phase"
+        );
+        assert!(
+            !region[join_pos..].contains("enqueue_delegate_request("),
+            "the join_all fan-out must not contain an enqueue (WEB_API borrow) — \
+             enqueues stay in the sequential per-wave loop to avoid a RefCell double-borrow"
+        );
+        // Guard against a regression to the serial combined send+await in the
+        // per-room region (the trailing meta GET, outside this region, may still
+        // use send_delegate_request).
+        assert!(
+            !region.contains("send_delegate_request("),
+            "per-room load must not use the serial send_delegate_request in the fan-out region"
+        );
+        // The fan-out is bounded (does not fire all N at once) — it iterates
+        // chunks of ROOM_LOAD_CONCURRENCY to stay under the node's delegate queue
+        // cap (PR #419 review).
+        assert!(
+            region.contains("chunks(ROOM_LOAD_CONCURRENCY)"),
+            "per-room load must fan out in bounded waves of ROOM_LOAD_CONCURRENCY, not all N at once"
         );
     }
 

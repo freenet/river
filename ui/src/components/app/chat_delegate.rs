@@ -4278,11 +4278,47 @@ pub async fn send_delegate_request_to(
     send_delegate_request_inner(delegate_key, request, key_bytes).await
 }
 
-async fn send_delegate_request_inner(
+/// A delegate request that has been SENT and is awaiting its response.
+///
+/// Splitting "send" from "await response" (vs. the combined
+/// [`send_delegate_request`]) lets a caller fire many requests and then await
+/// them concurrently. This is what collapses the startup room load's N serial
+/// round-trips into ~1 (freenet/river#417): the per-room `GetRequest`s are
+/// ENQUEUED sequentially — each enqueue does only the synchronous WS send, so
+/// the `WEB_API` borrow never overlaps another (a concurrent second borrow
+/// would be a `RefCell` double-borrow panic in single-threaded WASM) — and then
+/// their responses are awaited together via `join_all`.
+pub(crate) struct PendingDelegateRequest {
+    receiver: oneshot::Receiver<ChatDelegateResponseMsg>,
+    /// The `PENDING_REQUESTS` correlation key, needed to evict the waiter on a
+    /// timeout.
+    key_bytes: Vec<u8>,
+}
+
+/// Enqueue a request to the CURRENT delegate (bare correlation), returning a
+/// [`PendingDelegateRequest`] to await. The send/await split of
+/// [`send_delegate_request`], for concurrent fan-out (freenet/river#417).
+pub(crate) async fn enqueue_delegate_request(
+    request: ChatDelegateRequestMsg,
+) -> Result<PendingDelegateRequest, String> {
+    let key_bytes = get_request_key(&request);
+    enqueue_delegate_request_inner(CHAT_DELEGATE_KEY.clone(), request, key_bytes).await
+}
+
+/// Register the response waiter and SEND the request, WITHOUT awaiting the
+/// response. Returns a [`PendingDelegateRequest`] the caller awaits (once, or
+/// many concurrently via [`await_delegate_response`]).
+///
+/// The `WEB_API` write borrow is confined to the synchronous `api.send()` here.
+/// `WebApi::send` does not yield for sub-`CHUNK_THRESHOLD` payloads (all delegate
+/// request payloads are small keys), so awaiting each enqueue sequentially keeps
+/// the borrows strictly non-overlapping — the concurrency happens only in the
+/// subsequent `await_delegate_response` phase, which holds no `WEB_API` borrow.
+async fn enqueue_delegate_request_inner(
     delegate_key: DelegateKey,
     request: ChatDelegateRequestMsg,
     key_bytes: Vec<u8>,
-) -> Result<ChatDelegateResponseMsg, String> {
+) -> Result<PendingDelegateRequest, String> {
     debug!("Sending delegate request: {:?}", request);
 
     // Create a oneshot channel to receive the response
@@ -4312,7 +4348,9 @@ async fn send_delegate_request_inner(
         inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(app_msg)],
     });
 
-    // Get the API and send the request, releasing the lock before awaiting
+    // Get the API and send the request, releasing the lock before returning.
+    // The borrow is confined to this synchronous send (no yield for small
+    // payloads), so sequential enqueue calls never overlap the borrow.
     let api_result = {
         let mut web_api = WEB_API.write();
         if let Some(api) = web_api.as_mut() {
@@ -4332,6 +4370,22 @@ async fn send_delegate_request_inner(
     }
 
     info!("Request sent, waiting for response...");
+    Ok(PendingDelegateRequest {
+        receiver,
+        key_bytes,
+    })
+}
+
+/// Await the response for a request already sent via `enqueue_delegate_request*`.
+/// Many of these can be awaited concurrently (e.g. `join_all`) because each holds
+/// no `WEB_API` borrow — only its own oneshot receiver and timeout.
+pub(crate) async fn await_delegate_response(
+    pending: PendingDelegateRequest,
+) -> Result<ChatDelegateResponseMsg, String> {
+    let PendingDelegateRequest {
+        receiver,
+        key_bytes,
+    } = pending;
 
     // Wait for the response with a timeout
     // Use WASM-compatible sleep from util module
@@ -4356,6 +4410,15 @@ async fn send_delegate_request_inner(
             Err("Timeout waiting for delegate response".to_string())
         }
     }
+}
+
+async fn send_delegate_request_inner(
+    delegate_key: DelegateKey,
+    request: ChatDelegateRequestMsg,
+    key_bytes: Vec<u8>,
+) -> Result<ChatDelegateResponseMsg, String> {
+    let pending = enqueue_delegate_request_inner(delegate_key, request, key_bytes).await?;
+    await_delegate_response(pending).await
 }
 
 // =============================================================================
