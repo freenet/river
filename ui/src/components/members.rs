@@ -967,6 +967,22 @@ fn import_room_identity_exists(rooms: &crate::room_data::Rooms, owner_key: &Veri
     rooms.map.contains_key(owner_key)
 }
 
+/// Resolve which identity a Replace-confirm imports.
+///
+/// It MUST be the `snapshot` captured when the overwrite warning was shown.
+/// The `_live_token` (the current, still-editable textarea contents) is
+/// deliberately IGNORED so that editing the token after the warning appears
+/// cannot redirect the overwrite to a different room (freenet/river#414):
+/// otherwise a room-A warning followed by pasting room-B's token and clicking
+/// Replace would overwrite room B without ever confirming THAT replacement.
+/// Returns `None` when there is no pending snapshot (nothing to confirm).
+fn resolve_confirmed_import(
+    snapshot: Option<IdentityExport>,
+    _live_token: &str,
+) -> Option<IdentityExport> {
+    snapshot
+}
+
 /// Build the [`RoomData`](crate::room_data::RoomData) for an imported
 /// identity from its export.
 ///
@@ -1120,15 +1136,31 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
     let mut token_input = use_signal(String::new);
     let mut error_msg = use_signal(|| None::<String>);
     let mut success_msg = use_signal(|| None::<String>);
-    // When true, a room identity already exists for the pasted token's owner,
-    // so we prompt to confirm replacing it rather than importing silently
-    // (freenet/river#414). The token stays in `token_input` and is re-parsed
-    // on confirm.
-    let mut overwrite_confirm = use_signal(|| false);
+    // The parsed import awaiting overwrite confirmation. `Some` means a room
+    // identity already exists for this token's owner, so we prompt to confirm
+    // replacing it rather than importing silently (freenet/river#414). This
+    // is a SNAPSHOT of the token that was checked: Replace consumes it, NOT a
+    // fresh read of the (still-editable) textarea, so editing the token after
+    // the warning appears cannot redirect the overwrite to a different room.
+    let mut pending_import = use_signal(|| None::<IdentityExport>);
 
     if !*is_active.read() {
         return rsx! {};
     }
+
+    // Reset-and-close, matching the deferred pattern in `join_with_code_modal`
+    // and `.claude/rules/dioxus-signal-safety.md`: signal mutations from event
+    // handlers run inside `crate::util::defer()` so they execute in a clean
+    // Dioxus context (no re-entrant `RefCell` borrow, root scope present).
+    let reset_and_close = move || {
+        crate::util::defer(move || {
+            is_active.set(false);
+            error_msg.set(None);
+            success_msg.set(None);
+            pending_import.set(None);
+            token_input.set(String::new());
+        });
+    };
 
     let handle_import = move |_| {
         let input = token_input.read().clone();
@@ -1138,8 +1170,8 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
 
                 // If we already have an identity for this room, importing would
                 // replace it (and lose the current signing key unless it was
-                // exported). Prompt for confirmation instead of refusing
-                // (freenet/river#414).
+                // exported). Snapshot the CHECKED token and prompt for
+                // confirmation instead of refusing (freenet/river#414).
                 let already_exists = {
                     let Ok(rooms) = ROOMS.try_read() else {
                         return;
@@ -1147,51 +1179,59 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     import_room_identity_exists(&rooms, &owner_key)
                 };
                 if already_exists {
-                    overwrite_confirm.set(true);
-                    error_msg.set(None);
-                    success_msg.set(None);
+                    crate::util::defer(move || {
+                        pending_import.set(Some(export));
+                        error_msg.set(None);
+                        success_msg.set(None);
+                    });
                     return;
                 }
 
                 complete_identity_import(export, success_msg, error_msg);
             }
             Err(e) => {
-                error_msg.set(Some(format!("Invalid token: {}", e)));
-                success_msg.set(None);
+                crate::util::defer(move || {
+                    error_msg.set(Some(format!("Invalid token: {}", e)));
+                    success_msg.set(None);
+                });
             }
         }
     };
 
-    // User confirmed replacing the existing identity: re-parse the token
-    // (still in `token_input`) and complete the overwrite.
+    // User confirmed replacing the existing identity: import the SNAPSHOT
+    // captured when the warning was shown — never a fresh read of the editable
+    // textarea (freenet/river#414).
     let handle_replace_confirm = move |_| {
-        let input = token_input.read().clone();
-        overwrite_confirm.set(false);
-        match IdentityExport::from_armored_string(&input) {
-            Ok(export) => complete_identity_import(export, success_msg, error_msg),
-            Err(e) => {
-                error_msg.set(Some(format!("Invalid token: {}", e)));
-                success_msg.set(None);
-            }
+        let live_token = token_input.read().clone();
+        let snapshot = pending_import.read().clone();
+        let Some(export) = resolve_confirmed_import(snapshot, &live_token) else {
+            return;
+        };
+        // Belt-and-suspenders: bail on a torn ROOMS read rather than acting on
+        // inconsistent state. Existence does not change the action — we import
+        // the SNAPSHOT either way (complete_identity_import inserts whether or
+        // not the room still exists), so the read only guards consistency.
+        if ROOMS.try_read().is_err() {
+            return;
         }
+        crate::util::defer(move || {
+            pending_import.set(None);
+        });
+        complete_identity_import(export, success_msg, error_msg);
     };
 
-    // User backed out of the overwrite: return to the input state, keeping the
-    // pasted token so they can reconsider.
+    // User backed out of the overwrite: drop the snapshot and return to the
+    // input state, keeping the pasted token so they can reconsider.
     let handle_replace_cancel = move |_| {
-        overwrite_confirm.set(false);
+        crate::util::defer(move || {
+            pending_import.set(None);
+        });
     };
 
     rsx! {
         div {
             class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
-            onclick: move |_| {
-                is_active.set(false);
-                error_msg.set(None);
-                success_msg.set(None);
-                overwrite_confirm.set(false);
-                token_input.set(String::new());
-            },
+            onclick: move |_| reset_and_close(),
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
@@ -1205,7 +1245,16 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     class: "w-full h-40 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
                     placeholder: "-----BEGIN RIVER IDENTITY-----\n...\n-----END RIVER IDENTITY-----",
                     value: "{token_input}",
-                    oninput: move |e| token_input.set(e.value()),
+                    // Controlled input: set the value signal synchronously (the
+                    // documented signal-safety exception — a deferred write to a
+                    // controlled input's bound value lags the DOM and drops
+                    // keystrokes). Editing the token invalidates any pending
+                    // overwrite confirmation so the warning can't outlive the
+                    // token it was raised for (freenet/river#414).
+                    oninput: move |e| {
+                        token_input.set(e.value());
+                        pending_import.set(None);
+                    },
                 }
                 if let Some(err) = &*error_msg.read() {
                     div { class: "mt-2 text-sm text-red-400",
@@ -1217,7 +1266,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                         "{msg}"
                     }
                 }
-                if *overwrite_confirm.read() {
+                if pending_import.read().is_some() {
                     // A room identity already exists — warn before replacing it.
                     div {
                         "data-testid": "import-identity-replace-warning",
@@ -1242,13 +1291,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     div { class: "flex justify-end gap-3 mt-4",
                         button {
                             class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
-                            onclick: move |_| {
-                                is_active.set(false);
-                                error_msg.set(None);
-                                success_msg.set(None);
-                                overwrite_confirm.set(false);
-                                token_input.set(String::new());
-                            },
+                            onclick: move |_| reset_and_close(),
                             "Cancel"
                         }
                         button {
@@ -1383,6 +1426,51 @@ mod tests {
             !rooms.removed_rooms.contains(&owner_vk),
             "import is an explicit rejoin: the leave tombstone must be cleared"
         );
+    }
+
+    /// freenet/river#414 (Codex round 2): confirming an overwrite imports the
+    /// token SNAPSHOTTED when the warning appeared, NOT a fresh read of the
+    /// (still-editable) textarea. Guards the wrong-room data-loss where a
+    /// room-A warning + textarea swapped to room-B + Replace would overwrite
+    /// room B without ever confirming that replacement.
+    #[test]
+    fn confirm_imports_snapshot_not_edited_textarea() {
+        let owner_a = SigningKey::from_bytes(&[51u8; 32]);
+        let owner_b = SigningKey::from_bytes(&[52u8; 32]);
+        assert_ne!(
+            owner_a.verifying_key(),
+            owner_b.verifying_key(),
+            "rooms A and B must differ for the test to be meaningful"
+        );
+
+        // Snapshot captured when the warning was shown, for room A.
+        let snapshot = export_for(&owner_a, &SigningKey::from_bytes(&[53u8; 32]));
+
+        // The user edits the textarea to room B's token AFTER the warning.
+        let edited_live_token =
+            export_for(&owner_b, &SigningKey::from_bytes(&[54u8; 32])).to_armored_string();
+
+        // The confirm path resolves to the SNAPSHOT (room A), never the edited
+        // live token (room B).
+        let resolved = resolve_confirmed_import(Some(snapshot.clone()), &edited_live_token)
+            .expect("a pending snapshot must resolve to an import");
+        assert_eq!(
+            resolved.room_owner,
+            owner_a.verifying_key(),
+            "must import the snapshot's room (A)"
+        );
+        assert_ne!(
+            resolved.room_owner,
+            owner_b.verifying_key(),
+            "must NOT import the edited textarea's room (B)"
+        );
+
+        // And the RoomData built for the insert targets room A.
+        let room_data = build_imported_room_data(resolved);
+        assert_eq!(room_data.owner_vk, owner_a.verifying_key());
+
+        // No snapshot → nothing to confirm.
+        assert!(resolve_confirmed_import(None, &edited_live_token).is_none());
     }
 
     /// Frozen cross-side wire-format fixture (issue freenet/river#302/#305).
