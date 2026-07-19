@@ -1262,6 +1262,28 @@ mod tests {
         );
     }
 
+    /// freenet/river#417 follow-up: the empty-load quiescence window is
+    /// deliberately short — calibrated to the ~1-RTT legacy-probe response burst
+    /// (all in by ~490 ms on a fast link), because it was measured as ~89% of a
+    /// brand-new user's cold-load time-to-"No rooms yet" on try.freenet.org.
+    /// Guard against a silent regression back to the old multi-second value
+    /// (was 4_000 ms). Safety of a short window: a legacy delegate that actually
+    /// HAS data spawns a migrate worker (`pending > 0` in `idle_should_apply`),
+    /// which keeps the state non-Empty, so a short grace can't miss a real
+    /// migration — it only speeds up the genuinely-empty new-user case.
+    #[test]
+    fn load_idle_window_stays_short() {
+        assert!(
+            LOAD_IDLE_MS <= 1_000,
+            "LOAD_IDLE_MS ({LOAD_IDLE_MS}ms) gates the new-user cold-load; keep it \
+             calibrated to the ~1-RTT legacy-probe burst, not a multi-second pad"
+        );
+        assert!(
+            LOAD_IDLE_MS < LOAD_HARD_MAX_MS,
+            "idle window must stay well below the last-resort hard-max backstop"
+        );
+    }
+
     /// freenet/river#397 Codex review 5: the UNIVERSAL backstop resolves EVERY
     /// non-terminal state to a terminal, and a stalled `Migrating` (which we set
     /// ONLY after a non-empty index proved rooms exist) resolves to `LoadFailed`,
@@ -4821,8 +4843,20 @@ pub(crate) static LOAD_ACTIVITY_GEN: AtomicU32 = AtomicU32::new(0);
 /// Quiescence window: once the last worker settles with an empty result and no
 /// fetch failure, wait this long for a late (fire-and-forget legacy) response
 /// before resolving to Empty. A new worker starting (activity-gen bump) cancels
-/// it. Short because delegate ops are node-local (sub-second).
-const LOAD_IDLE_MS: u64 = 4_000;
+/// it, and a legacy delegate that DOES have data spawns a migrate worker
+/// (`pending > 0`), which keeps the state non-Empty — so this only bounds how
+/// long a GENUINELY-empty (new-user) load shows "Loading…" before "No rooms yet".
+///
+/// Sized to the measured legacy-probe response burst, not padded ~10x: the ~72
+/// fire-and-forget legacy probes (24 delegate generations × 3) come back in a
+/// tight burst within ~1 RTT of dispatch (measured ~130 ms spread, all in by
+/// ~490 ms on a fast link — try.freenet.org, freenet/river#417 follow-up), and a
+/// data-bearing legacy response would spawn a migrate worker (guarded above), so
+/// 750 ms is a comfortable grace for a late straggler. The previous 4_000 ms was
+/// ~10x the real burst spread and, per that measurement, ~89% of a brand-new
+/// user's cold-load time-to-"No rooms yet" (~4.5 s → ~1.2 s here). This resolves
+/// only the room-rail state; the app shell is already interactive at ~240 ms.
+const LOAD_IDLE_MS: u64 = 750;
 
 /// Absolute last-resort safety net (defense-in-depth for invariant 2). The
 /// progress-tracked idle resolution terminates first in practice; this only
