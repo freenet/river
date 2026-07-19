@@ -193,3 +193,9 @@ version = "V26"
 description = "Before adding MemberInfo.deputies field (deputy ban authority, #410): last pre-deputy room-contract generation"
 date = "2026-07-16"
 code_hash = "74f3dff1c3c2f4ef89e4c93ee45ddb62952df22161450a905c2784c1facf6740"
+
+[[entry]]
+version = "V27"
+description = "Before deterministic Summary (BTreeMap/BTreeSet for anti-entropy staleness, #4857): last deputy-generation room-contract"
+date = "2026-07-18"
+code_hash = "2e9a1eda53d9e4f495c2bc6af4c5eb5c1546223a3d2fd15286eb1648feb8e649"

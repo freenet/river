@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
@@ -281,7 +281,13 @@ impl BansV1 {
 
 impl ComposableState for BansV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = HashSet<BanId>;
+    // BTreeSet (not HashSet) so the ciborium-serialized summary bytes are
+    // deterministic: freenet-core byte-compares `summarize_state` output for
+    // staleness, and a HashSet iterates in a per-process-random order, making
+    // two identical ban sets summarize to different bytes → spurious
+    // anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
+    // and freenet/freenet-core#4857.
+    type Summary = BTreeSet<BanId>;
     type Delta = Vec<AuthorizedUserBan>;
     type Parameters = ChatRoomParametersV1;
 
@@ -749,17 +755,17 @@ mod tests {
         let bans = BansV1(vec![ban1.clone(), ban2.clone()]);
 
         // Test 1: Empty old summary
-        let empty_summary = HashSet::new();
+        let empty_summary = BTreeSet::new();
         let delta = bans.delta(&state, &params, &empty_summary);
         assert_eq!(delta, Some(vec![ban1.clone(), ban2.clone()]));
 
         // Test 2: Partial old summary
-        let partial_summary: HashSet<BanId> = vec![ban1.id()].into_iter().collect();
+        let partial_summary: BTreeSet<BanId> = vec![ban1.id()].into_iter().collect();
         let delta = bans.delta(&state, &params, &partial_summary);
         assert_eq!(delta, Some(vec![ban2.clone()]));
 
         // Test 3: Full old summary
-        let full_summary: HashSet<BanId> = vec![ban1.id(), ban2.id()].into_iter().collect();
+        let full_summary: BTreeSet<BanId> = vec![ban1.id(), ban2.id()].into_iter().collect();
         let delta = bans.delta(&state, &params, &full_summary);
         assert_eq!(delta, None);
     }

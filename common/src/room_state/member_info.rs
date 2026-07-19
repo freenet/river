@@ -6,7 +6,7 @@ use crate::util::{sign_struct, verify_struct};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Maximum number of deputies a single member may list in their `MemberInfo`,
 /// to bound state-bloat abuse (deputy ban authority, #410). A `MemberInfo`
@@ -116,7 +116,14 @@ impl ComposableState for MemberInfoV1 {
     /// `(version, signature)` per member. The signature is the equal-version
     /// tiebreak discriminator (see [`member_info_rank`]); carrying it lets
     /// anti-entropy detect a content difference at the SAME version (#411 B).
-    type Summary = HashMap<MemberId, (u32, Signature)>;
+    ///
+    /// BTreeMap (not HashMap) so the ciborium-serialized summary bytes are
+    /// deterministic: freenet-core byte-compares `summarize_state` output for
+    /// staleness, and a HashMap iterates in a per-process-random order, making
+    /// two identical member_info sets summarize to different bytes → spurious
+    /// anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
+    /// and freenet/freenet-core#4857.
+    type Summary = BTreeMap<MemberId, (u32, Signature)>;
     type Delta = Vec<AuthorizedMemberInfo>;
     type Parameters = ChatRoomParametersV1;
 
@@ -185,7 +192,7 @@ impl ComposableState for MemberInfoV1 {
         // `deputies_of` enforces on, or a peer with a different duplicate set
         // would advertise a different summary and anti-entropy would never
         // reconcile. Migration-safe: `verify` still accepts duplicates.
-        let mut summary: Self::Summary = HashMap::new();
+        let mut summary: Self::Summary = BTreeMap::new();
         for info in &self.member_info {
             let candidate = (info.member_info.version, info.signature);
             summary
@@ -670,7 +677,7 @@ mod tests {
 
         // Summary says the peer already holds member1 at (version 1, sig1), so
         // member1 does not outrank it and only member2 appears in the delta.
-        let mut old_summary = HashMap::new();
+        let mut old_summary = BTreeMap::new();
         old_summary.insert(member_id1, (1, sig1));
 
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
@@ -872,12 +879,12 @@ mod tests {
 
         // Test when all members are new
         member_info_v1.member_info = member_infos.clone();
-        let delta = member_info_v1.delta(&parent_state, &parameters, &HashMap::new());
+        let delta = member_info_v1.delta(&parent_state, &parameters, &BTreeMap::new());
         assert_eq!(delta.unwrap().len(), 5);
 
         // Test when all members are old with the same (version, signature) —
         // nothing outranks the summary, so the delta is empty (#411 round 4 B).
-        let old_summary: HashMap<MemberId, (u32, Signature)> = member_infos
+        let old_summary: BTreeMap<MemberId, (u32, Signature)> = member_infos
             .iter()
             .map(|info| {
                 (
@@ -890,7 +897,7 @@ mod tests {
         assert!(delta.is_none());
 
         // Test with a mix of new and old members
-        let mut old_summary = HashMap::new();
+        let mut old_summary = BTreeMap::new();
         old_summary.insert(
             member_infos[0].member_info.member_id,
             (1, member_infos[0].signature),

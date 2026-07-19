@@ -190,3 +190,10 @@ description = "Before adding MemberInfo.deputies field (deputy ban authority, #4
 date = "2026-07-16"
 delegate_key = "b61dc292c952f5ec48f870a0f9829090968a7d03669671f619487f0b5aca8633"
 code_hash = "d91e33fcf47b4863b996fbf6bb8d782b2250a0e5037fb8dc7a030b60ac1c4de1"
+
+[[entry]]
+version = "V27"
+description = "Before deterministic Summary (BTreeMap/BTreeSet for anti-entropy staleness, #4857): last deputy-generation chat-delegate"
+date = "2026-07-18"
+delegate_key = "c01c1602ceef95278c4dbb0a980cbb63cf2e9ec36ed985f4bc657225f1558ab5"
+code_hash = "ee08e689207af26de43e02ebc1ad9ebbc1e14fa305a600c79825c0bd27d1f774"
