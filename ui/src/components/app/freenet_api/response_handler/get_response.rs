@@ -757,7 +757,10 @@ pub async fn handle_get_response(
                     wasm_bindgen_futures::spawn_local(async move {
                         let room_key = owner_vk.to_bytes();
                         let result =
-                            crate::signing::migrate_signing_key(room_key, &signing_key_clone).await;
+                            // AUTHORITATIVE: accepting an invitation chooses this
+                            // room's identity now (freenet/river#414 P1).
+                            crate::signing::migrate_signing_key(room_key, &signing_key_clone, true)
+                                .await;
                         if result != crate::signing::MigrationResult::Failed {
                             // Must defer signal mutations from spawn_local to
                             // avoid RefCell already borrowed panics in Dioxus runtime
@@ -1112,7 +1115,13 @@ pub async fn handle_get_response(
                         wasm_bindgen_futures::spawn_local(async move {
                             let room_key = owner_vk.to_bytes();
                             let result =
-                                crate::signing::migrate_signing_key(room_key, &self_sk).await;
+                                // HYDRATION: re-migrating the already-stored
+                                // `self_sk` read from ROOMS after the imported
+                                // room's GET-first sync — NOT a new identity
+                                // choice, so it must not override the registry and
+                                // is discarded if superseded (freenet/river#414 P1).
+                                crate::signing::migrate_signing_key(room_key, &self_sk, false)
+                                    .await;
                             if result != crate::signing::MigrationResult::Failed {
                                 crate::util::defer(move || {
                                     ROOMS.with_mut(|rooms| {

@@ -562,21 +562,42 @@ impl Storage {
             }
             let identity_changed = old_key.is_some_and(|k| k != signing_key.to_bytes());
 
-            // Same-key re-import over an existing room (`was_overwrite &&
-            // !identity_changed`): PRESERVE the stored invitation secrets by
-            // merging them into the incoming map, existing wins on collision. The
-            // incoming token's map may be empty/incomplete (a legacy/stale export
-            // taken before the owner's `encrypted_secrets` backfill arrived), and
-            // for a private room still awaiting that backfill the stored map can be
-            // the ONLY copy of the room key — overwriting it with the token's empty
-            // map would make history permanently unreadable (Codex round-7). A
-            // genuine identity change instead REPLACES: the old identity's secrets
-            // must not carry forward to the new one.
+            // Assemble the incoming identity metadata.
             let mut invitation_secrets = invitation_secrets;
+            let mut self_nickname = self_nickname.map(str::to_string);
+            let mut invite_chain = invite_chain.to_vec();
+            let mut self_authorized_member = Some(authorized_member.clone());
+
+            // Same-key re-import over an existing room (`was_overwrite &&
+            // !identity_changed`): the incoming token may be a legacy/stale export
+            // that decodes optional fields as ABSENT/EMPTY. GENERAL RULE (Codex
+            // round-7/8): for EVERY field the token may carry absent/stale, RETAIN
+            // the stored value rather than overwrite it with an empty one — a
+            // genuine identity change instead REPLACES (old identity's metadata
+            // must not carry forward).
             if was_overwrite && !identity_changed {
                 if let Some(old) = storage.rooms.get(&owner_key_str) {
+                    // invitation_secrets: merge, existing wins — the stored map may
+                    // be the ONLY copy of a private room's key, so an empty token
+                    // must not wipe it (history would become unreadable, round-7).
                     for (version, secret) in &old.invitation_secrets {
                         invitation_secrets.entry(*version).or_insert(*secret);
+                    }
+                    // self_nickname: an absent token nickname must NOT erase the
+                    // stored chosen nickname (else `build_rejoin_delta` falls back
+                    // to "Member" after an inactivity prune).
+                    if self_nickname.is_none() {
+                        self_nickname = old.self_nickname.clone();
+                    }
+                    // membership proof (self_authorized_member + invite_chain) is a
+                    // coherent UNIT (the chain validates the member): keep the
+                    // stored pair when the token carries an empty chain, so we never
+                    // pair the token's member with an empty/mismatched chain.
+                    if invite_chain.is_empty() && !old.invite_chain.is_empty() {
+                        invite_chain = old.invite_chain.clone();
+                        if old.self_authorized_member.is_some() {
+                            self_authorized_member = old.self_authorized_member.clone();
+                        }
                     }
                 }
             }
@@ -590,11 +611,11 @@ impl Storage {
                     signing_key_bytes: signing_key.to_bytes(),
                     state,
                     contract_key: contract_key.id().to_string(),
-                    self_authorized_member: Some(authorized_member.clone()),
-                    invite_chain: invite_chain.to_vec(),
+                    self_authorized_member,
+                    invite_chain,
                     previous_contract_key: None,
                     invitation_secrets,
-                    self_nickname: self_nickname.map(str::to_string),
+                    self_nickname,
                 },
             );
             self.save_rooms_unlocked(&storage)?;
@@ -2196,6 +2217,79 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "different-key --force re-import must REPLACE (drop the old identity's secrets)"
+        );
+    }
+
+    /// freenet/river#414 (Codex round-8, systematic same-key audit): a same-key
+    /// `--force` re-import from a stale token (absent nickname, empty invite
+    /// chain) must RETAIN the stored nickname + membership proof, not erase them
+    /// (else `build_rejoin_delta` falls back to "Member").
+    #[test]
+    fn import_room_atomic_same_key_preserves_nickname_and_chain() {
+        use river_core::room_state::member::Member;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let key = expected_contract_key(&owner_vk);
+        let identity = create_test_signing_key();
+        let member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: identity.verifying_key(),
+            },
+            &owner_sk,
+        );
+
+        // Store the room WITH a chosen nickname and a non-empty invite chain.
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member,
+                std::slice::from_ref(&member),
+                Some("Chosen Name"),
+                false,
+            )
+            .unwrap();
+
+        // --force re-import of the SAME key from a stale token: no nickname, empty chain.
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member,
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+
+        let rooms = storage.load_rooms().unwrap();
+        let info = rooms
+            .rooms
+            .get(&bs58::encode(owner_vk.as_bytes()).into_string())
+            .unwrap();
+        assert_eq!(
+            info.self_nickname.as_deref(),
+            Some("Chosen Name"),
+            "an absent token nickname must NOT erase the stored chosen nickname"
+        );
+        assert_eq!(
+            info.invite_chain.len(),
+            1,
+            "an empty token invite_chain must NOT erase the stored chain"
+        );
+        assert!(
+            info.self_authorized_member.is_some(),
+            "the stored membership proof must survive a stale same-key re-import"
         );
     }
 

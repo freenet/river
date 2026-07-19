@@ -2245,6 +2245,32 @@ mod tests {
         reset_dm_prune_tombstones();
     }
 
+    /// freenet/river#414 (Codex round-8 P1): when a late DM-load response is
+    /// filtered by the prune tombstone, the sanitized store must be PERSISTED
+    /// back to the delegate — otherwise the in-memory filter is undone on the
+    /// next reload (the tombstone is session-only). Source-grep pin that both
+    /// hydration paths persist on suppression (the delegate save needs a runtime,
+    /// so the behaviour itself isn't unit-testable here).
+    #[test]
+    fn late_dm_hydration_persists_sanitized_store() {
+        // The needle is assembled at runtime so this test's own source does NOT
+        // contain the contiguous call string (else it would self-match). Count
+        // the CALL form (name + `();`); the fn def uses `() {`, so it isn't
+        // counted. Two calls = one in hydrate_outbound_dms_cache, one in
+        // hydrate_hidden_dm_threads.
+        let src = include_str!("chat_delegate.rs");
+        let needle = format!(
+            "{}{}",
+            "persist_sanitized_dm_store_after_tombstone_filter", "();"
+        );
+        assert_eq!(
+            src.matches(&needle).count(),
+            2,
+            "both hydrate_outbound_dms_cache and hydrate_hidden_dm_threads must \
+             persist the sanitized store when a tombstone filters a late entry"
+        );
+    }
+
     // ===== Outbound DM revives hidden thread (Codex P1 fix) =====
     // The testing-reviewer's BLOCKING #3 on PR #265. The "explicit
     // unhide on outbound" path lives in `dm_thread_modal::do_send` /
@@ -3680,6 +3706,7 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
     use crate::components::direct_messages::OUTBOUND_DMS;
     let count = entries.len();
     crate::util::defer(move || {
+        let mut suppressed_any = false;
         OUTBOUND_DMS.with_mut(|cache| {
             for entry in entries {
                 let room_vk = match ed25519_dalek::VerifyingKey::from_bytes(&entry.room_owner_vk) {
@@ -3694,6 +3721,7 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
                 // identity. The NEW identity's later DMs have a strictly-newer
                 // timestamp and are kept.
                 if dm_prune_suppresses(dm_prune_tombstone_for(&room_vk), entry.timestamp) {
+                    suppressed_any = true;
                     continue;
                 }
                 let key = (room_vk, entry.recipient, entry.purge_token);
@@ -3707,8 +3735,33 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
                 }
             }
         });
+        // The delegate's persisted store still contains the entries we just
+        // dropped in memory (the response came FROM it). Persist the sanitized
+        // snapshot so the replaced identity's plaintext is actually removed from
+        // storage, not just this session's memory — otherwise the next reload
+        // re-hydrates it (the tombstone is session-only). freenet/river#414 P1
+        // (Codex round-8). Reuses the coalesced save path.
+        if suppressed_any {
+            persist_sanitized_dm_store_after_tombstone_filter();
+        }
     });
     count
+}
+
+/// Persist the sanitized outbound-DM store after a tombstone filter dropped a
+/// late-hydration entry, so the replaced identity's plaintext / archive state is
+/// removed from the delegate store (not just in-memory). Reuses the coalesced
+/// `save_outbound_dms_to_delegate` path; failures warn (best-effort, the
+/// in-memory state is already sanitized). freenet/river#414 P1 (Codex round-8).
+fn persist_sanitized_dm_store_after_tombstone_filter() {
+    crate::util::safe_spawn_local(async {
+        if let Err(e) = save_outbound_dms_to_delegate().await {
+            warn!(
+                "Failed to persist sanitized DM store after tombstone filter: {}",
+                e
+            );
+        }
+    });
 }
 
 /// Session-scoped tombstone set for `(room, peer)` pairs the local
@@ -3854,6 +3907,7 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
         // their room (freenet/river#414 P2-3): they belong to the replaced
         // identity. The NEW identity's later archives have a strictly-newer
         // `hidden_at_ts` and are kept.
+        let before_filter = entries.len();
         let entries: Vec<HiddenDmThreadEntry> = entries
             .into_iter()
             .filter(|entry| {
@@ -3865,6 +3919,7 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
                 }
             })
             .collect();
+        let suppressed_any = entries.len() < before_filter;
         // Snapshot the tombstone set under its own lock so we don't
         // hold it across the signal write (the with_mut closure may
         // run subscriber notifications synchronously on Drop).
@@ -3886,6 +3941,12 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
                 hidden.insert(key, entry);
             }
         });
+        // Persist the sanitized store when a tombstone dropped a late archive
+        // entry, so the replaced identity's archive state is removed from the
+        // delegate (not just memory). freenet/river#414 P1 (Codex round-8).
+        if suppressed_any {
+            persist_sanitized_dm_store_after_tombstone_filter();
+        }
     });
     count
 }

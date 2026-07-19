@@ -1038,6 +1038,26 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
     }
 }
 
+/// Merge two optional `AuthorizedMemberInfo` records, keeping the HIGHER-version
+/// one (a same-key re-import must not let a stale token clobber a newer local
+/// member_info; an absent incoming keeps local). Ties keep `local`.
+fn merge_keep_newer_member_info(
+    local: Option<river_core::room_state::member_info::AuthorizedMemberInfo>,
+    incoming: Option<river_core::room_state::member_info::AuthorizedMemberInfo>,
+) -> Option<river_core::room_state::member_info::AuthorizedMemberInfo> {
+    match (local, incoming) {
+        (Some(l), Some(i)) => {
+            if i.member_info.version > l.member_info.version {
+                Some(i)
+            } else {
+                Some(l)
+            }
+        }
+        (Some(l), None) => Some(l),
+        (None, i) => i,
+    }
+}
+
 /// Swap a room's identity IN PLACE for an imported one, **keeping the existing
 /// `room_state`** (freenet/river#414 redesign).
 ///
@@ -1072,35 +1092,57 @@ fn swap_room_identity_in_place(
 ) -> bool {
     let key_changed = existing.self_sk != export.signing_key;
     existing.self_sk = export.signing_key;
-    existing.self_authorized_member = Some(export.authorized_member);
-    existing.invite_chain = export.invite_chain;
-    existing.self_member_info = export.member_info;
-    existing.self_nickname = export.self_nickname;
 
     if key_changed {
-        // DIFFERENT identity (a genuine swap): do NOT carry the OLD identity's
-        // decrypt access forward. Clear the in-memory decrypted secrets and the
-        // derived version pointers (`#[serde(skip)]` runtime caches, rebuilt
-        // below), and REPLACE the invitation-carried secrets with the new
-        // identity's — so an A-only version B has no contract blob for cannot
-        // remain readable by B (Codex round-6 P1-2).
+        // DIFFERENT identity (a genuine swap): REPLACE all identity metadata with
+        // the imported one's, and do NOT carry the OLD identity's decrypt access
+        // forward. Clear the in-memory decrypted secrets and the derived version
+        // pointers (`#[serde(skip)]` runtime caches, rebuilt below), and REPLACE
+        // the invitation-carried secrets — so an A-only version B has no contract
+        // blob for cannot remain readable by B (Codex round-6 P1-2).
+        existing.self_authorized_member = Some(export.authorized_member);
+        existing.invite_chain = export.invite_chain;
+        existing.self_member_info = export.member_info;
+        existing.self_nickname = export.self_nickname;
         existing.secrets.clear();
         existing.current_secret_version = None;
         existing.last_secret_rotation = None;
         existing.invitation_secrets = export.invitation_secrets;
     } else {
         // SAME identity re-import (the user re-importing their OWN token, e.g. a
-        // legacy/stale one). Clearing/replacing here is DATA LOSS: the token's
-        // `invitation_secrets` may be empty or incomplete (exported before the
-        // owner's `encrypted_secrets` backfill arrived), and for a private room
-        // still awaiting that backfill the existing `invitation_secrets` map can
-        // be the ONLY copy of the room key — wiping it would make history
-        // permanently unreadable. So PRESERVE the existing decrypted caches and
-        // MERGE the token's secrets in, keeping the existing value on collision
-        // (Codex round-7).
+        // legacy/stale one). A backward-compat decode of an old token yields
+        // ABSENT/EMPTY optional fields; blindly assigning them would ERASE richer
+        // local state. GENERAL RULE (Codex round-7/8): for EVERY field the token
+        // may carry absent/stale, RETAIN the existing local value when the
+        // incoming one is `None`/empty, and never replace a NEWER cached record
+        // with a STALER one. Applied to every identity-metadata field:
+        //
+        // - membership proof (`self_authorized_member` + `invite_chain`) is a
+        //   coherent UNIT (the chain validates the member), so keep them TOGETHER:
+        //   adopt the token's pair only when the local membership proof is absent;
+        if existing.self_authorized_member.is_none() {
+            existing.self_authorized_member = Some(export.authorized_member);
+            existing.invite_chain = export.invite_chain;
+        }
+        // - `self_member_info`: keep the higher-version record (a stale token must
+        //   not clobber a newer local member_info; absent token keeps local);
+        existing.self_member_info =
+            merge_keep_newer_member_info(existing.self_member_info.take(), export.member_info);
+        // - `self_nickname`: a present token value is a deliberate choice; an
+        //   absent one must NOT erase the locally-chosen nickname (else a later
+        //   inactivity prune + rejoin would publish a generated default);
+        if export.self_nickname.is_some() {
+            existing.self_nickname = export.self_nickname;
+        }
+        // - `invitation_secrets`: MERGE (existing wins) — the token may be empty
+        //   and the local map can be the ONLY copy of a private room's key, so
+        //   wiping it would make history permanently unreadable (Codex round-7).
         for (version, secret) in export.invitation_secrets {
             existing.invitation_secrets.entry(version).or_insert(secret);
         }
+        // - decrypted caches (`secrets`/`current_secret_version`/
+        //   `last_secret_rotation`) are PRESERVED (not cleared) — same identity,
+        //   same decrypt access.
     }
 
     // The (re)imported key has not been stored in the delegate yet.
@@ -1256,7 +1298,10 @@ fn complete_identity_import(
 
         // Migrate signing key to delegate in background
         crate::util::safe_spawn_local(async move {
-            let result = crate::signing::migrate_signing_key(room_key_bytes, &new_sk).await;
+            // AUTHORITATIVE: the user just imported/chose this identity, so it
+            // becomes the room's current identity and supersedes any stale
+            // hydration migration for an old key (freenet/river#414 P1).
+            let result = crate::signing::migrate_signing_key(room_key_bytes, &new_sk, true).await;
             match result {
                 crate::signing::MigrationResult::Stored
                 | crate::signing::MigrationResult::StaleKeyOverwritten
@@ -1791,6 +1836,117 @@ mod tests {
             existing.secrets.get(&7u32),
             Some(&[0x44u8; 32]),
             "same-key re-import must NOT clear the decrypted secret cache"
+        );
+    }
+
+    fn member_info_v(
+        sk: &SigningKey,
+        version: u32,
+    ) -> river_core::room_state::member_info::AuthorizedMemberInfo {
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+        let mi = MemberInfo {
+            member_id: MemberId::from(&sk.verifying_key()),
+            version,
+            preferred_nickname: river_core::room_state::privacy::SealedBytes::public(
+                b"nick".to_vec(),
+            ),
+            deputies: vec![],
+        };
+        AuthorizedMemberInfo::new_with_member_key(mi, sk)
+    }
+
+    /// freenet/river#414 (Codex round-8): `merge_keep_newer_member_info` keeps
+    /// the higher-version record and never clobbers a newer local one with a
+    /// staler/absent incoming one.
+    #[test]
+    fn merge_keep_newer_member_info_keeps_higher_version() {
+        let sk = SigningKey::from_bytes(&[91u8; 32]);
+        let v1 = member_info_v(&sk, 1);
+        let v3 = member_info_v(&sk, 3);
+
+        // Newer incoming wins.
+        assert_eq!(
+            merge_keep_newer_member_info(Some(v1.clone()), Some(v3.clone()))
+                .unwrap()
+                .member_info
+                .version,
+            3
+        );
+        // Staler incoming does NOT clobber the newer local.
+        assert_eq!(
+            merge_keep_newer_member_info(Some(v3.clone()), Some(v1.clone()))
+                .unwrap()
+                .member_info
+                .version,
+            3
+        );
+        // Absent incoming keeps local; absent local adopts incoming.
+        assert_eq!(
+            merge_keep_newer_member_info(Some(v3.clone()), None)
+                .unwrap()
+                .member_info
+                .version,
+            3
+        );
+        assert_eq!(
+            merge_keep_newer_member_info(None, Some(v1.clone()))
+                .unwrap()
+                .member_info
+                .version,
+            1
+        );
+        assert!(merge_keep_newer_member_info(None, None).is_none());
+    }
+
+    /// freenet/river#414 (Codex round-8, systematic same-key audit): a same-key
+    /// re-import from a stale token (absent nickname / member_info / invite
+    /// chain) must PRESERVE the locally-cached nickname, member_info, and
+    /// membership proof — not erase them (which would later publish a generated
+    /// default nickname on rejoin, and drop deputy/membership state).
+    #[test]
+    fn same_key_reimport_preserves_nickname_and_membership() {
+        let owner_sk = SigningKey::from_bytes(&[95u8; 32]);
+        let self_sk = SigningKey::from_bytes(&[96u8; 32]);
+
+        let mut existing = build_imported_room_data(export_for(&owner_sk, &self_sk));
+        existing.self_nickname = Some("Chosen Name".to_string());
+        existing.self_member_info = Some(member_info_v(&self_sk, 5));
+        existing.self_authorized_member =
+            Some(authorized_member(&owner_sk, &self_sk.verifying_key()));
+        existing.invite_chain = vec![authorized_member(&owner_sk, &self_sk.verifying_key())];
+
+        // Stale token for the SAME key: absent nickname/member_info, empty chain.
+        let mut export = export_for(&owner_sk, &self_sk);
+        export.self_nickname = None;
+        export.member_info = None;
+        assert!(export.invite_chain.is_empty());
+
+        let key_changed = swap_room_identity_in_place(&mut existing, export);
+
+        assert!(!key_changed);
+        assert_eq!(
+            existing.self_nickname.as_deref(),
+            Some("Chosen Name"),
+            "an absent token nickname must NOT erase the chosen nickname"
+        );
+        assert_eq!(
+            existing
+                .self_member_info
+                .as_ref()
+                .unwrap()
+                .member_info
+                .version,
+            5,
+            "an absent token member_info must NOT erase the local one"
+        );
+        assert!(
+            existing.self_authorized_member.is_some(),
+            "the membership proof must survive a stale re-import"
+        );
+        assert_eq!(
+            existing.invite_chain.len(),
+            1,
+            "an empty token invite_chain must NOT erase the local chain"
         );
     }
 
