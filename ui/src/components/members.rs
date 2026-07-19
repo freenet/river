@@ -1052,9 +1052,17 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
 ///
 /// Ordering matters: `self_sk` is set BEFORE `repopulate_secrets_from_state`,
 /// which decrypts the owner-signed `encrypted_secrets` blobs addressed to *this
-/// member* — a local recompute against the kept state, no network fetch. Folds
-/// in the invitation-carried room secrets (identity-independent, symmetric per
-/// version) and marks the delegate key un-migrated so the new key is (re)stored.
+/// member* — a local recompute against the kept state, no network fetch.
+///
+/// An overwrite may hand the room to a DIFFERENT identity, so we must NOT carry
+/// the OLD identity's decrypt access forward (Codex round-6 P1-2): the old
+/// identity's in-memory decrypted `secrets` (plus `current_secret_version` /
+/// `last_secret_rotation`) are cleared, and the invitation-carried secrets are
+/// REPLACED with the new identity's (not unioned — an A-only version B has no
+/// contract blob for must not remain readable). `repopulate_secrets_from_state`
+/// then rebuilds only what the NEW identity can actually decrypt from the kept
+/// state, and `rebuild_private_actions_state` re-derives the edit/reaction
+/// action cache under the new identity's (possibly narrower) secret access.
 ///
 /// Returns whether the signing key actually changed (drives the DM-cache
 /// prune). Pure (no signals) so the overwrite is unit-testable.
@@ -1068,37 +1076,50 @@ fn swap_room_identity_in_place(
     existing.invite_chain = export.invite_chain;
     existing.self_member_info = export.member_info;
     existing.self_nickname = export.self_nickname;
-    // Room secrets are per-room (symmetric per version), not per-identity, so a
-    // union is safe; keep any version already present (the owner-signed contract
-    // blob is authoritative and supersedes on the next repopulate).
-    for (version, secret) in export.invitation_secrets {
-        existing.invitation_secrets.entry(version).or_insert(secret);
-    }
+    // Drop the OLD identity's decrypt access: its in-memory decrypted secrets
+    // and the derived version pointers. These are `#[serde(skip)]` runtime
+    // caches; the new identity's are rebuilt from the kept state below.
+    existing.secrets.clear();
+    existing.current_secret_version = None;
+    existing.last_secret_rotation = None;
+    // REPLACE (do not union) the invitation-carried room secrets with the new
+    // identity's, so the old identity's invitation secrets can't grant the new
+    // identity read access to a version it holds no contract blob for.
+    existing.invitation_secrets = export.invitation_secrets;
     // The new key has not been stored in the delegate yet.
     existing.key_migrated_to_delegate = false;
     // Recompute in-memory decrypted secrets for the NEW identity's access
-    // (private rooms) from the KEPT room_state — local, no network fetch.
+    // (private rooms) from the KEPT room_state — local, no network fetch — then
+    // re-derive the action cache (edits/deletes/reactions) under those secrets.
     existing.repopulate_secrets_from_state();
+    existing.rebuild_private_actions_state();
     key_changed
 }
 
-/// Whether the room set is HYDRATED enough to reliably decide new-vs-overwrite.
+/// Whether the room set is COMPLETELY loaded — safe to decide new-vs-overwrite.
 ///
 /// Under the in-place redesign this decision is safety-critical: deciding
-/// "no room" on an unhydrated view would route a real, populated room to the
-/// build-empty NEW path and overwrite it with empty state (data loss). The
-/// room set is authoritative only once the startup delegate load has RESOLVED
-/// (`Loaded`). `Loading`/`Migrating` mean "we don't know the set yet", and
-/// `LoadFailed` means a known room failed to load (so a room could be missing
-/// from the in-memory map) — none of these are safe to decide on
-/// (freenet/river#414 redesign).
+/// "no room" on an incomplete view would route a real, populated room to the
+/// build-empty NEW path and overwrite its populated persisted slot (data loss).
+///
+/// Requires BOTH (Codex round-6 P1-1):
+/// - the startup delegate load RESOLVED (`Loaded`) — `Loading`/`Migrating` mean
+///   "we don't know the set yet"; `LoadFailed` means a known room failed; and
+/// - NO listed room's fetch failed (`!saw_fetch_failure`). `per_room_terminal`
+///   resolves to `Loaded` the instant ≥1 room materialized even if OTHER listed
+///   rooms failed to hydrate, so `Loaded` alone is not "complete". A room absent
+///   from `ROOMS` because its fetch failed would be misclassified as new.
+///
+/// If a fetch failed, the caller refuses the import ("some rooms didn't finish
+/// loading — retry") rather than risk classifying a real room as new.
 fn rooms_load_is_authoritative(
     state: crate::components::app::chat_delegate::RoomsLoadState,
+    saw_fetch_failure: bool,
 ) -> bool {
     matches!(
         state,
         crate::components::app::chat_delegate::RoomsLoadState::Loaded
-    )
+    ) && !saw_fetch_failure
 }
 
 /// Complete an identity import (freenet/river#414 redesign).
@@ -1146,6 +1167,13 @@ fn complete_identity_import(
         // Drives the DM-state prune below: true only when an overwrite actually
         // swaps to a different signing key.
         let mut identity_changed = false;
+        // For an OVERWRITE only: the new identity's member_info heal, built inside
+        // the borrow and sent AFTER it releases (the same ordering the UPDATE-path
+        // heal uses). An in-place overwrite does NO GET, so without this the new
+        // identity would render "Unknown" to peers until an unrelated future heal
+        // (freenet/river#414, Codex round-6 P2-4). A NEW room GET-first-syncs, so
+        // its GET-path heal covers it.
+        let mut pending_member_info_heal = None;
         ROOMS.with_mut(|rooms| {
             // Importing is an explicit rejoin: clear any leave tombstone and
             // record the rejoin so a remote `Tombstone` slot is overwritten with
@@ -1158,6 +1186,12 @@ fn complete_identity_import(
                 // OVERWRITE: swap the identity in place, KEEP room_state.
                 Some(existing) => {
                     identity_changed = swap_room_identity_in_place(existing, export);
+                    // Build the heal against the KEPT state (secrets were just
+                    // repopulated for the new identity by the swap). Returns None
+                    // when self isn't stranded, isn't a member, or — for a private
+                    // room — the secret isn't available yet (deferred, no leak).
+                    pending_member_info_heal =
+                        existing.build_member_info_heal(&existing.room_state);
                 }
                 // NEW room: empty placeholder; the GET-first sync fills it.
                 None => {
@@ -1167,6 +1201,16 @@ fn complete_identity_import(
                 }
             }
         });
+
+        // Send the new identity's member_info heal AFTER the ROOMS borrow is
+        // released (freenet/river#414 P2-4). `send_member_info_heal_update`
+        // builds the member_info-only UPDATE delta and spawns the send itself; it
+        // is self-signed and idempotent, so a race with any other heal is safe.
+        if let Some(heal_info) = pending_member_info_heal {
+            crate::components::app::freenet_api::room_synchronizer::send_member_info_heal_update(
+                owner_key, heal_info,
+            );
+        }
 
         // Overwriting a DIFFERENT identity: prune the OLD identity's cached
         // outbound-DM plaintext + archive state so it doesn't leak into (or
@@ -1259,14 +1303,21 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
         return rsx! {};
     }
 
-    // Reactive hydration gate (freenet/river#414 redesign): the room set must be
-    // authoritative before the Import button is enabled, so the new-vs-overwrite
-    // decision is never made on an unhydrated view (which would build-empty over
-    // a real room). Reading `ROOMS_LOAD_STATE` here subscribes the modal, so it
-    // re-renders — and the button enables — the moment the load resolves.
+    // Reactive hydration gate (freenet/river#414 redesign, Codex round-6 P1-1):
+    // the room set must be COMPLETELY loaded before the Import button is enabled,
+    // so the new-vs-overwrite decision is never made on an incomplete view (which
+    // would build-empty over a real room). Reading `ROOMS_LOAD_STATE` here
+    // subscribes the modal, so it re-renders — and the button enables — the
+    // moment the load resolves; `saw_fetch_failure()` is read alongside so a
+    // partial load (some listed rooms failed) keeps the button disabled.
     let rooms_hydrated = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
         .try_read()
-        .map(|g| rooms_load_is_authoritative(*g))
+        .map(|g| {
+            rooms_load_is_authoritative(
+                *g,
+                crate::components::app::chat_delegate::saw_fetch_failure(),
+            )
+        })
         .unwrap_or(false);
 
     // Reset-and-close, matching the deferred pattern in `join_with_code_modal`
@@ -1289,21 +1340,26 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
             Ok(export) => {
                 let owner_key = export.room_owner;
 
-                // Safety-critical (freenet/river#414 redesign): NEVER decide
-                // new-vs-overwrite on an unhydrated room set — a false "no room"
-                // would route a real, populated room to the build-empty NEW path
-                // and overwrite it with empty state. The Import button is disabled
-                // until hydrated (see `rooms_hydrated` in the render); this is the
+                // Safety-critical (freenet/river#414 redesign, Codex round-6
+                // P1-1): NEVER decide new-vs-overwrite on an incompletely-loaded
+                // room set — a false "no room" would route a real, populated room
+                // to the build-empty NEW path and overwrite its populated
+                // persisted slot. This requires a COMPLETE load (resolved AND no
+                // listed room's fetch failed); a partial load could be missing the
+                // very room being imported. The Import button is disabled until
+                // then (see `rooms_hydrated` in the render); this is the
                 // defense-in-depth net against a click landing before the render
                 // has re-disabled the button.
                 let load_state = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
                     .try_read()
                     .map(|g| *g)
                     .unwrap_or(crate::components::app::chat_delegate::RoomsLoadState::Loading);
-                if !rooms_load_is_authoritative(load_state) {
+                let saw_failure = crate::components::app::chat_delegate::saw_fetch_failure();
+                if !rooms_load_is_authoritative(load_state, saw_failure) {
                     crate::util::defer(move || {
                         error_msg.set(Some(
-                            "Still loading your rooms — please wait a moment and try again."
+                            "Some rooms didn't finish loading — retry loading your rooms \
+                             before importing an identity."
                                 .to_string(),
                         ));
                         success_msg.set(None);
@@ -1633,16 +1689,76 @@ mod tests {
         );
     }
 
-    /// freenet/river#414 REDESIGN (safety-critical): the new-vs-overwrite
-    /// decision is authoritative ONLY once the room set has resolved (`Loaded`).
-    /// Deciding on an unhydrated view could build-empty over a real room.
+    /// freenet/river#414 REDESIGN (Codex round-6 P1-2): an overwrite must NOT
+    /// carry the OLD identity's decrypt access forward. The old identity's
+    /// in-memory decrypted `secrets` are cleared, and invitation-carried secrets
+    /// are REPLACED (not unioned) with the new identity's — so a version only the
+    /// old identity could read does not remain readable by the new one.
     #[test]
-    fn rooms_load_authoritative_only_when_loaded() {
+    fn overwrite_drops_old_identity_decrypt_access() {
+        let owner_sk = SigningKey::from_bytes(&[71u8; 32]);
+        let old_sk = SigningKey::from_bytes(&[72u8; 32]);
+        let new_sk = SigningKey::from_bytes(&[73u8; 32]);
+
+        // Existing PRIVATE room where the OLD identity had decrypted secret v9
+        // and an invitation secret v5 the NEW identity has no blob for.
+        let mut existing = build_imported_room_data(export_for(&owner_sk, &old_sk));
+        existing.room_state.configuration.configuration.privacy_mode =
+            river_core::room_state::privacy::PrivacyMode::Private;
+        existing.secrets.insert(9u32, [0x11u8; 32]);
+        existing.current_secret_version = Some(9);
+        existing.last_secret_rotation = Some(std::time::SystemTime::now());
+        existing.invitation_secrets.insert(5u32, [0x22u8; 32]);
+
+        // The imported (new) identity carries only invitation secret v0.
+        let mut export = export_for(&owner_sk, &new_sk);
+        export.invitation_secrets.insert(0u32, [0x33u8; 32]);
+
+        swap_room_identity_in_place(&mut existing, export);
+
+        // The old identity's decrypted secret v9 is gone (cleared before repopulate).
+        assert!(
+            !existing.secrets.contains_key(&9u32),
+            "old identity's decrypted secret must be cleared, not carried forward"
+        );
+        // invitation_secrets REPLACED: the old identity's v5 must be gone…
+        assert!(
+            !existing.invitation_secrets.contains_key(&5u32),
+            "old identity's invitation secret must NOT be unioned into the new identity"
+        );
+        // …and only the NEW identity's v0 remains (folded into secrets by repopulate).
+        assert_eq!(existing.secrets.get(&0u32), Some(&[0x33u8; 32]));
+    }
+
+    /// freenet/river#414 REDESIGN (safety-critical, Codex round-6 P1-1): the
+    /// new-vs-overwrite decision is authoritative ONLY on a COMPLETE load —
+    /// `Loaded` AND no listed room's fetch failed. `Loaded` alone is
+    /// insufficient because `per_room_terminal` resolves to `Loaded` the instant
+    /// ≥1 room materialized, even if other listed rooms failed to hydrate (so a
+    /// room could be missing from the map and get misclassified as new).
+    #[test]
+    fn rooms_load_authoritative_requires_complete_load() {
         use crate::components::app::chat_delegate::RoomsLoadState;
-        assert!(rooms_load_is_authoritative(RoomsLoadState::Loaded));
-        assert!(!rooms_load_is_authoritative(RoomsLoadState::Loading));
-        assert!(!rooms_load_is_authoritative(RoomsLoadState::Migrating));
-        assert!(!rooms_load_is_authoritative(RoomsLoadState::LoadFailed));
+        // Complete load: Loaded AND no fetch failure → authoritative.
+        assert!(rooms_load_is_authoritative(RoomsLoadState::Loaded, false));
+        // Loaded but a listed room's fetch failed → NOT authoritative (data-loss
+        // guard: the missing room could be the one being imported).
+        assert!(!rooms_load_is_authoritative(RoomsLoadState::Loaded, true));
+        // Unresolved / failed / migrating are never authoritative, fetch flag
+        // notwithstanding.
+        assert!(!rooms_load_is_authoritative(RoomsLoadState::Loading, false));
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::Migrating,
+            false
+        ));
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::LoadFailed,
+            false
+        ));
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::LoadFailed,
+            true
+        ));
     }
 
     /// freenet/river#414 (Codex round 2): confirming an overwrite imports the
@@ -2272,12 +2388,34 @@ mod tests {
     fn handle_import_gates_on_hydration() {
         let prod = production_source();
         assert!(
-            prod.contains("if !rooms_load_is_authoritative(load_state)"),
-            "handle_import must refuse to decide on an unhydrated room set (#414 redesign)"
+            prod.contains("if !rooms_load_is_authoritative(load_state, saw_failure)"),
+            "handle_import must refuse to decide on an incompletely-loaded room set \
+             (#414 redesign, Codex round-6 P1-1)"
         );
         assert!(
             prod.contains("disabled: !rooms_hydrated"),
-            "the Import button must be disabled until the room set is hydrated (#414 redesign)"
+            "the Import button must be disabled until the room set is fully loaded (#414 redesign)"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414, Codex round-6 P2-4): an in-place
+    /// overwrite does NO GET, so `complete_identity_import` must itself trigger
+    /// the new identity's member_info heal (via the shared
+    /// `send_member_info_heal_update`) — otherwise the new identity renders
+    /// "Unknown" to peers until an unrelated future heal. The heal must be built
+    /// inside the ROOMS borrow (against the kept, secret-repopulated state).
+    #[test]
+    fn complete_identity_import_triggers_member_info_heal_on_overwrite() {
+        let prod = production_source();
+        assert!(
+            prod.contains("existing.build_member_info_heal(&existing.room_state)"),
+            "the overwrite must build the new identity's member_info heal against \
+             the kept state (freenet/river#414 P2-4)"
+        );
+        assert!(
+            prod.contains("send_member_info_heal_update("),
+            "complete_identity_import must send the member_info heal UPDATE after an \
+             in-place overwrite, since it does no GET (freenet/river#414 P2-4)"
         );
     }
 

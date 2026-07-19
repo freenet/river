@@ -66,7 +66,15 @@ fn compute_update_data(
 /// idempotent: re-sending it is harmless if it raced another heal, and once
 /// the entry lands the next `build_member_info_heal` returns `None`, so the
 /// UPDATE stops firing.
-fn send_member_info_heal_update(owner_vk: VerifyingKey, heal_info: AuthorizedMemberInfo) {
+///
+/// `pub(crate)` so the identity-overwrite path (`members.rs::complete_identity_import`)
+/// can trigger the heal too: an in-place identity swap does NO GET, so without
+/// this the new identity would render "Unknown" until an unrelated future heal
+/// (freenet/river#414, Codex round-6 P2-4).
+pub(crate) fn send_member_info_heal_update(
+    owner_vk: VerifyingKey,
+    heal_info: AuthorizedMemberInfo,
+) {
     let key = owner_vk_to_contract_key(&owner_vk);
     let heal_delta = ChatRoomStateV1Delta {
         member_info: Some(vec![heal_info]),
