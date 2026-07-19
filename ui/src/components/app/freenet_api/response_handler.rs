@@ -9,16 +9,17 @@ mod update_response;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    arm_legacy_migration_recovery, cas_store_correlation_key, clear_legacy_migration_in_progress,
-    complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
-    complete_pending_signing_key_request, decide_legacy_migration_action,
-    decide_per_room_load_action, fire_legacy_migration_request, get_versioned_correlation_key,
-    hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
-    is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
-    per_room_terminal, prune_outbound_dms_for_purges, room_storage_key,
-    save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
-    send_delegate_request_to, set_load_state_if_current, LegacyMigrationAction, LoadWorkerGuard,
+    arm_legacy_migration_recovery, await_delegate_response, cas_store_correlation_key,
+    clear_legacy_migration_in_progress, complete_pending_public_key_request,
+    complete_pending_request, complete_pending_sign_request, complete_pending_signing_key_request,
+    decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
+    fire_legacy_migration_request, get_versioned_correlation_key, hydrate_hidden_dm_threads,
+    hydrate_outbound_dms_cache, is_legacy_delegate_key, is_legacy_migration_in_progress,
+    legacy_scoped_correlation, load_state_after_probe_legacy, mark_legacy_migration_done,
+    mark_legacy_migration_in_progress, parse_room_storage_key, per_room_terminal,
+    prune_outbound_dms_for_purges, room_storage_key, save_outbound_dms_to_delegate,
+    save_rooms_to_delegate, send_delegate_request, send_delegate_request_to,
+    set_load_state_if_current, LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest,
     RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
@@ -703,12 +704,41 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             let listed_count = room_vks.len();
             let mut had_fetch_error = false;
             let mut slots: Vec<(ed25519_dalek::VerifyingKey, RoomSlot)> = Vec::new();
+            // Concurrency (freenet/river#417): ENQUEUE every per-room GET first
+            // (each enqueue is only the synchronous WS send, so the WEB_API
+            // borrow never overlaps another), then await all the responses
+            // together with `join_all`. This collapses N serial delegate
+            // round-trips into ~1. An enqueue failure is a transport failure; it
+            // is funneled into the per-room `Err` fold arm below so there is a
+            // single per-room failure-handling site.
+            let mut pending_slots: Vec<(ed25519_dalek::VerifyingKey, PendingDelegateRequest)> =
+                Vec::with_capacity(listed_count);
+            let mut per_room_responses: Vec<(
+                ed25519_dalek::VerifyingKey,
+                Result<ChatDelegateResponseMsg, String>,
+            )> = Vec::with_capacity(listed_count);
             for vk in room_vks {
-                match send_delegate_request(ChatDelegateRequestMsg::GetRequest {
+                match enqueue_delegate_request(ChatDelegateRequestMsg::GetRequest {
                     key: ChatDelegateKey::new(room_storage_key(&vk)),
                 })
                 .await
                 {
+                    Ok(pending) => pending_slots.push((vk, pending)),
+                    // The WS send failed (connection down): record as a per-room
+                    // `Err` so it flows through the single failure arm below.
+                    Err(e) => per_room_responses.push((vk, Err(e))),
+                }
+            }
+            // Await all enqueued per-room responses concurrently — this is the
+            // whole point: ~1 round-trip instead of N.
+            per_room_responses.extend(
+                futures::future::join_all(pending_slots.into_iter().map(
+                    |(vk, pending)| async move { (vk, await_delegate_response(pending).await) },
+                ))
+                .await,
+            );
+            for (vk, response) in per_room_responses {
+                match response {
                     Ok(ChatDelegateResponseMsg::GetResponse {
                         value: Some(bytes), ..
                     }) => match from_reader::<RoomSlot, _>(&bytes[..]) {
@@ -2509,6 +2539,52 @@ mod tests {
             !after_none.contains("had_fetch_error = true;")
                 && !after_none.contains("mark_fetch_failure()"),
             "a definitive `value: None` is a legitimate skip, not a fetch failure"
+        );
+    }
+
+    /// freenet/river#417: the startup room load must fan the per-room delegate
+    /// GETs out CONCURRENTLY — enqueue every request first (synchronous WS send),
+    /// then await all responses together via `join_all` — rather than awaiting
+    /// each in a serial `for … .await`. That collapses wall-clock from N
+    /// round-trips to ~1. Pin the wiring by source-grep (this repo's convention),
+    /// scoped to the per-room load region so the trailing single meta GET (which
+    /// legitimately still uses `send_delegate_request`) is excluded.
+    #[test]
+    fn per_room_load_fans_out_concurrently() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let start = production
+            .find("Loading {} per-room slot(s) from delegate")
+            .expect("per-room fetch loop marker must exist");
+        let end = production[start..]
+            .find("let meta = if has_meta")
+            .map(|i| start + i)
+            .expect("the per-room loop must be followed by the meta load");
+        let region = &production[start..end];
+
+        // Requests are ENQUEUED (send-only) and their responses awaited
+        // CONCURRENTLY via join_all — not a combined serial send+await.
+        assert!(
+            region.contains("enqueue_delegate_request("),
+            "per-room GETs must be enqueued (send) before awaiting"
+        );
+        assert!(
+            region.contains("join_all("),
+            "per-room responses must be awaited concurrently via join_all"
+        );
+        assert!(
+            region.contains("await_delegate_response("),
+            "per-room responses must be awaited via the split await_delegate_response"
+        );
+        // Guard against a regression to the serial combined send+await in the
+        // per-room region (the trailing meta GET, outside this region, may still
+        // use send_delegate_request).
+        assert!(
+            !region.contains("send_delegate_request("),
+            "per-room load must not use the serial send_delegate_request in the fan-out region"
         );
     }
 
