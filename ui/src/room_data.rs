@@ -1789,6 +1789,15 @@ impl Rooms {
             // current local identity) rather than ABORTING the whole merge —
             // otherwise one stale in-flight copy would drop every other room and
             // its secret rehydration until reload. The local copy always wins.
+            //
+            // STILL NEEDED after the #414 in-place-swap redesign: the redesign
+            // removed the empty-rebuild, but the stale-load race this guards is
+            // independent of it — an overwrite still mutates `map[vk].self_sk`
+            // in place, so a concurrent delegate load carrying the old `self_sk`
+            // still collides here. Without the skip, that one stale room would
+            // still abort the whole merge and drop unrelated rooms. This is a
+            // genuine robustness guard, NOT scaffolding for the deleted empty
+            // room.
             if let Some(existing) = self.map.get(&vk) {
                 if existing.self_sk != room_data.self_sk {
                     use dioxus::logger::tracing::warn;
