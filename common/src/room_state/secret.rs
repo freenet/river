@@ -6,7 +6,7 @@ use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::SystemTime;
 
 /// Room secrets state managing encrypted secret distribution
@@ -62,10 +62,10 @@ impl ComposableState for RoomSecretsV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        let version_ids: HashSet<SecretVersion> =
+        let version_ids: BTreeSet<SecretVersion> =
             self.versions.iter().map(|v| v.record.version).collect();
 
-        let member_secrets: HashSet<(SecretVersion, MemberId)> = self
+        let member_secrets: BTreeSet<(SecretVersion, MemberId)> = self
             .encrypted_secrets
             .iter()
             .map(|s| (s.secret.secret_version, s.secret.member_id))
@@ -250,8 +250,14 @@ impl ComposableState for RoomSecretsV1 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SecretsSummary {
     pub current_version: SecretVersion,
-    pub version_ids: HashSet<SecretVersion>,
-    pub member_secrets: HashSet<(SecretVersion, MemberId)>,
+    // BTreeSet (not HashSet) so the ciborium-serialized summary bytes are
+    // deterministic: freenet-core byte-compares `summarize_state` output for
+    // staleness, and a HashSet iterates in a per-process-random order, making
+    // two identical secret sets summarize to different bytes → spurious
+    // anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
+    // and freenet/freenet-core#4857.
+    pub version_ids: BTreeSet<SecretVersion>,
+    pub member_secrets: BTreeSet<(SecretVersion, MemberId)>,
 }
 
 /// Delta for room secrets state
@@ -779,8 +785,8 @@ mod tests {
 
         let old_summary = SecretsSummary {
             current_version: 0,
-            version_ids: HashSet::new(),
-            member_secrets: HashSet::new(),
+            version_ids: BTreeSet::new(),
+            member_secrets: BTreeSet::new(),
         };
 
         let delta = secrets.delta(&state, &params, &old_summary).unwrap();
@@ -809,8 +815,8 @@ mod tests {
 
         let mut old_summary = SecretsSummary {
             current_version: 1,
-            version_ids: HashSet::new(),
-            member_secrets: HashSet::new(),
+            version_ids: BTreeSet::new(),
+            member_secrets: BTreeSet::new(),
         };
         old_summary.version_ids.insert(1);
         old_summary.member_secrets.insert((1, owner_id));

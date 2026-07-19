@@ -108,7 +108,7 @@ use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // Domain separation tags (prepended to signed byte buffers)
@@ -190,10 +190,15 @@ impl<'de> Deserialize<'de> for PurgeToken {
 
 /// Newtype around a 64-byte Ed25519 signature, present only because
 /// serde doesn't derive `Serialize`/`Deserialize` for `[u8; 64]`.
-/// Used as a hash-table key in [`DirectMessagesSummary`] for fast
+/// Used as a set key in [`DirectMessagesSummary`] for fast
 /// "do we already have this signature?" lookups during delta
 /// computation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// `Ord`/`PartialOrd` (over the raw 64 bytes) are required so the summary can
+/// store these in a `BTreeSet` — a deterministic order is what keeps the
+/// ciborium-serialized summary bytes identical across peers (see
+/// [`DirectMessagesSummary`] and freenet/freenet-core#4857).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SignatureBytes(pub [u8; 64]);
 
 impl Serialize for SignatureBytes {
@@ -826,7 +831,7 @@ impl ComposableState for DirectMessagesV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        let message_signatures: HashSet<SignatureBytes> = self
+        let message_signatures: BTreeSet<SignatureBytes> = self
             .messages
             .iter()
             .map(|m| SignatureBytes(m.sender_signature.to_bytes()))
@@ -1104,8 +1109,15 @@ fn sort_state(s: &mut DirectMessagesV1) {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectMessagesSummary {
     /// Raw Ed25519 signatures of messages already held locally.
+    ///
+    /// `BTreeSet` (not `HashSet`) so the ciborium-serialized summary bytes are
+    /// deterministic: freenet-core byte-compares `summarize_state` output for
+    /// staleness, and a `HashSet` iterates in a per-process-random order,
+    /// making two identical DM sets summarize to different bytes → spurious
+    /// anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
+    /// and freenet/freenet-core#4857.
     #[serde(default)]
-    pub message_signatures: HashSet<SignatureBytes>,
+    pub message_signatures: BTreeSet<SignatureBytes>,
 
     /// Per-recipient purge-envelope version known locally. Stored as a
     /// sorted `Vec` (not `HashMap`) so the type round-trips through

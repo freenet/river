@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -25,7 +25,13 @@ pub struct MembersV1 {
 
 impl ComposableState for MembersV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = HashSet<MemberId>;
+    // BTreeSet (not HashSet) so the ciborium-serialized summary bytes are
+    // deterministic: freenet-core byte-compares `summarize_state` output for
+    // staleness, and a HashSet iterates in a per-process-random order, making
+    // two identical member sets summarize to different bytes → spurious
+    // anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
+    // and freenet/freenet-core#4857.
+    type Summary = BTreeSet<MemberId>;
     type Delta = MembersDelta;
     type Parameters = ChatRoomParametersV1;
 

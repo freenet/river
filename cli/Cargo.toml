@@ -1,6 +1,6 @@
 [package]
 name = "riverctl"
-version = "0.1.76"
+version = "0.1.77"
 edition = "2021"
 authors = ["Freenet Project"]
 description = "Command-line interface for River decentralized chat on Freenet"
@@ -50,7 +50,7 @@ dialoguer = "0.11"
 atty = "0.2"
 
 # Internal dependencies
-river-core = { version = "0.1.14", path = "../common", features = ["ecies", "ecies-randomized", "migration", "mentions"] }
+river-core = { version = "0.1.15", path = "../common", features = ["ecies", "ecies-randomized", "migration", "mentions"] }
 freenet-stdlib = { workspace = true, features = ["net"] }
 freenet-scaffold = "0.2.2"
 

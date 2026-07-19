@@ -312,6 +312,20 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
 This ensures any client can re-PUT old state bytes and the new WASM's `validate_state()` accepts it,
 which is critical for the permissionless contract migration system described above.
 
+## Contract `Summary` / `Delta` Determinism
+
+Every field of a contract's `ComposableState::Summary` MUST serialize
+deterministically — `BTreeMap`/`BTreeSet`/sorted `Vec`, never `HashMap`/`HashSet`
+or an unsorted `Vec`. freenet-core byte-compares `summarize_state` output to
+decide peer staleness, so a nondeterministically-ordered summary makes two
+identical states compare unequal → spurious anti-entropy full-state heals for
+every room (and feeds the update-drop divergence in freenet/freenet-core#4857).
+
+Full rule (why, the `BTreeMap`/`BTreeSet`/sorted-`Vec` fix, the required
+determinism test, and the WASM-migration coupling) lives in
+**`.claude/rules/contract-summary-determinism.md`**. Read it before touching any
+`type Summary` / `type Delta` under `common/src/room_state/`.
+
 ## Dioxus WASM Signal Safety Rules
 
 The UI runs as single-threaded WASM and Firefox mobile fires Dioxus
