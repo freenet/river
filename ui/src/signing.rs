@@ -191,6 +191,36 @@ fn extract_signature(
 // Migration and Fallback Functions
 // ============================================================================
 
+/// Per-room async locks serializing [`migrate_signing_key`].
+///
+/// The migration's get/store/get sequence is NOT atomic. Multiple migrations
+/// for the SAME room can run concurrently — startup hydration, the post-GET
+/// migration, and a rapid identity replacement (freenet/river#414) — and
+/// without serialization a second migration could `store` a different key
+/// BETWEEN this task's `store` and its verifying `get`, so the task verifies
+/// the wrong key and a completion callback marks the room migrated against a
+/// delegate that now holds a different identity. Holding a per-room async lock
+/// across the whole sequence makes it atomic w.r.t. other migrations of the
+/// same room. Placed inside `migrate_signing_key` so EVERY call site (import,
+/// hydration, post-GET) is covered, not just the overwrite path.
+///
+/// `std::sync::Mutex` guards only the brief map lookup (never held across an
+/// `.await`); the per-room `futures::lock::Mutex` is the async lock held across
+/// the sequence. Single-threaded WASM, so the std mutex never contends.
+static MIGRATION_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<RoomKey, std::sync::Arc<futures::lock::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn migration_lock_for(room_key: &RoomKey) -> std::sync::Arc<futures::lock::Mutex<()>> {
+    let mut locks = MIGRATION_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(*room_key)
+        .or_insert_with(|| std::sync::Arc::new(futures::lock::Mutex::new(())))
+        .clone()
+}
+
 /// Migrate a signing key to the delegate if not already present.
 ///
 /// Returns a `MigrationResult` indicating what happened:
@@ -199,6 +229,12 @@ fn extract_signature(
 /// - `Stored`: key was stored for the first time
 /// - `Failed`: migration failed (fallback to local signing should be used)
 pub async fn migrate_signing_key(room_key: RoomKey, signing_key: &SigningKey) -> MigrationResult {
+    // Serialize concurrent migrations for THIS room so the non-atomic
+    // get/store/get below runs to completion before another migration for the
+    // same room can start (freenet/river#414).
+    let room_lock = migration_lock_for(&room_key);
+    let _migration_guard = room_lock.lock().await;
+
     // Check if key already exists in delegate
     let was_stale = match get_public_key(room_key).await {
         Ok(Some(existing_vk)) => {
@@ -448,6 +484,49 @@ mod tests {
     use ed25519_dalek::Signer;
     use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+
+    /// freenet/river#414 (Codex round 4): `migrate_signing_key`'s non-atomic
+    /// get/store/get must be serialized PER ROOM so a concurrent migration for
+    /// the same room can't store a different key between this task's store and
+    /// its verify. Pin the lock is (a) per-room and (b) actually mutually
+    /// exclusive for the same room while leaving other rooms free.
+    #[test]
+    fn migration_lock_is_per_room_and_serializes_same_room() {
+        let room_a: RoomKey = [1u8; 32];
+        let room_b: RoomKey = [2u8; 32];
+
+        // Same room → one shared lock; different rooms → distinct locks.
+        let a1 = migration_lock_for(&room_a);
+        let a2 = migration_lock_for(&room_a);
+        let b1 = migration_lock_for(&room_b);
+        assert!(
+            std::sync::Arc::ptr_eq(&a1, &a2),
+            "the same room must share one migration lock"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&a1, &b1),
+            "different rooms must have distinct migration locks"
+        );
+
+        // Holding room A's lock blocks a second acquire for room A (the
+        // get/store/get sequence is serialized) but NOT for room B.
+        let held = a1
+            .try_lock()
+            .expect("first acquire for room A must succeed");
+        assert!(
+            a2.try_lock().is_none(),
+            "a concurrent migration for the SAME room must wait for the lock"
+        );
+        assert!(
+            b1.try_lock().is_some(),
+            "a migration for a DIFFERENT room must not be blocked"
+        );
+        drop(held);
+        assert!(
+            a2.try_lock().is_some(),
+            "releasing the lock must let the next same-room migration proceed"
+        );
+    }
 
     fn make_signed_message(author_sk: &SigningKey, owner_vk: &VerifyingKey) -> AuthorizedMessageV1 {
         let msg = MessageV1 {

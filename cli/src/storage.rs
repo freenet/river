@@ -603,6 +603,21 @@ impl Storage {
         })
     }
 
+    /// Public, self-locking counterpart to
+    /// [`Self::prune_outbound_dms_for_room_unlocked`]: drop every cached
+    /// outbound-DM plaintext entry and archived-thread entry for `owner_vk`'s
+    /// room from `outbound_dms.json`.
+    ///
+    /// Used by `identity import --force` when it REPLACES a room with a
+    /// different signing key (freenet/river#414): the prior identity's plaintext
+    /// outbound DMs and its archived-thread records (keyed by `(room, peer)`)
+    /// must not leak into the new identity's view, so they are pruned exactly as
+    /// [`Self::remove_room`] does on leave. Takes the advisory lock itself; do
+    /// NOT call while already holding it.
+    pub fn prune_outbound_dms_for_room(&self, owner_vk: &VerifyingKey) -> Result<()> {
+        self.with_lock(|| self.prune_outbound_dms_for_room_unlocked(owner_vk))
+    }
+
     /// Drop every cached outbound-DM plaintext entry and archived-thread entry
     /// for `owner_vk`'s room from `outbound_dms.json`. No-op if the cache file
     /// holds nothing for that room. Called by [`Self::remove_room`]; caller MUST
@@ -1580,6 +1595,134 @@ mod tests {
             "the left room's archived-thread entry must be pruned"
         );
         assert_eq!(after.hidden_threads[0].room_owner_vk, kept_vk.to_bytes());
+    }
+
+    /// freenet/river#414 (Codex round 4): `identity import --force` that swaps a
+    /// room to a DIFFERENT signing key must prune the OLD identity's cached
+    /// outbound-DM plaintext + archived threads (they belong to the old
+    /// identity and would otherwise leak into / wrongly hide threads for the new
+    /// one) — but an unchanged-key re-import must NOT prune, and a different
+    /// room's cache always survives. Drives the exact Storage sequence
+    /// `import_identity` runs (decision `old_key != imported_key`, then
+    /// `prune_outbound_dms_for_room`).
+    #[test]
+    fn force_import_prunes_dm_cache_only_on_key_change() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::chat_delegate::{HiddenDmThreadEntry, OutboundDmEntry, OutboundDmStore};
+        use river_core::room_state::direct_messages::PurgeToken;
+        use river_core::room_state::member::MemberId;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let other_vk = create_test_signing_key().verifying_key();
+        let key = expected_contract_key(&owner_vk);
+
+        let old_identity = create_test_signing_key();
+        let new_identity = create_test_signing_key();
+
+        let peer = MemberId(FastHash(7));
+        let seed_dm_cache = || {
+            storage
+                .save_outbound_dms(&OutboundDmStore {
+                    entries: vec![
+                        OutboundDmEntry {
+                            room_owner_vk: owner_vk.to_bytes(),
+                            sender: peer,
+                            recipient: peer,
+                            purge_token: PurgeToken([1u8; 16]),
+                            timestamp: 1,
+                            plaintext: "old-identity secret".to_string(),
+                        },
+                        OutboundDmEntry {
+                            room_owner_vk: other_vk.to_bytes(),
+                            sender: peer,
+                            recipient: peer,
+                            purge_token: PurgeToken([2u8; 16]),
+                            timestamp: 2,
+                            plaintext: "unrelated room".to_string(),
+                        },
+                    ],
+                    hidden_threads: vec![HiddenDmThreadEntry {
+                        room_owner_vk: owner_vk.to_bytes(),
+                        peer,
+                        hidden_at_ts: 1,
+                    }],
+                })
+                .unwrap();
+        };
+
+        // Scenario 1: --force replace with a DIFFERENT key → prune this room's cache.
+        storage
+            .add_room(&owner_vk, &old_identity, create_test_state(&owner_sk), &key)
+            .unwrap();
+        seed_dm_cache();
+        let old_key = storage.get_room(&owner_vk).unwrap().unwrap().0;
+        let identity_changed = old_key.to_bytes() != new_identity.to_bytes();
+        assert!(identity_changed, "precondition: the imported key differs");
+        storage
+            .add_room_with_invitation_secrets(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        if identity_changed {
+            storage.prune_outbound_dms_for_room(&owner_vk).unwrap();
+        }
+        let after = storage.load_outbound_dms().unwrap();
+        assert!(
+            !after
+                .entries
+                .iter()
+                .any(|e| e.room_owner_vk == owner_vk.to_bytes()),
+            "the replaced identity's DM plaintext must be pruned"
+        );
+        assert!(
+            after
+                .hidden_threads
+                .iter()
+                .all(|h| h.room_owner_vk != owner_vk.to_bytes()),
+            "the replaced identity's archived threads must be pruned"
+        );
+        assert!(
+            after
+                .entries
+                .iter()
+                .any(|e| e.room_owner_vk == other_vk.to_bytes()),
+            "another room's DM cache must survive"
+        );
+
+        // Scenario 2: re-import the SAME key → no identity change → keep the cache.
+        seed_dm_cache();
+        let old_key2 = storage.get_room(&owner_vk).unwrap().unwrap().0;
+        let identity_changed2 = old_key2.to_bytes() != new_identity.to_bytes();
+        assert!(
+            !identity_changed2,
+            "re-importing the SAME key is not an identity change"
+        );
+        storage
+            .add_room_with_invitation_secrets(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        if identity_changed2 {
+            storage.prune_outbound_dms_for_room(&owner_vk).unwrap();
+        }
+        let after2 = storage.load_outbound_dms().unwrap();
+        assert!(
+            after2
+                .entries
+                .iter()
+                .any(|e| e.room_owner_vk == owner_vk.to_bytes()),
+            "an unchanged-key re-import must NOT prune the DM cache"
+        );
     }
 
     /// Regression for issue freenet/river#307 (lost-update race).

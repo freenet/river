@@ -218,7 +218,16 @@ async fn import_identity(
     // opted in to replacing it with --force/--overwrite (freenet/river#414).
     // Replacing rewrites the stored signing key, so the previous identity is
     // lost locally unless it was exported first.
-    let room_exists = api_client.storage().get_room(&export.room_owner)?.is_some();
+    let existing_room = api_client.storage().get_room(&export.room_owner)?;
+    let room_exists = existing_room.is_some();
+    // Whether --force is actually swapping to a DIFFERENT identity. Used below
+    // to prune the old identity's per-room DM cache. (Compares the resolved
+    // stored key; in the normal no-`--signing-key` case this is exactly the
+    // stored identity. If they differ, the outbound-DM plaintext / archived
+    // threads belong to the old identity and must not leak into the new one.)
+    let identity_changed = existing_room
+        .as_ref()
+        .is_some_and(|(old_sk, _, _)| old_sk != &export.signing_key);
     if let Some(refusal) = import_overwrite_refusal(room_exists, force, &room_key_str) {
         return Err(anyhow!(refusal));
     }
@@ -262,6 +271,24 @@ async fn import_identity(
         &export.authorized_member,
         &export.invite_chain,
     )?;
+
+    // A --force replace with a DIFFERENT signing key just swapped the room's
+    // identity. Prune the OLD identity's per-room outbound-DM plaintext and
+    // archived-thread records so they don't leak into (or wrongly hide threads
+    // for) the new identity, exactly as `room leave` does (freenet/river#414).
+    // Best-effort: the identity is already committed, so a prune hiccup warns
+    // rather than failing the import (mirrors `Storage::remove_room`).
+    if force && identity_changed {
+        if let Err(e) = api_client
+            .storage()
+            .prune_outbound_dms_for_room(&export.room_owner)
+        {
+            eprintln!(
+                "WARNING: failed to prune the previous identity's DM cache for room {}: {}",
+                room_key_str, e
+            );
+        }
+    }
 
     // Persist the imported nickname so a later rejoin (after an inactivity
     // prune) restores it instead of "Member".

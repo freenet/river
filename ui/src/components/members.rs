@@ -1111,6 +1111,16 @@ fn complete_identity_import(
                         let mut sanitized = false;
                         ROOMS.with_mut(|rooms| {
                             if let Some(rd) = rooms.map.get_mut(&owner_key) {
+                                // Guard a rapid second replacement: only mark
+                                // migrated if the room's CURRENT identity is
+                                // still the one we just migrated. If a newer
+                                // import replaced it while this migration ran,
+                                // its own migration owns `key_migrated_to_delegate`
+                                // — don't mark it for a superseded key
+                                // (freenet/river#414).
+                                if rd.self_sk != signing_key_for_migration {
+                                    return;
+                                }
                                 rd.key_migrated_to_delegate = true;
                                 // Remove any messages with invalid signatures
                                 // left by a stale delegate key
@@ -1259,10 +1269,20 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     // controlled input's bound value lags the DOM and drops
                     // keystrokes). Editing the token invalidates any pending
                     // overwrite confirmation so the warning can't outlive the
-                    // token it was raised for (freenet/river#414).
+                    // token it was raised for (freenet/river#414). The
+                    // `pending_import` clear IS deferred, though: the component
+                    // subscribes to it (the confirm-vs-input branch below), so a
+                    // synchronous clear could re-render mid-write and hit the
+                    // Firefox-mobile `RefCell already borrowed` panic. Only defer
+                    // when something is actually pending, so a normal keystroke
+                    // doesn't schedule a setTimeout.
                     oninput: move |e| {
                         token_input.set(e.value());
-                        pending_import.set(None);
+                        if pending_import.try_read().is_ok_and(|p| p.is_some()) {
+                            crate::util::defer(move || {
+                                pending_import.set(None);
+                            });
+                        }
                     },
                 }
                 if let Some(err) = &*error_msg.read() {
@@ -2047,6 +2067,29 @@ mod tests {
             "complete_identity_import must call SYNC_INFO.reset_room_for_resync \
              so an overwrite import re-GETs full state (freenet/river#414); \
              without it a Subscribed room ships a delta off empty state."
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414, Codex round 4): the token
+    /// `oninput` must NOT clear `pending_import` synchronously — the component
+    /// subscribes to that signal, so a synchronous clear can re-render mid-write
+    /// and hit the Firefox-mobile `RefCell already borrowed` panic. The clear is
+    /// wrapped in `crate::util::defer()`, guarded so a normal keystroke doesn't
+    /// schedule one. Pin both: the guarded/deferred form is present, and the
+    /// bare synchronous pair is gone.
+    #[test]
+    fn oninput_defers_pending_import_clear() {
+        let prod = production_source();
+        assert!(
+            prod.contains("if pending_import.try_read().is_ok_and(|p| p.is_some()) {"),
+            "the token oninput must guard + defer the pending_import clear"
+        );
+        // Whitespace-normalized so indentation/rustfmt changes can't defeat it.
+        let normalized = prod.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !normalized.contains("token_input.set(e.value()); pending_import.set(None);"),
+            "the token oninput must not clear pending_import synchronously right \
+             after setting the value (freenet/river#414) — defer the clear"
         );
     }
 
