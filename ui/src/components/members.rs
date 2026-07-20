@@ -1250,6 +1250,13 @@ fn rooms_load_is_authoritative(
 ///   overwrite must not throw it away and re-fetch (the old empty-rebuild was
 ///   the root of the sync-reset / stale-load / bogus-delta cluster).
 ///
+/// Reaching this function means the import is committing: every validation error
+/// (invalid token, still-loading room set) returns in the CALLER before this is
+/// called. So this is the success path: it shows a brief "Identity imported!"
+/// flash and then auto-dismisses the dialog via `close` (the caller's
+/// `reset_and_close`). The error branches stay in the caller and keep the dialog
+/// open showing the error.
+///
 /// Precondition: the caller has confirmed the room set is authoritative
 /// (`rooms_load_is_authoritative`), so the new-vs-overwrite decision below is
 /// reliable and can't misclassify a real room as new during startup.
@@ -1257,6 +1264,7 @@ fn complete_identity_import(
     export: IdentityExport,
     mut success_msg: Signal<Option<String>>,
     mut error_msg: Signal<Option<String>>,
+    close: impl Fn() + Copy + 'static,
 ) {
     let owner_key = export.room_owner;
     // Migrate the imported signing key to the delegate immediately. Without
@@ -1408,8 +1416,31 @@ fn complete_identity_import(
             }
         });
 
-        success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
+        // Success flash. The pre-redesign wording announced that room state was
+        // still being fetched, which was stale from the empty-rebuild era: the
+        // in-place swap KEEPS `room_state`, so there is no re-fetch to wait on.
+        // Just confirm the import landed.
+        success_msg.set(Some("Identity imported!".to_string()));
         error_msg.set(None);
+    });
+
+    // Auto-dismiss the dialog after the brief success flash (Ian hit the modal
+    // staying open after a successful import). Only the SUCCESS path reaches here,
+    // so error branches (which return in the caller) keep the dialog open.
+    //
+    // Signal-safety (.claude/rules/dioxus-signal-safety.md): the delay uses the
+    // WASM-safe `sleep`, and the close runs inside `defer()` (never a raw
+    // setTimeout on signal mutations). The close is GUARDED on the success flash
+    // still being shown, so if the user manually closed and reopened the modal
+    // within the window we don't clobber their fresh state (`reset_and_close`
+    // clears `success_msg`, so a reopened modal reads `None` here).
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(crate::util::millis(1200)).await;
+        crate::util::defer(move || {
+            if success_msg.try_read().is_ok_and(|m| m.is_some()) {
+                close();
+            }
+        });
     });
 }
 
@@ -1520,7 +1551,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     return;
                 }
 
-                complete_identity_import(export, success_msg, error_msg);
+                complete_identity_import(export, success_msg, error_msg, reset_and_close);
             }
             Err(e) => {
                 crate::util::defer(move || {
@@ -1550,7 +1581,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
         crate::util::defer(move || {
             pending_import.set(None);
         });
-        complete_identity_import(export, success_msg, error_msg);
+        complete_identity_import(export, success_msg, error_msg, reset_and_close);
     };
 
     // User backed out of the overwrite: drop the snapshot and return to the
@@ -2775,6 +2806,58 @@ mod tests {
             prod.contains("send_member_info_heal_update("),
             "complete_identity_import must send the member_info heal UPDATE after an \
              in-place overwrite, since it does no GET (freenet/river#414 P2-4)"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414 follow-up): a SUCCESSFUL identity
+    /// import must auto-dismiss the modal (Ian hit the dialog staying open after
+    /// importing). `complete_identity_import` is the single success path (every
+    /// validation error returns in the caller before it), so the auto-close
+    /// wiring lives there, guarded on the success flash so a manual close+reopen
+    /// within the window can't clobber fresh state, and BOTH call sites hand it
+    /// the `reset_and_close` closure. The error branches never call it, so an
+    /// invalid token / still-loading state keeps the dialog open showing the error.
+    #[test]
+    fn successful_import_auto_dismisses_dialog() {
+        let prod = production_source();
+
+        // Stale pre-redesign copy is gone: the in-place swap keeps room_state, so
+        // there is no re-fetch to wait on. Just confirm the import landed.
+        assert!(
+            !prod.contains("Syncing room state"),
+            "the stale 'Syncing room state...' copy must be dropped; the in-place \
+             swap keeps room_state (freenet/river#414 follow-up)"
+        );
+        assert!(
+            prod.contains("Identity imported!"),
+            "a successful import must show the 'Identity imported!' confirmation flash"
+        );
+
+        // The auto-close delays via the WASM-safe sleep, then runs inside defer().
+        assert!(
+            prod.contains("crate::util::sleep(crate::util::millis("),
+            "the auto-dismiss must delay via the WASM-safe sleep before closing \
+             (.claude/rules/dioxus-signal-safety.md)"
+        );
+
+        // Whitespace-normalized so rustfmt wrapping can't defeat the match.
+        let normalized = prod.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized
+                .contains("if success_msg.try_read().is_ok_and(|m| m.is_some()) { close(); }"),
+            "the auto-close must be GUARDED on the success flash still being shown, \
+             so a manual close+reopen within the window can't clobber fresh state"
+        );
+
+        // Both success call sites (direct import + confirmed overwrite) pass the
+        // modal-close closure to the success helper; the error branches never do.
+        let call_sites = prod
+            .matches("complete_identity_import(export, success_msg, error_msg, reset_and_close)")
+            .count();
+        assert_eq!(
+            call_sites, 2,
+            "both success call sites must pass reset_and_close so the dialog \
+             auto-dismisses on success; found {call_sites}"
         );
     }
 
