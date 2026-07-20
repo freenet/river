@@ -4694,7 +4694,7 @@ dependencies = [
 
 [[package]]
 name = "riverctl"
-version = "0.1.78"
+version = "0.1.79"
 dependencies = [
  "anyhow",
  "assert_cmd",
