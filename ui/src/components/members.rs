@@ -1165,6 +1165,10 @@ fn swap_room_identity_in_place(
         // - membership proof (`self_authorized_member` + `invite_chain`) is a
         //   coherent UNIT (the chain validates the member), so keep them TOGETHER:
         //   adopt the token's pair only when the local membership proof is absent;
+        //   CROSS-REF: the CLI counterpart
+        //   (cli/src/storage.rs `import_room_atomic`) gates the equivalent step on
+        //   the TOKEN's chain being empty, not the LOCAL proof being absent — the
+        //   two conditions differ DELIBERATELY; do NOT harmonize them into one rule.
         if existing.self_authorized_member.is_none() {
             existing.self_authorized_member = Some(export.authorized_member);
             existing.invite_chain = export.invite_chain;

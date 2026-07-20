@@ -511,31 +511,14 @@ impl Storage {
         })
     }
 
-    /// Atomically import (or `--force`-overwrite) an identity for a room, under a
-    /// SINGLE advisory lock, closing the TOCTOU window (freenet/river#414, Codex
-    /// round-6 P1-5).
+    /// Compile-time exhaustive-destructure classification pin for the
+    /// [`Self::import_room_atomic`] OVERWRITE arm (Fable architectural review).
     ///
-    /// The pre-`import` existence/key snapshot in `import_identity` is taken
-    /// BEFORE the network GET, so a concurrent `riverctl` invocation can add an
-    /// identity for this room during the await — after which the un-atomic path
-    /// would still think it's a new room and overwrite it without `--force` (and
-    /// without pruning the old identity's DM cache). This method re-reads the
-    /// persisted key INSIDE the lock, makes the new-vs-overwrite + key-changed
-    /// decision, writes the full `StoredRoomInfo` in one shot (folding in the
-    /// authorized member, invite chain, and nickname — no read-back-and-patch),
-    /// and prunes the old identity's outbound-DM cache when the key changed — all
-    /// before any concurrent writer can interleave. Modeled on `remove_room`,
-    /// the existing one-lock-spanning-both-files method.
-    ///
-    /// Returns `RefusedNeedsForce` (nothing written) when a DIFFERENT-or-same
-    /// identity already exists and `force` is false; otherwise `Imported`.
-    ///
-    /// COMPILE-TIME CLASSIFICATION PIN (Fable architectural review): the
-    /// exhaustive destructure below has NO `..`, so ADDING A FIELD to
-    /// [`StoredRoomInfo`] FAILS COMPILATION here until a maintainer classifies its
-    /// OVERWRITE verb in the arm above. This is the forcing function that prevents
-    /// the round-11 `previous_contract_key` clobber class (a new field silently
-    /// defaulted in a fresh literal). Verb table:
+    /// The destructure below has NO `..`, so ADDING A FIELD to [`StoredRoomInfo`]
+    /// FAILS COMPILATION here until a maintainer classifies its OVERWRITE verb in
+    /// that arm. This is the forcing function that prevents the round-11
+    /// `previous_contract_key` clobber class (a new field silently defaulted in a
+    /// fresh literal). Verb table:
     ///
     /// ```text
     /// signing_key_bytes      REPLACE (the imported identity)
@@ -564,6 +547,26 @@ impl Storage {
         } = r;
     }
 
+    /// Atomically import (or `--force`-overwrite) an identity for a room, under a
+    /// SINGLE advisory lock, closing the TOCTOU window (freenet/river#414, Codex
+    /// round-6 P1-5).
+    ///
+    /// The pre-`import` existence/key snapshot in `import_identity` is taken
+    /// BEFORE the network GET, so a concurrent `riverctl` invocation can add an
+    /// identity for this room during the await — after which the un-atomic path
+    /// would still think it's a new room and overwrite it without `--force` (and
+    /// without pruning the old identity's DM cache). This method re-reads the
+    /// persisted key INSIDE the lock, makes the new-vs-overwrite + key-changed
+    /// decision, then either MUTATES the stored record in place (OVERWRITE arm —
+    /// keeping the room-scoped `state` / `contract_key` / `previous_contract_key`;
+    /// see the classification pin above) or inserts a fresh record (NEW-room arm),
+    /// folding in the authorized member, invite chain, and nickname, and prunes the
+    /// old identity's outbound-DM cache when the key changed — all before any
+    /// concurrent writer can interleave. Modeled on `remove_room`, the existing
+    /// one-lock-spanning-both-files method.
+    ///
+    /// Returns `RefusedNeedsForce` (nothing written) when a DIFFERENT-or-same
+    /// identity already exists and `force` is false; otherwise `Imported`.
     #[allow(clippy::too_many_arguments)]
     pub fn import_room_atomic(
         &self,
@@ -636,6 +639,13 @@ impl Storage {
                     // coherent UNIT (the chain validates the member): keep the
                     // stored pair when the token carries an empty chain, so we never
                     // pair the token's member with an empty/mismatched chain.
+                    // CROSS-REF: the UI's same-key merge
+                    // (ui/src/components/members.rs `swap_room_identity_in_place`)
+                    // gates the equivalent step on the LOCAL proof being absent
+                    // (`self_authorized_member.is_none()`), whereas this CLI path
+                    // gates on the TOKEN's chain being empty. The conditions differ
+                    // DELIBERATELY (each side's staler-source risk differs); do NOT
+                    // "harmonize" them into one rule.
                     if invite_chain.is_empty() && !old.invite_chain.is_empty() {
                         invite_chain = old.invite_chain.clone();
                         if old.self_authorized_member.is_some() {

@@ -238,7 +238,15 @@ async fn import_identity(
         );
     }
 
-    // Fetch room state from network to populate local storage
+    // Fetch room state from the network. This serves two purposes depending on
+    // which arm `import_room_atomic` takes:
+    //   - NEW room: the fetched state is the initial local copy that gets stored.
+    //   - OVERWRITE (room already exists): the stored state is KEPT untouched
+    //     (room state is identity-independent — see `import_room_atomic`), so
+    //     the fetched state here is DISCARDED. The GET still matters: it
+    //     validates the room is reachable and drives any migration/heal side
+    //     effects (`get_room` re-attempts `member_info` heal, contract-key
+    //     migration, etc.) before we swap in the replacement identity.
     let room_state = api_client
         .get_room(&export.room_owner, false)
         .await
@@ -645,10 +653,15 @@ mod tests {
         );
     }
 
-    /// freenet/river#414: a `--force` import runs the same storage sequence the
-    /// import path uses, but with a new signing key — it must REPLACE the
-    /// stored identity in place (not error, not duplicate). Drives the `Storage`
-    /// calls directly (the async `import_identity` needs a live node).
+    /// freenet/river#414: importing with `--force` and a new signing key must
+    /// REPLACE the stored identity in place (not error, not duplicate). The real
+    /// import path now does this atomically under one lock via
+    /// `Storage::import_room_atomic` (exercised by the `import_room_atomic_*`
+    /// tests, which the async `import_identity` needs a live node to drive
+    /// end-to-end). This test instead drives the underlying `Storage` mutators
+    /// directly to assert the in-place-overwrite CONTRACT they rely on: writing
+    /// the same owner key twice keeps a single room entry and swaps the stored
+    /// signing key.
     #[test]
     fn force_import_overwrites_stored_identity() {
         let owner_sk = signing_key_from_seed(21);
@@ -678,8 +691,11 @@ mod tests {
             "precondition: OLD identity is stored"
         );
 
-        // The `--force` path re-runs the import's storage sequence with the NEW
-        // key: add_room_with_invitation_secrets (overwrites) + store_authorized_member.
+        // Re-write the same owner key with the NEW signing key via the storage
+        // mutators (overwrite + authorized-member store). This is NOT the exact
+        // sequence the import path runs today (that's the single-lock
+        // `import_room_atomic`); it drives the same primitives directly to assert
+        // the overwrite-in-place contract those upper layers depend on.
         storage
             .add_room_with_invitation_secrets(
                 &owner_vk,
