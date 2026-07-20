@@ -1364,9 +1364,17 @@ fn merge_room_states(
 /// stranded state was found.
 async fn put_state_to_current_key(
     owner_vk: ed25519_dalek::VerifyingKey,
-    state: ChatRoomStateV1,
+    mut state: ChatRoomStateV1,
     label: &str,
 ) {
+    // Strip any forward upgrade pointer before PUTting FORWARD onto the current
+    // contract: the pointer is only meaningful on the OLD contract, and carrying
+    // it forward poisons the current generation with a pointer to an older one —
+    // which a later reader then follows backward onto stale state
+    // (freenet/river#427). This never clobbers a legitimate pointer already on
+    // the current key: a PUT carrying `None` emits no `OptionalUpgradeV1` delta.
+    state.upgrade = river_core::room_state::upgrade::OptionalUpgradeV1(None);
+
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
     let parameters = ChatRoomParametersV1 { owner: owner_vk };
     let params_bytes = to_cbor_vec(&parameters);
