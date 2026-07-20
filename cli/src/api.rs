@@ -17,6 +17,7 @@ use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configura
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersDelta};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata, SealedBytes};
+use river_core::room_state::upgrade::OptionalUpgradeV1;
 use river_core::room_state::ChatRoomStateV1Delta;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde::{Deserialize, Serialize};
@@ -47,19 +48,148 @@ const MAX_UPGRADE_HOPS: usize = 32;
 /// Decide the next contract to follow from `state`'s upgrade pointer.
 ///
 /// Returns `Some(next)` when `state` carries an `OptionalUpgradeV1` pointer to
-/// a contract not yet in `visited` — and records it in `visited`. Returns
-/// `None` when there is no pointer, or it targets an already-visited contract
-/// (a self-pointer or a cycle). Pure; the network GET is the caller's job.
-/// Extracted from `follow_upgrade_chain` so the cycle guard is unit-testable
-/// without a node (freenet/river#292).
+/// a contract that is a *genuine forward upgrade* and not yet in `visited` —
+/// and records it in `visited`. Returns `None` when:
+///   * there is no pointer;
+///   * the target is a **known** generation for this owner — the current
+///     bundled key or any known legacy/backward key (see `known_keys`). A
+///     pointer to a generation we already recognize is current-or-older, NOT a
+///     real forward upgrade, so following it can only regress to stale state
+///     (freenet/river#427); or
+///   * the target is an already-visited contract (a self-pointer or a cycle).
+///
+/// Pure; the network GET is the caller's job. Extracted from
+/// `follow_upgrade_chain` so the guards are unit-testable without a node
+/// (freenet/river#292, #427).
 fn next_upgrade_hop(
     state: &ChatRoomStateV1,
     visited: &mut HashSet<ContractInstanceId>,
+    known_keys: &HashSet<ContractInstanceId>,
 ) -> Option<ContractInstanceId> {
     let authorized_upgrade = state.upgrade.0.as_ref()?;
     let next = ContractInstanceId::new(*authorized_upgrade.upgrade.new_chatroom_address.as_bytes());
+    // A pointer to the current bundled key or to any known legacy/backward
+    // generation is not a genuine forward upgrade — refuse to follow it
+    // (freenet/river#427). Only a pointer to a generation we do NOT recognize
+    // (a WASM newer than this build bundles) is a real forward hop.
+    if known_keys.contains(&next) {
+        return None;
+    }
     // `HashSet::insert` returns false if `next` was already present — a cycle.
     visited.insert(next).then_some(next)
+}
+
+/// Fold a genuinely-forward upgrade generation's state into the authoritative
+/// base state, keeping the base authoritative (freenet/river#427).
+///
+/// The read path used to REPLACE the base (current-generation) state with the
+/// state a pointer led to (`state = next_state`). On a room whose current
+/// generation carried a *backward* pointer that poisoning had planted, that
+/// dropped every message the current key held. This instead CRDT-merges
+/// `next_state` INTO a clone of `base`, mirroring the UI (which merges a
+/// followed pointer's state into the authoritative current-key `RoomData`
+/// rather than replacing it), so a followed subset can never drop content
+/// already present on the base. On a merge failure the base is returned
+/// unchanged rather than losing it.
+fn fold_forward_upgrade_state(
+    base: &ChatRoomStateV1,
+    next_state: &ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+) -> ChatRoomStateV1 {
+    let mut merged = base.clone();
+    match merged.merge(base, params, next_state) {
+        Ok(()) => {
+            merged.recent_messages.rebuild_actions_state();
+            merged
+        }
+        Err(e) => {
+            warn!(
+                "Failed to merge forward upgrade-pointer state ({e}); keeping the \
+                 authoritative base state (freenet/river#427)"
+            );
+            base.clone()
+        }
+    }
+}
+
+/// Walk an `OptionalUpgradeV1` pointer chain forward from `id`, folding each
+/// genuinely-forward generation into the authoritative base. `fetch` supplies a
+/// generation's state (a network GET in production, a map lookup in tests), so
+/// the walk logic is unit-testable without a node.
+///
+/// The walk cursor — the state whose upgrade pointer selects the NEXT hop —
+/// advances to each **fetched** generation, NOT the merged accumulator. That is
+/// the crux of freenet/river#427 P2-1: the accumulator keeps the base's own
+/// pointer (a followed generation's onward pointer only merges when its version
+/// is strictly higher, and River stamps every pointer version 1), so reading the
+/// next hop from the accumulator would re-target the just-visited generation,
+/// the visited-set would then stop the walk, and a room 2+ generations stale
+/// would miss the newest generation. Reading the next hop from the fetched
+/// generation walks base -> gen+1 -> gen+2 -> ... -> newest correctly while the
+/// accumulator stays base-authoritative.
+///
+/// Bounded by [`MAX_UPGRADE_HOPS`] and a visited-set (cycle guard), and gated by
+/// `known_keys` so a backward/self pointer is never followed. The returned `id`
+/// is always the input `id` (the base generation): following is discovery-only,
+/// so we never return or subscribe to a non-base generation.
+async fn walk_upgrade_chain<'f>(
+    mut state: ChatRoomStateV1,
+    id: ContractInstanceId,
+    known_keys: &HashSet<ContractInstanceId>,
+    params: &ChatRoomParametersV1,
+    mut fetch: impl FnMut(
+        ContractInstanceId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<ChatRoomStateV1>> + 'f>,
+    >,
+) -> (ChatRoomStateV1, ContractInstanceId) {
+    let mut visited: HashSet<ContractInstanceId> = HashSet::new();
+    visited.insert(id);
+    // The state whose pointer selects the NEXT hop. Starts as the base and
+    // advances to each fetched generation (freenet/river#427 P2-1).
+    let mut walk_cursor = state.clone();
+    for _ in 0..MAX_UPGRADE_HOPS {
+        // `next_upgrade_hop` carries the no-pointer / known-generation /
+        // self-pointer / cycle decision (pure, unit-tested).
+        let Some(next) = next_upgrade_hop(&walk_cursor, &mut visited, known_keys) else {
+            break;
+        };
+        match fetch(next).await {
+            Some(next_state) => {
+                info!(
+                    "Followed genuine forward upgrade pointer to newer contract \
+                     generation {next}; merging (not replacing) into the base state"
+                );
+                // Merge the newer generation INTO the base (base stays
+                // authoritative; resolved id stays `id`), then advance the walk
+                // cursor to the FETCHED generation so the next hop reads ITS
+                // pointer, not the base's (freenet/river#427 P2-1).
+                state = fold_forward_upgrade_state(&state, &next_state, params);
+                walk_cursor = next_state;
+            }
+            None => break, // Pointer dangles; keep the best state we have.
+        }
+    }
+    (state, id)
+}
+
+/// Strip any `OptionalUpgradeV1` forward pointer from `state`, returning the
+/// cleaned clone (freenet/river#427).
+///
+/// The forward pointer is only meaningful on the OLD contract — it tells
+/// stragglers still on that generation where the new one lives. Carrying it
+/// FORWARD onto the new contract during migration poisons the new generation
+/// with a pointer to an older one; a client that later reads the new key then
+/// follows that pointer backward and (pre-#427) replaced fresh state with stale
+/// state. Stripping the pointer at every forward-migration PUT stops new
+/// poisoning at the source. This never removes a legitimate pointer already on
+/// the new contract: the room contract's `OptionalUpgradeV1` delta only applies
+/// a strictly-higher version, and a PUT carrying `None` emits no upgrade delta
+/// at all.
+fn strip_upgrade_pointer_for_forward_put(state: &ChatRoomStateV1) -> ChatRoomStateV1 {
+    let mut cleaned = state.clone();
+    cleaned.upgrade = OptionalUpgradeV1(None);
+    cleaned
 }
 
 /// Compute the contract key for a room from its owner verifying key.
@@ -1054,7 +1184,12 @@ impl ApiClient {
             WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
         ));
 
-        // Serialize state
+        // Serialize state. Strip any forward upgrade pointer before this FORWARD
+        // PUT onto the current bundled key: `republish` PUTs locally-stored
+        // state (which may carry an absorbed backward pointer) directly, without
+        // going through `ensure_room_migrated`, so it is another poisoning
+        // choke point (freenet/river#427 P2-3).
+        let room_state = strip_upgrade_pointer_for_forward_put(&room_state);
         let state_bytes = {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&room_state, &mut buf)
@@ -1173,7 +1308,22 @@ impl ApiClient {
         );
 
         if subscribe {
-            self.subscribe_to_contract(found_id).await?;
+            // Only ever subscribe to the CURRENT generation. `follow_upgrade_chain`
+            // and `fetch_room_state_with_recovery` already resolve `found_id` to
+            // the current key, but gate it explicitly so a future change can never
+            // subscribe to a stale/older generation reached via an upgrade pointer
+            // (freenet/river#427).
+            let current_id = *contract_key.id();
+            if found_id == current_id {
+                self.subscribe_to_contract(found_id).await?;
+            } else {
+                warn!(
+                    "Refusing to subscribe to resolved generation {found_id}: it is not the \
+                     current contract {current_id} — subscribing only to the current \
+                     generation (freenet/river#427)"
+                );
+                self.subscribe_to_contract(current_id).await?;
+            }
         }
 
         // Self-heal the "Unknown member" condition (issue freenet/river#304):
@@ -1472,33 +1622,46 @@ impl ApiClient {
     /// until a state has no upgrade pointer or a hop's target has no state.
     /// Bounded by [`MAX_UPGRADE_HOPS`] and a visited-set so a cyclic or
     /// self-referential pointer cannot loop forever (freenet/river#292, Part 3).
+    ///
+    /// Two defences against the stale-backward-pointer bug (freenet/river#427):
+    ///   * A pointer is followed only when its target is a genuine forward
+    ///     upgrade — NOT the current bundled key and NOT any known legacy
+    ///     generation for this owner (`known_keys`). A backward pointer planted
+    ///     by migration poisoning (e.g. the current generation carrying a
+    ///     pointer to an *older* one) is therefore never chased.
+    ///   * When a genuine forward pointer IS followed, the target's state is
+    ///     CRDT-**merged** into the authoritative base — mirroring the UI —
+    ///     rather than REPLACING it, so a followed subset can never drop content
+    ///     already present on the base.
+    ///
+    /// The returned `id` is always the input `id` (the base generation): like
+    /// the UI, pointer-following is discovery-only, so we never return or
+    /// subscribe to a non-base generation.
     async fn follow_upgrade_chain(
         &self,
         room_owner_key: &VerifyingKey,
-        mut state: ChatRoomStateV1,
-        mut id: ContractInstanceId,
+        state: ChatRoomStateV1,
+        id: ContractInstanceId,
     ) -> (ChatRoomStateV1, ContractInstanceId) {
-        let mut visited: HashSet<ContractInstanceId> = HashSet::new();
-        visited.insert(id);
-        for _ in 0..MAX_UPGRADE_HOPS {
-            // `next_upgrade_hop` carries the no-pointer / self-pointer / cycle
-            // decision (pure, unit-tested); the network GET is done here.
-            let Some(next) = next_upgrade_hop(&state, &mut visited) else {
-                break;
-            };
-            match self
-                .try_get_state(room_owner_key, next, UPGRADE_HOP_TIMEOUT)
-                .await
-            {
-                Some(next_state) => {
-                    info!("Followed upgrade pointer to newer contract generation {next}");
-                    state = next_state;
-                    id = next;
-                }
-                None => break, // Pointer dangles; keep the best state we have.
-            }
+        // Generations we already recognize for this owner: the current bundled
+        // key plus every known legacy key. A pointer to any of these is
+        // current-or-older and must not be followed (freenet/river#427).
+        let mut known_keys: HashSet<ContractInstanceId> = HashSet::new();
+        known_keys.insert(*self.owner_vk_to_contract_key(room_owner_key).id());
+        for legacy_key in river_core::migration::legacy_contract_keys_for_owner(room_owner_key) {
+            known_keys.insert(*legacy_key.id());
         }
-        (state, id)
+
+        let params = ChatRoomParametersV1 {
+            owner: *room_owner_key,
+        };
+
+        // The pure walk drives the cursor/merge/guard logic; this closure is the
+        // only network-bound piece (the per-hop GET).
+        walk_upgrade_chain(state, id, &known_keys, &params, |next| {
+            Box::pin(self.try_get_state(room_owner_key, next, UPGRADE_HOP_TIMEOUT))
+        })
+        .await
     }
 
     /// PUT a room state onto the *current* room contract. Used to migrate a
@@ -1518,8 +1681,12 @@ impl ApiClient {
         let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
             WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
         ));
+        // Strip any forward upgrade pointer before PUTting FORWARD onto the
+        // current contract: carrying it forward poisons the current generation
+        // with a pointer to an older one (freenet/river#427).
+        let state_to_put = strip_upgrade_pointer_for_forward_put(room_state);
         let mut state_bytes = Vec::new();
-        ciborium::ser::into_writer(room_state, &mut state_bytes)
+        ciborium::ser::into_writer(&state_to_put, &mut state_bytes)
             .map_err(|e| anyhow!("Failed to serialize room state: {e}"))?;
         let put_request = ContractRequest::Put {
             contract: contract_container,
@@ -2321,9 +2488,13 @@ impl ApiClient {
             WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
         ));
 
+        // Strip any forward upgrade pointer before PUTting FORWARD onto the new
+        // contract: carrying it forward poisons the new generation with a
+        // pointer to an older one (freenet/river#427).
+        let state_to_put = strip_upgrade_pointer_for_forward_put(room_state);
         let state_bytes = {
             let mut buf = Vec::new();
-            ciborium::ser::into_writer(room_state, &mut buf)
+            ciborium::ser::into_writer(&state_to_put, &mut buf)
                 .map_err(|e| anyhow!("Failed to serialize room state: {}", e))?;
             buf
         };
@@ -5065,16 +5236,18 @@ mod migration_recovery_tests {
     #[test]
     fn next_upgrade_hop_none_without_pointer() {
         let mut visited = HashSet::new();
-        assert!(next_upgrade_hop(&ChatRoomStateV1::default(), &mut visited).is_none());
+        let known = HashSet::new();
+        assert!(next_upgrade_hop(&ChatRoomStateV1::default(), &mut visited, &known).is_none());
     }
 
-    /// `next_upgrade_hop` follows a pointer to an unvisited contract and
-    /// records it in the visited-set.
+    /// `next_upgrade_hop` follows a pointer to an unvisited, unknown contract
+    /// (a genuine forward upgrade) and records it in the visited-set.
     #[test]
     fn next_upgrade_hop_follows_unvisited_pointer() {
         let target = [5u8; 32];
         let mut visited = HashSet::new();
-        let next = next_upgrade_hop(&state_pointing_at(target), &mut visited)
+        let known = HashSet::new();
+        let next = next_upgrade_hop(&state_pointing_at(target), &mut visited, &known)
             .expect("a pointer to a fresh contract must be followed");
         assert_eq!(next, ContractInstanceId::new(target));
         assert!(
@@ -5090,11 +5263,316 @@ mod migration_recovery_tests {
     fn next_upgrade_hop_stops_on_cycle() {
         let target = [5u8; 32];
         let mut visited = HashSet::new();
+        let known = HashSet::new();
         visited.insert(ContractInstanceId::new(target));
         assert!(
-            next_upgrade_hop(&state_pointing_at(target), &mut visited).is_none(),
+            next_upgrade_hop(&state_pointing_at(target), &mut visited, &known).is_none(),
             "a pointer back to an already-visited contract must stop the walk"
         );
+    }
+
+    /// Core regression for freenet/river#427: `next_upgrade_hop` REFUSES to
+    /// follow a pointer whose target is a KNOWN generation (the current bundled
+    /// key or a legacy/backward key). Such a pointer is current-or-older, not a
+    /// genuine forward upgrade — following it walked riverctl backward onto a
+    /// stale generation and returned the older state.
+    #[test]
+    fn next_upgrade_hop_refuses_known_backward_key() {
+        let target = [5u8; 32];
+        let target_id = ContractInstanceId::new(target);
+        // The pointer target is a KNOWN key (e.g. an older generation for this
+        // owner). Even though it is unvisited, it must not be followed.
+        let mut known = HashSet::new();
+        known.insert(target_id);
+        let mut visited = HashSet::new();
+        assert!(
+            next_upgrade_hop(&state_pointing_at(target), &mut visited, &known).is_none(),
+            "a pointer to a known (current-or-legacy) generation must NOT be followed"
+        );
+        assert!(
+            !visited.contains(&target_id),
+            "a refused known-key hop must not be recorded as visited"
+        );
+    }
+
+    /// Build a minimal owner-signed `ChatRoomStateV1` carrying the given
+    /// owner-authored public messages. Owner-authored messages survive
+    /// `post_apply_cleanup` (`author == owner_id`), so no explicit membership is
+    /// needed for them to persist through a merge.
+    fn owner_state_with_messages(owner_sk: &SigningKey, texts: &[&str]) -> ChatRoomStateV1 {
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let owner_vk = owner_sk.verifying_key();
+        let config = Configuration {
+            owner_member_id: owner_vk.into(),
+            ..Default::default()
+        };
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(config, owner_sk),
+            ..Default::default()
+        };
+        for (i, text) in texts.iter().enumerate() {
+            let message = MessageV1 {
+                room_owner: owner_vk.into(),
+                author: MemberId::from(&owner_vk),
+                content: RoomMessageBody::public((*text).to_string()),
+                time: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(i as u64),
+            };
+            state
+                .recent_messages
+                .messages
+                .push(AuthorizedMessageV1::new(message, owner_sk));
+        }
+        state.recent_messages.rebuild_actions_state();
+        state
+    }
+
+    /// Following a genuine forward pointer MERGES the followed state into the
+    /// authoritative base instead of REPLACING it (freenet/river#427): a message
+    /// present on the base survives even when the followed state lacks it. The
+    /// pre-#427 `state = next_state` would have dropped it.
+    #[test]
+    fn fold_forward_upgrade_state_keeps_base_messages() {
+        let owner_sk = SigningKey::from_bytes(&[42u8; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+
+        // Base (current generation) holds a message the followed state lacks.
+        let base = owner_state_with_messages(&owner_sk, &["on the current key"]);
+        // Followed (pointer target) has the same owner/config but NO messages.
+        let followed = owner_state_with_messages(&owner_sk, &[]);
+
+        let merged = fold_forward_upgrade_state(&base, &followed, &params);
+
+        let texts: Vec<String> = merged
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| message_display_text(&merged, m))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "on the current key"),
+            "merge must preserve the base-key message the followed state lacked; got {texts:?}"
+        );
+    }
+
+    /// The merge also ADDS content the followed (newer) generation carries that
+    /// the base lacks — a genuine forward upgrade's new messages are not lost.
+    #[test]
+    fn fold_forward_upgrade_state_adds_followed_messages() {
+        let owner_sk = SigningKey::from_bytes(&[43u8; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let base = owner_state_with_messages(&owner_sk, &["base msg"]);
+        let followed = owner_state_with_messages(&owner_sk, &["base msg", "followed msg"]);
+
+        let merged = fold_forward_upgrade_state(&base, &followed, &params);
+
+        let texts: Vec<String> = merged
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| message_display_text(&merged, m))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "base msg"),
+            "merge must keep the base message; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "followed msg"),
+            "merge must add the followed generation's new message; got {texts:?}"
+        );
+    }
+
+    /// The forward-migration PUT strips the upgrade pointer (freenet/river#427):
+    /// the state PUT onto the new/current contract must carry `upgrade = None`,
+    /// so migration never carries a stale forward/backward pointer forward.
+    #[test]
+    fn strip_upgrade_pointer_for_forward_put_clears_pointer() {
+        let poisoned = state_pointing_at([5u8; 32]);
+        assert!(
+            poisoned.upgrade.0.is_some(),
+            "precondition: the source state carries an upgrade pointer"
+        );
+        let cleaned = strip_upgrade_pointer_for_forward_put(&poisoned);
+        assert!(
+            cleaned.upgrade.0.is_none(),
+            "the forward-migration PUT payload must carry no upgrade pointer"
+        );
+    }
+
+    /// Stripping is a no-op on a state that already has no pointer — the rest of
+    /// the state is untouched.
+    #[test]
+    fn strip_upgrade_pointer_for_forward_put_noop_without_pointer() {
+        let owner_sk = SigningKey::from_bytes(&[44u8; 32]);
+        let state = owner_state_with_messages(&owner_sk, &["hi"]);
+        assert!(state.upgrade.0.is_none());
+        let cleaned = strip_upgrade_pointer_for_forward_put(&state);
+        assert!(cleaned.upgrade.0.is_none());
+        assert_eq!(
+            cleaned.recent_messages.messages.len(),
+            1,
+            "stripping must not disturb the rest of the state"
+        );
+    }
+
+    /// Build an owner-signed upgrade pointer to `target`.
+    fn pointer_to(owner_sk: &SigningKey, target: [u8; 32]) -> OptionalUpgradeV1 {
+        use river_core::room_state::upgrade::{AuthorizedUpgradeV1, UpgradeV1};
+        let upgrade = UpgradeV1 {
+            owner_member_id: MemberId::from(&owner_sk.verifying_key()),
+            version: 1,
+            new_chatroom_address: blake3::Hash::from(target),
+        };
+        OptionalUpgradeV1(Some(AuthorizedUpgradeV1::new(upgrade, owner_sk)))
+    }
+
+    /// P2-1 (freenet/river#427): a multi-generation forward chain
+    /// base -> gen+1 -> gen+2 is walked ALL the way to the newest generation,
+    /// merging every generation's content into the authoritative base. The
+    /// pre-P2-1 bug read the next hop from the merged accumulator (which keeps
+    /// the base's own pointer, since a lower-version onward pointer does not
+    /// merge in), so the visited-set stopped the walk after gen+1 and gen+2's
+    /// content was lost — the same stale-list symptom on a 2+-generation-stale
+    /// riverctl. Advancing the cursor from the FETCHED generation fixes it.
+    #[tokio::test]
+    async fn walk_upgrade_chain_follows_multi_generation_forward_chain() {
+        let owner_sk = SigningKey::from_bytes(&[71u8; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+
+        let base_bytes = [10u8; 32];
+        let gen1_bytes = [11u8; 32];
+        let gen2_bytes = [12u8; 32];
+        let base_id = ContractInstanceId::new(base_bytes);
+        let gen1_id = ContractInstanceId::new(gen1_bytes);
+        let gen2_id = ContractInstanceId::new(gen2_bytes);
+
+        // base -> gen1 -> gen2 (gen2 terminates). Each carries its own message.
+        let mut base = owner_state_with_messages(&owner_sk, &["base msg"]);
+        base.upgrade = pointer_to(&owner_sk, gen1_bytes);
+        let mut gen1 = owner_state_with_messages(&owner_sk, &["gen1 msg"]);
+        gen1.upgrade = pointer_to(&owner_sk, gen2_bytes);
+        let gen2 = owner_state_with_messages(&owner_sk, &["gen2 msg"]);
+
+        let states: HashMap<ContractInstanceId, ChatRoomStateV1> =
+            HashMap::from([(gen1_id, gen1), (gen2_id, gen2)]);
+
+        // gen1/gen2 are unknown, newer-than-current generations → genuine
+        // forward hops. base_id is the starting cursor.
+        let known_keys: HashSet<ContractInstanceId> = HashSet::new();
+
+        let (merged, resolved_id) =
+            walk_upgrade_chain(base, base_id, &known_keys, &params, |next| {
+                let s = states.get(&next).cloned();
+                Box::pin(std::future::ready(s))
+            })
+            .await;
+
+        // Discovery-only: the resolved id stays the base generation.
+        assert_eq!(
+            resolved_id, base_id,
+            "the resolved id must stay the base generation (discovery-only follow)"
+        );
+
+        let texts: Vec<String> = merged
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| message_display_text(&merged, m))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "base msg"),
+            "base content must be kept; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "gen1 msg"),
+            "gen+1 content must be merged in; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "gen2 msg"),
+            "gen+2 content must be merged in — the walk must reach the newest \
+             generation, not stall after gen+1; got {texts:?}"
+        );
+    }
+
+    /// A backward pointer at the head of the chain is still refused even by the
+    /// multi-hop walk: `known_keys` (current + legacy) gates every hop.
+    #[tokio::test]
+    async fn walk_upgrade_chain_refuses_backward_head_pointer() {
+        let owner_sk = SigningKey::from_bytes(&[72u8; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let base_bytes = [20u8; 32];
+        let legacy_bytes = [21u8; 32];
+        let base_id = ContractInstanceId::new(base_bytes);
+        let legacy_id = ContractInstanceId::new(legacy_bytes);
+
+        // base carries a BACKWARD pointer to a known legacy generation.
+        let mut base = owner_state_with_messages(&owner_sk, &["fresh current msg"]);
+        base.upgrade = pointer_to(&owner_sk, legacy_bytes);
+        // The legacy generation holds only stale/older content.
+        let legacy = owner_state_with_messages(&owner_sk, &["stale older msg"]);
+        let states: HashMap<ContractInstanceId, ChatRoomStateV1> =
+            HashMap::from([(legacy_id, legacy)]);
+
+        // legacy_id is a KNOWN generation for this owner.
+        let known_keys: HashSet<ContractInstanceId> = HashSet::from([legacy_id]);
+
+        let (result, resolved_id) =
+            walk_upgrade_chain(base, base_id, &known_keys, &params, |next| {
+                let s = states.get(&next).cloned();
+                Box::pin(std::future::ready(s))
+            })
+            .await;
+
+        assert_eq!(resolved_id, base_id);
+        let texts: Vec<String> = result
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| message_display_text(&result, m))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "fresh current msg"),
+            "the fresh current-key content must be returned; got {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == "stale older msg"),
+            "the backward pointer must NOT be followed to the stale generation; got {texts:?}"
+        );
+    }
+
+    /// P2-3 + root-fix pin (freenet/river#427): every FORWARD-PUT choke point
+    /// strips the upgrade pointer before its PUT. Guards against a future PUT
+    /// site (or a refactor) silently dropping the strip and re-introducing
+    /// poisoning of the current generation.
+    #[test]
+    fn forward_put_sites_strip_upgrade_pointer() {
+        let src = include_str!("api.rs");
+        for fn_name in [
+            "async fn migrate_room_to_new_contract",
+            "async fn put_room_state",
+            "pub async fn republish_room",
+        ] {
+            let fn_start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("could not find `{fn_name}` in api.rs"));
+            let rest = &src[fn_start..];
+            let put_at = rest
+                .find("ContractRequest::Put")
+                .unwrap_or_else(|| panic!("`{fn_name}` has no ContractRequest::Put"));
+            assert!(
+                rest[..put_at].contains("strip_upgrade_pointer_for_forward_put"),
+                "`{fn_name}` must call strip_upgrade_pointer_for_forward_put before its \
+                 forward PUT (freenet/river#427)"
+            );
+        }
     }
 }
 

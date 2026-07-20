@@ -1367,6 +1367,14 @@ async fn put_state_to_current_key(
     state: ChatRoomStateV1,
     label: &str,
 ) {
+    // Strip any forward upgrade pointer before PUTting FORWARD onto the current
+    // contract: the pointer is only meaningful on the OLD contract, and carrying
+    // it forward poisons the current generation with a pointer to an older one —
+    // which a later reader then follows backward onto stale state
+    // (freenet/river#427). This never clobbers a legitimate pointer already on
+    // the current key: a PUT carrying `None` emits no `OptionalUpgradeV1` delta.
+    let state = crate::util::strip_upgrade_pointer(&state);
+
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
     let parameters = ChatRoomParametersV1 { owner: owner_vk };
     let params_bytes = to_cbor_vec(&parameters);
