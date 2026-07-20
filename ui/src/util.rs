@@ -344,6 +344,30 @@ pub fn to_cbor_vec<T: serde::Serialize>(value: &T) -> Vec<u8> {
     buffer
 }
 
+/// Return a clone of `state` with any `OptionalUpgradeV1` forward pointer
+/// removed (freenet/river#427).
+///
+/// Call this before every FORWARD write of room state onto the CURRENT
+/// contract — the migration/backward-probe PUT (`put_state_to_current_key`),
+/// the generic sync UPDATE (via `compute_update_data`), and the imported-room
+/// seed PUT. The upgrade pointer is only meaningful on the OLD contract (it
+/// tells stragglers where the new generation lives); carrying it forward poisons
+/// the current generation with a pointer to an *older* one, which a later reader
+/// then follows backward onto stale state. A device that absorbed the owner's
+/// courtesy pointer while on an older generation keeps it locally (an incoming
+/// `None` emits no delta, so the local pointer survives), so without this every
+/// sync tick re-poisons the current key. Stripping to `None` emits no upgrade
+/// delta, so it never clobbers a legitimate pointer already on the target — and
+/// the one legitimate publish, the owner's pointer on the OLD contract, goes
+/// through a dedicated path that does NOT use this helper.
+pub fn strip_upgrade_pointer(
+    state: &river_core::room_state::ChatRoomStateV1,
+) -> river_core::room_state::ChatRoomStateV1 {
+    let mut cleaned = state.clone();
+    cleaned.upgrade = river_core::room_state::upgrade::OptionalUpgradeV1(None);
+    cleaned
+}
+
 pub fn from_cbor_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> T {
     ciborium::de::from_reader(data).unwrap()
 }

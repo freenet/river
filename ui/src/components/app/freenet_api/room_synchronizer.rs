@@ -14,7 +14,7 @@ use crate::components::app::sync_info::{now_ms, RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
-use crate::util::{owner_vk_to_contract_key, to_cbor_vec};
+use crate::util::{owner_vk_to_contract_key, strip_upgrade_pointer, to_cbor_vec};
 use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -39,12 +39,22 @@ fn compute_update_data(
     baseline: Option<&ChatRoomStateV1>,
     params: &ChatRoomParametersV1,
 ) -> Option<UpdateData<'static>> {
+    // Sanitize the upgrade pointer OUT of every generic sync write
+    // (freenet/river#427 P2-2). The ONLY legitimate upgrade publish is the
+    // owner's pointer on the OLD contract, sent via a dedicated path in
+    // `process_rooms`. A device that absorbed the owner's courtesy pointer while
+    // on an older generation keeps it locally, and without this the composite
+    // delta (or the full-state fallback) would re-emit that (now backward)
+    // pointer onto the current contract on every sync tick, re-poisoning it. A
+    // stripped `state.upgrade == None` makes `OptionalUpgradeV1::delta` return
+    // None, so no upgrade sub-delta is ever emitted here.
+    let state = strip_upgrade_pointer(state);
     if let Some(baseline) = baseline {
         let summary = baseline.summarize(baseline, params);
         let delta = state.delta(baseline, params, &summary)?;
         Some(UpdateData::Delta(to_cbor_vec(&delta).into()))
     } else {
-        Some(UpdateData::State(to_cbor_vec(state).into()))
+        Some(UpdateData::State(to_cbor_vec(&state).into()))
     }
 }
 
@@ -637,7 +647,11 @@ impl RoomSynchronizer {
                     WrappedContract::new(Arc::new(contract_code), parameters),
                 ));
 
-                let wrapped_state = WrappedState::new(to_cbor_vec(state));
+                // Strip any absorbed upgrade pointer before this FORWARD seed PUT
+                // onto the current contract, so an imported room that carried a
+                // backward pointer does not poison the current generation
+                // (freenet/river#427 P2-2).
+                let wrapped_state = WrappedState::new(to_cbor_vec(&strip_upgrade_pointer(state)));
 
                 info!(
                     "Preparing PutRequest for room {:?} with contract ID: {}",
@@ -1581,6 +1595,108 @@ mod tests {
             "delta ({} bytes) should be smaller than full state ({} bytes)",
             delta_size,
             full_size
+        );
+    }
+
+    /// Build an owner-signed upgrade pointer to `target` (for #427 P2-2 tests).
+    fn owner_upgrade_pointer(
+        owner_sk: &SigningKey,
+        target: [u8; 32],
+    ) -> river_core::room_state::upgrade::OptionalUpgradeV1 {
+        use river_core::room_state::upgrade::{AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1};
+        let upgrade = UpgradeV1 {
+            owner_member_id: MemberId::from(&owner_sk.verifying_key()),
+            version: 1,
+            new_chatroom_address: blake3::Hash::from(target),
+        };
+        OptionalUpgradeV1(Some(AuthorizedUpgradeV1::new(upgrade, owner_sk)))
+    }
+
+    /// P2-2 (freenet/river#427): the composite sync DELTA never carries an
+    /// upgrade pointer, even when the local state absorbed one — otherwise every
+    /// sync tick would re-emit the (now backward) pointer onto the current
+    /// contract, re-poisoning it. Real changes (the new message) still ship.
+    #[test]
+    fn compute_update_data_delta_omits_upgrade_pointer() {
+        let (baseline, params, owner_sk) = create_test_room();
+        let mut current = baseline.clone();
+        add_message(&mut current, &owner_sk, "hello");
+        current.upgrade = owner_upgrade_pointer(&owner_sk, [9u8; 32]);
+
+        let data = compute_update_data(&current, Some(&baseline), &params)
+            .expect("a changed state must yield an update");
+        let UpdateData::Delta(bytes) = data else {
+            panic!("expected a delta");
+        };
+        let delta: ChatRoomStateV1Delta =
+            ciborium::de::from_reader(bytes.as_ref()).expect("delta must decode");
+        assert!(
+            delta.upgrade.is_none(),
+            "the composite sync delta must NOT carry an upgrade pointer (#427 P2-2)"
+        );
+        assert!(
+            delta.recent_messages.is_some(),
+            "the real change (the new message) must still ship in the delta"
+        );
+    }
+
+    /// P2-2: the full-state sync fallback (no baseline) also strips the upgrade
+    /// pointer, while preserving the rest of the state.
+    #[test]
+    fn compute_update_data_state_omits_upgrade_pointer() {
+        let (mut current, params, owner_sk) = create_test_room();
+        add_message(&mut current, &owner_sk, "hello");
+        current.upgrade = owner_upgrade_pointer(&owner_sk, [9u8; 32]);
+
+        let data = compute_update_data(&current, None, &params).expect("full state");
+        let UpdateData::State(bytes) = data else {
+            panic!("expected a full state");
+        };
+        let state: ChatRoomStateV1 =
+            ciborium::de::from_reader(bytes.as_ref()).expect("state must decode");
+        assert!(
+            state.upgrade.0.is_none(),
+            "the full-state sync must NOT carry an upgrade pointer (#427 P2-2)"
+        );
+        assert_eq!(
+            state.recent_messages.messages.len(),
+            1,
+            "the message must survive the strip"
+        );
+    }
+
+    /// P2-2: the shared strip helper clears the pointer and leaves the rest of
+    /// the state intact.
+    #[test]
+    fn strip_upgrade_pointer_clears_pointer() {
+        let (mut current, _params, owner_sk) = create_test_room();
+        add_message(&mut current, &owner_sk, "hi");
+        current.upgrade = owner_upgrade_pointer(&owner_sk, [9u8; 32]);
+        assert!(current.upgrade.0.is_some());
+
+        let cleaned = strip_upgrade_pointer(&current);
+        assert!(cleaned.upgrade.0.is_none());
+        assert_eq!(cleaned.recent_messages.messages.len(), 1);
+    }
+
+    /// P2-2 source pin (freenet/river#427): the forward-write discipline in
+    /// `process_rooms`. The imported-room seed PUT strips the pointer, while the
+    /// ONE legitimate publish — the owner's pointer on the OLD contract — is
+    /// left intact. A future refactor dropping the strip, or accidentally
+    /// stripping the owner publish, would silently re-regress. We cannot drive
+    /// the async signal path in a unit test, so this is a source-text pin
+    /// (mirrors `apply_delta_inner_revives_hidden_thread_for_inbound_dm_sender`).
+    #[test]
+    fn forward_write_upgrade_pointer_discipline_pinned() {
+        let src = include_str!("room_synchronizer.rs");
+        assert!(
+            src.contains("to_cbor_vec(&strip_upgrade_pointer(state))"),
+            "the imported-room seed PUT must strip the upgrade pointer (#427 P2-2)"
+        );
+        assert!(
+            src.contains("upgrade: Some(authorized_upgrade)"),
+            "the owner-only OLD-contract upgrade delta must still publish the pointer \
+             (the one legitimate publish — #427 P2-2)"
         );
     }
 
