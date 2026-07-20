@@ -529,6 +529,41 @@ impl Storage {
     ///
     /// Returns `RefusedNeedsForce` (nothing written) when a DIFFERENT-or-same
     /// identity already exists and `force` is false; otherwise `Imported`.
+    ///
+    /// COMPILE-TIME CLASSIFICATION PIN (Fable architectural review): the
+    /// exhaustive destructure below has NO `..`, so ADDING A FIELD to
+    /// [`StoredRoomInfo`] FAILS COMPILATION here until a maintainer classifies its
+    /// OVERWRITE verb in the arm above. This is the forcing function that prevents
+    /// the round-11 `previous_contract_key` clobber class (a new field silently
+    /// defaulted in a fresh literal). Verb table:
+    ///
+    /// ```text
+    /// signing_key_bytes      REPLACE (the imported identity)
+    /// state                  KEEP    (get_room re-syncs; a concurrent newer stored
+    ///                                 state must not be clobbered by the pre-lock
+    ///                                 GET snapshot)
+    /// contract_key           KEEP    (load_rooms_unlocked regenerates it + keeps
+    ///                                 the previous_contract_key pairing)
+    /// self_authorized_member \ MERGE-same-key / REPLACE-different-key
+    /// invite_chain           / (paired coherent unit)
+    /// previous_contract_key  KEEP    (room-scoped #292 migration pointer)
+    /// invitation_secrets     MERGE-same-key (union, existing wins) / REPLACE-diff
+    /// self_nickname          MERGE-same-key (keep-if-absent) / REPLACE-different
+    /// ```
+    #[allow(dead_code)]
+    fn _stored_room_info_overwrite_classification(r: StoredRoomInfo) {
+        let StoredRoomInfo {
+            signing_key_bytes: _,
+            state: _,
+            contract_key: _,
+            self_authorized_member: _,
+            invite_chain: _,
+            previous_contract_key: _,
+            invitation_secrets: _,
+            self_nickname: _,
+        } = r;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn import_room_atomic(
         &self,
@@ -562,33 +597,29 @@ impl Storage {
             }
             let identity_changed = old_key.is_some_and(|k| k != signing_key.to_bytes());
 
-            // Assemble the incoming identity metadata.
+            // Assemble the incoming IDENTITY metadata. The four-verb table
+            // (`_stored_room_info_overwrite_classification` pins it at compile time):
+            //   signing_key_bytes     → REPLACE (the imported identity)
+            //   self_authorized_member} → MERGE-same-key / REPLACE-diff (paired unit)
+            //   invite_chain          }
+            //   invitation_secrets    → MERGE-same-key (union, existing wins) / REPLACE
+            //   self_nickname         → MERGE-same-key (keep-if-absent) / REPLACE
+            // ROOM-scoped fields (state, contract_key, previous_contract_key) are
+            // KEPT and are handled by the OVERWRITE arm's in-place mutation below.
             let mut invitation_secrets = invitation_secrets;
             let mut self_nickname = self_nickname.map(str::to_string);
             let mut invite_chain = invite_chain.to_vec();
             let mut self_authorized_member = Some(authorized_member.clone());
-            // `previous_contract_key` is ROOM-scoped, NOT identity-scoped: it is the
-            // freenet/river#292 room-contract migration pointer (`ensure_room_migrated`
-            // can leave it set after a failed old-state merge while still returning
-            // the current key, so a later command retries the merge). The import
-            // never carries a new one, so preserve the stored value on ANY overwrite
-            // (same-key OR different-key) — clearing it would prevent the retry and
-            // can strand state that exists only under the previous contract
-            // generation (Codex round-11 P1).
-            let mut previous_contract_key = None;
 
             // Same-key re-import over an existing room (`was_overwrite &&
             // !identity_changed`): the incoming token may be a legacy/stale export
-            // that decodes optional fields as ABSENT/EMPTY. GENERAL RULE (Codex
-            // round-7/8): for EVERY field the token may carry absent/stale, RETAIN
-            // the stored value rather than overwrite it with an empty one — a
-            // genuine identity change instead REPLACES (old identity's metadata
-            // must not carry forward).
-            if let Some(old) = storage.rooms.get(&owner_key_str) {
-                // Room-scoped, so preserved regardless of identity change.
-                previous_contract_key = old.previous_contract_key.clone();
-
-                if !identity_changed {
+            // that decodes optional fields as ABSENT/EMPTY. RETAIN the stored value
+            // rather than overwrite it with an empty one (round-7/8). A genuine
+            // identity change instead REPLACES (old identity's metadata must not
+            // carry forward). Computed against an IMMUTABLE borrow of the stored
+            // record so the OVERWRITE mutation below can take a fresh `get_mut`.
+            if was_overwrite && !identity_changed {
+                if let Some(old) = storage.rooms.get(&owner_key_str) {
                     // invitation_secrets: merge, existing wins — the stored map may
                     // be the ONLY copy of a private room's key, so an empty token
                     // must not wipe it (history would become unreadable, round-7).
@@ -614,22 +645,44 @@ impl Storage {
                 }
             }
 
-            // Build the FULL record in one shot (matches the fields
-            // `add_room_with_invitation_secrets` + `store_authorized_member` +
-            // `update_self_nickname` would set across three separate locks).
-            storage.rooms.insert(
-                owner_key_str.clone(),
-                StoredRoomInfo {
-                    signing_key_bytes: signing_key.to_bytes(),
-                    state,
-                    contract_key: contract_key.id().to_string(),
-                    self_authorized_member,
-                    invite_chain,
-                    previous_contract_key,
-                    invitation_secrets,
-                    self_nickname,
-                },
-            );
+            if let Some(existing) = storage.rooms.get_mut(&owner_key_str) {
+                // OVERWRITE arm — MUTATE IN PLACE. Only the identity fields are
+                // re-assigned; the ROOM-scoped fields are KEPT by never touching
+                // them (this is what makes the field classification robust — a new
+                // field isn't silently defaulted to a fresh literal):
+                //   - `state` KEEP — the `state` param is the PRE-LOCK network-GET
+                //     snapshot (identity.rs); a concurrent riverctl that persisted
+                //     newer state between that GET and this lock must NOT be
+                //     clobbered by the stale snapshot. `get_room` re-syncs from the
+                //     network anyway, so KEEP is safe (round-12 live-bug fix).
+                //   - `contract_key` KEEP — `load_rooms_unlocked` regenerates it
+                //     under the lock and maintains the `previous_contract_key`
+                //     pairing; the import site doesn't.
+                //   - `previous_contract_key` KEEP — room-scoped #292 migration
+                //     pointer (round-11).
+                existing.signing_key_bytes = signing_key.to_bytes();
+                existing.self_authorized_member = self_authorized_member;
+                existing.invite_chain = invite_chain;
+                existing.invitation_secrets = invitation_secrets;
+                existing.self_nickname = self_nickname;
+            } else {
+                // NEW-room arm — a brand-new room writes the fetched `state`,
+                // regenerated `contract_key`, and no migration pointer. Correct for
+                // a room this client has never seen.
+                storage.rooms.insert(
+                    owner_key_str.clone(),
+                    StoredRoomInfo {
+                        signing_key_bytes: signing_key.to_bytes(),
+                        state,
+                        contract_key: contract_key.id().to_string(),
+                        self_authorized_member,
+                        invite_chain,
+                        previous_contract_key: None,
+                        invitation_secrets,
+                        self_nickname,
+                    },
+                );
+            }
             self.save_rooms_unlocked(&storage)?;
 
             // Swapping to a DIFFERENT identity: prune the OLD identity's DM cache
@@ -2404,6 +2457,95 @@ mod tests {
             previous_of(&storage).as_deref(),
             Some("prev-migration-key"),
             "different-key --force must ALSO preserve previous_contract_key (room-scoped)"
+        );
+    }
+
+    /// freenet/river#414 (Fable review, round-12 live bug): the OVERWRITE arm
+    /// mutates in place and KEEPS the stored `state`. It must NOT write the
+    /// pre-lock network-GET snapshot passed by `import_identity`, or a concurrent
+    /// riverctl that persisted NEWER state between that GET and this lock would be
+    /// clobbered by the stale snapshot.
+    #[test]
+    fn import_room_atomic_overwrite_keeps_stored_state() {
+        use river_core::room_state::member::Member;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let key = expected_contract_key(&owner_vk);
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let member_for = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_vk.into(),
+                    invited_by: owner_vk.into(),
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+
+        // Store the room (initial state has no members).
+        let identity = create_test_signing_key();
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+
+        // Simulate a concurrent riverctl persisting NEWER state (a member added)
+        // between the pre-lock GET snapshot and our --force lock.
+        let newer_member = member_for(&create_test_signing_key());
+        {
+            let mut rs = storage.load_rooms().unwrap();
+            rs.rooms
+                .get_mut(&owner_key_str)
+                .unwrap()
+                .state
+                .members
+                .members
+                .push(newer_member.clone());
+            storage.save_rooms(&rs).unwrap();
+        }
+
+        // A --force overwrite whose `state` arg is a STALE snapshot (the plain
+        // create_test_state, WITHOUT the newer member).
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+
+        // The newer stored state must SURVIVE (KEEP), not be clobbered by the
+        // stale pre-lock snapshot.
+        let after = storage.load_rooms().unwrap();
+        let members = &after.rooms[&owner_key_str].state.members.members;
+        assert_eq!(
+            members.len(),
+            1,
+            "overwrite must KEEP the stored state, not clobber it with the pre-lock snapshot"
+        );
+        assert!(
+            members
+                .iter()
+                .any(|m| m.member.member_vk == newer_member.member.member_vk),
+            "the concurrently-persisted newer member must survive the --force overwrite"
         );
     }
 

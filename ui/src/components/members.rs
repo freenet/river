@@ -1038,6 +1038,51 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
     }
 }
 
+/// COMPILE-TIME CLASSIFICATION PIN (Fable architectural review): the exhaustive
+/// destructure below has NO `..`, so ADDING A FIELD to `RoomData` FAILS
+/// COMPILATION here until a maintainer classifies its identity-overwrite verb in
+/// [`swap_room_identity_in_place`]. This is the forcing function that prevents
+/// the field-clobber class of bugs (a new field silently kept/defaulted without a
+/// decision). Verb table — KEEP / REPLACE / MERGE-same-key / CLEAR+RECOMPUTE:
+///
+/// ```text
+/// owner_vk                KEEP (the room owner; identity-independent)
+/// room_state              KEEP (identity-independent shared contract state)
+/// self_sk                 REPLACE (the imported identity)
+/// contract_key            KEEP (owner+WASM derived)
+/// last_read_message_id    KEEP (local read-tracking preference)
+/// secrets                 CLEAR+RECOMPUTE different-key (repopulate_secrets_from_state) / KEEP same-key
+/// current_secret_version  CLEAR+RECOMPUTE different-key / KEEP same-key
+/// last_secret_rotation    CLEAR different-key / KEEP same-key
+/// key_migrated_to_delegate REPLACE (false — the new key isn't migrated yet)
+/// self_authorized_member  \ REPLACE different-key / MERGE-keep-if-absent same-key
+/// invite_chain            / (paired coherent unit)
+/// self_member_info        REPLACE different-key / MERGE-keep-newer same-key
+/// self_nickname           REPLACE different-key / MERGE-keep-if-absent same-key
+/// previous_contract_key   KEEP (room-scoped #292 migration pointer)
+/// invitation_secrets      REPLACE different-key / MERGE-union(existing wins) same-key
+/// ```
+#[allow(dead_code)]
+fn _room_data_swap_classification(rd: crate::room_data::RoomData) {
+    let crate::room_data::RoomData {
+        owner_vk: _,
+        room_state: _,
+        self_sk: _,
+        contract_key: _,
+        last_read_message_id: _,
+        secrets: _,
+        current_secret_version: _,
+        last_secret_rotation: _,
+        key_migrated_to_delegate: _,
+        self_authorized_member: _,
+        invite_chain: _,
+        self_member_info: _,
+        self_nickname: _,
+        previous_contract_key: _,
+        invitation_secrets: _,
+    } = rd;
+}
+
 /// Merge two optional `AuthorizedMemberInfo` records, keeping the HIGHER-version
 /// one (a same-key re-import must not let a stale token clobber a newer local
 /// member_info; an absent incoming keeps local). Ties keep `local`.
