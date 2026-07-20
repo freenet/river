@@ -567,6 +567,15 @@ impl Storage {
             let mut self_nickname = self_nickname.map(str::to_string);
             let mut invite_chain = invite_chain.to_vec();
             let mut self_authorized_member = Some(authorized_member.clone());
+            // `previous_contract_key` is ROOM-scoped, NOT identity-scoped: it is the
+            // freenet/river#292 room-contract migration pointer (`ensure_room_migrated`
+            // can leave it set after a failed old-state merge while still returning
+            // the current key, so a later command retries the merge). The import
+            // never carries a new one, so preserve the stored value on ANY overwrite
+            // (same-key OR different-key) — clearing it would prevent the retry and
+            // can strand state that exists only under the previous contract
+            // generation (Codex round-11 P1).
+            let mut previous_contract_key = None;
 
             // Same-key re-import over an existing room (`was_overwrite &&
             // !identity_changed`): the incoming token may be a legacy/stale export
@@ -575,8 +584,11 @@ impl Storage {
             // the stored value rather than overwrite it with an empty one — a
             // genuine identity change instead REPLACES (old identity's metadata
             // must not carry forward).
-            if was_overwrite && !identity_changed {
-                if let Some(old) = storage.rooms.get(&owner_key_str) {
+            if let Some(old) = storage.rooms.get(&owner_key_str) {
+                // Room-scoped, so preserved regardless of identity change.
+                previous_contract_key = old.previous_contract_key.clone();
+
+                if !identity_changed {
                     // invitation_secrets: merge, existing wins — the stored map may
                     // be the ONLY copy of a private room's key, so an empty token
                     // must not wipe it (history would become unreadable, round-7).
@@ -613,7 +625,7 @@ impl Storage {
                     contract_key: contract_key.id().to_string(),
                     self_authorized_member,
                     invite_chain,
-                    previous_contract_key: None,
+                    previous_contract_key,
                     invitation_secrets,
                     self_nickname,
                 },
@@ -2290,6 +2302,108 @@ mod tests {
         assert!(
             info.self_authorized_member.is_some(),
             "the stored membership proof must survive a stale same-key re-import"
+        );
+    }
+
+    /// freenet/river#414 (Codex round-11 P1): `previous_contract_key` is
+    /// ROOM-scoped (the #292 room-contract migration pointer), not
+    /// identity-scoped. An overwrite import must carry the STORED value forward —
+    /// on BOTH same-key AND different-key overwrites — instead of clearing it,
+    /// else a pending contract-migration retry is lost and state under the
+    /// previous generation can be stranded.
+    #[test]
+    fn import_room_atomic_preserves_previous_contract_key() {
+        use river_core::room_state::member::Member;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let key = expected_contract_key(&owner_vk);
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let member_for = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_vk.into(),
+                    invited_by: owner_vk.into(),
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+        let previous_of = |s: &Storage| {
+            s.load_rooms()
+                .unwrap()
+                .rooms
+                .get(&owner_key_str)
+                .unwrap()
+                .previous_contract_key
+                .clone()
+        };
+
+        let identity = create_test_signing_key();
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+
+        // Simulate a pending #292 room-contract migration pointer on the record.
+        {
+            let mut rs = storage.load_rooms().unwrap();
+            rs.rooms
+                .get_mut(&owner_key_str)
+                .unwrap()
+                .previous_contract_key = Some("prev-migration-key".to_string());
+            storage.save_rooms(&rs).unwrap();
+        }
+
+        // SAME-key --force overwrite: the pointer must survive.
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            previous_of(&storage).as_deref(),
+            Some("prev-migration-key"),
+            "same-key --force must preserve previous_contract_key (room-scoped)"
+        );
+
+        // DIFFERENT-key --force overwrite: room-scoped, so it must ALSO survive.
+        let new_identity = create_test_signing_key();
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&new_identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            previous_of(&storage).as_deref(),
+            Some("prev-migration-key"),
+            "different-key --force must ALSO preserve previous_contract_key (room-scoped)"
         );
     }
 
