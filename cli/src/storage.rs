@@ -80,6 +80,23 @@ pub struct RoomStorage {
     pub rooms: HashMap<String, StoredRoomInfo>,
 }
 
+/// Result of [`Storage::import_room_atomic`] (freenet/river#414, Codex round-6
+/// P1-5). Reported back so the caller can print the right message without
+/// re-reading disk (and so the atomic decision — made INSIDE the lock — is the
+/// authoritative one, not the pre-GET snapshot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// A room already existed and `force` was false — nothing was written.
+    RefusedNeedsForce,
+    /// The room was inserted/replaced. `was_overwrite` = an entry existed
+    /// before; `identity_changed` = the replaced signing key differed (so the
+    /// old identity's DM cache was pruned in the same lock).
+    Imported {
+        was_overwrite: bool,
+        identity_changed: bool,
+    },
+}
+
 /// Local on-disk persistence for riverctl (`rooms.json` + `outbound_dms.json`).
 ///
 /// **Concurrency model (issue freenet/river#307).** riverctl is a CLI invoked
@@ -259,6 +276,24 @@ impl Storage {
     /// key itself. See the field doc on [`Storage::signing_key_override`].
     pub fn has_signing_key_override(&self) -> bool {
         self.signing_key_override.is_some()
+    }
+
+    /// The RAW persisted `signing_key_bytes` for a room, ignoring any
+    /// `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` override that
+    /// [`Self::get_room`]'s `resolve_signing_key` would apply.
+    ///
+    /// Used by `identity import --force` to decide whether the imported key
+    /// actually changes the stored identity (freenet/river#414): comparing
+    /// against the override-resolved key would misjudge a real change as
+    /// unchanged (skipping the DM prune) or an unchanged identity as changed
+    /// (pruning wrongly). Returns `None` when no room is stored for `owner_vk`.
+    pub fn persisted_signing_key_bytes(&self, owner_vk: &VerifyingKey) -> Result<Option<[u8; 32]>> {
+        let storage = self.load_rooms()?;
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        Ok(storage
+            .rooms
+            .get(&owner_key_str)
+            .map(|r| r.signing_key_bytes))
     }
 
     /// Load all stored rooms, regenerating each room's contract key to match the
@@ -476,6 +511,208 @@ impl Storage {
         })
     }
 
+    /// Compile-time exhaustive-destructure classification pin for the
+    /// [`Self::import_room_atomic`] OVERWRITE arm (Fable architectural review).
+    ///
+    /// The destructure below has NO `..`, so ADDING A FIELD to [`StoredRoomInfo`]
+    /// FAILS COMPILATION here until a maintainer classifies its OVERWRITE verb in
+    /// that arm. This is the forcing function that prevents the round-11
+    /// `previous_contract_key` clobber class (a new field silently defaulted in a
+    /// fresh literal). Verb table:
+    ///
+    /// ```text
+    /// signing_key_bytes      REPLACE (the imported identity)
+    /// state                  KEEP    (get_room re-syncs; a concurrent newer stored
+    ///                                 state must not be clobbered by the pre-lock
+    ///                                 GET snapshot)
+    /// contract_key           KEEP    (load_rooms_unlocked regenerates it + keeps
+    ///                                 the previous_contract_key pairing)
+    /// self_authorized_member \ MERGE-same-key / REPLACE-different-key
+    /// invite_chain           / (paired coherent unit)
+    /// previous_contract_key  KEEP    (room-scoped #292 migration pointer)
+    /// invitation_secrets     MERGE-same-key (union, existing wins) / REPLACE-diff
+    /// self_nickname          MERGE-same-key (keep-if-absent) / REPLACE-different
+    /// ```
+    #[allow(dead_code)]
+    fn _stored_room_info_overwrite_classification(r: StoredRoomInfo) {
+        let StoredRoomInfo {
+            signing_key_bytes: _,
+            state: _,
+            contract_key: _,
+            self_authorized_member: _,
+            invite_chain: _,
+            previous_contract_key: _,
+            invitation_secrets: _,
+            self_nickname: _,
+        } = r;
+    }
+
+    /// Atomically import (or `--force`-overwrite) an identity for a room, under a
+    /// SINGLE advisory lock, closing the TOCTOU window (freenet/river#414, Codex
+    /// round-6 P1-5).
+    ///
+    /// The pre-`import` existence/key snapshot in `import_identity` is taken
+    /// BEFORE the network GET, so a concurrent `riverctl` invocation can add an
+    /// identity for this room during the await — after which the un-atomic path
+    /// would still think it's a new room and overwrite it without `--force` (and
+    /// without pruning the old identity's DM cache). This method re-reads the
+    /// persisted key INSIDE the lock, makes the new-vs-overwrite + key-changed
+    /// decision, then either MUTATES the stored record in place (OVERWRITE arm —
+    /// keeping the room-scoped `state` / `contract_key` / `previous_contract_key`;
+    /// see the classification pin above) or inserts a fresh record (NEW-room arm),
+    /// folding in the authorized member, invite chain, and nickname, and prunes the
+    /// old identity's outbound-DM cache when the key changed — all before any
+    /// concurrent writer can interleave. Modeled on `remove_room`, the existing
+    /// one-lock-spanning-both-files method.
+    ///
+    /// Returns `RefusedNeedsForce` (nothing written) when a DIFFERENT-or-same
+    /// identity already exists and `force` is false; otherwise `Imported`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_room_atomic(
+        &self,
+        owner_vk: &VerifyingKey,
+        signing_key: &SigningKey,
+        state: ChatRoomStateV1,
+        contract_key: &ContractKey,
+        invitation_secrets: HashMap<u32, [u8; 32]>,
+        authorized_member: &AuthorizedMember,
+        invite_chain: &[AuthorizedMember],
+        self_nickname: Option<&str>,
+        force: bool,
+    ) -> Result<ImportOutcome> {
+        self.with_lock(|| {
+            let mut storage = self.load_rooms_unlocked()?;
+            let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+
+            // Authoritative re-check INSIDE the lock — this is what closes the
+            // TOCTOU: read the RAW persisted key off the just-loaded snapshot
+            // (never `persisted_signing_key_bytes`, which re-locks and would
+            // self-deadlock per the Storage no-nesting rule).
+            let old_key = storage
+                .rooms
+                .get(&owner_key_str)
+                .map(|r| r.signing_key_bytes);
+            let was_overwrite = old_key.is_some();
+            if was_overwrite && !force {
+                // A concurrent import may have created this room during our GET;
+                // refuse rather than silently overwrite. Nothing written.
+                return Ok(ImportOutcome::RefusedNeedsForce);
+            }
+            let identity_changed = old_key.is_some_and(|k| k != signing_key.to_bytes());
+
+            // Assemble the incoming IDENTITY metadata. The four-verb table
+            // (`_stored_room_info_overwrite_classification` pins it at compile time):
+            //   signing_key_bytes     → REPLACE (the imported identity)
+            //   self_authorized_member} → MERGE-same-key / REPLACE-diff (paired unit)
+            //   invite_chain          }
+            //   invitation_secrets    → MERGE-same-key (union, existing wins) / REPLACE
+            //   self_nickname         → MERGE-same-key (keep-if-absent) / REPLACE
+            // ROOM-scoped fields (state, contract_key, previous_contract_key) are
+            // KEPT and are handled by the OVERWRITE arm's in-place mutation below.
+            let mut invitation_secrets = invitation_secrets;
+            let mut self_nickname = self_nickname.map(str::to_string);
+            let mut invite_chain = invite_chain.to_vec();
+            let mut self_authorized_member = Some(authorized_member.clone());
+
+            // Same-key re-import over an existing room (`was_overwrite &&
+            // !identity_changed`): the incoming token may be a legacy/stale export
+            // that decodes optional fields as ABSENT/EMPTY. RETAIN the stored value
+            // rather than overwrite it with an empty one (round-7/8). A genuine
+            // identity change instead REPLACES (old identity's metadata must not
+            // carry forward). Computed against an IMMUTABLE borrow of the stored
+            // record so the OVERWRITE mutation below can take a fresh `get_mut`.
+            if was_overwrite && !identity_changed {
+                if let Some(old) = storage.rooms.get(&owner_key_str) {
+                    // invitation_secrets: merge, existing wins — the stored map may
+                    // be the ONLY copy of a private room's key, so an empty token
+                    // must not wipe it (history would become unreadable, round-7).
+                    for (version, secret) in &old.invitation_secrets {
+                        invitation_secrets.entry(*version).or_insert(*secret);
+                    }
+                    // self_nickname: an absent token nickname must NOT erase the
+                    // stored chosen nickname (else `build_rejoin_delta` falls back
+                    // to "Member" after an inactivity prune).
+                    if self_nickname.is_none() {
+                        self_nickname = old.self_nickname.clone();
+                    }
+                    // membership proof (self_authorized_member + invite_chain) is a
+                    // coherent UNIT (the chain validates the member): keep the
+                    // stored pair when the token carries an empty chain, so we never
+                    // pair the token's member with an empty/mismatched chain.
+                    // CROSS-REF: the UI's same-key merge
+                    // (ui/src/components/members.rs `swap_room_identity_in_place`)
+                    // gates the equivalent step on the LOCAL proof being absent
+                    // (`self_authorized_member.is_none()`), whereas this CLI path
+                    // gates on the TOKEN's chain being empty. The conditions differ
+                    // DELIBERATELY (each side's staler-source risk differs); do NOT
+                    // "harmonize" them into one rule.
+                    if invite_chain.is_empty() && !old.invite_chain.is_empty() {
+                        invite_chain = old.invite_chain.clone();
+                        if old.self_authorized_member.is_some() {
+                            self_authorized_member = old.self_authorized_member.clone();
+                        }
+                    }
+                }
+            }
+
+            if let Some(existing) = storage.rooms.get_mut(&owner_key_str) {
+                // OVERWRITE arm — MUTATE IN PLACE. Only the identity fields are
+                // re-assigned; the ROOM-scoped fields are KEPT by never touching
+                // them (this is what makes the field classification robust — a new
+                // field isn't silently defaulted to a fresh literal):
+                //   - `state` KEEP — the `state` param is the PRE-LOCK network-GET
+                //     snapshot (identity.rs); a concurrent riverctl that persisted
+                //     newer state between that GET and this lock must NOT be
+                //     clobbered by the stale snapshot. `get_room` re-syncs from the
+                //     network anyway, so KEEP is safe (round-12 live-bug fix).
+                //   - `contract_key` KEEP — `load_rooms_unlocked` regenerates it
+                //     under the lock and maintains the `previous_contract_key`
+                //     pairing; the import site doesn't.
+                //   - `previous_contract_key` KEEP — room-scoped #292 migration
+                //     pointer (round-11).
+                existing.signing_key_bytes = signing_key.to_bytes();
+                existing.self_authorized_member = self_authorized_member;
+                existing.invite_chain = invite_chain;
+                existing.invitation_secrets = invitation_secrets;
+                existing.self_nickname = self_nickname;
+            } else {
+                // NEW-room arm — a brand-new room writes the fetched `state`,
+                // regenerated `contract_key`, and no migration pointer. Correct for
+                // a room this client has never seen.
+                storage.rooms.insert(
+                    owner_key_str.clone(),
+                    StoredRoomInfo {
+                        signing_key_bytes: signing_key.to_bytes(),
+                        state,
+                        contract_key: contract_key.id().to_string(),
+                        self_authorized_member,
+                        invite_chain,
+                        previous_contract_key: None,
+                        invitation_secrets,
+                        self_nickname,
+                    },
+                );
+            }
+            self.save_rooms_unlocked(&storage)?;
+
+            // Swapping to a DIFFERENT identity: prune the OLD identity's DM cache
+            // in the SAME lock. Best-effort, mirroring `remove_room`: the identity
+            // is already committed, so a prune hiccup warns rather than fails.
+            if identity_changed {
+                if let Err(e) = self.prune_outbound_dms_for_room_unlocked(owner_vk) {
+                    tracing::warn!(
+                        "import: failed to prune the previous identity's DM cache for {owner_key_str}: {e}"
+                    );
+                }
+            }
+
+            Ok(ImportOutcome::Imported {
+                was_overwrite,
+                identity_changed,
+            })
+        })
+    }
+
     /// Persist the member's own nickname for `owner_vk`'s room, so a later
     /// rejoin (`ApiClient::build_rejoin_delta`) can restore it instead of the
     /// generic "Member" placeholder. No-op if the room isn't stored yet.
@@ -601,6 +838,21 @@ impl Storage {
             }
             Ok(removed)
         })
+    }
+
+    /// Public, self-locking counterpart to
+    /// [`Self::prune_outbound_dms_for_room_unlocked`]: drop every cached
+    /// outbound-DM plaintext entry and archived-thread entry for `owner_vk`'s
+    /// room from `outbound_dms.json`.
+    ///
+    /// Used by `identity import --force` when it REPLACES a room with a
+    /// different signing key (freenet/river#414): the prior identity's plaintext
+    /// outbound DMs and its archived-thread records (keyed by `(room, peer)`)
+    /// must not leak into the new identity's view, so they are pruned exactly as
+    /// [`Self::remove_room`] does on leave. Takes the advisory lock itself; do
+    /// NOT call while already holding it.
+    pub fn prune_outbound_dms_for_room(&self, owner_vk: &VerifyingKey) -> Result<()> {
+        self.with_lock(|| self.prune_outbound_dms_for_room_unlocked(owner_vk))
     }
 
     /// Drop every cached outbound-DM plaintext entry and archived-thread entry
@@ -895,9 +1147,11 @@ mod tests {
         );
         let identity_src = include_str!("commands/identity.rs");
         assert!(
-            identity_src.contains("update_self_nickname("),
-            "import_identity must persist the imported (public-room) nickname \
-             via Storage::update_self_nickname."
+            identity_src.contains("nickname_to_persist.as_deref()"),
+            "import_identity must persist the imported nickname — now folded into \
+             the single-lock `Storage::import_room_atomic` write (freenet/river#414 \
+             P1-5) via the `nickname_to_persist` argument, not a separate \
+             `update_self_nickname` call."
         );
     }
 
@@ -1580,6 +1834,729 @@ mod tests {
             "the left room's archived-thread entry must be pruned"
         );
         assert_eq!(after.hidden_threads[0].room_owner_vk, kept_vk.to_bytes());
+    }
+
+    /// freenet/river#414 (Codex round 4): `identity import --force` that swaps a
+    /// room to a DIFFERENT signing key must prune the OLD identity's cached
+    /// outbound-DM plaintext + archived threads (they belong to the old
+    /// identity and would otherwise leak into / wrongly hide threads for the new
+    /// one) — but an unchanged-key re-import must NOT prune, and a different
+    /// room's cache always survives. Drives the exact Storage sequence
+    /// `import_identity` runs (decision `old_key != imported_key`, then
+    /// `prune_outbound_dms_for_room`).
+    #[test]
+    fn force_import_prunes_dm_cache_only_on_key_change() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::chat_delegate::{HiddenDmThreadEntry, OutboundDmEntry, OutboundDmStore};
+        use river_core::room_state::direct_messages::PurgeToken;
+        use river_core::room_state::member::MemberId;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let other_vk = create_test_signing_key().verifying_key();
+        let key = expected_contract_key(&owner_vk);
+
+        let old_identity = create_test_signing_key();
+        let new_identity = create_test_signing_key();
+
+        let peer = MemberId(FastHash(7));
+        let seed_dm_cache = || {
+            storage
+                .save_outbound_dms(&OutboundDmStore {
+                    entries: vec![
+                        OutboundDmEntry {
+                            room_owner_vk: owner_vk.to_bytes(),
+                            sender: peer,
+                            recipient: peer,
+                            purge_token: PurgeToken([1u8; 16]),
+                            timestamp: 1,
+                            plaintext: "old-identity secret".to_string(),
+                        },
+                        OutboundDmEntry {
+                            room_owner_vk: other_vk.to_bytes(),
+                            sender: peer,
+                            recipient: peer,
+                            purge_token: PurgeToken([2u8; 16]),
+                            timestamp: 2,
+                            plaintext: "unrelated room".to_string(),
+                        },
+                    ],
+                    hidden_threads: vec![HiddenDmThreadEntry {
+                        room_owner_vk: owner_vk.to_bytes(),
+                        peer,
+                        hidden_at_ts: 1,
+                    }],
+                })
+                .unwrap();
+        };
+
+        // Scenario 1: --force replace with a DIFFERENT key → prune this room's cache.
+        storage
+            .add_room(&owner_vk, &old_identity, create_test_state(&owner_sk), &key)
+            .unwrap();
+        seed_dm_cache();
+        let old_key = storage.get_room(&owner_vk).unwrap().unwrap().0;
+        let identity_changed = old_key.to_bytes() != new_identity.to_bytes();
+        assert!(identity_changed, "precondition: the imported key differs");
+        storage
+            .add_room_with_invitation_secrets(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        if identity_changed {
+            storage.prune_outbound_dms_for_room(&owner_vk).unwrap();
+        }
+        let after = storage.load_outbound_dms().unwrap();
+        assert!(
+            !after
+                .entries
+                .iter()
+                .any(|e| e.room_owner_vk == owner_vk.to_bytes()),
+            "the replaced identity's DM plaintext must be pruned"
+        );
+        assert!(
+            after
+                .hidden_threads
+                .iter()
+                .all(|h| h.room_owner_vk != owner_vk.to_bytes()),
+            "the replaced identity's archived threads must be pruned"
+        );
+        assert!(
+            after
+                .entries
+                .iter()
+                .any(|e| e.room_owner_vk == other_vk.to_bytes()),
+            "another room's DM cache must survive"
+        );
+
+        // Scenario 2: re-import the SAME key → no identity change → keep the cache.
+        seed_dm_cache();
+        let old_key2 = storage.get_room(&owner_vk).unwrap().unwrap().0;
+        let identity_changed2 = old_key2.to_bytes() != new_identity.to_bytes();
+        assert!(
+            !identity_changed2,
+            "re-importing the SAME key is not an identity change"
+        );
+        storage
+            .add_room_with_invitation_secrets(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        if identity_changed2 {
+            storage.prune_outbound_dms_for_room(&owner_vk).unwrap();
+        }
+        let after2 = storage.load_outbound_dms().unwrap();
+        assert!(
+            after2
+                .entries
+                .iter()
+                .any(|e| e.room_owner_vk == owner_vk.to_bytes()),
+            "an unchanged-key re-import must NOT prune the DM cache"
+        );
+    }
+
+    /// freenet/river#414 (Codex round 5): `persisted_signing_key_bytes` returns
+    /// the RAW stored key, NOT the `--signing-key` override that `get_room`
+    /// resolves. The `identity import --force` DM-prune decision (`identity_changed`)
+    /// depends on this — comparing against the override would misjudge whether
+    /// the identity actually changed.
+    #[test]
+    fn persisted_signing_key_bytes_ignores_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().to_str().unwrap();
+
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let stored_identity = create_test_signing_key();
+        let override_identity = create_test_signing_key();
+        assert_ne!(stored_identity.to_bytes(), override_identity.to_bytes());
+
+        // Persist the room under `stored_identity` (no override active).
+        let storage = Storage::new(Some(dir)).unwrap();
+        let key = expected_contract_key(&owner_vk);
+        storage
+            .add_room(
+                &owner_vk,
+                &stored_identity,
+                create_test_state(&owner_sk),
+                &key,
+            )
+            .unwrap();
+
+        // Re-open the SAME dir with an override selecting a DIFFERENT identity.
+        let overridden =
+            Storage::new_with_override(Some(dir), Some(override_identity.clone())).unwrap();
+
+        // get_room resolves to the override…
+        let (resolved, _, _) = overridden.get_room(&owner_vk).unwrap().unwrap();
+        assert_eq!(
+            resolved.to_bytes(),
+            override_identity.to_bytes(),
+            "get_room applies the --signing-key override"
+        );
+
+        // …but persisted_signing_key_bytes returns the RAW stored key, so the
+        // import DM-prune decision compares against the real stored identity.
+        let persisted = overridden
+            .persisted_signing_key_bytes(&owner_vk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted,
+            stored_identity.to_bytes(),
+            "persisted key must ignore the override"
+        );
+
+        // Absent room → None.
+        let absent = create_test_signing_key().verifying_key();
+        assert!(overridden
+            .persisted_signing_key_bytes(&absent)
+            .unwrap()
+            .is_none());
+    }
+
+    /// freenet/river#414 (Codex round-6 P1-5): `import_room_atomic` re-checks
+    /// existence + key INSIDE the lock, closing the TOCTOU where a concurrent
+    /// import created the room during this import's network GET. Simulates the
+    /// interleave by pre-adding the room, then importing over it.
+    #[test]
+    fn import_room_atomic_rechecks_existence_under_lock() {
+        use freenet_scaffold::util::FastHash;
+        use river_core::chat_delegate::{OutboundDmEntry, OutboundDmStore};
+        use river_core::room_state::direct_messages::PurgeToken;
+        use river_core::room_state::member::{Member, MemberId};
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let key = expected_contract_key(&owner_vk);
+
+        let old_identity = create_test_signing_key();
+        let new_identity = create_test_signing_key();
+        let member_for = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_vk.into(),
+                    invited_by: owner_vk.into(),
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+
+        // A concurrent `riverctl` created the room under `old_identity` while our
+        // GET was in flight, and cached an outbound DM under it.
+        storage
+            .add_room(&owner_vk, &old_identity, create_test_state(&owner_sk), &key)
+            .unwrap();
+        let peer = MemberId(FastHash(7));
+        storage
+            .save_outbound_dms(&OutboundDmStore {
+                entries: vec![OutboundDmEntry {
+                    room_owner_vk: owner_vk.to_bytes(),
+                    sender: peer,
+                    recipient: peer,
+                    purge_token: PurgeToken([1u8; 16]),
+                    timestamp: 1,
+                    plaintext: "old-identity secret".to_string(),
+                }],
+                hidden_threads: vec![],
+            })
+            .unwrap();
+
+        // WITHOUT --force: the atomic re-check finds the concurrently-added room
+        // and REFUSES — nothing written, the old identity + its DM cache survive.
+        let outcome = storage
+            .import_room_atomic(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&new_identity),
+                &[],
+                Some("newnick"),
+                false,
+            )
+            .unwrap();
+        assert_eq!(outcome, ImportOutcome::RefusedNeedsForce);
+        assert_eq!(
+            storage
+                .persisted_signing_key_bytes(&owner_vk)
+                .unwrap()
+                .unwrap(),
+            old_identity.to_bytes(),
+            "a refused import must NOT overwrite the concurrently-added identity"
+        );
+        assert!(
+            storage
+                .load_outbound_dms()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.room_owner_vk == owner_vk.to_bytes()),
+            "a refused import must NOT prune the DM cache"
+        );
+
+        // WITH --force: overwrite in one lock — full record written, key changed,
+        // old identity's DM cache pruned.
+        let outcome = storage
+            .import_room_atomic(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&new_identity),
+                std::slice::from_ref(&member_for(&new_identity)),
+                Some("newnick"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ImportOutcome::Imported {
+                was_overwrite: true,
+                identity_changed: true,
+            }
+        );
+        let rooms = storage.load_rooms().unwrap();
+        let info = rooms
+            .rooms
+            .get(&bs58::encode(owner_vk.as_bytes()).into_string())
+            .unwrap();
+        assert_eq!(info.signing_key_bytes, new_identity.to_bytes());
+        assert!(
+            info.self_authorized_member.is_some(),
+            "the atomic write must fold in the authorized member"
+        );
+        assert_eq!(
+            info.invite_chain.len(),
+            1,
+            "invite chain written in the same lock"
+        );
+        assert_eq!(info.self_nickname.as_deref(), Some("newnick"));
+        assert!(
+            !storage
+                .load_outbound_dms()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.room_owner_vk == owner_vk.to_bytes()),
+            "a --force key change must prune the old identity's DM cache in the same lock"
+        );
+
+        // A brand-new room (not present) imports without --force and reports no
+        // overwrite / no key change.
+        let fresh_owner_sk = create_test_signing_key();
+        let fresh_owner_vk = fresh_owner_sk.verifying_key();
+        let fresh_key = expected_contract_key(&fresh_owner_vk);
+        let fresh_self = create_test_signing_key();
+        let outcome = storage
+            .import_room_atomic(
+                &fresh_owner_vk,
+                &fresh_self,
+                create_test_state(&fresh_owner_sk),
+                &fresh_key,
+                std::collections::HashMap::new(),
+                &AuthorizedMember::new(
+                    Member {
+                        owner_member_id: fresh_owner_vk.into(),
+                        invited_by: fresh_owner_vk.into(),
+                        member_vk: fresh_self.verifying_key(),
+                    },
+                    &fresh_owner_sk,
+                ),
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ImportOutcome::Imported {
+                was_overwrite: false,
+                identity_changed: false,
+            }
+        );
+        assert!(storage.get_room(&fresh_owner_vk).unwrap().is_some());
+    }
+
+    /// freenet/river#414 (Codex round 7): a SAME-key `--force` re-import must
+    /// RETAIN the stored `invitation_secrets` (merging the token's map in,
+    /// existing wins) — the token may be a legacy/stale export with an empty map,
+    /// and for a private room awaiting the owner backfill the stored map can be
+    /// the only copy of the room key. A DIFFERENT-key `--force` still REPLACES.
+    #[test]
+    fn import_room_atomic_same_key_preserves_invitation_secrets() {
+        use river_core::room_state::member::Member;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let key = expected_contract_key(&owner_vk);
+        let member_for = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_vk.into(),
+                    invited_by: owner_vk.into(),
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+
+        // Store the room under `identity` with the ONLY copy of the room key at v3.
+        let identity = create_test_signing_key();
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(3u32, [0x55u8; 32]);
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                secrets,
+                &member_for(&identity),
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+
+        // --force re-import of the SAME identity from a token with EMPTY secrets.
+        let outcome = storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ImportOutcome::Imported {
+                was_overwrite: true,
+                identity_changed: false,
+            }
+        );
+        assert_eq!(
+            storage
+                .get_invitation_secrets(&owner_vk)
+                .unwrap()
+                .get(&3u32),
+            Some(&[0x55u8; 32]),
+            "same-key --force re-import must RETAIN the stored invitation secret \
+             (only copy of the room key)"
+        );
+
+        // A DIFFERENT-key --force re-import REPLACES (drops the old secret).
+        let new_identity = create_test_signing_key();
+        let outcome = storage
+            .import_room_atomic(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&new_identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ImportOutcome::Imported {
+                was_overwrite: true,
+                identity_changed: true,
+            }
+        );
+        assert!(
+            storage
+                .get_invitation_secrets(&owner_vk)
+                .unwrap()
+                .is_empty(),
+            "different-key --force re-import must REPLACE (drop the old identity's secrets)"
+        );
+    }
+
+    /// freenet/river#414 (Codex round-8, systematic same-key audit): a same-key
+    /// `--force` re-import from a stale token (absent nickname, empty invite
+    /// chain) must RETAIN the stored nickname + membership proof, not erase them
+    /// (else `build_rejoin_delta` falls back to "Member").
+    #[test]
+    fn import_room_atomic_same_key_preserves_nickname_and_chain() {
+        use river_core::room_state::member::Member;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let key = expected_contract_key(&owner_vk);
+        let identity = create_test_signing_key();
+        let member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_vk.into(),
+                invited_by: owner_vk.into(),
+                member_vk: identity.verifying_key(),
+            },
+            &owner_sk,
+        );
+
+        // Store the room WITH a chosen nickname and a non-empty invite chain.
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member,
+                std::slice::from_ref(&member),
+                Some("Chosen Name"),
+                false,
+            )
+            .unwrap();
+
+        // --force re-import of the SAME key from a stale token: no nickname, empty chain.
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member,
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+
+        let rooms = storage.load_rooms().unwrap();
+        let info = rooms
+            .rooms
+            .get(&bs58::encode(owner_vk.as_bytes()).into_string())
+            .unwrap();
+        assert_eq!(
+            info.self_nickname.as_deref(),
+            Some("Chosen Name"),
+            "an absent token nickname must NOT erase the stored chosen nickname"
+        );
+        assert_eq!(
+            info.invite_chain.len(),
+            1,
+            "an empty token invite_chain must NOT erase the stored chain"
+        );
+        assert!(
+            info.self_authorized_member.is_some(),
+            "the stored membership proof must survive a stale same-key re-import"
+        );
+    }
+
+    /// freenet/river#414 (Codex round-11 P1): `previous_contract_key` is
+    /// ROOM-scoped (the #292 room-contract migration pointer), not
+    /// identity-scoped. An overwrite import must carry the STORED value forward —
+    /// on BOTH same-key AND different-key overwrites — instead of clearing it,
+    /// else a pending contract-migration retry is lost and state under the
+    /// previous generation can be stranded.
+    #[test]
+    fn import_room_atomic_preserves_previous_contract_key() {
+        use river_core::room_state::member::Member;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let key = expected_contract_key(&owner_vk);
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let member_for = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_vk.into(),
+                    invited_by: owner_vk.into(),
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+        let previous_of = |s: &Storage| {
+            s.load_rooms()
+                .unwrap()
+                .rooms
+                .get(&owner_key_str)
+                .unwrap()
+                .previous_contract_key
+                .clone()
+        };
+
+        let identity = create_test_signing_key();
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+
+        // Simulate a pending #292 room-contract migration pointer on the record.
+        {
+            let mut rs = storage.load_rooms().unwrap();
+            rs.rooms
+                .get_mut(&owner_key_str)
+                .unwrap()
+                .previous_contract_key = Some("prev-migration-key".to_string());
+            storage.save_rooms(&rs).unwrap();
+        }
+
+        // SAME-key --force overwrite: the pointer must survive.
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            previous_of(&storage).as_deref(),
+            Some("prev-migration-key"),
+            "same-key --force must preserve previous_contract_key (room-scoped)"
+        );
+
+        // DIFFERENT-key --force overwrite: room-scoped, so it must ALSO survive.
+        let new_identity = create_test_signing_key();
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &new_identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&new_identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            previous_of(&storage).as_deref(),
+            Some("prev-migration-key"),
+            "different-key --force must ALSO preserve previous_contract_key (room-scoped)"
+        );
+    }
+
+    /// freenet/river#414 (Fable review, round-12 live bug): the OVERWRITE arm
+    /// mutates in place and KEEPS the stored `state`. It must NOT write the
+    /// pre-lock network-GET snapshot passed by `import_identity`, or a concurrent
+    /// riverctl that persisted NEWER state between that GET and this lock would be
+    /// clobbered by the stale snapshot.
+    #[test]
+    fn import_room_atomic_overwrite_keeps_stored_state() {
+        use river_core::room_state::member::Member;
+
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let key = expected_contract_key(&owner_vk);
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let member_for = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_vk.into(),
+                    invited_by: owner_vk.into(),
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+
+        // Store the room (initial state has no members).
+        let identity = create_test_signing_key();
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+
+        // Simulate a concurrent riverctl persisting NEWER state (a member added)
+        // between the pre-lock GET snapshot and our --force lock.
+        let newer_member = member_for(&create_test_signing_key());
+        {
+            let mut rs = storage.load_rooms().unwrap();
+            rs.rooms
+                .get_mut(&owner_key_str)
+                .unwrap()
+                .state
+                .members
+                .members
+                .push(newer_member.clone());
+            storage.save_rooms(&rs).unwrap();
+        }
+
+        // A --force overwrite whose `state` arg is a STALE snapshot (the plain
+        // create_test_state, WITHOUT the newer member).
+        storage
+            .import_room_atomic(
+                &owner_vk,
+                &identity,
+                create_test_state(&owner_sk),
+                &key,
+                std::collections::HashMap::new(),
+                &member_for(&identity),
+                &[],
+                None,
+                true,
+            )
+            .unwrap();
+
+        // The newer stored state must SURVIVE (KEEP), not be clobbered by the
+        // stale pre-lock snapshot.
+        let after = storage.load_rooms().unwrap();
+        let members = &after.rooms[&owner_key_str].state.members.members;
+        assert_eq!(
+            members.len(),
+            1,
+            "overwrite must KEEP the stored state, not clobber it with the pre-lock snapshot"
+        );
+        assert!(
+            members
+                .iter()
+                .any(|m| m.member.member_vk == newer_member.member.member_vk),
+            "the concurrently-persisted newer member must survive the --force overwrite"
+        );
     }
 
     /// Regression for issue freenet/river#307 (lost-update race).

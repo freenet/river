@@ -1542,15 +1542,28 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool, attempt: 
             let owner_contract_id = *owner_contract_id;
             crate::util::safe_spawn_local(async move {
                 let result =
-                    crate::signing::migrate_signing_key(delegate_room_key, &signing_key).await;
+                    // HYDRATION: startup LoadRooms re-migrating an already-stored
+                    // key — NOT a new identity choice, so it must not override the
+                    // registry and is discarded if superseded (freenet/river#414 P1).
+                    crate::signing::migrate_signing_key(delegate_room_key, &signing_key, false)
+                        .await;
 
                 if result != crate::signing::MigrationResult::Failed {
                     // Must defer signal mutations from spawn_local to
                     // avoid RefCell already borrowed panics in Dioxus runtime
+                    let migrated_key = signing_key.clone();
                     crate::util::defer(move || {
                         let mut sanitized = false;
                         ROOMS.with_mut(|rooms| {
                             if let Some(room_data) = rooms.map.get_mut(&room_key_copy) {
+                                // Only mark migrated for the identity that actually
+                                // completed: an overwrite may have replaced `self_sk`
+                                // while this migration ran, and marking the room
+                                // migrated for a superseded key would strand the new
+                                // identity (freenet/river#414).
+                                if room_data.self_sk != migrated_key {
+                                    return;
+                                }
                                 room_data.key_migrated_to_delegate = true;
                                 let params = river_core::room_state::ChatRoomParametersV1 {
                                     owner: room_key_copy,

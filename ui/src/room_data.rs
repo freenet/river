@@ -1779,6 +1779,37 @@ impl Rooms {
                 continue;
             }
 
+            // Identity-conflict guard, BEFORE any contract-key bookkeeping: if
+            // the room is already present with a DIFFERENT `self_sk`, this
+            // incoming copy is a stale/foreign identity for the SAME room. This
+            // happens legitimately during an identity overwrite
+            // (freenet/river#414): a delegate `LoadRooms` response issued before
+            // the replacement can still carry the OLD `self_sk` while `map`
+            // already holds the NEW one. SKIP just this room (keeping the
+            // current local identity) rather than ABORTING the whole merge —
+            // otherwise one stale in-flight copy would drop every other room and
+            // its secret rehydration until reload. The local copy always wins.
+            //
+            // STILL NEEDED after the #414 in-place-swap redesign: the redesign
+            // removed the empty-rebuild, but the stale-load race this guards is
+            // independent of it — an overwrite still mutates `map[vk].self_sk`
+            // in place, so a concurrent delegate load carrying the old `self_sk`
+            // still collides here. Without the skip, that one stale room would
+            // still abort the whole merge and drop unrelated rooms. This is a
+            // genuine robustness guard, NOT scaffolding for the deleted empty
+            // room.
+            if let Some(existing) = self.map.get(&vk) {
+                if existing.self_sk != room_data.self_sk {
+                    use dioxus::logger::tracing::warn;
+                    warn!(
+                        "merge: skipping room with conflicting self_sk (kept local \
+                         identity) — likely a stale in-flight load during an \
+                         identity overwrite (freenet/river#414)"
+                    );
+                    continue;
+                }
+            }
+
             // Capture the old contract key before regeneration
             let old_contract_key = room_data.contract_key;
 
@@ -1795,11 +1826,9 @@ impl Rooms {
             if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(vk) {
                 e.insert(room_data);
             } else {
-                // If the room is already in the map, merge in the new data
+                // Already present with a matching `self_sk` (the conflict case
+                // was skipped above) — merge in the new state.
                 let self_room_data = self.map.get_mut(&vk).unwrap();
-                if self_room_data.self_sk != room_data.self_sk {
-                    return Err("self_sk is different".to_string());
-                }
                 self_room_data.room_state.merge(
                     &self_room_data.room_state.clone(),
                     &ChatRoomParametersV1 { owner: vk },
@@ -2319,6 +2348,73 @@ mod tests {
             "the other tab's room B must be merged in, not clobbered"
         );
         assert_eq!(local.map.len(), 2);
+    }
+
+    /// freenet/river#414 (Codex round 4): a delegate `LoadRooms` response
+    /// issued before an identity overwrite can carry the OLD `self_sk` for a
+    /// room whose `map` copy already holds the NEW one. A `self_sk` conflict on
+    /// ONE room must SKIP only that room (keeping the local identity), NOT abort
+    /// the whole merge and drop every other room + its secret rehydration.
+    #[test]
+    fn merge_skips_conflicting_self_sk_room_but_keeps_the_rest() {
+        let mut rng = rand::thread_rng();
+
+        // Room C (conflict): local holds the NEW identity, incoming a stale OLD one.
+        let owner_c = SigningKey::generate(&mut rng);
+        let new_sk_c = SigningKey::generate(&mut rng);
+        let old_sk_c = SigningKey::generate(&mut rng);
+        let vk_c = owner_c.verifying_key();
+        assert_ne!(new_sk_c.to_bytes(), old_sk_c.to_bytes());
+
+        // Room B: only in the incoming snapshot; must still merge in.
+        let owner_b = SigningKey::generate(&mut rng);
+        let self_b = SigningKey::generate(&mut rng);
+        let vk_b = owner_b.verifying_key();
+
+        let mut local = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        };
+        local
+            .map
+            .insert(vk_c, make_rejoin_test_room(&owner_c, &new_sk_c, true));
+
+        let mut incoming = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        };
+        // Stale identity for the SAME room C, plus a brand-new room B.
+        incoming
+            .map
+            .insert(vk_c, make_rejoin_test_room(&owner_c, &old_sk_c, true));
+        incoming
+            .map
+            .insert(vk_b, make_rejoin_test_room(&owner_b, &self_b, true));
+
+        // Must NOT abort despite room C's conflicting self_sk.
+        local
+            .merge(incoming)
+            .expect("a per-room self_sk conflict must not abort the whole merge");
+
+        // The unrelated room B survived instead of being dropped by the conflict.
+        assert!(
+            local.map.contains_key(&vk_b),
+            "the unrelated incoming room must still merge in"
+        );
+        // Room C kept the LOCAL (new) identity; the stale incoming one was skipped.
+        assert_eq!(
+            local.map.get(&vk_c).unwrap().self_sk.to_bytes(),
+            new_sk_c.to_bytes(),
+            "the conflicting room must keep the local (current) identity"
+        );
     }
 
     #[test]

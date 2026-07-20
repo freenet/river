@@ -22,6 +22,13 @@ pub enum IdentityCommands {
         /// Path to a file containing the armored identity token
         #[arg(long, conflicts_with = "token")]
         file: Option<String>,
+        /// Replace an existing identity for the room instead of refusing.
+        ///
+        /// Overwriting loses the current identity's signing key locally unless
+        /// it was exported first (`riverctl identity export`). The room's
+        /// messages/members live on the network and re-sync (freenet/river#414).
+        #[arg(long, visible_alias = "overwrite")]
+        force: bool,
     },
 }
 
@@ -32,8 +39,8 @@ pub async fn execute(
 ) -> Result<()> {
     match command {
         IdentityCommands::Export { room } => export_identity(&api_client, &room, format).await,
-        IdentityCommands::Import { token, file } => {
-            import_identity(&api_client, token, file, format).await
+        IdentityCommands::Import { token, file, force } => {
+            import_identity(&api_client, token, file, force, format).await
         }
     }
 }
@@ -183,6 +190,7 @@ async fn import_identity(
     api_client: &ApiClient,
     token: Option<String>,
     file: Option<String>,
+    force: bool,
     format: OutputFormat,
 ) -> Result<()> {
     // Read token from argument, file, or stdin
@@ -206,17 +214,39 @@ async fn import_identity(
 
     let room_key_str = bs58::encode(export.room_owner.as_bytes()).into_string();
 
-    // Check if we already have this room
-    if api_client.storage().get_room(&export.room_owner)?.is_some() {
-        return Err(anyhow!(
-            "You already have an identity for room {}. \
-             Remove it first with `riverctl room leave {}` if you want to replace it.",
-            room_key_str,
+    // Fast-path pre-check (freenet/river#414): compare against the RAW persisted
+    // key (NOT `get_room`'s `--signing-key-file` override-resolved key) so we can
+    // skip a pointless network GET when we'd only refuse, and emit the replace
+    // warning. This is ADVISORY — the authoritative new-vs-overwrite + key-changed
+    // decision is re-made atomically INSIDE `import_room_atomic`'s lock AFTER the
+    // GET, so a concurrent `riverctl` import during the await cannot make us
+    // overwrite (or skip the DM prune) on a stale view (Codex round-6 P1-5).
+    let persisted_old_key = api_client
+        .storage()
+        .persisted_signing_key_bytes(&export.room_owner)?;
+    if let Some(refusal) =
+        import_overwrite_refusal(persisted_old_key.is_some(), force, &room_key_str)
+    {
+        return Err(anyhow!(refusal));
+    }
+    if persisted_old_key.is_some() {
+        // force && exists: proceeding to replace — warn about the lost key.
+        eprintln!(
+            "WARNING: replacing the existing identity for room {}. The previous \
+             signing key is lost unless you exported it first.",
             room_key_str
-        ));
+        );
     }
 
-    // Fetch room state from network to populate local storage
+    // Fetch room state from the network. This serves two purposes depending on
+    // which arm `import_room_atomic` takes:
+    //   - NEW room: the fetched state is the initial local copy that gets stored.
+    //   - OVERWRITE (room already exists): the stored state is KEPT untouched
+    //     (room state is identity-independent — see `import_room_atomic`), so
+    //     the fetched state here is DISCARDED. The GET still matters: it
+    //     validates the room is reachable and drives any migration/heal side
+    //     effects (`get_room` re-attempts `member_info` heal, contract-key
+    //     migration, etc.) before we swap in the replacement identity.
     let room_state = api_client
         .get_room(&export.room_owner, false)
         .await
@@ -227,40 +257,12 @@ async fn import_identity(
             )
         })?;
 
-    // Store the room with the imported identity, seeding the persisted
-    // `invitation_secrets` from the export so a non-owner of a private room
-    // keeps the secret across a device migration (freenet/river#306). For a
-    // public room or an export taken before this field existed, the map is
-    // empty and this behaves exactly like the previous `add_room` call.
-    let contract_key = api_client.owner_vk_to_contract_key(&export.room_owner);
-    api_client.storage().add_room_with_invitation_secrets(
-        &export.room_owner,
-        &export.signing_key,
-        room_state,
-        &contract_key,
-        export.invitation_secrets.clone(),
-    )?;
-
-    // Store the authorized member and invite chain for rejoin support
-    api_client.storage().store_authorized_member(
-        &export.room_owner,
-        &export.authorized_member,
-        &export.invite_chain,
-    )?;
-
-    // Persist the imported nickname so a later rejoin (after an inactivity
-    // prune) restores it instead of "Member".
-    //
-    // Prefer the public-plaintext nickname carried in `member_info`. A
-    // private room's exported `member_info` nickname is sealed, so
-    // `to_string_lossy` yields an "[Encrypted: …]" placeholder, not the real
-    // name; persisting that would be worse than the generic fallback.
-    //
-    // When `member_info` carries no usable public nickname (it is absent —
-    // e.g. an export taken before the private-room join-heal sealed it,
-    // freenet/river#298 — or sealed), fall back to the plaintext
-    // `self_nickname` the export now carries. This is the chosen nickname,
-    // not an "[Encrypted: …]" placeholder, so it is safe to persist.
+    // Compute the nickname to persist BEFORE the atomic write so it goes into the
+    // same `StoredRoomInfo` under one lock (a later rejoin restores it instead of
+    // "Member"). Prefer the public-plaintext `member_info` nickname; else the
+    // plaintext `self_nickname` the export carries. A private room's sealed
+    // `member_info` nickname renders as an "[Encrypted: …]" placeholder via
+    // `to_string_lossy` (worse than the fallback), so it is excluded here.
     let public_member_info_nickname = export.member_info.as_ref().and_then(|info| {
         info.member_info
             .preferred_nickname
@@ -270,10 +272,37 @@ async fn import_identity(
     let nickname_to_persist = public_member_info_nickname
         .clone()
         .or_else(|| export.self_nickname.clone());
-    if let Some(nick) = nickname_to_persist {
-        api_client
-            .storage()
-            .update_self_nickname(&export.room_owner, &nick)?;
+
+    // Atomic import (freenet/river#414 P1-5): re-check existence + key and write
+    // the full record (room + authorized member + invite chain + nickname) under
+    // ONE lock, pruning the old identity's DM cache on a key change — all inside
+    // the lock, so a concurrent import can't interleave. Seeds `invitation_secrets`
+    // from the export so a non-owner of a private room keeps the secret across a
+    // device migration (freenet/river#306).
+    let contract_key = api_client.owner_vk_to_contract_key(&export.room_owner);
+    let outcome = api_client.storage().import_room_atomic(
+        &export.room_owner,
+        &export.signing_key,
+        room_state,
+        &contract_key,
+        export.invitation_secrets.clone(),
+        &export.authorized_member,
+        &export.invite_chain,
+        nickname_to_persist.as_deref(),
+        force,
+    )?;
+
+    if outcome == crate::storage::ImportOutcome::RefusedNeedsForce {
+        // A concurrent import created this room during our network GET — refuse
+        // rather than silently overwrite it (this is the TOCTOU we now catch).
+        return Err(anyhow!(import_overwrite_refusal(
+            true,
+            false,
+            &room_key_str
+        )
+        .expect(
+            "refusal message is Some for an existing room without --force"
+        )));
     }
 
     // For the human/JSON summary, show the real nickname: prefer the
@@ -307,6 +336,28 @@ async fn import_identity(
     }
 
     Ok(())
+}
+
+/// Decide whether an identity import must be refused because the room already
+/// has a stored identity and the user did not opt into replacing it.
+///
+/// Returns the refusal message when the import should be blocked (an identity
+/// exists and `force` is false), or `None` when the import may proceed —
+/// either the room is new, or `--force`/`--overwrite` authorizes the replace
+/// (freenet/river#414). Pure, so the guard is unit-testable without a node.
+fn import_overwrite_refusal(room_exists: bool, force: bool, room_key_str: &str) -> Option<String> {
+    if room_exists && !force {
+        Some(format!(
+            "You already have an identity for room {room}. \
+             Re-run with `--force` (alias `--overwrite`) to replace it, or \
+             remove it first with `riverctl room leave {room}`. Replacing loses \
+             your current signing key for this room unless you exported it \
+             first with `riverctl identity export {room}`.",
+            room = room_key_str
+        ))
+    } else {
+        None
+    }
 }
 
 fn parse_room_key(s: &str) -> Result<VerifyingKey> {
@@ -566,6 +617,108 @@ mod tests {
         assert!(
             !msg.contains("--signing-key-file") && !msg.contains("RIVER_SIGNING_KEY_FILE"),
             "no-override hint must not reference an override the user never set, got: {msg}"
+        );
+    }
+
+    /// freenet/river#414: without `--force`, importing over an existing room
+    /// refuses — and the refusal must name `--force`, its `--overwrite` alias,
+    /// and the room. With `--force`, or for a brand-new room, it proceeds.
+    #[test]
+    fn import_overwrite_refusal_matrix() {
+        let room = "ExampleRoomKey58";
+
+        // Brand-new room: never refuse, force or not.
+        assert!(import_overwrite_refusal(false, false, room).is_none());
+        assert!(import_overwrite_refusal(false, true, room).is_none());
+
+        // Existing room, no force: refuse with the improved message.
+        let msg = import_overwrite_refusal(true, false, room).expect("must refuse without --force");
+        assert!(
+            msg.contains("--force"),
+            "refusal must point at --force, got: {msg}"
+        );
+        assert!(
+            msg.contains("--overwrite"),
+            "refusal must mention the --overwrite alias, got: {msg}"
+        );
+        assert!(
+            msg.contains(room),
+            "refusal should name the room, got: {msg}"
+        );
+
+        // Existing room, force: proceed (no refusal).
+        assert!(
+            import_overwrite_refusal(true, true, room).is_none(),
+            "--force must authorize replacing an existing identity"
+        );
+    }
+
+    /// freenet/river#414: importing with `--force` and a new signing key must
+    /// REPLACE the stored identity in place (not error, not duplicate). The real
+    /// import path now does this atomically under one lock via
+    /// `Storage::import_room_atomic` (exercised by the `import_room_atomic_*`
+    /// tests, which the async `import_identity` needs a live node to drive
+    /// end-to-end). This test instead drives the underlying `Storage` mutators
+    /// directly to assert the in-place-overwrite CONTRACT they rely on: writing
+    /// the same owner key twice keeps a single room entry and swaps the stored
+    /// signing key.
+    #[test]
+    fn force_import_overwrites_stored_identity() {
+        let owner_sk = signing_key_from_seed(21);
+        let owner_vk = owner_sk.verifying_key();
+
+        let old_sk = signing_key_from_seed(22);
+        let new_sk = signing_key_from_seed(23);
+        assert_ne!(old_sk.to_bytes(), new_sk.to_bytes());
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        let contract_key = compute_contract_key(&owner_vk);
+
+        // First import establishes the OLD identity.
+        storage
+            .add_room(
+                &owner_vk,
+                &old_sk,
+                create_test_state(&owner_sk),
+                &contract_key,
+            )
+            .unwrap();
+        let (stored, _, _) = storage.get_room(&owner_vk).unwrap().unwrap();
+        assert_eq!(
+            stored.to_bytes(),
+            old_sk.to_bytes(),
+            "precondition: OLD identity is stored"
+        );
+
+        // Re-write the same owner key with the NEW signing key via the storage
+        // mutators (overwrite + authorized-member store). This is NOT the exact
+        // sequence the import path runs today (that's the single-lock
+        // `import_room_atomic`); it drives the same primitives directly to assert
+        // the overwrite-in-place contract those upper layers depend on.
+        storage
+            .add_room_with_invitation_secrets(
+                &owner_vk,
+                &new_sk,
+                create_test_state(&owner_sk),
+                &contract_key,
+                HashMap::new(),
+            )
+            .unwrap();
+        storage
+            .store_authorized_member(&owner_vk, &authorized_member_for(&new_sk), &[])
+            .unwrap();
+
+        let (stored, _, _) = storage.get_room(&owner_vk).unwrap().unwrap();
+        assert_eq!(
+            stored.to_bytes(),
+            new_sk.to_bytes(),
+            "force import must overwrite the stored signing key with the imported one"
+        );
+        assert_eq!(
+            storage.load_rooms().unwrap().rooms.len(),
+            1,
+            "overwrite replaces in place — no duplicate room entry"
         );
     }
 }

@@ -2231,6 +2231,160 @@ mod tests {
         );
     }
 
+    /// freenet/river#414 (Codex round-6 P2-3; IDENTITY-based since round-9 P2):
+    /// an identity overwrite records a per-room DM-prune tombstone keyed to the
+    /// NEW identity's `MemberId`. A late DM-load response drops any entry whose
+    /// `sender` is NOT the new identity — independent of the entry's timestamp, so
+    /// a device clock skew / FUTURE-DATED old-identity entry can no longer slip
+    /// through (the round-8 wall-clock cutoff bug). Hidden (archive) entries carry
+    /// no identity, so they are dropped at the room level.
+    #[test]
+    fn dm_prune_tombstone_suppresses_replaced_identity_regardless_of_timestamp() {
+        reset_dm_prune_tombstones();
+        let room = sk(41).verifying_key();
+        let other_room = sk(42).verifying_key();
+        let new_id = MemberId(FastHash(1));
+        let old_id = MemberId(FastHash(2));
+
+        // No tombstone → nothing suppressed (outbound or hidden).
+        assert!(dm_prune_tombstone_for(&room).is_none());
+        assert!(!dm_prune_suppresses_outbound(
+            dm_prune_tombstone_for(&room),
+            old_id
+        ));
+        assert!(!dm_prune_suppresses_hidden(dm_prune_tombstone_for(&room)));
+
+        // Overwrite to `new_id`.
+        record_dm_prune_tombstone(room, new_id);
+        assert_eq!(dm_prune_tombstone_for(&room), Some(new_id));
+
+        // An OLD-identity outbound entry is dropped; the NEW identity's is kept —
+        // regardless of timestamp (the future-dated old-identity case the
+        // wall-clock cutoff missed).
+        assert!(dm_prune_suppresses_outbound(
+            dm_prune_tombstone_for(&room),
+            old_id
+        ));
+        assert!(!dm_prune_suppresses_outbound(
+            dm_prune_tombstone_for(&room),
+            new_id
+        ));
+
+        // Hidden entries (no identity) are dropped at the room level for a pruned
+        // room, and kept for an un-pruned one.
+        assert!(dm_prune_suppresses_hidden(dm_prune_tombstone_for(&room)));
+        assert!(!dm_prune_suppresses_hidden(dm_prune_tombstone_for(
+            &other_room
+        )));
+        assert!(!dm_prune_suppresses_outbound(
+            dm_prune_tombstone_for(&other_room),
+            old_id
+        ));
+
+        // A second overwrite updates the tombstone to the newest identity.
+        let newest_id = MemberId(FastHash(3));
+        record_dm_prune_tombstone(room, newest_id);
+        assert_eq!(dm_prune_tombstone_for(&room), Some(newest_id));
+        assert!(dm_prune_suppresses_outbound(
+            dm_prune_tombstone_for(&room),
+            new_id
+        ));
+        assert!(!dm_prune_suppresses_outbound(
+            dm_prune_tombstone_for(&room),
+            newest_id
+        ));
+
+        reset_dm_prune_tombstones();
+    }
+
+    /// freenet/river#414 (Codex round-11 P2): the OUTBOUND prune is DURABLE across
+    /// reload. Simulates a reload: the in-memory tombstone is EMPTY, but the room's
+    /// persisted current identity (from `ROOMS`, modelled here as the resolver's
+    /// second argument) still drives suppression. `resolve_dm_keep_identity`
+    /// prefers the in-session tombstone, else falls back to the durable identity —
+    /// so the replaced identity's cached plaintext is dropped next session even
+    /// though nothing sanitized the store in the overwrite session.
+    #[test]
+    fn outbound_prune_is_durable_via_room_identity() {
+        let new_id = MemberId(FastHash(10));
+        let old_id = MemberId(FastHash(11));
+        assert_ne!(new_id, old_id);
+
+        // Fresh session after overwrite+reload: no in-memory tombstone, but ROOMS
+        // holds the NEW identity as the room's current `self_sk`.
+        let keep = resolve_dm_keep_identity(None, Some(new_id));
+        assert_eq!(
+            keep,
+            Some(new_id),
+            "durable identity is used when no tombstone"
+        );
+        // The replaced identity's cached entry is STILL dropped after reload…
+        assert!(dm_prune_suppresses_outbound(keep, old_id));
+        // …and the new identity's entries survive.
+        assert!(!dm_prune_suppresses_outbound(keep, new_id));
+
+        // The in-session tombstone takes precedence over the durable identity.
+        let session_id = MemberId(FastHash(12));
+        assert_eq!(
+            resolve_dm_keep_identity(Some(session_id), Some(new_id)),
+            Some(session_id)
+        );
+
+        // A normal (never-loaded, no-identity) room suppresses nothing.
+        assert!(!dm_prune_suppresses_outbound(
+            resolve_dm_keep_identity(None, None),
+            old_id
+        ));
+    }
+
+    /// freenet/river#414 (Codex round-9 P1): the identity-import gate must ALSO
+    /// treat an in-flight load worker (`PENDING_LOADS != 0`) as "recovery in
+    /// progress" so an import can't be decided while the #345 recovery is still
+    /// restoring rooms. (`is_legacy_migration_in_progress()` is a localStorage read
+    /// that is always false off-WASM, so this pins the `PENDING_LOADS` branch.)
+    #[test]
+    fn rooms_recovery_in_progress_tracks_pending_loads() {
+        use std::sync::atomic::Ordering;
+        PENDING_LOADS.store(0, Ordering::Relaxed);
+        assert!(
+            !rooms_recovery_in_progress(),
+            "no legacy migration + no pending loads → not in recovery"
+        );
+        PENDING_LOADS.store(1, Ordering::Relaxed);
+        assert!(
+            rooms_recovery_in_progress(),
+            "an in-flight load worker must gate imports (recovery/load pending)"
+        );
+        PENDING_LOADS.store(0, Ordering::Relaxed);
+        assert!(!rooms_recovery_in_progress());
+    }
+
+    /// freenet/river#414 (Codex round-8 P1): when a late DM-load response is
+    /// filtered by the prune tombstone, the sanitized store must be PERSISTED
+    /// back to the delegate — otherwise the in-memory filter is undone on the
+    /// next reload (the tombstone is session-only). Source-grep pin that both
+    /// hydration paths persist on suppression (the delegate save needs a runtime,
+    /// so the behaviour itself isn't unit-testable here).
+    #[test]
+    fn late_dm_hydration_persists_sanitized_store() {
+        // The needle is assembled at runtime so this test's own source does NOT
+        // contain the contiguous call string (else it would self-match). Count
+        // the CALL form (name + `();`); the fn def uses `() {`, so it isn't
+        // counted. Two calls = one in hydrate_outbound_dms_cache, one in
+        // hydrate_hidden_dm_threads.
+        let src = include_str!("chat_delegate.rs");
+        let needle = format!(
+            "{}{}",
+            "persist_sanitized_dm_store_after_tombstone_filter", "();"
+        );
+        assert_eq!(
+            src.matches(&needle).count(),
+            2,
+            "both hydrate_outbound_dms_cache and hydrate_hidden_dm_threads must \
+             persist the sanitized store when a tombstone filters a late entry"
+        );
+    }
+
     // ===== Outbound DM revives hidden thread (Codex P1 fix) =====
     // The testing-reviewer's BLOCKING #3 on PR #265. The "explicit
     // unhide on outbound" path lives in `dm_thread_modal::do_send` /
@@ -3329,6 +3483,23 @@ fn reconcile_room_present(
                 // (local-authoritative), don't merge the other identity's
                 // state, and don't fail the whole save (M1 fix: scoped to this
                 // one room rather than wedging all persistence).
+                //
+                // KNOWN LIMITATION — multi-tab identity-overwrite reversal
+                // (freenet/river#420). This branch is last-writer-wins: it keeps
+                // whichever identity the SAVING session holds, with no way to
+                // tell which of the two identities is NEWER. So after a user
+                // replaces a room identity (freenet/river#414,
+                // `members.rs::complete_identity_import`), a second tab/device
+                // still holding the OLD identity will write it back here as its
+                // local copy on its next save, and on the next cold load the
+                // stale identity can win — silently undoing the replacement. The
+                // proper fix is a persisted, monotonically-increasing
+                // identity-generation counter on the per-room slot so this
+                // branch can adopt the higher generation instead of the last
+                // writer; that is a delegate/persisted-state change tracked in
+                // #420 and out of scope for the #414 escape hatch. Until then the
+                // overwrite-confirm dialog tells the user to close other sessions
+                // for the room first.
                 local.clone()
             } else {
                 let mut m = local.clone();
@@ -3584,10 +3755,119 @@ async fn fire_load_outbound_dms_request() {
 /// would otherwise overwrite the fresher current entries). Both
 /// senders signed equivalently-derived tokens, so the timestamp is the
 /// only authoritative recency signal.
+/// Per-room DM-prune tombstones (freenet/river#414, Codex round-6 P2-3;
+/// identity-based since round-9 P2).
+///
+/// Maps a room `owner_vk` → the CURRENT (post-overwrite) local identity's
+/// `MemberId`. The outbound-DM store loads via a SEPARATE fire-and-forget
+/// request, so hydration can finish (and permit the overwrite) before the DM
+/// response arrives; the prune then finds empty signals and records nothing, and
+/// the late DM response would re-hydrate the OLD identity's plaintext +
+/// hidden-thread entries. This tombstone is consulted by
+/// [`hydrate_outbound_dms_cache`] / [`hydrate_hidden_dm_threads`] to DROP those
+/// late entries.
+///
+/// IDENTITY-based, NOT wall-clock (Codex round-9 P2): the earlier design dropped
+/// entries whose `timestamp <= prune_cutoff`, but a device clock correction — or
+/// an already-future-dated cached entry — let an OLD-identity entry (timestamp >
+/// cutoff) slip through and leak the replaced identity's DM data. An outbound
+/// entry carries its `sender` `MemberId`, so we drop any whose sender is NOT the
+/// current identity, independent of timestamp.
+///
+/// This in-memory map is SESSION-scoped, but the OUTBOUND filter is DURABLE across
+/// reload (Codex round-11 P2): when the tombstone is absent (a fresh session after
+/// an overwrite-then-reload), [`hydrate_outbound_dms_cache`] falls back to the
+/// room's persisted current identity in `ROOMS` (`current_room_identity_member_id`).
+/// So even if the DM store was never sanitized in the overwrite session (the prune
+/// ran with empty signals) the replaced identity's plaintext is still dropped next
+/// session. Hidden (archive) entries have no identity field, so they remain
+/// session-scoped (the reload case is self-healing — the new identity's later
+/// messages un-hide the thread, and no plaintext is involved).
+static DM_PRUNE_TOMBSTONES: std::sync::LazyLock<Mutex<HashMap<VerifyingKey, MemberId>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record that room `owner_vk`'s DM state was pruned by an overwrite to
+/// `current_member_id` (the NEW identity). Any hydrated entry for this room NOT
+/// authored by `current_member_id` belongs to a replaced identity and is dropped.
+pub(crate) fn record_dm_prune_tombstone(owner_vk: VerifyingKey, current_member_id: MemberId) {
+    if let Ok(mut m) = DM_PRUNE_TOMBSTONES.lock() {
+        m.insert(owner_vk, current_member_id);
+    }
+}
+
+/// The room's current identity `MemberId` if it was pruned by an overwrite.
+fn dm_prune_tombstone_for(owner_vk: &VerifyingKey) -> Option<MemberId> {
+    DM_PRUNE_TOMBSTONES
+        .lock()
+        .ok()
+        .and_then(|m| m.get(owner_vk).copied())
+}
+
+/// Whether an arriving OUTBOUND-DM entry from `entry_sender` is suppressed by the
+/// room's prune tombstone: dropped iff the room was pruned AND the sender is NOT
+/// the current identity (i.e. it belongs to a replaced identity). Independent of
+/// the entry's timestamp (Codex round-9 P2). Pure so it is unit-testable.
+fn dm_prune_suppresses_outbound(current: Option<MemberId>, entry_sender: MemberId) -> bool {
+    matches!(current, Some(c) if entry_sender != c)
+}
+
+/// The room's CURRENT local identity `MemberId` from `ROOMS` (the DURABLE source
+/// of truth — the per-room slot persists the current `self_sk`), or `None` if the
+/// room isn't loaded / `ROOMS` is mid-write.
+///
+/// This is what makes the outbound-DM prune DURABLE across reload (Codex round-11
+/// P2): the in-memory `DM_PRUNE_TOMBSTONES` is session-scoped, so after an
+/// overwrite-then-reload the tombstone is gone — but `ROOMS[room].self_sk` still
+/// reflects the NEW identity (persisted at overwrite via the per-room save). An
+/// outbound entry whose `sender` is not the room's current identity belongs to a
+/// replaced identity and is dropped, timestamp-independent. Safe universally: the
+/// outbound cache is per-node (single identity per room), so a normal room's
+/// cached entries all carry the current identity and are never dropped. Startup
+/// fires the room-list request BEFORE the DM load, so on the common reload path
+/// `ROOMS` is populated by the time the DM response hydrates.
+fn current_room_identity_member_id(owner_vk: &VerifyingKey) -> Option<MemberId> {
+    use dioxus::prelude::ReadableExt;
+    let rooms = ROOMS.try_read().ok()?;
+    rooms
+        .map
+        .get(owner_vk)
+        .map(|rd| MemberId::from(&rd.self_sk.verifying_key()))
+}
+
+/// The identity a room's cached outbound DMs must match: the in-memory prune
+/// tombstone (in-session fast path) if present, else the durable current identity
+/// from `ROOMS`. Pure so the tombstone-vs-durable precedence is unit-testable.
+fn resolve_dm_keep_identity(
+    tombstone: Option<MemberId>,
+    room_identity: Option<MemberId>,
+) -> Option<MemberId> {
+    tombstone.or(room_identity)
+}
+
+/// Whether an arriving HIDDEN-thread (archive) entry is suppressed: dropped iff
+/// the room was pruned. Hidden entries carry no local-identity field, so they are
+/// dropped at the room level. Safe because the tombstone is session-scoped and
+/// the NEW identity's archives go through the save path (not hydration), so a
+/// same-session hydration only replays the replaced identity's pre-overwrite
+/// entries; a reload starts with an empty tombstone and the already-sanitized
+/// persisted store.
+fn dm_prune_suppresses_hidden(current: Option<MemberId>) -> bool {
+    current.is_some()
+}
+
+/// Reset the DM-prune tombstones. For tests only; production never calls this.
+#[cfg(test)]
+pub(crate) fn reset_dm_prune_tombstones() {
+    if let Ok(mut m) = DM_PRUNE_TOMBSTONES.lock() {
+        m.clear();
+    }
+}
+
 pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
     use crate::components::direct_messages::OUTBOUND_DMS;
     let count = entries.len();
     crate::util::defer(move || {
+        let mut suppressed_any = false;
         OUTBOUND_DMS.with_mut(|cache| {
             for entry in entries {
                 let room_vk = match ed25519_dalek::VerifyingKey::from_bytes(&entry.room_owner_vk) {
@@ -3597,6 +3877,22 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
                         continue;
                     }
                 };
+                // Drop an entry authored by a REPLACED identity for a room whose
+                // identity was overwritten (freenet/river#414 P2-3, identity-based
+                // since round-9): the entry's `sender` is not the room's current
+                // identity. Independent of timestamp — a device clock skew /
+                // future-dated entry can no longer slip through. The "keep"
+                // identity comes from the in-memory tombstone (in-session) OR,
+                // DURABLY across reload (round-11 P2), the room's persisted
+                // `self_sk` in `ROOMS`.
+                let keep_identity = resolve_dm_keep_identity(
+                    dm_prune_tombstone_for(&room_vk),
+                    current_room_identity_member_id(&room_vk),
+                );
+                if dm_prune_suppresses_outbound(keep_identity, entry.sender) {
+                    suppressed_any = true;
+                    continue;
+                }
                 let key = (room_vk, entry.recipient, entry.purge_token);
                 match cache.by_token.get(&key) {
                     Some(existing) if existing.timestamp >= entry.timestamp => {
@@ -3608,8 +3904,33 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
                 }
             }
         });
+        // The delegate's persisted store still contains the entries we just
+        // dropped in memory (the response came FROM it). Persist the sanitized
+        // snapshot so the replaced identity's plaintext is actually removed from
+        // storage, not just this session's memory — otherwise the next reload
+        // re-hydrates it (the tombstone is session-only). freenet/river#414 P1
+        // (Codex round-8). Reuses the coalesced save path.
+        if suppressed_any {
+            persist_sanitized_dm_store_after_tombstone_filter();
+        }
     });
     count
+}
+
+/// Persist the sanitized outbound-DM store after a tombstone filter dropped a
+/// late-hydration entry, so the replaced identity's plaintext / archive state is
+/// removed from the delegate store (not just in-memory). Reuses the coalesced
+/// `save_outbound_dms_to_delegate` path; failures warn (best-effort, the
+/// in-memory state is already sanitized). freenet/river#414 P1 (Codex round-8).
+fn persist_sanitized_dm_store_after_tombstone_filter() {
+    crate::util::safe_spawn_local(async {
+        if let Err(e) = save_outbound_dms_to_delegate().await {
+            warn!(
+                "Failed to persist sanitized DM store after tombstone filter: {}",
+                e
+            );
+        }
+    });
 }
 
 /// Session-scoped tombstone set for `(room, peer)` pairs the local
@@ -3751,6 +4072,24 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
         return 0;
     }
     crate::util::defer(move || {
+        // Drop hidden-thread (archive) entries for a room that was overwritten
+        // (freenet/river#414 P2-3, identity-based since round-9): they belong to
+        // the replaced identity. Hidden entries carry no local-identity field, so
+        // they are dropped at the ROOM level, independent of timestamp (a clock
+        // skew can no longer let a future-dated archive slip through). Safe: the
+        // tombstone is session-scoped and the NEW identity's archives arrive via
+        // the save path, not hydration (see `dm_prune_suppresses_hidden`).
+        let before_filter = entries.len();
+        let entries: Vec<HiddenDmThreadEntry> = entries
+            .into_iter()
+            .filter(|entry| {
+                match ed25519_dalek::VerifyingKey::from_bytes(&entry.room_owner_vk) {
+                    Ok(room_vk) => !dm_prune_suppresses_hidden(dm_prune_tombstone_for(&room_vk)),
+                    Err(_) => true, // invalid VK is handled downstream
+                }
+            })
+            .collect();
+        let suppressed_any = entries.len() < before_filter;
         // Snapshot the tombstone set under its own lock so we don't
         // hold it across the signal write (the with_mut closure may
         // run subscriber notifications synchronously on Drop).
@@ -3772,6 +4111,12 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
                 hidden.insert(key, entry);
             }
         });
+        // Persist the sanitized store when a tombstone dropped a late archive
+        // entry, so the replaced identity's archive state is removed from the
+        // delegate (not just memory). freenet/river#414 P1 (Codex round-8).
+        if suppressed_any {
+            persist_sanitized_dm_store_after_tombstone_filter();
+        }
     });
     count
 }
@@ -4137,6 +4482,78 @@ pub fn prune_outbound_dms_for_purges() {
         crate::util::safe_spawn_local(async {
             if let Err(e) = save_outbound_dms_to_delegate().await {
                 warn!("Failed to persist pruned outbound DM cache: {}", e);
+            }
+        });
+    });
+}
+
+/// Drop every cached outbound-DM plaintext entry and archived-thread entry for
+/// `owner_vk`'s room from the in-memory `OUTBOUND_DMS` / `HIDDEN_DM_THREADS`
+/// signals and persist the trimmed store.
+///
+/// The UI counterpart of the CLI `identity import --force` prune
+/// (freenet/river#414): when an identity overwrite swaps `self_sk` for a room,
+/// the OLD identity's outbound-DM plaintext and archive state must not leak into
+/// (or wrongly hide threads for) the NEW identity. Call ONLY when the key
+/// actually changed.
+///
+/// `new_member_id` is the CURRENT (post-overwrite) identity's `MemberId`; the
+/// tombstone drops any hydrated entry NOT authored by it.
+///
+/// Signal-safe: all mutation runs inside `crate::util::defer()`; the delegate
+/// persist is a coalesced `safe_spawn_local`. No-op (skips the whole
+/// defer/with_mut) when nothing is cached for the room.
+pub fn prune_dm_state_for_room(owner_vk: ed25519_dalek::VerifyingKey, new_member_id: MemberId) {
+    use crate::components::direct_messages::{HIDDEN_DM_THREADS, OUTBOUND_DMS};
+
+    // Record the prune tombstone UNCONDITIONALLY and FIRST (freenet/river#414
+    // P2-3): the outbound-DM store loads via a separate fire-and-forget request,
+    // so the signals may still be empty here while the OLD identity's entries are
+    // in flight. The tombstone (keyed to the NEW identity) makes
+    // `hydrate_outbound_dms_cache` / `hydrate_hidden_dm_threads` drop those
+    // entries when they arrive, instead of resurrecting the replaced identity's
+    // DM state. Must run before the has-nothing-cached early return below.
+    record_dm_prune_tombstone(owner_vk, new_member_id);
+
+    // Re-seed `DM_LAST_SEEN` for the NEW identity (freenet/river#414 round-10 P2):
+    // that map is keyed only by `(room, peer)`, so the OLD identity's last-seen
+    // cutoffs would otherwise carry over and wrongly suppress unread badges for
+    // messages the new identity has never seen. Runs before the early return —
+    // it does not depend on the outbound-DM cache being populated.
+    crate::components::direct_messages::reseed_dm_last_seen_for_room(owner_vk);
+
+    // `try_read` so we cooperate with any in-flight write; skip the whole
+    // defer path when there is nothing cached for this room.
+    let has_entries = {
+        let Ok(cache) = OUTBOUND_DMS.try_read() else {
+            return;
+        };
+        cache.by_token.keys().any(|(room, _, _)| *room == owner_vk)
+    };
+    let has_hidden = {
+        let Ok(hidden) = HIDDEN_DM_THREADS.try_read() else {
+            return;
+        };
+        hidden.keys().any(|(room, _)| *room == owner_vk)
+    };
+    if !has_entries && !has_hidden {
+        return;
+    }
+
+    crate::util::defer(move || {
+        OUTBOUND_DMS.with_mut(|cache| {
+            cache.by_token.retain(|(room, _, _), _| *room != owner_vk);
+        });
+        HIDDEN_DM_THREADS.with_mut(|hidden| {
+            hidden.retain(|(room, _), _| *room != owner_vk);
+        });
+        info!("Pruned outbound-DM cache + archive state for a replaced room identity");
+        crate::util::safe_spawn_local(async {
+            if let Err(e) = save_outbound_dms_to_delegate().await {
+                warn!(
+                    "Failed to persist pruned DM state after identity replace: {}",
+                    e
+                );
             }
         });
     });
@@ -4622,6 +5039,27 @@ fn legacy_migration_in_progress_key() -> String {
     )
 }
 
+/// Whether the room set is still being RECOVERED and is therefore NOT yet
+/// fully authoritative (freenet/river#414, Codex round-9 P1).
+///
+/// Distinct from `ROOMS_LOAD_STATE == Loaded`: during the freenet/river#345
+/// interrupted-legacy-migration RECOVERY, the per-room loader intentionally sets
+/// `Loaded` (so the partial room list renders instead of a spinner) BEFORE the
+/// background recovery workers restore rooms missing from the partial per-room
+/// index — and `SAW_FETCH_FAILURE` stays false. Importing an identity for one of
+/// those still-missing rooms in that window would misclassify it as new and
+/// overwrite its recovered persisted slot with empty state (DATA LOSS). The
+/// identity-import gate ANDs `!rooms_recovery_in_progress()` on top of
+/// `Loaded && !saw_fetch_failure`, so imports wait for recovery to finish.
+///
+/// True while EITHER the interrupted-migration flag is set (recovery pending /
+/// running — cleared only on a full successful re-save) OR any awaited load
+/// worker is still in flight (`PENDING_LOADS != 0`). This does NOT weaken the
+/// recovery; it only makes imports wait for it.
+pub(crate) fn rooms_recovery_in_progress() -> bool {
+    is_legacy_migration_in_progress() || PENDING_LOADS.load(Ordering::Relaxed) != 0
+}
+
 /// True if a legacy migration was started but not confirmed complete (see
 /// [`LEGACY_MIGRATION_IN_PROGRESS_PREFIX`]).
 pub fn is_legacy_migration_in_progress() -> bool {
@@ -4760,6 +5198,22 @@ pub(crate) static SAW_FETCH_FAILURE: AtomicBool = AtomicBool::new(false);
 /// Record that a listed room's fetch failed to materialize.
 pub(crate) fn mark_fetch_failure() {
     SAW_FETCH_FAILURE.store(true, Ordering::Relaxed);
+}
+
+/// Whether any LISTED room's fetch failed to materialize during the current
+/// load attempt (`SAW_FETCH_FAILURE`).
+///
+/// This is the COMPLETENESS signal the identity-import gate needs
+/// (freenet/river#414, Codex round-6 P1-1): `per_room_terminal` resolves the
+/// rail to `Loaded` as soon as ≥1 room materialized, IGNORING whether other
+/// listed rooms failed — so `Loaded` alone does NOT mean "every room loaded".
+/// A room that failed to hydrate is absent from `ROOMS`, so importing its token
+/// would misclassify it as a brand-new room and build-empty over its populated
+/// persisted slot (DATA LOSS). The import decision therefore requires
+/// `Loaded` AND `!saw_fetch_failure` (a COMPLETE load). Reset at load start and
+/// on Retry, so a successful retry clears it.
+pub(crate) fn saw_fetch_failure() -> bool {
+    SAW_FETCH_FAILURE.load(Ordering::Relaxed)
 }
 
 /// The terminal state the backstop resolves a still-non-terminal load to,

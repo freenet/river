@@ -956,15 +956,515 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
     }
 }
 
+/// Whether a room identity is already stored for `owner_key`.
+///
+/// When true, importing a fresh identity for that room would REPLACE the
+/// stored one, losing access to the current signing key unless it was
+/// exported first. The import flow therefore prompts for confirmation
+/// rather than refusing outright (freenet/river#414). Pure — no signal
+/// access — so the decision is unit-testable.
+fn import_room_identity_exists(rooms: &crate::room_data::Rooms, owner_key: &VerifyingKey) -> bool {
+    rooms.map.contains_key(owner_key)
+}
+
+/// Resolve which identity a Replace-confirm imports.
+///
+/// It MUST be the `snapshot` captured when the overwrite warning was shown.
+/// The `_live_token` (the current, still-editable textarea contents) is
+/// deliberately IGNORED so that editing the token after the warning appears
+/// cannot redirect the overwrite to a different room (freenet/river#414):
+/// otherwise a room-A warning followed by pasting room-B's token and clicking
+/// Replace would overwrite room B without ever confirming THAT replacement.
+/// Returns `None` when there is no pending snapshot (nothing to confirm).
+fn resolve_confirmed_import(
+    snapshot: Option<IdentityExport>,
+    _live_token: &str,
+) -> Option<IdentityExport> {
+    snapshot
+}
+
+/// Build the [`RoomData`](crate::room_data::RoomData) for a **brand-new**
+/// imported room (one this client has never seen).
+///
+/// Pure (no signal access) so it is unit-testable. The room state starts
+/// empty (`is_awaiting_initial_sync()`), so the synchronizer takes the
+/// GET-first path and fills it from the network. This is used ONLY for the
+/// new-room path; an OVERWRITE of an existing room instead swaps the identity
+/// in place via [`swap_room_identity_in_place`] and KEEPS the room's state
+/// (room state is identity-independent — freenet/river#414 redesign).
+fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomData {
+    let owner_key = export.room_owner;
+
+    // Compute contract key from owner key + current WASM
+    let params = ChatRoomParametersV1 { owner: owner_key };
+    let params_bytes = to_cbor_vec(&params);
+    let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
+    let contract_key =
+        ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code);
+
+    // Create RoomData from the import, using room name from export if available
+    let mut initial_state = river_core::room_state::ChatRoomStateV1::default();
+    if let Some(ref name) = export.room_name {
+        initial_state.configuration.configuration.display =
+            river_core::room_state::privacy::RoomDisplayMetadata::public(name.clone(), None);
+    }
+    crate::room_data::RoomData {
+        owner_vk: owner_key,
+        room_state: initial_state, // Will be fully populated on sync
+        self_sk: export.signing_key,
+        contract_key,
+        last_read_message_id: None,
+        secrets: HashMap::new(),
+        current_secret_version: None,
+        last_secret_rotation: None,
+        key_migrated_to_delegate: false,
+        self_authorized_member: Some(export.authorized_member),
+        invite_chain: export.invite_chain,
+        self_member_info: export.member_info,
+        // Imported room: the heal prefers `self_member_info` from the export
+        // when present. If the export pre-dates the member_info seal (a
+        // private-room identity exported before the join's self-heal ran)
+        // `export.member_info` is `None`, but the export still carries the
+        // chosen nickname in `self_nickname`, so the heal restores it instead
+        // of minting a generated default (freenet/river#298).
+        self_nickname: export.self_nickname,
+        previous_contract_key: None,
+        // Restore the invitation-carried room secrets so a non-owner of a
+        // private room keeps the secret across a device migration
+        // (freenet/river#306). Folded into the `#[serde(skip)]` `secrets` map
+        // by `repopulate_secrets_from_state` on the next sync. Empty for
+        // public rooms, owners, and pre-#306 exports.
+        invitation_secrets: export.invitation_secrets,
+    }
+}
+
+/// COMPILE-TIME CLASSIFICATION PIN (Fable architectural review): the exhaustive
+/// destructure below has NO `..`, so ADDING A FIELD to `RoomData` FAILS
+/// COMPILATION here until a maintainer classifies its identity-overwrite verb in
+/// [`swap_room_identity_in_place`]. This is the forcing function that prevents
+/// the field-clobber class of bugs (a new field silently kept/defaulted without a
+/// decision). Verb table — KEEP / REPLACE / MERGE-same-key / CLEAR+RECOMPUTE:
+///
+/// ```text
+/// owner_vk                KEEP (the room owner; identity-independent)
+/// room_state              KEEP (identity-independent shared contract state)
+/// self_sk                 REPLACE (the imported identity)
+/// contract_key            KEEP (owner+WASM derived)
+/// last_read_message_id    KEEP (local read-tracking preference)
+/// secrets                 CLEAR+RECOMPUTE different-key (repopulate_secrets_from_state) / KEEP same-key
+/// current_secret_version  CLEAR+RECOMPUTE different-key / KEEP same-key
+/// last_secret_rotation    CLEAR different-key / KEEP same-key
+/// key_migrated_to_delegate REPLACE (false — the new key isn't migrated yet)
+/// self_authorized_member  \ REPLACE different-key / MERGE-keep-if-absent same-key
+/// invite_chain            / (paired coherent unit)
+/// self_member_info        REPLACE different-key / MERGE-keep-newer same-key
+/// self_nickname           REPLACE different-key / MERGE-keep-if-absent same-key
+/// previous_contract_key   KEEP (room-scoped #292 migration pointer)
+/// invitation_secrets      REPLACE different-key / MERGE-union(existing wins) same-key
+/// ```
+#[allow(dead_code)]
+fn _room_data_swap_classification(rd: crate::room_data::RoomData) {
+    let crate::room_data::RoomData {
+        owner_vk: _,
+        room_state: _,
+        self_sk: _,
+        contract_key: _,
+        last_read_message_id: _,
+        secrets: _,
+        current_secret_version: _,
+        last_secret_rotation: _,
+        key_migrated_to_delegate: _,
+        self_authorized_member: _,
+        invite_chain: _,
+        self_member_info: _,
+        self_nickname: _,
+        previous_contract_key: _,
+        invitation_secrets: _,
+    } = rd;
+}
+
+/// Merge two optional `AuthorizedMemberInfo` records, keeping the HIGHER-version
+/// one (a same-key re-import must not let a stale token clobber a newer local
+/// member_info; an absent incoming keeps local). Ties keep `local`.
+fn merge_keep_newer_member_info(
+    local: Option<river_core::room_state::member_info::AuthorizedMemberInfo>,
+    incoming: Option<river_core::room_state::member_info::AuthorizedMemberInfo>,
+) -> Option<river_core::room_state::member_info::AuthorizedMemberInfo> {
+    match (local, incoming) {
+        (Some(l), Some(i)) => {
+            if i.member_info.version > l.member_info.version {
+                Some(i)
+            } else {
+                Some(l)
+            }
+        }
+        (Some(l), None) => Some(l),
+        (None, i) => i,
+    }
+}
+
+/// Swap a room's identity IN PLACE for an imported one, **keeping the existing
+/// `room_state`** (freenet/river#414 redesign).
+///
+/// Room state is identity-independent: it is shared contract state fetched by
+/// the room's contract key, the same for every member. Only `self_sk` (and the
+/// membership proof it signs) is identity-specific. So an overwrite must NOT
+/// rebuild the room from an empty `ChatRoomStateV1::default()` and re-fetch —
+/// that empty-rebuild was the root of the sync-reset / stale-load / bogus-delta
+/// cluster. Instead we replace the identity-specific fields from the export and
+/// keep `room_state`, `contract_key`, `previous_contract_key`, and the local
+/// `last_read_message_id`.
+///
+/// Ordering matters: `self_sk` is set BEFORE `repopulate_secrets_from_state`,
+/// which decrypts the owner-signed `encrypted_secrets` blobs addressed to *this
+/// member* — a local recompute against the kept state, no network fetch.
+///
+/// An overwrite may hand the room to a DIFFERENT identity, so we must NOT carry
+/// the OLD identity's decrypt access forward (Codex round-6 P1-2): the old
+/// identity's in-memory decrypted `secrets` (plus `current_secret_version` /
+/// `last_secret_rotation`) are cleared, and the invitation-carried secrets are
+/// REPLACED with the new identity's (not unioned — an A-only version B has no
+/// contract blob for must not remain readable). `repopulate_secrets_from_state`
+/// then rebuilds only what the NEW identity can actually decrypt from the kept
+/// state, and `rebuild_private_actions_state` re-derives the edit/reaction
+/// action cache under the new identity's (possibly narrower) secret access.
+///
+/// Returns whether the signing key actually changed (drives the DM-cache
+/// prune). Pure (no signals) so the overwrite is unit-testable.
+fn swap_room_identity_in_place(
+    existing: &mut crate::room_data::RoomData,
+    export: IdentityExport,
+) -> bool {
+    let key_changed = existing.self_sk != export.signing_key;
+    existing.self_sk = export.signing_key;
+
+    if key_changed {
+        // DIFFERENT identity (a genuine swap): REPLACE all identity metadata with
+        // the imported one's, and do NOT carry the OLD identity's decrypt access
+        // forward. Clear the in-memory decrypted secrets and the derived version
+        // pointers (`#[serde(skip)]` runtime caches, rebuilt below), and REPLACE
+        // the invitation-carried secrets — so an A-only version B has no contract
+        // blob for cannot remain readable by B (Codex round-6 P1-2).
+        existing.self_authorized_member = Some(export.authorized_member);
+        existing.invite_chain = export.invite_chain;
+        existing.self_member_info = export.member_info;
+        existing.self_nickname = export.self_nickname;
+        existing.secrets.clear();
+        existing.current_secret_version = None;
+        existing.last_secret_rotation = None;
+        existing.invitation_secrets = export.invitation_secrets;
+    } else {
+        // SAME identity re-import (the user re-importing their OWN token, e.g. a
+        // legacy/stale one). A backward-compat decode of an old token yields
+        // ABSENT/EMPTY optional fields; blindly assigning them would ERASE richer
+        // local state. GENERAL RULE (Codex round-7/8): for EVERY field the token
+        // may carry absent/stale, RETAIN the existing local value when the
+        // incoming one is `None`/empty, and never replace a NEWER cached record
+        // with a STALER one. Applied to every identity-metadata field:
+        //
+        // - membership proof (`self_authorized_member` + `invite_chain`) is a
+        //   coherent UNIT (the chain validates the member), so keep them TOGETHER:
+        //   adopt the token's pair only when the local membership proof is absent;
+        //   CROSS-REF: the CLI counterpart
+        //   (cli/src/storage.rs `import_room_atomic`) gates the equivalent step on
+        //   the TOKEN's chain being empty, not the LOCAL proof being absent — the
+        //   two conditions differ DELIBERATELY; do NOT harmonize them into one rule.
+        if existing.self_authorized_member.is_none() {
+            existing.self_authorized_member = Some(export.authorized_member);
+            existing.invite_chain = export.invite_chain;
+        }
+        // - `self_member_info`: keep the higher-version record (a stale token must
+        //   not clobber a newer local member_info; absent token keeps local);
+        existing.self_member_info =
+            merge_keep_newer_member_info(existing.self_member_info.take(), export.member_info);
+        // - `self_nickname`: a present token value is a deliberate choice; an
+        //   absent one must NOT erase the locally-chosen nickname (else a later
+        //   inactivity prune + rejoin would publish a generated default);
+        if export.self_nickname.is_some() {
+            existing.self_nickname = export.self_nickname;
+        }
+        // - `invitation_secrets`: MERGE (existing wins) — the token may be empty
+        //   and the local map can be the ONLY copy of a private room's key, so
+        //   wiping it would make history permanently unreadable (Codex round-7).
+        for (version, secret) in export.invitation_secrets {
+            existing.invitation_secrets.entry(version).or_insert(secret);
+        }
+        // - decrypted caches (`secrets`/`current_secret_version`/
+        //   `last_secret_rotation`) are PRESERVED (not cleared) — same identity,
+        //   same decrypt access.
+    }
+
+    // The (re)imported key has not been stored in the delegate yet.
+    existing.key_migrated_to_delegate = false;
+    // Recompute the in-memory decrypted secrets from the KEPT room_state — local,
+    // no network fetch — then re-derive the action cache (edits/deletes/reactions)
+    // under those secrets. For a same-key re-import this only tops up (repopulate
+    // never overwrites an existing decrypted version); for a genuine swap it
+    // rebuilds exactly what the new identity can decrypt.
+    existing.repopulate_secrets_from_state();
+    existing.rebuild_private_actions_state();
+    key_changed
+}
+
+/// Whether the room set is COMPLETELY loaded — safe to decide new-vs-overwrite.
+///
+/// Under the in-place redesign this decision is safety-critical: deciding
+/// "no room" on an incomplete view would route a real, populated room to the
+/// build-empty NEW path and overwrite its populated persisted slot (data loss).
+///
+/// Requires ALL of (Codex round-6 P1-1, round-9 P1):
+/// - the startup delegate load RESOLVED (`Loaded`) — `Loading`/`Migrating` mean
+///   "we don't know the set yet"; `LoadFailed` means a known room failed;
+/// - NO listed room's fetch failed (`!saw_fetch_failure`). `per_room_terminal`
+///   resolves to `Loaded` the instant ≥1 room materialized even if OTHER listed
+///   rooms failed to hydrate, so `Loaded` alone is not "complete". A room absent
+///   from `ROOMS` because its fetch failed would be misclassified as new; and
+/// - the freenet/river#345 RECOVERY is not in progress (`!recovery_in_progress`).
+///   The interrupted-legacy-migration recovery sets `Loaded` (to render the
+///   partial list) BEFORE background workers restore rooms still missing from the
+///   partial per-room index. Importing for one of those in that window would
+///   overwrite its recovered slot with empty state. So we wait for recovery too.
+///
+/// If any condition fails the caller refuses the import ("some rooms didn't
+/// finish loading — retry") rather than risk classifying a real room as new.
+fn rooms_load_is_authoritative(
+    state: crate::components::app::chat_delegate::RoomsLoadState,
+    saw_fetch_failure: bool,
+    recovery_in_progress: bool,
+) -> bool {
+    matches!(
+        state,
+        crate::components::app::chat_delegate::RoomsLoadState::Loaded
+    ) && !saw_fetch_failure
+        && !recovery_in_progress
+}
+
+/// Complete an identity import (freenet/river#414 redesign).
+///
+/// Splits the two genuinely-different cases:
+/// - **New room** (not in `ROOMS`): build an empty placeholder + let the
+///   GET-first sync fill it — the correct path for a room this client has
+///   never seen.
+/// - **Overwrite** (already in `ROOMS`): swap the identity IN PLACE and KEEP
+///   the existing `room_state`. Room state is identity-independent, so an
+///   overwrite must not throw it away and re-fetch (the old empty-rebuild was
+///   the root of the sync-reset / stale-load / bogus-delta cluster).
+///
+/// Precondition: the caller has confirmed the room set is authoritative
+/// (`rooms_load_is_authoritative`), so the new-vs-overwrite decision below is
+/// reliable and can't misclassify a real room as new during startup.
+fn complete_identity_import(
+    export: IdentityExport,
+    mut success_msg: Signal<Option<String>>,
+    mut error_msg: Signal<Option<String>>,
+) {
+    let owner_key = export.room_owner;
+    // Migrate the imported signing key to the delegate immediately. Without
+    // this, the delegate may have a stale key from a prior session, causing
+    // all message signatures to be rejected by the contract ("State
+    // verification failed: Invalid signature").
+    let new_sk = export.signing_key.clone();
+    let room_key_bytes = owner_key.to_bytes();
+
+    // Defer signal mutations to a clean execution context to prevent RefCell
+    // re-entrant borrow panics.
+    //
+    // KNOWN LIMITATION — multi-tab reversal (freenet/river#420). This overwrite
+    // updates THIS session's identity and re-saves the per-room delegate slot,
+    // but a SECOND tab/device for the same room still holding the OLD identity
+    // will write it back as `RoomSlot::Present` on its next save.
+    // `chat_delegate::reconcile_room_present` is local-authoritative on a
+    // self_sk conflict (last-writer-wins; there is no identity generation to
+    // decide which is newer), so on the next cold load a stale tab can silently
+    // undo the replacement. Full multi-tab identity coordination is out of scope
+    // for this get-unstuck escape hatch; the proper fix is a persisted
+    // identity-generation counter (see #420). The confirm dialog tells the user
+    // to close other tabs/devices first, which avoids the reversal in practice.
+    crate::util::defer(move || {
+        // Drives the DM-state prune below: true only when an overwrite actually
+        // swaps to a different signing key.
+        let mut identity_changed = false;
+        // For an OVERWRITE only: the new identity's member_info heal, built inside
+        // the borrow and sent AFTER it releases (the same ordering the UPDATE-path
+        // heal uses). An in-place overwrite does NO GET, so without this the new
+        // identity would render "Unknown" to peers until an unrelated future heal
+        // (freenet/river#414, Codex round-6 P2-4). A NEW room GET-first-syncs, so
+        // its GET-path heal covers it.
+        let mut pending_member_info_heal = None;
+        ROOMS.with_mut(|rooms| {
+            // Importing is an explicit rejoin: clear any leave tombstone and
+            // record the rejoin so a remote `Tombstone` slot is overwritten with
+            // `Present` rather than adopting the leave (freenet/river#247/#345).
+            // Applies to both the new-room and overwrite paths.
+            rooms.removed_rooms.remove(&owner_key);
+            crate::components::app::chat_delegate::mark_room_rejoined(owner_key);
+
+            match rooms.map.get_mut(&owner_key) {
+                // OVERWRITE: swap the identity in place, KEEP room_state.
+                Some(existing) => {
+                    identity_changed = swap_room_identity_in_place(existing, export);
+                    // Build the heal against the KEPT state (secrets were just
+                    // repopulated for the new identity by the swap). Returns None
+                    // when self isn't stranded, isn't a member, or — for a private
+                    // room — the secret isn't available yet (deferred, no leak).
+                    pending_member_info_heal =
+                        existing.build_member_info_heal(&existing.room_state);
+                }
+                // NEW room: empty placeholder; the GET-first sync fills it.
+                None => {
+                    rooms
+                        .map
+                        .insert(owner_key, build_imported_room_data(export));
+                }
+            }
+        });
+
+        // Send the new identity's member_info heal AFTER the ROOMS borrow is
+        // released (freenet/river#414 P2-4). `send_member_info_heal_update`
+        // builds the member_info-only UPDATE delta and spawns the send itself; it
+        // is self-signed and idempotent, so a race with any other heal is safe.
+        if let Some(heal_info) = pending_member_info_heal {
+            crate::components::app::freenet_api::room_synchronizer::send_member_info_heal_update(
+                owner_key, heal_info,
+            );
+        }
+
+        // Overwriting a DIFFERENT identity: prune the OLD identity's cached
+        // outbound-DM plaintext + archive state so it doesn't leak into (or
+        // wrongly hide threads for) the new identity — symmetric to the CLI
+        // `identity import --force` prune (freenet/river#414). Only on a real
+        // key change; a brand-new import or a same-key re-import prunes nothing.
+        // The tombstone is keyed to the NEW identity's MemberId so a late DM
+        // response drops entries authored by any replaced identity, regardless of
+        // their timestamp (freenet/river#414 round-9 P2).
+        if identity_changed {
+            let new_member_id = MemberId::from(&new_sk.verifying_key());
+            crate::components::app::chat_delegate::prune_dm_state_for_room(
+                owner_key,
+                new_member_id,
+            );
+        }
+
+        CURRENT_ROOM.with_mut(|current| {
+            current.owner_key = Some(owner_key);
+        });
+
+        // Persist the room (the overwrite's new `self_sk` rides in the per-room
+        // delegate slot via `save_rooms_to_delegate`, which the NEEDS_SYNC effect
+        // fires) and drive a normal sync. For a NEW room the placeholder is
+        // `is_awaiting_initial_sync()`, so the synchronizer takes the GET-first
+        // path; for an OVERWRITE the kept `room_state` matches `last_synced_state`,
+        // so no bogus delta is sent and no re-fetch is forced. The redesign keeps
+        // state, so there is NO forced sync-entry reset here (the old empty-rebuild
+        // scaffolding is gone — freenet/river#414).
+        crate::components::app::mark_needs_sync(owner_key);
+
+        // Migrate signing key to delegate in background
+        crate::util::safe_spawn_local(async move {
+            // AUTHORITATIVE: the user just imported/chose this identity, so it
+            // becomes the room's current identity and supersedes any stale
+            // hydration migration for an old key (freenet/river#414 P1).
+            let result = crate::signing::migrate_signing_key(room_key_bytes, &new_sk, true).await;
+            match result {
+                crate::signing::MigrationResult::Stored
+                | crate::signing::MigrationResult::StaleKeyOverwritten
+                | crate::signing::MigrationResult::AlreadyCurrent => {
+                    dioxus::logger::tracing::info!("Import: signing key migrated to delegate");
+                    crate::util::defer(move || {
+                        let mut sanitized = false;
+                        ROOMS.with_mut(|rooms| {
+                            if let Some(rd) = rooms.map.get_mut(&owner_key) {
+                                // Guard a rapid second replacement: only mark
+                                // migrated if the room's CURRENT identity is
+                                // still the one we just migrated. If a newer
+                                // import replaced it while this migration ran,
+                                // its own migration owns `key_migrated_to_delegate`
+                                // — don't mark it for a superseded key
+                                // (freenet/river#414).
+                                if rd.self_sk != new_sk {
+                                    return;
+                                }
+                                rd.key_migrated_to_delegate = true;
+                                // Remove any messages with invalid signatures
+                                // left by a stale delegate key
+                                let params = ChatRoomParametersV1 { owner: owner_key };
+                                let removed = crate::signing::remove_unverifiable_messages(
+                                    &mut rd.room_state,
+                                    &params,
+                                );
+                                sanitized = removed > 0;
+                            }
+                        });
+                        if sanitized {
+                            crate::components::app::mark_needs_sync(owner_key);
+                        }
+                    });
+                }
+                crate::signing::MigrationResult::Failed => {
+                    dioxus::logger::tracing::warn!(
+                        "Import: delegate key migration failed, will use fallback signing"
+                    );
+                }
+            }
+        });
+
+        success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
+        error_msg.set(None);
+    });
+}
+
 #[component]
 pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
     let mut token_input = use_signal(String::new);
     let mut error_msg = use_signal(|| None::<String>);
     let mut success_msg = use_signal(|| None::<String>);
+    // The parsed import awaiting overwrite confirmation. `Some` means a room
+    // identity already exists for this token's owner, so we prompt to confirm
+    // replacing it rather than importing silently (freenet/river#414). This
+    // is a SNAPSHOT of the token that was checked: Replace consumes it, NOT a
+    // fresh read of the (still-editable) textarea, so editing the token after
+    // the warning appears cannot redirect the overwrite to a different room.
+    let mut pending_import = use_signal(|| None::<IdentityExport>);
 
     if !*is_active.read() {
         return rsx! {};
     }
+
+    // Reactive hydration gate (freenet/river#414 redesign, Codex round-6 P1-1 +
+    // round-9 P1): the room set must be COMPLETELY loaded AND not mid-recovery
+    // before the Import button is enabled, so the new-vs-overwrite decision is
+    // never made on an incomplete view (which would build-empty over a real
+    // room). Reading `ROOMS_LOAD_STATE` here subscribes the modal so it re-renders
+    // when the load resolves; a `ROOMS.try_read()` touch adds a subscription so it
+    // ALSO re-renders when #345 recovery hydrates a room (recovery leaves
+    // `ROOMS_LOAD_STATE == Loaded` throughout). `saw_fetch_failure()` and
+    // `rooms_recovery_in_progress()` are read alongside (non-signal sources).
+    let _ = ROOMS.try_read(); // subscribe: re-render when recovery hydrates rooms
+    let saw_fetch_failure = crate::components::app::chat_delegate::saw_fetch_failure();
+    let rooms_hydrated = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
+        .try_read()
+        .map(|g| {
+            rooms_load_is_authoritative(
+                *g,
+                saw_fetch_failure,
+                crate::components::app::chat_delegate::rooms_recovery_in_progress(),
+            )
+        })
+        .unwrap_or(false);
+
+    // Reset-and-close, matching the deferred pattern in `join_with_code_modal`
+    // and `.claude/rules/dioxus-signal-safety.md`: signal mutations from event
+    // handlers run inside `crate::util::defer()` so they execute in a clean
+    // Dioxus context (no re-entrant `RefCell` borrow, root scope present).
+    let reset_and_close = move || {
+        crate::util::defer(move || {
+            is_active.set(false);
+            error_msg.set(None);
+            success_msg.set(None);
+            pending_import.set(None);
+            token_input.set(String::new());
+        });
+    };
 
     let handle_import = move |_| {
         let input = token_input.read().clone();
@@ -972,160 +1472,99 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
             Ok(export) => {
                 let owner_key = export.room_owner;
 
-                // Check if we already have this room
-                {
+                // Safety-critical (freenet/river#414 redesign, Codex round-6
+                // P1-1 + round-9 P1): NEVER decide new-vs-overwrite on an
+                // incompletely-loaded OR mid-recovery room set — a false "no room"
+                // would route a real, populated room to the build-empty NEW path
+                // and overwrite its populated persisted slot. This requires a
+                // COMPLETE load (resolved AND no listed room's fetch failed) AND
+                // that the #345 recovery has finished; a partial load / pending
+                // recovery could be missing the very room being imported. The
+                // Import button is disabled until then (see `rooms_hydrated`); this
+                // is the defense-in-depth net against a click landing before the
+                // render has re-disabled the button.
+                let load_state = crate::components::app::chat_delegate::ROOMS_LOAD_STATE
+                    .try_read()
+                    .map(|g| *g)
+                    .unwrap_or(crate::components::app::chat_delegate::RoomsLoadState::Loading);
+                let saw_failure = crate::components::app::chat_delegate::saw_fetch_failure();
+                let recovery = crate::components::app::chat_delegate::rooms_recovery_in_progress();
+                if !rooms_load_is_authoritative(load_state, saw_failure, recovery) {
+                    crate::util::defer(move || {
+                        error_msg.set(Some(
+                            "Still finishing loading your rooms — please wait a moment and \
+                             try again."
+                                .to_string(),
+                        ));
+                        success_msg.set(None);
+                    });
+                    return;
+                }
+
+                // If we already have an identity for this room, importing would
+                // replace it (and lose the current signing key unless it was
+                // exported). Snapshot the CHECKED token and prompt for
+                // confirmation instead of refusing (freenet/river#414).
+                let already_exists = {
                     let Ok(rooms) = ROOMS.try_read() else {
                         return;
                     };
-                    if rooms.map.contains_key(&owner_key) {
-                        error_msg.set(Some(
-                            "You already have an identity for this room.".to_string(),
-                        ));
-                        return;
-                    }
-                }
-
-                // Compute contract key from owner key + current WASM
-                let params = ChatRoomParametersV1 { owner: owner_key };
-                let params_bytes = to_cbor_vec(&params);
-                let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
-                let contract_key = ContractKey::from_params_and_code(
-                    Parameters::from(params_bytes),
-                    &contract_code,
-                );
-
-                // Create RoomData from the import, using room name from export if available
-                let mut initial_state = river_core::room_state::ChatRoomStateV1::default();
-                if let Some(ref name) = export.room_name {
-                    initial_state.configuration.configuration.display =
-                        river_core::room_state::privacy::RoomDisplayMetadata::public(
-                            name.clone(),
-                            None,
-                        );
-                }
-                let room_data = crate::room_data::RoomData {
-                    owner_vk: owner_key,
-                    room_state: initial_state, // Will be fully populated on sync
-                    self_sk: export.signing_key,
-                    contract_key,
-                    last_read_message_id: None,
-                    secrets: HashMap::new(),
-                    current_secret_version: None,
-                    last_secret_rotation: None,
-                    key_migrated_to_delegate: false,
-                    self_authorized_member: Some(export.authorized_member),
-                    invite_chain: export.invite_chain,
-                    self_member_info: export.member_info,
-                    // Imported room: the heal prefers `self_member_info` from
-                    // the export when present. If the export pre-dates the
-                    // member_info seal (a private-room identity exported
-                    // before the join's self-heal ran) `export.member_info`
-                    // is `None`, but the export still carries the chosen
-                    // nickname in `self_nickname`, so the heal restores it
-                    // instead of minting a generated default (freenet/river#298).
-                    self_nickname: export.self_nickname,
-                    previous_contract_key: None,
-                    // Restore the invitation-carried room secrets so a
-                    // non-owner of a private room keeps the secret across a
-                    // device migration (freenet/river#306). Folded into the
-                    // `#[serde(skip)]` `secrets` map by
-                    // `repopulate_secrets_from_state` on the next sync. Empty
-                    // for public rooms, owners, and pre-#306 exports.
-                    invitation_secrets: export.invitation_secrets,
+                    import_room_identity_exists(&rooms, &owner_key)
                 };
-
-                // Migrate the imported signing key to the delegate immediately.
-                // Without this, the delegate may have a stale key from a prior
-                // session, causing all message signatures to be rejected by the
-                // contract ("State verification failed: Invalid signature").
-                let signing_key_for_migration = room_data.self_sk.clone();
-                let room_key_bytes = owner_key.to_bytes();
-
-                // Defer signal mutations to a clean execution context to
-                // prevent RefCell re-entrant borrow panics.
-                crate::util::defer(move || {
-                    ROOMS.with_mut(|rooms| {
-                        // Importing a room is an explicit rejoin — clear any
-                        // prior leave tombstone for this owner_key so the
-                        // merge path doesn't silently filter the room out
-                        // on next reload (freenet/river#247). Also record the
-                        // explicit rejoin so the per-room save overwrites a
-                        // remote `Tombstone` slot with `Present` rather than
-                        // adopting the leave (freenet/river#345 round-9).
-                        rooms.removed_rooms.remove(&owner_key);
-                        crate::components::app::chat_delegate::mark_room_rejoined(owner_key);
-                        rooms.map.insert(owner_key, room_data);
+                if already_exists {
+                    crate::util::defer(move || {
+                        pending_import.set(Some(export));
+                        error_msg.set(None);
+                        success_msg.set(None);
                     });
+                    return;
+                }
 
-                    CURRENT_ROOM.with_mut(|current| {
-                        current.owner_key = Some(owner_key);
-                    });
-
-                    crate::components::app::mark_needs_sync(owner_key);
-
-                    // Migrate signing key to delegate in background
-                    crate::util::safe_spawn_local(async move {
-                        let result = crate::signing::migrate_signing_key(
-                            room_key_bytes,
-                            &signing_key_for_migration,
-                        )
-                        .await;
-                        match result {
-                            crate::signing::MigrationResult::Stored
-                            | crate::signing::MigrationResult::StaleKeyOverwritten
-                            | crate::signing::MigrationResult::AlreadyCurrent => {
-                                dioxus::logger::tracing::info!(
-                                    "Import: signing key migrated to delegate"
-                                );
-                                crate::util::defer(move || {
-                                    let mut sanitized = false;
-                                    ROOMS.with_mut(|rooms| {
-                                        if let Some(rd) = rooms.map.get_mut(&owner_key) {
-                                            rd.key_migrated_to_delegate = true;
-                                            // Remove any messages with invalid signatures
-                                            // left by a stale delegate key
-                                            let params = ChatRoomParametersV1 { owner: owner_key };
-                                            let removed =
-                                                crate::signing::remove_unverifiable_messages(
-                                                    &mut rd.room_state,
-                                                    &params,
-                                                );
-                                            sanitized = removed > 0;
-                                        }
-                                    });
-                                    if sanitized {
-                                        crate::components::app::mark_needs_sync(owner_key);
-                                    }
-                                });
-                            }
-                            crate::signing::MigrationResult::Failed => {
-                                dioxus::logger::tracing::warn!(
-                                    "Import: delegate key migration failed, will use fallback signing"
-                                );
-                            }
-                        }
-                    });
-
-                    success_msg.set(Some("Identity imported! Syncing room state...".to_string()));
-                    error_msg.set(None);
-                });
+                complete_identity_import(export, success_msg, error_msg);
             }
             Err(e) => {
-                error_msg.set(Some(format!("Invalid token: {}", e)));
-                success_msg.set(None);
+                crate::util::defer(move || {
+                    error_msg.set(Some(format!("Invalid token: {}", e)));
+                    success_msg.set(None);
+                });
             }
         }
+    };
+
+    // User confirmed replacing the existing identity: import the SNAPSHOT
+    // captured when the warning was shown — never a fresh read of the editable
+    // textarea (freenet/river#414).
+    let handle_replace_confirm = move |_| {
+        let live_token = token_input.read().clone();
+        let snapshot = pending_import.read().clone();
+        let Some(export) = resolve_confirmed_import(snapshot, &live_token) else {
+            return;
+        };
+        // Belt-and-suspenders: bail on a torn ROOMS read rather than acting on
+        // inconsistent state. Existence does not change the action — we import
+        // the SNAPSHOT either way (complete_identity_import inserts whether or
+        // not the room still exists), so the read only guards consistency.
+        if ROOMS.try_read().is_err() {
+            return;
+        }
+        crate::util::defer(move || {
+            pending_import.set(None);
+        });
+        complete_identity_import(export, success_msg, error_msg);
+    };
+
+    // User backed out of the overwrite: drop the snapshot and return to the
+    // input state, keeping the pasted token so they can reconsider.
+    let handle_replace_cancel = move |_| {
+        crate::util::defer(move || {
+            pending_import.set(None);
+        });
     };
 
     rsx! {
         div {
             class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
-            onclick: move |_| {
-                is_active.set(false);
-                error_msg.set(None);
-                success_msg.set(None);
-                token_input.set(String::new());
-            },
+            onclick: move |_| reset_and_close(),
             div {
                 class: "bg-panel border border-border rounded-xl shadow-lg p-6 max-w-lg w-full mx-4",
                 onclick: move |e| e.stop_propagation(),
@@ -1139,7 +1578,26 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                     class: "w-full h-40 bg-surface border border-border rounded-lg p-3 text-xs font-mono text-text resize-none",
                     placeholder: "-----BEGIN RIVER IDENTITY-----\n...\n-----END RIVER IDENTITY-----",
                     value: "{token_input}",
-                    oninput: move |e| token_input.set(e.value()),
+                    // Controlled input: set the value signal synchronously (the
+                    // documented signal-safety exception — a deferred write to a
+                    // controlled input's bound value lags the DOM and drops
+                    // keystrokes). Editing the token invalidates any pending
+                    // overwrite confirmation so the warning can't outlive the
+                    // token it was raised for (freenet/river#414). The
+                    // `pending_import` clear IS deferred, though: the component
+                    // subscribes to it (the confirm-vs-input branch below), so a
+                    // synchronous clear could re-render mid-write and hit the
+                    // Firefox-mobile `RefCell already borrowed` panic. Only defer
+                    // when something is actually pending, so a normal keystroke
+                    // doesn't schedule a setTimeout.
+                    oninput: move |e| {
+                        token_input.set(e.value());
+                        if pending_import.try_read().is_ok_and(|p| p.is_some()) {
+                            crate::util::defer(move || {
+                                pending_import.set(None);
+                            });
+                        }
+                    },
                 }
                 if let Some(err) = &*error_msg.read() {
                     div { class: "mt-2 text-sm text-red-400",
@@ -1151,21 +1609,84 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                         "{msg}"
                     }
                 }
-                div { class: "flex justify-end gap-3 mt-4",
-                    button {
-                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
-                        onclick: move |_| {
-                            is_active.set(false);
-                            error_msg.set(None);
-                            success_msg.set(None);
-                            token_input.set(String::new());
-                        },
-                        "Cancel"
+                if pending_import.read().is_some() {
+                    // A room identity already exists — warn before replacing it.
+                    div {
+                        "data-testid": "import-identity-replace-warning",
+                        class: "mt-3 text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3",
+                        "This room already has an identity. Importing will REPLACE it \u{2014} you'll lose access to your current identity for this room unless you've exported it first."
                     }
-                    button {
-                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
-                        onclick: handle_import,
-                        "Import"
+                    // Multi-tab reversal caveat (freenet/river#420): another
+                    // session still on the old identity can write it back and undo
+                    // the switch on next load, so tell the user to close them first.
+                    div {
+                        "data-testid": "import-identity-replace-multitab-warning",
+                        class: "mt-2 text-sm text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3",
+                        "Close any other tabs or devices open to this room first. A session still using the old identity can write it back and undo the switch."
+                    }
+                    div { class: "flex justify-end gap-3 mt-4",
+                        button {
+                            "data-testid": "import-identity-replace-cancel",
+                            class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                            onclick: handle_replace_cancel,
+                            "Cancel"
+                        }
+                        button {
+                            "data-testid": "import-identity-replace-confirm",
+                            class: "px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors",
+                            onclick: handle_replace_confirm,
+                            "Replace identity"
+                        }
+                    }
+                } else {
+                    // Until the room set is authoritative, importing could
+                    // misclassify a real room as new and overwrite it with empty
+                    // state — so the Import button waits for hydration
+                    // (freenet/river#414 redesign).
+                    if !rooms_hydrated {
+                        if saw_fetch_failure {
+                            // A partial load FAILED: the rail shows `List` (some
+                            // room exists) so its own Retry control is hidden, and
+                            // without a way out the import would be blocked
+                            // indefinitely. Give the user a working retry that
+                            // re-fires the load; the gate clears reactively once
+                            // the missing rooms hydrate (freenet/river#414 round-10 P2).
+                            div {
+                                "data-testid": "import-identity-load-failed",
+                                class: "mt-3 text-sm text-amber-400",
+                                "Some rooms didn't finish loading, so importing is paused to avoid overwriting one. Retry loading your rooms to continue."
+                            }
+                            div { class: "flex justify-end mt-2",
+                                button {
+                                    "data-testid": "import-identity-retry-load",
+                                    class: "px-3 py-1.5 bg-surface hover:bg-surface-hover text-text text-xs rounded-lg transition-colors border border-border",
+                                    onclick: move |_| {
+                                        crate::components::app::chat_delegate::retry_rooms_load();
+                                    },
+                                    "Retry loading rooms"
+                                }
+                            }
+                        } else {
+                            div {
+                                "data-testid": "import-identity-loading-rooms",
+                                class: "mt-3 text-sm text-text-muted",
+                                "Loading your rooms\u{2026} the import will be available in a moment."
+                            }
+                        }
+                    }
+                    div { class: "flex justify-end gap-3 mt-4",
+                        button {
+                            class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text text-sm rounded-lg transition-colors border border-border",
+                            onclick: move |_| reset_and_close(),
+                            "Cancel"
+                        }
+                        button {
+                            "data-testid": "import-identity-submit",
+                            class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                            disabled: !rooms_hydrated,
+                            onclick: handle_import,
+                            "Import"
+                        }
                     }
                 }
             }
@@ -1186,6 +1707,438 @@ mod tests {
             member_vk: *invitee_vk,
         };
         AuthorizedMember::new(member, owner_sk)
+    }
+
+    /// An empty [`Rooms`](crate::room_data::Rooms) for the overwrite-import
+    /// tests (`Rooms` derives no `Default`, so build it field-by-field —
+    /// mirrors the `empty_rooms` helper in `chat_delegate.rs`).
+    fn empty_rooms() -> crate::room_data::Rooms {
+        crate::room_data::Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: HashSet::new(),
+            notification_modes: HashMap::new(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        }
+    }
+
+    /// A minimal owner export whose `signing_key` is `self_sk` for the room
+    /// owned by `owner_sk`. Enough to drive `build_imported_room_data` /
+    /// `swap_room_identity_in_place` in the overwrite tests.
+    fn export_for(owner_sk: &SigningKey, self_sk: &SigningKey) -> IdentityExport {
+        let owner_vk = owner_sk.verifying_key();
+        let self_vk = self_sk.verifying_key();
+        IdentityExport {
+            room_owner: owner_vk,
+            signing_key: self_sk.clone(),
+            authorized_member: authorized_member(owner_sk, &self_vk),
+            invite_chain: vec![],
+            member_info: None,
+            room_name: None,
+            self_nickname: None,
+            invitation_secrets: HashMap::new(),
+        }
+    }
+
+    /// freenet/river#414: importing into a room that already has an identity
+    /// routes to the overwrite-confirm path, NOT a hard error. The component
+    /// branches on `import_room_identity_exists`, so pin that decision: true
+    /// when the room is present, false when absent.
+    #[test]
+    fn existing_room_import_routes_to_confirm() {
+        let owner_sk = SigningKey::from_bytes(&[41u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+
+        let mut rooms = empty_rooms();
+        assert!(
+            !import_room_identity_exists(&rooms, &owner_vk),
+            "no stored identity yet: first-time import path (no confirm)"
+        );
+
+        // Seed an existing identity for the room.
+        let existing_sk = SigningKey::from_bytes(&[42u8; 32]);
+        let existing = build_imported_room_data(export_for(&owner_sk, &existing_sk));
+        rooms.map.insert(owner_vk, existing);
+
+        assert!(
+            import_room_identity_exists(&rooms, &owner_vk),
+            "an identity now exists: import must prompt for overwrite confirmation, not refuse"
+        );
+    }
+
+    /// freenet/river#414 REDESIGN: overwriting an existing room's identity swaps
+    /// `self_sk` (and the membership proof) IN PLACE while KEEPING the existing
+    /// `room_state`. Room state is identity-independent shared contract state, so
+    /// an overwrite must never throw it away and rebuild empty (the old bug that
+    /// caused the sync-reset / bogus-delta cluster).
+    #[test]
+    fn overwrite_swaps_identity_in_place_keeping_room_state() {
+        let owner_sk = SigningKey::from_bytes(&[43u8; 32]);
+        let old_sk = SigningKey::from_bytes(&[44u8; 32]);
+        let new_sk = SigningKey::from_bytes(&[45u8; 32]);
+        assert_ne!(old_sk.to_bytes(), new_sk.to_bytes());
+
+        // Existing room under the OLD identity with a POPULATED, distinguishable
+        // state (a member added) so we can assert the state is KEPT.
+        let mut existing = build_imported_room_data(export_for(&owner_sk, &old_sk));
+        let member_vk = SigningKey::from_bytes(&[77u8; 32]).verifying_key();
+        existing
+            .room_state
+            .members
+            .members
+            .push(authorized_member(&owner_sk, &member_vk));
+        existing.key_migrated_to_delegate = true; // pretend the old key was migrated
+        let kept_state = existing.room_state.clone();
+        assert_ne!(
+            kept_state,
+            river_core::room_state::ChatRoomStateV1::default(),
+            "precondition: the existing room has non-empty state"
+        );
+
+        // Overwrite with the NEW identity.
+        let key_changed =
+            swap_room_identity_in_place(&mut existing, export_for(&owner_sk, &new_sk));
+
+        assert!(key_changed, "swapping to a different key reports a change");
+        assert_eq!(
+            existing.self_sk.to_bytes(),
+            new_sk.to_bytes(),
+            "self_sk must become the imported identity"
+        );
+        assert_eq!(
+            existing.room_state, kept_state,
+            "room_state must be KEPT untouched (identity-independent) — NOT rebuilt empty"
+        );
+        assert!(
+            !existing.key_migrated_to_delegate,
+            "the new key hasn't been migrated to the delegate yet"
+        );
+    }
+
+    /// freenet/river#414 REDESIGN: an overwrite of a PRIVATE room repopulates the
+    /// new identity's in-memory decrypted secrets from the KEPT state — a local
+    /// recompute (here via the invitation-carried secret fold), never a network
+    /// fetch.
+    #[test]
+    fn overwrite_repopulates_private_room_secrets_for_new_identity() {
+        let owner_sk = SigningKey::from_bytes(&[61u8; 32]);
+        let old_sk = SigningKey::from_bytes(&[62u8; 32]);
+        let new_sk = SigningKey::from_bytes(&[63u8; 32]);
+
+        // Existing PRIVATE room under the old identity (no secrets loaded yet).
+        let mut existing = build_imported_room_data(export_for(&owner_sk, &old_sk));
+        existing.room_state.configuration.configuration.privacy_mode =
+            river_core::room_state::privacy::PrivacyMode::Private;
+        assert!(existing.is_private());
+        assert!(existing.secrets.is_empty());
+
+        // The imported (new) identity carries an invitation secret at v0.
+        let mut export = export_for(&owner_sk, &new_sk);
+        export.invitation_secrets.insert(0u32, [0xABu8; 32]);
+
+        swap_room_identity_in_place(&mut existing, export);
+
+        assert_eq!(existing.self_sk.to_bytes(), new_sk.to_bytes());
+        assert_eq!(
+            existing.secrets.get(&0u32),
+            Some(&[0xABu8; 32]),
+            "overwrite must repopulate the new identity's in-memory secrets from kept state"
+        );
+    }
+
+    /// freenet/river#414 REDESIGN (Codex round-6 P1-2): an overwrite must NOT
+    /// carry the OLD identity's decrypt access forward. The old identity's
+    /// in-memory decrypted `secrets` are cleared, and invitation-carried secrets
+    /// are REPLACED (not unioned) with the new identity's — so a version only the
+    /// old identity could read does not remain readable by the new one.
+    #[test]
+    fn overwrite_drops_old_identity_decrypt_access() {
+        let owner_sk = SigningKey::from_bytes(&[71u8; 32]);
+        let old_sk = SigningKey::from_bytes(&[72u8; 32]);
+        let new_sk = SigningKey::from_bytes(&[73u8; 32]);
+
+        // Existing PRIVATE room where the OLD identity had decrypted secret v9
+        // and an invitation secret v5 the NEW identity has no blob for.
+        let mut existing = build_imported_room_data(export_for(&owner_sk, &old_sk));
+        existing.room_state.configuration.configuration.privacy_mode =
+            river_core::room_state::privacy::PrivacyMode::Private;
+        existing.secrets.insert(9u32, [0x11u8; 32]);
+        existing.current_secret_version = Some(9);
+        existing.last_secret_rotation = Some(std::time::SystemTime::now());
+        existing.invitation_secrets.insert(5u32, [0x22u8; 32]);
+
+        // The imported (new) identity carries only invitation secret v0.
+        let mut export = export_for(&owner_sk, &new_sk);
+        export.invitation_secrets.insert(0u32, [0x33u8; 32]);
+
+        swap_room_identity_in_place(&mut existing, export);
+
+        // The old identity's decrypted secret v9 is gone (cleared before repopulate).
+        assert!(
+            !existing.secrets.contains_key(&9u32),
+            "old identity's decrypted secret must be cleared, not carried forward"
+        );
+        // invitation_secrets REPLACED: the old identity's v5 must be gone…
+        assert!(
+            !existing.invitation_secrets.contains_key(&5u32),
+            "old identity's invitation secret must NOT be unioned into the new identity"
+        );
+        // …and only the NEW identity's v0 remains (folded into secrets by repopulate).
+        assert_eq!(existing.secrets.get(&0u32), Some(&[0x33u8; 32]));
+    }
+
+    /// freenet/river#414 (Codex round 7): a SAME-key re-import (the user
+    /// re-importing their OWN identity from a legacy/stale token whose
+    /// `invitation_secrets` may be empty) must PRESERVE the existing secrets, not
+    /// clear+replace them. For a private room still awaiting the owner backfill,
+    /// the existing `invitation_secrets` map can be the ONLY copy of the room key
+    /// — wiping it would make history permanently unreadable.
+    #[test]
+    fn same_key_reimport_preserves_existing_secrets() {
+        let owner_sk = SigningKey::from_bytes(&[81u8; 32]);
+        // The SAME signing key for both the existing room and the re-import.
+        let self_sk = SigningKey::from_bytes(&[82u8; 32]);
+
+        // Existing PRIVATE room where the (same) identity holds the ONLY copy of
+        // the room key at v7, plus its decrypted secret in memory.
+        let mut existing = build_imported_room_data(export_for(&owner_sk, &self_sk));
+        existing.room_state.configuration.configuration.privacy_mode =
+            river_core::room_state::privacy::PrivacyMode::Private;
+        existing.invitation_secrets.insert(7u32, [0x44u8; 32]);
+        existing.secrets.insert(7u32, [0x44u8; 32]);
+        existing.current_secret_version = Some(7);
+
+        // Re-import the SAME identity from a stale token with EMPTY secrets.
+        let export = export_for(&owner_sk, &self_sk);
+        assert!(
+            export.invitation_secrets.is_empty(),
+            "precondition: the stale token carries no invitation secrets"
+        );
+
+        let key_changed = swap_room_identity_in_place(&mut existing, export);
+
+        assert!(!key_changed, "same key must report no change");
+        // The room key (v7) survives — history stays readable.
+        assert_eq!(
+            existing.invitation_secrets.get(&7u32),
+            Some(&[0x44u8; 32]),
+            "same-key re-import must PRESERVE the existing invitation secret \
+             (it can be the only copy of the room key)"
+        );
+        assert_eq!(
+            existing.secrets.get(&7u32),
+            Some(&[0x44u8; 32]),
+            "same-key re-import must NOT clear the decrypted secret cache"
+        );
+    }
+
+    fn member_info_v(
+        sk: &SigningKey,
+        version: u32,
+    ) -> river_core::room_state::member_info::AuthorizedMemberInfo {
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+        let mi = MemberInfo {
+            member_id: MemberId::from(&sk.verifying_key()),
+            version,
+            preferred_nickname: river_core::room_state::privacy::SealedBytes::public(
+                b"nick".to_vec(),
+            ),
+            deputies: vec![],
+        };
+        AuthorizedMemberInfo::new_with_member_key(mi, sk)
+    }
+
+    /// freenet/river#414 (Codex round-8): `merge_keep_newer_member_info` keeps
+    /// the higher-version record and never clobbers a newer local one with a
+    /// staler/absent incoming one.
+    #[test]
+    fn merge_keep_newer_member_info_keeps_higher_version() {
+        let sk = SigningKey::from_bytes(&[91u8; 32]);
+        let v1 = member_info_v(&sk, 1);
+        let v3 = member_info_v(&sk, 3);
+
+        // Newer incoming wins.
+        assert_eq!(
+            merge_keep_newer_member_info(Some(v1.clone()), Some(v3.clone()))
+                .unwrap()
+                .member_info
+                .version,
+            3
+        );
+        // Staler incoming does NOT clobber the newer local.
+        assert_eq!(
+            merge_keep_newer_member_info(Some(v3.clone()), Some(v1.clone()))
+                .unwrap()
+                .member_info
+                .version,
+            3
+        );
+        // Absent incoming keeps local; absent local adopts incoming.
+        assert_eq!(
+            merge_keep_newer_member_info(Some(v3.clone()), None)
+                .unwrap()
+                .member_info
+                .version,
+            3
+        );
+        assert_eq!(
+            merge_keep_newer_member_info(None, Some(v1.clone()))
+                .unwrap()
+                .member_info
+                .version,
+            1
+        );
+        assert!(merge_keep_newer_member_info(None, None).is_none());
+    }
+
+    /// freenet/river#414 (Codex round-8, systematic same-key audit): a same-key
+    /// re-import from a stale token (absent nickname / member_info / invite
+    /// chain) must PRESERVE the locally-cached nickname, member_info, and
+    /// membership proof — not erase them (which would later publish a generated
+    /// default nickname on rejoin, and drop deputy/membership state).
+    #[test]
+    fn same_key_reimport_preserves_nickname_and_membership() {
+        let owner_sk = SigningKey::from_bytes(&[95u8; 32]);
+        let self_sk = SigningKey::from_bytes(&[96u8; 32]);
+
+        let mut existing = build_imported_room_data(export_for(&owner_sk, &self_sk));
+        existing.self_nickname = Some("Chosen Name".to_string());
+        existing.self_member_info = Some(member_info_v(&self_sk, 5));
+        existing.self_authorized_member =
+            Some(authorized_member(&owner_sk, &self_sk.verifying_key()));
+        existing.invite_chain = vec![authorized_member(&owner_sk, &self_sk.verifying_key())];
+
+        // Stale token for the SAME key: absent nickname/member_info, empty chain.
+        let mut export = export_for(&owner_sk, &self_sk);
+        export.self_nickname = None;
+        export.member_info = None;
+        assert!(export.invite_chain.is_empty());
+
+        let key_changed = swap_room_identity_in_place(&mut existing, export);
+
+        assert!(!key_changed);
+        assert_eq!(
+            existing.self_nickname.as_deref(),
+            Some("Chosen Name"),
+            "an absent token nickname must NOT erase the chosen nickname"
+        );
+        assert_eq!(
+            existing
+                .self_member_info
+                .as_ref()
+                .unwrap()
+                .member_info
+                .version,
+            5,
+            "an absent token member_info must NOT erase the local one"
+        );
+        assert!(
+            existing.self_authorized_member.is_some(),
+            "the membership proof must survive a stale re-import"
+        );
+        assert_eq!(
+            existing.invite_chain.len(),
+            1,
+            "an empty token invite_chain must NOT erase the local chain"
+        );
+    }
+
+    /// freenet/river#414 REDESIGN (safety-critical, Codex round-6 P1-1 + round-9
+    /// P1): the new-vs-overwrite decision is authoritative ONLY on a COMPLETE load
+    /// — `Loaded` AND no listed room's fetch failed AND the #345 recovery is not
+    /// in progress. `Loaded` alone is insufficient (`per_room_terminal` resolves
+    /// to `Loaded` the instant ≥1 room materialized, and recovery sets `Loaded`
+    /// before restoring still-missing rooms), so a room could be missing from the
+    /// map and get misclassified as new.
+    #[test]
+    fn rooms_load_authoritative_requires_complete_load() {
+        use crate::components::app::chat_delegate::RoomsLoadState;
+        // Complete load: Loaded, no fetch failure, no recovery → authoritative.
+        assert!(rooms_load_is_authoritative(
+            RoomsLoadState::Loaded,
+            false,
+            false
+        ));
+        // Loaded but a listed room's fetch failed → NOT authoritative.
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::Loaded,
+            true,
+            false
+        ));
+        // Loaded but the #345 recovery is still in progress → NOT authoritative
+        // (a still-missing room could be the one being imported = data loss).
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::Loaded,
+            false,
+            true
+        ));
+        // Unresolved / failed / migrating are never authoritative.
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::Loading,
+            false,
+            false
+        ));
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::Migrating,
+            false,
+            false
+        ));
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::LoadFailed,
+            false,
+            false
+        ));
+        assert!(!rooms_load_is_authoritative(
+            RoomsLoadState::LoadFailed,
+            true,
+            true
+        ));
+    }
+
+    /// freenet/river#414 (Codex round 2): confirming an overwrite imports the
+    /// token SNAPSHOTTED when the warning appeared, NOT a fresh read of the
+    /// (still-editable) textarea. Guards the wrong-room data-loss where a
+    /// room-A warning + textarea swapped to room-B + Replace would overwrite
+    /// room B without ever confirming that replacement.
+    #[test]
+    fn confirm_imports_snapshot_not_edited_textarea() {
+        let owner_a = SigningKey::from_bytes(&[51u8; 32]);
+        let owner_b = SigningKey::from_bytes(&[52u8; 32]);
+        assert_ne!(
+            owner_a.verifying_key(),
+            owner_b.verifying_key(),
+            "rooms A and B must differ for the test to be meaningful"
+        );
+
+        // Snapshot captured when the warning was shown, for room A.
+        let snapshot = export_for(&owner_a, &SigningKey::from_bytes(&[53u8; 32]));
+
+        // The user edits the textarea to room B's token AFTER the warning.
+        let edited_live_token =
+            export_for(&owner_b, &SigningKey::from_bytes(&[54u8; 32])).to_armored_string();
+
+        // The confirm path resolves to the SNAPSHOT (room A), never the edited
+        // live token (room B).
+        let resolved = resolve_confirmed_import(Some(snapshot.clone()), &edited_live_token)
+            .expect("a pending snapshot must resolve to an import");
+        assert_eq!(
+            resolved.room_owner,
+            owner_a.verifying_key(),
+            "must import the snapshot's room (A)"
+        );
+        assert_ne!(
+            resolved.room_owner,
+            owner_b.verifying_key(),
+            "must NOT import the edited textarea's room (B)"
+        );
+
+        // And the RoomData built for the insert targets room A.
+        let room_data = build_imported_room_data(resolved);
+        assert_eq!(room_data.owner_vk, owner_a.verifying_key());
+
+        // No snapshot → nothing to confirm.
+        assert!(resolve_confirmed_import(None, &edited_live_token).is_none());
     }
 
     /// Frozen cross-side wire-format fixture (issue freenet/river#302/#305).
@@ -1736,6 +2689,157 @@ mod tests {
             "MemberList must render the nickname as a Dioxus text node \
              (`span {{ \"{{parts.nickname}}\" }}`). Concatenating it into \
              an HTML string reopens freenet/river#227."
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414 REDESIGN): the overwrite path must
+    /// swap the identity IN PLACE (keeping room_state) and must NOT resurrect the
+    /// deleted empty-rebuild scaffolding. The behavioural swap logic is
+    /// unit-tested on the pure helper; this pins that the deferred signal block
+    /// actually routes overwrite → `swap_room_identity_in_place` and does not
+    /// re-add `reset_room_for_resync` (which only existed to nurse the rebuilt
+    /// empty room).
+    #[test]
+    fn complete_identity_import_overwrites_in_place_without_resync_reset() {
+        let prod = production_source();
+        assert!(
+            prod.contains("swap_room_identity_in_place(existing, export)"),
+            "complete_identity_import must swap the identity in place on overwrite \
+             (keeping room_state), not rebuild empty (freenet/river#414 redesign)"
+        );
+        assert!(
+            !prod.contains("reset_room_for_resync"),
+            "the empty-rebuild scaffolding (reset_room_for_resync) must stay \
+             deleted — the redesign keeps room_state, so there is nothing to nurse"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414 REDESIGN, safety-critical): the import
+    /// handler must gate the new-vs-overwrite decision on `rooms_load_is_authoritative`
+    /// so it never decides on an unhydrated room set (which would build-empty over
+    /// a real room). Both the render-time button gate and the handler safety-net
+    /// must be present.
+    #[test]
+    fn handle_import_gates_on_hydration() {
+        let prod = production_source();
+        assert!(
+            prod.contains("if !rooms_load_is_authoritative(load_state, saw_failure, recovery)"),
+            "handle_import must refuse to decide on an incompletely-loaded or \
+             mid-recovery room set (#414 redesign, Codex round-6 P1-1 + round-9 P1)"
+        );
+        assert!(
+            prod.contains("disabled: !rooms_hydrated"),
+            "the Import button must be disabled until the room set is fully loaded (#414 redesign)"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414, Codex round-10 P2): a PARTIAL load
+    /// failure (rail shows `List`, so its own Retry is hidden) must give the
+    /// import modal a working way out — a "Retry loading rooms" control that
+    /// re-fires the load — so imports aren't blocked indefinitely. Guarded on
+    /// `saw_fetch_failure` so it only appears for a real failure.
+    #[test]
+    fn gated_import_offers_retry_on_partial_load_failure() {
+        let prod = production_source();
+        assert!(
+            prod.contains("if saw_fetch_failure {"),
+            "the gated import state must distinguish a partial-load FAILURE from \
+             a still-loading state (freenet/river#414 round-10 P2)"
+        );
+        assert!(
+            prod.contains("chat_delegate::retry_rooms_load();"),
+            "the partial-load-failure state must wire a Retry button to \
+             retry_rooms_load (freenet/river#414 round-10 P2)"
+        );
+        assert!(
+            prod.contains("import-identity-retry-load"),
+            "the Retry control needs a stable data-testid (import-identity-retry-load)"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414, Codex round-6 P2-4): an in-place
+    /// overwrite does NO GET, so `complete_identity_import` must itself trigger
+    /// the new identity's member_info heal (via the shared
+    /// `send_member_info_heal_update`) — otherwise the new identity renders
+    /// "Unknown" to peers until an unrelated future heal. The heal must be built
+    /// inside the ROOMS borrow (against the kept, secret-repopulated state).
+    #[test]
+    fn complete_identity_import_triggers_member_info_heal_on_overwrite() {
+        let prod = production_source();
+        assert!(
+            prod.contains("existing.build_member_info_heal(&existing.room_state)"),
+            "the overwrite must build the new identity's member_info heal against \
+             the kept state (freenet/river#414 P2-4)"
+        );
+        assert!(
+            prod.contains("send_member_info_heal_update("),
+            "complete_identity_import must send the member_info heal UPDATE after an \
+             in-place overwrite, since it does no GET (freenet/river#414 P2-4)"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414, Codex round 4): the token
+    /// `oninput` must NOT clear `pending_import` synchronously — the component
+    /// subscribes to that signal, so a synchronous clear can re-render mid-write
+    /// and hit the Firefox-mobile `RefCell already borrowed` panic. The clear is
+    /// wrapped in `crate::util::defer()`, guarded so a normal keystroke doesn't
+    /// schedule one. Pin both: the guarded/deferred form is present, and the
+    /// bare synchronous pair is gone.
+    #[test]
+    fn oninput_defers_pending_import_clear() {
+        let prod = production_source();
+        assert!(
+            prod.contains("if pending_import.try_read().is_ok_and(|p| p.is_some()) {"),
+            "the token oninput must guard + defer the pending_import clear"
+        );
+        // Whitespace-normalized so indentation/rustfmt changes can't defeat it.
+        let normalized = prod.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !normalized.contains("token_input.set(e.value()); pending_import.set(None);"),
+            "the token oninput must not clear pending_import synchronously right \
+             after setting the value (freenet/river#414) — defer the clear"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#414, Codex round 5): the UI overwrite path
+    /// must prune the OLD identity's DM state when the imported key changes,
+    /// symmetric to the CLI `--force` prune. Catches a refactor that drops the
+    /// `prune_dm_state_for_room` wiring from the deferred signal block.
+    #[test]
+    fn complete_identity_import_prunes_dm_state_on_key_change() {
+        // Whitespace-normalized so the multi-line call (owner_key + new_member_id)
+        // is matched regardless of rustfmt wrapping.
+        let prod = production_source()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            prod.contains("prune_dm_state_for_room( owner_key, new_member_id, )")
+                || prod.contains("prune_dm_state_for_room(owner_key, new_member_id)"),
+            "complete_identity_import must prune the old identity's DM state (keyed to \
+             the NEW MemberId) on an overwrite that changes self_sk (freenet/river#414)"
+        );
+        // Gated on the key actually changing.
+        assert!(
+            prod.contains("if identity_changed {"),
+            "the DM-state prune must be gated on the identity actually changing"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#420): the overwrite-confirm dialog must
+    /// carry the multi-tab reversal warning telling the user to close other
+    /// sessions for the room first (the documented limitation of the #414
+    /// escape hatch).
+    #[test]
+    fn overwrite_confirm_dialog_warns_about_multitab_reversal() {
+        let prod = production_source();
+        assert!(
+            prod.contains("import-identity-replace-multitab-warning"),
+            "the confirm dialog must show the multi-tab reversal warning (#420)"
+        );
+        assert!(
+            prod.contains("Close any other tabs or devices open to this room first"),
+            "the multi-tab warning must tell the user to close other sessions first"
         );
     }
 

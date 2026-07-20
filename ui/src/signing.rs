@@ -191,14 +191,119 @@ fn extract_signature(
 // Migration and Fallback Functions
 // ============================================================================
 
+/// Per-room async locks serializing [`migrate_signing_key`].
+///
+/// The migration's get/store/get sequence is NOT atomic. Multiple migrations
+/// for the SAME room can run concurrently — startup hydration, the post-GET
+/// migration, and a rapid identity replacement (freenet/river#414) — and
+/// without serialization a second migration could `store` a different key
+/// BETWEEN this task's `store` and its verifying `get`, so the task verifies
+/// the wrong key and a completion callback marks the room migrated against a
+/// delegate that now holds a different identity. Holding a per-room async lock
+/// across the whole sequence makes it atomic w.r.t. other migrations of the
+/// same room. Placed inside `migrate_signing_key` so EVERY call site (import,
+/// hydration, post-GET) is covered, not just the overwrite path.
+///
+/// `std::sync::Mutex` guards only the brief map lookup (never held across an
+/// `.await`); the per-room `futures::lock::Mutex` is the async lock held across
+/// the sequence. Single-threaded WASM, so the std mutex never contends.
+static MIGRATION_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<RoomKey, std::sync::Arc<futures::lock::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn migration_lock_for(room_key: &RoomKey) -> std::sync::Arc<futures::lock::Mutex<()>> {
+    let mut locks = MIGRATION_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(*room_key)
+        .or_insert_with(|| std::sync::Arc::new(futures::lock::Mutex::new(())))
+        .clone()
+}
+
+/// The current AUTHORITATIVE signing identity per room — a RUNTIME-SAFE
+/// (non-signal) mirror of the identity the user last deliberately CHOSE for a
+/// room (imported, or accepted-into). Used by [`migrate_signing_key`] to reject
+/// a SUPERSEDED migration before it stores (freenet/river#414, Codex round-8).
+///
+/// Why this instead of reading `ROOMS`: `migrate_signing_key` runs inside a
+/// spawned task with NO Dioxus runtime, so reading the `ROOMS` GlobalSignal
+/// there panics (the deleted round-5 version's exact bug). A plain `Mutex`
+/// registry is safe to read from any context. Only AUTHORITATIVE call sites
+/// (import / invitation-accept) write it — to their own key — so a stale
+/// HYDRATION migration carrying an OLD key finds a mismatch and is discarded,
+/// while a genuine re-choice (e.g. leave + re-accept a different key) updates
+/// the registry to its own key and so is NOT falsely discarded.
+static CURRENT_ROOM_IDENTITY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<RoomKey, VerifyingKey>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn set_current_room_identity(room_key: RoomKey, vk: VerifyingKey) {
+    if let Ok(mut m) = CURRENT_ROOM_IDENTITY.lock() {
+        m.insert(room_key, vk);
+    }
+}
+
+fn current_room_identity(room_key: &RoomKey) -> Option<VerifyingKey> {
+    CURRENT_ROOM_IDENTITY
+        .lock()
+        .ok()
+        .and_then(|m| m.get(room_key).copied())
+}
+
+/// Whether a migration of `migrating_vk` is SUPERSEDED: the room has a recorded
+/// authoritative identity and it is a DIFFERENT key. Pure, so the discard
+/// decision is unit-testable. `None` (no authoritative identity recorded — a
+/// normal never-imported room) is never superseded.
+fn migration_superseded(
+    current_identity: Option<VerifyingKey>,
+    migrating_vk: VerifyingKey,
+) -> bool {
+    matches!(current_identity, Some(cur) if cur != migrating_vk)
+}
+
+/// Reset the per-room authoritative-identity registry. Tests only.
+#[cfg(test)]
+pub(crate) fn reset_current_room_identity() {
+    if let Ok(mut m) = CURRENT_ROOM_IDENTITY.lock() {
+        m.clear();
+    }
+}
+
 /// Migrate a signing key to the delegate if not already present.
+///
+/// `mark_authoritative` distinguishes an AUTHORITATIVE identity choice (import,
+/// invitation-accept — the user is choosing this identity NOW) from a HYDRATION
+/// re-migration (startup LoadRooms, imported-room GET-first follow-up — merely
+/// re-establishing an already-stored key). An authoritative call records itself
+/// as the room's current identity; every call then checks that registry before
+/// storing and DISCARDS a superseded migration, so a stale hydration task
+/// carrying an OLD key cannot clobber the delegate after an overwrite
+/// (freenet/river#414, Codex round-8).
 ///
 /// Returns a `MigrationResult` indicating what happened:
 /// - `AlreadyCurrent`: key matched, no action needed
 /// - `StaleKeyOverwritten`: old key was replaced (caller should sanitize local messages)
 /// - `Stored`: key was stored for the first time
-/// - `Failed`: migration failed (fallback to local signing should be used)
-pub async fn migrate_signing_key(room_key: RoomKey, signing_key: &SigningKey) -> MigrationResult {
+/// - `Failed`: migration failed OR was discarded as superseded (fallback to local signing)
+pub async fn migrate_signing_key(
+    room_key: RoomKey,
+    signing_key: &SigningKey,
+    mark_authoritative: bool,
+) -> MigrationResult {
+    // An authoritative identity choice (import / accept) records itself as the
+    // room's current identity BEFORE serializing, so its own migration is never
+    // discarded and any later stale hydration for a DIFFERENT key is.
+    if mark_authoritative {
+        set_current_room_identity(room_key, signing_key.verifying_key());
+    }
+
+    // Serialize concurrent migrations for THIS room so the non-atomic
+    // get/store/get below runs to completion before another migration for the
+    // same room can start (freenet/river#414).
+    let room_lock = migration_lock_for(&room_key);
+    let _migration_guard = room_lock.lock().await;
+
     // Check if key already exists in delegate
     let was_stale = match get_public_key(room_key).await {
         Ok(Some(existing_vk)) => {
@@ -226,6 +331,24 @@ pub async fn migrate_signing_key(room_key: RoomKey, signing_key: &SigningKey) ->
             false
         }
     };
+
+    // Reject a SUPERSEDED migration before storing (freenet/river#414, Codex
+    // round-8): if the room's authoritative identity is now a DIFFERENT key than
+    // the one this task is migrating, a newer identity choice replaced it while
+    // this (stale hydration) migration was queued. Storing the old key would
+    // clobber the delegate — the per-room lock only serializes; it does not stop
+    // a late old-key migration from acquiring the lock second. Runtime-safe (a
+    // plain Mutex, not a signal), so it is valid inside the spawned task.
+    if migration_superseded(
+        current_room_identity(&room_key),
+        signing_key.verifying_key(),
+    ) {
+        warn!(
+            "Discarding superseded signing-key migration — the room's authoritative \
+             identity changed since this migration was queued (freenet/river#414)"
+        );
+        return MigrationResult::Failed;
+    }
 
     // Store the key
     match store_signing_key(room_key, signing_key).await {
@@ -448,6 +571,88 @@ mod tests {
     use ed25519_dalek::Signer;
     use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+
+    /// freenet/river#414 (Codex round 4): `migrate_signing_key`'s non-atomic
+    /// get/store/get must be serialized PER ROOM so a concurrent migration for
+    /// the same room can't store a different key between this task's store and
+    /// its verify. Pin the lock is (a) per-room and (b) actually mutually
+    /// exclusive for the same room while leaving other rooms free.
+    #[test]
+    fn migration_lock_is_per_room_and_serializes_same_room() {
+        let room_a: RoomKey = [1u8; 32];
+        let room_b: RoomKey = [2u8; 32];
+
+        // Same room → one shared lock; different rooms → distinct locks.
+        let a1 = migration_lock_for(&room_a);
+        let a2 = migration_lock_for(&room_a);
+        let b1 = migration_lock_for(&room_b);
+        assert!(
+            std::sync::Arc::ptr_eq(&a1, &a2),
+            "the same room must share one migration lock"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&a1, &b1),
+            "different rooms must have distinct migration locks"
+        );
+
+        // Holding room A's lock blocks a second acquire for room A (the
+        // get/store/get sequence is serialized) but NOT for room B.
+        let held = a1
+            .try_lock()
+            .expect("first acquire for room A must succeed");
+        assert!(
+            a2.try_lock().is_none(),
+            "a concurrent migration for the SAME room must wait for the lock"
+        );
+        assert!(
+            b1.try_lock().is_some(),
+            "a migration for a DIFFERENT room must not be blocked"
+        );
+        drop(held);
+        assert!(
+            a2.try_lock().is_some(),
+            "releasing the lock must let the next same-room migration proceed"
+        );
+    }
+
+    /// freenet/river#414 (Codex round-8): an AUTHORITATIVE identity choice records
+    /// the room's current identity in the runtime-safe registry, and a HYDRATION
+    /// migration carrying a DIFFERENT (superseded) key is discarded; a matching or
+    /// unrecorded key proceeds. Pins the registry bookkeeping + the pure decision.
+    #[test]
+    fn superseded_migration_is_discarded() {
+        reset_current_room_identity();
+        let room: RoomKey = [7u8; 32];
+        let new_key = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let old_key = SigningKey::from_bytes(&[2u8; 32]).verifying_key();
+        assert_ne!(new_key, old_key);
+
+        // No authoritative identity recorded yet → nothing is superseded (a
+        // normal, never-imported room migrates freely).
+        assert!(current_room_identity(&room).is_none());
+        assert!(!migration_superseded(current_room_identity(&room), old_key));
+
+        // An authoritative import/accept records the NEW identity.
+        set_current_room_identity(room, new_key);
+        assert_eq!(current_room_identity(&room), Some(new_key));
+
+        // A stale hydration for the OLD key is now superseded (discarded)…
+        assert!(migration_superseded(current_room_identity(&room), old_key));
+        // …while the authoritative NEW key proceeds.
+        assert!(!migration_superseded(current_room_identity(&room), new_key));
+
+        // A later authoritative RE-choice (e.g. leave + re-accept a third key)
+        // updates the registry to itself, so it is NOT falsely discarded.
+        let third_key = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        set_current_room_identity(room, third_key);
+        assert!(!migration_superseded(
+            current_room_identity(&room),
+            third_key
+        ));
+        assert!(migration_superseded(current_room_identity(&room), new_key));
+
+        reset_current_room_identity();
+    }
 
     fn make_signed_message(author_sk: &SigningKey, owner_vk: &VerifyingKey) -> AuthorizedMessageV1 {
         let msg = MessageV1 {
