@@ -723,8 +723,8 @@ impl RoomMessageBody {
     /// Send gates and byte counters MUST use the `measure_*` functions, not
     /// `text.len()`: the contract validates encoded content bytes (CBOR
     /// framing, plus the AEAD tag in private rooms), so a raw-text gate
-    /// passes messages the contract then silently prunes (freenet/river —
-    /// "message was lost" reports).
+    /// passes messages the contract then silently prunes (freenet/river#430,
+    /// the "message was lost" reports).
     pub fn measure_text(text: &str, encrypted: bool) -> usize {
         use crate::room_state::content::TextContentV1;
         let plain = TextContentV1::new(text.to_owned()).encode().len();

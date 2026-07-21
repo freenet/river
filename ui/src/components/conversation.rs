@@ -2636,7 +2636,11 @@ fn MessageGroupComponent(
                                                             is_private,
                                                         );
                                                         let over_limit = encoded_bytes > max_message_size;
-                                                        let near_limit = encoded_bytes > max_message_size * 4 / 5;
+                                                        // `/ 5 * 4` (not `* 4 / 5`): max_message_size is
+                                                        // room-config-controlled and falls back to
+                                                        // usize::MAX with no room, so multiply-first
+                                                        // overflows.
+                                                        let near_limit = encoded_bytes > max_message_size / 5 * 4;
                                                         rsx! {
                                                             if near_limit {
                                                                 div {

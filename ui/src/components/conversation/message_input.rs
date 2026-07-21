@@ -235,7 +235,10 @@ pub fn MessageInput(
                                 replying_to.read().as_ref(),
                                 is_private,
                             );
-                            let threshold = max_message_size * 4 / 5; // 80%
+                            // `/ 5 * 4` (not `* 4 / 5`): max_message_size is
+                            // room-config-controlled, so multiply-first can
+                            // overflow on a hostile/corrupt config.
+                            let threshold = max_message_size / 5 * 4; // 80%
                             if encoded_bytes > threshold {
                                 let over = encoded_bytes > max_message_size;
                                 if over {
