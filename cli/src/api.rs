@@ -240,6 +240,40 @@ impl ProbeStateOps for RiverCliProbeOps {
     // to the caller. Do NOT add a prepare_forward override.
 }
 
+/// Map a completed backward-probe [`Outcome`] to the recovery result. Pure and
+/// I/O-free so both arms are unit-testable without a live node — the async
+/// forward migration stays in `fetch_room_state_with_recovery`.
+///
+/// * `Ok((state, current_id, migrate_forward))` — a generation was recovered;
+///   `migrate_forward` reports whether the caller should PUT it onto the current
+///   contract.
+/// * `Err(..)` — nothing recovered (`SeedLocal` / `NoLegacy` / an already-taken
+///   outcome). riverctl NEVER seeds device-local state, so every non-`Recovered`
+///   outcome is the not-found error. The error TEXT is a stable contract callers
+///   and scripts may match on — keep it verbatim (pinned by
+///   `recovery_outcome_seed_local_and_no_legacy_map_to_not_found_err`).
+fn resolve_legacy_recovery_outcome(
+    outcome: Option<Outcome<ChatRoomStateV1>>,
+    current_id: ContractInstanceId,
+    legacy_count: usize,
+) -> Result<(ChatRoomStateV1, ContractInstanceId, bool)> {
+    match outcome {
+        Some(Outcome::Recovered { merged, source, .. }) => {
+            // `source` is a legacy id, never the current key (the legacy
+            // registry excludes the current WASM — pinned by
+            // `current_wasm_is_not_in_legacy_registry`), so this guard is
+            // unreachable-true today. Kept as defence: if a future change ever
+            // probed the current key, it prevents a pointless self-PUT.
+            Ok((merged, current_id, source != current_id))
+        }
+        _ => Err(anyhow!(
+            "Room not found on the current contract or any of the {legacy_count} known \
+             previous contract generations. The room may never have existed, or its \
+             state may have been garbage-collected from the network."
+        )),
+    }
+}
+
 /// Compute the contract key for a room from its owner verifying key.
 /// This uses the current bundled WASM to ensure consistency.
 pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
@@ -1597,38 +1631,29 @@ impl ApiClient {
             }
         }
 
-        match driver.take_outcome() {
-            Some(Outcome::Recovered { merged, source, .. }) => {
-                info!(
-                    "Recovered room from a previous contract generation (probe {probes_run}/{legacy_count})"
-                );
-                // Migrate the recovered state forward onto the current contract
-                // so the room is no longer stranded on an old generation. The
-                // current contract was just confirmed empty/absent, so this PUT
-                // creates it; the room contract's CRDT merge keeps a concurrent
-                // migrator's PUT safe. `source` is a legacy id, so this always
-                // fires — the guard mirrors the pre-driver `found_id != current`.
-                if source != current_id {
-                    match self.put_room_state(room_owner_key, &merged).await {
-                        Ok(()) => info!(
-                            "Migrated recovered room forward onto current contract {current_id}"
-                        ),
-                        Err(e) => warn!(
-                            "Could not migrate recovered room forward (returning it anyway): {e}"
-                        ),
-                    }
+        // Pure outcome->result mapping (unit-tested): Recovered => the state +
+        // whether to migrate forward; every non-Recovered outcome => the
+        // not-found Err (the CLI never seeds).
+        let (merged, resolved_id, migrate_forward) =
+            resolve_legacy_recovery_outcome(driver.take_outcome(), current_id, legacy_count)?;
+        info!(
+            "Recovered room from a previous contract generation (probe {probes_run}/{legacy_count})"
+        );
+        // Migrate the recovered state forward onto the current contract so the
+        // room is no longer stranded on an old generation. The current contract
+        // was just confirmed empty/absent, so this creates it; the room
+        // contract's CRDT merge keeps a concurrent migrator's write safe.
+        if migrate_forward {
+            match self.put_room_state(room_owner_key, &merged).await {
+                Ok(()) => {
+                    info!("Migrated recovered room forward onto current contract {current_id}")
                 }
-                Ok((merged, current_id))
+                Err(e) => {
+                    warn!("Could not migrate recovered room forward (returning it anyway): {e}")
+                }
             }
-            // SeedLocal (every generation missed) and NoLegacy (no legacy keys)
-            // both mean nothing was recovered. The CLI never seeds device-local
-            // state, so both map to the not-found error.
-            _ => Err(anyhow!(
-                "Room not found on the current contract or any of the {legacy_count} known \
-                 previous contract generations. The room may never have existed, or its \
-                 state may have been garbage-collected from the network."
-            )),
         }
+        Ok((merged, resolved_id))
     }
 
     /// Probe one legacy generation for the decision driver: GET it (with the
@@ -5835,10 +5860,11 @@ mod migration_recovery_tests {
     }
 
     /// Source-grep pin: `fetch_room_state_with_recovery` must drive the legacy
-    /// search through the decision driver (newest-first) AND must never PUT on
-    /// the exhaustion path — the CLI-never-seeds guarantee. A refactor that
-    /// re-introduced a hand-rolled loop or seeded on exhaustion would need to
-    /// update this pin.
+    /// search through the decision driver (newest-first), route the outcome
+    /// through the pure `resolve_legacy_recovery_outcome` mapping, AND contain
+    /// exactly ONE forward PUT — the CLI-never-seeds guarantee. A refactor that
+    /// re-introduced a hand-rolled loop, or added a seed-arm PUT, would fail
+    /// this pin.
     #[test]
     fn legacy_recovery_routes_through_decision_driver() {
         let full = include_str!("api.rs");
@@ -5852,25 +5878,330 @@ mod migration_recovery_tests {
             .expect("probe_legacy_bytes must follow fetch_room_state_with_recovery");
         let body = &rest[..body_end];
 
+        // Match "NewestFirstWins" bare so a `use` that drops the
+        // `SelectionPolicy::` prefix cannot false-fail this pin.
         assert!(
-            body.contains("SelectionPolicy::NewestFirstWins"),
+            body.contains("NewestFirstWins"),
             "the legacy recovery search must use the newest-first decision driver"
         );
         assert!(
-            body.contains("Outcome::Recovered"),
-            "recovery must be driven by the driver's Outcome, not a hand-rolled loop"
+            body.contains("resolve_legacy_recovery_outcome"),
+            "the outcome->result mapping must go through the pure, unit-tested resolver, \
+             not a hand-rolled match on Outcome"
         );
-        // CLI-never-seeds: the only forward PUT must be inside the Recovered arm,
-        // i.e. `put_room_state` must appear AFTER `Outcome::Recovered`.
-        let recovered_idx = body.find("Outcome::Recovered").expect("Recovered arm");
-        let put_idx = body
-            .find("put_room_state")
-            .expect("the Recovered arm migrates forward via put_room_state");
+        // CLI-never-seeds: EXACTLY ONE forward PUT in the whole function. A
+        // seed-arm PUT (or any second migration PUT) would make this 2 and slip
+        // past a first-match `.find`. Exhaustion (SeedLocal / NoLegacy) maps to
+        // the not-found Err inside the resolver (unit-tested separately) with no
+        // PUT at all.
+        assert_eq!(
+            body.matches("put_room_state").count(),
+            1,
+            "fetch_room_state_with_recovery must contain exactly one put_room_state call — a \
+             second would mean a seed-arm PUT slipped in (the CLI must never seed)"
+        );
+    }
+
+    /// Build a `ChatRoomStateV1` with EVERY field non-default and owner-signed:
+    /// configuration, members, member_info, bans, secrets, direct_messages,
+    /// upgrade, version, and recent_messages carrying an edit + reaction +
+    /// delete so the derived `actions_state` is non-trivially rebuilt.
+    fn fully_populated_state(owner_sk: &SigningKey) -> ChatRoomStateV1 {
+        use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+        use river_core::room_state::direct_messages::sign_direct_message;
+        use river_core::room_state::member::{AuthorizedMember, Member};
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        use river_core::room_state::privacy::RoomCipherSpec;
+        use river_core::room_state::secret::{
+            AuthorizedEncryptedSecretForMember, AuthorizedSecretVersionRecord,
+            EncryptedSecretForMemberV1, SecretVersionRecordV1,
+        };
+        use river_core::room_state::upgrade::{AuthorizedUpgradeV1, OptionalUpgradeV1, UpgradeV1};
+        use river_core::room_state::version::StateVersion;
+
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        // A distinct member (a fixed, owner-independent seed).
+        let member_sk = SigningKey::from_bytes(&[201u8; 32]);
+        let member_vk = member_sk.verifying_key();
+        let member_id = MemberId::from(&member_vk);
+
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                owner_sk,
+            ),
+            ..Default::default()
+        };
+
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk,
+            },
+            owner_sk,
+        ));
+
+        state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new(
+                MemberInfo::new_public(member_id, 1, "Nacho".to_string()),
+                owner_sk,
+            ));
+
+        state.bans.0.push(AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(500),
+                banned_user: member_id,
+            },
+            owner_id,
+            owner_sk,
+        ));
+
+        state.secrets.current_version = 1;
+        state
+            .secrets
+            .versions
+            .push(AuthorizedSecretVersionRecord::new(
+                SecretVersionRecordV1 {
+                    version: 1,
+                    cipher_spec: RoomCipherSpec::Aes256Gcm,
+                    created_at: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+                },
+                owner_sk,
+            ));
+        state
+            .secrets
+            .encrypted_secrets
+            .push(AuthorizedEncryptedSecretForMember::new(
+                EncryptedSecretForMemberV1 {
+                    member_id,
+                    secret_version: 1,
+                    ciphertext: vec![1, 2, 3, 4],
+                    nonce: [7u8; 12],
+                    sender_ephemeral_public_key: [9u8; 32],
+                    provider: owner_id,
+                },
+                owner_sk,
+            ));
+
+        state.direct_messages.messages.push(
+            sign_direct_message(
+                owner_sk,
+                owner_id,
+                member_id,
+                &owner_vk,
+                1234,
+                vec![9, 9, 9],
+            )
+            .expect("owner->member DM signs"),
+        );
+
+        // recent_messages: two texts, then an edit + reaction on the first and a
+        // delete of the second, so actions_state has edited_content, reactions,
+        // and deleted entries after rebuild.
+        let authored = |i: u64, body: RoomMessageBody| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: owner_id,
+                    content: body,
+                    time: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(i),
+                },
+                owner_sk,
+            )
+        };
+        let msg_a = authored(1, RoomMessageBody::public("hello".to_string()));
+        let msg_b = authored(2, RoomMessageBody::public("to delete".to_string()));
+        let a_id = msg_a.id();
+        let b_id = msg_b.id();
+        state.recent_messages.messages.push(msg_a);
+        state.recent_messages.messages.push(msg_b);
+        state.recent_messages.messages.push(authored(
+            3,
+            RoomMessageBody::edit(a_id.clone(), "hello (edited)".to_string()),
+        ));
+        state.recent_messages.messages.push(authored(
+            4,
+            RoomMessageBody::reaction(a_id, "👍".to_string()),
+        ));
+        state
+            .recent_messages
+            .messages
+            .push(authored(5, RoomMessageBody::delete(b_id)));
+
+        state.upgrade = OptionalUpgradeV1(Some(AuthorizedUpgradeV1::new(
+            UpgradeV1 {
+                owner_member_id: owner_id,
+                version: 2,
+                new_chatroom_address: blake3::Hash::from([5u8; 32]),
+            },
+            owner_sk,
+        )));
+
+        state.version = StateVersion(7);
+
+        // Rebuild the derived actions cache so the fixture's actions_state
+        // matches what `decode` rebuilds — the round-trip's fidelity anchor.
+        state.recent_messages.rebuild_actions_state();
+        state
+    }
+
+    /// The re-encode -> re-decode surface `probe_legacy_bytes` +
+    /// `RiverCliProbeOps::decode` introduces MUST be lossless across every field,
+    /// including the `#[serde(skip)]` `actions_state` (rebuilt in `decode`). This
+    /// encodes a fully-populated state exactly as `probe_legacy_bytes` does and
+    /// asserts the driver decodes back an identical value.
+    #[test]
+    fn river_cli_probe_ops_roundtrips_fully_populated_state() {
+        let owner_sk = SigningKey::from_bytes(&[200u8; 32]);
+        let ops = RiverCliProbeOps {
+            owner_vk: owner_sk.verifying_key(),
+        };
+        let original = fully_populated_state(&owner_sk);
+
         assert!(
-            put_idx > recovered_idx,
-            "put_room_state must only run on the Recovered path — exhaustion (SeedLocal / \
-             NoLegacy) must map to the not-found Err with no PUT (the CLI never seeds)"
+            ops.is_real(&original),
+            "the fully-populated owner-signed state must classify as real"
         );
+        // `encode_state` uses the same ciborium::ser::into_writer as
+        // `probe_legacy_bytes`.
+        let decoded = ops
+            .decode(&encode_state(&original))
+            .expect("a fully-populated state must decode");
+        assert_eq!(
+            decoded, original,
+            "the re-encode -> re-decode round-trip (incl. rebuild_actions_state) must be \
+             lossless across every field"
+        );
+        // Guard the fixture itself: it must actually exercise the actions rebuild.
+        let actions = &original.recent_messages.actions_state;
+        assert!(
+            !actions.edited_content.is_empty()
+                && !actions.deleted.is_empty()
+                && !actions.reactions.is_empty(),
+            "the fixture must populate actions_state (edit + delete + reaction) so the \
+             rebuild is genuinely exercised"
+        );
+    }
+
+    /// End-to-end: a full `ProbeDriver` + `RiverCliProbeOps` run recovers a
+    /// fully-populated room VERBATIM — `merge_with_local` is a pass-through and
+    /// `prepare_forward` is identity, so `Outcome::Recovered.merged` equals the
+    /// original byte-for-byte.
+    #[test]
+    fn cli_driver_recovers_fully_populated_room_verbatim() {
+        let owner_sk = SigningKey::from_bytes(&[202u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let original = fully_populated_state(&owner_sk);
+
+        let mut driver = ProbeDriver::new(
+            RiverCliProbeOps { owner_vk },
+            ChatRoomStateV1::default(),
+            NewestFirst::assume_ordered(vec![cli_id(3), cli_id(2)]),
+            SelectionPolicy::NewestFirstWins,
+        );
+        let Step::Get(newest) = driver.next_action() else {
+            panic!("expected a GET")
+        };
+        // Feed the bytes exactly as `probe_legacy_bytes` would.
+        driver.on_response(newest, &encode_state(&original));
+        assert_eq!(driver.next_action(), Step::Done);
+        let Some(Outcome::Recovered { merged, .. }) = driver.take_outcome() else {
+            panic!("expected recovery");
+        };
+        assert_eq!(
+            merged, original,
+            "the driver must recover the fully-populated room verbatim (no local merge, \
+             no forward-strip)"
+        );
+    }
+
+    /// The pure `resolve_legacy_recovery_outcome`, Recovered arm: returns the
+    /// state under the CURRENT id and reports the forward-PUT decision. A legacy
+    /// source (!= current) reports a forward PUT; a source == current (the
+    /// defensive, unreachable-today guard) reports none.
+    #[test]
+    fn recovery_outcome_recovered_returns_state_and_reports_forward_put() {
+        let owner_sk = SigningKey::from_bytes(&[203u8; 32]);
+        let state = owner_state_with_messages(&owner_sk, &["recovered"]);
+        let current = cli_id(1);
+
+        let (out_state, out_id, migrate_forward) = resolve_legacy_recovery_outcome(
+            Some(Outcome::Recovered {
+                merged: state.clone(),
+                source: cli_id(9),
+                truncated_fold: false,
+            }),
+            current,
+            5,
+        )
+        .expect("Recovered maps to Ok");
+        assert_eq!(
+            out_state, state,
+            "the recovered state is returned unchanged"
+        );
+        assert_eq!(out_id, current, "recovery returns the CURRENT contract id");
+        assert!(
+            migrate_forward,
+            "a legacy source (!= current) must report forward-PUT = true"
+        );
+
+        let (_, _, migrate_same) = resolve_legacy_recovery_outcome(
+            Some(Outcome::Recovered {
+                merged: state,
+                source: current,
+                truncated_fold: false,
+            }),
+            current,
+            5,
+        )
+        .expect("Recovered maps to Ok");
+        assert!(
+            !migrate_same,
+            "source == current must report forward-PUT = false (the defensive guard)"
+        );
+    }
+
+    /// The pure `resolve_legacy_recovery_outcome`, non-Recovered arms: SeedLocal,
+    /// NoLegacy, and an already-taken (None) outcome all map to the not-found
+    /// Err — the CLI never seeds. The error TEXT is a stable contract, so it is
+    /// pinned verbatim here.
+    #[test]
+    fn recovery_outcome_seed_local_and_no_legacy_map_to_not_found_err() {
+        let current = cli_id(1);
+        let default = ChatRoomStateV1::default();
+        for outcome in [
+            Some(Outcome::SeedLocal {
+                local: default.clone(),
+            }),
+            Some(Outcome::NoLegacy {
+                local: default.clone(),
+            }),
+            None,
+        ] {
+            let err = resolve_legacy_recovery_outcome(outcome, current, 5)
+                .expect_err("every non-Recovered outcome must be the not-found Err (never a seed)");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(
+                    "Room not found on the current contract or any of the 5 known previous \
+                     contract generations."
+                ),
+                "the not-found Err text is a stable contract callers may match; got: {msg}"
+            );
+            assert!(
+                msg.contains("garbage-collected from the network."),
+                "the full not-found error text must be preserved; got: {msg}"
+            );
+        }
     }
 }
 
