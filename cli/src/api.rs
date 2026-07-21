@@ -219,6 +219,12 @@ impl ProbeStateOps for RiverCliProbeOps {
         // "Real" == the configuration signature verifies against the owner —
         // the same predicate `try_get_state` and the UI (`is_awaiting_initial_sync`)
         // use. A default / never-initialised contract fails it.
+        //
+        // Note: in THIS integration `probe_legacy_bytes` calls `try_get_state`,
+        // which ALREADY drops non-real states (returns `None`), so bytes ever
+        // reaching this `is_real` have already verified. This check is therefore
+        // defensively redundant here — kept so the driver stays the sole
+        // classifier of record if `try_get_state` ever stops verifying.
         state.configuration.verify_signature(&self.owner_vk).is_ok()
     }
 
@@ -238,6 +244,17 @@ impl ProbeStateOps for RiverCliProbeOps {
     // already strips the upgrade pointer on the forward PUT (freenet/river#427),
     // so stripping here too would be redundant and would change what is returned
     // to the caller. Do NOT add a prepare_forward override.
+}
+
+/// Serialize a chain-walk-resolved state into the raw bytes the decision driver
+/// consumes. The single production re-encode used by `probe_legacy_bytes`;
+/// the round-trip tests encode through this SAME function so they exercise the
+/// real production encoding, not a parallel copy. `None` on serialize failure
+/// (a miss — the driver advances), matching the old `.ok()?`.
+fn encode_probe_state(state: &ChatRoomStateV1) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(state, &mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// Map a completed backward-probe [`Outcome`] to the recovery result. Pure and
@@ -1614,7 +1631,13 @@ impl ApiClient {
             ChatRoomStateV1::default(),
             NewestFirst::assume_ordered(candidate_ids),
             SelectionPolicy::NewestFirstWins,
-        );
+        )
+        // The pre-driver loop probed EVERY legacy key unbounded; the driver's
+        // default hop cap (64) would silently strand the oldest generations if
+        // the registry ever exceeded it (27 today). Size the cap to fit the whole
+        // registry so it only ever guards a runaway registry, never truncates a
+        // real one.
+        .with_max_hops(legacy_count.max(freenet_migrate::DEFAULT_MAX_PROBE_HOPS));
 
         // Trivial pump: one awaitable GET (with its forward chain-walk) per
         // candidate. `probe_legacy_bytes` is the I/O adapter — it returns the
@@ -1674,10 +1697,9 @@ impl ApiClient {
             .try_fetch_room(room_owner_key, id, LEGACY_PROBE_TIMEOUT)
             .await?;
         // Re-serialize the chain-walk-resolved state so the driver decodes and
-        // classifies it (a cheap round-trip; recovery is a rare CLI path).
-        let mut bytes = Vec::new();
-        ciborium::ser::into_writer(&state, &mut bytes).ok()?;
-        Some(bytes)
+        // classifies it (a cheap round-trip; recovery is a rare CLI path). The
+        // round-trip tests encode via this SAME `encode_probe_state`.
+        encode_probe_state(&state)
     }
 
     /// GET a room state from `id`, then walk any `OptionalUpgradeV1` pointer
@@ -5713,10 +5735,10 @@ mod migration_recovery_tests {
     // --- freenet/river#398 phase 2b: the legacy recovery search now runs on
     // freenet_migrate's decision driver via `RiverCliProbeOps`. ---
 
+    // Encode through the SAME production function `probe_legacy_bytes` uses, so
+    // the round-trip tests exercise the real production encoding.
     fn encode_state(state: &ChatRoomStateV1) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        ciborium::ser::into_writer(state, &mut bytes).expect("state serializes");
-        bytes
+        encode_probe_state(state).expect("a valid state serializes")
     }
 
     fn cli_id(n: u8) -> ContractInstanceId {
@@ -5883,6 +5905,14 @@ mod migration_recovery_tests {
         assert!(
             body.contains("NewestFirstWins"),
             "the legacy recovery search must use the newest-first decision driver"
+        );
+        // The hop cap must be sized to the registry so the driver's default
+        // 64-hop cap never silently truncates a >64-generation registry (the old
+        // loop was unbounded).
+        assert!(
+            body.contains("with_max_hops"),
+            "the driver must set with_max_hops (sized to the registry) so the default hop cap \
+             can never strand the oldest legacy generations"
         );
         assert!(
             body.contains("resolve_legacy_recovery_outcome"),
