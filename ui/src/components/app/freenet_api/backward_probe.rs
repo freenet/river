@@ -39,6 +39,22 @@
 //! hand-rolled per-fire epoch counter; the driver's single-shot correlation
 //! covers everything else.
 //!
+//! Two paths can start a second same-owner probe, with different timing:
+//!
+//! * The **subscription-timeout sweep** (`rooms_awaiting_subscription`) is
+//!   serialized out of the race by construction: a probe re-stamps
+//!   `subscribing_since` every hop and `PROBE_GET_TIMEOUT` (12s) is below
+//!   `REPUT_DELAY_MS` (20s, the sweep threshold), so the sweep never reclaims a
+//!   room and re-GETs it mid-probe. That ordering is what the compile-time
+//!   assert below pins.
+//! * The **reconnect path** is NOT serialized: on a WebSocket reconnect
+//!   `room_synchronizer` sets the room `Disconnected` and clears
+//!   `subscribing_since`, and `rooms_awaiting_subscription` then re-GETs with no
+//!   throttle — so a fresh current-key GET (and a second probe) can start well
+//!   inside the first probe's 12s window. This is the path the per-fire token
+//!   exists to cover; without it the first probe's late watchdog would advance
+//!   the second probe past its newest generation.
+//!
 //! ## Routing & bookkeeping
 //!
 //! A GET response for a *legacy* contract key cannot be resolved back to an
@@ -676,17 +692,30 @@ mod tests {
     fn stale_watchdog_does_not_advance_a_later_same_owner_probe() {
         let (_sk, vk) = owner(7);
         // Distinct ids so this test can't collide with others sharing the
-        // process-global PROBE_ROUTES map under parallel `cargo test`.
+        // process-global PROBE_ROUTES / PROBE_DRIVERS maps under parallel
+        // `cargo test`.
         let newest = id(70);
         let older = id(71);
 
-        // Probe 1 fired `newest` with token t1 and has since COMPLETED (its
-        // route was removed on completion), but its watchdog W1 is still armed,
-        // holding t1.
-        let t1 = next_fire_token();
+        // This exercises the ROUTE + WATCHDOG-GATE layer where the bug actually
+        // lives — PROBE_ROUTES, the per-fire token, `claim_route_if_current`,
+        // and a REAL driver in PROBE_DRIVERS — not just an in-memory driver. It
+        // models the effects of `fire_probe_get` / `deliver_probe_response` /
+        // the watchdog on the shared maps directly, because those fns are async
+        // and spawn tasks / touch Dioxus signals that cannot run in a host unit
+        // test.
 
-        // Probe 2 then starts for the same owner and re-fires the SAME `newest`
-        // id with a fresh token t2, and is sitting on it as its outstanding GET.
+        // --- Probe 1: fire `newest` (token t1), then complete the hop. ---
+        // `fire_probe_get` inserts (owner, token) and arms a watchdog W1 that
+        // holds t1.
+        let t1 = next_fire_token();
+        routes().insert(newest, (vk, t1));
+        // A real response arrives: `deliver_probe_response` removes the route
+        // and probe 1 completes. W1 stays armed with t1 — nothing cancels it.
+        assert_eq!(routes().remove(&newest), Some((vk, t1)));
+
+        // --- Probe 2: same owner, re-fires the SAME `newest` id (fresh token
+        // t2); its driver is live in PROBE_DRIVERS, sitting on `newest`. ---
         let t2 = next_fire_token();
         routes().insert(newest, (vk, t2));
         let mut probe2 = ProbeDriver::new(
@@ -700,32 +729,40 @@ mod tests {
             Step::Get(newest),
             "probe 2 starts on its newest candidate"
         );
+        drivers().insert(vk, probe2);
 
-        // W1 fires late. Its token (t1) no longer matches `newest`'s route (t2),
-        // so it must NOT claim the route and must NOT call on_timeout on probe 2.
+        // --- W1 fires LATE. Run the watchdog's EXACT gate: it advances
+        // (on_timeout + pump) ONLY if `claim_route_if_current` returns true. ---
+        let w1_claimed = claim_route_if_current(newest, vk, t1);
+        if w1_claimed {
+            // The buggy path this guards: this would advance probe 2 past its
+            // newest candidate onto `older` — a silent rollback.
+            drivers().get_mut(&vk).unwrap().on_timeout(newest);
+        }
+
         assert!(
-            !claim_route_if_current(newest, vk, t1),
-            "a stale watchdog (old token) must not claim a later probe's reused route"
+            !w1_claimed,
+            "a stale watchdog (old token t1) must not claim probe 2's reused route"
         );
         assert_eq!(
             routes().get(&newest),
             Some(&(vk, t2)),
-            "probe 2's route must survive the stale watchdog"
+            "probe 2's route must survive the stale watchdog untouched"
         );
         assert_eq!(
-            probe2.next_action(),
+            drivers().get_mut(&vk).unwrap().next_action(),
             Step::Get(newest),
-            "probe 2 must still probe its newest candidate — no rollback"
+            "probe 2's driver must be untouched — still on its newest candidate, no rollback"
         );
 
-        // Sanity: probe 2's OWN watchdog (token t2) DOES claim the route.
+        // --- Contrast: probe 2's OWN watchdog (token t2) DOES claim its route. ---
         assert!(
             claim_route_if_current(newest, vk, t2),
             "the current fire's watchdog claims its own route"
         );
-        assert!(
-            routes().remove(&newest).is_none(),
-            "the matching claim already removed the route"
-        );
+
+        // Cleanup the process-global maps this test populated.
+        drivers().remove(&vk);
+        routes().remove(&newest);
     }
 }
