@@ -304,6 +304,19 @@ pub(crate) async fn deliver_probe_response(id: ContractInstanceId, bytes: Vec<u8
     {
         let mut drivers = drivers();
         if let Some(driver) = drivers.get_mut(&owner_vk) {
+            // Observability only — the driver makes the actual decision. This
+            // re-classifies the bytes purely to keep the pre-driver era's
+            // per-candidate logs (once per probe hop, cost negligible).
+            let ops = RiverProbeOps { owner_vk };
+            match ops.decode(&bytes) {
+                None => warn!(
+                    "Legacy contract {id} returned undeserializable state — skipping generation"
+                ),
+                Some(state) if !ops.is_real(&state) => {
+                    info!("Legacy contract {id} is empty — advancing to older generation")
+                }
+                Some(_) => {}
+            }
             driver.on_response(id, &bytes);
         }
     }
