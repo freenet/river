@@ -53,6 +53,10 @@ atty = "0.2"
 river-core = { version = "0.1.15", path = "../common", features = ["ecies", "ecies-randomized", "migration", "mentions"] }
 freenet-stdlib = { workspace = true, features = ["net"] }
 freenet-scaffold = "0.2.2"
+# Sans-IO backward-probe decision driver (freenet/river#398 phase 2b): drives
+# the legacy-generation recovery search (newest-first, first real generation
+# wins). Its stdlib dep unifies with the workspace's 0.8.x.
+freenet-migrate = "0.3"
 
 # Serialization (for contract state)
 ciborium = "0.2.2"
