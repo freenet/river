@@ -1798,7 +1798,7 @@ mod measure_tests {
     #[test]
     fn raw_text_gate_undercounts_encoded_size() {
         let max = 1000;
-        let text = "a".repeat(998); // HostFat's case: 998 chars -> 1006 encoded
+        let text = "a".repeat(998); // 998 chars -> 1007 encoded (raw + 9)
         assert!(text.len() <= max);
         assert!(RoomMessageBody::measure_text(&text, false) > max);
 

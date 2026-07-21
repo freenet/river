@@ -2684,6 +2684,19 @@ fn MessageGroupComponent(
                                                                     },
                                                                     onclick: move |_| {
                                                                         let new_text = edit_text.read().clone();
+                                                                        // Same guard as Enter-save: `disabled` should
+                                                                        // make this unreachable when over, but a
+                                                                        // render-lag click must keep the form open
+                                                                        // rather than fall through to the silent
+                                                                        // safety-net drop.
+                                                                        if RoomMessageBody::measure_edit(
+                                                                            save_msg_id.clone(),
+                                                                            &new_text,
+                                                                            is_private,
+                                                                        ) > max_message_size
+                                                                        {
+                                                                            return;
+                                                                        }
                                                                         if !new_text.is_empty() && new_text != save_original {
                                                                             on_edit.call((save_msg_id.clone(), new_text));
                                                                         }
