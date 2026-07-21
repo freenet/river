@@ -50,7 +50,59 @@ riverctl invite accept <invite-code>             # On the recipient's machine.
 
 ## Managing your identity
 
-Each room uses a separate signing key. Export it to move between machines or back it up:
+Each room uses a separate signing key, so there is no single global member ID —
+`whoami` is per-room:
+
+```bash
+riverctl identity whoami <room-owner-vk>         # Your member ID in one room.
+riverctl identity whoami                         # Every room you're in.
+```
+
+The `member_id` it reports is exactly the top-level `author` value your own
+messages carry in `message list` / `message stream --format json`, which is what
+a bridge needs to filter out its own echo:
+
+```bash
+me=$(riverctl identity whoami <room-owner-vk> --format json | jq -r .member_id)
+riverctl message stream <room-owner-vk> --format json --no-version-check |
+  jq -c --arg me "$me" 'select(.author != $me)'
+```
+
+(The `author` inside `reply_to` is a display nickname, not a member ID — only
+the top-level `author` is comparable.)
+
+`whoami` needs no node: it resolves from local storage, so it works with the
+peer stopped and before any message has arrived. It does need a *writable*
+config dir, since the shared storage loader may rewrite `rooms.json` when the
+bundled contract WASM has changed. Pass `--no-version-check` (or set
+`RIVERCTL_NO_VERSION_CHECK`) if you poll it, so it never makes the once-a-day
+crates.io version request.
+
+It reports the identity that will actually **sign**, across all three override
+mechanisms, using the same precedence `message send` does — inline
+`--signing-key` / `RIVER_SIGNING_KEY` beats `--signing-key-file` /
+`RIVER_SIGNING_KEY_FILE`, which beats the per-room key in `rooms.json`. The
+winner is reported as `signing_key_source` (`inline` / `override` / `stored`).
+With `--signing-key` the room need not be in local storage at all, matching
+`message send --signing-key`:
+
+```bash
+RIVER_SIGNING_KEY=<base64-key> riverctl identity whoami <room-owner-vk> --format json
+```
+
+`room list --format json` carries the same `self_member_id` (plus
+`signing_key_source`) and honours the same `--signing-key` / `RIVER_SIGNING_KEY`,
+so one call covers every room and always agrees with `whoami`. Note that an
+override applies to *every* room, including ones that identity is not a member
+of — which is what `signing_key_source` is there to tell you.
+
+**On comparing IDs.** A `MemberId` renders as 8 base32 characters — a truncated,
+non-cryptographic hash of the verifying key. That is fine for recognising your
+own messages, which is what it is for. Do not treat it as a security boundary:
+it is short enough to collide deliberately, so don't grant trust based on an
+`author` match alone.
+
+Export your identity to move between machines or back it up:
 
 ```bash
 riverctl identity export <room-owner-vk> > my-identity.token
@@ -74,7 +126,7 @@ riverctl member ban          <room-owner-vk> <member-vk>   # Owner only.
 | `member`   | `list`, `set-nickname`, `ban`                                           |
 | `invite`   | `create`, `accept`                                                      |
 | `dm`       | `send`, `list`, `purge`, `accept`                                       |
-| `identity` | `export`, `import`                                                      |
+| `identity` | `whoami`, `export`, `import`                                            |
 | `debug`    | troubleshooting utilities                                               |
 
 Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags. All commands accept `--format json` for scripting.
@@ -90,6 +142,10 @@ Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags.
 | `delete` | A previously-streamed message was deleted | `message_id`, `room`, `author`, `nickname`, `timestamp` (no `content`) |
 
 `reply_to` is `null` for non-replies, otherwise `{ "author", "preview" }`. `edit`/`delete` events are emitted only for messages the stream actually surfaced. Bridges should key off `type` and tolerate unknown future types.
+
+The top-level `author` is the sending member's ID; get your own with `riverctl
+identity whoami <room-owner-vk>` and compare against it to recognise your own
+messages. (`reply_to.author` is a display nickname, not an ID.)
 
 ## Configuration
 

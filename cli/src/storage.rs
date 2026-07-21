@@ -5,7 +5,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::prelude::ContractKey;
 use fs2::FileExt;
 use river_core::chat_delegate::OutboundDmStore;
-use river_core::room_state::member::AuthorizedMember;
+use river_core::room_state::member::{AuthorizedMember, MemberId};
 use river_core::room_state::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -78,6 +78,154 @@ pub struct StoredRoomInfo {
 pub struct RoomStorage {
     /// Map from room owner verifying key (as base58) to room info
     pub rooms: HashMap<String, StoredRoomInfo>,
+}
+
+/// Who the local user is *within one room* (freenet/river#438).
+///
+/// River identities are per-room: each room in `rooms.json` carries its own
+/// signing key, so there is no single global "my member id". Every field here
+/// is derived from local state alone — no network round-trip — so a bridge or
+/// script can resolve its own identity before any message arrives.
+///
+/// [`Self::member_id`] is the value that appears as `author` in the JSON
+/// emitted by `riverctl message list/stream`, which is what makes it usable
+/// for "is this message mine?" filtering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfIdentity {
+    /// This identity's verifying key for the room (base58-encodable).
+    pub verifying_key: VerifyingKey,
+    /// `MemberId` derived from [`Self::verifying_key`] — matches `author`.
+    pub member_id: MemberId,
+    /// Own nickname, read from the locally-cached room state where possible
+    /// and falling back to `StoredRoomInfo::self_nickname`.
+    ///
+    /// `None` when neither is available — an identity that has never been
+    /// seen in a synced state and never set one locally. Never the
+    /// `[Encrypted: N bytes, vN]` placeholder: an undecryptable private-room
+    /// nickname falls back rather than surfacing ciphertext.
+    pub nickname: Option<String>,
+    /// Whether this identity owns the room.
+    pub is_owner: bool,
+}
+
+/// One entry from [`Storage::list_rooms`] / [`crate::api::ApiClient::list_rooms`].
+#[derive(Debug, Clone)]
+pub struct RoomListing {
+    /// The room owner's verifying key — the room's identifier.
+    pub owner_vk: VerifyingKey,
+    /// Room display name, decrypted for a private room where possible.
+    pub name: String,
+    pub contract_key: String,
+    /// Who the local user is in this room (freenet/river#438).
+    pub self_identity: SelfIdentity,
+}
+
+/// Shared empty map so the public-nickname path borrows instead of allocating.
+static EMPTY_SECRETS: std::sync::LazyLock<HashMap<u32, [u8; 32]>> =
+    std::sync::LazyLock::new(HashMap::new);
+
+/// A [`SelfIdentity`] derivable from a signing key ALONE, with no stored room.
+///
+/// `member_id` / `verifying_key` / `is_owner` need nothing but the key and the
+/// room's owner key, which is what lets `whoami --signing-key` serve the
+/// stateless bot workflow that `ApiClient::send_message_with_key` supports.
+/// Nickname is unknowable without the room's state, so it is `None`.
+pub(crate) fn self_identity_from_key(
+    room_owner_vk: &VerifyingKey,
+    signing_key: &SigningKey,
+) -> SelfIdentity {
+    let verifying_key = signing_key.verifying_key();
+    SelfIdentity {
+        member_id: crate::api::author_member_id(signing_key),
+        is_owner: verifying_key == *room_owner_vk,
+        verifying_key,
+        nickname: None,
+    }
+}
+
+/// Build a [`SelfIdentity`] from an already-resolved signing key and the
+/// room's stored record.
+///
+/// Pure (no I/O) so the derivation is unit-testable without a node or a data
+/// dir. Callers must pass the EFFECTIVE key — [`Storage::resolve_signing_key`]
+/// for the persisted/file-override case, or the inline `--signing-key` — since
+/// reporting the persisted identity while something else actually signs is the
+/// bug this feature exists to prevent.
+///
+/// `secrets`, when `Some`, is a already-collected room secrets map to reuse
+/// for unsealing a private nickname; pass `None` to collect on demand.
+pub(crate) fn self_identity_from(
+    room_owner_vk: &VerifyingKey,
+    signing_key: &SigningKey,
+    room_info: &StoredRoomInfo,
+    secrets: Option<&HashMap<u32, [u8; 32]>>,
+) -> SelfIdentity {
+    let verifying_key = signing_key.verifying_key();
+    // The SAME function every send path uses to set `MessageV1::author`, so
+    // whoami's promise ("this is the author on your own messages") holds by
+    // construction rather than by two copies of a derivation staying in step.
+    let member_id = crate::api::author_member_id(signing_key);
+
+    // Prefer the room's own view of the nickname (what other members see),
+    // read from the CACHED state so this never needs the node. `canonical`,
+    // not a bare `.find()`, for the same reason as
+    // `api::resolve_own_member_info_base`: a state may legally carry more than
+    // one `member_info` record for a member and the highest-ranked one wins.
+    let room_nickname = room_info
+        .state
+        .member_info
+        .canonical(member_id)
+        .and_then(|info| {
+            let sealed = &info.member_info.preferred_nickname;
+            // Reuse the caller's secrets when it already collected them (the
+            // `room list` path needs them for the room NAME anyway); only pay
+            // the X25519/AES work here when nobody has. Collecting twice per
+            // private room also double-logged every decrypt failure.
+            let owned;
+            let secrets = match (sealed.is_private(), secrets) {
+                (false, _) => &EMPTY_SECRETS,
+                (true, Some(s)) => s,
+                (true, None) => {
+                    owned = crate::private_room::collect_secrets_for_room(
+                        &room_info.state,
+                        signing_key,
+                        &room_info.invitation_secrets,
+                    );
+                    &owned
+                }
+            };
+            // `.ok()`, so an undecryptable private nickname falls through to
+            // `self_nickname` instead of reporting the sealed placeholder.
+            river_core::ecies::unseal_bytes_with_secrets(sealed, secrets)
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        })
+        // An empty nickname is not a nickname: without this, a member_info
+        // record carrying "" wins over the fallback and prints as a blank
+        // name instead of "(none)".
+        .filter(|nickname| !nickname.is_empty());
+
+    // `self_nickname` is the PERSISTED identity's nickname, so it is only a
+    // valid fallback when the effective key IS the persisted one. Under a
+    // `--signing-key-file` override selecting a different member, falling back
+    // would label the override's member ID and verifying key with another
+    // account's name (Codex review on PR #439). Reporting no nickname is the
+    // correct answer there — same reasoning as the CLI's member_info heal,
+    // which is likewise skipped under a mismatched override because "the
+    // persisted nickname/secrets are not that identity's"
+    // (`.claude/rules/private-rooms.md`).
+    let local_nickname = if signing_key.to_bytes() == room_info.signing_key_bytes {
+        room_info.self_nickname.clone()
+    } else {
+        None
+    };
+
+    SelfIdentity {
+        member_id,
+        is_owner: verifying_key == *room_owner_vk,
+        verifying_key,
+        nickname: room_nickname.or(local_nickname),
+    }
 }
 
 /// Result of [`Storage::import_room_atomic`] (freenet/river#414, Codex round-6
@@ -891,7 +1039,14 @@ impl Storage {
         })
     }
 
-    pub fn list_rooms(&self) -> Result<Vec<(VerifyingKey, String, String)>> {
+    pub fn list_rooms(&self) -> Result<Vec<RoomListing>> {
+        self.list_rooms_as(None)
+    }
+
+    /// [`Self::list_rooms`], reporting each room's `self_identity` as
+    /// `signing_key` would sign (the inline `--signing-key` /
+    /// `RIVER_SIGNING_KEY` case). `None` uses each room's effective stored key.
+    pub fn list_rooms_as(&self, signing_key: Option<&SigningKey>) -> Result<Vec<RoomListing>> {
         let storage = self.load_rooms()?;
         let mut rooms = Vec::new();
 
@@ -901,6 +1056,11 @@ impl Storage {
                 let mut key_array = [0u8; 32];
                 key_array.copy_from_slice(&owner_key_bytes);
                 if let Ok(owner_vk) = VerifyingKey::from_bytes(&key_array) {
+                    let stored_sk = self.resolve_signing_key(&room_info.signing_key_bytes);
+                    // The room NAME is sealed to the room secret, which the
+                    // room's own stored key unwraps; an inline override key is
+                    // an identity for signing, not necessarily one holding the
+                    // secret, so the name always resolves via the stored key.
                     let sealed_name = &room_info.state.configuration.configuration.display.name;
                     // A private room's name is AES-256-GCM sealed under the room
                     // secret. Decrypt it with the local member's secrets so
@@ -909,25 +1069,84 @@ impl Storage {
                     // yields for a sealed value. Falls back to that placeholder
                     // when the secret is unavailable (not yet synced / rotated
                     // past); a public name decrypts trivially to its bytes.
+                    let mut secrets = None;
                     let room_name = if sealed_name.is_private() {
-                        let self_sk = self.resolve_signing_key(&room_info.signing_key_bytes);
-                        let secrets = crate::private_room::collect_secrets_for_room(
+                        let collected = crate::private_room::collect_secrets_for_room(
                             &room_info.state,
-                            &self_sk,
+                            &stored_sk,
                             &room_info.invitation_secrets,
                         );
-                        river_core::ecies::unseal_bytes_with_secrets(sealed_name, &secrets)
-                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                            .unwrap_or_else(|_| sealed_name.to_string_lossy())
+                        let name =
+                            river_core::ecies::unseal_bytes_with_secrets(sealed_name, &collected)
+                                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                                .unwrap_or_else(|_| sealed_name.to_string_lossy());
+                        // Hand the same map to the nickname unsealing below
+                        // instead of collecting it a second time per room —
+                        // but ONLY when the identity we are reporting is the
+                        // one that collected it. An inline `--signing-key`
+                        // member may hold its own owner-signed secret blob
+                        // that the stored key cannot open; reusing the stored
+                        // key's map would then report a null nickname here
+                        // while the single-room path (which collects with the
+                        // effective key) resolves it, making the two whoami
+                        // forms disagree (Codex review round 2 on PR #439).
+                        let same_identity = signing_key
+                            .is_none_or(|inline| inline.to_bytes() == stored_sk.to_bytes());
+                        if same_identity {
+                            secrets = Some(collected);
+                        }
+                        name
                     } else {
                         sealed_name.to_string_lossy()
                     };
-                    rooms.push((owner_vk, room_name, room_info.contract_key.clone()));
+                    let self_sk = signing_key.unwrap_or(&stored_sk);
+                    rooms.push(RoomListing {
+                        self_identity: self_identity_from(
+                            &owner_vk,
+                            self_sk,
+                            room_info,
+                            secrets.as_ref(),
+                        ),
+                        owner_vk,
+                        name: room_name,
+                        contract_key: room_info.contract_key.clone(),
+                    });
                 }
             }
         }
 
         Ok(rooms)
+    }
+
+    /// Who the local user is in one room, resolved from local storage only
+    /// (freenet/river#438). `None` when the room is not in `rooms.json`.
+    ///
+    /// Deliberately does NOT touch the network: the point is to let a bridge
+    /// learn its own `author` value up front, rather than inferring it from
+    /// messages it observes.
+    pub fn self_identity(&self, room_owner_vk: &VerifyingKey) -> Result<Option<SelfIdentity>> {
+        self.self_identity_with(room_owner_vk, None)
+    }
+
+    /// [`Self::self_identity`], reporting the identity `signing_key` would
+    /// sign as (the inline `--signing-key` / `RIVER_SIGNING_KEY` case) rather
+    /// than the room's effective stored key. `None` uses the stored key.
+    pub fn self_identity_with(
+        &self,
+        room_owner_vk: &VerifyingKey,
+        signing_key: Option<&SigningKey>,
+    ) -> Result<Option<SelfIdentity>> {
+        let storage = self.load_rooms()?;
+        let key_str = bs58::encode(room_owner_vk.as_bytes()).into_string();
+        Ok(storage.rooms.get(&key_str).map(|room_info| {
+            let stored_sk = self.resolve_signing_key(&room_info.signing_key_bytes);
+            self_identity_from(
+                room_owner_vk,
+                signing_key.unwrap_or(&stored_sk),
+                room_info,
+                None,
+            )
+        }))
     }
 }
 
@@ -963,6 +1182,565 @@ mod tests {
         };
         state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
         state
+    }
+
+    /// Build a `StoredRoomInfo` carrying `state`, with no cached
+    /// `member_info` for anyone unless the caller adds it.
+    fn stored_room_info(state: ChatRoomStateV1, signing_key: &SigningKey) -> StoredRoomInfo {
+        StoredRoomInfo {
+            signing_key_bytes: signing_key.to_bytes(),
+            state,
+            contract_key: "test-contract-key".to_string(),
+            self_authorized_member: None,
+            invite_chain: Vec::new(),
+            previous_contract_key: None,
+            invitation_secrets: HashMap::new(),
+            self_nickname: None,
+        }
+    }
+
+    /// Add an owner-signed `encrypted_secrets` blob addressing `member_vk`, so
+    /// the room secret is reachable ONLY by that member's key (the real
+    /// distribution path, as opposed to an invitation-carried copy).
+    fn push_owner_secret_for(
+        state: &mut ChatRoomStateV1,
+        owner_sk: &SigningKey,
+        member_vk: &VerifyingKey,
+        secret: &[u8; 32],
+        version: u32,
+    ) {
+        use river_core::ecies::encrypt_secret_for_member;
+        use river_core::room_state::secret::{
+            AuthorizedEncryptedSecretForMember, EncryptedSecretForMemberV1,
+        };
+        let (ciphertext, nonce, ephemeral) = encrypt_secret_for_member(secret, member_vk);
+        let blob = EncryptedSecretForMemberV1 {
+            member_id: MemberId::from(member_vk),
+            secret_version: version,
+            ciphertext,
+            nonce,
+            sender_ephemeral_public_key: ephemeral.to_bytes(),
+            provider: MemberId::from(&owner_sk.verifying_key()),
+        };
+        state
+            .secrets
+            .encrypted_secrets
+            .push(AuthorizedEncryptedSecretForMember::new(blob, owner_sk));
+    }
+
+    /// Push an `AuthorizedMemberInfo` for `member_sk` carrying `nickname`.
+    fn push_member_info(
+        state: &mut ChatRoomStateV1,
+        member_sk: &SigningKey,
+        nickname: river_core::room_state::privacy::SealedBytes,
+    ) {
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+        let info = MemberInfo {
+            member_id: MemberId::from(&member_sk.verifying_key()),
+            version: 0,
+            preferred_nickname: nickname,
+            deputies: Vec::new(),
+        };
+        state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(info, member_sk));
+    }
+
+    /// THE contract freenet/river#438 exists to expose: `whoami`'s reported
+    /// `member_id` must be the same value a message this identity sends
+    /// carries as its `author`, so an XMPP/Matrix bridge can filter its own
+    /// echo. Every send path in `api.rs` derives `author` as
+    /// `MemberId::from(&signing_key.verifying_key())`; if `self_identity_from`
+    /// ever derives it differently (e.g. folding in the room key), the whole
+    /// feature silently reports an id that matches nothing.
+    #[test]
+    fn self_identity_member_id_matches_message_author_derivation() {
+        let owner_sk = create_test_signing_key();
+        let member_sk = create_test_signing_key();
+        let room_info = stored_room_info(create_test_state(&owner_sk), &member_sk);
+
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
+
+        // The exact expression every `author:` field in api.rs is built from.
+        let author_on_send = MemberId::from(&member_sk.verifying_key());
+        assert_eq!(identity.member_id, author_on_send);
+        // JSON output compares the Display form, so pin that too.
+        assert_eq!(identity.member_id.to_string(), author_on_send.to_string());
+        assert_eq!(identity.verifying_key, member_sk.verifying_key());
+    }
+
+    /// Structural companion to the test above: `whoami` and every send path
+    /// must derive `author` through the SAME function, not through copies of
+    /// the same expression.
+    ///
+    /// The first version of this test scraped for the literal
+    /// `author: MemberId::from(&signing_key.verifying_key())` and claimed to
+    /// cover "every send path". It did not: `send_message` spelled it with a
+    /// fully-qualified path and `send_message_with_key` derived it via
+    /// `(&sender_vk).into()`, so the scrape was satisfied by the five *action*
+    /// paths alone while the two that send actual chat messages went unpinned
+    /// (caught in review on PR #439). Rather than enumerate spellings, the
+    /// derivation now lives in one function and this pins that.
+    #[test]
+    fn message_author_derivation_shared_with_whoami() {
+        let api_src = include_str!("api.rs");
+        let storage_src = include_str!("storage.rs");
+
+        assert!(
+            api_src.contains("pub(crate) fn author_member_id("),
+            "api::author_member_id must remain the single source of truth for \
+             `MessageV1::author` (freenet/river#438)."
+        );
+        assert!(
+            storage_src.contains("crate::api::author_member_id(signing_key)"),
+            "`self_identity_from` must derive the reported member_id via \
+             `api::author_member_id` — the SAME function the send paths use. \
+             Re-inlining the derivation here lets whoami and the send paths \
+             drift, which is the entire bug class this feature must not have."
+        );
+
+        // Every send site must call the helper rather than re-inlining. The
+        // match is on `author: author_member_id(` so it is agnostic to whether
+        // the site passes `signing_key` or `&signing_key` (both spellings
+        // occur, depending on whether the key is owned at that site) — pinning
+        // one spelling would false-fail on a harmless `&`.
+        assert_eq!(
+            api_src
+                .matches("author: MemberId::from(&signing_key")
+                .count(),
+            0,
+            "a send path is hand-inlining the author derivation instead of \
+             calling `author_member_id`. Route it through the helper so \
+             `identity whoami` keeps matching it."
+        );
+        // Production `author:` sites: send_message, edit, delete, react,
+        // unreact, reply (6 direct), plus send_message_with_key and the join
+        // event, which bind the helper's result to a local first.
+        assert!(
+            api_src.matches("author: author_member_id(").count() >= 6,
+            "expected every message-construction site to call \
+             `author_member_id`; found fewer than the known production sites, \
+             so one has been changed to derive `author` some other way."
+        );
+        for binding in [
+            "let sender_member_id = author_member_id(",
+            "let self_id = author_member_id(",
+        ] {
+            assert!(
+                api_src.contains(binding),
+                "`{binding}...` must keep deriving through the shared helper — \
+                 this is `send_message_with_key` / the join event, whose \
+                 `author` a bridge also has to recognise as its own."
+            );
+        }
+    }
+
+    /// Owner vs non-owner, and the owner's id is derived from their own key.
+    #[test]
+    fn self_identity_reports_ownership() {
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let member_sk = create_test_signing_key();
+
+        let as_owner = self_identity_from(
+            &owner_vk,
+            &owner_sk,
+            &stored_room_info(create_test_state(&owner_sk), &owner_sk),
+            None,
+        );
+        assert!(as_owner.is_owner);
+        assert_eq!(as_owner.member_id, MemberId::from(&owner_vk));
+
+        let as_member = self_identity_from(
+            &owner_vk,
+            &member_sk,
+            &stored_room_info(create_test_state(&owner_sk), &member_sk),
+            None,
+        );
+        assert!(!as_member.is_owner);
+        assert_ne!(as_member.member_id, as_owner.member_id);
+    }
+
+    /// The nickname comes from the room's own (cached) view when present —
+    /// that is what other members see — rather than the local-only
+    /// `self_nickname`, which can be stale after a rename elsewhere.
+    #[test]
+    fn self_identity_prefers_room_state_nickname_over_local() {
+        use river_core::room_state::privacy::SealedBytes;
+
+        let owner_sk = create_test_signing_key();
+        let member_sk = create_test_signing_key();
+        let mut state = create_test_state(&owner_sk);
+        push_member_info(
+            &mut state,
+            &member_sk,
+            SealedBytes::public(b"from-room".to_vec()),
+        );
+
+        let mut room_info = stored_room_info(state, &member_sk);
+        room_info.self_nickname = Some("stale-local".to_string());
+
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
+        assert_eq!(identity.nickname.as_deref(), Some("from-room"));
+    }
+
+    /// With no record in the cached state (a just-accepted invitation that has
+    /// not round-tripped yet), fall back to the locally-stored nickname.
+    #[test]
+    fn self_identity_falls_back_to_local_nickname() {
+        let owner_sk = create_test_signing_key();
+        let member_sk = create_test_signing_key();
+        let mut room_info = stored_room_info(create_test_state(&owner_sk), &member_sk);
+        room_info.self_nickname = Some("only-local".to_string());
+
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
+        assert_eq!(identity.nickname.as_deref(), Some("only-local"));
+
+        // Neither source available → None, not an empty string.
+        let bare = stored_room_info(create_test_state(&owner_sk), &member_sk);
+        assert_eq!(
+            self_identity_from(&owner_sk.verifying_key(), &member_sk, &bare, None).nickname,
+            None
+        );
+    }
+
+    /// A private-room nickname we cannot decrypt must NOT surface the
+    /// "[Encrypted: N bytes, vN]" placeholder as if it were the nickname —
+    /// fall back to the local one instead.
+    #[test]
+    fn self_identity_undecryptable_private_nickname_falls_back() {
+        use river_core::ecies::seal_bytes;
+        use river_core::room_state::privacy::PrivacyMode;
+
+        let owner_sk = create_test_signing_key();
+        let member_sk = create_test_signing_key();
+        let mut state = create_test_state(&owner_sk);
+        state.configuration.configuration.privacy_mode = PrivacyMode::Private;
+        state.configuration =
+            AuthorizedConfigurationV1::new(state.configuration.configuration.clone(), &owner_sk);
+        // Sealed under a secret this member has no way to obtain.
+        push_member_info(&mut state, &member_sk, seal_bytes(b"hidden", &[9u8; 32], 0));
+
+        let mut room_info = stored_room_info(state, &member_sk);
+        room_info.self_nickname = Some("local-copy".to_string());
+
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
+        assert_eq!(
+            identity.nickname.as_deref(),
+            Some("local-copy"),
+            "an undecryptable sealed nickname must fall back, not report ciphertext"
+        );
+        assert!(!identity
+            .nickname
+            .as_deref()
+            .unwrap()
+            .contains("[Encrypted:"));
+    }
+
+    /// A private-room nickname we CAN decrypt is reported in plaintext.
+    #[test]
+    fn self_identity_decrypts_private_nickname() {
+        use river_core::ecies::seal_bytes;
+        use river_core::room_state::privacy::PrivacyMode;
+
+        let owner_sk = create_test_signing_key();
+        let member_sk = create_test_signing_key();
+        let secret = [4u8; 32];
+
+        let mut state = create_test_state(&owner_sk);
+        state.configuration.configuration.privacy_mode = PrivacyMode::Private;
+        state.configuration =
+            AuthorizedConfigurationV1::new(state.configuration.configuration.clone(), &owner_sk);
+        push_member_info(&mut state, &member_sk, seal_bytes(b"Nacho", &secret, 0));
+
+        let mut room_info = stored_room_info(state, &member_sk);
+        // The invitation-carried secret, as a just-joined invitee would have.
+        room_info.invitation_secrets.insert(0, secret);
+
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
+        assert_eq!(identity.nickname.as_deref(), Some("Nacho"));
+    }
+
+    /// The `self_nickname` fallback belongs to the PERSISTED identity, so an
+    /// override selecting a DIFFERENT member must not inherit it — that would
+    /// label the override's member ID with another account's name (Codex
+    /// review on PR #439). Reporting no nickname is correct there.
+    #[test]
+    fn self_identity_does_not_inherit_persisted_nickname_under_override() {
+        let owner_sk = create_test_signing_key();
+        let persisted_sk = create_test_signing_key();
+        let override_sk = create_test_signing_key();
+
+        let mut room_info = stored_room_info(create_test_state(&owner_sk), &persisted_sk);
+        room_info.self_nickname = Some("persisted-identity".to_string());
+
+        // Effective key == persisted key: the fallback is genuinely ours.
+        let same = self_identity_from(&owner_sk.verifying_key(), &persisted_sk, &room_info, None);
+        assert_eq!(same.nickname.as_deref(), Some("persisted-identity"));
+
+        // Effective key is an override for a DIFFERENT member: no nickname,
+        // rather than the persisted identity's.
+        let overridden =
+            self_identity_from(&owner_sk.verifying_key(), &override_sk, &room_info, None);
+        assert_eq!(
+            overridden.nickname, None,
+            "an override identity must not inherit the persisted identity's \
+             nickname — it belongs to a different member"
+        );
+        assert_eq!(
+            overridden.member_id,
+            MemberId::from(&override_sk.verifying_key())
+        );
+    }
+
+    /// An override that DOES have its own record in the cached state reports
+    /// that record's nickname — the override is a real member here, so the
+    /// room's view of it is correct and must not be suppressed.
+    #[test]
+    fn self_identity_reports_override_own_room_nickname() {
+        use river_core::room_state::privacy::SealedBytes;
+
+        let owner_sk = create_test_signing_key();
+        let persisted_sk = create_test_signing_key();
+        let override_sk = create_test_signing_key();
+
+        let mut state = create_test_state(&owner_sk);
+        push_member_info(
+            &mut state,
+            &override_sk,
+            SealedBytes::public(b"the-override".to_vec()),
+        );
+        let mut room_info = stored_room_info(state, &persisted_sk);
+        room_info.self_nickname = Some("persisted-identity".to_string());
+
+        let identity =
+            self_identity_from(&owner_sk.verifying_key(), &override_sk, &room_info, None);
+        assert_eq!(identity.nickname.as_deref(), Some("the-override"));
+    }
+
+    /// `Storage::self_identity` must report the identity that will actually
+    /// SIGN — so a `--signing-key-file` override wins over `rooms.json`.
+    /// Reporting the persisted id while the override signs would hand a bridge
+    /// an id matching none of its own messages: the exact bug whoami exists to
+    /// prevent.
+    #[test]
+    fn self_identity_honors_signing_key_override() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let stored_sk = create_test_signing_key();
+        let override_sk = create_test_signing_key();
+
+        storage
+            .add_room(
+                &owner_vk,
+                &stored_sk,
+                create_test_state(&owner_sk),
+                &expected_contract_key(&owner_vk),
+            )
+            .unwrap();
+
+        let without = storage.self_identity(&owner_vk).unwrap().unwrap();
+        assert_eq!(
+            without.member_id,
+            MemberId::from(&stored_sk.verifying_key())
+        );
+
+        let overridden = Storage::new_with_override(
+            Some(_temp_dir.path().to_str().unwrap()),
+            Some(override_sk.clone()),
+        )
+        .unwrap();
+        let with = overridden.self_identity(&owner_vk).unwrap().unwrap();
+        assert_eq!(
+            with.member_id,
+            MemberId::from(&override_sk.verifying_key()),
+            "whoami must report the OVERRIDE identity, which is the one signing"
+        );
+        assert_ne!(with.member_id, without.member_id);
+    }
+
+    /// `whoami <room>` and `whoami` (all rooms) run through two independent
+    /// code paths — `self_identity` vs `list_rooms` — so they must be shown to
+    /// agree. A bridge that resolves its ID one way and filters messages the
+    /// other way would otherwise silently mismatch.
+    #[test]
+    fn self_identity_agrees_with_list_rooms() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let member_sk = create_test_signing_key();
+
+        storage
+            .add_room(
+                &owner_vk,
+                &member_sk,
+                create_test_state(&owner_sk),
+                &expected_contract_key(&owner_vk),
+            )
+            .unwrap();
+
+        let single = storage.self_identity(&owner_vk).unwrap().unwrap();
+        let listed = storage
+            .list_rooms()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.owner_vk == owner_vk)
+            .expect("room present")
+            .self_identity;
+        assert_eq!(single, listed, "the two whoami paths must not diverge");
+
+        // ...including under an inline key, which both paths also accept.
+        let inline = create_test_signing_key();
+        let single_inline = storage
+            .self_identity_with(&owner_vk, Some(&inline))
+            .unwrap()
+            .unwrap();
+        let listed_inline = storage
+            .list_rooms_as(Some(&inline))
+            .unwrap()
+            .into_iter()
+            .find(|r| r.owner_vk == owner_vk)
+            .expect("room present")
+            .self_identity;
+        assert_eq!(single_inline, listed_inline);
+        assert_eq!(
+            single_inline.member_id,
+            MemberId::from(&inline.verifying_key())
+        );
+    }
+
+    /// The two whoami paths must also agree in a PRIVATE room under an inline
+    /// key. `list_rooms_as` collects the room secrets with the room's STORED
+    /// key (it needs them for the room name); reusing that map to unseal an
+    /// INLINE identity's nickname reports null whenever only the inline member
+    /// can open its own owner-signed blob, while the single-room path — which
+    /// collects with the effective key — resolves it (Codex review round 2).
+    #[test]
+    fn inline_identity_nickname_agrees_across_paths_in_private_room() {
+        use river_core::ecies::seal_bytes;
+        use river_core::room_state::privacy::PrivacyMode;
+
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let stored_sk = create_test_signing_key();
+        let inline_sk = create_test_signing_key();
+        let secret = [17u8; 32];
+
+        let mut state = create_test_state(&owner_sk);
+        state.configuration.configuration.privacy_mode = PrivacyMode::Private;
+        state.configuration.configuration.display.name = seal_bytes(b"Private", &secret, 0);
+        state.configuration =
+            AuthorizedConfigurationV1::new(state.configuration.configuration.clone(), &owner_sk);
+        // The INLINE identity has a sealed nickname in the room's state.
+        push_member_info(
+            &mut state,
+            &inline_sk,
+            seal_bytes(b"inline-bot", &secret, 0),
+        );
+
+        // The secret is reachable ONLY through an owner-signed blob addressed
+        // to the INLINE member. This is what makes the test bite: the stored
+        // key cannot open it, so a secrets map collected with the stored key
+        // is useless for the inline identity's nickname. Supplying the secret
+        // via `invitation_secrets` instead would let the stored key's map
+        // decrypt it and the test would pass with or without the fix.
+        push_owner_secret_for(
+            &mut state,
+            &owner_sk,
+            &inline_sk.verifying_key(),
+            &secret,
+            0,
+        );
+        state.secrets.current_version = 0;
+
+        storage
+            .add_room(
+                &owner_vk,
+                &stored_sk,
+                state,
+                &expected_contract_key(&owner_vk),
+            )
+            .unwrap();
+
+        let single = storage
+            .self_identity_with(&owner_vk, Some(&inline_sk))
+            .unwrap()
+            .unwrap();
+        let listed = storage
+            .list_rooms_as(Some(&inline_sk))
+            .unwrap()
+            .into_iter()
+            .find(|r| r.owner_vk == owner_vk)
+            .expect("room present")
+            .self_identity;
+
+        assert_eq!(
+            single, listed,
+            "whoami <room> and whoami must agree for an inline identity in a \
+             private room"
+        );
+        assert_eq!(single.nickname.as_deref(), Some("inline-bot"));
+    }
+
+    /// An empty nickname in the cached state is not a nickname: it must not
+    /// shadow the local fallback and print as a blank name.
+    #[test]
+    fn self_identity_empty_room_nickname_falls_back() {
+        use river_core::room_state::privacy::SealedBytes;
+
+        let owner_sk = create_test_signing_key();
+        let member_sk = create_test_signing_key();
+        let mut state = create_test_state(&owner_sk);
+        push_member_info(&mut state, &member_sk, SealedBytes::public(Vec::new()));
+
+        let mut room_info = stored_room_info(state, &member_sk);
+        room_info.self_nickname = Some("local".to_string());
+
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
+        assert_eq!(identity.nickname.as_deref(), Some("local"));
+    }
+
+    /// An unknown room reports `None` so the command can print a helpful
+    /// "join it first" error rather than inventing an identity.
+    #[test]
+    fn self_identity_none_for_unknown_room() {
+        let (storage, _temp_dir) = create_test_storage();
+        let unknown = create_test_signing_key().verifying_key();
+        assert!(storage.self_identity(&unknown).unwrap().is_none());
+    }
+
+    /// `room list` carries the same id, so `--format json` consumers can
+    /// resolve every room's self-id in one call (the alternative the reporter
+    /// asked for in freenet/river#438).
+    #[test]
+    fn list_rooms_includes_self_member_id() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let member_sk = create_test_signing_key();
+
+        storage
+            .add_room(
+                &owner_vk,
+                &member_sk,
+                create_test_state(&owner_sk),
+                &expected_contract_key(&owner_vk),
+            )
+            .unwrap();
+
+        let rooms = storage.list_rooms().unwrap();
+        let room = rooms
+            .iter()
+            .find(|r| r.owner_vk == owner_vk)
+            .expect("room present");
+        assert_eq!(
+            room.self_identity.member_id,
+            MemberId::from(&member_sk.verifying_key())
+        );
+        assert!(!room.self_identity.is_owner);
     }
 
     /// A `room list` on a **private** room must show the decrypted name, not
@@ -1005,11 +1783,11 @@ mod tests {
             .unwrap();
 
         let rooms = storage.list_rooms().unwrap();
-        let (_, name, _) = rooms
+        let room = rooms
             .iter()
-            .find(|(vk, _, _)| *vk == owner_vk)
+            .find(|r| r.owner_vk == owner_vk)
             .expect("room present");
-        assert_eq!(name, "Secret Room");
+        assert_eq!(room.name, "Secret Room");
     }
 
     /// Without the secret, the private name gracefully falls back to the
@@ -1037,11 +1815,11 @@ mod tests {
             .unwrap();
 
         let rooms = storage.list_rooms().unwrap();
-        let (_, name, _) = rooms
+        let room = rooms
             .iter()
-            .find(|(vk, _, _)| *vk == owner_vk)
+            .find(|r| r.owner_vk == owner_vk)
             .expect("room present");
-        assert_eq!(name, "[Encrypted: 11 bytes, v0]");
+        assert_eq!(room.name, "[Encrypted: 11 bytes, v0]");
     }
 
     #[test]
