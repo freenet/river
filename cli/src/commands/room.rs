@@ -165,6 +165,14 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 eprintln!("Listing rooms...");
             }
 
+            // Disclosed alongside `self_member_id` (freenet/river#438): a
+            // `--signing-key-file` override replaces the reported identity for
+            // every room at once.
+            let signing_key_source = if api.storage().has_signing_key_override() {
+                "override"
+            } else {
+                "stored"
+            };
             match api.list_rooms().await {
                 Ok(rooms) => {
                     if rooms.is_empty() {
@@ -204,6 +212,13 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                                             // message from this identity carries.
                                             "self_member_id":
                                                 room.self_identity.member_id.to_string(),
+                                            // Which identity that is. Under
+                                            // `--signing-key-file` the override
+                                            // applies to EVERY room, including
+                                            // ones it isn't a member of, so say
+                                            // so rather than letting a script
+                                            // read the ids as per-room facts.
+                                            "signing_key_source": signing_key_source,
                                         })
                                     })
                                     .collect();

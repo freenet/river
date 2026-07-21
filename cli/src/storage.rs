@@ -120,18 +120,45 @@ pub struct RoomListing {
     pub self_identity: SelfIdentity,
 }
 
+/// Shared empty map so the public-nickname path borrows instead of allocating.
+static EMPTY_SECRETS: std::sync::LazyLock<HashMap<u32, [u8; 32]>> =
+    std::sync::LazyLock::new(HashMap::new);
+
+/// A [`SelfIdentity`] derivable from a signing key ALONE, with no stored room.
+///
+/// `member_id` / `verifying_key` / `is_owner` need nothing but the key and the
+/// room's owner key, which is what lets `whoami --signing-key` serve the
+/// stateless bot workflow that `ApiClient::send_message_with_key` supports.
+/// Nickname is unknowable without the room's state, so it is `None`.
+pub(crate) fn self_identity_from_key(
+    room_owner_vk: &VerifyingKey,
+    signing_key: &SigningKey,
+) -> SelfIdentity {
+    let verifying_key = signing_key.verifying_key();
+    SelfIdentity {
+        member_id: crate::api::author_member_id(signing_key),
+        is_owner: verifying_key == *room_owner_vk,
+        verifying_key,
+        nickname: None,
+    }
+}
+
 /// Build a [`SelfIdentity`] from an already-resolved signing key and the
 /// room's stored record.
 ///
 /// Pure (no I/O) so the derivation is unit-testable without a node or a data
-/// dir. Callers must pass the key from [`Storage::resolve_signing_key`] so a
-/// `--signing-key-file` override is reflected — reporting the persisted
-/// identity while the override is the one actually signing messages would be
-/// worse than reporting nothing.
+/// dir. Callers must pass the EFFECTIVE key — [`Storage::resolve_signing_key`]
+/// for the persisted/file-override case, or the inline `--signing-key` — since
+/// reporting the persisted identity while something else actually signs is the
+/// bug this feature exists to prevent.
+///
+/// `secrets`, when `Some`, is a already-collected room secrets map to reuse
+/// for unsealing a private nickname; pass `None` to collect on demand.
 pub(crate) fn self_identity_from(
     room_owner_vk: &VerifyingKey,
     signing_key: &SigningKey,
     room_info: &StoredRoomInfo,
+    secrets: Option<&HashMap<u32, [u8; 32]>>,
 ) -> SelfIdentity {
     let verifying_key = signing_key.verifying_key();
     // The SAME function every send path uses to set `MessageV1::author`, so
@@ -150,21 +177,33 @@ pub(crate) fn self_identity_from(
         .canonical(member_id)
         .and_then(|info| {
             let sealed = &info.member_info.preferred_nickname;
-            let secrets = if sealed.is_private() {
-                crate::private_room::collect_secrets_for_room(
-                    &room_info.state,
-                    signing_key,
-                    &room_info.invitation_secrets,
-                )
-            } else {
-                HashMap::new()
+            // Reuse the caller's secrets when it already collected them (the
+            // `room list` path needs them for the room NAME anyway); only pay
+            // the X25519/AES work here when nobody has. Collecting twice per
+            // private room also double-logged every decrypt failure.
+            let owned;
+            let secrets = match (sealed.is_private(), secrets) {
+                (false, _) => &EMPTY_SECRETS,
+                (true, Some(s)) => s,
+                (true, None) => {
+                    owned = crate::private_room::collect_secrets_for_room(
+                        &room_info.state,
+                        signing_key,
+                        &room_info.invitation_secrets,
+                    );
+                    &owned
+                }
             };
             // `.ok()`, so an undecryptable private nickname falls through to
             // `self_nickname` instead of reporting the sealed placeholder.
-            river_core::ecies::unseal_bytes_with_secrets(sealed, &secrets)
+            river_core::ecies::unseal_bytes_with_secrets(sealed, secrets)
                 .ok()
                 .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-        });
+        })
+        // An empty nickname is not a nickname: without this, a member_info
+        // record carrying "" wins over the fallback and prints as a blank
+        // name instead of "(none)".
+        .filter(|nickname| !nickname.is_empty());
 
     // `self_nickname` is the PERSISTED identity's nickname, so it is only a
     // valid fallback when the effective key IS the persisted one. Under a
@@ -1001,6 +1040,13 @@ impl Storage {
     }
 
     pub fn list_rooms(&self) -> Result<Vec<RoomListing>> {
+        self.list_rooms_as(None)
+    }
+
+    /// [`Self::list_rooms`], reporting each room's `self_identity` as
+    /// `signing_key` would sign (the inline `--signing-key` /
+    /// `RIVER_SIGNING_KEY` case). `None` uses each room's effective stored key.
+    pub fn list_rooms_as(&self, signing_key: Option<&SigningKey>) -> Result<Vec<RoomListing>> {
         let storage = self.load_rooms()?;
         let mut rooms = Vec::new();
 
@@ -1010,7 +1056,11 @@ impl Storage {
                 let mut key_array = [0u8; 32];
                 key_array.copy_from_slice(&owner_key_bytes);
                 if let Ok(owner_vk) = VerifyingKey::from_bytes(&key_array) {
-                    let self_sk = self.resolve_signing_key(&room_info.signing_key_bytes);
+                    let stored_sk = self.resolve_signing_key(&room_info.signing_key_bytes);
+                    // The room NAME is sealed to the room secret, which the
+                    // room's own stored key unwraps; an inline override key is
+                    // an identity for signing, not necessarily one holding the
+                    // secret, so the name always resolves via the stored key.
                     let sealed_name = &room_info.state.configuration.configuration.display.name;
                     // A private room's name is AES-256-GCM sealed under the room
                     // secret. Decrypt it with the local member's secrets so
@@ -1019,20 +1069,32 @@ impl Storage {
                     // yields for a sealed value. Falls back to that placeholder
                     // when the secret is unavailable (not yet synced / rotated
                     // past); a public name decrypts trivially to its bytes.
+                    let mut secrets = None;
                     let room_name = if sealed_name.is_private() {
-                        let secrets = crate::private_room::collect_secrets_for_room(
+                        let collected = crate::private_room::collect_secrets_for_room(
                             &room_info.state,
-                            &self_sk,
+                            &stored_sk,
                             &room_info.invitation_secrets,
                         );
-                        river_core::ecies::unseal_bytes_with_secrets(sealed_name, &secrets)
-                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                            .unwrap_or_else(|_| sealed_name.to_string_lossy())
+                        let name =
+                            river_core::ecies::unseal_bytes_with_secrets(sealed_name, &collected)
+                                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                                .unwrap_or_else(|_| sealed_name.to_string_lossy());
+                        // Hand the same map to the nickname unsealing below
+                        // instead of collecting it a second time per room.
+                        secrets = Some(collected);
+                        name
                     } else {
                         sealed_name.to_string_lossy()
                     };
+                    let self_sk = signing_key.unwrap_or(&stored_sk);
                     rooms.push(RoomListing {
-                        self_identity: self_identity_from(&owner_vk, &self_sk, room_info),
+                        self_identity: self_identity_from(
+                            &owner_vk,
+                            self_sk,
+                            room_info,
+                            secrets.as_ref(),
+                        ),
                         owner_vk,
                         name: room_name,
                         contract_key: room_info.contract_key.clone(),
@@ -1051,13 +1113,26 @@ impl Storage {
     /// learn its own `author` value up front, rather than inferring it from
     /// messages it observes.
     pub fn self_identity(&self, room_owner_vk: &VerifyingKey) -> Result<Option<SelfIdentity>> {
+        self.self_identity_with(room_owner_vk, None)
+    }
+
+    /// [`Self::self_identity`], reporting the identity `signing_key` would
+    /// sign as (the inline `--signing-key` / `RIVER_SIGNING_KEY` case) rather
+    /// than the room's effective stored key. `None` uses the stored key.
+    pub fn self_identity_with(
+        &self,
+        room_owner_vk: &VerifyingKey,
+        signing_key: Option<&SigningKey>,
+    ) -> Result<Option<SelfIdentity>> {
         let storage = self.load_rooms()?;
         let key_str = bs58::encode(room_owner_vk.as_bytes()).into_string();
         Ok(storage.rooms.get(&key_str).map(|room_info| {
+            let stored_sk = self.resolve_signing_key(&room_info.signing_key_bytes);
             self_identity_from(
                 room_owner_vk,
-                &self.resolve_signing_key(&room_info.signing_key_bytes),
+                signing_key.unwrap_or(&stored_sk),
                 room_info,
+                None,
             )
         }))
     }
@@ -1144,7 +1219,7 @@ mod tests {
         let member_sk = create_test_signing_key();
         let room_info = stored_room_info(create_test_state(&owner_sk), &member_sk);
 
-        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info);
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
 
         // The exact expression every `author:` field in api.rs is built from.
         let author_on_send = MemberId::from(&member_sk.verifying_key());
@@ -1231,6 +1306,7 @@ mod tests {
             &owner_vk,
             &owner_sk,
             &stored_room_info(create_test_state(&owner_sk), &owner_sk),
+            None,
         );
         assert!(as_owner.is_owner);
         assert_eq!(as_owner.member_id, MemberId::from(&owner_vk));
@@ -1239,6 +1315,7 @@ mod tests {
             &owner_vk,
             &member_sk,
             &stored_room_info(create_test_state(&owner_sk), &member_sk),
+            None,
         );
         assert!(!as_member.is_owner);
         assert_ne!(as_member.member_id, as_owner.member_id);
@@ -1263,7 +1340,7 @@ mod tests {
         let mut room_info = stored_room_info(state, &member_sk);
         room_info.self_nickname = Some("stale-local".to_string());
 
-        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info);
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
         assert_eq!(identity.nickname.as_deref(), Some("from-room"));
     }
 
@@ -1276,13 +1353,13 @@ mod tests {
         let mut room_info = stored_room_info(create_test_state(&owner_sk), &member_sk);
         room_info.self_nickname = Some("only-local".to_string());
 
-        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info);
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
         assert_eq!(identity.nickname.as_deref(), Some("only-local"));
 
         // Neither source available → None, not an empty string.
         let bare = stored_room_info(create_test_state(&owner_sk), &member_sk);
         assert_eq!(
-            self_identity_from(&owner_sk.verifying_key(), &member_sk, &bare).nickname,
+            self_identity_from(&owner_sk.verifying_key(), &member_sk, &bare, None).nickname,
             None
         );
     }
@@ -1307,7 +1384,7 @@ mod tests {
         let mut room_info = stored_room_info(state, &member_sk);
         room_info.self_nickname = Some("local-copy".to_string());
 
-        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info);
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
         assert_eq!(
             identity.nickname.as_deref(),
             Some("local-copy"),
@@ -1340,7 +1417,7 @@ mod tests {
         // The invitation-carried secret, as a just-joined invitee would have.
         room_info.invitation_secrets.insert(0, secret);
 
-        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info);
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
         assert_eq!(identity.nickname.as_deref(), Some("Nacho"));
     }
 
@@ -1358,12 +1435,13 @@ mod tests {
         room_info.self_nickname = Some("persisted-identity".to_string());
 
         // Effective key == persisted key: the fallback is genuinely ours.
-        let same = self_identity_from(&owner_sk.verifying_key(), &persisted_sk, &room_info);
+        let same = self_identity_from(&owner_sk.verifying_key(), &persisted_sk, &room_info, None);
         assert_eq!(same.nickname.as_deref(), Some("persisted-identity"));
 
         // Effective key is an override for a DIFFERENT member: no nickname,
         // rather than the persisted identity's.
-        let overridden = self_identity_from(&owner_sk.verifying_key(), &override_sk, &room_info);
+        let overridden =
+            self_identity_from(&owner_sk.verifying_key(), &override_sk, &room_info, None);
         assert_eq!(
             overridden.nickname, None,
             "an override identity must not inherit the persisted identity's \
@@ -1395,7 +1473,8 @@ mod tests {
         let mut room_info = stored_room_info(state, &persisted_sk);
         room_info.self_nickname = Some("persisted-identity".to_string());
 
-        let identity = self_identity_from(&owner_sk.verifying_key(), &override_sk, &room_info);
+        let identity =
+            self_identity_from(&owner_sk.verifying_key(), &override_sk, &room_info, None);
         assert_eq!(identity.nickname.as_deref(), Some("the-override"));
     }
 
@@ -1439,6 +1518,74 @@ mod tests {
             "whoami must report the OVERRIDE identity, which is the one signing"
         );
         assert_ne!(with.member_id, without.member_id);
+    }
+
+    /// `whoami <room>` and `whoami` (all rooms) run through two independent
+    /// code paths — `self_identity` vs `list_rooms` — so they must be shown to
+    /// agree. A bridge that resolves its ID one way and filters messages the
+    /// other way would otherwise silently mismatch.
+    #[test]
+    fn self_identity_agrees_with_list_rooms() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let member_sk = create_test_signing_key();
+
+        storage
+            .add_room(
+                &owner_vk,
+                &member_sk,
+                create_test_state(&owner_sk),
+                &expected_contract_key(&owner_vk),
+            )
+            .unwrap();
+
+        let single = storage.self_identity(&owner_vk).unwrap().unwrap();
+        let listed = storage
+            .list_rooms()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.owner_vk == owner_vk)
+            .expect("room present")
+            .self_identity;
+        assert_eq!(single, listed, "the two whoami paths must not diverge");
+
+        // ...including under an inline key, which both paths also accept.
+        let inline = create_test_signing_key();
+        let single_inline = storage
+            .self_identity_with(&owner_vk, Some(&inline))
+            .unwrap()
+            .unwrap();
+        let listed_inline = storage
+            .list_rooms_as(Some(&inline))
+            .unwrap()
+            .into_iter()
+            .find(|r| r.owner_vk == owner_vk)
+            .expect("room present")
+            .self_identity;
+        assert_eq!(single_inline, listed_inline);
+        assert_eq!(
+            single_inline.member_id,
+            MemberId::from(&inline.verifying_key())
+        );
+    }
+
+    /// An empty nickname in the cached state is not a nickname: it must not
+    /// shadow the local fallback and print as a blank name.
+    #[test]
+    fn self_identity_empty_room_nickname_falls_back() {
+        use river_core::room_state::privacy::SealedBytes;
+
+        let owner_sk = create_test_signing_key();
+        let member_sk = create_test_signing_key();
+        let mut state = create_test_state(&owner_sk);
+        push_member_info(&mut state, &member_sk, SealedBytes::public(Vec::new()));
+
+        let mut room_info = stored_room_info(state, &member_sk);
+        room_info.self_nickname = Some("local".to_string());
+
+        let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info, None);
+        assert_eq!(identity.nickname.as_deref(), Some("local"));
     }
 
     /// An unknown room reports `None` so the command can print a helpful

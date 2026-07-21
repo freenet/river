@@ -22,6 +22,16 @@ pub enum IdentityCommands {
     Whoami {
         /// Room owner's verifying key (base58). Omit for all rooms.
         room: Option<String>,
+        /// Signing key (base64-encoded 32-byte Ed25519 signing key), matching
+        /// `message send --signing-key` / `RIVER_SIGNING_KEY`.
+        ///
+        /// Report the identity THIS key would send as. Because `message send`
+        /// prefers its inline key over `--signing-key-file` and over
+        /// `rooms.json`, whoami must do the same or it reports an ID that
+        /// matches none of the bridge's own messages. With this set, the room
+        /// need not be in local storage.
+        #[arg(long, env = "RIVER_SIGNING_KEY")]
+        signing_key: Option<String>,
     },
     /// Export your identity for a room as a portable token
     Export {
@@ -52,7 +62,19 @@ pub async fn execute(
     format: OutputFormat,
 ) -> Result<()> {
     match command {
-        IdentityCommands::Whoami { room } => whoami(api_client.storage(), room.as_deref(), format),
+        // Reachable only by library callers: the binary short-circuits Whoami
+        // in `main` BEFORE building the client (so it works offline). Kept so
+        // `execute` stays total rather than growing an `unreachable!()`; a
+        // library caller pays the client's connection for a lookup that does
+        // not need it. Any change to the short-circuit's behaviour (new
+        // options, new precedence) must be mirrored here — both call the same
+        // `whoami`, so only argument plumbing can drift.
+        IdentityCommands::Whoami { room, signing_key } => whoami(
+            api_client.storage(),
+            room.as_deref(),
+            signing_key.as_deref(),
+            format,
+        ),
         IdentityCommands::Export { room } => export_identity(&api_client, &room, format).await,
         IdentityCommands::Import { token, file, force } => {
             import_identity(&api_client, token, file, force, format).await
@@ -63,42 +85,66 @@ pub async fn execute(
 /// `riverctl identity whoami [room]` — report the local user's own member ID
 /// (freenet/river#438).
 ///
-/// Deliberately **offline**: everything comes from `rooms.json`, so this works
-/// with the node down and, more importantly, resolves before any message has
-/// been observed. Takes `&Storage` rather than `&ApiClient` precisely so it
+/// Deliberately **offline**: everything comes from local storage, so this
+/// works with the node down and, more importantly, resolves before any message
+/// has been observed. Takes `&Storage` rather than `&ApiClient` precisely so it
 /// cannot acquire a node connection by accident — `main` short-circuits to it
 /// before the client is built, and that short-circuit is only sound while this
-/// signature keeps the node out of reach.
+/// signature keeps the node out of reach. (It is not strictly read-only: the
+/// shared `Storage` loader takes the advisory lock and may rewrite `rooms.json`
+/// when the bundled WASM's contract key has changed, so the config dir must be
+/// writable.)
 ///
-/// The reported ID reflects the *effective* signing key, so a
-/// `--signing-key-file` override is honoured and disclosed via
-/// `signing_key_source`.
-pub fn whoami(storage: &Storage, room: Option<&str>, format: OutputFormat) -> Result<()> {
-    let source = if storage.has_signing_key_override() {
-        "override"
-    } else {
-        "stored"
+/// The reported ID reflects the identity that would actually SIGN, across all
+/// three override mechanisms, in the same precedence `message send` uses:
+/// an inline `--signing-key` / `RIVER_SIGNING_KEY` beats `--signing-key-file` /
+/// `RIVER_SIGNING_KEY_FILE`, which beats the per-room key in `rooms.json`. The
+/// winner is disclosed as `signing_key_source`.
+pub fn whoami(
+    storage: &Storage,
+    room: Option<&str>,
+    inline_signing_key: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let inline_key = inline_signing_key
+        .map(parse_inline_signing_key)
+        .transpose()?;
+
+    let source = match (&inline_key, storage.has_signing_key_override()) {
+        // `message send` takes its inline-key branch before consulting
+        // storage, so an inline key wins even with a file override also set.
+        (Some(_), _) => "inline",
+        (None, true) => "override",
+        (None, false) => "stored",
     };
 
     let entries: Vec<(String, SelfIdentity)> = match room {
         Some(room_key_str) => {
             let room_owner_key = parse_room_key(room_key_str)?;
-            let identity = storage.self_identity(&room_owner_key)?.ok_or_else(|| {
-                anyhow!(
-                    "Room {} not found in local storage. Join it first, or run \
-                     `riverctl identity whoami` with no argument to list the \
-                     rooms you do have.",
-                    room_key_str
-                )
-            })?;
-            vec![(
-                bs58::encode(room_owner_key.as_bytes()).into_string(),
-                identity,
-            )]
+            let room_key = bs58::encode(room_owner_key.as_bytes()).into_string();
+            let stored = storage.self_identity_with(&room_owner_key, inline_key.as_ref())?;
+            let identity = match (stored, &inline_key) {
+                (Some(identity), _) => identity,
+                // An inline key needs no local storage to yield a member ID —
+                // `message send --signing-key` explicitly works without it, so
+                // refusing here would leave that bot workflow unserved.
+                // Nickname is unknowable without the room's state.
+                (None, Some(key)) => crate::storage::self_identity_from_key(&room_owner_key, key),
+                (None, None) => {
+                    return Err(anyhow!(
+                        "Room {} not found in local storage. Join it first, run \
+                         `riverctl identity whoami` with no argument to list the \
+                         rooms you do have, or pass `--signing-key` to report an \
+                         identity without local storage.",
+                        room_key_str
+                    ))
+                }
+            };
+            vec![(room_key, identity)]
         }
         None => {
             let mut all: Vec<_> = storage
-                .list_rooms()?
+                .list_rooms_as(inline_key.as_ref())?
                 .into_iter()
                 .map(|room| {
                     (
@@ -118,25 +164,14 @@ pub fn whoami(storage: &Storage, room: Option<&str>, format: OutputFormat) -> Re
         OutputFormat::Json => {
             let json: Vec<_> = entries
                 .iter()
-                .map(|(room_key, identity)| {
-                    serde_json::json!({
-                        "room": room_key,
-                        "member_id": identity.member_id.to_string(),
-                        "verifying_key":
-                            bs58::encode(identity.verifying_key.as_bytes()).into_string(),
-                        "nickname": identity.nickname,
-                        "is_owner": identity.is_owner,
-                        "signing_key_source": source,
-                    })
-                })
+                .map(|(room_key, identity)| whoami_json(room_key, identity, source))
                 .collect();
             // A single named room reports one object, not a one-element array,
             // so `riverctl identity whoami <room> -f json | jq -r .member_id`
             // works without an index.
-            if room.is_some() {
-                println!("{}", serde_json::to_string_pretty(&json[0])?);
-            } else {
-                println!("{}", serde_json::to_string_pretty(&json)?);
+            match (room.is_some(), json.first()) {
+                (true, Some(one)) => println!("{}", serde_json::to_string_pretty(one)?),
+                _ => println!("{}", serde_json::to_string_pretty(&json)?),
             }
         }
         OutputFormat::Human => {
@@ -155,13 +190,45 @@ pub fn whoami(storage: &Storage, room: Option<&str>, format: OutputFormat) -> Re
                     identity.nickname.as_deref().unwrap_or("(none)")
                 );
                 println!("  Owner: {}", if identity.is_owner { "yes" } else { "no" });
-                println!("  Signing key: {}", source);
+                println!("  Signing key source: {}", source);
                 println!();
             }
         }
     }
 
     Ok(())
+}
+
+/// The `whoami --format json` payload for one room.
+///
+/// Pure, so the field names — the actual contract with a bridge, e.g. the
+/// documented `| jq -r .member_id` — are unit-testable without a node or a
+/// data dir (mirrors `room::join_requires_invitation_json`).
+fn whoami_json(room_key: &str, identity: &SelfIdentity, source: &str) -> serde_json::Value {
+    serde_json::json!({
+        "room": room_key,
+        "member_id": identity.member_id.to_string(),
+        "verifying_key": bs58::encode(identity.verifying_key.as_bytes()).into_string(),
+        "nickname": identity.nickname,
+        "is_owner": identity.is_owner,
+        "signing_key_source": source,
+    })
+}
+
+/// Parse a base64 32-byte Ed25519 signing key, matching the encoding
+/// `message send --signing-key` / `RIVER_SIGNING_KEY` accepts.
+fn parse_inline_signing_key(encoded: &str) -> Result<SigningKey> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|e| anyhow!("Invalid --signing-key (base64 decode failed): {}", e))?;
+    let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "Invalid --signing-key: expected 32 bytes, got {}",
+            bytes.len()
+        )
+    })?;
+    Ok(SigningKey::from_bytes(&bytes))
 }
 
 async fn export_identity(
@@ -534,6 +601,71 @@ fn check_export_coherence(
 }
 
 #[cfg(test)]
+mod whoami_payload_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member::MemberId;
+
+    fn identity(nickname: Option<&str>) -> SelfIdentity {
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let vk = sk.verifying_key();
+        SelfIdentity {
+            member_id: MemberId::from(&vk),
+            verifying_key: vk,
+            nickname: nickname.map(str::to_string),
+            is_owner: false,
+        }
+    }
+
+    /// The JSON field NAMES are the contract with a bridge — `cli/README.md`
+    /// documents `| jq -r .member_id`. Renaming one silently breaks every
+    /// consumer, so pin them.
+    #[test]
+    fn whoami_json_field_names_are_stable() {
+        let id = identity(Some("bridge-bot"));
+        let json = whoami_json("ROOMKEY", &id, "stored");
+
+        assert_eq!(json["room"], "ROOMKEY");
+        assert_eq!(json["member_id"], id.member_id.to_string());
+        assert_eq!(
+            json["verifying_key"],
+            bs58::encode(id.verifying_key.as_bytes()).into_string()
+        );
+        assert_eq!(json["nickname"], "bridge-bot");
+        assert_eq!(json["is_owner"], false);
+        assert_eq!(json["signing_key_source"], "stored");
+
+        let keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys.len(),
+            6,
+            "unexpected field count — adding a field is fine, but update this \
+             pin and the README so consumers learn about it: {keys:?}"
+        );
+    }
+
+    /// `member_id` must be the `Display` form (what `message list/stream` puts
+    /// in `author`), not a debug or byte rendering.
+    #[test]
+    fn whoami_json_member_id_matches_author_display_form() {
+        let id = identity(None);
+        let json = whoami_json("ROOMKEY", &id, "stored");
+        // `author` in message JSON is `msg.message.author.to_string()`.
+        assert_eq!(json["member_id"], id.member_id.to_string());
+        assert!(!json["member_id"].as_str().unwrap().contains("MemberId"));
+    }
+
+    /// A missing nickname is JSON `null`, not `"None"` or `""` — a bridge
+    /// checking for absence should not have to string-match.
+    #[test]
+    fn whoami_json_absent_nickname_is_null() {
+        let json = whoami_json("ROOMKEY", &identity(None), "override");
+        assert_eq!(json["nickname"], serde_json::Value::Null);
+        assert_eq!(json["signing_key_source"], "override");
+    }
+}
+
+#[cfg(test)]
 mod whoami_wiring_tests {
     /// `identity whoami` must be answered from local storage BEFORE the API
     /// client is constructed (freenet/river#438). `ApiClient::new*` opens a
@@ -542,21 +674,23 @@ mod whoami_wiring_tests {
     /// exactly when a bridge most needs to know its own member ID. This pins
     /// the short-circuit; a refactor that folds whoami back into the general
     /// dispatch fails here.
+    ///
+    /// These scrapes are a backstop with a readable failure message; the
+    /// BEHAVIOURAL proof is `cli/tests/whoami_offline.rs`, which runs the real
+    /// binary against a dead node URL. Anchors here are deliberately short
+    /// (`identity::whoami(`, not a full argument list) — an earlier version
+    /// pinned the whole call and false-failed the moment an argument was
+    /// added, which is noise, not signal.
     #[test]
     fn whoami_short_circuits_before_client_creation() {
         let main_src = include_str!("../main.rs");
-        assert!(
-            main_src.contains("identity::whoami(&storage, room.as_deref(), cli.format)"),
+        let whoami_at = main_src.find("identity::whoami(").expect(
             "main must dispatch `identity whoami` directly against Storage. Do \
              NOT route it through ApiClient — that opens a WebSocket and makes \
-             an offline, node-free lookup impossible (freenet/river#438)."
+             an offline, node-free lookup impossible (freenet/river#438).",
         );
-
         // The short-circuit must come BEFORE the client is built, or it buys
         // nothing: the connection would already have been attempted.
-        let whoami_at = main_src
-            .find("identity::whoami(&storage")
-            .expect("whoami dispatch present");
         let client_at = main_src
             .find("ApiClient::new_with_signing_key_override(")
             .expect("client construction present");
@@ -574,17 +708,20 @@ mod whoami_wiring_tests {
     #[test]
     fn whoami_short_circuit_passes_signing_key_override() {
         let main_src = include_str!("../main.rs");
+        // Anchor BOTH ends on code, never on a comment: an earlier version
+        // anchored the end on a `// Create API client` comment, so deleting
+        // the comment was a false failure with a misdirecting message.
         let start = main_src
-            .find("let whoami_room = match &cli.command")
+            .find("identity::whoami(")
             .expect("whoami short-circuit present");
-        // Anchor the end on CODE, not on a comment: anchoring on the
-        // "// Create API client" comment made a comment cleanup a false
-        // failure with a misdirecting message (review on PR #439).
-        let end = main_src[start..]
+        let end = main_src
             .find("ApiClient::new_with_signing_key_override(")
-            .expect("client construction follows")
-            + start;
-        let block = &main_src[start..end];
+            .expect("client construction follows");
+        // Search back from the dispatch to the Storage the short-circuit built.
+        let block_start = main_src[..start]
+            .rfind("Storage::new_with_override(")
+            .expect("short-circuit builds its own Storage");
+        let block = &main_src[block_start..end];
         assert!(
             block.contains("signing_key_override"),
             "the whoami short-circuit must pass `signing_key_override` into \

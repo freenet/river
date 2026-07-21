@@ -150,19 +150,24 @@ async fn main() -> Result<()> {
     // is answered BEFORE the client is built: it must work with the node down,
     // and a bridge polling for its own member ID should never pay a WebSocket
     // handshake for it. Every other command needs a connected client.
-    let whoami_room = match &cli.command {
+    let whoami_args = match &cli.command {
         Commands::Identity {
-            command: identity::IdentityCommands::Whoami { room },
-        } => Some(room.clone()),
+            command: identity::IdentityCommands::Whoami { room, signing_key },
+        } => Some((room.clone(), signing_key.clone())),
         _ => None,
     };
 
-    if let Some(room) = whoami_room {
+    if let Some((room, inline_signing_key)) = whoami_args {
         let storage = riverctl::storage::Storage::new_with_override(
             cli.config_dir.as_deref(),
             signing_key_override,
         )?;
-        identity::whoami(&storage, room.as_deref(), cli.format)?;
+        identity::whoami(
+            &storage,
+            room.as_deref(),
+            inline_signing_key.as_deref(),
+            cli.format,
+        )?;
     } else {
         // Create API client
         let api_client = api::ApiClient::new_with_signing_key_override(
