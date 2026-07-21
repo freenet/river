@@ -1,5 +1,5 @@
 use crate::components::app::freenet_api::backward_probe::{
-    advance_backward_probe, start_backward_probe, take_probe,
+    deliver_probe_response, start_backward_probe,
 };
 use crate::components::app::freenet_api::error::SynchronizerError;
 use crate::components::app::freenet_api::response_handler::update_notification::{
@@ -44,7 +44,7 @@ pub async fn handle_get_response(
     // owner via SYNC_INFO / ROOMS (both keyed by the CURRENT contract
     // id), so route it into the probe handler before any other lookup.
     if crate::components::app::freenet_api::backward_probe::is_probe_instance(key.id()) {
-        handle_probe_get_response(key, state).await;
+        deliver_probe_response(*key.id(), state).await;
         return Ok(());
     }
 
@@ -832,7 +832,7 @@ pub async fn handle_get_response(
                     MemberId::from(owner_vk)
                 );
                 // Capture the device's local snapshot now and hand it to the
-                // probe. It rides along in `ProbeState` so the probe can both
+                // probe. It is moved into the probe driver so the probe can both
                 // CRDT-merge it with any recovered state and use it for the
                 // last-resort seed — without a fallible signal read at
                 // probe-completion time.
@@ -842,7 +842,7 @@ pub async fn handle_get_response(
                     .get(&owner_vk)
                     .map(|rd| rd.room_state.clone())
                     .unwrap_or_default();
-                if start_backward_probe(owner_vk, local_snapshot) {
+                if start_backward_probe(owner_vk, local_snapshot).await {
                     // A probe is in flight. It is responsible for either
                     // recovering stranded state (CRDT-merge + PUT-forward)
                     // or, on full exhaustion, seeding the current key with
@@ -1174,159 +1174,92 @@ pub async fn handle_get_response(
     Ok(())
 }
 
-/// Handle a GET response whose contract id matches an outstanding
-/// backward probe (freenet/river#292, Task 3).
+/// Adopt a backward-probe-recovered state (freenet/river#292, Task 3): the
+/// probe driver found real state in a legacy generation and already
+/// CRDT-merged it with the device's local snapshot. Adopt the merged state
+/// into the room's `RoomData` in `ROOMS` and PUT it forward onto the CURRENT
+/// contract key so the room is no longer stranded.
 ///
-/// The GET was for a *legacy* room-contract generation. Two outcomes:
-///
-/// * **The legacy key holds real state** (its `configuration` signature
-///   verifies against the owner): this is the room's last-active
-///   stranded state. CRDT-merge it into the room's `RoomData` in `ROOMS`
-///   and PUT it forward onto the CURRENT contract key so the room is no
-///   longer stranded. The probe ends here.
-/// * **The legacy key is empty/default**: advance the probe to the next
-///   (older) legacy key. If the probe is now exhausted — every
-///   generation tried, nothing found — seed the CURRENT contract key
-///   with the device's local snapshot as the genuine last resort.
-pub(crate) async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) {
-    let Some(probe) = take_probe(key.id()) else {
-        // Race: the probe entry was already consumed — e.g. the real GET
-        // response and the timeout watchdog both fired. Whichever ran first
-        // owns the outcome; the loser lands here. Nothing to do.
-        warn!(
-            "Probe GET response for {} had no matching probe entry — ignoring",
-            key.id()
-        );
-        return;
-    };
-    let owner_vk = probe.owner_vk;
-
-    // Deserialize defensively: the probe walks many historical generations,
-    // and a very old one may carry a `ChatRoomStateV1` whose layout the
-    // current type cannot decode. Treat an undeserializable legacy state as
-    // empty (default) so the probe advances to the next generation rather
-    // than panicking — matching the CLI's `try_get_state` (freenet/river#292).
-    let recovered_state: ChatRoomStateV1 = match try_from_cbor_slice::<ChatRoomStateV1>(&state) {
-        Some(s) => s,
-        None => {
-            warn!(
-                "Backward probe: legacy contract {} returned undeserializable state \
-                 (incompatible older generation) — treating as empty",
-                key.id()
-            );
-            ChatRoomStateV1::default()
-        }
-    };
-    let recovered_has_real_state = recovered_state
-        .configuration
-        .verify_signature(&owner_vk)
-        .is_ok();
-
-    if recovered_has_real_state {
-        info!(
-            "Backward probe for room {:?} recovered real state from legacy contract {} \
-             — adopting and PUTting forward onto the current key",
-            MemberId::from(owner_vk),
-            key.id()
-        );
-
-        // No need to follow this recovered state's own upgrade pointer: the
-        // probe walks generations newest-first, so every generation newer than
-        // this one was already probed and found empty. The newest-first probe
-        // order subsumes forward upgrade-pointer following.
-        //
-        // CRDT-merge the recovered state with the device's local snapshot
-        // BEFORE PUTting it forward, so unsynced local edits the device made
-        // offline are not dropped from the migrating PUT. This matches the
-        // CLI's `get_migration_state`, which merges network + local.
-        let params = ChatRoomParametersV1 { owner: owner_vk };
-        let merged_state = merge_room_states(recovered_state, &probe.local_snapshot, &params);
-
-        // Adopt the merged state into the room's RoomData. If the room is
-        // still a placeholder (a fresh import), replace wholesale — exactly
-        // as the normal imported-room GET path does, because the placeholder's
-        // `owner_member_id` differs and `merge` would reject it.
-        let rooms_state = merged_state.clone();
-        crate::util::defer(move || {
-            ROOMS.with_mut(|rooms| {
-                if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
-                    let params = ChatRoomParametersV1 { owner: owner_vk };
-                    if room_data.is_awaiting_initial_sync() {
-                        room_data.room_state = rooms_state;
-                        room_data.capture_self_membership_data(&params);
-                        let _ = room_data.repopulate_secrets_from_state();
-                    } else {
-                        let current_state = room_data.room_state.clone();
-                        match room_data
-                            .room_state
-                            .merge(&current_state, &params, &rooms_state)
-                        {
-                            Ok(_) => {
-                                room_data.capture_self_membership_data(&params);
-                                let _ = room_data.repopulate_secrets_from_state();
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Backward probe: failed to merge recovered state \
-                                     for room {:?}: {}",
-                                    MemberId::from(owner_vk),
-                                    e
-                                );
-                            }
+/// `merged` is the driver's `Outcome::Recovered` payload: `merge_with_local`
+/// applied, `prepare_forward` (identity for River) applied. It is UNSTRIPPED —
+/// the upgrade pointer is stripped only inside `put_state_to_current_key`
+/// (freenet/river#427), and the UNSTRIPPED value is what is adopted locally.
+pub(crate) async fn adopt_recovered_probe_state(
+    owner_vk: ed25519_dalek::VerifyingKey,
+    merged: ChatRoomStateV1,
+) {
+    // Adopt the merged state into the room's RoomData. If the room is still a
+    // placeholder (a fresh import), replace wholesale — exactly as the normal
+    // imported-room GET path does, because the placeholder's `owner_member_id`
+    // differs and `merge` would reject it.
+    let rooms_state = merged.clone();
+    crate::util::defer(move || {
+        ROOMS.with_mut(|rooms| {
+            if let Some(room_data) = rooms.map.get_mut(&owner_vk) {
+                let params = ChatRoomParametersV1 { owner: owner_vk };
+                if room_data.is_awaiting_initial_sync() {
+                    room_data.room_state = rooms_state;
+                    room_data.capture_self_membership_data(&params);
+                    let _ = room_data.repopulate_secrets_from_state();
+                } else {
+                    let current_state = room_data.room_state.clone();
+                    match room_data
+                        .room_state
+                        .merge(&current_state, &params, &rooms_state)
+                    {
+                        Ok(_) => {
+                            room_data.capture_self_membership_data(&params);
+                            let _ = room_data.repopulate_secrets_from_state();
+                        }
+                        Err(e) => {
+                            error!(
+                                "Backward probe: failed to merge recovered state \
+                                 for room {:?}: {}",
+                                MemberId::from(owner_vk),
+                                e
+                            );
                         }
                     }
-                } else {
-                    warn!(
-                        "Backward probe recovered state for room {:?} but it is no \
-                         longer in ROOMS — discarding",
-                        MemberId::from(owner_vk)
-                    );
                 }
-            });
+            } else {
+                warn!(
+                    "Backward probe recovered state for room {:?} but it is no \
+                     longer in ROOMS — discarding",
+                    MemberId::from(owner_vk)
+                );
+            }
         });
+    });
 
-        // PUT the merged state forward onto the current contract key so the
-        // room is no longer stranded, and subscribe to it.
-        put_state_to_current_key(owner_vk, merged_state, "recovered (backward probe)").await;
+    // PUT the merged state forward onto the current contract key so the room
+    // is no longer stranded, and subscribe to it. `put_state_to_current_key`
+    // strips the upgrade pointer on the way out (freenet/river#427).
+    put_state_to_current_key(owner_vk, merged, "recovered (backward probe)").await;
 
-        crate::util::defer(move || {
-            SYNC_INFO.with_mut(|sync_info| {
-                sync_info.register_new_room(owner_vk);
-                sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
-            });
-            // Enable notifications — the room now has real state, exactly
-            // as the normal imported-room GET path does once it has
-            // adopted network state.
-            mark_initial_sync_complete(&owner_vk);
+    crate::util::defer(move || {
+        SYNC_INFO.with_mut(|sync_info| {
+            sync_info.register_new_room(owner_vk);
+            sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
         });
-        crate::components::app::mark_needs_sync(owner_vk);
-        return;
-    }
+        // Enable notifications — the room now has real state, exactly as the
+        // normal imported-room GET path does once it has adopted network state.
+        mark_initial_sync_complete(&owner_vk);
+    });
+    crate::components::app::mark_needs_sync(owner_vk);
+}
 
-    // Legacy key empty — advance to the next older generation. Capture the
-    // local snapshot first so the exhaustion seed below has it without a
-    // fallible signal read (the probe is consumed by `advance_backward_probe`).
-    let local_snapshot = probe.local_snapshot.clone();
-    if advance_backward_probe(probe) {
-        info!(
-            "Backward probe for room {:?}: legacy contract {} empty, advancing",
-            MemberId::from(owner_vk),
-            key.id()
-        );
-        return;
-    }
-
-    // Probe exhausted — no legacy generation held real state. Last resort:
-    // seed the current contract key with the device's local snapshot. This is
-    // the ONLY path on which the local snapshot is PUT onto the network (the
-    // core design principle of #292). The snapshot was captured up front, so
-    // this seed always runs — it never depends on a signal read here.
-    info!(
-        "Backward probe for room {:?} exhausted — seeding current contract key \
-         with the local snapshot (last resort)",
-        MemberId::from(owner_vk)
-    );
-    put_state_to_current_key(owner_vk, local_snapshot, "local snapshot (last resort)").await;
+/// Seed the CURRENT contract key with the device's local snapshot as the
+/// genuine last resort (freenet/river#292, Task 3): the probe driver exhausted
+/// every legacy generation (or there were none) without finding real state.
+///
+/// This is the ONLY path on which the local snapshot is PUT onto the network.
+/// `local` is the driver's `Outcome::SeedLocal`/`NoLegacy` payload (the
+/// captured snapshot, `prepare_forward` applied — identity for River).
+pub(crate) async fn seed_current_key_with_local(
+    owner_vk: ed25519_dalek::VerifyingKey,
+    local: ChatRoomStateV1,
+) {
+    put_state_to_current_key(owner_vk, local, "local snapshot (last resort)").await;
     crate::util::defer(move || {
         SYNC_INFO.with_mut(|sync_info| {
             sync_info.register_new_room(owner_vk);
@@ -1337,8 +1270,9 @@ pub(crate) async fn handle_probe_get_response(key: ContractKey, state: Vec<u8>) 
 
 /// CRDT-merge `local` into `primary`, returning the merged state. On a merge
 /// failure (genuinely incompatible states) returns `primary` unchanged rather
-/// than losing it.
-fn merge_room_states(
+/// than losing it. `pub(crate)` so `RiverProbeOps::merge_with_local` (the
+/// backward-probe decision driver's app hook) reuses the exact same merge.
+pub(crate) fn merge_room_states(
     primary: ChatRoomStateV1,
     local: &ChatRoomStateV1,
     params: &ChatRoomParametersV1,

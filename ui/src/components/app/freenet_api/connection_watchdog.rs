@@ -107,7 +107,7 @@ static WS_ACTIVITY_SEQ: AtomicU64 = AtomicU64::new(0);
 static WS_CONNECT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // All three are plain atomics, NOT Dioxus signals — internal bookkeeping with
-// zero UI reactivity, like `backward_probe::BACKWARD_PROBES`.
+// zero UI reactivity, like `backward_probe::PROBE_ROUTES`.
 
 /// Record that an inbound WebSocket message just arrived — proof the socket is
 /// alive. Called from the `WebApi` result callback for every inbound
