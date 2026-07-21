@@ -1904,7 +1904,8 @@ mod tests {
     /// (freenet/river#398 moved codegen to `freenet-migrate-build`) must
     /// reproduce it byte-identically, or every user silently re-runs legacy
     /// migration once. Pinned to the value computed from the current
-    /// `legacy_delegates.toml` (24 entries, V1..V24 file order). This value
+    /// `legacy_delegates.toml` (24 entries spanning V1..V27 — V4–V6 removed —
+    /// in file order). This value
     /// SHOULD change when a genuinely new legacy entry is added — update the
     /// constant then — but must NEVER change from a codegen/tooling swap.
     #[test]
