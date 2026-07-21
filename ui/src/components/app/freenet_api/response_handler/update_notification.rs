@@ -24,7 +24,7 @@ const MAX_UPGRADE_HOPS: usize = 32;
 /// immediately-preceding one — is a cycle) AND the hop cap (`len()`).
 ///
 /// Plain `Mutex` map, NOT a Dioxus signal — internal bookkeeping with zero UI
-/// reactivity, like `backward_probe::BACKWARD_PROBES`.
+/// reactivity, like `backward_probe::PROBE_ROUTES`.
 static UPGRADE_CHAIN_VISITED: LazyLock<Mutex<HashMap<VerifyingKey, HashSet<ContractInstanceId>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

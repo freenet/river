@@ -86,6 +86,10 @@ river-core = { workspace = true, features = ["ecies", "ecies-randomized", "migra
 # Freenet dependencies
 freenet-scaffold.workspace = true
 freenet-stdlib = { workspace = true, features = ["net"] }
+# Sans-IO backward-probe decision driver (freenet/river#398 phase 2). The `ui`
+# default profile exposes the probe/driver surface; its stdlib dep unifies with
+# the workspace's 0.8.x.
+freenet-migrate = "0.3"
 
 futures = "0.3.30"
 futures-timer = "3.0.3"

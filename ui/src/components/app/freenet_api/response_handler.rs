@@ -1,5 +1,7 @@
-// `pub(crate)` so the backward-probe watchdog (freenet_api::backward_probe)
-// can call `get_response::handle_probe_get_response` on timeout (#292).
+// `pub(crate)` so the backward-probe adapter (freenet_api::backward_probe) can
+// call `get_response::{adopt_recovered_probe_state, seed_current_key_with_local,
+// merge_room_states}` when its decision driver reaches a terminal outcome (#292,
+// #398 phase 2).
 pub(crate) mod get_response;
 mod put_response;
 mod subscribe_response;
