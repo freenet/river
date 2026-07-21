@@ -1,7 +1,11 @@
 //! Validates that legacy_delegates.toml entries are well-formed.
 //!
 //! For entries V3+, verifies that delegate_key = BLAKE3(code_hash_bytes).
-//! V1 and V2 predate the BLAKE3 fix and may use a different derivation.
+//! V1 predates the BLAKE3 fix and uses a different (unreconstructible)
+//! derivation; it is marked `irregular_key = true` in the TOML. V2+ all
+//! derive correctly. (V2 was historically exempted here too, but its key in
+//! fact derives correctly — found when freenet-migrate-build's per-row
+//! cross-check ran against the full registry, freenet/river#398.)
 
 use serde::Deserialize;
 use std::fs;
@@ -98,10 +102,11 @@ fn all_entries_have_valid_hex() {
 fn delegate_key_is_blake3_of_code_hash() {
     let entries = load_entries();
 
-    // V1 and V2 predate the BLAKE3 derivation fix; skip them
+    // V1 predates the BLAKE3 derivation fix; skip it (it carries
+    // `irregular_key = true` in the TOML). V2+ must all derive.
     let verifiable: Vec<&Entry> = entries
         .iter()
-        .filter(|e| !matches!(e.version.as_str(), "V1" | "V2"))
+        .filter(|e| e.version.as_str() != "V1")
         .collect();
 
     assert!(!verifiable.is_empty(), "No verifiable entries (V3+) found");

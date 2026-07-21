@@ -72,10 +72,9 @@ migration = []
 mentions = []
 
 [build-dependencies]
-# Used by build.rs to parse legacy_room_contracts.toml and generate the
-# LEGACY_ROOM_CONTRACT_CODE_HASHES registry (freenet/river#292).
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+# Parses legacy_room_contracts.toml, validates every hash, and generates the
+# LEGACY_ROOM_CONTRACT_CODE_HASHES registry (freenet/river#292, #398).
+freenet-migrate-build = "0.2"
 
 [dev-dependencies]
 rand.workspace = true
