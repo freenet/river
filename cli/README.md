@@ -91,9 +91,10 @@ RIVER_SIGNING_KEY=<base64-key> riverctl identity whoami <room-owner-vk> --format
 ```
 
 `room list --format json` carries the same `self_member_id` (plus
-`signing_key_source`), so one call covers every room. Note that a
-`--signing-key-file` override applies to *every* room, including ones that
-identity is not a member of.
+`signing_key_source`) and honours the same `--signing-key` / `RIVER_SIGNING_KEY`,
+so one call covers every room and always agrees with `whoami`. Note that an
+override applies to *every* room, including ones that identity is not a member
+of — which is what `signing_key_source` is there to tell you.
 
 **On comparing IDs.** A `MemberId` renders as 8 base32 characters — a truncated,
 non-cryptographic hash of the verifying key. That is fine for recognising your

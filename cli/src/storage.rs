@@ -1081,8 +1081,20 @@ impl Storage {
                                 .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
                                 .unwrap_or_else(|_| sealed_name.to_string_lossy());
                         // Hand the same map to the nickname unsealing below
-                        // instead of collecting it a second time per room.
-                        secrets = Some(collected);
+                        // instead of collecting it a second time per room —
+                        // but ONLY when the identity we are reporting is the
+                        // one that collected it. An inline `--signing-key`
+                        // member may hold its own owner-signed secret blob
+                        // that the stored key cannot open; reusing the stored
+                        // key's map would then report a null nickname here
+                        // while the single-room path (which collects with the
+                        // effective key) resolves it, making the two whoami
+                        // forms disagree (Codex review round 2 on PR #439).
+                        let same_identity = signing_key
+                            .is_none_or(|inline| inline.to_bytes() == stored_sk.to_bytes());
+                        if same_identity {
+                            secrets = Some(collected);
+                        }
                         name
                     } else {
                         sealed_name.to_string_lossy()
@@ -1185,6 +1197,35 @@ mod tests {
             invitation_secrets: HashMap::new(),
             self_nickname: None,
         }
+    }
+
+    /// Add an owner-signed `encrypted_secrets` blob addressing `member_vk`, so
+    /// the room secret is reachable ONLY by that member's key (the real
+    /// distribution path, as opposed to an invitation-carried copy).
+    fn push_owner_secret_for(
+        state: &mut ChatRoomStateV1,
+        owner_sk: &SigningKey,
+        member_vk: &VerifyingKey,
+        secret: &[u8; 32],
+        version: u32,
+    ) {
+        use river_core::ecies::encrypt_secret_for_member;
+        use river_core::room_state::secret::{
+            AuthorizedEncryptedSecretForMember, EncryptedSecretForMemberV1,
+        };
+        let (ciphertext, nonce, ephemeral) = encrypt_secret_for_member(secret, member_vk);
+        let blob = EncryptedSecretForMemberV1 {
+            member_id: MemberId::from(member_vk),
+            secret_version: version,
+            ciphertext,
+            nonce,
+            sender_ephemeral_public_key: ephemeral.to_bytes(),
+            provider: MemberId::from(&owner_sk.verifying_key()),
+        };
+        state
+            .secrets
+            .encrypted_secrets
+            .push(AuthorizedEncryptedSecretForMember::new(blob, owner_sk));
     }
 
     /// Push an `AuthorizedMemberInfo` for `member_sk` carrying `nickname`.
@@ -1568,6 +1609,80 @@ mod tests {
             single_inline.member_id,
             MemberId::from(&inline.verifying_key())
         );
+    }
+
+    /// The two whoami paths must also agree in a PRIVATE room under an inline
+    /// key. `list_rooms_as` collects the room secrets with the room's STORED
+    /// key (it needs them for the room name); reusing that map to unseal an
+    /// INLINE identity's nickname reports null whenever only the inline member
+    /// can open its own owner-signed blob, while the single-room path — which
+    /// collects with the effective key — resolves it (Codex review round 2).
+    #[test]
+    fn inline_identity_nickname_agrees_across_paths_in_private_room() {
+        use river_core::ecies::seal_bytes;
+        use river_core::room_state::privacy::PrivacyMode;
+
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let stored_sk = create_test_signing_key();
+        let inline_sk = create_test_signing_key();
+        let secret = [17u8; 32];
+
+        let mut state = create_test_state(&owner_sk);
+        state.configuration.configuration.privacy_mode = PrivacyMode::Private;
+        state.configuration.configuration.display.name = seal_bytes(b"Private", &secret, 0);
+        state.configuration =
+            AuthorizedConfigurationV1::new(state.configuration.configuration.clone(), &owner_sk);
+        // The INLINE identity has a sealed nickname in the room's state.
+        push_member_info(
+            &mut state,
+            &inline_sk,
+            seal_bytes(b"inline-bot", &secret, 0),
+        );
+
+        // The secret is reachable ONLY through an owner-signed blob addressed
+        // to the INLINE member. This is what makes the test bite: the stored
+        // key cannot open it, so a secrets map collected with the stored key
+        // is useless for the inline identity's nickname. Supplying the secret
+        // via `invitation_secrets` instead would let the stored key's map
+        // decrypt it and the test would pass with or without the fix.
+        push_owner_secret_for(
+            &mut state,
+            &owner_sk,
+            &inline_sk.verifying_key(),
+            &secret,
+            0,
+        );
+        state.secrets.current_version = 0;
+
+        storage
+            .add_room(
+                &owner_vk,
+                &stored_sk,
+                state,
+                &expected_contract_key(&owner_vk),
+            )
+            .unwrap();
+
+        let single = storage
+            .self_identity_with(&owner_vk, Some(&inline_sk))
+            .unwrap()
+            .unwrap();
+        let listed = storage
+            .list_rooms_as(Some(&inline_sk))
+            .unwrap()
+            .into_iter()
+            .find(|r| r.owner_vk == owner_vk)
+            .expect("room present")
+            .self_identity;
+
+        assert_eq!(
+            single, listed,
+            "whoami <room> and whoami must agree for an inline identity in a \
+             private room"
+        );
+        assert_eq!(single.nickname.as_deref(), Some("inline-bot"));
     }
 
     /// An empty nickname in the cached state is not a nickname: it must not

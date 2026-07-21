@@ -217,7 +217,7 @@ fn whoami_json(room_key: &str, identity: &SelfIdentity, source: &str) -> serde_j
 
 /// Parse a base64 32-byte Ed25519 signing key, matching the encoding
 /// `message send --signing-key` / `RIVER_SIGNING_KEY` accepts.
-fn parse_inline_signing_key(encoded: &str) -> Result<SigningKey> {
+pub(crate) fn parse_inline_signing_key(encoded: &str) -> Result<SigningKey> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded.trim())

@@ -24,7 +24,18 @@ pub enum RoomCommands {
         private: bool,
     },
     /// List all rooms
-    List,
+    List {
+        /// Signing key (base64-encoded 32-byte Ed25519 signing key), matching
+        /// `message send --signing-key` / `RIVER_SIGNING_KEY`.
+        ///
+        /// Only affects `self_member_id` / `signing_key_source`: report the
+        /// identity THIS key would send as, so the value agrees with
+        /// `identity whoami` and with the `author` on messages this key signs.
+        /// Room names still resolve via each room's stored key, since a
+        /// signing identity does not necessarily hold the room secret.
+        #[arg(long, env = "RIVER_SIGNING_KEY")]
+        signing_key: Option<String>,
+    },
     /// Join a room
     Join {
         /// Room ID
@@ -160,20 +171,26 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 }
             }
         }
-        RoomCommands::List => {
+        RoomCommands::List { signing_key } => {
             if !matches!(format, OutputFormat::Json) {
                 eprintln!("Listing rooms...");
             }
 
-            // Disclosed alongside `self_member_id` (freenet/river#438): a
-            // `--signing-key-file` override replaces the reported identity for
-            // every room at once.
-            let signing_key_source = if api.storage().has_signing_key_override() {
-                "override"
-            } else {
-                "stored"
+            // Same three-way precedence as `identity whoami`, so the two
+            // surfaces never report different ids for the same room
+            // (freenet/river#438). Disclosed alongside `self_member_id`
+            // because an override replaces the identity for EVERY room at
+            // once, including ones it is not a member of.
+            let inline_key = signing_key
+                .as_deref()
+                .map(crate::commands::identity::parse_inline_signing_key)
+                .transpose()?;
+            let signing_key_source = match (&inline_key, api.storage().has_signing_key_override()) {
+                (Some(_), _) => "inline",
+                (None, true) => "override",
+                (None, false) => "stored",
             };
-            match api.list_rooms().await {
+            match api.list_rooms_as(inline_key.as_ref()).await {
                 Ok(rooms) => {
                     if rooms.is_empty() {
                         match format {

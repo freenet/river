@@ -2730,6 +2730,16 @@ impl ApiClient {
         self.storage.list_rooms()
     }
 
+    /// [`Self::list_rooms`], reporting each room's `self_identity` as
+    /// `signing_key` would sign (the inline `--signing-key` /
+    /// `RIVER_SIGNING_KEY` case). `None` uses each room's effective stored key.
+    pub async fn list_rooms_as(
+        &self,
+        signing_key: Option<&SigningKey>,
+    ) -> Result<Vec<crate::storage::RoomListing>> {
+        self.storage.list_rooms_as(signing_key)
+    }
+
     /// Build a rejoin delta if the user has been pruned from the members list.
     /// Returns (members_delta, member_info_delta) if the user needs to re-add themselves.
     ///
