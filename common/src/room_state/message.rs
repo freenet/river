@@ -12,6 +12,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::SystemTime;
 
+/// Ciphertext overhead added by AES-256-GCM (`encrypt_with_symmetric_key`):
+/// the 16-byte authentication tag appended to the plaintext. The nonce lives
+/// in a separate field of [`RoomMessageBody::Private`] and does not count
+/// toward [`RoomMessageBody::content_len`]. Pinned against real encryption
+/// by the `measure_*_matches_private_*` tests (feature `ecies-randomized`).
+pub const ENCRYPTION_TAG_OVERHEAD: usize = 16;
+
 /// Computed state for message actions (edits, deletes, reactions)
 /// This is rebuilt from action messages and not serialized
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -706,6 +713,63 @@ impl RoomMessageBody {
         match self {
             Self::Public { data, .. } => data.len(),
             Self::Private { ciphertext, .. } => ciphertext.len(),
+        }
+    }
+
+    /// Exact [`Self::content_len`] of the body [`Self::public`] builds for
+    /// `text` — or, with `encrypted`, of the private body the senders build
+    /// by AES-256-GCM-sealing the encoded `TextContentV1`.
+    ///
+    /// Send gates and byte counters MUST use the `measure_*` functions, not
+    /// `text.len()`: the contract validates encoded content bytes (CBOR
+    /// framing, plus the AEAD tag in private rooms), so a raw-text gate
+    /// passes messages the contract then silently prunes (freenet/river —
+    /// "message was lost" reports).
+    pub fn measure_text(text: &str, encrypted: bool) -> usize {
+        use crate::room_state::content::TextContentV1;
+        let plain = TextContentV1::new(text.to_owned()).encode().len();
+        Self::with_encryption_overhead(plain, encrypted)
+    }
+
+    /// Exact [`Self::content_len`] of the body [`Self::reply`] builds — or,
+    /// with `encrypted`, of the private reply body (encrypted encoded
+    /// `ReplyContentV1`). Reply bodies embed the quoted author name and
+    /// content preview, so their overhead is much larger than plain text.
+    pub fn measure_reply(
+        text: &str,
+        target_message_id: MessageId,
+        target_author_name: &str,
+        target_content_preview: &str,
+        encrypted: bool,
+    ) -> usize {
+        use crate::room_state::content::ReplyContentV1;
+        let plain = ReplyContentV1::new(
+            text.to_owned(),
+            target_message_id,
+            target_author_name.to_owned(),
+            target_content_preview.to_owned(),
+        )
+        .encode()
+        .len();
+        Self::with_encryption_overhead(plain, encrypted)
+    }
+
+    /// Exact [`Self::content_len`] of the body [`Self::edit`] builds — or,
+    /// with `encrypted`, of the private edit body (encrypted encoded
+    /// `ActionContentV1`).
+    pub fn measure_edit(target: MessageId, new_text: &str, encrypted: bool) -> usize {
+        use crate::room_state::content::ActionContentV1;
+        let plain = ActionContentV1::edit(target, new_text.to_owned())
+            .encode()
+            .len();
+        Self::with_encryption_overhead(plain, encrypted)
+    }
+
+    fn with_encryption_overhead(plain_len: usize, encrypted: bool) -> usize {
+        if encrypted {
+            plain_len + ENCRYPTION_TAG_OVERHEAD
+        } else {
+            plain_len
         }
     }
 
@@ -1640,5 +1704,193 @@ mod tests {
             display[1].message.content.as_public_string(),
             Some("World".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod measure_tests {
+    use super::*;
+    use crate::room_state::content::{
+        CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT, REPLY_CONTENT_VERSION, TEXT_CONTENT_VERSION,
+    };
+
+    /// Text samples crossing CBOR length-prefix boundaries (23/24, 255/256
+    /// bytes) and mixing multi-byte UTF-8 (the HostFat report: chars < limit
+    /// but encoded bytes > limit).
+    fn samples() -> Vec<String> {
+        vec![
+            String::new(),
+            "a".repeat(1),
+            "a".repeat(23),
+            "a".repeat(24),
+            "a".repeat(255),
+            "a".repeat(256),
+            "a".repeat(997),
+            "a".repeat(998),
+            "a".repeat(1000),
+            "é".repeat(400),  // 800 bytes, 400 chars
+            "🎉".repeat(200), // 800 bytes, 200 chars
+            format!("{}é🎉", "a".repeat(990)),
+        ]
+    }
+
+    fn target_id() -> MessageId {
+        MessageId(FastHash(0x1234_5678_9abc_def0_u64 as i64))
+    }
+
+    #[test]
+    fn measure_text_matches_public_body() {
+        for text in samples() {
+            let body = RoomMessageBody::public(text.clone());
+            assert_eq!(
+                RoomMessageBody::measure_text(&text, false),
+                body.content_len(),
+                "text bytes={} chars={}",
+                text.len(),
+                text.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn measure_reply_matches_reply_body() {
+        let previews = ["", "short", &"préview🎉 ".repeat(10)];
+        let authors = ["", "Alice", "HöstFat"];
+        for text in samples() {
+            for preview in previews {
+                for author in authors {
+                    let body = RoomMessageBody::reply(
+                        text.clone(),
+                        target_id(),
+                        author.to_string(),
+                        preview.to_string(),
+                    );
+                    assert_eq!(
+                        RoomMessageBody::measure_reply(&text, target_id(), author, preview, false),
+                        body.content_len(),
+                        "text bytes={} author={:?} preview bytes={}",
+                        text.len(),
+                        author,
+                        preview.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn measure_edit_matches_edit_body() {
+        for text in samples() {
+            let body = RoomMessageBody::edit(target_id(), text.clone());
+            assert_eq!(
+                RoomMessageBody::measure_edit(target_id(), &text, false),
+                body.content_len(),
+                "text bytes={}",
+                text.len()
+            );
+        }
+    }
+
+    /// Pins the bug class this API exists to prevent: raw text within the
+    /// default 1000-byte limit whose ENCODED content exceeds it. The old UI
+    /// gate compared `text.len()` and let these through; the contract then
+    /// silently pruned them ("a message was lost").
+    #[test]
+    fn raw_text_gate_undercounts_encoded_size() {
+        let max = 1000;
+        let text = "a".repeat(998); // HostFat's case: 998 chars -> 1006 encoded
+        assert!(text.len() <= max);
+        assert!(RoomMessageBody::measure_text(&text, false) > max);
+
+        // A reply blows the budget far earlier because of embedded metadata.
+        let reply_text = "a".repeat(900);
+        assert!(reply_text.len() <= max);
+        assert!(
+            RoomMessageBody::measure_reply(
+                &reply_text,
+                target_id(),
+                "Alice",
+                &"p".repeat(100),
+                false
+            ) > max
+        );
+    }
+
+    #[cfg(feature = "ecies-randomized")]
+    mod private_bodies {
+        use super::*;
+        use crate::ecies::encrypt_with_symmetric_key;
+
+        const SECRET: [u8; 32] = [7u8; 32];
+
+        #[test]
+        fn measure_text_matches_private_body() {
+            for text in samples() {
+                let content_bytes =
+                    crate::room_state::content::TextContentV1::new(text.clone()).encode();
+                let (ciphertext, nonce) = encrypt_with_symmetric_key(&SECRET, &content_bytes);
+                let body = RoomMessageBody::private(
+                    CONTENT_TYPE_TEXT,
+                    TEXT_CONTENT_VERSION,
+                    ciphertext,
+                    nonce,
+                    1,
+                );
+                assert_eq!(
+                    RoomMessageBody::measure_text(&text, true),
+                    body.content_len(),
+                    "text bytes={}",
+                    text.len()
+                );
+            }
+        }
+
+        #[test]
+        fn measure_reply_matches_private_body() {
+            for text in samples() {
+                let reply = crate::room_state::content::ReplyContentV1::new(
+                    text.clone(),
+                    target_id(),
+                    "Alice".to_string(),
+                    "some preview".to_string(),
+                );
+                let (ciphertext, nonce) = encrypt_with_symmetric_key(&SECRET, &reply.encode());
+                let body = RoomMessageBody::private(
+                    CONTENT_TYPE_REPLY,
+                    REPLY_CONTENT_VERSION,
+                    ciphertext,
+                    nonce,
+                    1,
+                );
+                assert_eq!(
+                    RoomMessageBody::measure_reply(
+                        &text,
+                        target_id(),
+                        "Alice",
+                        "some preview",
+                        true
+                    ),
+                    body.content_len(),
+                    "text bytes={}",
+                    text.len()
+                );
+            }
+        }
+
+        #[test]
+        fn measure_edit_matches_private_body() {
+            for text in samples() {
+                let action =
+                    crate::room_state::content::ActionContentV1::edit(target_id(), text.clone());
+                let (ciphertext, nonce) = encrypt_with_symmetric_key(&SECRET, &action.encode());
+                let body = RoomMessageBody::private_action(ciphertext, nonce, 1);
+                assert_eq!(
+                    RoomMessageBody::measure_edit(target_id(), &text, true),
+                    body.content_len(),
+                    "text bytes={}",
+                    text.len()
+                );
+            }
+        }
     }
 }

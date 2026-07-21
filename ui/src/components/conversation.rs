@@ -1509,6 +1509,25 @@ pub fn Conversation() -> Element {
                     .get_secret()
                     .map(|(secret, version)| (*secret, version));
 
+                // Safety net (see the send-path twin): the edit form disables
+                // Save when the encoded action exceeds max_message_size. If
+                // this fires, the UI gate drifted from the body construction
+                // and the edit is silently dropped — fix the drift.
+                let max_size = current_room_data
+                    .room_state
+                    .configuration
+                    .configuration
+                    .max_message_size;
+                let measured =
+                    RoomMessageBody::measure_edit(target_message_id.clone(), &new_text, is_private);
+                if measured > max_size {
+                    error!(
+                        "BUG: over-size edit passed the UI gate ({} encoded bytes, max {}) — edit dropped",
+                        measured, max_size
+                    );
+                    return;
+                }
+
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -1709,16 +1728,21 @@ pub fn Conversation() -> Element {
                     };
 
                     // Safety net: check encoded content size before signing.
-                    // The input UI blocks sending when text is over limit, but
-                    // encoded size can differ slightly from raw text length.
+                    // Should be unreachable — the input gate measures the same
+                    // encoded size via RoomMessageBody::measure_* (pinned equal
+                    // to content_len() by river-core tests). If this fires, the
+                    // measure helpers have drifted from the body construction
+                    // above and the draft is already cleared: the message is
+                    // LOST, which is the HostFat bug. Fix the drift, don't
+                    // relax this check.
                     let content_size = content.content_len();
                     let max_size = room_state_clone
                         .configuration
                         .configuration
                         .max_message_size;
                     if content_size > max_size {
-                        warn!(
-                            "Message too long: {} encoded bytes, max {} bytes",
+                        error!(
+                            "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; message dropped",
                             content_size, max_size
                         );
                         return;
@@ -1912,6 +1936,21 @@ pub fn Conversation() -> Element {
                                     let groups = groups.clone();
                                     let self_member_id = *self_member_id;
                                     let member_names = member_names.clone();
+                                    // Room limits for the in-place edit form's
+                                    // encoded-size gate (same measure the
+                                    // contract enforces on the edit action).
+                                    let (edit_max_size, edit_is_private) = current_room_data
+                                        .as_ref()
+                                        .map(|rd| {
+                                            (
+                                                rd.room_state
+                                                    .configuration
+                                                    .configuration
+                                                    .max_message_size,
+                                                rd.is_private(),
+                                            )
+                                        })
+                                        .unwrap_or((usize::MAX, false));
                                     // Flatten the message/event groups into render rows,
                                     // inserting a day-change separator row above the first
                                     // item of each local calendar day (a run of messages on
@@ -1993,6 +2032,8 @@ pub fn Conversation() -> Element {
                                                                 group: group,
                                                                 self_member_id: self_member_id,
                                                                 member_names: member_names,
+                                                                max_message_size: edit_max_size,
+                                                                is_private: edit_is_private,
                                                                 last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
                                                                 edit_trigger: edit_trigger,
                                                                 on_react: move |(msg_id, emoji)| {
@@ -2152,6 +2193,7 @@ pub fn Conversation() -> Element {
                         match room_data.can_participate() {
                             Ok(()) => {
                                 let max_msg_size = room_data.room_state.configuration.configuration.max_message_size;
+                                let room_is_private = room_data.is_private();
                                 // Mentionable members for the @ autocomplete: every member
                                 // with a (decrypted) nickname except self, sorted by name.
                                 let self_id = MemberId::from(&room_data.self_sk.verifying_key());
@@ -2184,6 +2226,7 @@ pub fn Conversation() -> Element {
                                         replying_to: replying_to,
                                         on_request_edit_last: request_edit_last,
                                         max_message_size: max_msg_size,
+                                        is_private: room_is_private,
                                         members: mention_members,
                                     }
                                 }
@@ -2295,6 +2338,11 @@ fn MessageGroupComponent(
     group: MessageGroup,
     self_member_id: MemberId,
     member_names: HashMap<MemberId, String>,
+    /// Room max message size in ENCODED content bytes — bounds the edit
+    /// action body (`RoomMessageBody::measure_edit`), not the raw text.
+    max_message_size: usize,
+    /// Whether the room is private (encrypted edits carry the AES-GCM tag).
+    is_private: bool,
     last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
     edit_trigger: Signal<Option<(String, String)>>,
     on_react: EventHandler<(MessageId, String)>,
@@ -2504,6 +2552,16 @@ fn MessageGroupComponent(
                                                             } else if e.key() == Key::Enter && !e.modifiers().shift() {
                                                                 e.prevent_default();
                                                                 let new_text = edit_text.read().clone();
+                                                                // Encoded-size gate: keep the form open so the
+                                                                // over-limit edit isn't silently discarded.
+                                                                if RoomMessageBody::measure_edit(
+                                                                    msg_id.clone(),
+                                                                    &new_text,
+                                                                    is_private,
+                                                                ) > max_message_size
+                                                                {
+                                                                    return;
+                                                                }
                                                                 if !new_text.is_empty() && new_text != original {
                                                                     on_edit.call((msg_id.clone(), new_text));
                                                                 }
@@ -2567,28 +2625,69 @@ fn MessageGroupComponent(
                                                             },
                                                         }
                                                     }
-                                                    div { class: "flex justify-end gap-3 mt-3",
-                                                        style: "overflow: visible;",
-                                                        button {
-                                                            class: if is_self {
-                                                                "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"
-                                                            } else {
-                                                                "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border"
-                                                            },
-                                                            onclick: move |_| editing_message.set(None),
-                                                            "Cancel (Esc)"
-                                                        }
-                                                        button {
-                                                            class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-medium hover:opacity-90",
-                                                            style: "background-color: #2563eb; color: white;",
-                                                            onclick: move |_| {
-                                                                let new_text = edit_text.read().clone();
-                                                                if !new_text.is_empty() && new_text != save_original {
-                                                                    on_edit.call((save_msg_id.clone(), new_text));
+                                                    // Encoded-size gate for the edit action: same
+                                                    // measure the contract enforces. Without it an
+                                                    // over-limit edit is signed, sent, and silently
+                                                    // pruned by the contract validation.
+                                                    {
+                                                        let encoded_bytes = RoomMessageBody::measure_edit(
+                                                            msg_id_for_save.clone(),
+                                                            &edit_text.read(),
+                                                            is_private,
+                                                        );
+                                                        let over_limit = encoded_bytes > max_message_size;
+                                                        let near_limit = encoded_bytes > max_message_size * 4 / 5;
+                                                        rsx! {
+                                                            if near_limit {
+                                                                div {
+                                                                    class: if over_limit {
+                                                                        "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium"
+                                                                    } else if is_self {
+                                                                        "text-xs text-right mt-1 pr-1 text-white/70"
+                                                                    } else {
+                                                                        "text-xs text-right mt-1 pr-1 text-text-muted"
+                                                                    },
+                                                                    if over_limit {
+                                                                        "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
+                                                                    } else {
+                                                                        "{encoded_bytes}/{max_message_size}"
+                                                                    }
                                                                 }
-                                                                editing_message.set(None);
-                                                            },
-                                                            "Save (Enter)"
+                                                            }
+                                                            div { class: "flex justify-end gap-3 mt-3",
+                                                                style: "overflow: visible;",
+                                                                button {
+                                                                    class: if is_self {
+                                                                        "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"
+                                                                    } else {
+                                                                        "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border"
+                                                                    },
+                                                                    onclick: move |_| editing_message.set(None),
+                                                                    "Cancel (Esc)"
+                                                                }
+                                                                button {
+                                                                    class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-medium hover:opacity-90",
+                                                                    style: if over_limit {
+                                                                        "background-color: #9ca3af; color: white; cursor: not-allowed; opacity: 0.6;"
+                                                                    } else {
+                                                                        "background-color: #2563eb; color: white;"
+                                                                    },
+                                                                    disabled: over_limit,
+                                                                    title: if over_limit {
+                                                                        format!("Edited message exceeds the {} byte limit", max_message_size)
+                                                                    } else {
+                                                                        String::new()
+                                                                    },
+                                                                    onclick: move |_| {
+                                                                        let new_text = edit_text.read().clone();
+                                                                        if !new_text.is_empty() && new_text != save_original {
+                                                                            on_edit.call((save_msg_id.clone(), new_text));
+                                                                        }
+                                                                        editing_message.set(None);
+                                                                    },
+                                                                    "Save (Enter)"
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }

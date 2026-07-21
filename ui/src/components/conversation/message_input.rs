@@ -8,6 +8,26 @@ use super::mention::{
 };
 use super::ReplyContext;
 use river_core::room_state::member::MemberId;
+use river_core::room_state::message::RoomMessageBody;
+
+/// Encoded `content_len()` the draft will have when sent — the measure the
+/// contract enforces (`max_message_size` bounds encoded bytes, not typed
+/// text). Mirrors `handle_send_message`'s body construction: replies embed
+/// the quoted author + preview, private rooms add the AES-GCM tag. Gating on
+/// `text.len()` instead silently lost messages in the encoding-overhead gap
+/// (the contract prunes them after the draft is already cleared).
+fn measure_draft(text: &str, reply: Option<&ReplyContext>, is_private: bool) -> usize {
+    match reply {
+        Some(r) => RoomMessageBody::measure_reply(
+            text,
+            r.message_id.clone(),
+            &r.author_name,
+            &r.content_preview,
+            is_private,
+        ),
+        None => RoomMessageBody::measure_text(text, is_private),
+    }
+}
 
 fn auto_resize_message_input() {
     let Some(el) = get_message_textarea() else {
@@ -38,7 +58,12 @@ pub fn MessageInput(
     replying_to: Signal<Option<ReplyContext>>,
     on_request_edit_last: EventHandler<()>,
     /// Maximum message content size in bytes (from room configuration).
+    /// Bounds the ENCODED content (`RoomMessageBody::content_len`), which is
+    /// what the contract validates — not the raw typed text.
     max_message_size: usize,
+    /// Whether the room is private (encrypted): private bodies carry the
+    /// AES-GCM tag, which counts toward the encoded size.
+    is_private: bool,
     /// Mentionable members (id, current nickname), excluding self, sorted by
     /// name. Drives the `@` autocomplete. Changes only when membership changes,
     /// so it does not affect keystroke-level re-rendering.
@@ -51,7 +76,9 @@ pub fn MessageInput(
 
     let mut send_message = move || {
         let text = message_text.peek().to_string();
-        if !text.is_empty() && text.len() <= max_message_size {
+        let within_limit =
+            measure_draft(&text, replying_to.peek().as_ref(), is_private) <= max_message_size;
+        if !text.is_empty() && within_limit {
             let reply_ctx = replying_to.peek().clone();
             message_text.set(String::new());
             replying_to.set(None);
@@ -198,22 +225,29 @@ pub fn MessageInput(
                                 }
                             }
                         }
-                        // Byte counter — shown when approaching the limit (>80%)
+                        // Byte counter — shown when approaching the limit (>80%).
+                        // Counts ENCODED bytes (what the contract enforces), so
+                        // it stays truthful for replies, private rooms, and
+                        // multi-byte characters.
                         {
-                            let text_bytes = message_text.read().len();
+                            let encoded_bytes = measure_draft(
+                                &message_text.read(),
+                                replying_to.read().as_ref(),
+                                is_private,
+                            );
                             let threshold = max_message_size * 4 / 5; // 80%
-                            if text_bytes > threshold {
-                                let over = text_bytes > max_message_size;
+                            if encoded_bytes > threshold {
+                                let over = encoded_bytes > max_message_size;
                                 if over {
                                     rsx! {
                                         div { class: "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium",
-                                            "Message too long \u{2014} {text_bytes}/{max_message_size} bytes"
+                                            "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
                                         }
                                     }
                                 } else {
                                     rsx! {
                                         div { class: "text-xs text-right mt-1 pr-1 text-text-muted",
-                                            "{text_bytes}/{max_message_size}"
+                                            "{encoded_bytes}/{max_message_size}"
                                         }
                                     }
                                 }
@@ -223,8 +257,12 @@ pub fn MessageInput(
                         }
                     }
                     {
-                        let text_bytes = message_text.read().len();
-                        let over_limit = text_bytes > max_message_size;
+                        let encoded_bytes = measure_draft(
+                            &message_text.read(),
+                            replying_to.read().as_ref(),
+                            is_private,
+                        );
+                        let over_limit = encoded_bytes > max_message_size;
                         let btn_class = if over_limit {
                             "px-5 py-2.5 bg-gray-400 dark:bg-gray-600 text-white font-medium rounded-xl opacity-50 cursor-not-allowed"
                         } else {
