@@ -115,6 +115,7 @@ Commands include:
 - `riverctl message` - Send and receive messages
 - `riverctl member` - Member management
 - `riverctl invite` - Create and accept invitations
+- `riverctl identity whoami` - Your own member ID in a room (matches the `author` on your messages)
 
 Use `--format json` for machine-readable output. Run `riverctl --help` for full documentation.
 

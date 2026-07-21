@@ -180,21 +180,30 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                         match format {
                             OutputFormat::Human => {
                                 println!("\n{} room(s) found:\n", rooms.len());
-                                for (owner_key, name, contract_key) in rooms {
-                                    println!("Room: {}", name.green());
-                                    println!("  Owner key: {}", owner_key);
-                                    println!("  Contract key: {}", contract_key);
+                                for room in rooms {
+                                    println!("Room: {}", room.name.green());
+                                    println!(
+                                        "  Owner key: {}",
+                                        bs58::encode(room.owner_vk.as_bytes()).into_string()
+                                    );
+                                    println!("  Contract key: {}", room.contract_key);
+                                    println!("  Your member ID: {}", room.self_identity.member_id);
                                     println!();
                                 }
                             }
                             OutputFormat::Json => {
                                 let json_rooms: Vec<_> = rooms
                                     .into_iter()
-                                    .map(|(owner_key, name, contract_key)| {
+                                    .map(|room| {
                                         serde_json::json!({
-                                            "name": name,
-                                            "owner_key": owner_key,
-                                            "contract_key": contract_key,
+                                            "name": room.name,
+                                            "owner_key": bs58::encode(room.owner_vk.as_bytes())
+                                                .into_string(),
+                                            "contract_key": room.contract_key,
+                                            // freenet/river#438: the `author` a
+                                            // message from this identity carries.
+                                            "self_member_id":
+                                                room.self_identity.member_id.to_string(),
                                         })
                                     })
                                     .collect();

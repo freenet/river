@@ -50,7 +50,31 @@ riverctl invite accept <invite-code>             # On the recipient's machine.
 
 ## Managing your identity
 
-Each room uses a separate signing key. Export it to move between machines or back it up:
+Each room uses a separate signing key, so there is no single global member ID —
+`whoami` is per-room:
+
+```bash
+riverctl identity whoami <room-owner-vk>         # Your member ID in one room.
+riverctl identity whoami                         # Every room you're in.
+```
+
+The `member_id` it reports is exactly the `author` value your own messages carry
+in `message list` / `message stream --format json`, which is what a bridge needs
+to filter out its own echo:
+
+```bash
+me=$(riverctl identity whoami <room-owner-vk> --format json | jq -r .member_id)
+riverctl message stream <room-owner-vk> --format json |
+  jq -c --arg me "$me" 'select(.author != $me)'
+```
+
+`whoami` reads only local storage — it works with the node stopped, and resolves
+before any message has arrived. Under `--signing-key-file` it reports the
+override identity (the one that will actually sign), and says so via
+`signing_key_source`. `room list --format json` carries the same value as
+`self_member_id`, so one call covers every room.
+
+Export your identity to move between machines or back it up:
 
 ```bash
 riverctl identity export <room-owner-vk> > my-identity.token
@@ -74,7 +98,7 @@ riverctl member ban          <room-owner-vk> <member-vk>   # Owner only.
 | `member`   | `list`, `set-nickname`, `ban`                                           |
 | `invite`   | `create`, `accept`                                                      |
 | `dm`       | `send`, `list`, `purge`, `accept`                                       |
-| `identity` | `export`, `import`                                                      |
+| `identity` | `whoami`, `export`, `import`                                            |
 | `debug`    | troubleshooting utilities                                               |
 
 Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags. All commands accept `--format json` for scripting.
@@ -90,6 +114,9 @@ Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags.
 | `delete` | A previously-streamed message was deleted | `message_id`, `room`, `author`, `nickname`, `timestamp` (no `content`) |
 
 `reply_to` is `null` for non-replies, otherwise `{ "author", "preview" }`. `edit`/`delete` events are emitted only for messages the stream actually surfaced. Bridges should key off `type` and tolerate unknown future types.
+
+`author` is your correspondent's member ID; get your own with `riverctl identity
+whoami <room-owner-vk>` and compare against it to recognise your own messages.
 
 ## Configuration
 

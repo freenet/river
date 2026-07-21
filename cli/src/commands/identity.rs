@@ -1,5 +1,6 @@
 use crate::api::ApiClient;
 use crate::output::OutputFormat;
+use crate::storage::{SelfIdentity, Storage};
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -9,6 +10,19 @@ use river_core::room_state::ChatRoomParametersV1;
 
 #[derive(Subcommand)]
 pub enum IdentityCommands {
+    /// Show your own member ID for a room (offline; no node required)
+    ///
+    /// The reported `member_id` is exactly the `author` value that messages
+    /// from this identity carry in `riverctl message list/stream --format
+    /// json`, so a bridge can filter out its own echo without waiting for a
+    /// message to arrive first (freenet/river#438).
+    ///
+    /// With no room, reports every room in local storage — River identities
+    /// are per-room, so there is no single global member ID.
+    Whoami {
+        /// Room owner's verifying key (base58). Omit for all rooms.
+        room: Option<String>,
+    },
     /// Export your identity for a room as a portable token
     Export {
         /// Room owner's verifying key (base58)
@@ -38,11 +52,116 @@ pub async fn execute(
     format: OutputFormat,
 ) -> Result<()> {
     match command {
+        IdentityCommands::Whoami { room } => whoami(api_client.storage(), room.as_deref(), format),
         IdentityCommands::Export { room } => export_identity(&api_client, &room, format).await,
         IdentityCommands::Import { token, file, force } => {
             import_identity(&api_client, token, file, force, format).await
         }
     }
+}
+
+/// `riverctl identity whoami [room]` — report the local user's own member ID
+/// (freenet/river#438).
+///
+/// Deliberately **offline**: everything comes from `rooms.json`, so this works
+/// with the node down and, more importantly, resolves before any message has
+/// been observed. Takes `&Storage` rather than `&ApiClient` precisely so it
+/// cannot acquire a node connection by accident — `main` short-circuits to it
+/// before the client is built, and that short-circuit is only sound while this
+/// signature keeps the node out of reach.
+///
+/// The reported ID reflects the *effective* signing key, so a
+/// `--signing-key-file` override is honoured and disclosed via
+/// `signing_key_source`.
+pub fn whoami(storage: &Storage, room: Option<&str>, format: OutputFormat) -> Result<()> {
+    let source = if storage.has_signing_key_override() {
+        "override"
+    } else {
+        "stored"
+    };
+
+    let entries: Vec<(String, SelfIdentity)> = match room {
+        Some(room_key_str) => {
+            let room_owner_key = parse_room_key(room_key_str)?;
+            let identity = storage.self_identity(&room_owner_key)?.ok_or_else(|| {
+                anyhow!(
+                    "Room {} not found in local storage. Join it first, or run \
+                     `riverctl identity whoami` with no argument to list the \
+                     rooms you do have.",
+                    room_key_str
+                )
+            })?;
+            vec![(
+                bs58::encode(room_owner_key.as_bytes()).into_string(),
+                identity,
+            )]
+        }
+        None => {
+            let mut all: Vec<_> = storage
+                .list_rooms()?
+                .into_iter()
+                .map(|room| {
+                    (
+                        bs58::encode(room.owner_vk.as_bytes()).into_string(),
+                        room.self_identity,
+                    )
+                })
+                .collect();
+            // Stable output: `rooms.json` is a HashMap, so iteration order
+            // varies between runs and would churn any script diffing it.
+            all.sort_by(|(a, _), (b, _)| a.cmp(b));
+            all
+        }
+    };
+
+    match format {
+        OutputFormat::Json => {
+            let json: Vec<_> = entries
+                .iter()
+                .map(|(room_key, identity)| {
+                    serde_json::json!({
+                        "room": room_key,
+                        "member_id": identity.member_id.to_string(),
+                        "verifying_key":
+                            bs58::encode(identity.verifying_key.as_bytes()).into_string(),
+                        "nickname": identity.nickname,
+                        "is_owner": identity.is_owner,
+                        "signing_key_source": source,
+                    })
+                })
+                .collect();
+            // A single named room reports one object, not a one-element array,
+            // so `riverctl identity whoami <room> -f json | jq -r .member_id`
+            // works without an index.
+            if room.is_some() {
+                println!("{}", serde_json::to_string_pretty(&json[0])?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+        }
+        OutputFormat::Human => {
+            if entries.is_empty() {
+                println!("No rooms found. Use 'riverctl room create' or accept an invitation.");
+            }
+            for (room_key, identity) in &entries {
+                println!("Room: {}", room_key);
+                println!("  Member ID: {}", identity.member_id);
+                println!(
+                    "  Verifying key: {}",
+                    bs58::encode(identity.verifying_key.as_bytes()).into_string()
+                );
+                println!(
+                    "  Nickname: {}",
+                    identity.nickname.as_deref().unwrap_or("(none)")
+                );
+                println!("  Owner: {}", if identity.is_owner { "yes" } else { "no" });
+                println!("  Signing key: {}", source);
+                println!();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn export_identity(
@@ -412,6 +531,64 @@ fn check_export_coherence(
          authorized member. The signing key's verifying key does not match the \
          cached AuthorizedMember.member_vk for this room. {hint}"
     ))
+}
+
+#[cfg(test)]
+mod whoami_wiring_tests {
+    /// `identity whoami` must be answered from local storage BEFORE the API
+    /// client is constructed (freenet/river#438). `ApiClient::new*` opens a
+    /// WebSocket eagerly, so routing whoami through it makes a pure
+    /// `rooms.json` read fail outright when the node is down — which is
+    /// exactly when a bridge most needs to know its own member ID. This pins
+    /// the short-circuit; a refactor that folds whoami back into the general
+    /// dispatch fails here.
+    #[test]
+    fn whoami_short_circuits_before_client_creation() {
+        let main_src = include_str!("../main.rs");
+        assert!(
+            main_src.contains("identity::whoami(&storage, room.as_deref(), cli.format)"),
+            "main must dispatch `identity whoami` directly against Storage. Do \
+             NOT route it through ApiClient — that opens a WebSocket and makes \
+             an offline, node-free lookup impossible (freenet/river#438)."
+        );
+
+        // The short-circuit must come BEFORE the client is built, or it buys
+        // nothing: the connection would already have been attempted.
+        let whoami_at = main_src
+            .find("identity::whoami(&storage")
+            .expect("whoami dispatch present");
+        let client_at = main_src
+            .find("ApiClient::new_with_signing_key_override(")
+            .expect("client construction present");
+        assert!(
+            whoami_at < client_at,
+            "the whoami short-circuit must precede ApiClient construction in \
+             main; otherwise the WebSocket handshake still runs first."
+        );
+    }
+
+    /// The short-circuit must honour `--signing-key-file`, or whoami would
+    /// report the persisted identity while messages get signed by the
+    /// override — reporting an id that matches none of the bridge's own
+    /// messages, the precise failure this feature exists to prevent.
+    #[test]
+    fn whoami_short_circuit_passes_signing_key_override() {
+        let main_src = include_str!("../main.rs");
+        let start = main_src
+            .find("let whoami_room = match &cli.command")
+            .expect("whoami short-circuit present");
+        let end = main_src[start..]
+            .find("// Create API client")
+            .expect("client construction follows")
+            + start;
+        let block = &main_src[start..end];
+        assert!(
+            block.contains("signing_key_override"),
+            "the whoami short-circuit must pass `signing_key_override` into \
+             Storage, so `--signing-key-file` / RIVER_SIGNING_KEY_FILE selects \
+             the reported identity (freenet/river#438)."
+        );
+    }
 }
 
 #[cfg(test)]

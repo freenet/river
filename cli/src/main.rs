@@ -146,26 +146,51 @@ async fn main() -> Result<()> {
         .map(load_signing_key_from_file)
         .transpose()?;
 
-    // Create API client
-    let api_client = api::ApiClient::new_with_signing_key_override(
-        &cli.node_url,
-        config,
-        cli.config_dir.as_deref(),
-        signing_key_override,
-    )
-    .await?;
+    // `identity whoami` (freenet/river#438) is a pure `rooms.json` read, so it
+    // is answered BEFORE the client is built: it must work with the node down,
+    // and a bridge polling for its own member ID should never pay a WebSocket
+    // handshake for it. Every other command needs a connected client.
+    let whoami_room = match &cli.command {
+        Commands::Identity {
+            command: identity::IdentityCommands::Whoami { room },
+        } => Some(room.clone()),
+        _ => None,
+    };
 
-    // Execute command
-    match cli.command {
-        Commands::Room { command } => room::execute(command, api_client, cli.format).await?,
-        Commands::Message { command } => message::execute(command, api_client, cli.format).await?,
-        Commands::Member { command } => member::execute(command, api_client, cli.format).await?,
-        Commands::Invite { command } => invite::execute(command, api_client, cli.format).await?,
-        Commands::Identity { command } => {
-            identity::execute(command, api_client, cli.format).await?
+    if let Some(room) = whoami_room {
+        let storage = riverctl::storage::Storage::new_with_override(
+            cli.config_dir.as_deref(),
+            signing_key_override,
+        )?;
+        identity::whoami(&storage, room.as_deref(), cli.format)?;
+    } else {
+        // Create API client
+        let api_client = api::ApiClient::new_with_signing_key_override(
+            &cli.node_url,
+            config,
+            cli.config_dir.as_deref(),
+            signing_key_override,
+        )
+        .await?;
+
+        // Execute command
+        match cli.command {
+            Commands::Room { command } => room::execute(command, api_client, cli.format).await?,
+            Commands::Message { command } => {
+                message::execute(command, api_client, cli.format).await?
+            }
+            Commands::Member { command } => {
+                member::execute(command, api_client, cli.format).await?
+            }
+            Commands::Invite { command } => {
+                invite::execute(command, api_client, cli.format).await?
+            }
+            Commands::Identity { command } => {
+                identity::execute(command, api_client, cli.format).await?
+            }
+            Commands::Debug { command } => debug::execute(command, api_client, cli.format).await?,
+            Commands::Dm { command } => dm::execute(command, api_client, cli.format).await?,
         }
-        Commands::Debug { command } => debug::execute(command, api_client, cli.format).await?,
-        Commands::Dm { command } => dm::execute(command, api_client, cli.format).await?,
     }
 
     // Best-effort "newer riverctl available?" nudge — crates.io, once/day

@@ -2707,19 +2707,8 @@ impl ApiClient {
         }
     }
 
-    pub async fn list_rooms(&self) -> Result<Vec<(String, String, String)>> {
-        self.storage.list_rooms().map(|rooms| {
-            rooms
-                .into_iter()
-                .map(|(owner_vk, name, contract_key)| {
-                    (
-                        bs58::encode(owner_vk.as_bytes()).into_string(),
-                        name,
-                        contract_key,
-                    )
-                })
-                .collect()
-        })
+    pub async fn list_rooms(&self) -> Result<Vec<crate::storage::RoomListing>> {
+        self.storage.list_rooms()
     }
 
     /// Build a rejoin delta if the user has been pruned from the members list.
