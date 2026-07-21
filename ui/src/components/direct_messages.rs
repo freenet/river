@@ -525,6 +525,35 @@ fn summarise_body_for_outbound_cache(
     }
 }
 
+/// Resolve the display body (+ placeholder flag) for an OUTBOUND DM bubble
+/// (freenet/river#432).
+///
+/// - Cache hit (the local outbound plaintext, #256) wins — fast path.
+/// - On a miss, the sender-copy plaintext is decoded to the SAME
+///   `[Invitation] …` / text summary the cache stores via
+///   [`summarise_body_for_outbound_cache`] — deliberately NOT an interactive
+///   invite card, so the sender never sees an Accept button on their own sent
+///   invite (and `BodyKind::Invite` stays inbound-only).
+/// - No cache entry and no decodable sender copy (a legacy pre-#432 message) →
+///   the "ciphertext only" placeholder.
+///
+/// Pure so it is unit-testable without a Dioxus runtime. The returned bool is
+/// `true` when the string is a placeholder (render skips markdown).
+pub(crate) fn resolve_outbound_dm_body(
+    cached_plaintext: Option<String>,
+    sender_copy_plaintext: Option<&[u8]>,
+) -> (String, bool) {
+    if let Some(text) = cached_plaintext {
+        return (text, false);
+    }
+    if let Some(bytes) = sender_copy_plaintext {
+        if let Ok(body) = river_core::room_state::dm_body::decode_body(bytes) {
+            return (summarise_body_for_outbound_cache(&body), false);
+        }
+    }
+    ("sent — ciphertext only".to_string(), true)
+}
+
 fn unix_now() -> u64 {
     use std::time::UNIX_EPOCH;
     crate::util::get_current_system_time()
@@ -936,5 +965,56 @@ mod tests {
             lookup_outbound_plaintext(&empty, &room_vk, &recipient, &token),
             Err(())
         );
+    }
+
+    /// #432: a cache hit is returned verbatim (fast path) and the sender copy
+    /// is ignored.
+    #[test]
+    fn resolve_outbound_prefers_cache_hit() {
+        let (text, is_placeholder) =
+            resolve_outbound_dm_body(Some("cached text".to_string()), Some(b"ignored"));
+        assert_eq!(text, "cached text");
+        assert!(!is_placeholder);
+    }
+
+    /// #432: on a cache miss a Text sender copy decodes to the same plaintext
+    /// the cache would have stored — this is what makes a sent DM readable on a
+    /// device without the cache.
+    #[test]
+    fn resolve_outbound_decodes_sender_copy_text() {
+        use river_core::room_state::dm_body::{encode_body, DirectMessageBody};
+        let bytes = encode_body(&DirectMessageBody::Text {
+            text: "hi from another device".to_string(),
+        })
+        .unwrap();
+        let (text, is_placeholder) = resolve_outbound_dm_body(None, Some(&bytes));
+        assert_eq!(text, "hi from another device");
+        assert!(!is_placeholder);
+    }
+
+    /// #432 (F2 fix): an outbound INVITE self-copy renders as the
+    /// `[Invitation] …` summary, NOT an interactive Accept card — the sender
+    /// must never see an Accept button on their own sent invite.
+    #[test]
+    fn resolve_outbound_invite_self_copy_renders_summary_not_card() {
+        use river_core::room_state::dm_body::{encode_body, DirectMessageBody, InvitePayload};
+        let payload = InvitePayload {
+            room_owner_vk: fixed_sk(9).verifying_key(),
+            invitation_payload: Vec::new(),
+            personal_message: Some("come join us".to_string()),
+        };
+        let bytes = encode_body(&DirectMessageBody::Invite(Box::new(payload))).unwrap();
+        let (text, is_placeholder) = resolve_outbound_dm_body(None, Some(&bytes));
+        assert_eq!(text, "[Invitation] come join us");
+        assert!(!is_placeholder);
+    }
+
+    /// #432: a legacy pre-#432 message (no cache entry, no sender copy) falls
+    /// back to the "ciphertext only" placeholder.
+    #[test]
+    fn resolve_outbound_falls_back_to_placeholder_without_sender_copy() {
+        let (text, is_placeholder) = resolve_outbound_dm_body(None, None);
+        assert_eq!(text, "sent — ciphertext only");
+        assert!(is_placeholder);
     }
 }

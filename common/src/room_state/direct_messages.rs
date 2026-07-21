@@ -79,6 +79,15 @@
 //!   cannot read it, has no view into per-message replay, and provides
 //!   no in-contract de-duplication of identical re-sent ciphertexts.
 //!
+//! - Since #432 each message carries TWO opaque ECIES envelopes: the
+//!   recipient-only [`DirectMessage::ciphertext`] and the sender-only
+//!   [`DirectMessage::sender_ciphertext`] (a copy the sender can read on
+//!   any device). Both are covered by the sender signature and each is
+//!   independently size-capped at [`MAX_DM_CIPHERTEXT_BYTES`], so on-wire
+//!   size and the per-pair storage/griefing bound below roughly DOUBLE
+//!   vs a single-envelope message. The sender copy is optional and absent
+//!   on pre-#432 messages.
+//!
 //! - A malicious member can grief storage by saturating their own
 //!   per-pair cap (up to [`MAX_DM_MESSAGES_PER_PAIR`] ×
 //!   [`MAX_DM_CIPHERTEXT_BYTES`] per recipient they target). The

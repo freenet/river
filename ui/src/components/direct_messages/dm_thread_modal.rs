@@ -201,15 +201,21 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // the success path).
             let outbound_cache = OUTBOUND_DMS.try_read().ok().map(|g| g.clone());
 
-            // Render decrypted DM plaintext bytes into a display body. Shared
-            // by the inbound path (recipient-decrypted) and the outbound
-            // self-copy path (freenet/river#431, sender-decrypted) so a Text
-            // vs Invite body renders identically regardless of which envelope
-            // it came from.
-            let render_decoded_body = |bytes: &[u8]| -> (String, BodyKind) {
+            // Render an INBOUND (recipient-decrypted) DM body into a display
+            // body. An invite here becomes an interactive Accept card — this is
+            // the recipient's view. Outbound self-copies (freenet/river#432)
+            // are rendered separately below as a `[Invitation] …` summary, never
+            // a card, so the sender never sees an Accept button on their OWN
+            // sent invite (which keeps `BodyKind::Invite` inbound-only).
+            let render_inbound_body = |bytes: &[u8]| -> (String, BodyKind) {
                 match decode_body(bytes) {
                     Ok(DirectMessageBody::Text { text }) => (text, BodyKind::Plaintext),
                     Ok(DirectMessageBody::Invite(payload)) => {
+                        // Treat "loaded but observer-only" as NOT-a-member: the
+                        // user can still join via the invite even though they
+                        // have the room loaded. `can_participate()` is the
+                        // canonical membership check used elsewhere in the
+                        // codebase.
                         let target_room_data = rooms.map.get(&payload.room_owner_vk);
                         let card_state = classify_invite_card_state(
                             target_room_data.map(|rd| rd.can_participate()),
@@ -264,7 +270,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
                 let (body, kind) = if is_self_recipient {
                     match open_direct_message(&self_sk, msg) {
-                        Ok(bytes) => render_decoded_body(&bytes),
+                        Ok(bytes) => render_inbound_body(&bytes),
                         Err(err) => (
                             // Skeptical reviewer caught: putting `<...>`
                             // through `message_to_html` produces mangled
@@ -281,23 +287,36 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     // `lookup_outbound_plaintext`, which the regression tests
                     // in `direct_messages.rs` pin. On a MISS (DM sent from a
                     // different node, or before the cache shipped), fall back
-                    // to the sender-copy envelope carried in the message
-                    // itself (freenet/river#431): decrypt it with our own
-                    // signing key, exactly as the recipient path does. Only
-                    // when both are unavailable (a legacy pre-#431 message
-                    // with no local cache) do we show the "ciphertext only"
-                    // placeholder.
+                    // to the sender-copy envelope carried in the message itself
+                    // (freenet/river#432): decrypt it with our own signing key.
+                    // An invite renders as the same `[Invitation] …` summary the
+                    // cache stores — NOT an interactive card — so we never show
+                    // the sender an Accept button on their own sent invite. Only
+                    // when both are unavailable (a legacy pre-#432 message with
+                    // no local cache) do we show the "ciphertext only"
+                    // placeholder. The hit-vs-self-copy-vs-placeholder decision
+                    // is the pure, unit-tested `resolve_outbound_dm_body`; the
+                    // self-copy is decrypted only on a cache miss.
                     let token = msg.purge_token();
                     let cached = outbound_cache.as_ref().and_then(|cache| {
                         lookup_outbound_plaintext(cache, &room, &msg.message.recipient, &token).ok()
                     });
-                    match cached {
-                        Some(plaintext) => (plaintext, BodyKind::Plaintext),
-                        None => match open_own_direct_message(&self_sk, msg) {
-                            Ok(bytes) => render_decoded_body(&bytes),
-                            Err(_) => ("sent — ciphertext only".to_string(), BodyKind::Placeholder),
-                        },
-                    }
+                    let self_copy = if cached.is_some() {
+                        None
+                    } else {
+                        open_own_direct_message(&self_sk, msg).ok()
+                    };
+                    let (text, is_placeholder) =
+                        crate::components::direct_messages::resolve_outbound_dm_body(
+                            cached,
+                            self_copy.as_deref(),
+                        );
+                    let kind = if is_placeholder {
+                        BodyKind::Placeholder
+                    } else {
+                        BodyKind::Plaintext
+                    };
+                    (text, kind)
                 };
 
                 rendered.push(RenderedDm {

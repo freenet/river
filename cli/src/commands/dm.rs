@@ -493,11 +493,15 @@ async fn execute_list(
             .then(a.timestamp.cmp(&b.timestamp))
     });
 
-    // Whether any inbound invite DM exists — computed BEFORE the per-thread
+    // Whether any INBOUND invite DM exists — computed BEFORE the per-thread
     // cap below so a `dm accept`able invite that scrolled off a chatty thread
     // still surfaces the discoverability tip (`dm accept` scans the full,
-    // uncapped state regardless of what `dm list` chose to print).
-    let any_invite = decrypted.iter().any(|dm| dm.is_invite);
+    // uncapped state regardless of what `dm list` chose to print). Must exclude
+    // OUTBOUND invites: since #432, a sent invite-via-DM also decodes to
+    // `is_invite` via the sender-copy fallback on a cacheless node, but
+    // `dm accept` only acts on inbound invites — so an outbound-only match
+    // would print a tip that leads nowhere.
+    let any_invite = decrypted.iter().any(|dm| dm.is_invite && !dm.outgoing);
 
     // Group + cap per counterparty.
     let mut by_peer: HashMap<MemberId, Vec<DecryptedDm>> = HashMap::new();
