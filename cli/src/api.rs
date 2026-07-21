@@ -4,6 +4,7 @@ use crate::storage::Storage;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use freenet_migrate::{NewestFirst, Outcome, ProbeDriver, ProbeStateOps, SelectionPolicy, Step};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
@@ -190,6 +191,53 @@ fn strip_upgrade_pointer_for_forward_put(state: &ChatRoomStateV1) -> ChatRoomSta
     let mut cleaned = state.clone();
     cleaned.upgrade = OptionalUpgradeV1(None);
     cleaned
+}
+
+/// App-supplied state semantics for `freenet_migrate`'s backward-probe decision
+/// driver (freenet/river#398 phase 2b): the CLI's rules for classifying a
+/// legacy-generation response. Everything else (candidate order, single-shot
+/// correlation, exhaustion) is owned by the driver; the per-candidate GET plus
+/// its forward upgrade-chain walk stays in the I/O adapter (`probe_legacy_bytes`).
+struct RiverCliProbeOps {
+    /// The owner whose stranded room we're recovering.
+    owner_vk: VerifyingKey,
+}
+
+impl ProbeStateOps for RiverCliProbeOps {
+    type State = ChatRoomStateV1;
+
+    fn decode(&self, bytes: &[u8]) -> Option<ChatRoomStateV1> {
+        // The same deserialization as `try_get_state`: ciborium decode, then
+        // rebuild the derived actions cache. `None` marks a miss so the driver
+        // advances to the next generation rather than adopting garbage.
+        let mut state: ChatRoomStateV1 = ciborium::de::from_reader(bytes).ok()?;
+        state.recent_messages.rebuild_actions_state();
+        Some(state)
+    }
+
+    fn is_real(&self, state: &ChatRoomStateV1) -> bool {
+        // "Real" == the configuration signature verifies against the owner —
+        // the same predicate `try_get_state` and the UI (`is_awaiting_initial_sync`)
+        // use. A default / never-initialised contract fails it.
+        state.configuration.verify_signature(&self.owner_vk).is_ok()
+    }
+
+    fn merge_with_local(
+        &self,
+        recovered: ChatRoomStateV1,
+        _local: &ChatRoomStateV1,
+    ) -> ChatRoomStateV1 {
+        // riverctl recovery does NOT merge device-local state (unlike the UI):
+        // it adopts the recovered network state verbatim. Preserved exactly from
+        // the pre-driver loop, which returned the fetched state as-is. `_local`
+        // is always the empty default handed to the driver.
+        recovered
+    }
+
+    // `prepare_forward` stays the driver default (identity): `put_room_state`
+    // already strips the upgrade pointer on the forward PUT (freenet/river#427),
+    // so stripping here too would be redundant and would change what is returned
+    // to the caller. Do NOT add a prepare_forward override.
 }
 
 /// Compute the contract key for a room from its owner verifying key.
@@ -1501,30 +1549,67 @@ impl ApiClient {
             return Ok((state, id));
         }
 
-        // 2. Backward search across previous contract generations.
+        // 2. Backward search across previous contract generations, driven by
+        //    freenet_migrate's sans-IO decision driver. Candidates are the
+        //    legacy keys, already newest-first BY CONSTRUCTION
+        //    (`legacy_contract_keys_for_owner` reverses the oldest-first
+        //    registry), so `assume_ordered` is sound; `NewestFirstWins` stops
+        //    at the first real generation — the anti-rollback guarantee.
         let legacy_keys = river_core::migration::legacy_contract_keys_for_owner(room_owner_key);
+        let legacy_count = legacy_keys.len();
         info!(
-            "Room not present on current contract {}; probing {} previous contract generation(s)",
-            current_id,
-            legacy_keys.len()
+            "Room not present on current contract {current_id}; probing {legacy_count} previous \
+             contract generation(s)"
         );
-        for (i, legacy_key) in legacy_keys.iter().enumerate() {
-            if let Some((state, found_id)) = self
-                .try_fetch_room(room_owner_key, *legacy_key.id(), LEGACY_PROBE_TIMEOUT)
-                .await
-            {
+
+        // The raw driver (not the crate's `migrate_contract` pump) fits riverctl
+        // best: `migrate_contract` consumes a `ContractLineageEntry` lineage,
+        // but riverctl only has newest-first `ContractKey`s from
+        // `river_core::migration`, and feeding the raw driver avoids fabricating
+        // lineage values just to satisfy that signature. The pump below is the
+        // same trivial loop `migrate_contract` runs.
+        let candidate_ids: Vec<ContractInstanceId> = legacy_keys.iter().map(|k| *k.id()).collect();
+        let mut driver = ProbeDriver::new(
+            RiverCliProbeOps {
+                owner_vk: *room_owner_key,
+            },
+            // The CLI never merges device-local state and never seeds it, so the
+            // local snapshot is an empty default: `merge_with_local` returns the
+            // recovered state verbatim, and exhaustion (SeedLocal) maps to the
+            // not-found error below rather than PUTting anything.
+            ChatRoomStateV1::default(),
+            NewestFirst::assume_ordered(candidate_ids),
+            SelectionPolicy::NewestFirstWins,
+        );
+
+        // Trivial pump: one awaitable GET (with its forward chain-walk) per
+        // candidate. `probe_legacy_bytes` is the I/O adapter — it returns the
+        // resolved raw bytes (Ok(None) => a miss => the driver advances); the
+        // driver owns the decode + is_real classification.
+        // Loop while the driver hands out GETs; it yields `Step::Done` (exiting
+        // the loop) once a generation is recovered or all are exhausted.
+        let mut probes_run = 0usize;
+        while let Step::Get(id) = driver.next_action() {
+            probes_run += 1;
+            match self.probe_legacy_bytes(room_owner_key, id).await {
+                Some(bytes) => driver.on_response(id, &bytes),
+                None => driver.on_timeout(id),
+            }
+        }
+
+        match driver.take_outcome() {
+            Some(Outcome::Recovered { merged, source, .. }) => {
                 info!(
-                    "Recovered room from a previous contract generation (probe {}/{})",
-                    i + 1,
-                    legacy_keys.len()
+                    "Recovered room from a previous contract generation (probe {probes_run}/{legacy_count})"
                 );
                 // Migrate the recovered state forward onto the current contract
                 // so the room is no longer stranded on an old generation. The
                 // current contract was just confirmed empty/absent, so this PUT
                 // creates it; the room contract's CRDT merge keeps a concurrent
-                // migrator's PUT safe.
-                if found_id != current_id {
-                    match self.put_room_state(room_owner_key, &state).await {
+                // migrator's PUT safe. `source` is a legacy id, so this always
+                // fires — the guard mirrors the pre-driver `found_id != current`.
+                if source != current_id {
+                    match self.put_room_state(room_owner_key, &merged).await {
                         Ok(()) => info!(
                             "Migrated recovered room forward onto current contract {current_id}"
                         ),
@@ -1533,16 +1618,41 @@ impl ApiClient {
                         ),
                     }
                 }
-                return Ok((state, current_id));
+                Ok((merged, current_id))
             }
+            // SeedLocal (every generation missed) and NoLegacy (no legacy keys)
+            // both mean nothing was recovered. The CLI never seeds device-local
+            // state, so both map to the not-found error.
+            _ => Err(anyhow!(
+                "Room not found on the current contract or any of the {legacy_count} known \
+                 previous contract generations. The room may never have existed, or its \
+                 state may have been garbage-collected from the network."
+            )),
         }
+    }
 
-        Err(anyhow!(
-            "Room not found on the current contract or any of the {} known previous \
-             contract generations. The room may never have existed, or its state may \
-             have been garbage-collected from the network.",
-            legacy_keys.len()
-        ))
+    /// Probe one legacy generation for the decision driver: GET it (with the
+    /// legacy timeout), walk any forward `OptionalUpgradeV1` pointer chain, and
+    /// return the resolved state's raw bytes for the driver to classify. `None`
+    /// = timeout / absent / empty / undecodable (a miss — the driver advances).
+    ///
+    /// This is `try_fetch_room` restructured to hand the driver RAW BYTES
+    /// instead of a decoded state, so the driver owns the decode + is_real
+    /// classification (`RiverCliProbeOps`). The chain-walk still happens here in
+    /// the I/O adapter — the driver only replaces the newest-first legacy loop.
+    async fn probe_legacy_bytes(
+        &self,
+        room_owner_key: &VerifyingKey,
+        id: ContractInstanceId,
+    ) -> Option<Vec<u8>> {
+        let (state, _base_id) = self
+            .try_fetch_room(room_owner_key, id, LEGACY_PROBE_TIMEOUT)
+            .await?;
+        // Re-serialize the chain-walk-resolved state so the driver decodes and
+        // classifies it (a cheap round-trip; recovery is a rare CLI path).
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&state, &mut bytes).ok()?;
+        Some(bytes)
     }
 
     /// GET a room state from `id`, then walk any `OptionalUpgradeV1` pointer
@@ -5573,6 +5683,194 @@ mod migration_recovery_tests {
                  forward PUT (freenet/river#427)"
             );
         }
+    }
+
+    // --- freenet/river#398 phase 2b: the legacy recovery search now runs on
+    // freenet_migrate's decision driver via `RiverCliProbeOps`. ---
+
+    fn encode_state(state: &ChatRoomStateV1) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(state, &mut bytes).expect("state serializes");
+        bytes
+    }
+
+    fn cli_id(n: u8) -> ContractInstanceId {
+        ContractInstanceId::new([n; 32])
+    }
+
+    /// `RiverCliProbeOps` classification matches the pre-driver `try_get_state`:
+    /// an owner-signed state is real (a hit), a default state is not (a miss),
+    /// undecodable bytes decode to `None` (a miss), and `merge_with_local` is a
+    /// pass-through — the CLI adopts the recovered network state verbatim and
+    /// NEVER folds in device-local state (unlike the UI).
+    #[test]
+    fn river_cli_probe_ops_classifies_and_never_merges() {
+        let owner_sk = SigningKey::from_bytes(&[71u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let ops = RiverCliProbeOps { owner_vk };
+
+        let real = owner_state_with_messages(&owner_sk, &["hi"]);
+        assert!(ops.is_real(&real), "an owner-signed state must be real");
+        assert!(
+            !ops.is_real(&ChatRoomStateV1::default()),
+            "a default state must NOT be real (a miss)"
+        );
+        assert!(
+            ops.decode(&encode_state(&real)).is_some(),
+            "valid CBOR must decode"
+        );
+        assert!(
+            ops.decode(&[0xffu8; 8]).is_none(),
+            "undecodable bytes must map to None (a miss)"
+        );
+
+        // merge_with_local returns the recovered state untouched, ignoring the
+        // local snapshot entirely. `real` and `local` carry distinct messages,
+        // so a mistaken fold would change the message set.
+        let local = owner_state_with_messages(&owner_sk, &["local-only message"]);
+        let merged = ops.merge_with_local(real.clone(), &local);
+        let real_ids: HashSet<_> = real
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| m.id())
+            .collect();
+        assert_eq!(
+            merged.recent_messages.messages.len(),
+            real.recent_messages.messages.len(),
+            "the CLI must adopt the recovered state verbatim — no local merge"
+        );
+        assert!(
+            merged
+                .recent_messages
+                .messages
+                .iter()
+                .all(|m| real_ids.contains(&m.id())),
+            "no device-local message may appear in the merged result"
+        );
+    }
+
+    /// `prepare_forward` must be identity: the CLI strips the upgrade pointer in
+    /// `put_room_state` (freenet/river#427), NOT in the driver hook. Stripping
+    /// here would change what is returned to the caller.
+    #[test]
+    fn river_cli_probe_ops_prepare_forward_is_identity() {
+        let owner_sk = SigningKey::from_bytes(&[72u8; 32]);
+        let ops = RiverCliProbeOps {
+            owner_vk: owner_sk.verifying_key(),
+        };
+        // A state carrying a forward upgrade pointer (built via the module's
+        // pointer helper) must come back through prepare_forward untouched.
+        let mut state = owner_state_with_messages(&owner_sk, &["m"]);
+        state.upgrade = pointer_to(&owner_sk, [9u8; 32]);
+        let forwarded = ops.prepare_forward(state.clone());
+        assert_eq!(
+            forwarded.upgrade, state.upgrade,
+            "prepare_forward must NOT strip the upgrade pointer (stripping happens \
+             only in put_room_state — freenet/river#427)"
+        );
+    }
+
+    /// End-to-end at the CLI level: two real generations, the driver adopts the
+    /// NEWEST and never reads the older (anti-rollback), wiring `RiverCliProbeOps`
+    /// into a real `ProbeDriver`.
+    #[test]
+    fn cli_driver_adopts_newest_real_generation() {
+        let owner_sk = SigningKey::from_bytes(&[73u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let mut driver = ProbeDriver::new(
+            RiverCliProbeOps { owner_vk },
+            ChatRoomStateV1::default(),
+            NewestFirst::assume_ordered(vec![cli_id(9), cli_id(5)]),
+            SelectionPolicy::NewestFirstWins,
+        );
+        let Step::Get(newest) = driver.next_action() else {
+            panic!("expected a GET")
+        };
+        assert_eq!(newest, cli_id(9), "the newest generation is probed first");
+        driver.on_response(
+            newest,
+            &encode_state(&owner_state_with_messages(&owner_sk, &["newest"])),
+        );
+        assert_eq!(driver.next_action(), Step::Done);
+        let Some(Outcome::Recovered { source, merged, .. }) = driver.take_outcome() else {
+            panic!("expected recovery");
+        };
+        assert_eq!(
+            source,
+            cli_id(9),
+            "an older generation must not shadow the newer"
+        );
+        assert!(merged.configuration.verify_signature(&owner_vk).is_ok());
+    }
+
+    /// End-to-end: every generation misses (a timeout then an undecodable
+    /// response), so the driver reports SeedLocal — which
+    /// `fetch_room_state_with_recovery` maps to the not-found error. The CLI
+    /// never seeds device-local state.
+    #[test]
+    fn cli_driver_exhausts_to_seed_local() {
+        let owner_sk = SigningKey::from_bytes(&[74u8; 32]);
+        let mut driver = ProbeDriver::new(
+            RiverCliProbeOps {
+                owner_vk: owner_sk.verifying_key(),
+            },
+            ChatRoomStateV1::default(),
+            NewestFirst::assume_ordered(vec![cli_id(2), cli_id(1)]),
+            SelectionPolicy::NewestFirstWins,
+        );
+        let Step::Get(a) = driver.next_action() else {
+            panic!()
+        };
+        driver.on_timeout(a); // absent generation
+        let Step::Get(b) = driver.next_action() else {
+            panic!()
+        };
+        driver.on_response(b, &[0xffu8; 8]); // undecodable → miss
+        assert_eq!(driver.next_action(), Step::Done);
+        assert!(
+            matches!(driver.take_outcome(), Some(Outcome::SeedLocal { .. })),
+            "exhaustion must be SeedLocal — which the CLI maps to the not-found Err, never a seed"
+        );
+    }
+
+    /// Source-grep pin: `fetch_room_state_with_recovery` must drive the legacy
+    /// search through the decision driver (newest-first) AND must never PUT on
+    /// the exhaustion path — the CLI-never-seeds guarantee. A refactor that
+    /// re-introduced a hand-rolled loop or seeded on exhaustion would need to
+    /// update this pin.
+    #[test]
+    fn legacy_recovery_routes_through_decision_driver() {
+        let full = include_str!("api.rs");
+        let fn_start = full
+            .find("async fn fetch_room_state_with_recovery")
+            .expect("fetch_room_state_with_recovery must exist");
+        // Bound the slice at the next fn so we only inspect this function body.
+        let rest = &full[fn_start..];
+        let body_end = rest
+            .find("async fn probe_legacy_bytes")
+            .expect("probe_legacy_bytes must follow fetch_room_state_with_recovery");
+        let body = &rest[..body_end];
+
+        assert!(
+            body.contains("SelectionPolicy::NewestFirstWins"),
+            "the legacy recovery search must use the newest-first decision driver"
+        );
+        assert!(
+            body.contains("Outcome::Recovered"),
+            "recovery must be driven by the driver's Outcome, not a hand-rolled loop"
+        );
+        // CLI-never-seeds: the only forward PUT must be inside the Recovered arm,
+        // i.e. `put_room_state` must appear AFTER `Outcome::Recovered`.
+        let recovered_idx = body.find("Outcome::Recovered").expect("Recovered arm");
+        let put_idx = body
+            .find("put_room_state")
+            .expect("the Recovered arm migrates forward via put_room_state");
+        assert!(
+            put_idx > recovered_idx,
+            "put_room_state must only run on the Recovered path — exhaustion (SeedLocal / \
+             NoLegacy) must map to the not-found Err with no PUT (the CLI never seeds)"
+        );
     }
 }
 

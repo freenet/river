@@ -4739,6 +4739,7 @@ dependencies = [
  "dialoguer",
  "directories 5.0.1",
  "ed25519-dalek",
+ "freenet-migrate",
  "freenet-scaffold",
  "freenet-stdlib 0.8.3",
  "freenet-test-network",
