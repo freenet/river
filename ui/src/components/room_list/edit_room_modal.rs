@@ -1,11 +1,9 @@
 use super::room_name_field::RoomNameField;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
-use crate::room_data::NotificationMode;
 use crate::util::ecies::{seal_for_room, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
-use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata};
@@ -100,12 +98,6 @@ pub fn EditRoomModal() -> Element {
                                     }
                                 }
                             }
-                        }
-
-                        // Per-room notification preference (local setting, all
-                        // users — not owner-gated).
-                        if let Some(room_vk) = EDIT_ROOM_MODAL.read().room {
-                            NotificationModeField { room_vk }
                         }
 
                         // Numeric configuration fields (owner-only)
@@ -363,61 +355,6 @@ pub fn EditRoomModal() -> Element {
         }
     } else {
         rsx! {}
-    }
-}
-
-/// Per-room notification preference selector. Local-only setting (persisted in
-/// the `rooms_data` delegate blob, applies on this device), so it is shown to
-/// every member, not just the owner. Reads the current mode from `ROOMS` each
-/// render (no cached hook state) so reopening the modal for a different room
-/// always reflects that room's value.
-#[component]
-fn NotificationModeField(room_vk: VerifyingKey) -> Element {
-    let current = ROOMS
-        .read()
-        .notification_modes
-        .get(&room_vk)
-        .copied()
-        .unwrap_or_default();
-    let current_str = match current {
-        NotificationMode::All => "all",
-        NotificationMode::MentionsAndReplies => "mentions",
-        NotificationMode::Muted => "muted",
-    };
-
-    rsx! {
-        div { class: "mb-4",
-            label { class: "block text-sm font-medium text-text-muted mb-2", "Notifications" }
-            select {
-                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
-                value: "{current_str}",
-                onchange: move |evt| {
-                    let mode = match evt.value().as_str() {
-                        "mentions" => NotificationMode::MentionsAndReplies,
-                        "muted" => NotificationMode::Muted,
-                        _ => NotificationMode::All,
-                    };
-                    // Defer the signal mutation (RefCell re-entrancy rule), then
-                    // persist to the delegate so the choice survives reloads.
-                    crate::util::defer(move || {
-                        ROOMS.with_mut(|rooms| {
-                            rooms.notification_modes.insert(room_vk, mode);
-                        });
-                        spawn(async move {
-                            if let Err(e) = save_rooms_to_delegate().await {
-                                error!("Failed to save notification mode: {}", e);
-                            }
-                        });
-                    });
-                },
-                option { value: "all", "All messages" }
-                option { value: "mentions", "Mentions & replies only" }
-                option { value: "muted", "Muted" }
-            }
-            p { class: "text-xs text-text-muted mt-1",
-                "When to notify for this room. Applies on this device only."
-            }
-        }
     }
 }
 

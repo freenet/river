@@ -3,9 +3,10 @@ use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::receive_times::{format_delay, get_delay_secs};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{
-    MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS,
+    MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
+    ROOMS,
 };
-use crate::room_data::SendMessageError;
+use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
@@ -23,8 +24,8 @@ use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile, FaPenToSquare, FaReply,
-    FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile,
+    FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -948,6 +949,20 @@ pub fn Conversation() -> Element {
             }
             "No Room Selected".to_string()
         }
+    });
+
+    // The current room's notification mode, for the header bell icon + tooltip.
+    // Absent entry means the default (`All`).
+    let current_notification_mode = use_memo(move || {
+        let current_room = CURRENT_ROOM.read();
+        let Some(key) = current_room.owner_key else {
+            return NotificationMode::All;
+        };
+        ROOMS
+            .try_read()
+            .ok()
+            .and_then(|rooms| rooms.notification_modes.get(&key).copied())
+            .unwrap_or_default()
     });
 
     // Memoize room description as rendered HTML (markdown)
@@ -1875,6 +1890,34 @@ pub fn Conversation() -> Element {
                                             class: "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline",
                                             dangerous_inner_html: "{desc_html}"
                                         }
+                                    }
+                                }
+                                // Per-room notification preference. Sibling of the
+                                // room-name button (not nested — same interactive-content
+                                // rule as the description link). Icon reflects state:
+                                // bell = notifying, bell-slash = muted; the tooltip names
+                                // the exact mode. Opens the compact NotificationModal.
+                                button {
+                                    "data-testid": "notification-bell-button",
+                                    class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors flex-shrink-0",
+                                    title: match *current_notification_mode.read() {
+                                        NotificationMode::All => "Notifications: All messages",
+                                        NotificationMode::MentionsAndReplies => "Notifications: Mentions & replies only",
+                                        NotificationMode::Muted => "Notifications: Muted",
+                                    },
+                                    onclick: move |_| {
+                                        crate::util::defer(move || {
+                                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                NOTIFICATION_MODAL.with_mut(|modal| {
+                                                    modal.room = Some(current_room);
+                                                });
+                                            }
+                                        });
+                                    },
+                                    if *current_notification_mode.read() == NotificationMode::Muted {
+                                        Icon { icon: FaBellSlash, width: 18, height: 18 }
+                                    } else {
+                                        Icon { icon: FaBell, width: 18, height: 18 }
                                     }
                                 }
                                 // Mobile: button to open members panel
