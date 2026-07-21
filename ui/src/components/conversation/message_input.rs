@@ -297,3 +297,57 @@ pub fn MessageInput(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freenet_scaffold::util::FastHash;
+    use river_core::room_state::message::MessageId;
+
+    fn reply_ctx() -> ReplyContext {
+        ReplyContext {
+            message_id: MessageId(FastHash(42)),
+            author_name: "Alice".to_string(),
+            content_preview: "préview 🎉 of the quoted message".to_string(),
+        }
+    }
+
+    /// Pins the gate's plumbing: `measure_draft` must select the reply
+    /// measurement when a reply is active and thread `is_private` through —
+    /// a revert to `text.len()` (the HostFat message-loss bug) or a dropped
+    /// reply/private branch fails here without needing a browser.
+    #[test]
+    fn measure_draft_matches_room_message_body_measures() {
+        let texts = ["", "short", &"a".repeat(998), &"é".repeat(499)];
+        for text in texts {
+            for is_private in [false, true] {
+                assert_eq!(
+                    measure_draft(text, None, is_private),
+                    RoomMessageBody::measure_text(text, is_private),
+                    "text branch: bytes={} private={}",
+                    text.len(),
+                    is_private
+                );
+                let r = reply_ctx();
+                assert_eq!(
+                    measure_draft(text, Some(&r), is_private),
+                    RoomMessageBody::measure_reply(
+                        text,
+                        r.message_id.clone(),
+                        &r.author_name,
+                        &r.content_preview,
+                        is_private
+                    ),
+                    "reply branch: bytes={} private={}",
+                    text.len(),
+                    is_private
+                );
+            }
+        }
+        // The branches must actually differ (reply embeds metadata) and
+        // private must cost more (AES-GCM tag): guards against collapsing
+        // the match into a single arm.
+        assert!(measure_draft("hi", Some(&reply_ctx()), false) > measure_draft("hi", None, false));
+        assert!(measure_draft("hi", None, true) > measure_draft("hi", None, false));
+    }
+}

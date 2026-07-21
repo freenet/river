@@ -94,4 +94,80 @@ test.describe("Encoded message size gate", () => {
     await expect(page.getByTestId("send-message-button")).toBeDisabled();
     await expect(page.getByText(/Message too long/)).toBeVisible();
   });
+
+  test("a message at exactly the encoded limit is sendable (no off-by-one)", async ({
+    page,
+  }) => {
+    await openRoomWithInput(page);
+    const input = page.getByTestId("message-input");
+    await input.fill("a".repeat(991)); // encoded exactly 1000
+
+    await expect(page.getByText("1000/1000")).toBeVisible();
+    await expect(page.getByTestId("send-message-button")).toBeEnabled();
+  });
+});
+
+// The in-place edit form previously had NO size gate: an over-limit edit
+// action was signed, sent, and silently pruned by contract validation. The
+// edit action (ActionContentV1: target id + payload) carries more overhead
+// than plain text, so the gate must measure the encoded action.
+test.describe("Encoded size gate on the edit form", () => {
+  test("over-limit edit disables Save, shows the counter, and Enter keeps the form open", async ({
+    page,
+  }) => {
+    await openRoomWithInput(page);
+
+    // Open the edit form on an own message — kebab menu on touch devices,
+    // hover actions on desktop (same affordance split as
+    // message-layout.spec.ts / freenet/river#402).
+    const touch = await page.evaluate(
+      () => window.matchMedia("(hover: none)").matches
+    );
+    let clicked = false;
+    if (touch) {
+      const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
+      await expect(ownRow).toBeVisible();
+      await ownRow.scrollIntoViewIfNeeded();
+      await ownRow.locator('[data-testid="message-kebab"]').click();
+      await page
+        .locator('[data-testid="message-action-menu"]')
+        .getByRole("button", { name: /edit/i })
+        .click();
+      clicked = true;
+    } else {
+      const bubbles = page.locator(".max-w-prose");
+      const count = await bubbles.count();
+      expect(count).toBeGreaterThan(0);
+      for (let i = 0; i < count; i++) {
+        const bubble = bubbles.nth(i);
+        await bubble.scrollIntoViewIfNeeded();
+        await bubble.hover();
+        const editBtn = bubble
+          .locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]")
+          .getByRole("button", { name: /edit/i });
+        if (await editBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+          await editBtn.click();
+          clicked = true;
+          break;
+        }
+      }
+    }
+    expect(clicked, "found an own-message edit affordance").toBe(true);
+
+    const editArea = page.locator('textarea[id^="edit-msg-"]');
+    await expect(editArea).toBeVisible({ timeout: 5_000 });
+
+    // 998 raw chars: within the limit as raw text, over it as an encoded
+    // edit action (ActionContentV1 overhead > plain-text overhead).
+    await editArea.fill("a".repeat(998));
+
+    const saveBtn = page.getByRole("button", { name: /Save/ });
+    await expect(saveBtn).toBeDisabled();
+    await expect(page.getByText(/Message too long/)).toBeVisible();
+
+    // Enter must not discard the over-limit edit — the form stays open.
+    await editArea.press("Enter");
+    await expect(editArea).toBeVisible();
+    await expect(editArea).toHaveValue("a".repeat(998));
+  });
 });
