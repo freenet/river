@@ -18,6 +18,11 @@ description = "Before signing API was added"
 date = "2026-01-15"
 delegate_key = "1a9330820e806cda54eca7dab22b84f20cfa793ebe61a2615312cc6e6ebcfff6"
 code_hash = "783996bde3bc2235affec9deb8a0f7e9d21fa131dcf003000bb03f467db0f831"
+# V1's recorded delegate_key predates the standard BLAKE3(code_hash) derivation
+# (it derives from nothing reconstructible); the recorded key is what the old
+# delegate actually had on the network, so it is trusted as-is. V2+ all derive
+# correctly and get full validation. See freenet-migrate-build's registry docs.
+irregular_key = true
 
 [[entry]]
 version = "V2"

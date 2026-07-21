@@ -93,5 +93,6 @@ futures-timer = "3.0.3"
 # Add this section for the build script
 [build-dependencies]
 chrono = "0.4"
-toml = "0.8"
-serde = { version = "1", features = ["derive"] }
+# Parses ../legacy_delegates.toml, validates every hash + key derivation, and
+# generates the LEGACY_DELEGATES registry (freenet/river#398).
+freenet-migrate-build = "0.2"

@@ -92,6 +92,24 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
+    /// Value-pin for the generated registry (the room-contract analogue of
+    /// river-ui's `legacy_set_fingerprint_is_stable_across_codegen_changes`):
+    /// blake3 over the code hashes in registry order. Codegen/tooling changes
+    /// (freenet/river#398 moved generation to `freenet-migrate-build`) must
+    /// reproduce the const's exact values AND order — a drift would misdirect
+    /// the dormant-room backward probe. This SHOULD change when a genuinely
+    /// new generation is registered — update the constant then — but must
+    /// NEVER change from a codegen swap.
+    #[test]
+    fn registry_values_and_order_are_stable_across_codegen_changes() {
+        let mut hasher = blake3::Hasher::new();
+        for hash in LEGACY_ROOM_CONTRACT_CODE_HASHES {
+            hasher.update(hash);
+        }
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 27);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "d931340e569e9c74");
+    }
+
     #[test]
     fn registry_is_non_empty_and_hashes_are_distinct() {
         // The registry must carry every historical generation; a regression
