@@ -28,9 +28,16 @@
 //! app-specific semantics (CBOR decode, "is this real state", CRDT-merge with
 //! the local snapshot) are supplied by [`RiverProbeOps`].
 //!
-//! The driver's per-candidate correlation is single-shot by construction, so
-//! there is no cross-probe epoch machinery to get wrong (the previous
-//! hand-rolled state machine carried one; it is gone).
+//! The driver's per-candidate correlation is single-shot WITHIN a single
+//! probe. It does NOT cover cross-probe reuse: sequential probes for the SAME
+//! owner walk the SAME deterministic legacy ids, so a later probe re-registers
+//! an id an earlier probe's watchdog is still armed against. Each probe GET
+//! therefore carries a monotonic **per-fire token** ([`PROBE_ROUTES`] value):
+//! a watchdog advances its probe only if the route it armed against still
+//! carries its own token, so a stale watchdog from a completed probe can never
+//! advance a LATER probe that reused the same id. The token replaces the old
+//! hand-rolled per-fire epoch counter; the driver's single-shot correlation
+//! covers everything else.
 //!
 //! ## Routing & bookkeeping
 //!
@@ -38,8 +45,8 @@
 //! `owner_vk` via `SYNC_INFO` (keyed by the current contract id) or via
 //! `RoomData::contract_key` (also the current id). [`PROBE_ROUTES`] is the
 //! side-table that maps the outstanding legacy `ContractInstanceId` back to the
-//! owner whose probe it belongs to; [`PROBE_DRIVERS`] holds one in-flight
-//! [`ProbeDriver`] per owner.
+//! `(owner_vk, per-fire token)` of the probe GET it belongs to; [`PROBE_DRIVERS`]
+//! holds one in-flight [`ProbeDriver`] per owner.
 //!
 //! Both are plain `Mutex`-guarded maps, NOT Dioxus signals: internal
 //! bookkeeping with zero UI reactivity (no component or memo ever reads them),
@@ -55,9 +62,11 @@
 //! arrived by then, the watchdog counts the generation as a miss so the driver
 //! advances to the next generation (and ultimately seeds the current key)
 //! rather than stalling forever. Without this a dormant room — exactly what
-//! this feature targets — could be left permanently stuck. Whichever of
-//! {response, watchdog} removes the route first owns the hop; the loser finds
-//! the route gone and no-ops (single-shot).
+//! this feature targets — could be left permanently stuck. Within one probe,
+//! whichever of {response, watchdog} removes the route first owns the hop; the
+//! loser finds the route gone and no-ops. Across probes, the per-fire token
+//! (above) stops a stale watchdog from claiming a later probe's re-registered
+//! route.
 
 use crate::components::app::freenet_api::constants::REPUT_DELAY_MS;
 use crate::components::app::freenet_api::response_handler::get_response::{
@@ -75,6 +84,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -153,11 +163,23 @@ impl ProbeStateOps for RiverProbeOps {
 }
 
 /// Maps the `ContractInstanceId` of the currently-outstanding legacy probe GET
-/// back to the owner whose probe it belongs to. Plain `Mutex` map — see the
-/// module docs. The presence of an entry is what makes a legacy-key GET
-/// response route into the probe handler ([`is_probe_instance`]).
-static PROBE_ROUTES: LazyLock<Mutex<HashMap<ContractInstanceId, VerifyingKey>>> =
+/// back to the `(owner_vk, per-fire token)` of the probe GET it belongs to.
+/// Plain `Mutex` map — see the module docs. The presence of an entry is what
+/// makes a legacy-key GET response route into the probe handler
+/// ([`is_probe_instance`]); the token lets a watchdog tell its own outstanding
+/// fire apart from a later probe that reused the same deterministic id.
+static PROBE_ROUTES: LazyLock<Mutex<HashMap<ContractInstanceId, (VerifyingKey, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Monotonic source of the per-fire route token. Bumped once per
+/// [`fire_probe_get`]; the value stored in [`PROBE_ROUTES`] and captured by that
+/// fire's watchdog. Globally unique, so a token match implies the SAME fire.
+static PROBE_FIRE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh, globally-unique per-fire token for one probe GET.
+fn next_fire_token() -> u64 {
+    PROBE_FIRE_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 /// One in-flight [`ProbeDriver`] per owner. The driver owns the sans-IO probe
 /// decision state; this module only pumps I/O through it. Deduplicating
@@ -167,8 +189,27 @@ static PROBE_DRIVERS: LazyLock<Mutex<HashMap<VerifyingKey, ProbeDriver<RiverProb
 
 /// Lock the route table, recovering from a poisoned mutex (a panic while the
 /// lock was held must not wedge all future recovery).
-fn routes() -> MutexGuard<'static, HashMap<ContractInstanceId, VerifyingKey>> {
+fn routes() -> MutexGuard<'static, HashMap<ContractInstanceId, (VerifyingKey, u64)>> {
     PROBE_ROUTES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Remove `id`'s route ONLY if it still carries `(owner_vk, token)` — the
+/// per-fire guard a watchdog uses to advance its probe. Returns `true` (route
+/// removed) only when this watchdog owns the CURRENT outstanding fire for `id`.
+///
+/// The check-and-remove is one locked step: a stale watchdog whose token no
+/// longer matches (a later same-owner probe re-fired the same deterministic id
+/// with a fresh token) leaves the route untouched and does not advance the
+/// later probe. This is what the deleted per-fire epoch counter guarded.
+fn claim_route_if_current(id: ContractInstanceId, owner_vk: VerifyingKey, token: u64) -> bool {
+    let mut routes = routes();
+    match routes.get(&id) {
+        Some(&(o, t)) if o == owner_vk && t == token => {
+            routes.remove(&id);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Lock the driver table, recovering from a poisoned mutex.
@@ -248,7 +289,13 @@ pub async fn start_backward_probe(owner_vk: VerifyingKey, local_snapshot: ChatRo
 /// FIRST of {this response, the watchdog} to remove the route owns the hop
 /// (single-shot). Unknown ids are the race-loser and no-op.
 pub(crate) async fn deliver_probe_response(id: ContractInstanceId, bytes: Vec<u8>) {
-    let Some(owner_vk) = routes().remove(&id) else {
+    // The per-fire token is deliberately IGNORED here (unlike the watchdog): a
+    // GET response for `id` is a valid response for whatever fire currently owns
+    // `id`'s route, and the driver is single-shot on its own outstanding
+    // candidate — if the owning driver has already advanced past `id`, its
+    // `on_response(id, ..)` is a no-op. So routing by the current owner is
+    // always correct; only the stale-timeout case needs the token.
+    let Some((owner_vk, _token)) = routes().remove(&id) else {
         // The route was already consumed — e.g. the timeout watchdog fired
         // first. Whichever ran first owns the outcome; the loser lands here.
         warn!("Probe GET response for {id} had no matching probe entry — ignoring");
@@ -317,11 +364,16 @@ async fn pump_probe(owner_vk: VerifyingKey) {
 /// Register `id` as the outstanding probe GET for `owner_vk`, send the GET, and
 /// arm a watchdog so an absent legacy generation cannot stall the probe.
 fn fire_probe_get(owner_vk: VerifyingKey, id: ContractInstanceId) {
+    // A fresh per-fire token: it stamps this route and is captured by the
+    // watchdog below, so a stale watchdog from a completed probe cannot advance
+    // a LATER probe that reused the same deterministic legacy id.
+    let token = next_fire_token();
+
     // Register the route BEFORE sending the GET so the response handler can
     // resolve the legacy key when the reply arrives (and so `is_probe_instance`
     // routes it into the probe handler). Plain mutex — synchronous, no defer,
     // no signal re-entrancy.
-    routes().insert(id, owner_vk);
+    routes().insert(id, (owner_vk, token));
 
     // Keep the room out of the subscription-timeout sweep: a probe in flight IS
     // active subscription progress. Each hop refreshes `subscribing_since` (hops
@@ -367,13 +419,16 @@ fn fire_probe_get(owner_vk: VerifyingKey, id: ContractInstanceId) {
     });
 
     // Watchdog: if no GET response consumes THIS route within PROBE_GET_TIMEOUT,
-    // count the legacy generation as a miss and advance. The route-removal race
-    // makes this single-shot — whichever of {response, watchdog} removes the
-    // route first owns the hop; the loser finds it gone and no-ops. This
-    // subsumes the old per-probe epoch machinery.
+    // count the legacy generation as a miss and advance. `claim_route_if_current`
+    // makes this single-shot AND cross-probe-safe: it advances only if `id`'s
+    // route still carries THIS fire's `token`. Within one probe, whichever of
+    // {response, watchdog} removes the route first owns the hop (the loser
+    // finds it gone). Across probes, a completed probe's late watchdog finds a
+    // later probe's fresh token on the reused id and no-ops — the guard the old
+    // per-fire epoch counter used to provide.
     safe_spawn_local(async move {
         sleep(PROBE_GET_TIMEOUT).await;
-        if routes().remove(&id) == Some(owner_vk) {
+        if claim_route_if_current(id, owner_vk, token) {
             warn!(
                 "Backward-probe GET for {id} timed out after {}s — treating the legacy \
                  generation as absent and advancing",
@@ -556,10 +611,11 @@ mod tests {
         );
     }
 
-    /// Single-shot correlation at the River level: a candidate times out (the
+    /// Single-shot correlation WITHIN one probe: a candidate times out (the
     /// probe advances), then its real response arrives late — it must be
-    /// ignored, not adopted. The driver's per-candidate correlation subsumes the
-    /// old epoch machinery this refactor deleted.
+    /// ignored, not adopted. This is the driver's per-candidate correlation;
+    /// the CROSS-probe same-owner case is covered separately by the route
+    /// token (see `stale_watchdog_does_not_advance_a_later_same_owner_probe`).
     #[test]
     fn driver_ignores_late_response_after_timeout_with_river_ops() {
         let (sk, vk) = owner(6);
@@ -588,6 +644,75 @@ mod tests {
         assert!(
             matches!(driver.take_outcome(), Some(Outcome::SeedLocal { .. })),
             "the late hit must not have been adopted"
+        );
+    }
+
+    /// Regression (Codex review of #398 phase 2): a stale watchdog from a
+    /// COMPLETED probe must not advance a LATER probe for the same owner that
+    /// re-registered the same deterministic legacy id.
+    ///
+    /// Sequential same-owner probes walk the SAME legacy ids (they are derived
+    /// from the owner + a fixed legacy-WASM registry), so probe 1's still-armed
+    /// watchdog and probe 2's fresh route collide on one id. The per-fire route
+    /// token is what tells them apart: the stale watchdog's token no longer
+    /// matches, so `claim_route_if_current` refuses to claim probe 2's route,
+    /// and probe 2 stays on its NEWEST candidate. Without the token (the bug the
+    /// deleted epoch counter guarded), the stale watchdog would skip probe 2's
+    /// newest generation and roll it back to an older one.
+    #[test]
+    fn stale_watchdog_does_not_advance_a_later_same_owner_probe() {
+        let (_sk, vk) = owner(7);
+        // Distinct ids so this test can't collide with others sharing the
+        // process-global PROBE_ROUTES map under parallel `cargo test`.
+        let newest = id(70);
+        let older = id(71);
+
+        // Probe 1 fired `newest` with token t1 and has since COMPLETED (its
+        // route was removed on completion), but its watchdog W1 is still armed,
+        // holding t1.
+        let t1 = next_fire_token();
+
+        // Probe 2 then starts for the same owner and re-fires the SAME `newest`
+        // id with a fresh token t2, and is sitting on it as its outstanding GET.
+        let t2 = next_fire_token();
+        routes().insert(newest, (vk, t2));
+        let mut probe2 = ProbeDriver::new(
+            RiverProbeOps { owner_vk: vk },
+            ChatRoomStateV1::default(),
+            NewestFirst::assume_ordered(vec![newest, older]),
+            SelectionPolicy::NewestFirstWins,
+        );
+        assert_eq!(
+            probe2.next_action(),
+            Step::Get(newest),
+            "probe 2 starts on its newest candidate"
+        );
+
+        // W1 fires late. Its token (t1) no longer matches `newest`'s route (t2),
+        // so it must NOT claim the route and must NOT call on_timeout on probe 2.
+        assert!(
+            !claim_route_if_current(newest, vk, t1),
+            "a stale watchdog (old token) must not claim a later probe's reused route"
+        );
+        assert_eq!(
+            routes().get(&newest),
+            Some(&(vk, t2)),
+            "probe 2's route must survive the stale watchdog"
+        );
+        assert_eq!(
+            probe2.next_action(),
+            Step::Get(newest),
+            "probe 2 must still probe its newest candidate — no rollback"
+        );
+
+        // Sanity: probe 2's OWN watchdog (token t2) DOES claim the route.
+        assert!(
+            claim_route_if_current(newest, vk, t2),
+            "the current fire's watchdog claims its own route"
+        );
+        assert!(
+            routes().remove(&newest).is_none(),
+            "the matching claim already removed the route"
         );
     }
 }
