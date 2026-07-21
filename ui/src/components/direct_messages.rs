@@ -765,6 +765,7 @@ mod tests {
             room_owner_vk,
             ts,
             b"opaque".to_vec(),
+            None,
         )
         .expect("sign_direct_message");
         rooms

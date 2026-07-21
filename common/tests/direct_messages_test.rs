@@ -127,6 +127,7 @@ fn dm_at(
         &f.params.owner,
         timestamp,
         ct.to_vec(),
+        None,
     )
     .expect("sign_direct_message")
 }
@@ -303,6 +304,7 @@ fn sender_signature_failure_rejected() {
         &f.params.owner,
         bad.message.timestamp,
         &bad.message.ciphertext,
+        bad.message.sender_ciphertext.as_deref(),
     )
     .unwrap();
     bad.sender_signature = f.bob_sk.sign(&bytes);
@@ -539,6 +541,7 @@ fn self_dm_rejected_in_verify() {
         &f.params.owner,
         timestamp,
         b"hi",
+        None,
     )
     .unwrap();
     let sig = f.alice_sk.sign(&bytes);
@@ -548,6 +551,7 @@ fn self_dm_rejected_in_verify() {
             recipient: f.alice_id,
             timestamp,
             ciphertext: b"hi".to_vec(),
+            sender_ciphertext: None,
         },
         sender_signature: sig,
     };
@@ -570,6 +574,7 @@ fn self_dm_rejected_at_signing_time() {
         &f.params.owner,
         1,
         b"hi".to_vec(),
+        None,
     )
     .expect_err("self-DM at signing time must be rejected");
     assert!(err.contains("must differ"), "got: {err}");
@@ -1304,6 +1309,7 @@ fn direct_messages_wire_format_locked() {
         &room_owner_vk,
         1_700_000_000,
         b"deterministic ciphertext".to_vec(),
+        None,
     )
     .unwrap();
 
@@ -1362,7 +1368,8 @@ fn direct_messages_wire_format_locked() {
 fn signed_bytes_carry_domain_tag() {
     let f = make_fixture();
     let dm_bytes =
-        build_direct_message_signed_bytes(f.alice_id, f.bob_id, &f.params.owner, 0, b"hi").unwrap();
+        build_direct_message_signed_bytes(f.alice_id, f.bob_id, &f.params.owner, 0, b"hi", None)
+            .unwrap();
     assert_eq!(dm_bytes[0], DOMAIN_TAG_MESSAGE);
 
     let p_bytes = build_recipient_purges_signed_bytes(
@@ -1557,6 +1564,7 @@ fn apply_delta_silently_drops_non_member_sender() {
         &f.params.owner,
         1,
         b"hi".to_vec(),
+        None,
     )
     .unwrap();
     let delta = DirectMessagesDelta {
@@ -1585,6 +1593,7 @@ fn apply_delta_silently_drops_self_dm() {
         &f.params.owner,
         timestamp,
         b"hi",
+        None,
     )
     .unwrap();
     let sig = f.alice_sk.sign(&bytes);
@@ -1594,6 +1603,7 @@ fn apply_delta_silently_drops_self_dm() {
             recipient: f.alice_id,
             timestamp,
             ciphertext: b"hi".to_vec(),
+            sender_ciphertext: None,
         },
         sender_signature: sig,
     };
@@ -1662,6 +1672,158 @@ fn apply_delta_silently_drops_per_pair_overflow() {
 }
 
 // ---------------------------------------------------------------------------
+// Sender-copy field (freenet/river#432) — signature coverage + back-compat.
+// These need only the always-compiled signing/verify surface (no ECIES), so
+// they run under default features too.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn signed_bytes_none_sender_copy_matches_legacy_layout() {
+    // A message with no sender copy MUST sign over exactly the pre-#432 byte
+    // layout — fixed header (1+8+8+32+8+4) plus the recipient ciphertext, no
+    // trailing bytes — so legacy messages keep verifying after the upgrade.
+    let f = make_fixture();
+    let ct = b"opaque recipient envelope";
+    let none_bytes =
+        build_direct_message_signed_bytes(f.alice_id, f.bob_id, &f.params.owner, 42, ct, None)
+            .unwrap();
+    assert_eq!(none_bytes.len(), 1 + 8 + 8 + 32 + 8 + 4 + ct.len());
+    assert_eq!(none_bytes[0], DOMAIN_TAG_MESSAGE);
+
+    // Adding a sender copy appends exactly a u32 length + the bytes and leaves
+    // the legacy prefix byte-identical.
+    let sct = b"sender copy envelope bytes";
+    let some_bytes =
+        build_direct_message_signed_bytes(f.alice_id, f.bob_id, &f.params.owner, 42, ct, Some(sct))
+            .unwrap();
+    assert_eq!(some_bytes.len(), none_bytes.len() + 4 + sct.len());
+    assert_eq!(
+        &some_bytes[..none_bytes.len()],
+        &none_bytes[..],
+        "the legacy prefix must be unchanged when a sender copy is appended"
+    );
+}
+
+#[test]
+fn sender_copy_is_covered_by_signature() {
+    // The sender copy is authorised state: it must be bound by the signature
+    // so a peer cannot strip it or graft one on.
+    let f = make_fixture();
+    let alice_vk = f.alice_sk.verifying_key();
+    let ct = b"recipient envelope".to_vec();
+    let sct = b"sender copy envelope".to_vec();
+
+    let signed = sign_direct_message(
+        &f.alice_sk,
+        f.alice_id,
+        f.bob_id,
+        &f.params.owner,
+        7,
+        ct.clone(),
+        Some(sct.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        signed.message.sender_ciphertext.as_deref(),
+        Some(sct.as_slice())
+    );
+    signed
+        .verify_signature(&alice_vk, &f.params.owner)
+        .expect("message carrying a sender copy must verify");
+
+    // Strip the sender copy -> signature no longer matches.
+    let mut stripped = signed.clone();
+    stripped.message.sender_ciphertext = None;
+    assert!(
+        stripped
+            .verify_signature(&alice_vk, &f.params.owner)
+            .is_err(),
+        "stripping the sender copy must invalidate the signature"
+    );
+
+    // Graft a sender copy onto a legacy (None) message -> also invalid.
+    let legacy = sign_direct_message(
+        &f.alice_sk,
+        f.alice_id,
+        f.bob_id,
+        &f.params.owner,
+        7,
+        ct,
+        None,
+    )
+    .unwrap();
+    legacy
+        .verify_signature(&alice_vk, &f.params.owner)
+        .expect("legacy (no sender copy) message must verify");
+    let mut grafted = legacy;
+    grafted.message.sender_ciphertext = Some(sct);
+    assert!(
+        grafted
+            .verify_signature(&alice_vk, &f.params.owner)
+            .is_err(),
+        "grafting a sender copy onto a legacy message must invalidate the signature"
+    );
+}
+
+#[test]
+fn verify_rejects_oversized_sender_ciphertext() {
+    // A sender copy over the size cap must be rejected by verify, exactly like
+    // an oversized recipient ciphertext.
+    let f = make_fixture();
+    let ct = b"ok".to_vec();
+    let big = vec![0u8; MAX_DM_CIPHERTEXT_BYTES + 1];
+    let signed = sign_direct_message(
+        &f.alice_sk,
+        f.alice_id,
+        f.bob_id,
+        &f.params.owner,
+        3,
+        ct,
+        Some(big),
+    )
+    .unwrap();
+    let mut state = f.state.clone();
+    state.direct_messages.messages.push(signed);
+    let err = state
+        .direct_messages
+        .verify(&state, &f.params)
+        .expect_err("verify should reject an oversized sender copy");
+    assert!(err.contains("sender_ciphertext too large"), "got: {err}");
+}
+
+#[test]
+fn apply_delta_drops_oversized_sender_ciphertext() {
+    // The merge path silently drops a message whose sender copy is oversized,
+    // rather than poisoning the whole delta.
+    let f = make_fixture();
+    let ct = b"ok".to_vec();
+    let big = vec![0u8; MAX_DM_CIPHERTEXT_BYTES + 1];
+    let signed = sign_direct_message(
+        &f.alice_sk,
+        f.alice_id,
+        f.bob_id,
+        &f.params.owner,
+        3,
+        ct,
+        Some(big),
+    )
+    .unwrap();
+    let delta = DirectMessagesDelta {
+        new_messages: vec![signed],
+        advanced_purges: vec![],
+    };
+    let mut state = f.state.clone();
+    state
+        .direct_messages
+        .apply_delta(&f.state, &f.params, &Some(delta))
+        .expect("apply_delta must not fail on an oversized sender copy");
+    assert!(
+        state.direct_messages.messages.is_empty(),
+        "the oversized-sender-copy message must be silently dropped"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // compose_direct_message / open_direct_message / advance_recipient_purges
 // (#243 — helpers that UI + riverctl share so wire bytes are identical)
 // ---------------------------------------------------------------------------
@@ -1671,6 +1833,7 @@ mod end_to_end_helpers {
     use super::*;
     use river_core::room_state::direct_messages::{
         advance_recipient_purges, compose_direct_message, open_direct_message,
+        open_own_direct_message,
     };
 
     #[test]
@@ -1700,6 +1863,96 @@ mod end_to_end_helpers {
 
         // Carol can NOT read it.
         assert!(open_direct_message(&f.carol_sk, &auth).is_err());
+    }
+
+    #[test]
+    fn compose_seals_sender_copy_readable_by_sender_on_a_fresh_device() {
+        // freenet/river#432: the whole point. A DM composed by Alice carries a
+        // sender copy that ALICE can decrypt with only her signing key — no
+        // local plaintext cache — so she reads her own sent DMs on any device.
+        let f = make_fixture();
+        let bob_vk = f.bob_sk.verifying_key();
+        let body = b"a message alice sent that she wants to reread later";
+        let now = 1_700_000_000;
+
+        let auth = compose_direct_message(&f.alice_sk, &bob_vk, &f.params.owner, now, now, body)
+            .expect("compose_direct_message");
+
+        // The message actually carries a sender copy.
+        assert!(
+            auth.message.sender_ciphertext.is_some(),
+            "compose must seal a sender copy"
+        );
+
+        // Alice recovers her own plaintext from the message alone.
+        let recovered = open_own_direct_message(&f.alice_sk, &auth)
+            .expect("alice must decrypt her own sent DM from contract state");
+        assert_eq!(recovered, body);
+
+        // Bob still reads the recipient copy; Carol reads neither copy.
+        assert_eq!(open_direct_message(&f.bob_sk, &auth).unwrap(), body);
+        assert!(
+            open_own_direct_message(&f.bob_sk, &auth).is_err(),
+            "the sender copy is sealed to alice, not bob"
+        );
+        assert!(open_own_direct_message(&f.carol_sk, &auth).is_err());
+        assert!(open_direct_message(&f.carol_sk, &auth).is_err());
+    }
+
+    #[test]
+    fn sender_and_recipient_copies_differ_but_decode_to_same_body() {
+        // The two envelopes use independent per-message randomness, so they
+        // are not byte-equal even though they carry the same plaintext.
+        let f = make_fixture();
+        let bob_vk = f.bob_sk.verifying_key();
+        let body = b"same plaintext, two envelopes";
+        let auth = compose_direct_message(&f.alice_sk, &bob_vk, &f.params.owner, 1, 1, body)
+            .expect("compose");
+
+        let sender_copy = auth
+            .message
+            .sender_ciphertext
+            .as_ref()
+            .expect("sender copy");
+        assert_ne!(
+            &auth.message.ciphertext, sender_copy,
+            "sender and recipient envelopes must not be byte-identical"
+        );
+        assert_eq!(open_direct_message(&f.bob_sk, &auth).unwrap(), body);
+        assert_eq!(open_own_direct_message(&f.alice_sk, &auth).unwrap(), body);
+    }
+
+    #[test]
+    fn composed_dm_with_sender_copy_verifies_in_full_room_state() {
+        // The sender copy is covered by the signature and capped, so a composed
+        // message passes the full ComposableState verify path.
+        let f = make_fixture();
+        let bob_vk = f.bob_sk.verifying_key();
+        let auth =
+            compose_direct_message(&f.alice_sk, &bob_vk, &f.params.owner, 1, 1, b"hello bob")
+                .expect("compose");
+        let mut state = f.state.clone();
+        state.direct_messages.messages.push(auth);
+        state
+            .verify(&state, &f.params)
+            .expect("state carrying a sender-copy DM must verify");
+    }
+
+    #[test]
+    fn open_own_errs_on_legacy_message_without_sender_copy() {
+        // A pre-#432 message (no sender copy) has nothing for open_own to
+        // decrypt — callers fall back to the local cache / placeholder.
+        let f = make_fixture();
+        let auth = dm_at(
+            &f,
+            &f.alice_sk,
+            f.alice_id,
+            f.bob_id,
+            1,
+            b"opaque recipient ct",
+        );
+        assert!(auth.message.sender_ciphertext.is_none());
+        assert!(open_own_direct_message(&f.alice_sk, &auth).is_err());
     }
 
     #[test]

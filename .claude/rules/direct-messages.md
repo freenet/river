@@ -32,9 +32,25 @@ live in `common/src/room_state/direct_messages.rs`.
   plaintext is attacker-controlled (random ephemeral + random nonce per
   call). `open_direct_message` is feature-gated on `ecies` so the
   room-contract WASM (which never decrypts) still builds.
+- **Sender copy (`DirectMessage.sender_ciphertext`, #432).** In addition
+  to the recipient-only `ciphertext`, `compose_direct_message` seals a
+  SECOND envelope of the same body to the SENDER's own `member_vk`. This
+  makes sent DMs portable: any device holding the sender's signing key
+  reads its own sent DMs from contract state via `open_own_direct_message`,
+  the same way received DMs already work — the recipient-only envelope
+  can't be decrypted by the sender, which is why the outbound plaintext
+  cache below existed. The field is `Option` (`None` for pre-#432
+  messages), `#[serde(default, skip_serializing_if = "Option::is_none")]`
+  so a legacy message serializes byte-identically, and is **covered by the
+  sender signature** (appended to `build_direct_message_signed_bytes` only
+  when `Some`, so it can't be stripped or grafted without breaking the
+  signature). Size-capped to `MAX_DM_CIPHERTEXT_BYTES` like `ciphertext`.
+  It DOES NOT recover DMs sent before #432 (those carry no sender copy);
+  it is forward-looking. Adding the field changed the room-contract AND
+  chat-delegate WASM (both re-keyed — see migration entries V28).
 - UI and CLI emit byte-identical wire bytes via shared `river-core`
   helpers: `compose_direct_message`, `open_direct_message`,
-  `advance_recipient_purges`.
+  `open_own_direct_message`, `advance_recipient_purges`.
 
 ## UI surface
 
@@ -112,7 +128,13 @@ plaintext in the chat delegate.
 - **Render path**: both `DmThreadModalBody` and `riverctl dm list` go
   through the shared pure helper
   `lookup_outbound_plaintext(cache, room, recipient, token)`. Cache
-  hit → plaintext; miss → legacy placeholder. Pinned by
+  hit → plaintext; on a MISS they now fall back to the message's own
+  sender copy (`open_own_direct_message`, #432) before the legacy
+  placeholder — so a sent DM is readable on a node without the cache.
+  The cache is thus a fast-path optimization; the network sender-copy is
+  the portable source of truth for messages authored after #432 (older
+  messages have no sender copy and still show "ciphertext only" on a
+  cacheless node). Cache lookup pinned by
   `dm_outbound_lookup_returns_plaintext_on_hit` /
   `…_returns_err_on_miss`.
 - **Save path**: `save_outbound_dm()` defers the cache insert, enforces

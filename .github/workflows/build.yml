@@ -165,6 +165,19 @@ jobs:
       # `ecies-randomized` enables `ecies` transitively.
       run: cargo test -p river-core --lib --features ecies-randomized,migration,mentions
 
+    - name: Test river-core in-room DM suite (incl. #432 sender-copy portability)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # The in-room direct-message integration suite
+      # (common/tests/direct_messages_test.rs) previously had NO CI coverage —
+      # only `--lib` and specific `--test` targets ran, so this file (the whole
+      # DM verify/apply_delta/compose/open surface) never gated. Add it here.
+      # `ecies-randomized` is required so the `end_to_end_helpers` module
+      # (compose/open round-trips, including the #432 sender-copy portability
+      # tests) is compiled and run rather than silently cfg'd out.
+      run: cargo test -p river-core --test direct_messages_test --features ecies-randomized
+
     - name: Test river-ui (UI crate unit tests)
       env:
         RUST_MIN_STACK: 8388608

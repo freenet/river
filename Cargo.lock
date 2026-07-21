@@ -4634,7 +4634,7 @@ dependencies = [
 
 [[package]]
 name = "river-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -4659,7 +4659,7 @@ dependencies = [
 
 [[package]]
 name = "river-ui"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -4694,7 +4694,7 @@ dependencies = [
 
 [[package]]
 name = "riverctl"
-version = "0.1.79"
+version = "0.1.80"
 dependencies = [
  "anyhow",
  "assert_cmd",

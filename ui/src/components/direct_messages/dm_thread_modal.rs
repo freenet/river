@@ -23,8 +23,9 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::direct_messages::{
-    advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
-    DirectMessagesDelta, PurgeToken, MAX_DM_CIPHERTEXT_BYTES, MAX_DM_MESSAGES_PER_PAIR,
+    advance_recipient_purges, compose_direct_message, open_direct_message, open_own_direct_message,
+    pair_message_count, DirectMessagesDelta, PurgeToken, MAX_DM_CIPHERTEXT_BYTES,
+    MAX_DM_MESSAGES_PER_PAIR,
 };
 use river_core::room_state::dm_body::{decode_body, DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
@@ -200,6 +201,52 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // the success path).
             let outbound_cache = OUTBOUND_DMS.try_read().ok().map(|g| g.clone());
 
+            // Render decrypted DM plaintext bytes into a display body. Shared
+            // by the inbound path (recipient-decrypted) and the outbound
+            // self-copy path (freenet/river#431, sender-decrypted) so a Text
+            // vs Invite body renders identically regardless of which envelope
+            // it came from.
+            let render_decoded_body = |bytes: &[u8]| -> (String, BodyKind) {
+                match decode_body(bytes) {
+                    Ok(DirectMessageBody::Text { text }) => (text, BodyKind::Plaintext),
+                    Ok(DirectMessageBody::Invite(payload)) => {
+                        let target_room_data = rooms.map.get(&payload.room_owner_vk);
+                        let card_state = classify_invite_card_state(
+                            target_room_data.map(|rd| rd.can_participate()),
+                        );
+                        let room_label = target_room_data
+                            .map(|rd| {
+                                let sealed =
+                                    &rd.room_state.configuration.configuration.display.name;
+                                match unseal_bytes_with_secrets(sealed, &rd.secrets) {
+                                    Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                                    Err(_) => sealed.to_string_lossy(),
+                                }
+                            })
+                            .unwrap_or_else(|| {
+                                format!("Room {}", short_vk_prefix(&payload.room_owner_vk))
+                            });
+                        let personal = payload.personal_message.clone();
+                        (
+                            String::new(),
+                            BodyKind::Invite(Box::new(InviteCardData {
+                                payload: *payload,
+                                room_label,
+                                card_state,
+                                personal_message: personal,
+                            })),
+                        )
+                    }
+                    Err(err) => (
+                        // Body bytes didn't decode (malformed new-format
+                        // CBOR). Surface as a placeholder rather than a card
+                        // or text — same UX as the decrypt-failed branch.
+                        format!("unable to decode invite: {}", err),
+                        BodyKind::Placeholder,
+                    ),
+                }
+            };
+
             let mut latest_inbound_ts: u64 = 0;
             let mut rendered: Vec<RenderedDm> = Vec::new();
             for msg in &room_data.room_state.direct_messages.messages {
@@ -217,56 +264,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
                 let (body, kind) = if is_self_recipient {
                     match open_direct_message(&self_sk, msg) {
-                        Ok(bytes) => match decode_body(&bytes) {
-                            Ok(DirectMessageBody::Text { text }) => (text, BodyKind::Plaintext),
-                            Ok(DirectMessageBody::Invite(payload)) => {
-                                // Resolve a friendly room label and the
-                                // "already a member" flag for the card.
-                                // We treat "loaded but observer-only" as
-                                // NOT-a-member: the user can join via
-                                // the invite even though they have the
-                                // room loaded. `can_participate()` is
-                                // the canonical check used elsewhere in
-                                // the codebase. Computed here under the
-                                // existing `rooms` read so the card
-                                // render path itself is purely
-                                // declarative.
-                                let target_room_data = rooms.map.get(&payload.room_owner_vk);
-                                let card_state = classify_invite_card_state(
-                                    target_room_data.map(|rd| rd.can_participate()),
-                                );
-                                let room_label = target_room_data
-                                    .map(|rd| {
-                                        let sealed =
-                                            &rd.room_state.configuration.configuration.display.name;
-                                        match unseal_bytes_with_secrets(sealed, &rd.secrets) {
-                                            Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                                            Err(_) => sealed.to_string_lossy(),
-                                        }
-                                    })
-                                    .unwrap_or_else(|| {
-                                        format!("Room {}", short_vk_prefix(&payload.room_owner_vk))
-                                    });
-                                let personal = payload.personal_message.clone();
-                                (
-                                    String::new(),
-                                    BodyKind::Invite(Box::new(InviteCardData {
-                                        payload: *payload,
-                                        room_label,
-                                        card_state,
-                                        personal_message: personal,
-                                    })),
-                                )
-                            }
-                            Err(err) => (
-                                // Body bytes didn't decode (malformed new-
-                                // format CBOR). Surface as a placeholder
-                                // rather than a card or text — same UX as
-                                // the decrypt-failed branch.
-                                format!("unable to decode invite: {}", err),
-                                BodyKind::Placeholder,
-                            ),
-                        },
+                        Ok(bytes) => render_decoded_body(&bytes),
                         Err(err) => (
                             // Skeptical reviewer caught: putting `<...>`
                             // through `message_to_html` produces mangled
@@ -278,22 +276,27 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         ),
                     }
                 } else {
-                    // Outbound: check the delegate-backed plaintext
-                    // cache (#256). Hit → render the original plaintext
-                    // through the markdown path; miss → fall through to
-                    // the legacy "ciphertext only" placeholder for DMs
-                    // sent before the cache shipped or on a second
-                    // device without the cache yet hydrated. Goes
-                    // through the shared pure helper
-                    // `lookup_outbound_plaintext` so the regression
-                    // tests in `direct_messages.rs` pin THIS behaviour.
+                    // Outbound. Prefer the delegate-backed plaintext cache
+                    // (#256) — a fast O(1) lookup via the shared pure helper
+                    // `lookup_outbound_plaintext`, which the regression tests
+                    // in `direct_messages.rs` pin. On a MISS (DM sent from a
+                    // different node, or before the cache shipped), fall back
+                    // to the sender-copy envelope carried in the message
+                    // itself (freenet/river#431): decrypt it with our own
+                    // signing key, exactly as the recipient path does. Only
+                    // when both are unavailable (a legacy pre-#431 message
+                    // with no local cache) do we show the "ciphertext only"
+                    // placeholder.
                     let token = msg.purge_token();
-                    let resolved = outbound_cache.as_ref().and_then(|cache| {
+                    let cached = outbound_cache.as_ref().and_then(|cache| {
                         lookup_outbound_plaintext(cache, &room, &msg.message.recipient, &token).ok()
                     });
-                    match resolved {
+                    match cached {
                         Some(plaintext) => (plaintext, BodyKind::Plaintext),
-                        None => ("sent — ciphertext only".to_string(), BodyKind::Placeholder),
+                        None => match open_own_direct_message(&self_sk, msg) {
+                            Ok(bytes) => render_decoded_body(&bytes),
+                            Err(_) => ("sent — ciphertext only".to_string(), BodyKind::Placeholder),
+                        },
                     }
                 };
 
