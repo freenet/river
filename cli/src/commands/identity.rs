@@ -577,8 +577,11 @@ mod whoami_wiring_tests {
         let start = main_src
             .find("let whoami_room = match &cli.command")
             .expect("whoami short-circuit present");
+        // Anchor the end on CODE, not on a comment: anchoring on the
+        // "// Create API client" comment made a comment cleanup a false
+        // failure with a misdirecting message (review on PR #439).
         let end = main_src[start..]
-            .find("// Create API client")
+            .find("ApiClient::new_with_signing_key_override(")
             .expect("client construction follows")
             + start;
         let block = &main_src[start..end];

@@ -134,7 +134,10 @@ pub(crate) fn self_identity_from(
     room_info: &StoredRoomInfo,
 ) -> SelfIdentity {
     let verifying_key = signing_key.verifying_key();
-    let member_id = MemberId::from(&verifying_key);
+    // The SAME function every send path uses to set `MessageV1::author`, so
+    // whoami's promise ("this is the author on your own messages") holds by
+    // construction rather than by two copies of a derivation staying in step.
+    let member_id = crate::api::author_member_id(signing_key);
 
     // Prefer the room's own view of the nickname (what other members see),
     // read from the CACHED state so this never needs the node. `canonical`,
@@ -163,11 +166,26 @@ pub(crate) fn self_identity_from(
                 .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
         });
 
+    // `self_nickname` is the PERSISTED identity's nickname, so it is only a
+    // valid fallback when the effective key IS the persisted one. Under a
+    // `--signing-key-file` override selecting a different member, falling back
+    // would label the override's member ID and verifying key with another
+    // account's name (Codex review on PR #439). Reporting no nickname is the
+    // correct answer there — same reasoning as the CLI's member_info heal,
+    // which is likewise skipped under a mismatched override because "the
+    // persisted nickname/secrets are not that identity's"
+    // (`.claude/rules/private-rooms.md`).
+    let local_nickname = if signing_key.to_bytes() == room_info.signing_key_bytes {
+        room_info.self_nickname.clone()
+    } else {
+        None
+    };
+
     SelfIdentity {
         member_id,
         is_owner: verifying_key == *room_owner_vk,
         verifying_key,
-        nickname: room_nickname.or_else(|| room_info.self_nickname.clone()),
+        nickname: room_nickname.or(local_nickname),
     }
 }
 
@@ -1136,23 +1154,70 @@ mod tests {
         assert_eq!(identity.verifying_key, member_sk.verifying_key());
     }
 
-    /// Source-scrape companion to the test above: it can only stay honest
-    /// while the send paths really do derive `author` from the signing key's
-    /// verifying key. If a send path starts deriving `author` some other way,
-    /// `whoami` must be updated in the same change.
+    /// Structural companion to the test above: `whoami` and every send path
+    /// must derive `author` through the SAME function, not through copies of
+    /// the same expression.
+    ///
+    /// The first version of this test scraped for the literal
+    /// `author: MemberId::from(&signing_key.verifying_key())` and claimed to
+    /// cover "every send path". It did not: `send_message` spelled it with a
+    /// fully-qualified path and `send_message_with_key` derived it via
+    /// `(&sender_vk).into()`, so the scrape was satisfied by the five *action*
+    /// paths alone while the two that send actual chat messages went unpinned
+    /// (caught in review on PR #439). Rather than enumerate spellings, the
+    /// derivation now lives in one function and this pins that.
     #[test]
-    fn message_author_derivation_pinned() {
+    fn message_author_derivation_shared_with_whoami() {
         let api_src = include_str!("api.rs");
+        let storage_src = include_str!("storage.rs");
+
         assert!(
-            api_src.contains("author: MemberId::from(&signing_key.verifying_key())"),
-            "riverctl's message send paths must derive `author` from the \
-             signing key's verifying key. `riverctl identity whoami` \
-             (freenet/river#438) reports `MemberId::from(&verifying_key)` on \
-             the promise that it equals the `author` of messages this identity \
-             sends. If you change how `author` is derived, update \
-             `storage::self_identity_from` in the SAME change or whoami starts \
-             reporting an id that matches no message."
+            api_src.contains("pub(crate) fn author_member_id("),
+            "api::author_member_id must remain the single source of truth for \
+             `MessageV1::author` (freenet/river#438)."
         );
+        assert!(
+            storage_src.contains("crate::api::author_member_id(signing_key)"),
+            "`self_identity_from` must derive the reported member_id via \
+             `api::author_member_id` — the SAME function the send paths use. \
+             Re-inlining the derivation here lets whoami and the send paths \
+             drift, which is the entire bug class this feature must not have."
+        );
+
+        // Every send site must call the helper rather than re-inlining. The
+        // match is on `author: author_member_id(` so it is agnostic to whether
+        // the site passes `signing_key` or `&signing_key` (both spellings
+        // occur, depending on whether the key is owned at that site) — pinning
+        // one spelling would false-fail on a harmless `&`.
+        assert_eq!(
+            api_src
+                .matches("author: MemberId::from(&signing_key")
+                .count(),
+            0,
+            "a send path is hand-inlining the author derivation instead of \
+             calling `author_member_id`. Route it through the helper so \
+             `identity whoami` keeps matching it."
+        );
+        // Production `author:` sites: send_message, edit, delete, react,
+        // unreact, reply (6 direct), plus send_message_with_key and the join
+        // event, which bind the helper's result to a local first.
+        assert!(
+            api_src.matches("author: author_member_id(").count() >= 6,
+            "expected every message-construction site to call \
+             `author_member_id`; found fewer than the known production sites, \
+             so one has been changed to derive `author` some other way."
+        );
+        for binding in [
+            "let sender_member_id = author_member_id(",
+            "let self_id = author_member_id(",
+        ] {
+            assert!(
+                api_src.contains(binding),
+                "`{binding}...` must keep deriving through the shared helper — \
+                 this is `send_message_with_key` / the join event, whose \
+                 `author` a bridge also has to recognise as its own."
+            );
+        }
     }
 
     /// Owner vs non-owner, and the owner's id is derived from their own key.
@@ -1277,6 +1342,61 @@ mod tests {
 
         let identity = self_identity_from(&owner_sk.verifying_key(), &member_sk, &room_info);
         assert_eq!(identity.nickname.as_deref(), Some("Nacho"));
+    }
+
+    /// The `self_nickname` fallback belongs to the PERSISTED identity, so an
+    /// override selecting a DIFFERENT member must not inherit it — that would
+    /// label the override's member ID with another account's name (Codex
+    /// review on PR #439). Reporting no nickname is correct there.
+    #[test]
+    fn self_identity_does_not_inherit_persisted_nickname_under_override() {
+        let owner_sk = create_test_signing_key();
+        let persisted_sk = create_test_signing_key();
+        let override_sk = create_test_signing_key();
+
+        let mut room_info = stored_room_info(create_test_state(&owner_sk), &persisted_sk);
+        room_info.self_nickname = Some("persisted-identity".to_string());
+
+        // Effective key == persisted key: the fallback is genuinely ours.
+        let same = self_identity_from(&owner_sk.verifying_key(), &persisted_sk, &room_info);
+        assert_eq!(same.nickname.as_deref(), Some("persisted-identity"));
+
+        // Effective key is an override for a DIFFERENT member: no nickname,
+        // rather than the persisted identity's.
+        let overridden = self_identity_from(&owner_sk.verifying_key(), &override_sk, &room_info);
+        assert_eq!(
+            overridden.nickname, None,
+            "an override identity must not inherit the persisted identity's \
+             nickname — it belongs to a different member"
+        );
+        assert_eq!(
+            overridden.member_id,
+            MemberId::from(&override_sk.verifying_key())
+        );
+    }
+
+    /// An override that DOES have its own record in the cached state reports
+    /// that record's nickname — the override is a real member here, so the
+    /// room's view of it is correct and must not be suppressed.
+    #[test]
+    fn self_identity_reports_override_own_room_nickname() {
+        use river_core::room_state::privacy::SealedBytes;
+
+        let owner_sk = create_test_signing_key();
+        let persisted_sk = create_test_signing_key();
+        let override_sk = create_test_signing_key();
+
+        let mut state = create_test_state(&owner_sk);
+        push_member_info(
+            &mut state,
+            &override_sk,
+            SealedBytes::public(b"the-override".to_vec()),
+        );
+        let mut room_info = stored_room_info(state, &persisted_sk);
+        room_info.self_nickname = Some("persisted-identity".to_string());
+
+        let identity = self_identity_from(&owner_sk.verifying_key(), &override_sk, &room_info);
+        assert_eq!(identity.nickname.as_deref(), Some("the-override"));
     }
 
     /// `Storage::self_identity` must report the identity that will actually

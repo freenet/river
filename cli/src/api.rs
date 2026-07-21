@@ -445,6 +445,25 @@ pub(crate) fn render_mentions_for_terminal(room_state: &ChatRoomStateV1, text: &
 /// `[Encrypted: N bytes, vN]` — and, worse, `send_reply` sealed that
 /// placeholder into `ReplyContentV1.target_author_name`, persisting it to
 /// contract state for every reader (including the UI).
+/// The `author` an outgoing message from `signing_key` carries.
+///
+/// SINGLE SOURCE OF TRUTH, shared with `riverctl identity whoami`
+/// (freenet/river#438) via `storage::self_identity_from`. whoami's entire
+/// promise is that the ID it reports equals the `author` on this identity's
+/// own messages, so a bridge can filter its own echo. Previously every send
+/// site hand-inlined `MemberId::from(&signing_key.verifying_key())` (in three
+/// different spellings), and whoami inlined a fourth copy — nothing but a
+/// source-scrape kept them in step, and the scrape silently missed the two
+/// paths that send actual chat messages.
+///
+/// Call this from EVERY site that sets `MessageV1::author`. Do not re-inline
+/// the derivation: a new send path that derives `author` its own way breaks
+/// whoami for that path only, which is invisible until a bridge starts
+/// double-posting.
+pub(crate) fn author_member_id(signing_key: &SigningKey) -> MemberId {
+    MemberId::from(&signing_key.verifying_key())
+}
+
 pub(crate) fn unseal_nickname_display(
     nickname: &river_core::room_state::privacy::SealedBytes,
     secrets: &HashMap<u32, [u8; 32]>,
@@ -2145,7 +2164,7 @@ impl ApiClient {
                         // The join event counts as a message, preventing
                         // post_apply_cleanup from pruning the new member.
                         let signing_key = &invitation.invitee_signing_key;
-                        let self_id = MemberId::from(&signing_key.verifying_key());
+                        let self_id = author_member_id(signing_key);
 
                         // Build members delta: invitee + any missing invite chain members
                         let current_member_ids: HashSet<MemberId> = room_state
@@ -2839,7 +2858,7 @@ impl ApiClient {
         let mut room_state = self.get_room(room_owner_key, false).await?;
 
         let sender_vk = signing_key.verifying_key();
-        let sender_member_id: MemberId = (&sender_vk).into();
+        let sender_member_id = author_member_id(signing_key);
 
         // Resolve any bare @nickname mentions to full mention tokens.
         let message_content = resolve_outgoing_mentions(&room_state, &message_content);
@@ -2997,7 +3016,7 @@ impl ApiClient {
         // Create the message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: river_core::room_state::member::MemberId::from(*room_owner_key),
-            author: river_core::room_state::member::MemberId::from(&signing_key.verifying_key()),
+            author: author_member_id(&signing_key),
             content,
             time: std::time::SystemTime::now(),
         };
@@ -3161,7 +3180,7 @@ impl ApiClient {
         // Create the edit action message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
-            author: MemberId::from(&signing_key.verifying_key()),
+            author: author_member_id(&signing_key),
             content,
             time: std::time::SystemTime::now(),
         };
@@ -3231,7 +3250,7 @@ impl ApiClient {
         // Create the delete action message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
-            author: MemberId::from(&signing_key.verifying_key()),
+            author: author_member_id(&signing_key),
             content,
             time: std::time::SystemTime::now(),
         };
@@ -3303,7 +3322,7 @@ impl ApiClient {
         // Create the reaction action message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
-            author: MemberId::from(&signing_key.verifying_key()),
+            author: author_member_id(&signing_key),
             content,
             time: std::time::SystemTime::now(),
         };
@@ -3378,7 +3397,7 @@ impl ApiClient {
         // Create the remove_reaction action message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
-            author: MemberId::from(&signing_key.verifying_key()),
+            author: author_member_id(&signing_key),
             content,
             time: std::time::SystemTime::now(),
         };
@@ -3497,7 +3516,7 @@ impl ApiClient {
         // Create the reply message
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
-            author: MemberId::from(&signing_key.verifying_key()),
+            author: author_member_id(&signing_key),
             content,
             time: std::time::SystemTime::now(),
         };
