@@ -79,6 +79,15 @@
 //!   cannot read it, has no view into per-message replay, and provides
 //!   no in-contract de-duplication of identical re-sent ciphertexts.
 //!
+//! - Since #432 each message carries TWO opaque ECIES envelopes: the
+//!   recipient-only [`DirectMessage::ciphertext`] and the sender-only
+//!   [`DirectMessage::sender_ciphertext`] (a copy the sender can read on
+//!   any device). Both are covered by the sender signature and each is
+//!   independently size-capped at [`MAX_DM_CIPHERTEXT_BYTES`], so on-wire
+//!   size and the per-pair storage/griefing bound below roughly DOUBLE
+//!   vs a single-envelope message. The sender copy is optional and absent
+//!   on pre-#432 messages.
+//!
 //! - A malicious member can grief storage by saturating their own
 //!   per-pair cap (up to [`MAX_DM_MESSAGES_PER_PAIR`] ×
 //!   [`MAX_DM_CIPHERTEXT_BYTES`] per recipient they target). The
@@ -266,6 +275,32 @@ pub struct DirectMessage {
 
     /// Opaque ciphertext, ECIES-encrypted to recipient's `member_vk`.
     pub ciphertext: Vec<u8>,
+
+    /// Optional second opaque ciphertext of the SAME plaintext body,
+    /// ECIES-encrypted to the SENDER's own `member_vk` (freenet/river#432).
+    ///
+    /// The recipient-only `ciphertext` above cannot be decrypted by the
+    /// sender, so historically a sender could only read their own sent DMs
+    /// from a device-local plaintext cache (issue #256). That cache never
+    /// leaves the device, so on a new node / after a delegate-key change the
+    /// sender's own sent messages render as "sent — ciphertext only". This
+    /// field carries a sender-decryptable copy inside the message itself, so
+    /// any device holding the sender's signing key can recover its own sent
+    /// DMs from contract state — exactly the way received DMs already work.
+    ///
+    /// `None` for messages authored before this field existed and by clients
+    /// that predate it; readers fall back to the local outbound-DM cache when
+    /// it is absent. When present it is covered by `sender_signature` (see
+    /// [`build_direct_message_signed_bytes`]) so it cannot be stripped or
+    /// substituted without invalidating the signature. Size-capped to
+    /// [`MAX_DM_CIPHERTEXT_BYTES`] like `ciphertext`.
+    ///
+    /// Placed LAST with `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// so a legacy message (`None`) serializes byte-identically to the
+    /// pre-#432 encoding — see the backwards-compat rule in
+    /// `.claude/rules/direct-messages.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_ciphertext: Option<Vec<u8>>,
 }
 
 /// A recipient-signed purge envelope.
@@ -315,19 +350,32 @@ pub struct RecipientPurges {
 ///     timestamp_le_u64            ( 8 bytes)
 ///     ciphertext_len_le_u32       ( 4 bytes)
 ///     ciphertext                  (variable)
+///     sender_ciphertext_len_le_u32( 4 bytes)   ONLY when Some
+///     sender_ciphertext           (variable)   ONLY when Some
 /// ```
 ///
-/// Canonical by construction: all fields fixed-length except the
-/// trailing ciphertext, which is preceded by its u32 little-endian
-/// length. The leading domain-separation tag prevents this signed
-/// buffer from ever being byte-equal to a [`build_recipient_purges_signed_bytes`]
-/// buffer regardless of crafted field lengths.
+/// Canonical by construction: all fields fixed-length except the two
+/// trailing ciphertexts, each preceded by its u32 little-endian length.
+/// The leading domain-separation tag prevents this signed buffer from ever
+/// being byte-equal to a [`build_recipient_purges_signed_bytes`] buffer
+/// regardless of crafted field lengths.
+///
+/// Backwards compatibility (freenet/river#432): the `sender_ciphertext`
+/// block is appended ONLY when `Some`, so a legacy message (`None`) produces
+/// byte-identical output to the pre-#432 layout and its signature still
+/// verifies. Because the block is covered by the signature when present, an
+/// attacker cannot strip it (verify would reconstruct without it and the
+/// signature would fail) nor graft one onto a legacy message (verify would
+/// reconstruct with it and fail). The verifier always reconstructs from the
+/// stored [`DirectMessage::sender_ciphertext`], so signing and verification
+/// stay in lock-step.
 pub fn build_direct_message_signed_bytes(
     sender: MemberId,
     recipient: MemberId,
     room_owner_vk: &VerifyingKey,
     timestamp: u64,
     ciphertext: &[u8],
+    sender_ciphertext: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     let ct_len: u32 = ciphertext.len().try_into().map_err(|_| {
         format!(
@@ -335,7 +383,17 @@ pub fn build_direct_message_signed_bytes(
             ciphertext.len()
         )
     })?;
-    let mut out = Vec::with_capacity(1 + 8 + 8 + 32 + 8 + 4 + ciphertext.len());
+    let sender_ct_len: Option<u32> = match sender_ciphertext {
+        Some(sct) => Some(sct.len().try_into().map_err(|_| {
+            format!(
+                "DM sender_ciphertext length {} does not fit in u32",
+                sct.len()
+            )
+        })?),
+        None => None,
+    };
+    let trailing = sender_ciphertext.map_or(0, |sct| 4 + sct.len());
+    let mut out = Vec::with_capacity(1 + 8 + 8 + 32 + 8 + 4 + ciphertext.len() + trailing);
     out.push(DOMAIN_TAG_MESSAGE);
     out.extend_from_slice(&sender.0 .0.to_le_bytes());
     out.extend_from_slice(&recipient.0 .0.to_le_bytes());
@@ -343,6 +401,10 @@ pub fn build_direct_message_signed_bytes(
     out.extend_from_slice(&timestamp.to_le_bytes());
     out.extend_from_slice(&ct_len.to_le_bytes());
     out.extend_from_slice(ciphertext);
+    if let (Some(sct), Some(sct_len)) = (sender_ciphertext, sender_ct_len) {
+        out.extend_from_slice(&sct_len.to_le_bytes());
+        out.extend_from_slice(sct);
+    }
     Ok(out)
 }
 
@@ -398,6 +460,7 @@ pub fn sign_direct_message(
     room_owner_vk: &VerifyingKey,
     timestamp: u64,
     ciphertext: Vec<u8>,
+    sender_ciphertext: Option<Vec<u8>>,
 ) -> Result<AuthorizedDirectMessage, String> {
     debug_assert_eq!(
         sender,
@@ -413,6 +476,7 @@ pub fn sign_direct_message(
         room_owner_vk,
         timestamp,
         &ciphertext,
+        sender_ciphertext.as_deref(),
     )?;
     let signature = sender_sk.sign(&bytes);
     Ok(AuthorizedDirectMessage {
@@ -421,6 +485,7 @@ pub fn sign_direct_message(
             recipient,
             timestamp,
             ciphertext,
+            sender_ciphertext,
         },
         sender_signature: signature,
     })
@@ -493,10 +558,17 @@ pub fn check_dm_future_skew(timestamp: u64, now_secs: u64) -> Result<(), String>
 ///
 /// Caps enforced here so a client never tries to push state the contract
 /// will silently drop:
-/// * `body` is rejected when the resulting envelope exceeds
+/// * `body` is rejected when either resulting envelope exceeds
 ///   [`MAX_DM_CIPHERTEXT_BYTES`].
 /// * `timestamp` is rejected if more than [`MAX_DM_FUTURE_SKEW_SECS`] ahead
 ///   of `now_secs` (the caller's view of wall-clock).
+///
+/// Portability (freenet/river#432): in addition to the recipient-only
+/// envelope, this seals a SECOND envelope of the same `body` to the sender's
+/// own key ([`DirectMessage::sender_ciphertext`]) so the sender can read its
+/// own sent DM from contract state on any device via
+/// [`open_own_direct_message`]. Both envelopes are covered by the sender's
+/// signature.
 #[cfg(feature = "ecies-randomized")]
 pub fn compose_direct_message(
     sender_sk: &SigningKey,
@@ -508,7 +580,8 @@ pub fn compose_direct_message(
 ) -> Result<AuthorizedDirectMessage, String> {
     check_dm_future_skew(timestamp, now_secs)?;
 
-    let sender = MemberId::from(&sender_sk.verifying_key());
+    let sender_vk = sender_sk.verifying_key();
+    let sender = MemberId::from(&sender_vk);
     let recipient = MemberId::from(recipient_vk);
     if sender == recipient {
         return Err("DM sender and recipient must differ".to_string());
@@ -525,6 +598,20 @@ pub fn compose_direct_message(
         ));
     }
 
+    // Sender-recoverable copy of the same body, sealed to the sender's own
+    // key. Independent per-message randomness, so it is NOT byte-equal to the
+    // recipient envelope even though the plaintext matches.
+    let sender_envelope = crate::ecies::seal_dm_for_recipient(&sender_vk, body);
+    if sender_envelope.len() > MAX_DM_CIPHERTEXT_BYTES {
+        return Err(format!(
+            "DM body too large: sender-copy envelope {} bytes exceeds cap {} (body {} bytes; {} bytes of crypto overhead)",
+            sender_envelope.len(),
+            MAX_DM_CIPHERTEXT_BYTES,
+            body.len(),
+            sender_envelope.len() - body.len()
+        ));
+    }
+
     sign_direct_message(
         sender_sk,
         sender,
@@ -532,6 +619,7 @@ pub fn compose_direct_message(
         room_owner_vk,
         timestamp,
         envelope,
+        Some(sender_envelope),
     )
 }
 
@@ -551,6 +639,33 @@ pub fn open_direct_message(
     msg: &AuthorizedDirectMessage,
 ) -> Result<Vec<u8>, String> {
     crate::ecies::unseal_dm_from_sender(recipient_sk, &msg.message.ciphertext)
+}
+
+/// Decrypt the SENDER's own copy of a sent DM ([`DirectMessage::sender_ciphertext`])
+/// back to plaintext, using the sender's signing key (freenet/river#432).
+///
+/// This is how a sender reads its own sent DMs on a device that lacks the
+/// local outbound-DM plaintext cache (a new node, or after a delegate-key
+/// change). Returns `Err` when the message carries no sender copy (authored
+/// before #432, or by a client that predates it) — callers then fall back to
+/// the local cache or a "ciphertext only" placeholder.
+///
+/// Does NOT verify the sender signature — the caller reads its own outbound
+/// message from already-validated contract state; call
+/// [`AuthorizedDirectMessage::verify_signature`] separately if needed.
+///
+/// Feature-gated on `ecies` (see [`open_direct_message`]).
+#[cfg(feature = "ecies")]
+pub fn open_own_direct_message(
+    sender_sk: &SigningKey,
+    msg: &AuthorizedDirectMessage,
+) -> Result<Vec<u8>, String> {
+    match &msg.message.sender_ciphertext {
+        Some(sender_ciphertext) => {
+            crate::ecies::unseal_dm_from_sender(sender_sk, sender_ciphertext)
+        }
+        None => Err("DM carries no sender copy (authored before #432)".to_string()),
+    }
 }
 
 /// Construct a fresh [`AuthorizedRecipientPurges`] that bumps the recipient's
@@ -622,6 +737,7 @@ impl AuthorizedDirectMessage {
             room_owner_vk,
             self.message.timestamp,
             &self.message.ciphertext,
+            self.message.sender_ciphertext.as_deref(),
         )?;
         sender_vk
             .verify(&bytes, &self.sender_signature)
@@ -774,6 +890,18 @@ impl ComposableState for DirectMessagesV1 {
                     msg.message.ciphertext.len(),
                     MAX_DM_CIPHERTEXT_BYTES
                 ));
+            }
+
+            // Sender-copy envelope (freenet/river#432) is opaque like
+            // `ciphertext`; cap it the same way.
+            if let Some(sct) = &msg.message.sender_ciphertext {
+                if sct.len() > MAX_DM_CIPHERTEXT_BYTES {
+                    return Err(format!(
+                        "DM sender_ciphertext too large: {} > {}",
+                        sct.len(),
+                        MAX_DM_CIPHERTEXT_BYTES
+                    ));
+                }
             }
 
             if msg.message.sender == msg.message.recipient {
@@ -1013,6 +1141,16 @@ impl ComposableState for DirectMessagesV1 {
 
         for msg in &delta.new_messages {
             if msg.message.ciphertext.len() > MAX_DM_CIPHERTEXT_BYTES {
+                continue; // silently drop oversized messages
+            }
+
+            // Sender-copy envelope (freenet/river#432) capped like `ciphertext`.
+            if msg
+                .message
+                .sender_ciphertext
+                .as_ref()
+                .is_some_and(|sct| sct.len() > MAX_DM_CIPHERTEXT_BYTES)
+            {
                 continue; // silently drop oversized messages
             }
 

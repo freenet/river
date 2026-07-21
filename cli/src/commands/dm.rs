@@ -17,8 +17,8 @@ use clap::Subcommand;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::chat_delegate::OutboundDmEntry;
 use river_core::room_state::direct_messages::{
-    advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
-    PurgeToken, MAX_DM_MESSAGES_PER_PAIR,
+    advance_recipient_purges, compose_direct_message, open_direct_message, open_own_direct_message,
+    pair_message_count, PurgeToken, MAX_DM_MESSAGES_PER_PAIR,
 };
 use river_core::room_state::dm_body::{decode_body, DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
@@ -432,11 +432,15 @@ async fn execute_list(
         }
 
         // Render the body as a String. For inbound DMs we decrypt the
-        // ECIES envelope, then decode the structured `DirectMessageBody`
-        // (which falls back to legacy raw-UTF-8 → `Text` for pre-#XXX
-        // peers). Outbound DMs go through the local plaintext cache as
-        // before — the cache stores the user-facing string regardless of
-        // wire shape.
+        // recipient ECIES envelope, then decode the structured
+        // `DirectMessageBody` (which falls back to legacy raw-UTF-8 → `Text`
+        // for pre-structured-body peers). For outbound DMs we prefer the
+        // local plaintext cache (#256); on a miss we fall back to the
+        // sender-copy envelope carried in the message itself
+        // (freenet/river#432), decrypting it with our own key exactly like
+        // the inbound path — so sent DMs are readable on a node without the
+        // cache. Only a legacy pre-#432 message with no cache entry shows
+        // the "ciphertext only" placeholder.
         let (body_str, is_invite) = if is_self_recipient {
             match open_direct_message(&signing_key, msg) {
                 Ok(bytes) => match decode_body(&bytes) {
@@ -449,11 +453,19 @@ async fn execute_list(
                 Err(_) => ("<unable to decrypt>".to_string(), false),
             }
         } else {
-            let plaintext = match outbound_lookup.get(&(msg.message.recipient, msg.purge_token())) {
-                Some(plaintext) => plaintext.clone(),
-                None => "<sent: ciphertext only>".to_string(),
-            };
-            (plaintext, false)
+            match outbound_lookup.get(&(msg.message.recipient, msg.purge_token())) {
+                Some(plaintext) => (plaintext.clone(), false),
+                None => match open_own_direct_message(&signing_key, msg) {
+                    Ok(bytes) => match decode_body(&bytes) {
+                        Ok(body) => {
+                            let invite = matches!(body, DirectMessageBody::Invite(_));
+                            (format_dm_body_for_cli(&body, &nicknames), invite)
+                        }
+                        Err(_) => ("<unable to decode body>".to_string(), false),
+                    },
+                    Err(_) => ("<sent: ciphertext only>".to_string(), false),
+                },
+            }
         };
 
         decrypted.push(DecryptedDm {
@@ -481,11 +493,15 @@ async fn execute_list(
             .then(a.timestamp.cmp(&b.timestamp))
     });
 
-    // Whether any inbound invite DM exists — computed BEFORE the per-thread
+    // Whether any INBOUND invite DM exists — computed BEFORE the per-thread
     // cap below so a `dm accept`able invite that scrolled off a chatty thread
     // still surfaces the discoverability tip (`dm accept` scans the full,
-    // uncapped state regardless of what `dm list` chose to print).
-    let any_invite = decrypted.iter().any(|dm| dm.is_invite);
+    // uncapped state regardless of what `dm list` chose to print). Must exclude
+    // OUTBOUND invites: since #432, a sent invite-via-DM also decodes to
+    // `is_invite` via the sender-copy fallback on a cacheless node, but
+    // `dm accept` only acts on inbound invites — so an outbound-only match
+    // would print a tip that leads nowhere.
+    let any_invite = decrypted.iter().any(|dm| dm.is_invite && !dm.outgoing);
 
     // Group + cap per counterparty.
     let mut by_peer: HashMap<MemberId, Vec<DecryptedDm>> = HashMap::new();
