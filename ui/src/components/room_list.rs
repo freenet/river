@@ -150,10 +150,14 @@ pub fn RoomList() -> Element {
     // not-yet-positioned rooms in a deterministic order — see
     // `Rooms::ordered_room_keys` (raw `HashMap` order is unstable).
     let room_items = use_memo(move || {
+        // CURRENT_ROOM is read (infallibly) BEFORE the fallible ROOMS read:
+        // `try_read() -> Err` registers no subscription (dioxus-signal-safety
+        // rules), so with the reads inverted an Err poll would leave this
+        // memo with zero subscriptions — permanently frozen room list.
+        let current_room_key = CURRENT_ROOM.read().owner_key;
         let Ok(rooms) = ROOMS.try_read() else {
             return Vec::new();
         };
-        let current_room_key = CURRENT_ROOM.read().owner_key;
 
         rooms
             .ordered_room_keys()

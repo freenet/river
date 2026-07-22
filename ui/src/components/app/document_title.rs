@@ -219,23 +219,119 @@ fn count_unread_dms(rooms: &crate::room_data::Rooms) -> usize {
         Ok(g) => g.clone(),
         Err(_) => return 0,
     };
+    let hidden = match crate::components::direct_messages::HIDDEN_DM_THREADS.try_read() {
+        Ok(g) => g.clone(),
+        Err(_) => return 0,
+    };
+    count_unread_dms_with(&rooms.map, &last_seen, &hidden)
+}
+
+/// Pure core of [`count_unread_dms`], mirroring the DM rail's per-thread
+/// accumulation (`dm_rail_section.rs`): a thread's unread only counts if
+/// the thread is actually visible in the panel. A hidden (archived)
+/// thread is skipped unless a message STRICTLY newer than its
+/// `hidden_at_ts` revived it — the same `is_thread_hidden_for` rule
+/// `filter_rail_entries` applies, and revival considers messages in both
+/// directions, exactly like the rail's `last_any_ts`. Without this
+/// filter the unread tallies (title, hamburger badge) count messages the
+/// user has no visible thread for and no way to clear.
+fn count_unread_dms_with(
+    map: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
+    last_seen: &std::collections::HashMap<(ed25519_dalek::VerifyingKey, MemberId), u64>,
+    hidden: &std::collections::HashMap<
+        (ed25519_dalek::VerifyingKey, MemberId),
+        river_core::chat_delegate::HiddenDmThreadEntry,
+    >,
+) -> usize {
     let mut total = 0usize;
-    for (owner_key, room_data) in &rooms.map {
+    for (owner_key, room_data) in map {
         let self_id: MemberId = room_data.self_sk.verifying_key().into();
+
+        // Per-peer accumulation: unread inbound messages plus the newest
+        // timestamp in either direction (the revival clock).
+        struct Acc {
+            last_any_ts: u64,
+            unread: usize,
+        }
+        let mut per_peer: std::collections::HashMap<MemberId, Acc> =
+            std::collections::HashMap::new();
         for msg in &room_data.room_state.direct_messages.messages {
-            if msg.message.recipient != self_id {
+            let is_self_sender = msg.message.sender == self_id;
+            let is_self_recipient = msg.message.recipient == self_id;
+            if !is_self_sender && !is_self_recipient {
                 continue;
             }
-            let cutoff = last_seen
-                .get(&(*owner_key, msg.message.sender))
-                .copied()
-                .unwrap_or(0);
-            if msg.message.timestamp > cutoff {
-                total += 1;
+            let peer = if is_self_sender {
+                msg.message.recipient
+            } else {
+                msg.message.sender
+            };
+            let acc = per_peer.entry(peer).or_insert(Acc {
+                last_any_ts: 0,
+                unread: 0,
+            });
+            if msg.message.timestamp > acc.last_any_ts {
+                acc.last_any_ts = msg.message.timestamp;
             }
+            if is_self_recipient {
+                let cutoff = last_seen.get(&(*owner_key, peer)).copied().unwrap_or(0);
+                if msg.message.timestamp > cutoff {
+                    acc.unread += 1;
+                }
+            }
+        }
+
+        for (peer, acc) in per_peer {
+            if crate::components::direct_messages::is_thread_hidden_for(
+                hidden,
+                owner_key,
+                peer,
+                acc.last_any_ts,
+            ) {
+                continue;
+            }
+            total += acc.unread;
         }
     }
     total
+}
+
+/// Sum unread messages across every room in `map` except `exclude`.
+///
+/// Pure (no signal reads) so the exclusion logic is unit-testable; the
+/// signal-reading wrapper is [`count_unread_behind_rooms_panel`].
+pub fn count_unread_excluding_room(
+    map: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
+    exclude: Option<&ed25519_dalek::VerifyingKey>,
+) -> usize {
+    map.iter()
+        .filter(|(owner_key, _)| Some(*owner_key) != exclude)
+        .map(|(_, room_data)| count_unread_in_room_data(room_data))
+        .sum()
+}
+
+/// Count unread messages waiting *behind* the mobile rooms panel: rooms
+/// OTHER than the currently-open one, plus inbound direct messages (the
+/// DM rail lives in that same panel).
+///
+/// Drives the badge on the mobile hamburger buttons in the conversation
+/// header. The current room is excluded because its messages are on
+/// screen and marked read on open — counting them would only make the
+/// badge flicker (mirrors the `!is_current` guard on the room-list
+/// badge in `room_list.rs`).
+pub fn count_unread_behind_rooms_panel() -> usize {
+    // CURRENT_ROOM is read (infallibly) BEFORE the fallible ROOMS read:
+    // `try_read() -> Err` registers no subscription (dioxus-signal-safety
+    // rules), so with the reads inverted an Err poll would leave the
+    // consuming memo with zero subscriptions — permanently frozen, badge
+    // silently stuck. The non-try read first guarantees at least the
+    // CURRENT_ROOM subscription always survives (same pattern as
+    // `current_room_label` in conversation.rs).
+    let current = CURRENT_ROOM.read().owner_key;
+    let Ok(rooms) = ROOMS.try_read() else {
+        return 0;
+    };
+    count_unread_excluding_room(&rooms.map, current.as_ref()) + count_unread_dms(&rooms)
 }
 
 /// Update the document title based on current state
@@ -693,5 +789,185 @@ mod tests {
             .filter(|m| m.message.author != self_id)
             .count();
         assert_eq!(count_unread_in_room_data(&rd), expected);
+    }
+
+    #[test]
+    fn excluding_the_current_room_omits_its_unread() {
+        // The mobile hamburger badge counts unread in OTHER rooms only —
+        // the current room's messages are on screen and marked read on
+        // open, so including them would make the badge flicker.
+        let (self_sk, _) = keypair();
+        let (owner_a_sk, owner_a_vk) = keypair();
+        let (owner_b_sk, owner_b_vk) = keypair();
+        let room_a = room(
+            self_sk.clone(),
+            owner_a_vk,
+            vec![
+                msg(&owner_a_sk, &owner_a_vk, 1),
+                msg(&owner_a_sk, &owner_a_vk, 2),
+            ],
+            None,
+        );
+        let room_b = room(
+            self_sk,
+            owner_b_vk,
+            vec![msg(&owner_b_sk, &owner_b_vk, 1)],
+            None,
+        );
+        let mut map = HashMap::new();
+        map.insert(owner_a_vk, room_a);
+        map.insert(owner_b_vk, room_b);
+
+        // Excluding room A (2 unread) leaves only room B's single unread.
+        assert_eq!(count_unread_excluding_room(&map, Some(&owner_a_vk)), 1);
+        // No current room (welcome screen): every room counts.
+        assert_eq!(count_unread_excluding_room(&map, None), 3);
+        // Excluding a key not in the map changes nothing.
+        let (_, other_vk) = keypair();
+        assert_eq!(count_unread_excluding_room(&map, Some(&other_vk)), 3);
+    }
+
+    /// Build a direct message. The counters never verify signatures, so
+    /// any signature over any bytes suffices.
+    fn dm(
+        sender: MemberId,
+        recipient: MemberId,
+        ts: u64,
+        signer: &SigningKey,
+    ) -> river_core::room_state::direct_messages::AuthorizedDirectMessage {
+        use ed25519_dalek::Signer;
+        river_core::room_state::direct_messages::AuthorizedDirectMessage {
+            message: river_core::room_state::direct_messages::DirectMessage {
+                sender,
+                recipient,
+                timestamp: ts,
+                ciphertext: vec![1, 2, 3],
+            },
+            sender_signature: signer.sign(b"test-dm"),
+        }
+    }
+
+    #[test]
+    fn dm_unread_counts_inbound_and_respects_last_seen() {
+        let (self_sk, self_vk) = keypair();
+        let (_owner_sk, owner_vk) = keypair();
+        let (peer_sk, peer_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let peer_id: MemberId = (&peer_vk).into();
+
+        let mut rd = room(self_sk, owner_vk, vec![], None);
+        rd.room_state.direct_messages.messages = vec![
+            dm(peer_id, self_id, 100, &peer_sk),
+            dm(peer_id, self_id, 200, &peer_sk),
+            // Outbound (self → peer): never unread.
+            dm(self_id, peer_id, 300, &peer_sk),
+        ];
+        let mut map = HashMap::new();
+        map.insert(owner_vk, rd);
+
+        // No last-seen: both inbound messages count, outbound doesn't.
+        assert_eq!(
+            count_unread_dms_with(&map, &HashMap::new(), &HashMap::new()),
+            2
+        );
+        // Seen up to ts=100: only the ts=200 inbound counts.
+        let mut seen = HashMap::new();
+        seen.insert((owner_vk, peer_id), 100u64);
+        assert_eq!(count_unread_dms_with(&map, &seen, &HashMap::new()), 1);
+    }
+
+    #[test]
+    fn dm_unread_skips_hidden_threads_until_revived() {
+        // A hidden (archived) thread is invisible in the DM rail, so its
+        // unread must not feed the badge/title tallies — until a message
+        // STRICTLY newer than hidden_at_ts revives it (the rail's
+        // `is_thread_hidden_for` strict-<= rule).
+        let (self_sk, self_vk) = keypair();
+        let (_owner_sk, owner_vk) = keypair();
+        let (peer_sk, peer_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let peer_id: MemberId = (&peer_vk).into();
+
+        let mut rd = room(self_sk, owner_vk, vec![], None);
+        rd.room_state.direct_messages.messages = vec![dm(peer_id, self_id, 100, &peer_sk)];
+        let mut map = HashMap::new();
+        map.insert(owner_vk, rd);
+
+        let mut hidden = HashMap::new();
+        hidden.insert(
+            (owner_vk, peer_id),
+            river_core::chat_delegate::HiddenDmThreadEntry {
+                room_owner_vk: owner_vk.to_bytes(),
+                peer: peer_id,
+                hidden_at_ts: 100,
+            },
+        );
+        // Hidden at the newest message's ts (<=): thread invisible → 0.
+        assert_eq!(count_unread_dms_with(&map, &HashMap::new(), &hidden), 0);
+
+        // A strictly newer inbound message revives the thread: both its
+        // unread messages count again (matching the rail badge).
+        map.get_mut(&owner_vk)
+            .unwrap()
+            .room_state
+            .direct_messages
+            .messages
+            .push(dm(peer_id, self_id, 150, &peer_sk));
+        assert_eq!(count_unread_dms_with(&map, &HashMap::new(), &hidden), 2);
+    }
+
+    #[test]
+    fn dm_unread_outbound_message_revives_hidden_thread() {
+        // The revival clock counts BOTH directions (the rail's
+        // `last_any_ts`): replying into a hidden thread makes it visible
+        // again, so its older unread inbound must count again too.
+        let (self_sk, self_vk) = keypair();
+        let (_owner_sk, owner_vk) = keypair();
+        let (peer_sk, peer_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let peer_id: MemberId = (&peer_vk).into();
+
+        let mut rd = room(self_sk, owner_vk, vec![], None);
+        rd.room_state.direct_messages.messages = vec![
+            dm(peer_id, self_id, 90, &peer_sk),  // inbound, unread
+            dm(self_id, peer_id, 150, &peer_sk), // outbound, after hide
+        ];
+        let mut map = HashMap::new();
+        map.insert(owner_vk, rd);
+
+        let mut hidden = HashMap::new();
+        hidden.insert(
+            (owner_vk, peer_id),
+            river_core::chat_delegate::HiddenDmThreadEntry {
+                room_owner_vk: owner_vk.to_bytes(),
+                peer: peer_id,
+                hidden_at_ts: 90,
+            },
+        );
+        // last_any_ts = 150 (outbound) > hidden_at 90 → revived → the
+        // ts=90 inbound counts.
+        assert_eq!(count_unread_dms_with(&map, &HashMap::new(), &hidden), 1);
+    }
+
+    #[test]
+    fn dm_unread_ignores_third_party_messages() {
+        // DMs between two OTHER members (present in replicated room
+        // state) must contribute nothing to the local user's count.
+        let (self_sk, _self_vk) = keypair();
+        let (_owner_sk, owner_vk) = keypair();
+        let (peer_sk, peer_vk) = keypair();
+        let (_other_sk, other_vk) = keypair();
+        let peer_id: MemberId = (&peer_vk).into();
+        let other_id: MemberId = (&other_vk).into();
+
+        let mut rd = room(self_sk, owner_vk, vec![], None);
+        rd.room_state.direct_messages.messages = vec![dm(peer_id, other_id, 100, &peer_sk)];
+        let mut map = HashMap::new();
+        map.insert(owner_vk, rd);
+
+        assert_eq!(
+            count_unread_dms_with(&map, &HashMap::new(), &HashMap::new()),
+            0
+        );
     }
 }
