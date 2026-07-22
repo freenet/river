@@ -99,7 +99,16 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
     let mut members = MembersV1::default();
     let mut member_info = MemberInfoV1::default();
 
-    // Always add owner to member_info
+    // The "other member" identity is generated up front so the owner can
+    // deputize them below: this makes the deputy 🛡 shield (and the
+    // member-info modal's deputy legend chip, freenet/river#451) visible in
+    // example / dev mode and exercisable by Playwright.
+    let other_member_sk = SigningKey::generate(&mut csprng);
+    let other_member_vk = other_member_sk.verifying_key();
+    let other_member_id = MemberId::from(&other_member_vk);
+
+    // Always add owner to member_info. The owner deputizes the other member
+    // (a global moderator), so that member shows the 🛡 shield in every view.
     member_info
         .member_info
         .push(AuthorizedMemberInfo::new_with_member_key(
@@ -109,7 +118,7 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
                 preferred_nickname: SealedBytes::public(
                     (random_full_name() + " (Owner)").into_bytes(),
                 ),
-                deputies: Vec::new(),
+                deputies: vec![other_member_id],
             },
             owner_sk,
         ));
@@ -143,11 +152,8 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
             ));
     }
 
-    // Always add another member to ensure the room has at least one member
-    let other_member_sk = SigningKey::generate(&mut csprng);
-    let other_member_vk = other_member_sk.verifying_key();
-    let other_member_id = MemberId::from(&other_member_vk);
-
+    // Add another member to ensure the room has at least one member. (Their
+    // identity was generated above so the owner could deputize them.)
     // In rooms where self is owner, other member should be invited by self
     // In other rooms, other member should be invited by owner
     let inviter_id = if self_is == SelfIs::Owner {
