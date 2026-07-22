@@ -917,16 +917,48 @@ mod tests {
     }
 
     #[test]
+    fn dm_unread_outbound_message_revives_hidden_thread() {
+        // The revival clock counts BOTH directions (the rail's
+        // `last_any_ts`): replying into a hidden thread makes it visible
+        // again, so its older unread inbound must count again too.
+        let (self_sk, self_vk) = keypair();
+        let (_owner_sk, owner_vk) = keypair();
+        let (peer_sk, peer_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let peer_id: MemberId = (&peer_vk).into();
+
+        let mut rd = room(self_sk, owner_vk, vec![], None);
+        rd.room_state.direct_messages.messages = vec![
+            dm(peer_id, self_id, 90, &peer_sk),  // inbound, unread
+            dm(self_id, peer_id, 150, &peer_sk), // outbound, after hide
+        ];
+        let mut map = HashMap::new();
+        map.insert(owner_vk, rd);
+
+        let mut hidden = HashMap::new();
+        hidden.insert(
+            (owner_vk, peer_id),
+            river_core::chat_delegate::HiddenDmThreadEntry {
+                room_owner_vk: owner_vk.to_bytes(),
+                peer: peer_id,
+                hidden_at_ts: 90,
+            },
+        );
+        // last_any_ts = 150 (outbound) > hidden_at 90 → revived → the
+        // ts=90 inbound counts.
+        assert_eq!(count_unread_dms_with(&map, &HashMap::new(), &hidden), 1);
+    }
+
+    #[test]
     fn dm_unread_ignores_third_party_messages() {
         // DMs between two OTHER members (present in replicated room
         // state) must contribute nothing to the local user's count.
         let (self_sk, _self_vk) = keypair();
         let (_owner_sk, owner_vk) = keypair();
         let (peer_sk, peer_vk) = keypair();
-        let (other_sk, other_vk) = keypair();
+        let (_other_sk, other_vk) = keypair();
         let peer_id: MemberId = (&peer_vk).into();
         let other_id: MemberId = (&other_vk).into();
-        let _ = &other_sk;
 
         let mut rd = room(self_sk, owner_vk, vec![], None);
         rd.room_state.direct_messages.messages = vec![dm(peer_id, other_id, 100, &peer_sk)];
