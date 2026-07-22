@@ -246,6 +246,61 @@ impl ProbeStateOps for RiverCliProbeOps {
     // to the caller. Do NOT add a prepare_forward override.
 }
 
+/// App-supplied state semantics for the ACTIVE-migration probe
+/// (freenet/river#442) — the search that finds the freshest state to migrate
+/// forward when a room is stranded on an older contract generation. The
+/// decode/classify rules are identical to the read/recovery path, so they
+/// delegate to an inner [`RiverCliProbeOps`] (one classifier of record for
+/// both paths). The ONE difference is `merge_with_local`: the active path
+/// CRDT-merges the recovered network state with the device-local cache (so the
+/// migrating PUT carries the freshest of both), whereas the read path adopts
+/// network state verbatim.
+struct RiverCliMigrationProbeOps {
+    /// Supplies decode + is_real (delegated) and the owner for the merge params.
+    inner: RiverCliProbeOps,
+}
+
+impl ProbeStateOps for RiverCliMigrationProbeOps {
+    type State = ChatRoomStateV1;
+
+    fn decode(&self, bytes: &[u8]) -> Option<ChatRoomStateV1> {
+        self.inner.decode(bytes)
+    }
+
+    fn is_real(&self, state: &ChatRoomStateV1) -> bool {
+        self.inner.is_real(state)
+    }
+
+    fn merge_with_local(
+        &self,
+        recovered: ChatRoomStateV1,
+        local: &ChatRoomStateV1,
+    ) -> ChatRoomStateV1 {
+        // The active-migration merge (unlike the read path's pass-through):
+        // CRDT-merge the recovered network state with the local cache so
+        // neither a fresher network state nor unsynced local edits are lost.
+        // Preserved exactly from the pre-driver `get_migration_state`:
+        //   let mut merged = net_state.clone();
+        //   merged.merge(&net_state, &params, local_state)  // Err => net_state
+        let params = ChatRoomParametersV1 {
+            owner: self.inner.owner_vk,
+        };
+        let mut merged = recovered.clone();
+        match merged.merge(&recovered, &params, local) {
+            Ok(()) => merged,
+            Err(e) => {
+                info!("Merge with local state failed ({e}); using network state alone");
+                recovered
+            }
+        }
+    }
+
+    // `prepare_forward` stays the driver default (identity): the caller
+    // (`migrate_room_to_new_contract`) strips the upgrade pointer at PUT time
+    // (freenet/river#427), so the state returned to adopt keeps its pointer —
+    // exactly the pre-driver behavior. Do NOT add a prepare_forward override.
+}
+
 /// Serialize a chain-walk-resolved state into the raw bytes the decision driver
 /// consumes. The single production re-encode used by `probe_legacy_bytes`;
 /// the round-trip tests encode through this SAME function so they exercise the
@@ -288,6 +343,81 @@ fn resolve_legacy_recovery_outcome(
              previous contract generations. The room may never have existed, or its \
              state may have been garbage-collected from the network."
         )),
+    }
+}
+
+/// The active-migration probe candidates, newest-first: the stored
+/// `previous_contract_key` (the immediately-previous generation) FIRST, then
+/// every known legacy generation newest-first
+/// (`legacy_contract_keys_for_owner` reverses the oldest-first registry). This
+/// preserves the pre-driver fast-path-then-deep-path order; under
+/// `NewestFirstWins` the stored key short-circuits the deep scan on a hit.
+/// Pure (no I/O) so the ordering is unit-testable.
+///
+/// The stored key is deliberately NOT de-duplicated against the registry: when
+/// it equals a registry generation it appears TWICE, and that duplicate is
+/// load-bearing. A probe "miss" is not only an absent state — it also covers a
+/// transient send failure or an 8s `LEGACY_PROBE_TIMEOUT`. The pre-driver code
+/// re-GET the stored key in the deep sweep after a fast-path miss, giving it a
+/// second attempt; de-duping would drop that retry, so a single transient
+/// timeout on the newest generation would advance to an OLDER one, migrate its
+/// stale state forward, and clear `previous_contract_key` — stranding newer
+/// network-only state on the skipped generation. `NewestFirstWins` never issues
+/// the second GET after a fast-path HIT (the probe ends there), so the duplicate
+/// only ever costs a retry after a miss — exactly the pre-driver semantics
+/// (freenet/river#442 review finding).
+///
+/// Intentional consequence of probing the stored key FIRST: if it carries state
+/// it is adopted under `NewestFirstWins` even over a NEWER registry generation
+/// that also has state. In the normal case this is moot — the stored
+/// `previous_contract_key` IS the immediately-previous (newest legacy)
+/// generation — but if it were ever an older generation with state, the fast
+/// path wins. That is deliberate: it preserves the pre-driver semantics, whose
+/// fast path returned the stored-key GET before the deep sweep ran.
+fn migration_candidate_ids(
+    previous_contract_key_str: &Option<String>,
+    room_owner_key: &VerifyingKey,
+) -> Vec<ContractInstanceId> {
+    let mut ids = Vec::new();
+    // Fast path: the immediately-previous contract key recorded in storage.
+    if let Some(prev_key_str) = previous_contract_key_str {
+        match prev_key_str.parse::<ContractInstanceId>() {
+            Ok(prev_id) => ids.push(prev_id),
+            Err(e) => warn!("Stored previous_contract_key is not a valid contract id: {e}"),
+        }
+    }
+    // Deep path: every known previous contract generation, newest-first. The
+    // stored key is re-listed here when it is a registry generation (NOT
+    // de-duped) so a transient miss on the fast-path attempt is retried before
+    // the probe advances to an older generation (see the doc comment).
+    for legacy_key in river_core::migration::legacy_contract_keys_for_owner(room_owner_key) {
+        ids.push(*legacy_key.id());
+    }
+    ids
+}
+
+/// Map a completed active-migration probe [`Outcome`] to the state to migrate
+/// forward. Pure and I/O-free so it is unit-testable without a live node.
+///
+/// Unlike the read path's [`resolve_legacy_recovery_outcome`] (which errors on
+/// exhaustion — the CLI never seeds a read), the active path FALLS BACK to the
+/// local cache when nothing is reachable on-network, exactly as the pre-driver
+/// `get_migration_state` did (`Ok(local_state.clone())`):
+///
+/// * `Recovered { merged }` — a generation had real state; `merged` is that
+///   network state CRDT-merged with the local cache (see
+///   [`RiverCliMigrationProbeOps::merge_with_local`]).
+/// * `SeedLocal { local }` / `NoLegacy { local }` — every candidate missed (or
+///   there were none): migrate the local cache forward.
+/// * `None` — defensive (an already-taken outcome): the local cache.
+fn resolve_migration_state_outcome(
+    outcome: Option<Outcome<ChatRoomStateV1>>,
+    local_state: &ChatRoomStateV1,
+) -> ChatRoomStateV1 {
+    match outcome {
+        Some(Outcome::Recovered { merged, .. }) => merged,
+        Some(Outcome::SeedLocal { local }) | Some(Outcome::NoLegacy { local }) => local,
+        None => local_state.clone(),
     }
 }
 
@@ -2557,56 +2687,84 @@ impl ApiClient {
         local_state: &ChatRoomStateV1,
         previous_contract_key_str: &Option<String>,
     ) -> Result<ChatRoomStateV1> {
-        let mut network_state: Option<ChatRoomStateV1> = None;
+        // Candidates newest-first: the stored previous_contract_key first, then
+        // the legacy registry — the same fast-path-then-deep-path order the
+        // pre-driver search used. The stored key is re-listed (NOT deduped) so a
+        // transient fast-path miss is retried before advancing to an older
+        // generation (freenet/river#442 review finding; see migration_candidate_ids).
+        let candidate_ids = migration_candidate_ids(previous_contract_key_str, room_owner_key);
+        let candidate_count = candidate_ids.len();
+        info!(
+            "Searching {candidate_count} contract generation(s) for the freshest state to \
+             migrate forward"
+        );
 
-        // Fast path: the immediately-previous contract key recorded in storage.
-        if let Some(prev_key_str) = previous_contract_key_str {
-            match prev_key_str.parse::<ContractInstanceId>() {
-                Ok(prev_id) => {
-                    info!("Trying GET from previous contract {prev_id} for migration");
-                    network_state = self
-                        .try_get_state(room_owner_key, prev_id, LEGACY_PROBE_TIMEOUT)
-                        .await;
-                }
-                Err(e) => warn!("Stored previous_contract_key is not a valid contract id: {e}"),
+        // The same sans-IO decision driver the read/recovery path runs
+        // (freenet/river#398 phase 2b, #437), with the ACTIVE path's semantics:
+        // `merge_with_local` is the REAL CRDT merge (`RiverCliMigrationProbeOps`),
+        // and exhaustion falls back to the local cache rather than erroring.
+        // `NewestFirstWins` stops at the first real generation — so the stored
+        // key short-circuits the deep scan on a hit, preserving the fast path.
+        let mut driver = ProbeDriver::new(
+            RiverCliMigrationProbeOps {
+                inner: RiverCliProbeOps {
+                    owner_vk: *room_owner_key,
+                },
+            },
+            // Folded into a hit via `merge_with_local`, and handed back verbatim
+            // on exhaustion (SeedLocal / NoLegacy) — the pre-driver
+            // `Ok(local_state.clone())` fallback.
+            local_state.clone(),
+            NewestFirst::assume_ordered(candidate_ids),
+            SelectionPolicy::NewestFirstWins,
+        )
+        // Size the hop cap to the candidate set so the driver's default 64-hop
+        // cap can never truncate a >64-generation registry (the pre-driver deep
+        // path was unbounded), mirroring the read path.
+        .with_max_hops(candidate_count.max(freenet_migrate::DEFAULT_MAX_PROBE_HOPS));
+
+        // Trivial pump: one awaitable GET per candidate. `probe_migration_bytes`
+        // is the I/O adapter (plain GET, no upgrade-chain walk — matching the
+        // pre-driver active path); the driver owns decode + is_real + merge.
+        while let Step::Get(id) = driver.next_action() {
+            match self.probe_migration_bytes(room_owner_key, id).await {
+                Some(bytes) => driver.on_response(id, &bytes),
+                None => driver.on_timeout(id),
             }
         }
 
-        // Deep path: probe every known previous contract generation
-        // newest-first. Covers a room dormant across several WASM upgrades.
-        if network_state.is_none() {
-            for legacy_key in river_core::migration::legacy_contract_keys_for_owner(room_owner_key)
-            {
-                if let Some(state) = self
-                    .try_get_state(room_owner_key, *legacy_key.id(), LEGACY_PROBE_TIMEOUT)
-                    .await
-                {
-                    info!("Found state on a previous contract generation for migration");
-                    network_state = Some(state);
-                    break;
-                }
+        // Pure outcome->state mapping (unit-tested): Recovered => the merged
+        // state; SeedLocal / NoLegacy => the local cache migrated forward.
+        let outcome = driver.take_outcome();
+        match &outcome {
+            Some(Outcome::Recovered { source, .. }) => {
+                info!("Found state on a previous contract generation ({source}) for migration")
             }
+            _ => info!("No network state on any contract generation; using local cached state"),
         }
+        Ok(resolve_migration_state_outcome(outcome, local_state))
+    }
 
-        match network_state {
-            Some(net_state) => {
-                // CRDT-merge the network state with the local cache so neither a
-                // fresher network state nor unsynced local edits are lost.
-                let params = ChatRoomParametersV1 {
-                    owner: *room_owner_key,
-                };
-                let mut merged = net_state.clone();
-                if let Err(e) = merged.merge(&net_state, &params, local_state) {
-                    info!("Merge with local state failed ({e}); using network state alone");
-                    return Ok(net_state);
-                }
-                Ok(merged)
-            }
-            None => {
-                info!("No network state on any contract generation; using local cached state");
-                Ok(local_state.clone())
-            }
-        }
+    /// Probe one contract generation for the active-migration decision driver:
+    /// GET it (with the legacy timeout) and return the resolved state's raw
+    /// bytes for the driver to classify. `None` = timeout / absent / empty /
+    /// undecodable (a miss — the driver advances).
+    ///
+    /// Unlike the read path's `probe_legacy_bytes`, this does NOT walk the
+    /// forward upgrade chain: the pre-driver `get_migration_state` used a plain
+    /// `try_get_state` per generation, and this preserves that exactly.
+    async fn probe_migration_bytes(
+        &self,
+        room_owner_key: &VerifyingKey,
+        id: ContractInstanceId,
+    ) -> Option<Vec<u8>> {
+        let state = self
+            .try_get_state(room_owner_key, id, LEGACY_PROBE_TIMEOUT)
+            .await?;
+        // Re-serialize so the driver decodes + classifies it (a cheap round-trip;
+        // migration is a rare CLI path), through the SAME `encode_probe_state`
+        // the read path and the round-trip tests use.
+        encode_probe_state(&state)
     }
 
     /// Send an upgrade pointer to the old contract key for old-client compatibility.
@@ -6250,6 +6408,390 @@ mod migration_recovery_tests {
                 "the full not-found error text must be preserved; got: {msg}"
             );
         }
+    }
+
+    // --- freenet/river#442: the ACTIVE room-migration search
+    // (`get_migration_state`) now runs on freenet_migrate's decision driver via
+    // `RiverCliMigrationProbeOps`, completing what #437 did for the read path.
+    // The two active-path differences from the read path pinned here: the merge
+    // with local is a REAL CRDT merge, and exhaustion falls back to the local
+    // cache (never an error). ---
+
+    /// The pure `resolve_migration_state_outcome`: Recovered returns the merged
+    /// state; SeedLocal and NoLegacy both fall back to the carried local
+    /// snapshot (the active path migrates the local cache forward when nothing
+    /// is on-network — it does NOT error like the read path); a defensive None
+    /// falls back to the passed-in local cache.
+    #[test]
+    fn migration_outcome_recovered_returns_merged_others_seed_local() {
+        let owner_sk = SigningKey::from_bytes(&[91u8; 32]);
+        let merged = owner_state_with_messages(&owner_sk, &["merged network+local"]);
+        let local = owner_state_with_messages(&owner_sk, &["local only"]);
+
+        let out = resolve_migration_state_outcome(
+            Some(Outcome::Recovered {
+                merged: merged.clone(),
+                source: cli_id(9),
+                truncated_fold: false,
+            }),
+            &local,
+        );
+        assert_eq!(
+            out, merged,
+            "Recovered must return the merged state verbatim"
+        );
+
+        // SeedLocal / NoLegacy both migrate the outcome's carried local forward.
+        let seed = owner_state_with_messages(&owner_sk, &["seeded"]);
+        assert_eq!(
+            resolve_migration_state_outcome(
+                Some(Outcome::SeedLocal {
+                    local: seed.clone()
+                }),
+                &local
+            ),
+            seed,
+            "SeedLocal must migrate the (carried) local snapshot forward"
+        );
+        let no_legacy = owner_state_with_messages(&owner_sk, &["nolegacy"]);
+        assert_eq!(
+            resolve_migration_state_outcome(
+                Some(Outcome::NoLegacy {
+                    local: no_legacy.clone()
+                }),
+                &local
+            ),
+            no_legacy,
+            "NoLegacy must migrate the (carried) local snapshot forward"
+        );
+        assert_eq!(
+            resolve_migration_state_outcome(None, &local),
+            local,
+            "an already-taken outcome falls back to the local cache (never an error)"
+        );
+    }
+
+    /// The active-migration ops delegate decode + is_real to the shared
+    /// `RiverCliProbeOps` classifier (one classifier of record for both paths):
+    /// an owner-signed state is real, a default is not, undecodable bytes miss.
+    #[test]
+    fn migration_probe_ops_classifies_via_shared_classifier() {
+        let owner_sk = SigningKey::from_bytes(&[93u8; 32]);
+        let ops = RiverCliMigrationProbeOps {
+            inner: RiverCliProbeOps {
+                owner_vk: owner_sk.verifying_key(),
+            },
+        };
+        assert!(ops.is_real(&owner_state_with_messages(&owner_sk, &["hi"])));
+        assert!(
+            !ops.is_real(&ChatRoomStateV1::default()),
+            "a default state must NOT be real (a miss)"
+        );
+        assert!(
+            ops.decode(&encode_state(&owner_state_with_messages(
+                &owner_sk,
+                &["hi"]
+            )))
+            .is_some(),
+            "valid CBOR must decode"
+        );
+        assert!(
+            ops.decode(&[0xffu8; 8]).is_none(),
+            "undecodable bytes must map to None (a miss)"
+        );
+    }
+
+    /// THE distinguishing active-path behavior: `merge_with_local` is the REAL
+    /// CRDT merge, NOT the read path's pass-through. Recovered and local carry
+    /// DISJOINT owner-authored messages; the merge must contain BOTH — a
+    /// pass-through would silently drop the device-local message.
+    #[test]
+    fn migration_probe_ops_merge_with_local_is_the_real_merge() {
+        let owner_sk = SigningKey::from_bytes(&[92u8; 32]);
+        let ops = RiverCliMigrationProbeOps {
+            inner: RiverCliProbeOps {
+                owner_vk: owner_sk.verifying_key(),
+            },
+        };
+        let recovered = owner_state_with_messages(&owner_sk, &["network-only"]);
+        let local = owner_state_with_messages(&owner_sk, &["local-only"]);
+
+        let merged = ops.merge_with_local(recovered, &local);
+        let texts: Vec<String> = merged
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| message_display_text(&merged, m))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "network-only"),
+            "the recovered network message must survive the merge; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "local-only"),
+            "the device-local message must be folded in (the ACTIVE path's real \
+             merge, not the read path's pass-through); got {texts:?}"
+        );
+    }
+
+    /// `migration_candidate_ids` puts the stored previous_contract_key FIRST,
+    /// then the legacy registry newest-first. When the stored key IS a registry
+    /// generation it is deliberately re-listed (present TWICE), NOT de-duped:
+    /// the duplicate is the retry a transient fast-path miss (send failure / 8s
+    /// timeout) needs before the probe advances to an older generation
+    /// (freenet/river#442 review finding). Stored-key-first + the retry preserve
+    /// the pre-driver fast-path-then-deep-path semantics under `NewestFirstWins`.
+    #[test]
+    fn migration_candidates_put_stored_key_first_and_keep_retry_duplicate() {
+        let owner = SigningKey::from_bytes(&[94u8; 32]).verifying_key();
+        let legacy: Vec<ContractInstanceId> =
+            river_core::migration::legacy_contract_keys_for_owner(&owner)
+                .iter()
+                .map(|k| *k.id())
+                .collect();
+        assert!(
+            !legacy.is_empty(),
+            "precondition: the owner has at least one legacy generation to probe"
+        );
+
+        // A distinct stored key (not in the registry) is prepended; registry follows.
+        let distinct = cli_id(200);
+        assert!(
+            !legacy.contains(&distinct),
+            "fixture: the distinct stored key must not collide with the registry"
+        );
+        let with_distinct = migration_candidate_ids(&Some(distinct.to_string()), &owner);
+        assert_eq!(
+            with_distinct.first(),
+            Some(&distinct),
+            "the stored key must be probed first (the fast path)"
+        );
+        assert_eq!(
+            &with_distinct[1..],
+            &legacy[..],
+            "the full registry follows the stored key, in newest-first order"
+        );
+
+        // A stored key that IS a registry generation is RE-LISTED (present
+        // twice), NOT de-duped: it is probed first AND again in its registry
+        // slot, so the fast-path attempt has a deep-sweep retry.
+        let dup = legacy[0];
+        let with_dup = migration_candidate_ids(&Some(dup.to_string()), &owner);
+        assert_eq!(
+            with_dup.first(),
+            Some(&dup),
+            "the stored key is still probed first"
+        );
+        assert_eq!(
+            &with_dup[1..],
+            &legacy[..],
+            "the full registry (including the stored key's own slot) follows it — the \
+             stored key is re-listed so a transient fast-path miss is retried"
+        );
+        assert_eq!(
+            with_dup.iter().filter(|&&id| id == dup).count(),
+            2,
+            "a stored key that is also a registry generation must appear TWICE (the \
+             retry duplicate), never de-duped to once"
+        );
+        assert_eq!(
+            with_dup.len(),
+            legacy.len() + 1,
+            "the retry duplicate adds exactly one candidate ahead of the registry"
+        );
+
+        // No stored key, or an unparseable one → just the registry.
+        assert_eq!(migration_candidate_ids(&None, &owner), legacy);
+        assert_eq!(
+            migration_candidate_ids(&Some("not-a-contract-id".to_string()), &owner),
+            legacy,
+            "an unparseable stored key is skipped, leaving the registry"
+        );
+    }
+
+    /// The retry duplicate in action at the driver level: a transient timeout on
+    /// the newest generation (the fast-path attempt) does NOT strand the probe
+    /// on an older generation — the re-listed stored key is retried and recovers
+    /// the NEWEST state. Without the duplicate, the timeout would advance to
+    /// `cli_id(5)` and migrate stale state forward, clearing the pointer (the
+    /// freenet/river#442 review finding).
+    #[test]
+    fn migration_retry_after_transient_timeout_recovers_newest() {
+        let owner_sk = SigningKey::from_bytes(&[97u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let local = owner_state_with_messages(&owner_sk, &["local"]);
+        // Candidates as migration_candidate_ids builds them when the stored key
+        // is the newest registry generation: [stored, stored(retry), older].
+        let mut driver = ProbeDriver::new(
+            RiverCliMigrationProbeOps {
+                inner: RiverCliProbeOps { owner_vk },
+            },
+            local.clone(),
+            NewestFirst::assume_ordered(vec![cli_id(9), cli_id(9), cli_id(5)]),
+            SelectionPolicy::NewestFirstWins,
+        );
+        // Fast-path attempt on the newest generation transiently times out.
+        let Step::Get(first) = driver.next_action() else {
+            panic!("expected a GET")
+        };
+        assert_eq!(first, cli_id(9));
+        driver.on_timeout(first);
+        // The re-listed stored key is retried (NOT an older generation) and hits.
+        let Step::Get(retry) = driver.next_action() else {
+            panic!("expected the retry GET")
+        };
+        assert_eq!(
+            retry,
+            cli_id(9),
+            "a transient timeout must retry the newest generation, not advance to an older one"
+        );
+        driver.on_response(
+            retry,
+            &encode_state(&owner_state_with_messages(&owner_sk, &["newest"])),
+        );
+        assert_eq!(driver.next_action(), Step::Done);
+        let Some(Outcome::Recovered { source, merged, .. }) = driver.take_outcome() else {
+            panic!("the retry must recover the newest generation")
+        };
+        assert_eq!(
+            source,
+            cli_id(9),
+            "the newest generation is recovered by the retry, not the older cli_id(5)"
+        );
+        let texts: Vec<String> = merged
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| message_display_text(&merged, m))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "newest"),
+            "the recovered state is the newest generation's; got {texts:?}"
+        );
+    }
+
+    /// End-to-end at the driver level: `RiverCliMigrationProbeOps` + a real
+    /// `ProbeDriver` adopt the NEWEST real generation (anti-rollback) AND fold
+    /// the local cache into it (the active path's real merge), then
+    /// `resolve_migration_state_outcome` returns that merged state.
+    #[test]
+    fn cli_migration_driver_adopts_newest_and_merges_local() {
+        let owner_sk = SigningKey::from_bytes(&[95u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let local = owner_state_with_messages(&owner_sk, &["local"]);
+        let mut driver = ProbeDriver::new(
+            RiverCliMigrationProbeOps {
+                inner: RiverCliProbeOps { owner_vk },
+            },
+            local.clone(),
+            NewestFirst::assume_ordered(vec![cli_id(9), cli_id(5)]),
+            SelectionPolicy::NewestFirstWins,
+        );
+        let Step::Get(newest) = driver.next_action() else {
+            panic!("expected a GET")
+        };
+        assert_eq!(newest, cli_id(9), "the newest generation is probed first");
+        driver.on_response(
+            newest,
+            &encode_state(&owner_state_with_messages(&owner_sk, &["network"])),
+        );
+        assert_eq!(
+            driver.next_action(),
+            Step::Done,
+            "NewestFirstWins stops at the first real generation"
+        );
+        let state = resolve_migration_state_outcome(driver.take_outcome(), &local);
+        let texts: Vec<String> = state
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| message_display_text(&state, m))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "network"),
+            "the adopted network state must be kept; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "local"),
+            "the local cache must be folded into the migrated state; got {texts:?}"
+        );
+    }
+
+    /// End-to-end exhaustion: every candidate misses, so the driver reports
+    /// SeedLocal — which the active path migrates FORWARD as the local cache
+    /// (never an error, unlike the read path's not-found Err).
+    #[test]
+    fn cli_migration_driver_exhausts_to_local_cache() {
+        let owner_sk = SigningKey::from_bytes(&[96u8; 32]);
+        let local = owner_state_with_messages(&owner_sk, &["only local"]);
+        let mut driver = ProbeDriver::new(
+            RiverCliMigrationProbeOps {
+                inner: RiverCliProbeOps {
+                    owner_vk: owner_sk.verifying_key(),
+                },
+            },
+            local.clone(),
+            NewestFirst::assume_ordered(vec![cli_id(2), cli_id(1)]),
+            SelectionPolicy::NewestFirstWins,
+        );
+        let Step::Get(a) = driver.next_action() else {
+            panic!()
+        };
+        driver.on_timeout(a); // absent generation
+        let Step::Get(b) = driver.next_action() else {
+            panic!()
+        };
+        driver.on_response(b, &[0xffu8; 8]); // undecodable → miss
+        assert_eq!(driver.next_action(), Step::Done);
+        let state = resolve_migration_state_outcome(driver.take_outcome(), &local);
+        assert_eq!(
+            state, local,
+            "on exhaustion the active path migrates the local cache forward, never errors"
+        );
+    }
+
+    /// Source-grep pin: `get_migration_state` must drive the generation search
+    /// through the decision driver (newest-first) with the active-path MERGE ops
+    /// (`RiverCliMigrationProbeOps`), size its hop cap to the candidate set,
+    /// build candidates via `migration_candidate_ids`, and route the outcome
+    /// through the pure `resolve_migration_state_outcome`. A refactor that
+    /// re-introduced the hand-rolled fast-path/deep-path loop would fail this.
+    #[test]
+    fn active_migration_routes_through_decision_driver() {
+        let full = include_str!("api.rs");
+        let fn_start = full
+            .find("async fn get_migration_state")
+            .expect("get_migration_state must exist");
+        // Bound the slice at the next fn so we only inspect this function body.
+        let rest = &full[fn_start..];
+        let body_end = rest
+            .find("async fn probe_migration_bytes")
+            .expect("probe_migration_bytes must follow get_migration_state");
+        let body = &rest[..body_end];
+
+        // Match "NewestFirstWins" bare so a `use` that drops the
+        // `SelectionPolicy::` prefix cannot false-fail this pin.
+        assert!(
+            body.contains("NewestFirstWins"),
+            "the active-migration search must use the newest-first decision driver"
+        );
+        assert!(
+            body.contains("RiverCliMigrationProbeOps"),
+            "the active path must use the merge-with-local ops, NOT the read path's pass-through"
+        );
+        assert!(
+            body.contains("with_max_hops"),
+            "the driver must size its hop cap to the candidate set (the pre-driver deep path \
+             was unbounded)"
+        );
+        assert!(
+            body.contains("migration_candidate_ids"),
+            "candidates must be built by the shared stored-key-first + dedupe helper"
+        );
+        assert!(
+            body.contains("resolve_migration_state_outcome"),
+            "the outcome->state mapping must go through the pure, unit-tested resolver"
+        );
     }
 }
 
