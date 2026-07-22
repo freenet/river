@@ -3,9 +3,10 @@ use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::receive_times::{format_delay, get_delay_secs};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{
-    MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS,
+    MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
+    ROOMS,
 };
-use crate::room_data::SendMessageError;
+use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
@@ -23,8 +24,8 @@ use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile, FaPenToSquare, FaReply,
-    FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile,
+    FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -950,6 +951,20 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // The current room's notification mode, for the header bell icon + tooltip.
+    // Absent entry means the default (`All`).
+    let current_notification_mode = use_memo(move || {
+        let current_room = CURRENT_ROOM.read();
+        let Some(key) = current_room.owner_key else {
+            return NotificationMode::All;
+        };
+        ROOMS
+            .try_read()
+            .ok()
+            .and_then(|rooms| rooms.notification_modes.get(&key).copied())
+            .unwrap_or_default()
+    });
+
     // Memoize room description as rendered HTML (markdown)
     let current_room_description_html = use_memo({
         move || {
@@ -1870,28 +1885,65 @@ pub fn Conversation() -> Element {
                                 // `<button>` per the HTML spec. Nesting also bubbles link
                                 // clicks to the modal-opening onclick handler.
                                 div { class: "min-w-0 flex-1",
-                                    button {
-                                        // `md:-mx-3` only pulls the hover target outward on
-                                        // desktop, where there is no adjacent hamburger. On
-                                        // mobile the negative margin is dropped so this
-                                        // room-details target stays clear of the hamburger (#402).
-                                        class: "flex items-center gap-2 px-3 py-1.5 md:-mx-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0 w-full",
-                                        title: "Room details",
-                                        onclick: move |_| {
-                                            crate::util::defer(move || {
-                                                if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                                    EDIT_ROOM_MODAL.with_mut(|modal| {
-                                                        modal.room = Some(current_room);
-                                                    });
-                                                }
-                                            });
-                                        },
-                                        h2 { class: "text-lg font-semibold text-text truncate",
-                                            "{current_room_label}"
+                                    // Room title + notification bell on one line, so the bell
+                                    // sits right after the (i) and vertically centred with it —
+                                    // NOT at the header's far edge. The bell is a SIBLING of the
+                                    // room-details button (a <button> can't nest another
+                                    // <button>). The title button is content-sized (no `w-full`)
+                                    // so the bell hugs the (i); a long name still truncates via
+                                    // `min-w-0` + `truncate`.
+                                    div { class: "flex items-center gap-1 min-w-0",
+                                        button {
+                                            // `md:-ml-3` pulls only the LEFT hover edge outward on
+                                            // desktop (no adjacent hamburger there); the right edge
+                                            // stays put so the bell sits close to the (i). On mobile
+                                            // the negative margin is dropped so this room-details
+                                            // target stays clear of the hamburger (#402).
+                                            class: "flex items-center gap-2 px-3 py-1.5 md:-ml-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0",
+                                            title: "Room details",
+                                            onclick: move |_| {
+                                                crate::util::defer(move || {
+                                                    if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                        EDIT_ROOM_MODAL.with_mut(|modal| {
+                                                            modal.room = Some(current_room);
+                                                        });
+                                                    }
+                                                });
+                                            },
+                                            h2 { class: "text-lg font-semibold text-text truncate",
+                                                "{current_room_label}"
+                                            }
+                                            span {
+                                                class: "text-text-muted flex-shrink-0",
+                                                Icon { icon: FaCircleInfo, width: 16, height: 16 }
+                                            }
                                         }
-                                        span {
-                                            class: "text-text-muted flex-shrink-0",
-                                            Icon { icon: FaCircleInfo, width: 16, height: 16 }
+                                        // Per-room notification preference. Icon reflects state:
+                                        // bell = notifying, bell-slash = muted; the tooltip names
+                                        // the exact mode. Opens the compact NotificationModal.
+                                        // Sized to 16px to pair with the adjacent (i) icon.
+                                        button {
+                                            "data-testid": "notification-bell-button",
+                                            class: "flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                            title: match *current_notification_mode.read() {
+                                                NotificationMode::All => "Notifications: All messages",
+                                                NotificationMode::MentionsAndReplies => "Notifications: Mentions & replies only",
+                                                NotificationMode::Muted => "Notifications: Muted",
+                                            },
+                                            onclick: move |_| {
+                                                crate::util::defer(move || {
+                                                    if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                        NOTIFICATION_MODAL.with_mut(|modal| {
+                                                            modal.room = Some(current_room);
+                                                        });
+                                                    }
+                                                });
+                                            },
+                                            if *current_notification_mode.read() == NotificationMode::Muted {
+                                                Icon { icon: FaBellSlash, width: 16, height: 16 }
+                                            } else {
+                                                Icon { icon: FaBell, width: 16, height: 16 }
+                                            }
                                         }
                                     }
                                     if let Some(desc_html) = current_room_description_html.read().as_ref() {
