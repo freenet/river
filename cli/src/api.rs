@@ -349,34 +349,41 @@ fn resolve_legacy_recovery_outcome(
 /// The active-migration probe candidates, newest-first: the stored
 /// `previous_contract_key` (the immediately-previous generation) FIRST, then
 /// every known legacy generation newest-first
-/// (`legacy_contract_keys_for_owner` reverses the oldest-first registry), with
-/// the stored key de-duplicated out of the registry tail so it is probed once.
-/// This preserves the pre-driver fast-path-then-deep-path order; under
+/// (`legacy_contract_keys_for_owner` reverses the oldest-first registry). This
+/// preserves the pre-driver fast-path-then-deep-path order; under
 /// `NewestFirstWins` the stored key short-circuits the deep scan on a hit.
-/// Pure (no I/O) so the ordering + dedup are unit-testable.
+/// Pure (no I/O) so the ordering is unit-testable.
+///
+/// The stored key is deliberately NOT de-duplicated against the registry: when
+/// it equals a registry generation it appears TWICE, and that duplicate is
+/// load-bearing. A probe "miss" is not only an absent state — it also covers a
+/// transient send failure or an 8s `LEGACY_PROBE_TIMEOUT`. The pre-driver code
+/// re-GET the stored key in the deep sweep after a fast-path miss, giving it a
+/// second attempt; de-duping would drop that retry, so a single transient
+/// timeout on the newest generation would advance to an OLDER one, migrate its
+/// stale state forward, and clear `previous_contract_key` — stranding newer
+/// network-only state on the skipped generation. `NewestFirstWins` never issues
+/// the second GET after a fast-path HIT (the probe ends there), so the duplicate
+/// only ever costs a retry after a miss — exactly the pre-driver semantics
+/// (freenet/river#442 review finding).
 fn migration_candidate_ids(
     previous_contract_key_str: &Option<String>,
     room_owner_key: &VerifyingKey,
 ) -> Vec<ContractInstanceId> {
     let mut ids = Vec::new();
-    let mut seen: HashSet<ContractInstanceId> = HashSet::new();
     // Fast path: the immediately-previous contract key recorded in storage.
     if let Some(prev_key_str) = previous_contract_key_str {
         match prev_key_str.parse::<ContractInstanceId>() {
-            Ok(prev_id) => {
-                if seen.insert(prev_id) {
-                    ids.push(prev_id);
-                }
-            }
+            Ok(prev_id) => ids.push(prev_id),
             Err(e) => warn!("Stored previous_contract_key is not a valid contract id: {e}"),
         }
     }
-    // Deep path: every known previous contract generation, newest-first.
+    // Deep path: every known previous contract generation, newest-first. The
+    // stored key is re-listed here when it is a registry generation (NOT
+    // de-duped) so a transient miss on the fast-path attempt is retried before
+    // the probe advances to an older generation (see the doc comment).
     for legacy_key in river_core::migration::legacy_contract_keys_for_owner(room_owner_key) {
-        let id = *legacy_key.id();
-        if seen.insert(id) {
-            ids.push(id);
-        }
+        ids.push(*legacy_key.id());
     }
     ids
 }
@@ -2673,8 +2680,10 @@ impl ApiClient {
         previous_contract_key_str: &Option<String>,
     ) -> Result<ChatRoomStateV1> {
         // Candidates newest-first: the stored previous_contract_key first, then
-        // the legacy registry (deduped) — the same fast-path-then-deep-path
-        // order the pre-driver search used (freenet/river#442).
+        // the legacy registry — the same fast-path-then-deep-path order the
+        // pre-driver search used. The stored key is re-listed (NOT deduped) so a
+        // transient fast-path miss is retried before advancing to an older
+        // generation (freenet/river#442 review finding; see migration_candidate_ids).
         let candidate_ids = migration_candidate_ids(previous_contract_key_str, room_owner_key);
         let candidate_count = candidate_ids.len();
         info!(
@@ -6518,11 +6527,14 @@ mod migration_recovery_tests {
     }
 
     /// `migration_candidate_ids` puts the stored previous_contract_key FIRST,
-    /// then the legacy registry newest-first, de-duplicating the stored key out
-    /// of the registry tail. Stored-key-first is what preserves the pre-driver
-    /// fast-path-then-deep-path semantics under `NewestFirstWins`.
+    /// then the legacy registry newest-first. When the stored key IS a registry
+    /// generation it is deliberately re-listed (present TWICE), NOT de-duped:
+    /// the duplicate is the retry a transient fast-path miss (send failure / 8s
+    /// timeout) needs before the probe advances to an older generation
+    /// (freenet/river#442 review finding). Stored-key-first + the retry preserve
+    /// the pre-driver fast-path-then-deep-path semantics under `NewestFirstWins`.
     #[test]
-    fn migration_candidates_put_stored_key_first_and_dedupe() {
+    fn migration_candidates_put_stored_key_first_and_keep_retry_duplicate() {
         let owner = SigningKey::from_bytes(&[94u8; 32]).verifying_key();
         let legacy: Vec<ContractInstanceId> =
             river_core::migration::legacy_contract_keys_for_owner(&owner)
@@ -6547,22 +6559,37 @@ mod migration_recovery_tests {
             "the stored key must be probed first (the fast path)"
         );
         assert_eq!(
-            with_distinct.len(),
-            legacy.len() + 1,
-            "a new stored key adds exactly one candidate ahead of the registry"
-        );
-        assert_eq!(
             &with_distinct[1..],
             &legacy[..],
-            "the registry follows the stored key, in newest-first order"
+            "the full registry follows the stored key, in newest-first order"
         );
 
-        // A stored key that IS a registry generation is deduped (probed once, first).
+        // A stored key that IS a registry generation is RE-LISTED (present
+        // twice), NOT de-duped: it is probed first AND again in its registry
+        // slot, so the fast-path attempt has a deep-sweep retry.
         let dup = legacy[0];
         let with_dup = migration_candidate_ids(&Some(dup.to_string()), &owner);
         assert_eq!(
-            with_dup, legacy,
-            "a stored key already in the registry must be probed once, keeping order"
+            with_dup.first(),
+            Some(&dup),
+            "the stored key is still probed first"
+        );
+        assert_eq!(
+            &with_dup[1..],
+            &legacy[..],
+            "the full registry (including the stored key's own slot) follows it — the \
+             stored key is re-listed so a transient fast-path miss is retried"
+        );
+        assert_eq!(
+            with_dup.iter().filter(|&&id| id == dup).count(),
+            2,
+            "a stored key that is also a registry generation must appear TWICE (the \
+             retry duplicate), never de-duped to once"
+        );
+        assert_eq!(
+            with_dup.len(),
+            legacy.len() + 1,
+            "the retry duplicate adds exactly one candidate ahead of the registry"
         );
 
         // No stored key, or an unparseable one → just the registry.
@@ -6571,6 +6598,67 @@ mod migration_recovery_tests {
             migration_candidate_ids(&Some("not-a-contract-id".to_string()), &owner),
             legacy,
             "an unparseable stored key is skipped, leaving the registry"
+        );
+    }
+
+    /// The retry duplicate in action at the driver level: a transient timeout on
+    /// the newest generation (the fast-path attempt) does NOT strand the probe
+    /// on an older generation — the re-listed stored key is retried and recovers
+    /// the NEWEST state. Without the duplicate, the timeout would advance to
+    /// `cli_id(5)` and migrate stale state forward, clearing the pointer (the
+    /// freenet/river#442 review finding).
+    #[test]
+    fn migration_retry_after_transient_timeout_recovers_newest() {
+        let owner_sk = SigningKey::from_bytes(&[97u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let local = owner_state_with_messages(&owner_sk, &["local"]);
+        // Candidates as migration_candidate_ids builds them when the stored key
+        // is the newest registry generation: [stored, stored(retry), older].
+        let mut driver = ProbeDriver::new(
+            RiverCliMigrationProbeOps {
+                inner: RiverCliProbeOps { owner_vk },
+            },
+            local.clone(),
+            NewestFirst::assume_ordered(vec![cli_id(9), cli_id(9), cli_id(5)]),
+            SelectionPolicy::NewestFirstWins,
+        );
+        // Fast-path attempt on the newest generation transiently times out.
+        let Step::Get(first) = driver.next_action() else {
+            panic!("expected a GET")
+        };
+        assert_eq!(first, cli_id(9));
+        driver.on_timeout(first);
+        // The re-listed stored key is retried (NOT an older generation) and hits.
+        let Step::Get(retry) = driver.next_action() else {
+            panic!("expected the retry GET")
+        };
+        assert_eq!(
+            retry,
+            cli_id(9),
+            "a transient timeout must retry the newest generation, not advance to an older one"
+        );
+        driver.on_response(
+            retry,
+            &encode_state(&owner_state_with_messages(&owner_sk, &["newest"])),
+        );
+        assert_eq!(driver.next_action(), Step::Done);
+        let Some(Outcome::Recovered { source, merged, .. }) = driver.take_outcome() else {
+            panic!("the retry must recover the newest generation")
+        };
+        assert_eq!(
+            source,
+            cli_id(9),
+            "the newest generation is recovered by the retry, not the older cli_id(5)"
+        );
+        let texts: Vec<String> = merged
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| message_display_text(&merged, m))
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "newest"),
+            "the recovered state is the newest generation's; got {texts:?}"
         );
     }
 
