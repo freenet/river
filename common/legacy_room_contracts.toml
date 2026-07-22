@@ -199,3 +199,9 @@ version = "V27"
 description = "Before deterministic Summary (BTreeMap/BTreeSet for anti-entropy staleness, #4857): last deputy-generation room-contract"
 date = "2026-07-18"
 code_hash = "2e9a1eda53d9e4f495c2bc6af4c5eb5c1546223a3d2fd15286eb1648feb8e649"
+
+[[entry]]
+version = "V28"
+description = "Action payload encoded as CBOR byte string (issue #443)"
+date = "2026-07-22"
+code_hash = "c53ded28a355cb08c83dab4c3ee95475bbdf661dd1e3ba7b4bbbbe93794f4152"

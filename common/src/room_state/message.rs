@@ -1816,6 +1816,84 @@ mod measure_tests {
         );
     }
 
+    /// Regression pin for freenet/river#443 at the level the UI gate uses.
+    ///
+    /// `ActionContentV1::payload` used to serialize as a CBOR array of
+    /// integers, costing ~2.1 bytes per ASCII character against a plain
+    /// message's ~1.01. Against the default 1000-byte limit that capped edits
+    /// at ~467 characters while sends allowed ~991, so a message could be sent
+    /// and then never edited.
+    ///
+    /// The fix makes edit cost **proportional-parity** with send: the overhead
+    /// is now a small CONSTANT (CBOR framing for `action_type` / `target` /
+    /// the nested `EditPayload`), not a per-character multiplier. This test
+    /// pins that property, which is the one that actually prevents the bug
+    /// class from scaling with message length.
+    ///
+    /// NOTE: a residual constant gap remains — see
+    /// `edit_overhead_over_send_is_a_small_constant`. It is ~54 bytes, so the
+    /// longest editable message (~946 chars) is still slightly shorter than
+    /// the longest sendable one (~991). Closing that fully would mean either
+    /// shrinking the send budget or another wire-format change, so it is
+    /// deliberately left as a documented, bounded residual rather than
+    /// silently fixed here.
+    #[test]
+    fn edit_cost_is_not_proportional_to_length() {
+        for n in [100usize, 400, 900] {
+            let text = "a".repeat(n);
+            let overhead = RoomMessageBody::measure_edit(target_id(), &text, false) - n;
+            assert!(
+                overhead < 80,
+                "edit overhead must be a small constant, got {overhead} bytes for {n} chars"
+            );
+        }
+
+        // The concrete user-facing win: a 900-char edit now fits the default
+        // budget (it measured ~1866 bytes before the fix).
+        let text = "a".repeat(900);
+        assert!(RoomMessageBody::measure_edit(target_id(), &text, false) <= 1000);
+
+        // Private rooms add only the AES-GCM tag, not a per-character cost.
+        let private = RoomMessageBody::measure_edit(target_id(), &text, true);
+        let public = RoomMessageBody::measure_edit(target_id(), &text, false);
+        assert_eq!(
+            private - public,
+            ENCRYPTION_TAG_OVERHEAD,
+            "private edits must cost exactly the AES-GCM tag more than public"
+        );
+    }
+
+    /// Pins the RESIDUAL of freenet/river#443 so it cannot silently grow back
+    /// into a proportional cost. An edit of the same text costs a bounded
+    /// constant more than sending it; if this constant creeps up, the
+    /// send-but-cannot-edit window widens again.
+    #[test]
+    fn edit_overhead_over_send_is_a_small_constant() {
+        let mut overheads = vec![];
+        for n in [10usize, 100, 500, 900] {
+            let text = "a".repeat(n);
+            let send = RoomMessageBody::measure_text(&text, false);
+            let edit = RoomMessageBody::measure_edit(target_id(), &text, false);
+            assert!(
+                edit > send,
+                "an edit carries strictly more framing than a send"
+            );
+            overheads.push(edit - send);
+        }
+
+        let max_overhead = *overheads.iter().max().expect("non-empty");
+        assert!(
+            max_overhead <= 60,
+            "edit-over-send overhead must stay a small constant, got {overheads:?}"
+        );
+        // Constant, not growing with length: spread across sizes stays tight.
+        let min_overhead = *overheads.iter().min().expect("non-empty");
+        assert!(
+            max_overhead - min_overhead <= 4,
+            "edit-over-send overhead must not scale with length, got {overheads:?}"
+        );
+    }
+
     #[cfg(feature = "ecies-randomized")]
     mod private_bodies {
         use super::*;

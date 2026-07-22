@@ -77,6 +77,79 @@ fn decode_cbor<T: serde::de::DeserializeOwned>(data: &[u8], type_name: &str) -> 
     ciborium::from_reader(data).map_err(|e| format!("Failed to decode {}: {}", type_name, e))
 }
 
+/// Serde helper: encode [`ActionContentV1::payload`] as a CBOR **byte string**
+/// while still decoding the legacy **array-of-integers** form.
+///
+/// serde has no distinct byte-string type in the derive path, so a bare
+/// `Vec<u8>` goes through `serialize_seq` and ciborium writes a CBOR array of
+/// integers. Every byte >= 0x18 then costs 2 bytes on the wire, and all
+/// printable ASCII is >= 0x20 — so an edit cost ~2.1 bytes per character while
+/// a plain `TextContentV1 { text: String }` message cost ~1.01 (a CBOR text
+/// string). Against the default `max_message_size` of 1000 that capped edits at
+/// ~467 characters while sends allowed ~985, i.e. a message could be sent and
+/// then never edited (freenet/river#443).
+///
+/// Serializing as a byte string brings edits to ~1.05 bytes per character.
+///
+/// `deserialize` accepts BOTH encodings, which is required rather than
+/// cosmetic: rooms created before this change hold action payloads in the
+/// array form, and contract migration re-PUTs that existing state into the new
+/// contract. Without the legacy arm every pre-existing edit and reaction would
+/// silently stop rendering (`ActionContentV1::decode` -> `Err` -> the action is
+/// skipped by `rebuild_actions_state_with_decrypted`).
+///
+/// `deserialize_any` is sound here because this type is only ever serialized
+/// with ciborium (see `encode_cbor` / `decode_cbor` above) and CBOR is
+/// self-describing. Do NOT reuse this helper for a type that may be handled by
+/// a non-self-describing format such as bincode.
+mod payload_bytes {
+    use serde::de::{Error as _, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(payload: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(payload)
+    }
+
+    struct BytesOrLegacySeq;
+
+    impl<'de> Visitor<'de> for BytesOrLegacySeq {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a CBOR byte string, or a legacy array of byte values")
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+            Ok(v)
+        }
+
+        /// Legacy form: a CBOR array of integers, one per byte.
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            // Read as u16 so an out-of-range element is a decode error rather
+            // than a silent truncation to u8.
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(byte) = seq.next_element::<u16>()? {
+                if byte > u8::MAX as u16 {
+                    return Err(A::Error::custom(format!(
+                        "action payload element {byte} is not a byte"
+                    )));
+                }
+                out.push(byte as u8);
+            }
+            Ok(out)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_any(BytesOrLegacySeq)
+    }
+}
+
 /// Action message content (content_type = 2)
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct ActionContentV1 {
@@ -84,7 +157,13 @@ pub struct ActionContentV1 {
     pub action_type: u32,
     /// Target message ID for the action
     pub target: MessageId,
-    /// Action-specific payload (CBOR-encoded)
+    /// Action-specific payload (CBOR-encoded).
+    ///
+    /// Encoded on the wire as a CBOR byte string; the legacy array-of-integers
+    /// form is still accepted on decode. See [`payload_bytes`] and
+    /// freenet/river#443 — do NOT drop the `serde(with = ...)` attribute, it is
+    /// what keeps an edit from costing ~2 bytes per character.
+    #[serde(with = "payload_bytes")]
     pub payload: Vec<u8>,
 }
 
@@ -334,6 +413,93 @@ mod tests {
         let encoded = content.encode();
         let decoded = TextContentV1::decode(&encoded).unwrap();
         assert_eq!(content, decoded);
+    }
+
+    /// Mirror of [`ActionContentV1`] as it was encoded BEFORE freenet/river#443
+    /// (bare `Vec<u8>` -> CBOR array of integers). Stands in for both an
+    /// existing room's stored actions and a pre-#443 client on the wire.
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+    struct LegacyActionContentV1 {
+        action_type: u32,
+        target: MessageId,
+        payload: Vec<u8>,
+    }
+
+    /// The migration-critical direction: rooms created before #443 hold action
+    /// payloads as a CBOR array of integers, and contract migration re-PUTs that
+    /// state into the new contract. If this breaks, every pre-existing edit and
+    /// reaction silently stops rendering.
+    #[test]
+    fn legacy_array_payload_still_decodes() {
+        let action = ActionContentV1::edit(test_message_id(), "Edited text".to_string());
+        let legacy = LegacyActionContentV1 {
+            action_type: action.action_type,
+            target: action.target.clone(),
+            payload: action.payload.clone(),
+        };
+        let legacy_bytes = encode_cbor(&legacy);
+
+        let decoded = ActionContentV1::decode(&legacy_bytes)
+            .expect("legacy array-encoded payload must still decode");
+        assert_eq!(decoded, action, "legacy decode must be lossless");
+        assert_eq!(
+            decoded.edit_payload().expect("edit payload").new_text,
+            "Edited text",
+            "the edited text must survive a legacy-format decode"
+        );
+    }
+
+    /// The rollout direction: a pre-#443 reader must still understand the new
+    /// byte-string encoding (ciborium's `deserialize_seq` accepts a byte
+    /// string), so a stale riverctl/UI does not lose newly-authored edits.
+    #[test]
+    fn new_byte_string_payload_decodes_with_legacy_reader() {
+        let action = ActionContentV1::edit(test_message_id(), "Edited text".to_string());
+        let new_bytes = action.encode();
+
+        let legacy: LegacyActionContentV1 = ciborium::from_reader(&new_bytes[..])
+            .expect("a pre-#443 reader must still decode the new encoding");
+        assert_eq!(legacy.payload, action.payload);
+        assert_eq!(legacy.action_type, action.action_type);
+        assert_eq!(legacy.target, action.target);
+    }
+
+    /// Regression pin for freenet/river#443. Before the fix an edit cost ~2.1
+    /// bytes per ASCII character (CBOR array of integers), so against the
+    /// default `max_message_size` of 1000 edits were capped at ~467 characters
+    /// while sends allowed ~985 — a message could be sent and never edited.
+    #[test]
+    fn edit_action_does_not_cost_two_bytes_per_character() {
+        let text = "a".repeat(900);
+        let encoded_len = ActionContentV1::edit(test_message_id(), text.clone())
+            .encode()
+            .len();
+
+        // Legacy encoding of the very same action, for contrast.
+        let legacy_len = {
+            let action = ActionContentV1::edit(test_message_id(), text.clone());
+            encode_cbor(&LegacyActionContentV1 {
+                action_type: action.action_type,
+                target: action.target.clone(),
+                payload: action.payload,
+            })
+            .len()
+        };
+
+        assert!(
+            legacy_len > 1800,
+            "sanity: the legacy encoding should be ~2x the text ({legacy_len} bytes)"
+        );
+        assert!(
+            encoded_len < 1000,
+            "a 900-char edit must fit the default 1000-byte limit, got {encoded_len} bytes"
+        );
+        assert!(
+            encoded_len < text.len() + 100,
+            "edit overhead must be roughly constant, not proportional: \
+             {encoded_len} bytes for {} chars",
+            text.len()
+        );
     }
 
     #[test]
