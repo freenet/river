@@ -502,12 +502,21 @@ pub(crate) fn build_deputizers_of(
     member_info: &river_core::room_state::member_info::MemberInfoV1,
 ) -> HashMap<MemberId, Vec<MemberId>> {
     let mut deputizers_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
-    let member_ids_with_info: HashSet<MemberId> = member_info
+    // Iterate appointers in a DETERMINISTIC order (sorted by MemberId), NOT
+    // raw `HashSet` iteration order. The member row and the modal legend build
+    // this map independently, so a nondeterministic order would let a member
+    // with multiple deputizers show "room owner, you" in one place and "you,
+    // room owner" in the other — and even reorder between renders. Sorting the
+    // appointers makes each deputizer list (and thus the tooltip) stable and
+    // identical across both call sites (freenet/river#451, Codex P3).
+    let mut appointers: Vec<MemberId> = member_info
         .member_info
         .iter()
         .map(|mi| mi.member_info.member_id)
         .collect();
-    for appointer in member_ids_with_info {
+    appointers.sort_unstable();
+    appointers.dedup();
+    for appointer in appointers {
         let Some(canonical) = member_info.canonical(appointer) else {
             continue;
         };
@@ -2791,6 +2800,62 @@ mod tests {
             viewer_id,
         )
         .is_empty());
+    }
+
+    /// `build_deputizers_of` must order each deputy's appointers
+    /// DETERMINISTICALLY (sorted by MemberId), not by `HashSet` iteration
+    /// order. The row and the modal legend build this map independently, so a
+    /// member appointed by multiple relevant deputizers would otherwise show
+    /// "room owner, you" in one place and "you, room owner" in the other, or
+    /// reorder between renders (freenet/river#451, Codex P3).
+    #[test]
+    fn build_deputizers_of_orders_appointers_deterministically() {
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+
+        let mut rng = rand::thread_rng();
+        // A pool of appointers all deputizing the same target, built in a
+        // shuffled input order; the output must be sorted regardless.
+        let appointer_sks: Vec<SigningKey> =
+            (0..6).map(|_| SigningKey::generate(&mut rng)).collect();
+        let target_sk = SigningKey::generate(&mut rng);
+        let target_id = MemberId::from(&target_sk.verifying_key());
+
+        let mk_info = |sk: &SigningKey, deputies: Vec<MemberId>| {
+            let mi = MemberInfo {
+                member_id: MemberId::from(&sk.verifying_key()),
+                version: 0,
+                preferred_nickname: river_core::room_state::privacy::SealedBytes::public(
+                    b"n".to_vec(),
+                ),
+                deputies,
+            };
+            AuthorizedMemberInfo::new_with_member_key(mi, sk)
+        };
+
+        let mut expected: Vec<MemberId> = appointer_sks
+            .iter()
+            .map(|sk| MemberId::from(&sk.verifying_key()))
+            .collect();
+        expected.sort_unstable();
+
+        // Build the state twice with the appointer records in DIFFERENT input
+        // orders; both must yield the same sorted appointer list for target.
+        let build = |order: &[usize]| {
+            let records: Vec<AuthorizedMemberInfo> = order
+                .iter()
+                .map(|&i| mk_info(&appointer_sks[i], vec![target_id]))
+                .collect();
+            let member_info = MemberInfoV1 {
+                member_info: records,
+            };
+            build_deputizers_of(&member_info)
+                .get(&target_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        assert_eq!(build(&[0, 1, 2, 3, 4, 5]), expected);
+        assert_eq!(build(&[5, 3, 1, 4, 0, 2]), expected);
     }
 
     /// Production-code slice of this file (everything before the
