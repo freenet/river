@@ -1873,7 +1873,14 @@ pub fn Conversation() -> Element {
                                     // `relative` anchors the unread badge overlay.
                                     class: "relative md:hidden flex-shrink-0 mr-1 p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
                                     "data-testid": "hamburger-rooms-button",
-                                    "aria-label": "Open room list",
+                                    // The button's aria-label overrides descendant text in
+                                    // accessible-name computation, so the unread count must
+                                    // live HERE — the badge below is visual-only.
+                                    "aria-label": if panel_unread() > 0 {
+                                        format!("Open room list, {} unread", panel_unread())
+                                    } else {
+                                        "Open room list".to_string()
+                                    },
                                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                     Icon { icon: FaBars, width: 18, height: 18 }
                                     // Unread-elsewhere badge: new messages in OTHER rooms
@@ -1883,7 +1890,7 @@ pub fn Conversation() -> Element {
                                         span {
                                             class: "absolute top-0 right-0 flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-accent text-white text-[10px] font-semibold leading-none pointer-events-none",
                                             "data-testid": "hamburger-unread-badge",
-                                            "aria-label": "{panel_unread} unread messages in other rooms",
+                                            "aria-hidden": "true",
                                             "{panel_unread}"
                                         }
                                     }
@@ -2276,7 +2283,13 @@ pub fn Conversation() -> Element {
                                 // `relative` anchors the unread badge overlay.
                                 class: "relative p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
                                 "data-testid": "hamburger-rooms-button",
-                                "aria-label": "Open room list",
+                                // Count in the button's own accessible name; the badge
+                                // below is visual-only (see the room-header hamburger).
+                                "aria-label": if panel_unread() > 0 {
+                                    format!("Open room list, {} unread", panel_unread())
+                                } else {
+                                    "Open room list".to_string()
+                                },
                                 onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                 Icon { icon: FaBars, width: 18, height: 18 }
                                 // Same unread-elsewhere badge as the room-header
@@ -2286,7 +2299,7 @@ pub fn Conversation() -> Element {
                                     span {
                                         class: "absolute top-0 right-0 flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-accent text-white text-[10px] font-semibold leading-none pointer-events-none",
                                         "data-testid": "hamburger-unread-badge",
-                                        "aria-label": "{panel_unread} unread messages in other rooms",
+                                        "aria-hidden": "true",
                                         "{panel_unread}"
                                     }
                                 }
