@@ -366,6 +366,14 @@ fn resolve_legacy_recovery_outcome(
 /// the second GET after a fast-path HIT (the probe ends there), so the duplicate
 /// only ever costs a retry after a miss — exactly the pre-driver semantics
 /// (freenet/river#442 review finding).
+///
+/// Intentional consequence of probing the stored key FIRST: if it carries state
+/// it is adopted under `NewestFirstWins` even over a NEWER registry generation
+/// that also has state. In the normal case this is moot — the stored
+/// `previous_contract_key` IS the immediately-previous (newest legacy)
+/// generation — but if it were ever an older generation with state, the fast
+/// path wins. That is deliberate: it preserves the pre-driver semantics, whose
+/// fast path returned the stored-key GET before the deep sweep ran.
 fn migration_candidate_ids(
     previous_contract_key_str: &Option<String>,
     room_owner_key: &VerifyingKey,
