@@ -116,7 +116,7 @@ pub const LAST_NAMES: [&str; 100] = [
     "Mantis",
     "Panther",
     "Jaguar",
-    "Cougar",
+    "Ocelot",
     "Wolfhound",
     "Serpent",
     "Foundry",
@@ -179,7 +179,7 @@ pub fn generate_default_nickname(vk: &VerifyingKey) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     /// Every handle the generator can emit, for the exhaustive checks.
     fn all_handles() -> impl Iterator<Item = String> {
@@ -316,35 +316,55 @@ mod tests {
         );
     }
 
+    /// The point of the bigger pools is variety, which only materializes if
+    /// the fold indexes evenly across the whole of each one.
+    ///
+    /// A reachability floor alone is NOT enough, and it is worth being precise
+    /// about why: a "how many words were reached" check is a total-COLLAPSE
+    /// detector only. Degenerate multipliers (2, 32, even 100 — one sharing
+    /// factors with the pool size) still reach all 100 buckets over 2,000
+    /// keys, and so does a synthetic distribution putting 90% of its mass on
+    /// 10 words. So this test also bounds the SHARE any single word may take,
+    /// which is what actually catches skew.
     #[test]
-    fn fold_reaches_most_of_both_pools() {
-        // The point of the bigger pools is variety, which only materializes
-        // if the fold indexes across the whole of each one. With 2,000 keys
-        // a uniform fold hits all 100 words in each pool with overwhelming
-        // probability; 80 is a loose floor that still catches a fold that
-        // has collapsed onto a subset (e.g. a pool size sharing factors
-        // with the hash multiplier).
+    fn fold_spreads_evenly_across_both_pools() {
         let mut rng = rand::thread_rng();
-        let mut firsts = HashSet::new();
-        let mut lasts = HashSet::new();
-        for _ in 0..2_000 {
+        const KEYS: usize = 2_000;
+        let mut firsts: HashMap<String, usize> = HashMap::new();
+        let mut lasts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..KEYS {
             let sk = SigningKey::generate(&mut rng);
             let name = generate_default_nickname(&sk.verifying_key());
             let (first, last) = name.split_once(' ').unwrap();
-            firsts.insert(first.to_string());
-            lasts.insert(last.to_string());
+            *firsts.entry(first.to_string()).or_default() += 1;
+            *lasts.entry(last.to_string()).or_default() += 1;
         }
-        assert!(
-            firsts.len() >= 80,
-            "only {} of {} first words reachable",
-            firsts.len(),
-            FIRST_NAMES.len()
-        );
-        assert!(
-            lasts.len() >= 80,
-            "only {} of {} last words reachable",
-            lasts.len(),
-            LAST_NAMES.len()
-        );
+
+        for (label, counts, pool) in [
+            ("first", &firsts, FIRST_NAMES.len()),
+            ("last", &lasts, LAST_NAMES.len()),
+        ] {
+            // Reachability: catches a fold collapsed onto a subset.
+            assert!(
+                counts.len() >= 80,
+                "{label}: only {} of {pool} words reachable",
+                counts.len()
+            );
+
+            // Evenness: expected share is KEYS/pool (20). Allow 4x headroom
+            // for sampling noise — the observed max is ~2x — while still
+            // failing the 90%-on-10-words case a reachability floor waves
+            // through.
+            let expected = KEYS / pool;
+            let (worst_word, worst_count) = counts
+                .iter()
+                .max_by_key(|(_, c)| **c)
+                .expect("non-empty pool");
+            assert!(
+                *worst_count <= expected * 4,
+                "{label}: \"{worst_word}\" took {worst_count} of {KEYS} draws \
+                 (expected ~{expected}) — the fold is skewed, not uniform"
+            );
+        }
     }
 }
