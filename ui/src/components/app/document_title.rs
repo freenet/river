@@ -238,6 +238,37 @@ fn count_unread_dms(rooms: &crate::room_data::Rooms) -> usize {
     total
 }
 
+/// Sum unread messages across every room in `map` except `exclude`.
+///
+/// Pure (no signal reads) so the exclusion logic is unit-testable; the
+/// signal-reading wrapper is [`count_unread_behind_rooms_panel`].
+pub fn count_unread_excluding_room(
+    map: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
+    exclude: Option<&ed25519_dalek::VerifyingKey>,
+) -> usize {
+    map.iter()
+        .filter(|(owner_key, _)| Some(*owner_key) != exclude)
+        .map(|(_, room_data)| count_unread_in_room_data(room_data))
+        .sum()
+}
+
+/// Count unread messages waiting *behind* the mobile rooms panel: rooms
+/// OTHER than the currently-open one, plus inbound direct messages (the
+/// DM rail lives in that same panel).
+///
+/// Drives the badge on the mobile hamburger buttons in the conversation
+/// header. The current room is excluded because its messages are on
+/// screen and marked read on open — counting them would only make the
+/// badge flicker (mirrors the `!is_current` guard on the room-list
+/// badge in `room_list.rs`).
+pub fn count_unread_behind_rooms_panel() -> usize {
+    let Ok(rooms) = ROOMS.try_read() else {
+        return 0;
+    };
+    let current = CURRENT_ROOM.read().owner_key;
+    count_unread_excluding_room(&rooms.map, current.as_ref()) + count_unread_dms(&rooms)
+}
+
 /// Update the document title based on current state
 pub fn update_document_title() {
     let is_visible = *DOCUMENT_VISIBLE.read();
@@ -693,5 +724,41 @@ mod tests {
             .filter(|m| m.message.author != self_id)
             .count();
         assert_eq!(count_unread_in_room_data(&rd), expected);
+    }
+
+    #[test]
+    fn excluding_the_current_room_omits_its_unread() {
+        // The mobile hamburger badge counts unread in OTHER rooms only —
+        // the current room's messages are on screen and marked read on
+        // open, so including them would make the badge flicker.
+        let (self_sk, _) = keypair();
+        let (owner_a_sk, owner_a_vk) = keypair();
+        let (owner_b_sk, owner_b_vk) = keypair();
+        let room_a = room(
+            self_sk.clone(),
+            owner_a_vk,
+            vec![
+                msg(&owner_a_sk, &owner_a_vk, 1),
+                msg(&owner_a_sk, &owner_a_vk, 2),
+            ],
+            None,
+        );
+        let room_b = room(
+            self_sk,
+            owner_b_vk,
+            vec![msg(&owner_b_sk, &owner_b_vk, 1)],
+            None,
+        );
+        let mut map = HashMap::new();
+        map.insert(owner_a_vk, room_a);
+        map.insert(owner_b_vk, room_b);
+
+        // Excluding room A (2 unread) leaves only room B's single unread.
+        assert_eq!(count_unread_excluding_room(&map, Some(&owner_a_vk)), 1);
+        // No current room (welcome screen): every room counts.
+        assert_eq!(count_unread_excluding_room(&map, None), 3);
+        // Excluding a key not in the map changes nothing.
+        let (_, other_vk) = keypair();
+        assert_eq!(count_unread_excluding_room(&map, Some(&other_vk)), 3);
     }
 }

@@ -1,3 +1,4 @@
+use crate::components::app::document_title::count_unread_behind_rooms_panel;
 #[cfg(target_arch = "wasm32")]
 use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::receive_times::{format_delay, get_delay_secs};
@@ -950,6 +951,14 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // Unread activity waiting behind the mobile rooms panel: rooms OTHER
+    // than the current one, plus inbound DMs (the DM rail lives in that
+    // panel). Drives the badge on the mobile hamburger buttons below so a
+    // user deep in one room can tell there are new messages elsewhere.
+    // Re-runs when ROOMS mutates (message arrival, read-marker advance) or
+    // CURRENT_ROOM changes — both read inside the helper.
+    let panel_unread = use_memo(count_unread_behind_rooms_panel);
+
     // Memoize room description as rendered HTML (markdown)
     let current_room_description_html = use_memo({
         move || {
@@ -1861,9 +1870,23 @@ pub fn Conversation() -> Element {
                                 // tap target so a touch user does not open the room-details
                                 // modal by mistake when reaching for the room list (#402).
                                 button {
-                                    class: "md:hidden flex-shrink-0 mr-1 p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                    // `relative` anchors the unread badge overlay.
+                                    class: "relative md:hidden flex-shrink-0 mr-1 p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                    "data-testid": "hamburger-rooms-button",
+                                    "aria-label": "Open room list",
                                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                     Icon { icon: FaBars, width: 18, height: 18 }
+                                    // Unread-elsewhere badge: new messages in OTHER rooms
+                                    // (and DMs) are invisible on mobile while a room fills
+                                    // the screen — surface them on the room-list button.
+                                    if panel_unread() > 0 {
+                                        span {
+                                            class: "absolute top-0 right-0 flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-accent text-white text-[10px] font-semibold leading-none pointer-events-none",
+                                            "data-testid": "hamburger-unread-badge",
+                                            "aria-label": "{panel_unread} unread messages in other rooms",
+                                            "{panel_unread}"
+                                        }
+                                    }
                                 }
                                 // Description is a sibling of the title button, not a child:
                                 // `<a>` is interactive content and cannot be nested inside
@@ -2250,9 +2273,23 @@ pub fn Conversation() -> Element {
                         // Mobile: show hamburger to access room list even with no room selected
                         div { class: "md:hidden flex-shrink-0 px-3 py-3 border-b border-border bg-panel",
                             button {
-                                class: "p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                // `relative` anchors the unread badge overlay.
+                                class: "relative p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                "data-testid": "hamburger-rooms-button",
+                                "aria-label": "Open room list",
                                 onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                                 Icon { icon: FaBars, width: 18, height: 18 }
+                                // Same unread-elsewhere badge as the room-header
+                                // hamburger; with no room selected every room's
+                                // unread (plus DMs) counts.
+                                if panel_unread() > 0 {
+                                    span {
+                                        class: "absolute top-0 right-0 flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-accent text-white text-[10px] font-semibold leading-none pointer-events-none",
+                                        "data-testid": "hamburger-unread-badge",
+                                        "aria-label": "{panel_unread} unread messages in other rooms",
+                                        "{panel_unread}"
+                                    }
+                                }
                             }
                         }
                         div { class: "flex-1 flex flex-col items-center justify-center text-center p-8",
