@@ -435,6 +435,20 @@ impl MessagesV1 {
 /// - New action types: Just use a new action_type number within ActionContentV1
 /// - New fields: Add to content structs (old clients ignore unknown fields)
 /// - Breaking changes: Bump content_version
+/// # Do NOT apply `serde_bytes` to `data` / `ciphertext`
+///
+/// Both are bare `Vec<u8>`, so like `ActionContentV1::payload` before
+/// freenet/river#443 they serialize as a CBOR array of integers (~2 bytes per
+/// byte). That looks like the same easy win, and it is NOT: these fields live
+/// inside `MessageV1`, which `verify_struct` RE-SERIALIZES to check the
+/// signature (`AuthorizedMessageV1::verify`). Changing their encoding would
+/// invalidate the signature of **every existing message in every room** —
+/// unlike `ActionContentV1`, which is pre-encoded into these opaque bytes and
+/// is therefore outside the signed representation.
+///
+/// The #443 fix was safe precisely because it stopped at that boundary. If the
+/// on-wire size of message bodies ever needs to shrink, it requires a versioned
+/// migration, not a serde attribute.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub enum RoomMessageBody {
     /// Public (unencrypted) message
@@ -443,7 +457,9 @@ pub enum RoomMessageBody {
         content_type: u32,
         /// Version of the content format
         content_version: u32,
-        /// CBOR-encoded content bytes
+        /// CBOR-encoded content bytes.
+        ///
+        /// Do NOT add `serde(with = "serde_bytes")` — see the type-level note.
         data: Vec<u8>,
     },
     /// Private (encrypted) message
@@ -452,7 +468,9 @@ pub enum RoomMessageBody {
         content_type: u32,
         /// Version of the content format
         content_version: u32,
-        /// Encrypted CBOR-encoded content
+        /// Encrypted CBOR-encoded content.
+        ///
+        /// Do NOT add `serde(with = "serde_bytes")` — see the type-level note.
         ciphertext: Vec<u8>,
         /// Nonce used for encryption
         nonce: [u8; 12],
@@ -910,6 +928,138 @@ mod tests {
     fn test_messages_v1_default() {
         let default_messages = MessagesV1::default();
         assert!(default_messages.messages.is_empty());
+    }
+
+    /// Full-stack pin for freenet/river#443's backward compatibility.
+    ///
+    /// The unit tests in `content.rs` prove `ActionContentV1::decode` accepts
+    /// the legacy array-of-integers payload, but the behaviour that actually
+    /// matters is that `rebuild_actions_state` — the entry point the contract
+    /// and every client run after `apply_delta` — still SURFACES those
+    /// pre-existing edits, deletes and reactions. A change to which decode
+    /// path that routes through would break every already-stored action while
+    /// the unit tests stayed green.
+    #[test]
+    fn legacy_encoded_actions_still_render_through_rebuild_actions_state() {
+        use crate::room_state::content::{
+            ActionContentV1, ACTION_TYPE_DELETE, ACTION_TYPE_EDIT, ACTION_TYPE_REACTION,
+            CONTENT_TYPE_ACTION,
+        };
+
+        /// Pre-#443 shape: bare `Vec<u8>` -> CBOR array of integers.
+        #[derive(Serialize)]
+        struct LegacyAction {
+            action_type: u32,
+            target: MessageId,
+            payload: Vec<u8>,
+        }
+
+        fn legacy_action_body(action: &ActionContentV1) -> RoomMessageBody {
+            let mut data = Vec::new();
+            ciborium::into_writer(
+                &LegacyAction {
+                    action_type: action.action_type,
+                    target: action.target.clone(),
+                    payload: action.payload.clone(),
+                },
+                &mut data,
+            )
+            .expect("serialize legacy action");
+            RoomMessageBody::public_raw(CONTENT_TYPE_ACTION, 1, data)
+        }
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let owner_id = MemberId(FastHash(0));
+        let author_id = MemberId::from(&signing_key.verifying_key());
+
+        let original = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: author_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("original text".to_string()),
+            },
+            &signing_key,
+        );
+        let target = original.id();
+
+        let push_action = |messages: &mut MessagesV1, action: ActionContentV1| {
+            messages.messages.push(AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: author_id,
+                    time: SystemTime::now() + Duration::from_secs(1),
+                    content: legacy_action_body(&action),
+                },
+                &signing_key,
+            ));
+        };
+
+        // --- a legacy EDIT must still render ---
+        let mut messages = MessagesV1 {
+            messages: vec![original.clone()],
+            ..Default::default()
+        };
+        push_action(
+            &mut messages,
+            ActionContentV1 {
+                action_type: ACTION_TYPE_EDIT,
+                target: target.clone(),
+                payload: ActionContentV1::edit(target.clone(), "edited text".to_string()).payload,
+            },
+        );
+        messages.rebuild_actions_state();
+        assert!(
+            messages.is_edited(&target),
+            "a pre-#443 stored edit must still be seen as an edit"
+        );
+        assert_eq!(
+            messages.effective_text(&original).as_deref(),
+            Some("edited text"),
+            "a pre-#443 stored edit must still render its new text"
+        );
+
+        // --- a legacy REACTION (emoji -> bytes >= 0x80) must still render ---
+        let mut messages = MessagesV1 {
+            messages: vec![original.clone()],
+            ..Default::default()
+        };
+        push_action(
+            &mut messages,
+            ActionContentV1 {
+                action_type: ACTION_TYPE_REACTION,
+                target: target.clone(),
+                payload: ActionContentV1::reaction(target.clone(), "👍".to_string()).payload,
+            },
+        );
+        messages.rebuild_actions_state();
+        assert!(
+            messages
+                .actions_state
+                .reactions
+                .get(&target)
+                .is_some_and(|r| r.contains_key("👍")),
+            "a pre-#443 stored emoji reaction must still render"
+        );
+
+        // --- a legacy DELETE (empty payload) must still apply ---
+        let mut messages = MessagesV1 {
+            messages: vec![original.clone()],
+            ..Default::default()
+        };
+        push_action(
+            &mut messages,
+            ActionContentV1 {
+                action_type: ACTION_TYPE_DELETE,
+                target: target.clone(),
+                payload: Vec::new(),
+            },
+        );
+        messages.rebuild_actions_state();
+        assert!(
+            messages.is_deleted(&target),
+            "a pre-#443 stored delete must still apply"
+        );
     }
 
     #[test]
@@ -1782,10 +1932,18 @@ mod measure_tests {
     fn measure_edit_matches_edit_body() {
         for text in samples() {
             let body = RoomMessageBody::edit(target_id(), text.clone());
-            assert_eq!(
-                RoomMessageBody::measure_edit(target_id(), &text, false),
-                body.content_len(),
-                "text bytes={}",
+            let measured = RoomMessageBody::measure_edit(target_id(), &text, false);
+            assert_eq!(measured, body.content_len(), "text bytes={}", text.len());
+
+            // Consistency alone let freenet/river#443 hide here for months:
+            // this loop happily accepted a 1000-char edit measuring ~2070
+            // bytes because it only compared the measure against the body.
+            // Also assert MAGNITUDE, across every sample — which covers the
+            // multi-byte UTF-8 and CBOR length-prefix boundary cases that the
+            // ASCII-only #443 pins do not.
+            assert!(
+                measured <= text.len() + 80,
+                "edit overhead must be a small constant: {measured} bytes for {} text bytes",
                 text.len()
             );
         }
@@ -1813,6 +1971,82 @@ mod measure_tests {
                 &"p".repeat(100),
                 false
             ) > max
+        );
+    }
+
+    /// Regression pin for freenet/river#443 at the level the UI gate uses.
+    ///
+    /// `ActionContentV1::payload` used to serialize as a CBOR array of
+    /// integers, costing ~2.1 bytes per ASCII character against a plain
+    /// message's ~1.01. Against the default 1000-byte limit that capped edits
+    /// at ~467 characters while sends allowed ~991, so a message could be sent
+    /// and then never edited.
+    ///
+    /// The fix makes edit cost **proportional-parity** with send: the overhead
+    /// is now a small CONSTANT (CBOR framing for `action_type` / `target` /
+    /// the nested `EditPayload`), not a per-character multiplier. This test
+    /// pins that property, which is the one that actually prevents the bug
+    /// class from scaling with message length.
+    ///
+    /// NOTE: a residual constant gap remains — see
+    /// `edit_overhead_over_send_is_a_small_constant`. It is ~54 bytes, so the
+    /// longest editable message (~946 chars) is still slightly shorter than
+    /// the longest sendable one (~991). Closing that fully would mean either
+    /// shrinking the send budget or another wire-format change, so it is
+    /// deliberately left as a documented, bounded residual rather than
+    /// silently fixed here.
+    #[test]
+    fn edit_cost_is_not_proportional_to_length() {
+        for n in [100usize, 400, 900] {
+            let text = "a".repeat(n);
+            let overhead = RoomMessageBody::measure_edit(target_id(), &text, false) - n;
+            assert!(
+                overhead < 80,
+                "edit overhead must be a small constant, got {overhead} bytes for {n} chars"
+            );
+        }
+
+        // The concrete user-facing win: a 900-char edit now fits the default
+        // budget (it measured ~1866 bytes before the fix).
+        let text = "a".repeat(900);
+        assert!(RoomMessageBody::measure_edit(target_id(), &text, false) <= 1000);
+
+        // NOTE: deliberately no `private - public == ENCRYPTION_TAG_OVERHEAD`
+        // assertion here — both sides funnel through `with_encryption_overhead`,
+        // so it holds by construction for ANY encoding and would inflate this
+        // test's apparent coverage. The real pin is
+        // `private_bodies::measure_edit_matches_private_body`, which compares
+        // against an actually-encrypted body.
+    }
+
+    /// Pins the RESIDUAL of freenet/river#443 so it cannot silently grow back
+    /// into a proportional cost. An edit of the same text costs a bounded
+    /// constant more than sending it; if this constant creeps up, the
+    /// send-but-cannot-edit window widens again.
+    #[test]
+    fn edit_overhead_over_send_is_a_small_constant() {
+        let mut overheads = vec![];
+        for n in [10usize, 100, 500, 900] {
+            let text = "a".repeat(n);
+            let send = RoomMessageBody::measure_text(&text, false);
+            let edit = RoomMessageBody::measure_edit(target_id(), &text, false);
+            assert!(
+                edit > send,
+                "an edit carries strictly more framing than a send"
+            );
+            overheads.push(edit - send);
+        }
+
+        let max_overhead = *overheads.iter().max().expect("non-empty");
+        assert!(
+            max_overhead <= 60,
+            "edit-over-send overhead must stay a small constant, got {overheads:?}"
+        );
+        // Constant, not growing with length: spread across sizes stays tight.
+        let min_overhead = *overheads.iter().min().expect("non-empty");
+        assert!(
+            max_overhead - min_overhead <= 4,
+            "edit-over-send overhead must not scale with length, got {overheads:?}"
         );
     }
 

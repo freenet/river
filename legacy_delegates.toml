@@ -202,3 +202,10 @@ description = "Before deterministic Summary (BTreeMap/BTreeSet for anti-entropy 
 date = "2026-07-18"
 delegate_key = "c01c1602ceef95278c4dbb0a980cbb63cf2e9ec36ed985f4bc657225f1558ab5"
 code_hash = "ee08e689207af26de43e02ebc1ad9ebbc1e14fa305a600c79825c0bd27d1f774"
+
+[[entry]]
+version = "V28"
+description = "Action payload encoded as CBOR byte string (issue #443)"
+date = "2026-07-22"
+delegate_key = "992155c30b554f334c8869874fea4ce277af3a5b16f072e7893d8502f028e8cd"
+code_hash = "82da3a0ea2b7d393b5a88674e7fda4768d73bce97c1d161d7793a46f316bb5a1"

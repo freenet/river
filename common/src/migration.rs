@@ -106,8 +106,8 @@ mod tests {
         for hash in LEGACY_ROOM_CONTRACT_CODE_HASHES {
             hasher.update(hash);
         }
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 27);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "d931340e569e9c74");
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 28);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "0b83bd665d97c514");
     }
 
     #[test]
