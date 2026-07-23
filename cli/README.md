@@ -41,6 +41,40 @@ riverctl message edit   <room-owner-vk> <message-id> "Fixed typo."
 riverctl message delete <room-owner-vk> <message-id>
 ```
 
+## Direct messages
+
+End-to-end-encrypted one-to-one messages between two members of the same room.
+They travel inside the room's contract state, so both people must already be
+members — there is no cross-room DM.
+
+The recipient is a member ID: either the short 8-character form that
+`riverctl member list` prints, or the full ID.
+
+```bash
+riverctl member list <room-owner-vk>             # Find the recipient's member ID.
+riverctl dm send  <room-owner-vk> <recipient> "Hello, just between us."
+riverctl dm list  <room-owner-vk>                # Threads to/from you, decrypted.
+riverctl dm purge <room-owner-vk> <purge-token>  # Drop a DM addressed to you.
+```
+
+The purge token is the 32-character hex value `dm list` prints beneath each
+inbound DM as `purge token: …`.
+
+Only the recipient can decrypt a DM, so `dm list` renders your own sent
+messages from a local plaintext cache. A DM you sent from a different machine
+shows as ciphertext-only there.
+
+The UI can also share an invitation *inside* a DM, which `dm list` shows as
+`[Invitation to room …]`. Accept it with:
+
+```bash
+riverctl dm accept <carrier-room-vk>
+```
+
+`<carrier-room-vk>` is the room whose DM thread **contains** the invitation, not
+the room you are joining. If you have invite DMs for several rooms, narrow with
+`--from <sender>` or `--room <target-room>`.
+
 ## Inviting others
 
 ```bash

@@ -113,6 +113,7 @@ cargo install riverctl
 Commands include:
 - `riverctl room` - Room management (create, list, info)
 - `riverctl message` - Send and receive messages
+- `riverctl dm` - End-to-end-encrypted direct messages to a co-member (send, list, purge, accept)
 - `riverctl member` - Member management
 - `riverctl invite` - Create and accept invitations
 - `riverctl identity whoami` - Your own member ID in a room (matches the `author` on your messages)
