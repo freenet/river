@@ -489,6 +489,130 @@ fn relevant_deputizers(
         .collect()
 }
 
+/// Reverse map: for each deputy member, the members who have deputized them,
+/// built from every member's CANONICAL signed `MemberInfo.deputies` (#410).
+///
+/// Routed through each member_id's canonical record (highest
+/// `member_info_rank`), not a raw scan of `member_info.member_info` — `verify`
+/// accepts duplicate member_info records per member_id (migration safety), and
+/// unioning deputies across ALL of a member's duplicate records (rather than
+/// reading only the converged/canonical one) can keep a revoked deputy grant
+/// showing even after the revoke has won (freenet/river#411 round 8).
+pub(crate) fn build_deputizers_of(
+    member_info: &river_core::room_state::member_info::MemberInfoV1,
+) -> HashMap<MemberId, Vec<MemberId>> {
+    let mut deputizers_of: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+    // Iterate appointers in a DETERMINISTIC order (sorted by MemberId), NOT
+    // raw `HashSet` iteration order. The member row and the modal legend build
+    // this map independently, so a nondeterministic order would let a member
+    // with multiple deputizers show "room owner, you" in one place and "you,
+    // room owner" in the other — and even reorder between renders. Sorting the
+    // appointers makes each deputizer list (and thus the tooltip) stable and
+    // identical across both call sites (freenet/river#451, Codex P3).
+    let mut appointers: Vec<MemberId> = member_info
+        .member_info
+        .iter()
+        .map(|mi| mi.member_info.member_id)
+        .collect();
+    appointers.sort_unstable();
+    appointers.dedup();
+    for appointer in appointers {
+        let Some(canonical) = member_info.canonical(appointer) else {
+            continue;
+        };
+        for deputy in &canonical.member_info.deputies {
+            deputizers_of.entry(*deputy).or_default().push(appointer);
+        }
+    }
+    deputizers_of
+}
+
+/// The viewer-relevant set for the 🛡 deputy badge (#410): the viewer's STRICT
+/// ancestors (members whose deputy could ban the viewer) unioned with the
+/// viewer themselves (deputies they appointed). Strict ancestors are EMPTY for
+/// the owner, so the owner sees the shield only for their own appointees; the
+/// owner is always included so a global moderator (a deputy of the owner) is
+/// relevant to every viewer.
+pub(crate) fn viewer_relevant_deputizer_set(
+    members: &MembersV1,
+    owner_id: MemberId,
+    self_member_id: MemberId,
+) -> HashSet<MemberId> {
+    // Strict ancestors of the viewer: the owner (of every non-owner) plus the
+    // walk up the invite chain. `self` is deliberately NOT a strict ancestor.
+    let mut set = HashSet::new();
+    if self_member_id != owner_id {
+        set.insert(owner_id);
+    }
+    let invited_by: HashMap<MemberId, MemberId> = members
+        .members
+        .iter()
+        .map(|m| (m.member.id(), m.member.invited_by))
+        .collect();
+    let mut guard = HashSet::new();
+    guard.insert(self_member_id);
+    let mut cur = invited_by.get(&self_member_id).copied();
+    while let Some(c) = cur {
+        if !guard.insert(c) {
+            break; // cycle guard
+        }
+        set.insert(c);
+        if c == owner_id {
+            break;
+        }
+        cur = invited_by.get(&c).copied();
+    }
+    // Union the viewer's own id (deputies the viewer appointed).
+    set.insert(self_member_id);
+    set
+}
+
+/// Display names of `target`'s deputizers that are RELEVANT to the viewer,
+/// resolved to `"room owner"` / `"you"` / the appointer's decrypted nickname —
+/// exactly what the member-list 🛡 badge shows. An empty result means the
+/// shield does not show for this viewer.
+///
+/// This is the single definition shared by the member-list row and the
+/// member-info modal legend, so the shield's visibility and its
+/// `Deputy (appointed by …)` tooltip cannot drift between the two
+/// (freenet/river#451).
+pub(crate) fn relevant_deputizer_names(
+    member_info: &river_core::room_state::member_info::MemberInfoV1,
+    room_secrets: &HashMap<u32, [u8; 32]>,
+    deputizers_of: &HashMap<MemberId, Vec<MemberId>>,
+    viewer_relevant: &HashSet<MemberId>,
+    owner_id: MemberId,
+    self_member_id: MemberId,
+    target: MemberId,
+) -> Vec<String> {
+    // Resolve an appointer's id to a display name (owner -> "room owner",
+    // self -> "you", else the appointer's decrypted preferred nickname).
+    let name_of = |id: MemberId| -> String {
+        if id == owner_id {
+            return "room owner".to_string();
+        }
+        if id == self_member_id {
+            return "you".to_string();
+        }
+        member_info
+            .canonical(id)
+            .map(|mi| {
+                match unseal_bytes_with_secrets(&mi.member_info.preferred_nickname, room_secrets) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                    Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
+                }
+            })
+            .unwrap_or_else(|| "Unknown".to_string())
+    };
+    relevant_deputizers(
+        deputizers_of.get(&target).map(Vec::as_slice).unwrap_or(&[]),
+        viewer_relevant,
+    )
+    .into_iter()
+    .map(name_of)
+    .collect()
+}
+
 #[component]
 pub fn MemberList() -> Element {
     let mut invite_modal_active = use_signal(|| false);
@@ -512,76 +636,17 @@ pub fn MemberList() -> Element {
         // Reverse map: for each deputy member, who has deputized them (#410).
         // Built from every member's signed `MemberInfo.deputies`, so the 🛡
         // badge tooltip can name the appointer(s) rather than a generic label,
-        // and so the list can be ordered by deputizer.
-        //
-        // Routed through each member_id's CANONICAL record (highest
-        // member_info_rank), not a raw scan of `member_info.member_info` —
-        // `verify` accepts duplicate member_info records per member_id
-        // (migration safety), and unioning deputies across ALL of a member's
-        // duplicate records (rather than reading only the converged/canonical
-        // one) can keep a revoked deputy grant showing here even after the
-        // revoke has won (freenet/river#411 round 8).
-        let mut deputizers_of: std::collections::HashMap<MemberId, Vec<MemberId>> =
-            std::collections::HashMap::new();
-        let member_ids_with_info: std::collections::HashSet<MemberId> = member_info
-            .member_info
-            .iter()
-            .map(|mi| mi.member_info.member_id)
-            .collect();
-        for appointer in member_ids_with_info {
-            let Some(canonical) = member_info.canonical(appointer) else {
-                continue;
-            };
-            for deputy in &canonical.member_info.deputies {
-                deputizers_of.entry(*deputy).or_default().push(appointer);
-            }
-        }
-
-        // The viewer's STRICT ancestors — the members whose invite subtree
-        // contains self, i.e. who could ban self. `self` is NOT included, and it
-        // is EMPTY when the viewer is the owner (nobody can ban the owner). This
-        // is the strict base for `viewer_relevant` below, which unions in the
-        // viewer's own id to also cover deputies the viewer appointed (#410).
-        let self_ancestors: std::collections::HashSet<MemberId> = {
-            let mut set = std::collections::HashSet::new();
-            // The owner is a strict ancestor of every non-owner (but not of
-            // themselves — hence the guard, so the owner's set stays empty).
-            if self_member_id != owner_id {
-                set.insert(owner_id);
-            }
-            let invited_by: std::collections::HashMap<MemberId, MemberId> = members
-                .members
-                .iter()
-                .map(|m| (m.member.id(), m.member.invited_by))
-                .collect();
-            let mut guard = std::collections::HashSet::new();
-            guard.insert(self_member_id);
-            let mut cur = invited_by.get(&self_member_id).copied();
-            while let Some(c) = cur {
-                if !guard.insert(c) {
-                    break; // cycle guard
-                }
-                set.insert(c);
-                if c == owner_id {
-                    break;
-                }
-                cur = invited_by.get(&c).copied();
-            }
-            set
-        };
+        // and so the list can be ordered by deputizer. Shared with the
+        // member-info modal legend via `build_deputizers_of` so the two never
+        // drift (freenet/river#451).
+        let deputizers_of = build_deputizers_of(member_info);
 
         // The relevance set for BOTH the 🛡 badge and the display ordering
-        // (#410, Ian's final call): a deputizer matters to this viewer if it is a
-        // strict ancestor of the viewer (their deputy could ban the viewer) OR is
-        // the viewer themselves (the viewer appointed the deputy). `self_ancestors`
-        // stays STRICT (empty-for-owner); we union the viewer's own id here so a
-        // mod you appointed — and a mod the OWNER appointed, in the owner's own
-        // view — gets the badge and top/under-you positioning.
-        let viewer_relevant: std::collections::HashSet<MemberId> = {
-            let mut set = self_ancestors.clone();
-            set.insert(self_member_id);
-            set
-        };
+        // (#410, Ian's final call): a deputizer matters to this viewer if it is
+        // a strict ancestor of the viewer (their deputy could ban the viewer)
+        // OR is the viewer themselves (the viewer appointed the deputy). Shared
+        // with the modal legend via `viewer_relevant_deputizer_set` (#451).
+        let viewer_relevant = viewer_relevant_deputizer_set(members, owner_id, self_member_id);
 
         // Order the list as a DISPLAY tree, VIEWER-SCOPED: a member renders under
         // a deputizer only if that deputizer is viewer-relevant — so a global mod
@@ -589,29 +654,6 @@ pub fn MemberList() -> Element {
         // non-owner's deputy rises within that member's subtree and in that
         // member's own view, and a deputy you appointed rises under you (#410).
         let ordered_ids = deputy_display_order(owner_id, members, &deputizers_of, &viewer_relevant);
-
-        // Resolve an appointer's id to a display name (owner -> "room owner",
-        // self -> "you").
-        let name_of = |id: MemberId| -> String {
-            if id == owner_id {
-                return "room owner".to_string();
-            }
-            if id == self_member_id {
-                return "you".to_string();
-            }
-            member_info
-                .canonical(id)
-                .map(|mi| {
-                    match unseal_bytes_with_secrets(
-                        &mi.member_info.preferred_nickname,
-                        room_secrets,
-                    ) {
-                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                        Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
-                    }
-                })
-                .unwrap_or_else(|| "Unknown".to_string())
-        };
 
         // Build display list in tree order
         let mut all_members = Vec::new();
@@ -658,16 +700,16 @@ pub fn MemberList() -> Element {
                 // appointed them). A deputy of the OWNER (global mod) shows in
                 // every view including the owner's own; a mod you appointed
                 // shows in your view; a deputy of an unrelated subtree is hidden.
-                deputized_by: relevant_deputizers(
-                    deputizers_of
-                        .get(&member_id)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
+                // Same helper the member-info modal legend uses (#451).
+                deputized_by: relevant_deputizer_names(
+                    member_info,
+                    room_secrets,
+                    &deputizers_of,
                     &viewer_relevant,
-                )
-                .into_iter()
-                .map(&name_of)
-                .collect(),
+                    owner_id,
+                    self_member_id,
+                    member_id,
+                ),
             };
 
             all_members.push((member_display_parts(&member_display), member_id));
@@ -2654,6 +2696,166 @@ mod tests {
         let icons: Vec<&str> = parts.tags.iter().map(|(icon, _)| *icon).collect();
         assert!(icons.contains(&"👑"));
         assert!(icons.contains(&"⭐"));
+    }
+
+    /// The 🛡 deputy shield renders exactly when `deputized_by` is non-empty,
+    /// and its tooltip names the appointer(s). The member-info modal legend
+    /// mirrors this (freenet/river#451) via the shared
+    /// `relevant_deputizer_names` helper, so this pins the row half of the
+    /// "same shield in both places" contract.
+    #[test]
+    fn member_display_parts_shows_deputy_shield_with_appointer_tooltip() {
+        let mut display = make_member_display("bob");
+        assert!(
+            !member_display_parts(&display)
+                .tags
+                .iter()
+                .any(|(icon, _)| *icon == "🛡"),
+            "no shield when the member is not a deputy"
+        );
+
+        display.deputized_by = vec!["room owner".to_string()];
+        let parts = member_display_parts(&display);
+        let shield = parts
+            .tags
+            .iter()
+            .find(|(icon, _)| *icon == "🛡")
+            .expect("a deputy must show the 🛡 shield");
+        assert_eq!(shield.1, "Deputy (appointed by room owner)");
+    }
+
+    /// End-to-end pin of the shared deputy helpers the member row AND the
+    /// member-info modal legend both depend on (freenet/river#451): build a
+    /// room where the OWNER deputizes `mod_member`, and assert that from an
+    /// unrelated viewer's perspective `relevant_deputizer_names` reports the
+    /// shield named "room owner" (a global moderator is relevant to everyone),
+    /// while a member nobody deputized reports no shield.
+    #[test]
+    fn shared_deputy_helpers_name_a_global_moderator() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let mod_id = MemberId::from(&mod_sk.verifying_key());
+        let viewer_id = MemberId::from(&viewer_sk.verifying_key());
+
+        // The owner invited both the moderator and the viewer.
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+            ],
+        };
+
+        // Owner's signed record deputizes the moderator; the others carry none.
+        let mk_info = |sk: &SigningKey, deputies: Vec<MemberId>| {
+            let mi = MemberInfo {
+                member_id: MemberId::from(&sk.verifying_key()),
+                version: 0,
+                preferred_nickname: river_core::room_state::privacy::SealedBytes::public(
+                    b"nick".to_vec(),
+                ),
+                deputies,
+            };
+            AuthorizedMemberInfo::new_with_member_key(mi, sk)
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                mk_info(&owner_sk, vec![mod_id]),
+                mk_info(&mod_sk, vec![]),
+                mk_info(&viewer_sk, vec![]),
+            ],
+        };
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let deputizers_of = build_deputizers_of(&member_info);
+        let viewer_relevant = viewer_relevant_deputizer_set(&members, owner_id, viewer_id);
+
+        // The moderator (a deputy of the owner) shows the shield, named "room
+        // owner", even to an unrelated viewer.
+        assert_eq!(
+            relevant_deputizer_names(
+                &member_info,
+                &secrets,
+                &deputizers_of,
+                &viewer_relevant,
+                owner_id,
+                viewer_id,
+                mod_id,
+            ),
+            vec!["room owner".to_string()],
+        );
+        // A member nobody deputized shows no shield.
+        assert!(relevant_deputizer_names(
+            &member_info,
+            &secrets,
+            &deputizers_of,
+            &viewer_relevant,
+            owner_id,
+            viewer_id,
+            viewer_id,
+        )
+        .is_empty());
+    }
+
+    /// `build_deputizers_of` must order each deputy's appointers
+    /// DETERMINISTICALLY (sorted by MemberId), not by `HashSet` iteration
+    /// order. The row and the modal legend build this map independently, so a
+    /// member appointed by multiple relevant deputizers would otherwise show
+    /// "room owner, you" in one place and "you, room owner" in the other, or
+    /// reorder between renders (freenet/river#451, Codex P3).
+    #[test]
+    fn build_deputizers_of_orders_appointers_deterministically() {
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+
+        let mut rng = rand::thread_rng();
+        // A pool of appointers all deputizing the same target, built in a
+        // shuffled input order; the output must be sorted regardless.
+        let appointer_sks: Vec<SigningKey> =
+            (0..6).map(|_| SigningKey::generate(&mut rng)).collect();
+        let target_sk = SigningKey::generate(&mut rng);
+        let target_id = MemberId::from(&target_sk.verifying_key());
+
+        let mk_info = |sk: &SigningKey, deputies: Vec<MemberId>| {
+            let mi = MemberInfo {
+                member_id: MemberId::from(&sk.verifying_key()),
+                version: 0,
+                preferred_nickname: river_core::room_state::privacy::SealedBytes::public(
+                    b"n".to_vec(),
+                ),
+                deputies,
+            };
+            AuthorizedMemberInfo::new_with_member_key(mi, sk)
+        };
+
+        let mut expected: Vec<MemberId> = appointer_sks
+            .iter()
+            .map(|sk| MemberId::from(&sk.verifying_key()))
+            .collect();
+        expected.sort_unstable();
+
+        // Build the state twice with the appointer records in DIFFERENT input
+        // orders; both must yield the same sorted appointer list for target.
+        let build = |order: &[usize]| {
+            let records: Vec<AuthorizedMemberInfo> = order
+                .iter()
+                .map(|&i| mk_info(&appointer_sks[i], vec![target_id]))
+                .collect();
+            let member_info = MemberInfoV1 {
+                member_info: records,
+            };
+            build_deputizers_of(&member_info)
+                .get(&target_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        assert_eq!(build(&[0, 1, 2, 3, 4, 5]), expected);
+        assert_eq!(build(&[5, 3, 1, 4, 0, 2]), expected);
     }
 
     /// Production-code slice of this file (everything before the
