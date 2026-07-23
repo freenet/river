@@ -67,8 +67,9 @@ pub enum DmCommands {
     ///
     /// `room_id` is the CARRIER room the DM travels in — you and `recipient`
     /// must both be members of it. `--room` is the TARGET room you are inviting
-    /// them to (any room you are a member of, including `room_id` itself). A
-    /// fresh single-use invitee credential is minted, exactly as
+    /// them to; it must be a DIFFERENT room you are a member of (inviting them
+    /// to the carrier room, which they are already in, would be un-acceptable).
+    /// A fresh single-use invitee credential is minted, exactly as
     /// `invite create` does.
     Invite {
         /// Carrier room ID (base58 room owner key) — the room whose DM thread
@@ -78,7 +79,8 @@ pub enum DmCommands {
         /// Recipient member ID (short prefix accepted).
         recipient: String,
         /// Target room ID (base58 room owner key) — the room you are inviting
-        /// the recipient to join. You must be a member of it.
+        /// the recipient to join. You must be a member of it, and it must be
+        /// different from the carrier room.
         #[arg(long)]
         room: String,
         /// Optional personal note shown above the Accept button.
@@ -445,8 +447,22 @@ async fn execute_invite(
     let carrier_room_key = parse_room_id(carrier_room_id)?;
     let target_room_key = parse_room_id(target_room_id)?;
 
+    // Reject a self-invite: the recipient is resolved as a current member of
+    // the carrier room, so inviting them to the carrier room (`--room` ==
+    // carrier) mints an invitation to a room they are ALREADY in. Both the CLI
+    // #308 re-accept guard and the UI's member-aware guard then refuse it, so
+    // the card can never be accepted. Fail loudly instead of "delivering" a
+    // dead invitation (freenet/river#456, Codex P2).
+    if target_room_key == carrier_room_key {
+        return Err(anyhow!(
+            "The target room (--room) is the same as the carrier room. The recipient is already \
+             a member of it, so the invitation could not be accepted. Pick a different --room."
+        ));
+    }
+
     // Signing identity for the carrier room (the DM is signed by, and travels
-    // in, the carrier room).
+    // in, the carrier room). Honours a `--signing-key-file` override — that is
+    // the carrier-room sender identity.
     let (signing_key, _, _) = api.storage().get_room(&carrier_room_key)?.ok_or_else(|| {
         anyhow!("Carrier room not found. You must be a member of it to send an invite DM.")
     })?;
@@ -454,16 +470,29 @@ async fn execute_invite(
     let room_state = api.get_room(&carrier_room_key, false).await?;
     let recipient_vk = resolve_recipient_vk(&room_state, &carrier_room_key, recipient)?;
 
-    // Build the invitation for the TARGET room (requires the target room in
-    // local storage). Byte-identical to what `invite create` produces — same
-    // `build_invitation` — so the recipient's `dm accept` / UI Accept card
-    // decode it the same way as a base58 `?invitation=` code.
-    let invitation = api.build_invitation(&target_room_key).map_err(|e| {
-        anyhow!(
-            "Could not build an invitation for the target room (are you a member of it?): {}",
-            e
-        )
-    })?;
+    // Build the invitation for the TARGET room. Sign it with the target room's
+    // OWN stored member key, NOT a `--signing-key-file` override (which is the
+    // carrier sender identity and is generally not a target-room member —
+    // signing with it mints an invitation the target contract rejects on
+    // accept; freenet/river#456, Codex P2). The target-room local state comes
+    // from storage; `get_invitation_secrets` inside `build_invitation` adds the
+    // private-room secrets. Byte-identical to what `invite create` produces.
+    let target_state = api
+        .storage()
+        .get_room(&target_room_key)?
+        .map(|(_, state, _)| state)
+        .ok_or_else(|| {
+            anyhow!("Target room (--room) not found in local storage. You must be a member of it to invite others to it.")
+        })?;
+    let target_signing_key = api
+        .storage()
+        .stored_signing_key(&target_room_key)?
+        .ok_or_else(|| {
+            anyhow!("Target room (--room) not found in local storage. You must be a member of it to invite others to it.")
+        })?;
+    let invitation = api
+        .build_invitation(&target_room_key, &target_signing_key, &target_state)
+        .map_err(|e| anyhow!("Could not build an invitation for the target room: {}", e))?;
 
     let mut invitation_payload = Vec::new();
     ciborium::ser::into_writer(&invitation, &mut invitation_payload)
@@ -1814,6 +1843,27 @@ mod tests {
         assert!(
             label.starts_with("[Invitation to room ") && label.ends_with("come join"),
             "got: {label}"
+        );
+    }
+
+    /// `dm send` MUST put text DMs on the wire as RAW UTF-8 (the legacy
+    /// no-magic-byte shape) so pre-#243 clients still render them — wrapping a
+    /// `Text` body in `encode_body` would prepend the `0x80` magic and garble
+    /// them on those clients. `execute_send` needs a live `ApiClient` to run,
+    /// so pin the call shape by source-scrape: the send path passes raw bytes,
+    /// and only the invite path opts into `encode_body`.
+    #[test]
+    fn dm_send_uses_legacy_raw_text_wire_shape() {
+        let src = include_str!("dm.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        assert!(
+            prod.contains("message.as_bytes(),"),
+            "execute_send must pass raw message bytes to deliver_dm (legacy text wire shape); \
+             wrapping Text in encode_body would break pre-#243 clients"
+        );
+        assert!(
+            prod.contains("encode_body(&body)"),
+            "execute_invite must opt the Invite body into the magic-byte+CBOR encoding"
         );
     }
 

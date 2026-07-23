@@ -418,6 +418,26 @@ impl Storage {
         }
     }
 
+    /// The room's STORED signing key, IGNORING any `--signing-key-file` /
+    /// `RIVER_SIGNING_KEY_FILE` override. Returns `None` if the room isn't in
+    /// local storage.
+    ///
+    /// Use this when you need a room's own persisted member identity
+    /// regardless of a global override that was selected for a DIFFERENT room.
+    /// `dm invite` needs it: the override (if any) is the carrier-room sender
+    /// identity, but the invitation must be signed by the TARGET room's own
+    /// member key — signing it with the carrier override would mint an
+    /// invitation from a non-member that the target contract rejects on accept
+    /// (freenet/river#456, Codex review P2).
+    pub fn stored_signing_key(&self, owner_vk: &VerifyingKey) -> Result<Option<SigningKey>> {
+        let storage = self.load_rooms()?;
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        Ok(storage
+            .rooms
+            .get(&owner_key_str)
+            .map(|room_info| SigningKey::from_bytes(&room_info.signing_key_bytes)))
+    }
+
     /// Whether an in-memory signing-key override is active (from
     /// `--signing-key-file` / `RIVER_SIGNING_KEY_FILE`). Lets callers tailor
     /// diagnostics to the override-set vs not-set case without exposing the

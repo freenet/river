@@ -77,9 +77,10 @@ riverctl dm invite <carrier-room-vk> <recipient> --room <target-room-vk> -m "com
 
 - `<carrier-room-vk>` is the room the DM travels in — you and the recipient must
   both be members of it.
-- `--room <target-room-vk>` is the room you are inviting them to (any room you're
-  a member of, including the carrier room itself). A fresh single-use invite
-  credential is minted, exactly as `invite create` does.
+- `--room <target-room-vk>` is the room you are inviting them to. It must be a
+  *different* room you're a member of (the recipient is already in the carrier
+  room). A fresh single-use invite credential is minted, exactly as
+  `invite create` does.
 - `-m/--message` is an optional note shown above the Accept button.
 
 The recipient accepts with `dm accept` (below), or clicks the card in the UI.
