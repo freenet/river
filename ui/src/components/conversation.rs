@@ -35,7 +35,10 @@ use river_core::room_state::message::{
     AuthorizedMessageV1, MessageId, MessageV1, MessagesV1, RoomMessageBody,
 };
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen::JsCast;
@@ -170,6 +173,12 @@ fn group_messages(
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
 
+    // Inputs to the per-message HTML cache (see MESSAGE_HTML_CACHE). The member
+    // fingerprint is computed once per render, not per message.
+    let members_fp = member_names_fingerprint(member_names);
+    let mut seen_message_ids: std::collections::HashSet<MessageId> =
+        std::collections::HashSet::new();
+
     // Only iterate over displayable messages (non-deleted, non-action)
     for message in messages_state.display_messages() {
         let author_id = message.message.author;
@@ -217,8 +226,14 @@ fn group_messages(
         let content_text = messages_state
             .effective_text(message)
             .unwrap_or_else(|| decrypt_message_content(&message.message.content, secrets));
-        let content_html =
-            message_to_html_with_mentions(&content_text, member_names, self_member_id);
+        seen_message_ids.insert(message_id.clone());
+        let content_html = render_message_html_cached(
+            &message_id,
+            &content_text,
+            member_names,
+            members_fp,
+            self_member_id,
+        );
         let is_self = author_id == self_member_id;
 
         // Get edited status and reactions
@@ -312,6 +327,10 @@ fn group_messages(
             }));
         }
     }
+
+    // Evict cached HTML for messages that are no longer visible so the cache
+    // stays bounded to the current room's message set.
+    prune_message_html_cache(&seen_message_ids);
 
     items
 }
@@ -620,6 +639,106 @@ pub(crate) fn message_to_html_with_mentions(
         html = html.replace(&format!("{OPEN}{idx}{CLOSE}"), chip);
     }
     html
+}
+
+thread_local! {
+    /// Per-message rendered-HTML cache for message bodies.
+    ///
+    /// The `message_groups` memo rebuilds the *entire* visible message list
+    /// whenever `ROOMS` changes — which is on every sync tick, incoming
+    /// message, reaction, and DM. Rendering one body runs a full markdown
+    /// parse + HTML serialize + mention/anchor rewrite (tens of µs natively,
+    /// several-fold more in WASM on a mobile CPU). Re-parsing all
+    /// `max_recent_messages` (default 100) bodies on every update was a major
+    /// source of the mobile jank users reported ("really slows down the mobile
+    /// browser").
+    ///
+    /// This cache keys each body's HTML by `MessageId` plus a fingerprint of
+    /// every input that affects the output, so steady-state message flow
+    /// re-parses only the one new/changed message instead of the whole
+    /// history. It is single-threaded (WASM) / per-thread (native tests) and
+    /// is pruned each render (`prune_message_html_cache`) to the currently
+    /// visible set, so it stays bounded to the current room's messages.
+    static MESSAGE_HTML_CACHE: RefCell<HashMap<MessageId, (u64, String)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Order-independent fingerprint of the member-name map (mention chips resolve
+/// to members' *current* nicknames, so a rename must invalidate any cached body
+/// that renders a chip). Combining per-entry hashes with `wrapping_add` makes
+/// the result independent of `HashMap` iteration order, so identical logical
+/// content always fingerprints identically. `len()` is folded in to
+/// distinguish an empty map from an all-zero-hash one.
+fn member_names_fingerprint(member_names: &HashMap<MemberId, String>) -> u64 {
+    let mut acc: u64 = member_names.len() as u64;
+    for (id, name) in member_names {
+        let mut h = DefaultHasher::new();
+        id.hash(&mut h);
+        name.hash(&mut h);
+        acc = acc.wrapping_add(h.finish());
+    }
+    acc
+}
+
+/// Fingerprint of every input that determines a message body's rendered HTML.
+///
+/// The body depends on the effective `text` always, and — only when the text
+/// can carry a mention (`rv:` reference scheme present) — on the member-name
+/// map (chip nicknames) and the local member id (self-mention highlight).
+/// `running_behind_freenet_gateway()` is constant per session, so it is not
+/// part of the key. Gating the member inputs on the presence of a mention
+/// means an ordinary (mention-free) message survives member joins/renames in
+/// the cache, while a message that renders a chip is invalidated by them.
+fn message_html_fingerprint(text: &str, members_fp: u64, self_member_id: MemberId) -> u64 {
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    if text.contains(river_core::mention::REF_SCHEME) {
+        members_fp.hash(&mut h);
+        self_member_id.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Cached wrapper around [`message_to_html_with_mentions`]. Returns the cached
+/// HTML on a fingerprint match, otherwise renders it and stores it. The output
+/// is always byte-identical to calling `message_to_html_with_mentions` directly
+/// with the current inputs — the cache only skips redundant re-rendering.
+fn render_message_html_cached(
+    message_id: &MessageId,
+    text: &str,
+    member_names: &HashMap<MemberId, String>,
+    members_fp: u64,
+    self_member_id: MemberId,
+) -> String {
+    let fp = message_html_fingerprint(text, members_fp, self_member_id);
+    MESSAGE_HTML_CACHE.with(|cache| {
+        if let Some((cached_fp, html)) = cache.borrow().get(message_id) {
+            if *cached_fp == fp {
+                return html.clone();
+            }
+        }
+        let html = message_to_html_with_mentions(text, member_names, self_member_id);
+        cache
+            .borrow_mut()
+            .insert(message_id.clone(), (fp, html.clone()));
+        html
+    })
+}
+
+/// Drop cached entries for messages no longer visible (e.g. after a room
+/// switch or history trim), keeping the cache bounded to the current room's
+/// message set.
+fn prune_message_html_cache(seen: &std::collections::HashSet<MessageId>) {
+    MESSAGE_HTML_CACHE.with(|cache| {
+        cache.borrow_mut().retain(|id, _| seen.contains(id));
+    });
+}
+
+/// Test-only: reset the cache so each test observes a clean cache regardless of
+/// thread reuse across the test binary.
+#[cfg(test)]
+fn clear_message_html_cache() {
+    MESSAGE_HTML_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Build the inline chip markup for one mention. `name` is the resolved current
@@ -3981,6 +4100,128 @@ mod tests {
 
     fn mid_from(hex: &str) -> MemberId {
         river_core::mention::member_id_from_hex(hex).unwrap()
+    }
+
+    fn msg_id(seed: &[u8]) -> MessageId {
+        MessageId(freenet_scaffold::util::fast_hash(seed))
+    }
+
+    /// The cached renderer must always return exactly what the uncached
+    /// renderer would for the *current* inputs — a repeat call (hit) and a
+    /// content edit (same id) must each reflect current state.
+    #[test]
+    fn cached_message_html_matches_uncached_across_input_changes() {
+        clear_message_html_cache();
+        let id = msg_id(b"m-cache-1");
+        let alice = mid_from("00000000000000aa");
+        let me = mid_from("00000000000000bb");
+        let mut names = HashMap::new();
+        names.insert(alice, "Alice".to_string());
+        let fp = member_names_fingerprint(&names);
+
+        // Plain (mention-free) body: repeat call returns identical HTML.
+        let text = "hello **world** https://freenet.org";
+        let first = render_message_html_cached(&id, text, &names, fp, me);
+        let second = render_message_html_cached(&id, text, &names, fp, me);
+        assert_eq!(first, second, "cache hit is identical");
+        assert_eq!(
+            first,
+            message_to_html_with_mentions(text, &names, me),
+            "cached output equals uncached"
+        );
+
+        // Editing the body (same id) invalidates and re-renders.
+        let edited = "goodbye **world**";
+        let after_edit = render_message_html_cached(&id, edited, &names, fp, me);
+        assert_eq!(
+            after_edit,
+            message_to_html_with_mentions(edited, &names, me),
+            "edited content re-rendered"
+        );
+        assert_ne!(after_edit, first, "edit changed the HTML");
+    }
+
+    /// A mention chip renders the member's *current* nickname; renaming the
+    /// member must invalidate the cached body even though its text is unchanged.
+    #[test]
+    fn cached_message_html_reflects_member_rename_for_mentions() {
+        clear_message_html_cache();
+        let id = msg_id(b"m-cache-2");
+        let alice = mid_from("00000000000000aa");
+        let me = mid_from("00000000000000bb");
+        let token = river_core::mention::encode_mention(alice, "Alice");
+        let text = format!("hey {token}!");
+
+        let mut names = HashMap::new();
+        names.insert(alice, "Alice".to_string());
+        let fp1 = member_names_fingerprint(&names);
+        let before = render_message_html_cached(&id, &text, &names, fp1, me);
+        assert!(
+            before.contains("Alice"),
+            "chip shows current name: {before}"
+        );
+
+        // Rename Alice -> Roberta (not a substring of the old name). Same
+        // message text, new member map.
+        names.insert(alice, "Roberta".to_string());
+        let fp2 = member_names_fingerprint(&names);
+        assert_ne!(fp1, fp2, "rename changes the member fingerprint");
+        let after = render_message_html_cached(&id, &text, &names, fp2, me);
+        assert_eq!(
+            after,
+            message_to_html_with_mentions(&text, &names, me),
+            "rename invalidated the cached chip"
+        );
+        assert!(after.contains("Roberta"), "chip shows new name: {after}");
+        assert!(!after.contains("Alice"), "old name gone: {after}");
+    }
+
+    /// A mention-free body must fingerprint the same regardless of the member
+    /// map, so ordinary messages survive member joins/renames in the cache; a
+    /// body carrying a mention token must incorporate the member fingerprint.
+    #[test]
+    fn message_html_fingerprint_gates_member_inputs_on_mentions() {
+        let me = mid_from("00000000000000bb");
+        let plain = "just a normal message, no mentions here";
+        assert_eq!(
+            message_html_fingerprint(plain, 111, me),
+            message_html_fingerprint(plain, 222, me),
+            "mention-free fingerprint ignores member fp"
+        );
+
+        let alice = mid_from("00000000000000aa");
+        let token = river_core::mention::encode_mention(alice, "Alice");
+        let mentioned = format!("ping {token}");
+        assert_ne!(
+            message_html_fingerprint(&mentioned, 111, me),
+            message_html_fingerprint(&mentioned, 222, me),
+            "mention fingerprint depends on member fp"
+        );
+    }
+
+    /// `prune_message_html_cache` drops entries for messages no longer visible
+    /// (e.g. after a room switch) while keeping the still-visible ones.
+    #[test]
+    fn prune_message_html_cache_bounds_to_visible_set() {
+        clear_message_html_cache();
+        let me = mid_from("00000000000000bb");
+        let names = HashMap::new();
+        let fp = member_names_fingerprint(&names);
+        let keep = msg_id(b"keep");
+        let drop = msg_id(b"drop");
+        render_message_html_cached(&keep, "keep me", &names, fp, me);
+        render_message_html_cached(&drop, "drop me", &names, fp, me);
+        assert_eq!(MESSAGE_HTML_CACHE.with(|c| c.borrow().len()), 2);
+
+        let mut visible = std::collections::HashSet::new();
+        visible.insert(keep.clone());
+        prune_message_html_cache(&visible);
+
+        MESSAGE_HTML_CACHE.with(|c| {
+            let c = c.borrow();
+            assert!(c.contains_key(&keep), "visible entry kept");
+            assert!(!c.contains_key(&drop), "off-screen entry pruned");
+        });
     }
 
     #[test]
