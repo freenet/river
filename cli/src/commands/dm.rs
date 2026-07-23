@@ -422,6 +422,17 @@ async fn deliver_dm(
     Ok(())
 }
 
+/// Whether `member_id` is currently a member of `state` (the room owner always
+/// counts, even without an explicit `AuthorizedMember` entry).
+fn room_has_member(state: &ChatRoomStateV1, owner_id: MemberId, member_id: MemberId) -> bool {
+    member_id == owner_id
+        || state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member_id)
+}
+
 /// Normalize the optional `--message` for an invite DM: trim it, and treat a
 /// blank / whitespace-only note as absent so the recipient's UI hides the
 /// message box entirely (per the `InvitePayload::personal_message` contract)
@@ -474,22 +485,41 @@ async fn execute_invite(
     // OWN stored member key, NOT a `--signing-key-file` override (which is the
     // carrier sender identity and is generally not a target-room member —
     // signing with it mints an invitation the target contract rejects on
-    // accept; freenet/river#456, Codex P2). The target-room local state comes
-    // from storage; `get_invitation_secrets` inside `build_invitation` adds the
-    // private-room secrets. Byte-identical to what `invite create` produces.
-    let target_state = api
-        .storage()
-        .get_room(&target_room_key)?
-        .map(|(_, state, _)| state)
-        .ok_or_else(|| {
-            anyhow!("Target room (--room) not found in local storage. You must be a member of it to invite others to it.")
-        })?;
+    // accept; freenet/river#456, Codex P2). Presence in local storage proves
+    // you hold credentials for the room.
     let target_signing_key = api
         .storage()
         .stored_signing_key(&target_room_key)?
         .ok_or_else(|| {
             anyhow!("Target room (--room) not found in local storage. You must be a member of it to invite others to it.")
         })?;
+
+    // Fetch the target room's CURRENT network state, NOT the stale local cache:
+    // (1) it gives the invitee up-to-date `room_secrets` (a rotation since the
+    // last sync would otherwise strand them on `[Encrypted …]`), and (2) it
+    // lets us verify the inviting identity is still a current member. If it was
+    // pruned from the target room (inactivity, or a join that never landed),
+    // an invitation it signs has an `invited_by` that isn't in the room, so the
+    // recipient's accept fails `get_invite_chain` / `MembersV1` verification.
+    // Refuse loudly instead of delivering a dead invitation that reports
+    // success (freenet/river#456, Codex P2 round 2).
+    let target_state = api.get_room(&target_room_key, false).await.map_err(|e| {
+        anyhow!(
+            "Could not fetch the target room (--room) state to build the invitation: {}",
+            e
+        )
+    })?;
+    let target_inviter_id = MemberId::from(&target_signing_key.verifying_key());
+    let target_owner_id = MemberId::from(&target_room_key);
+    if !room_has_member(&target_state, target_owner_id, target_inviter_id) {
+        return Err(anyhow!(
+            "Your identity is not a current member of the target room (--room), so an invitation \
+             signed by it could not be accepted. Re-establish your membership there (send a \
+             message, or re-accept your invitation) before inviting others to it."
+        ));
+    }
+
+    // Byte-identical to what `invite create` produces (same `build_invitation`).
     let invitation = api
         .build_invitation(&target_room_key, &target_signing_key, &target_state)
         .map_err(|e| anyhow!("Could not build an invitation for the target room: {}", e))?;
@@ -1865,6 +1895,43 @@ mod tests {
             prod.contains("encode_body(&body)"),
             "execute_invite must opt the Invite body into the magic-byte+CBOR encoding"
         );
+    }
+
+    /// `room_has_member` gates the `dm invite` target-membership check (a
+    /// non-member target signer produces an un-acceptable invitation). The
+    /// owner counts without an explicit entry; a stranger does not.
+    #[test]
+    fn room_has_member_recognizes_owner_and_members() {
+        let owner = key(1);
+        let member = key(2);
+        let stranger = key(3);
+        let owner_vk = owner.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let mut state = ChatRoomStateV1::default();
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                member_vk: member.verifying_key(),
+                invited_by: owner_id,
+            },
+            &owner,
+        ));
+
+        // Owner counts even without an explicit AuthorizedMember entry.
+        assert!(room_has_member(&state, owner_id, owner_id));
+        // An enrolled member counts.
+        assert!(room_has_member(
+            &state,
+            owner_id,
+            MemberId::from(&member.verifying_key())
+        ));
+        // A non-member does not.
+        assert!(!room_has_member(
+            &state,
+            owner_id,
+            MemberId::from(&stranger.verifying_key())
+        ));
     }
 
     /// A blank / whitespace-only `--message` becomes `None` so the recipient's
