@@ -20,7 +20,7 @@ use river_core::room_state::direct_messages::{
     advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
     PurgeToken, MAX_DM_MESSAGES_PER_PAIR,
 };
-use river_core::room_state::dm_body::{decode_body, DirectMessageBody, InvitePayload};
+use river_core::room_state::dm_body::{decode_body, encode_body, DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use serde_json::json;
@@ -55,6 +55,37 @@ pub enum DmCommands {
         /// Show only messages from the last N minutes
         #[arg(long)]
         since_minutes: Option<u64>,
+    },
+    /// Send a room invitation AS a direct message, so the recipient's River UI
+    /// renders it as a clickable "Invitation" card (with an Accept button)
+    /// rather than inert text.
+    ///
+    /// This is the send-side counterpart of `dm accept` and the CLI equivalent
+    /// of the UI's "Share invite via DM" button (#252). Pasting a bare invite
+    /// code into `dm send` just shows raw text at the other end — only this
+    /// structured invite DM produces the card.
+    ///
+    /// `room_id` is the CARRIER room the DM travels in — you and `recipient`
+    /// must both be members of it. `--room` is the TARGET room you are inviting
+    /// them to; it must be a DIFFERENT room you are a member of (inviting them
+    /// to the carrier room, which they are already in, would be un-acceptable).
+    /// A fresh single-use invitee credential is minted, exactly as
+    /// `invite create` does.
+    Invite {
+        /// Carrier room ID (base58 room owner key) — the room whose DM thread
+        /// the invitation is delivered in. You and the recipient must both be
+        /// members.
+        room_id: String,
+        /// Recipient member ID (short prefix accepted).
+        recipient: String,
+        /// Target room ID (base58 room owner key) — the room you are inviting
+        /// the recipient to join. You must be a member of it, and it must be
+        /// different from the carrier room.
+        #[arg(long)]
+        room: String,
+        /// Optional personal note shown above the Accept button.
+        #[arg(short = 'm', long)]
+        message: Option<String>,
     },
     /// Purge a direct message addressed to you. Builds a recipient purge
     /// envelope listing the message's token; once accepted by the room
@@ -114,6 +145,12 @@ pub async fn execute(command: DmCommands, api: ApiClient, format: OutputFormat) 
             recipient,
             message,
         } => execute_send(api, format, &room_id, &recipient, &message).await,
+        DmCommands::Invite {
+            room_id,
+            recipient,
+            room,
+            message,
+        } => execute_invite(api, format, &room_id, &recipient, &room, message.as_deref()).await,
         DmCommands::List {
             room_id,
             with,
@@ -158,6 +195,60 @@ async fn execute_send(
     let room_state = api.get_room(&room_owner_key, false).await?;
 
     let recipient_vk = resolve_recipient_vk(&room_state, &room_owner_key, recipient)?;
+
+    // Text-variant DMs keep the legacy wire shape (raw UTF-8 bytes, no magic
+    // byte) for backwards compatibility: pre-#243 clients in the wild decode
+    // raw UTF-8 directly via `String::from_utf8_lossy`, and new clients
+    // round-trip cleanly because `decode_body`'s legacy fallback hands raw
+    // UTF-8 back as `DirectMessageBody::Text`. So `dm send` passes the raw
+    // bytes, NOT `encode_body(&Text{..})`. Only NEW variants (`Invite`) opt
+    // into the magic-byte + CBOR shape — see `execute_invite`.
+    deliver_dm(
+        &api,
+        format,
+        room_owner_key,
+        &signing_key,
+        &room_state,
+        recipient_vk,
+        message.as_bytes(),
+        message.to_string(),
+        DmKind::Text,
+    )
+    .await
+}
+
+/// What kind of DM `deliver_dm` is delivering — only affects the
+/// success-message wording, not the wire bytes (the caller has already
+/// encoded those into `body_bytes`).
+#[derive(Clone, Copy)]
+enum DmKind {
+    Text,
+    Invite,
+}
+
+/// Shared delivery core for `dm send` and `dm invite`.
+///
+/// Given an ALREADY-ENCODED DM `body_bytes` (raw UTF-8 for a legacy `Text`
+/// DM, magic-byte+CBOR for a structured `Invite`), this runs the identical
+/// membership / per-pair-cap pre-flight, composes and signs the DM, publishes
+/// the delta (bundling a member-rejoin when the sender was pruned), verifies
+/// the DM actually lands in a local pre-flight `apply_delta`, caches
+/// `cache_label` for the sender's own `dm list` bubble, and prints the result.
+///
+/// Keeping one body means the anti-silent-drop guards (#269) and the rejoin
+/// bundling (#256 / Ivvor Bug #1) are byte-identical for text and invite DMs.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_dm(
+    api: &ApiClient,
+    format: OutputFormat,
+    room_owner_key: VerifyingKey,
+    signing_key: &SigningKey,
+    room_state: &ChatRoomStateV1,
+    recipient_vk: VerifyingKey,
+    body_bytes: &[u8],
+    cache_label: String,
+    kind: DmKind,
+) -> Result<()> {
     let recipient_id = MemberId::from(&recipient_vk);
     let self_id = MemberId::from(&signing_key.verifying_key());
 
@@ -192,7 +283,7 @@ async fn execute_send(
     // Contract-level pin: `pruned_sender_can_dm_when_bundling_rejoin_delta`
     // in `common/tests/direct_messages_test.rs`.
     let (rejoin_members, rejoin_member_info) =
-        api.build_rejoin_delta(&room_state, &room_owner_key, &signing_key);
+        api.build_rejoin_delta(room_state, &room_owner_key, signing_key);
 
     // Codex P2 (PR #269 review): if the sender is pruned AND
     // `build_rejoin_delta` returned no credentials (e.g. older stored
@@ -228,25 +319,13 @@ async fn execute_send(
     }
 
     let now = unix_now()?;
-    // Text-variant DMs keep the legacy wire shape (raw UTF-8 bytes,
-    // no magic byte) for backwards compatibility: pre-this-PR clients
-    // in the wild decode raw UTF-8 directly via
-    // `String::from_utf8_lossy`. A new-format `Text` body would
-    // render a stray `\u{0080}` glyph plus garbled CBOR on those
-    // older clients, with no way for them to know better. New clients
-    // round-trip cleanly because `decode_body`'s legacy fallback path
-    // hands raw UTF-8 back as `DirectMessageBody::Text`.
-    //
-    // Only NEW variants (currently `Invite`) need to opt into the
-    // magic-byte + CBOR wire shape — old clients can't render those
-    // anyway, so the rendering regression is moot.
     let auth = compose_direct_message(
-        &signing_key,
+        signing_key,
         &recipient_vk,
         &room_owner_key,
         now,
         now,
-        message.as_bytes(),
+        body_bytes,
     )
     .map_err(|e| anyhow!("Failed to compose DM: {}", e))?;
 
@@ -270,7 +349,7 @@ async fn execute_send(
     {
         use freenet_scaffold::ComposableState;
         local
-            .apply_delta(&room_state, &params, &Some(delta.clone()))
+            .apply_delta(room_state, &params, &Some(delta.clone()))
             .map_err(|e| anyhow!("Local pre-flight apply_delta failed: {:?}", e))?;
     }
 
@@ -297,26 +376,34 @@ async fn execute_send(
     let token = auth.purge_token();
     let token_hex = hex_token(&token);
 
-    // Persist plaintext in the local outbound-DM cache so a future
-    // `dm list` can render the sender's own bubble as plaintext
-    // instead of `<sent: ciphertext only>`. See issue freenet/river#256.
-    // Failure is logged but not fatal — the DM has already been sent.
+    // Persist a label in the local outbound-DM cache so a future `dm list`
+    // renders the sender's own bubble as text instead of
+    // `<sent: ciphertext only>` (the ciphertext is recipient-sealed, so the
+    // sender can't re-derive it). For a text DM this is the message; for an
+    // invite it's the same `[Invitation to room …]` summary the recipient's
+    // list shows. See issue freenet/river#256. Failure is logged but not
+    // fatal — the DM has already been sent.
     if let Err(e) = persist_outbound_plaintext(
-        &api,
+        api,
         room_owner_key,
         self_id,
         recipient_id,
         token,
         auth.message.timestamp,
-        message.to_string(),
+        cache_label,
     ) {
         tracing::warn!("Failed to persist outbound DM plaintext locally: {}", e);
     }
 
+    let noun = match kind {
+        DmKind::Text => "DM",
+        DmKind::Invite => "Invitation DM",
+    };
     match format {
         OutputFormat::Human => {
             println!(
-                "DM sent to {} (purge token: {})",
+                "{} sent to {} (purge token: {})",
+                noun,
                 short_member_id(&recipient_id),
                 token_hex
             );
@@ -333,6 +420,138 @@ async fn execute_send(
         }
     }
     Ok(())
+}
+
+/// Whether `member_id` is currently a member of `state` (the room owner always
+/// counts, even without an explicit `AuthorizedMember` entry).
+fn room_has_member(state: &ChatRoomStateV1, owner_id: MemberId, member_id: MemberId) -> bool {
+    member_id == owner_id
+        || state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.id() == member_id)
+}
+
+/// Normalize the optional `--message` for an invite DM: trim it, and treat a
+/// blank / whitespace-only note as absent so the recipient's UI hides the
+/// message box entirely (per the `InvitePayload::personal_message` contract)
+/// rather than rendering an empty line.
+fn normalize_personal_message(message: Option<&str>) -> Option<String> {
+    message
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
+/// `dm invite`: send a structured invitation DM so the recipient's UI shows a
+/// clickable Accept card. The CLI counterpart of the UI's "Share invite via
+/// DM" (#252) and the send-side counterpart of `dm accept`.
+async fn execute_invite(
+    api: ApiClient,
+    format: OutputFormat,
+    carrier_room_id: &str,
+    recipient: &str,
+    target_room_id: &str,
+    message: Option<&str>,
+) -> Result<()> {
+    let carrier_room_key = parse_room_id(carrier_room_id)?;
+    let target_room_key = parse_room_id(target_room_id)?;
+
+    // Reject a self-invite: the recipient is resolved as a current member of
+    // the carrier room, so inviting them to the carrier room (`--room` ==
+    // carrier) mints an invitation to a room they are ALREADY in. Both the CLI
+    // #308 re-accept guard and the UI's member-aware guard then refuse it, so
+    // the card can never be accepted. Fail loudly instead of "delivering" a
+    // dead invitation (freenet/river#456, Codex P2).
+    if target_room_key == carrier_room_key {
+        return Err(anyhow!(
+            "The target room (--room) is the same as the carrier room. The recipient is already \
+             a member of it, so the invitation could not be accepted. Pick a different --room."
+        ));
+    }
+
+    // Signing identity for the carrier room (the DM is signed by, and travels
+    // in, the carrier room). Honours a `--signing-key-file` override — that is
+    // the carrier-room sender identity.
+    let (signing_key, _, _) = api.storage().get_room(&carrier_room_key)?.ok_or_else(|| {
+        anyhow!("Carrier room not found. You must be a member of it to send an invite DM.")
+    })?;
+
+    let room_state = api.get_room(&carrier_room_key, false).await?;
+    let recipient_vk = resolve_recipient_vk(&room_state, &carrier_room_key, recipient)?;
+
+    // Build the invitation for the TARGET room. Sign it with the target room's
+    // OWN stored member key, NOT a `--signing-key-file` override (which is the
+    // carrier sender identity and is generally not a target-room member —
+    // signing with it mints an invitation the target contract rejects on
+    // accept; freenet/river#456, Codex P2). Presence in local storage proves
+    // you hold credentials for the room.
+    let target_signing_key = api
+        .storage()
+        .stored_signing_key(&target_room_key)?
+        .ok_or_else(|| {
+            anyhow!("Target room (--room) not found in local storage. You must be a member of it to invite others to it.")
+        })?;
+
+    // Fetch the target room's CURRENT network state, NOT the stale local cache:
+    // (1) it gives the invitee up-to-date `room_secrets` (a rotation since the
+    // last sync would otherwise strand them on `[Encrypted …]`), and (2) it
+    // lets us verify the inviting identity is still a current member. If it was
+    // pruned from the target room (inactivity, or a join that never landed),
+    // an invitation it signs has an `invited_by` that isn't in the room, so the
+    // recipient's accept fails `get_invite_chain` / `MembersV1` verification.
+    // Refuse loudly instead of delivering a dead invitation that reports
+    // success (freenet/river#456, Codex P2 round 2).
+    let target_state = api.get_room(&target_room_key, false).await.map_err(|e| {
+        anyhow!(
+            "Could not fetch the target room (--room) state to build the invitation: {}",
+            e
+        )
+    })?;
+    let target_inviter_id = MemberId::from(&target_signing_key.verifying_key());
+    let target_owner_id = MemberId::from(&target_room_key);
+    if !room_has_member(&target_state, target_owner_id, target_inviter_id) {
+        return Err(anyhow!(
+            "Your identity is not a current member of the target room (--room), so an invitation \
+             signed by it could not be accepted. Re-establish your membership there (send a \
+             message, or re-accept your invitation) before inviting others to it."
+        ));
+    }
+
+    // Byte-identical to what `invite create` produces (same `build_invitation`).
+    let invitation = api
+        .build_invitation(&target_room_key, &target_signing_key, &target_state)
+        .map_err(|e| anyhow!("Could not build an invitation for the target room: {}", e))?;
+
+    let mut invitation_payload = Vec::new();
+    ciborium::ser::into_writer(&invitation, &mut invitation_payload)
+        .map_err(|e| anyhow!("Failed to serialize invitation: {}", e))?;
+
+    let body = DirectMessageBody::Invite(Box::new(InvitePayload {
+        room_owner_vk: target_room_key,
+        invitation_payload,
+        personal_message: normalize_personal_message(message),
+    }));
+    let body_bytes =
+        encode_body(&body).map_err(|e| anyhow!("Failed to encode invite DM: {}", e))?;
+
+    // Same summary the recipient's `dm list` shows, cached so the sender's own
+    // bubble isn't a bare `<sent: ciphertext only>`.
+    let cache_label = format_dm_body_for_cli(&body, &HashMap::new());
+
+    deliver_dm(
+        &api,
+        format,
+        carrier_room_key,
+        &signing_key,
+        &room_state,
+        recipient_vk,
+        &body_bytes,
+        cache_label,
+        DmKind::Invite,
+    )
+    .await
 }
 
 async fn execute_list(
@@ -1612,6 +1831,120 @@ mod tests {
             personal_message: None,
         };
         assert!(decode_invitation_from_payload(&garbage).is_err());
+    }
+
+    /// The invite DM that `dm invite` builds must decode back — through the
+    /// exact `decode_body` + `decode_invitation_from_payload` path `dm accept`
+    /// and the UI Accept card use — into the same invitation. This pins the
+    /// send/accept wire contract end to end (freenet/river#456).
+    #[test]
+    fn invite_dm_body_round_trips_through_accept_path() {
+        let target = key(30);
+        let target_vk = target.verifying_key();
+        // Same bytes `execute_invite` puts in `invitation_payload` (CBOR of the
+        // `Invitation`, identical to the base58 `invite create` payload).
+        let invitation_payload = encode_invitation(&target);
+
+        let body = DirectMessageBody::Invite(Box::new(InvitePayload {
+            room_owner_vk: target_vk,
+            invitation_payload,
+            personal_message: normalize_personal_message(Some("  come join  ")),
+        }));
+
+        // Wire round-trip: encode_body → decode_body.
+        let wire = encode_body(&body).expect("encode");
+        let decoded = decode_body(&wire).expect("decode");
+        assert_eq!(decoded, body, "invite DM must survive the wire round-trip");
+
+        let DirectMessageBody::Invite(payload) = decoded else {
+            panic!("expected an Invite body");
+        };
+        // Personal message trimmed, not dropped.
+        assert_eq!(payload.personal_message.as_deref(), Some("come join"));
+
+        // The recipient's accept path decodes the embedded invitation and
+        // checks it targets the advertised room.
+        let invitation = decode_invitation_from_payload(&payload)
+            .expect("invite must decode on the accept side");
+        assert_eq!(invitation.room, target_vk);
+
+        // And `dm list` labels it as an invitation to that room.
+        let label = format_dm_body_for_cli(&body, &HashMap::new());
+        assert!(
+            label.starts_with("[Invitation to room ") && label.ends_with("come join"),
+            "got: {label}"
+        );
+    }
+
+    /// `dm send` MUST put text DMs on the wire as RAW UTF-8 (the legacy
+    /// no-magic-byte shape) so pre-#243 clients still render them — wrapping a
+    /// `Text` body in `encode_body` would prepend the `0x80` magic and garble
+    /// them on those clients. `execute_send` needs a live `ApiClient` to run,
+    /// so pin the call shape by source-scrape: the send path passes raw bytes,
+    /// and only the invite path opts into `encode_body`.
+    #[test]
+    fn dm_send_uses_legacy_raw_text_wire_shape() {
+        let src = include_str!("dm.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        assert!(
+            prod.contains("message.as_bytes(),"),
+            "execute_send must pass raw message bytes to deliver_dm (legacy text wire shape); \
+             wrapping Text in encode_body would break pre-#243 clients"
+        );
+        assert!(
+            prod.contains("encode_body(&body)"),
+            "execute_invite must opt the Invite body into the magic-byte+CBOR encoding"
+        );
+    }
+
+    /// `room_has_member` gates the `dm invite` target-membership check (a
+    /// non-member target signer produces an un-acceptable invitation). The
+    /// owner counts without an explicit entry; a stranger does not.
+    #[test]
+    fn room_has_member_recognizes_owner_and_members() {
+        let owner = key(1);
+        let member = key(2);
+        let stranger = key(3);
+        let owner_vk = owner.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let mut state = ChatRoomStateV1::default();
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                member_vk: member.verifying_key(),
+                invited_by: owner_id,
+            },
+            &owner,
+        ));
+
+        // Owner counts even without an explicit AuthorizedMember entry.
+        assert!(room_has_member(&state, owner_id, owner_id));
+        // An enrolled member counts.
+        assert!(room_has_member(
+            &state,
+            owner_id,
+            MemberId::from(&member.verifying_key())
+        ));
+        // A non-member does not.
+        assert!(!room_has_member(
+            &state,
+            owner_id,
+            MemberId::from(&stranger.verifying_key())
+        ));
+    }
+
+    /// A blank / whitespace-only `--message` becomes `None` so the recipient's
+    /// UI hides the message box rather than rendering an empty line.
+    #[test]
+    fn normalize_personal_message_blanks_to_none() {
+        assert_eq!(normalize_personal_message(None), None);
+        assert_eq!(normalize_personal_message(Some("")), None);
+        assert_eq!(normalize_personal_message(Some("   ")), None);
+        assert_eq!(
+            normalize_personal_message(Some("  hi ")).as_deref(),
+            Some("hi")
+        );
     }
 
     /// Build an `InboundInvite` for `select_invite_to_accept` tests. A `valid`

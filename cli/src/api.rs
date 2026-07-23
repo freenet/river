@@ -2067,15 +2067,50 @@ impl ApiClient {
     }
 
     pub async fn create_invitation(&self, room_owner_key: &VerifyingKey) -> Result<String> {
+        // `invite create <room>` honours a `--signing-key-file` override for
+        // the room it targets (that is the override's whole purpose — pick
+        // which of your identities in THIS room mints the invite), so resolve
+        // the inviter key via `get_room`.
+        let (inviter_signing_key, state, _contract_key) = self
+            .storage
+            .get_room(room_owner_key)?
+            .ok_or_else(|| anyhow!("Room not found in local storage. You must be a member of the room to create invitations."))?;
+        let invitation = self.build_invitation(room_owner_key, &inviter_signing_key, &state)?;
+
+        // Encode as base58
+        let mut data = Vec::new();
+        ciborium::ser::into_writer(&invitation, &mut data)
+            .map_err(|e| anyhow!("Failed to serialize invitation: {}", e))?;
+        let encoded = bs58::encode(data).into_string();
+
+        Ok(encoded)
+    }
+
+    /// Build the [`Invitation`] artifact for `room_owner_key`, signed by
+    /// `inviter_signing_key` (which MUST be a member of that room) over the
+    /// local `state`. Shared by [`Self::create_invitation`] (which
+    /// base58-encodes it into an `?invitation=…` code) and by `dm invite`
+    /// (which CBOR-encodes it into a
+    /// [`river_core::room_state::dm_body::InvitePayload`]), so both entry
+    /// points produce byte-identical invitation payloads.
+    ///
+    /// The inviter key is passed EXPLICITLY rather than resolved here because
+    /// the two callers resolve it differently: `create_invitation` honours the
+    /// `--signing-key-file` override for its one target room, whereas
+    /// `dm invite` must sign the target-room invitation with the target room's
+    /// OWN stored key (the override, if any, is the carrier-room sender
+    /// identity, not a target member) — see freenet/river#456 / Codex P2. The
+    /// generated invitee signing key is a fresh bearer credential.
+    pub(crate) fn build_invitation(
+        &self,
+        room_owner_key: &VerifyingKey,
+        inviter_signing_key: &SigningKey,
+        state: &ChatRoomStateV1,
+    ) -> Result<Invitation> {
         info!(
-            "Creating invitation for room owned by: {}",
+            "Building invitation for room owned by: {}",
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
-
-        // Get the room info from persistent storage
-        let room_data = self.storage.get_room(room_owner_key)?
-            .ok_or_else(|| anyhow!("Room not found in local storage. You must be the room owner to create invitations."))?;
-        let (signing_key, state, _contract_key) = room_data;
 
         // Generate a new signing key for the invitee
         let invitee_signing_key =
@@ -2086,11 +2121,11 @@ impl ApiClient {
         let member = Member {
             owner_member_id: (*room_owner_key).into(),
             member_vk: invitee_vk,
-            invited_by: signing_key.verifying_key().into(),
+            invited_by: inviter_signing_key.verifying_key().into(),
         };
 
-        // Sign the member entry with the inviter's key (room owner in this case)
-        let authorized_member = AuthorizedMember::new(member, &signing_key);
+        // Sign the member entry with the inviter's key.
+        let authorized_member = AuthorizedMember::new(member, inviter_signing_key);
 
         // Collect every room secret the CLI holds so the invitee can decrypt
         // the room immediately on join — without waiting for the owner
@@ -2108,27 +2143,19 @@ impl ApiClient {
         // creation is a possible future hardening.
         let invitation_secrets = self.storage.get_invitation_secrets(room_owner_key)?;
         let secrets = crate::private_room::collect_secrets_for_room(
-            &state,
-            &signing_key,
+            state,
+            inviter_signing_key,
             &invitation_secrets,
         );
         let room_secrets = crate::private_room::collect_invitation_secrets(&secrets);
 
         // Create the invitation struct
-        let invitation = Invitation {
+        Ok(Invitation {
             room: *room_owner_key,
             invitee_signing_key,
             invitee: authorized_member,
             room_secrets,
-        };
-
-        // Encode as base58
-        let mut data = Vec::new();
-        ciborium::ser::into_writer(&invitation, &mut data)
-            .map_err(|e| anyhow!("Failed to serialize invitation: {}", e))?;
-        let encoded = bs58::encode(data).into_string();
-
-        Ok(encoded)
+        })
     }
 
     pub async fn accept_invitation(
