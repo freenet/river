@@ -64,8 +64,29 @@ Only the recipient can decrypt a DM, so `dm list` renders your own sent
 messages from a local plaintext cache. A DM you sent from a different machine
 shows as ciphertext-only there.
 
-The UI can also share an invitation *inside* a DM, which `dm list` shows as
-`[Invitation to room …]`. Accept it with:
+### Inviting someone via DM
+
+You can hand a room invitation to a co-member *as a DM*. The recipient's River
+UI renders it as a clickable **Invitation card** with an Accept button — unlike a
+bare invite code pasted into `dm send`, which just shows up as raw text.
+
+```bash
+# Invite <recipient> (a member of the carrier room) to <target-room>.
+riverctl dm invite <carrier-room-vk> <recipient> --room <target-room-vk> -m "come join!"
+```
+
+- `<carrier-room-vk>` is the room the DM travels in — you and the recipient must
+  both be members of it.
+- `--room <target-room-vk>` is the room you are inviting them to (any room you're
+  a member of, including the carrier room itself). A fresh single-use invite
+  credential is minted, exactly as `invite create` does.
+- `-m/--message` is an optional note shown above the Accept button.
+
+The recipient accepts with `dm accept` (below), or clicks the card in the UI.
+
+### Accepting an invitation that arrived as a DM
+
+`dm list` shows an invite DM as `[Invitation to room …]`. Accept it with:
 
 ```bash
 riverctl dm accept <carrier-room-vk>

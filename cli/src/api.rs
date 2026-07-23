@@ -2067,14 +2067,34 @@ impl ApiClient {
     }
 
     pub async fn create_invitation(&self, room_owner_key: &VerifyingKey) -> Result<String> {
+        let invitation = self.build_invitation(room_owner_key)?;
+
+        // Encode as base58
+        let mut data = Vec::new();
+        ciborium::ser::into_writer(&invitation, &mut data)
+            .map_err(|e| anyhow!("Failed to serialize invitation: {}", e))?;
+        let encoded = bs58::encode(data).into_string();
+
+        Ok(encoded)
+    }
+
+    /// Build the [`Invitation`] artifact for `room_owner_key` from local
+    /// storage. Shared by [`Self::create_invitation`] (which base58-encodes it
+    /// into an `?invitation=…` code) and by `dm invite` (which CBOR-encodes it
+    /// into a [`river_core::room_state::dm_body::InvitePayload`]), so both
+    /// entry points produce byte-identical invitation payloads.
+    ///
+    /// The caller must be a member of the room with a stored signing key; the
+    /// generated invitee signing key is a fresh bearer credential.
+    pub(crate) fn build_invitation(&self, room_owner_key: &VerifyingKey) -> Result<Invitation> {
         info!(
-            "Creating invitation for room owned by: {}",
+            "Building invitation for room owned by: {}",
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
 
         // Get the room info from persistent storage
         let room_data = self.storage.get_room(room_owner_key)?
-            .ok_or_else(|| anyhow!("Room not found in local storage. You must be the room owner to create invitations."))?;
+            .ok_or_else(|| anyhow!("Room not found in local storage. You must be a member of the room to create invitations."))?;
         let (signing_key, state, _contract_key) = room_data;
 
         // Generate a new signing key for the invitee
@@ -2115,20 +2135,12 @@ impl ApiClient {
         let room_secrets = crate::private_room::collect_invitation_secrets(&secrets);
 
         // Create the invitation struct
-        let invitation = Invitation {
+        Ok(Invitation {
             room: *room_owner_key,
             invitee_signing_key,
             invitee: authorized_member,
             room_secrets,
-        };
-
-        // Encode as base58
-        let mut data = Vec::new();
-        ciborium::ser::into_writer(&invitation, &mut data)
-            .map_err(|e| anyhow!("Failed to serialize invitation: {}", e))?;
-        let encoded = bs58::encode(data).into_string();
-
-        Ok(encoded)
+        })
     }
 
     pub async fn accept_invitation(
