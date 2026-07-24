@@ -193,7 +193,9 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 // never puts a bearer credential through an
                                 // outside channel, so it belongs ABOVE the
                                 // link/code it is meant to displace.
-                                div { class: "mb-4 p-3 bg-accent-soft border-l-4 border-accent rounded-r-lg",
+                                div {
+                                    "data-testid": "invite-dm-recommendation",
+                                    class: "mb-4 p-3 bg-accent-soft border-l-4 border-accent rounded-r-lg",
                                     p { class: "text-sm text-text",
                                         span { class: "font-medium", "Best way to invite someone: send the invitation in a DM. " }
                                         "Ask whether they'd like to join first. Then, in any room you already share with them, click their name in the member list, choose "
@@ -206,7 +208,9 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 // link/code below are bearer credentials — a
                                 // single reusable identity — hence the
                                 // one-person-only warning.
-                                div { class: "mb-4 p-3 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
+                                div {
+                                    "data-testid": "invite-share-warning",
+                                    class: "mb-4 p-3 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
                                     p { class: "text-sm text-text",
                                         span { class: "font-medium", "No DM yet? Share the link or code below privately, with one person only. " }
                                         "Each invitation creates a unique identity and is good for exactly one person. If two people use the same link or code, they share one identity and neither works correctly. Click "
