@@ -186,11 +186,32 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             );
 
                             rsx! {
-                                // Warning
+                                // Recommended path first: ask, then send the
+                                // invitation as a DM via the built-in
+                                // "Share invite" flow (#252, #457). It hands
+                                // the recipient a one-click Accept card and
+                                // never puts a bearer credential through an
+                                // outside channel, so it belongs ABOVE the
+                                // link/code it is meant to displace.
+                                div { class: "mb-4 p-3 bg-accent-soft border-l-4 border-accent rounded-r-lg",
+                                    p { class: "text-sm text-text",
+                                        span { class: "font-medium", "Best way to invite someone: send it in a DM. " }
+                                        "If you already share a room with them, ask whether they'd like to join — then click their name in the member list and choose "
+                                        span { class: "font-medium", "Share invite" }
+                                        ". River builds the invitation and drops it into your DM as a card they accept in one click, with nothing to copy, paste, or leak."
+                                    }
+                                }
+
+                                // Fallback path (no shared room yet): the
+                                // link/code below are bearer credentials — a
+                                // single reusable identity — hence the
+                                // one-person-only warning.
                                 div { class: "mb-4 p-3 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
                                     p { class: "text-sm text-text",
-                                        span { class: "font-medium", "Share privately with one person only. " }
-                                        "Each invitation creates a unique identity. If multiple people use the same link, they will share one identity and cause conflicts. Generate a new invitation for each person."
+                                        span { class: "font-medium", "No DM yet? Share the link or code below privately, with one person only. " }
+                                        "Each invitation creates a unique identity and is good for exactly one person. If two people use the same link or code, they share one identity and neither works correctly. Click "
+                                        span { class: "font-medium", "New Invitation" }
+                                        " for every additional person."
                                     }
                                 }
 
