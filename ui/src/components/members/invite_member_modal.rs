@@ -195,10 +195,10 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                 // link/code it is meant to displace.
                                 div { class: "mb-4 p-3 bg-accent-soft border-l-4 border-accent rounded-r-lg",
                                     p { class: "text-sm text-text",
-                                        span { class: "font-medium", "Best way to invite someone: send it in a DM. " }
-                                        "If you already share a room with them, ask whether they'd like to join — then click their name in the member list and choose "
+                                        span { class: "font-medium", "Best way to invite someone: send the invitation in a DM. " }
+                                        "Ask whether they'd like to join first. Then, in any room you already share with them, click their name in the member list, choose "
                                         span { class: "font-medium", "Share invite" }
-                                        ". River builds the invitation and drops it into your DM as a card they accept in one click, with nothing to copy, paste, or leak."
+                                        ", and pick this room. River drops an invitation card into your DM thread that they accept in one click — nothing to copy, paste, or leak."
                                     }
                                 }
 
