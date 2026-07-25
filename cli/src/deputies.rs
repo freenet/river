@@ -66,22 +66,47 @@ pub struct DeputyGrant {
     pub deputizer: DeputyParty,
     pub deputy: DeputyParty,
     pub scope: DeputyScope,
-    /// How many members this grant can currently be used against.
+    /// How many OTHER members, within this grant's scope, the deputy can ban.
     ///
-    /// This is what separates "the grant exists" from "the grant does anything",
-    /// and it is computed from `MembersV1::is_ban_authorized`'s actual rules:
+    /// This is what separates "the grant exists" from "the grant does
+    /// anything". The per-target decision is never re-derived locally: each
+    /// candidate is decided by calling `MembersV1::is_ban_authorized` itself.
+    /// Do NOT reintroduce a local copy of its rules, which is what an earlier
+    /// version got wrong twice. The scope is the grant's: every member for an
+    /// owner grant, otherwise the deputizer's invite subtree.
     ///
-    /// * `0` whenever [`Self::active`] is false, since the contract honours
-    ///   nothing in that case.
-    /// * For an owner grant, every member. That grant is absolute (step 3,
-    ///   checked before the guardrail), and the owner is never a valid target.
-    /// * Otherwise the deputizer's invite subtree (step 5), minus any member of
-    ///   it who has themselves deputized this deputy, since step 4 denies a ban
-    ///   whose target lists the banner in their own `deputies`.
+    /// There are exactly TWO deliberate deviations from the raw predicate, both
+    /// narrowing:
     ///
-    /// Frequently `0` for a live grant: most members have invited nobody, so a
-    /// grant from them reaches no one. That is the common case, not a corner.
-    pub reaches_members: usize,
+    /// * The deputy is not counted against themselves. `is_ban_authorized` has
+    ///   no `banner == target` check and self-ban really is permitted, but a
+    ///   deputy who can only ban themselves holds no moderation authority, and
+    ///   counting it would give a script filtering `members_deputy_can_ban > 0` a
+    ///   false positive. Nothing is hidden by this: if the self-ban cascade
+    ///   would remove anyone else, those members are already counted
+    ///   individually (they are the deputy's descendants, hence in scope and
+    ///   authorized via step 2).
+    /// * An inactive grant reports `0` outright, without consulting the
+    ///   predicate at all. See [`Self::active`] for why that is safe.
+    ///
+    /// The room owner needs no exclusion: they are never in `members.members`
+    /// and `is_ban_authorized` refuses `target == owner` outright.
+    ///
+    /// `0` whenever [`Self::active`] is false, since the contract honours
+    /// nothing then. Frequently `0` for a LIVE grant too: most members have
+    /// invited nobody, so a grant from them reaches no one. That is the common
+    /// case, not a corner.
+    ///
+    /// This counts CAPABILITY, not attribution: a target the deputy could also
+    /// ban by another route (they are that target's own invite ancestor, say)
+    /// still counts, so revoking THIS grant may not change the number. The
+    /// alternative would print `0` for an owner-appointed moderator who can
+    /// plainly ban the whole subtree, which is the same class of false negative
+    /// this field exists to avoid. It also counts DIRECT targets: a ban
+    /// cascades to the target's own invite subtree
+    /// (`MembersV1::get_downstream_members`), so the number understates removal
+    /// blast radius for every target, not just the excluded self.
+    pub members_deputy_can_ban: usize,
     /// Whether the grant is structurally live: both parties are currently in the
     /// room. The load-bearing half is the DEPUTY: `is_ban_authorized` gates both
     /// deputy branches on the banner being a current member, so a grant naming a
@@ -91,7 +116,7 @@ pub struct DeputyGrant {
     /// absent from the room cannot occur in a state the contract accepted.
     ///
     /// `active` does NOT mean the deputy can ban a given person; see
-    /// [`Self::reaches_members`] and [`Self::scope`] for how far it goes.
+    /// [`Self::members_deputy_can_ban`] and [`Self::scope`] for how far it goes.
     pub active: bool,
 }
 
@@ -273,17 +298,19 @@ impl<'a> RoomDeputies<'a> {
 
     /// How many members within a grant's scope the deputy can actually ban.
     ///
-    /// Delegates the per-target decision to `MembersV1::is_ban_authorized`, the
-    /// contract's OWN public predicate, rather than re-deriving its rules here.
-    /// That matters: the rules do not compose the way a summary would suggest.
-    /// The "you cannot ban the member who deputized you" guardrail is step 4,
+    /// The per-target decision is `MembersV1::is_ban_authorized`, the contract's
+    /// OWN public predicate, never a local re-derivation of its rules. That
+    /// matters: the rules do not compose the way a summary would suggest. The
+    /// "you cannot ban the member who deputized you" guardrail is step 4,
     /// checked AFTER the absolute grants, so a target who deputized this deputy
     /// is still bannable when the deputy is that target's own invite ancestor,
     /// or is an owner-appointed global moderator. An earlier version of this
     /// function approximated the guardrail by hand and undercounted both cases.
     ///
-    /// Scope is the grant's: every member for an owner grant (whose subtree is
-    /// the room), otherwise the deputizer's invite subtree.
+    /// ONE local narrowing is applied on top: the deputy is not counted against
+    /// themselves (see the filter below). Scope is the grant's: every member for
+    /// an owner grant (whose subtree is the room), otherwise the deputizer's
+    /// invite subtree.
     fn reach_of(&self, deputizer: MemberId, deputy: MemberId) -> usize {
         let empty = HashSet::new();
         let targets = if deputizer == self.owner_id {
@@ -294,13 +321,26 @@ impl<'a> RoomDeputies<'a> {
         targets
             .iter()
             .filter(|target| {
-                MembersV1::is_ban_authorized(
-                    deputy,
-                    **target,
-                    &self.members_by_id,
-                    self.member_info(),
-                    self.owner_id,
-                )
+                // Exclude the deputy themselves. `is_ban_authorized` has no
+                // `banner == target` check and self-ban really is contract-
+                // permitted (a deputy whose deputizer is their own invite
+                // ancestor satisfies step 5 against themselves), but counting
+                // it makes the number answer the wrong question: a deputy who
+                // can only "ban" themselves holds no moderation authority.
+                //
+                // riverctl's own WRITE path already refuses it -- `ban_member`
+                // returns "Cannot ban yourself" (`api.rs`) -- so before this
+                // the read path advertised a capability the CLI will not
+                // exercise. Keep the two in step: if either is relaxed, revisit
+                // the other.
+                **target != deputy
+                    && MembersV1::is_ban_authorized(
+                        deputy,
+                        **target,
+                        &self.members_by_id,
+                        self.member_info(),
+                        self.owner_id,
+                    )
             })
             .count()
     }
@@ -315,9 +355,9 @@ impl<'a> RoomDeputies<'a> {
                 DeputyScope::InviteSubtree
             },
             // Zero when the grant is inert, so a script filtering
-            // `reaches_members > 0` for real moderation authority cannot get a
+            // `members_deputy_can_ban > 0` for real moderation authority cannot get a
             // false positive from a grant the contract would refuse outright.
-            reaches_members: if active {
+            members_deputy_can_ban: if active {
                 self.reach_of(deputizer, deputy)
             } else {
                 0
@@ -460,12 +500,18 @@ pub fn party_label(party: &DeputyParty) -> String {
     }
 }
 
-/// `"1 member"` / `"N members"`.
-fn members(count: usize) -> String {
+/// `"1 other member"` / `"N other members"`.
+///
+/// "other" is load-bearing in every count this module prints: the number
+/// excludes the deputy themselves, so the bare form would assert a room or
+/// subtree size one short of the real one. `debug room-state` prints the true
+/// member count two lines above the grant list, where that would read as a
+/// contradiction.
+fn other_members(count: usize) -> String {
     if count == 1 {
-        "1 member".to_string()
+        "1 other member".to_string()
     } else {
-        format!("{count} members")
+        format!("{count} other members")
     }
 }
 
@@ -500,22 +546,33 @@ pub fn grant_status_line(grant: &DeputyGrant) -> String {
     match grant.scope {
         // `is_ban_authorized` refuses `target == owner` outright, so even an
         // owner-appointed deputy cannot ban the owner.
-        DeputyScope::RoomWide if grant.reaches_members == 1 => {
+        DeputyScope::RoomWide if grant.members_deputy_can_ban == 0 => {
+            "active but reaches no one: there is no other member in the room to ban \
+             (granted by the room owner)"
+                .to_string()
+        }
+        DeputyScope::RoomWide if grant.members_deputy_can_ban == 1 => {
             "active: may ban the only other member in the room (granted by the room owner)"
                 .to_string()
         }
+        // "other members", not "members": the count excludes the deputy, so
+        // the bare form would assert a room size one short of the real one, and
+        // `debug room-state` prints the true member count two lines above it.
         DeputyScope::RoomWide => format!(
             "active: may ban any of the {} in the room (granted by the room owner)",
-            members(grant.reaches_members)
+            other_members(grant.members_deputy_can_ban)
         ),
-        DeputyScope::InviteSubtree if grant.reaches_members == 0 => format!(
-            "active but reaches no one: there is currently nobody in {}'s invite \
-             subtree that this deputy may ban",
+        // "nobody else": when the deputy is themselves inside the deputizer's
+        // subtree, the contract does authorize them to ban themselves, so the
+        // unqualified form would be false.
+        DeputyScope::InviteSubtree if grant.members_deputy_can_ban == 0 => format!(
+            "active but reaches no one: there is currently nobody else in {}'s \
+             invite subtree that this deputy may ban",
             party_label(&grant.deputizer)
         ),
         DeputyScope::InviteSubtree => format!(
             "active: may ban {} in {}'s invite subtree",
-            members(grant.reaches_members),
+            other_members(grant.members_deputy_can_ban),
             party_label(&grant.deputizer)
         ),
     }
@@ -638,8 +695,9 @@ mod tests {
             "the owner is never in members.members but is always in the room"
         );
         assert_eq!(
-            owner_grant.reaches_members, 2,
-            "an owner grant reaches every member"
+            owner_grant.members_deputy_can_ban, 1,
+            "an owner grant reaches every member EXCEPT the deputy themselves \
+             (self-ban is contract-permitted but is not moderation authority)"
         );
 
         let alice_grant = d.grant(id(&alice), id(&bot));
@@ -783,9 +841,12 @@ mod tests {
         let mut state = room(&owner, &[&alice, &bob]);
         push_info(&mut state, &owner, 0, "Room Owner", vec![]);
         push_info(&mut state, &bob, 0, "Bob", vec![]);
-        // Grant @ v1, then revoke @ v2, pushed in "wrong" order on purpose.
-        push_info(&mut state, &alice, 2, "Alice", vec![]);
+        // The LOSING record (the v1 grant) is pushed FIRST, deliberately: a bare
+        // first-match scan of `member_info.member_info` would read it and report
+        // a revoked deputy as live. With the revoke pushed first the test would
+        // pass even against that bug, which is exactly what it exists to catch.
         push_info(&mut state, &alice, 1, "Alice", vec![id(&bob)]);
+        push_info(&mut state, &alice, 2, "Alice", vec![]);
 
         let secrets = no_secrets();
         let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
@@ -878,6 +939,13 @@ mod tests {
         assert!(!grant.active);
         assert!(!grant.deputizer.in_room);
         assert!(grant.deputy.in_room);
+
+        // The status line must name the DEPUTIZER as the absent party here,
+        // not the deputy (who is present).
+        let line = grant_status_line(&grant);
+        assert!(line.starts_with("inactive:"), "{line}");
+        assert!(line.contains(&id(&gone).to_string()), "{line}");
+        assert!(!line.contains(&id(&bob).to_string()), "{line}");
     }
 
     #[test]
@@ -917,7 +985,7 @@ mod tests {
 
     #[test]
     fn reach_is_the_deputizers_invite_subtree_not_merely_that_a_grant_exists() {
-        // The whole point of `reaches_members`: a deputy of someone who invited
+        // The whole point of `members_deputy_can_ban`: a deputy of someone who invited
         // nobody has authority over an empty set, and saying "may ban within
         // their invite subtree" would overstate it. Tree:
         //   owner -> alice -> carol -> dave
@@ -947,20 +1015,25 @@ mod tests {
         // Alice's subtree is carol + dave (transitive), so 2.
         let from_alice = d.grant(id(&alice), id(&deputy));
         assert!(from_alice.active);
-        assert_eq!(from_alice.reaches_members, 2);
+        assert_eq!(from_alice.members_deputy_can_ban, 2);
         let line = grant_status_line(&from_alice);
-        assert!(line.contains("2 members"), "{line}");
+        assert!(line.contains("2 other members"), "{line}");
         assert!(line.contains("Alice"), "must name the deputizer: {line}");
 
         // Bob invited nobody, so his grant is live but reaches no one. This
         // must NOT read as though the deputy can ban within a real subtree.
         let from_bob = d.grant(id(&bob), id(&deputy));
         assert!(from_bob.active);
-        assert_eq!(from_bob.reaches_members, 0);
+        assert_eq!(from_bob.members_deputy_can_ban, 0);
         let bob_line = grant_status_line(&from_bob);
         assert!(
             bob_line.contains("reaches no one"),
             "an empty subtree must be stated plainly: {bob_line}"
+        );
+        assert!(
+            bob_line.contains("nobody else"),
+            "the deputy CAN ban themselves when they are inside the subtree, so \
+             the unqualified 'nobody' would be false: {bob_line}"
         );
         assert!(bob_line.contains("Bob"), "{bob_line}");
     }
@@ -993,6 +1066,33 @@ mod tests {
         let sizes = subtree_sizes(&state);
         assert_eq!(sizes.get(&id(&alice)).copied().unwrap_or(0), 1);
         assert_eq!(sizes.get(&id(&bob)).copied().unwrap_or(0), 1);
+
+        // A cycle the root is NOT part of is what the visited set is for, and
+        // it IS reachable: `invited_by` is only a function while each member id
+        // appears once in `members.members`, and nothing in `MembersV1::verify`
+        // enforces that. A second entry for `alice` naming `bob` as her inviter
+        // closes an alice/bob cycle BELOW the owner, so the walk from `owner`
+        // enters it. `*child != root` does not help there (neither cycle member
+        // is the root); only `seen.insert` gating the push terminates it.
+        //
+        // Run on a worker thread with a deadline so a regression FAILS rather
+        // than hanging the whole test binary.
+        let mut disjoint = ChatRoomStateV1::default();
+        push_member(&mut disjoint, &owner, &owner, &alice);
+        push_member(&mut disjoint, &owner, &alice, &bob);
+        push_member(&mut disjoint, &owner, &bob, &alice);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(subtree_sizes(&disjoint));
+        });
+        let sizes = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("invite_subtrees must terminate on a cycle below the root");
+        assert_eq!(
+            sizes.get(&id(&owner)).copied(),
+            Some(2),
+            "the owner reaches alice and bob, each counted once"
+        );
 
         // A member who invited themselves must not be counted as their own
         // descendant, and must not loop.
@@ -1172,7 +1272,7 @@ mod tests {
 
         let grant = d.grant(id(&alice), id(&deputy));
         assert_eq!(
-            grant.reaches_members, 1,
+            grant.members_deputy_can_ban, 1,
             "Alice's subtree is {{target, other}}, but target deputized this \
              deputy so only `other` is reachable"
         );
@@ -1208,9 +1308,10 @@ mod tests {
         let secrets = no_secrets();
         let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
         assert_eq!(
-            d.grant(id(&alice), id(&deputy)).reaches_members,
-            2,
-            "Alice's subtree is {{deputy, target}}; the deputy is the target's \
+            d.grant(id(&alice), id(&deputy)).members_deputy_can_ban,
+            1,
+            "Alice's subtree is {{deputy, target}}; the deputy does not count \
+             themselves, and the target IS counted because the deputy is their \
              own invite ancestor, so step 2 authorizes the ban despite the \
              target having deputized them"
         );
@@ -1228,7 +1329,7 @@ mod tests {
 
         let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
         assert_eq!(
-            d.grant(id(&alice), id(&deputy)).reaches_members,
+            d.grant(id(&alice), id(&deputy)).members_deputy_can_ban,
             1,
             "Alice's subtree is {{target}}; the owner's global appointment is \
              absolute (step 3), so the target's own grant cannot block it"
@@ -1238,36 +1339,51 @@ mod tests {
         let owner_grant = d.grant(id(&owner), id(&deputy));
         assert_eq!(owner_grant.scope, DeputyScope::RoomWide);
         assert_eq!(
-            owner_grant.reaches_members, 3,
-            "alice + target + deputy; the owner is never a valid ban target"
+            owner_grant.members_deputy_can_ban, 2,
+            "alice + target; the owner is never a valid ban target and the \
+             deputy does not count themselves"
         );
     }
 
     #[test]
     fn an_inactive_grant_reaches_nobody() {
-        // A script filtering `reaches_members > 0` for real moderation
+        // A script filtering `members_deputy_can_ban > 0` for real moderation
         // authority must not get a false positive from a grant the contract
         // would refuse outright.
+        //
+        // The fixture is deliberately the case where the `if active` gate is
+        // LOAD-BEARING: the deputizer has left, but still names a child via
+        // that child's `invited_by`, so they still have a subtree, and the
+        // deputy is a current member the contract would otherwise authorize
+        // (step 5, via the departed inviter as a strict ancestor). Without the
+        // gate this reports 1. A fixture where the DEPUTY is the absent party
+        // would report 0 either way and pin nothing.
         let owner = key(1);
-        let alice = key(2);
+        let gone = key(2);
         let child = key(3);
-        let pruned = key(4);
+        let deputy = key(4);
 
         let mut state = ChatRoomStateV1::default();
-        push_member(&mut state, &owner, &owner, &alice);
-        push_member(&mut state, &owner, &alice, &child);
+        // `gone` is not in `members`, but is `child`'s inviter.
+        push_member(&mut state, &owner, &gone, &child);
+        push_member(&mut state, &owner, &owner, &deputy);
         push_info(&mut state, &owner, 0, "Room Owner", vec![]);
-        push_info(&mut state, &alice, 0, "Alice", vec![id(&pruned)]);
+        push_info(&mut state, &gone, 0, "Gone", vec![id(&deputy)]);
         push_info(&mut state, &child, 0, "Child", vec![]);
+        push_info(&mut state, &deputy, 0, "Deputy", vec![]);
 
         let secrets = no_secrets();
         let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
 
-        let grant = d.grant(id(&alice), id(&pruned));
-        assert!(!grant.active, "the deputy has left the room");
+        // The departed deputizer does have a subtree, and the raw predicate
+        // does authorize the ban, so only the gate keeps this at zero.
+        assert_eq!(d.deputies_of(id(&gone)), [id(&deputy)]);
+        let grant = d.grant(id(&gone), id(&deputy));
+        assert!(!grant.active, "the deputizer is not in the room");
         assert_eq!(
-            grant.reaches_members, 0,
-            "Alice has a real subtree, but this grant confers nothing"
+            grant.members_deputy_can_ban, 0,
+            "an inactive grant must report no reach even though the departed \
+             deputizer still has a subtree the contract would authorize"
         );
     }
 
@@ -1314,7 +1430,8 @@ mod tests {
         let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
 
         let line = grant_status_line(&d.grant(id(&alice), id(&deputy)));
-        assert!(line.contains("1 member in"), "{line}");
+        assert!(line.contains("1 other member in"), "{line}");
+        assert!(!line.contains("1 other members"), "{line}");
         assert!(!line.contains("member(s)"), "{line}");
     }
 
@@ -1339,36 +1456,120 @@ mod tests {
             "...but must print identically, or this test proves nothing"
         );
 
-        // A third entry equal to the first: the duplicate `dedup` has to remove.
-        let mut ids = vec![twin_a, twin_b, twin_a];
-        ids.sort_by_key(|id| (id.to_string(), *id));
-        ids.dedup();
-        assert_eq!(
-            ids.len(),
-            2,
-            "the genuine duplicate must collapse while the twin survives"
-        );
-        assert!(ids.contains(&twin_a) && ids.contains(&twin_b));
-    }
-
-    #[test]
-    fn room_wide_status_reads_correctly_for_a_single_other_member() {
-        // The room-wide branch needed its own singular form: "may ban any of
-        // the 1 member in the room" is not English.
+        // Drive the PRODUCTION path, not an inlined copy of the sort: a signed
+        // deputies list carrying [a, b, a]. Sorting by the printed form alone
+        // is stable, so it leaves the equal-keyed triple in that order and
+        // `dedup` (which compares adjacent MemberIds) removes nothing.
         let owner = key(1);
-        let deputy = key(2);
-        let mut state = room(&owner, &[&deputy]);
-        push_info(&mut state, &owner, 0, "Room Owner", vec![id(&deputy)]);
-        push_info(&mut state, &deputy, 0, "Deputy", vec![]);
+        let alice = key(2);
+        let mut state = room(&owner, &[&alice]);
+        push_info(&mut state, &owner, 0, "Room Owner", vec![]);
+        push_info(&mut state, &alice, 0, "Alice", vec![twin_a, twin_b, twin_a]);
 
         let secrets = no_secrets();
         let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        let deputies = d.deputies_of(id(&alice));
+        assert_eq!(
+            deputies.len(),
+            2,
+            "the genuine duplicate must collapse while the twin survives; \
+             sorting by the printed id alone leaves three"
+        );
+        assert!(deputies.contains(&twin_a) && deputies.contains(&twin_b));
+    }
 
+    #[test]
+    fn room_wide_status_covers_zero_one_and_many_other_members() {
+        // Three arms, all reachable now that a deputy does not count themselves:
+        // a room where the deputy is the ONLY member reaches nobody; one other
+        // member needs a singular form ("may ban any of the 1 member in the
+        // room" is not English); two or more takes the plural.
+        let owner = key(1);
+        let deputy = key(2);
+        let other = key(3);
+        let third = key(4);
+        let secrets = no_secrets();
+
+        // Zero: the deputy is the only member, and cannot count themselves.
+        let mut alone = room(&owner, &[&deputy]);
+        push_info(&mut alone, &owner, 0, "Room Owner", vec![id(&deputy)]);
+        push_info(&mut alone, &deputy, 0, "Deputy", vec![]);
+        let d = RoomDeputies::new(&alone, &owner.verifying_key(), &secrets);
         let grant = d.grant(id(&owner), id(&deputy));
-        assert_eq!(grant.reaches_members, 1);
+        assert_eq!(grant.members_deputy_can_ban, 0);
+        let line = grant_status_line(&grant);
+        assert!(line.contains("no other member in the room"), "{line}");
+
+        // One.
+        let mut pair = room(&owner, &[&deputy, &other]);
+        push_info(&mut pair, &owner, 0, "Room Owner", vec![id(&deputy)]);
+        push_info(&mut pair, &deputy, 0, "Deputy", vec![]);
+        push_info(&mut pair, &other, 0, "Other", vec![]);
+        let d = RoomDeputies::new(&pair, &owner.verifying_key(), &secrets);
+        let grant = d.grant(id(&owner), id(&deputy));
+        assert_eq!(grant.members_deputy_can_ban, 1);
         let line = grant_status_line(&grant);
         assert!(line.contains("the only other member"), "{line}");
         assert!(!line.contains("1 member in the room"), "{line}");
+
+        // Many.
+        let mut crowd = room(&owner, &[&deputy, &other, &third]);
+        push_info(&mut crowd, &owner, 0, "Room Owner", vec![id(&deputy)]);
+        push_info(&mut crowd, &deputy, 0, "Deputy", vec![]);
+        push_info(&mut crowd, &other, 0, "Other", vec![]);
+        push_info(&mut crowd, &third, 0, "Third", vec![]);
+        let d = RoomDeputies::new(&crowd, &owner.verifying_key(), &secrets);
+        let grant = d.grant(id(&owner), id(&deputy));
+        assert_eq!(grant.members_deputy_can_ban, 2);
+        let line = grant_status_line(&grant);
+        assert!(
+            line.contains("2 other members in the room"),
+            "the count excludes the deputy, so the line must not assert a room \
+             size one short of the real one: {line}"
+        );
+        assert!(line.contains("room owner"), "{line}");
+    }
+
+    #[test]
+    fn a_private_room_nickname_decrypts_through_party() {
+        // `party` is the only place the deputy surfaces resolve a nickname, and
+        // in a private room that nickname is sealed. Pin the wiring: with the
+        // secret it decrypts, without it falls back to the placeholder rather
+        // than leaking ciphertext.
+        use river_core::ecies::seal_bytes;
+
+        let owner = key(1);
+        let alice = key(2);
+        let secret = [4u8; 32];
+
+        let mut state = room(&owner, &[&alice]);
+        push_info(&mut state, &owner, 0, "Room Owner", vec![]);
+        let sealed = seal_bytes(b"Alice", &secret, 0);
+        let info = MemberInfo {
+            member_id: id(&alice),
+            version: 0,
+            preferred_nickname: sealed,
+            deputies: Vec::new(),
+        };
+        state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(info, &alice));
+
+        let secrets = HashMap::from([(0u32, secret)]);
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        assert_eq!(d.party(id(&alice)).nickname.as_deref(), Some("Alice"));
+        assert_eq!(
+            party_label(&d.party(id(&alice))),
+            format!("\"Alice\" ({})", id(&alice))
+        );
+
+        // No secret: the placeholder, never raw ciphertext.
+        let none = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &none);
+        let nickname = d.party(id(&alice)).nickname.expect("record exists");
+        assert!(nickname.contains("Encrypted"), "{nickname}");
+        assert!(!nickname.contains("Alice"), "{nickname}");
     }
 
     #[test]
@@ -1392,7 +1593,10 @@ mod tests {
 
         assert_eq!(json["scope"], "room-wide");
         assert_eq!(json["active"], true);
-        assert_eq!(json["reaches_members"], 2);
+        assert_eq!(
+            json["members_deputy_can_ban"], 1,
+            "alice; bob is the deputy and does not count themselves"
+        );
         for side in ["deputizer", "deputy"] {
             let party = &json[side];
             assert!(party["member_id"].is_string(), "{side}.member_id");

@@ -1,6 +1,6 @@
 use crate::api::ApiClient;
 use crate::deputies::{
-    display_nickname, grant_status_line, party_label, ResolveError, RoomDeputies,
+    display_nickname, grant_status_line, party_label, DeputyParty, ResolveError, RoomDeputies,
 };
 use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
@@ -155,20 +155,7 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                     let json_members: Vec<_> = members
                         .into_iter()
                         .map(|(party, own_deputies, granted_by)| {
-                            serde_json::json!({
-                                "member_id": party.member_id,
-                                // Unchanged shape: the pre-#470 output rendered
-                                // a member with no readable nickname as the
-                                // lossy placeholder string, never null, and
-                                // `party.nickname` is only None for a member
-                                // with no member_info record, which cannot
-                                // appear in this listing.
-                                "nickname": party.nickname.unwrap_or_default(),
-                                // Members this member has deputized.
-                                "deputies": ids_to_strings(&own_deputies),
-                                // Members who have deputized this member.
-                                "deputized_by": ids_to_strings(&granted_by),
-                            })
+                            member_list_json(&party, &own_deputies, &granted_by)
                         })
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&json_members)?);
@@ -459,6 +446,30 @@ fn ids_to_strings(ids: &[MemberId]) -> Vec<String> {
     ids.iter().map(|id| id.to_string()).collect()
 }
 
+/// One row of `member list --format json`.
+///
+/// A published output contract, so it lives in a testable helper rather than
+/// inline in the command: `member_id` and `nickname` predate the deputy
+/// commands and must not change shape, while `deputies` (who this member
+/// deputized) and `deputized_by` (who deputized them) are additive.
+///
+/// `nickname` is a STRING, never null. Before the deputy commands a member with
+/// an unreadable nickname rendered as the lossy placeholder, and `party.nickname`
+/// is `None` only for a member with no `member_info` record, who cannot appear
+/// in this listing at all.
+fn member_list_json(
+    party: &DeputyParty,
+    own_deputies: &[MemberId],
+    granted_by: &[MemberId],
+) -> serde_json::Value {
+    serde_json::json!({
+        "member_id": party.member_id,
+        "nickname": party.nickname.clone().unwrap_or_default(),
+        "deputies": ids_to_strings(own_deputies),
+        "deputized_by": ids_to_strings(granted_by),
+    })
+}
+
 /// `"1 grant"` / `"3 grants"`, so counted output reads as English rather than
 /// as the `N thing(s)` form.
 fn count(n: usize, noun: &str) -> String {
@@ -588,6 +599,44 @@ mod tests {
     fn room_id_is_required_for_both_new_commands() {
         assert!(parse(&["deputies"]).is_err());
         assert!(parse(&["deputized-by"]).is_err());
+    }
+
+    #[test]
+    fn member_list_json_keeps_the_pre_existing_shape_and_adds_both_directions() {
+        // `member_id` and `nickname` are the published shape from before the
+        // deputy commands; renaming either silently breaks every consumer.
+        // `nickname` must stay a STRING, never null.
+        use ed25519_dalek::SigningKey;
+        let a: MemberId = SigningKey::from_bytes(&[5u8; 32]).verifying_key().into();
+        let b: MemberId = SigningKey::from_bytes(&[6u8; 32]).verifying_key().into();
+
+        let party = DeputyParty {
+            member_id: a.to_string(),
+            nickname: Some("Alice".to_string()),
+            is_owner: false,
+            in_room: true,
+        };
+        let json = member_list_json(&party, &[b], &[]);
+        assert_eq!(json["member_id"], a.to_string());
+        assert_eq!(json["nickname"], "Alice");
+        assert_eq!(json["deputies"][0], b.to_string());
+        assert!(
+            json["deputized_by"].as_array().unwrap().is_empty(),
+            "an empty list, not null"
+        );
+
+        // A member with no readable nickname renders as an empty string, not
+        // null, matching the pre-deputy-command behaviour.
+        let anonymous = DeputyParty {
+            member_id: b.to_string(),
+            nickname: None,
+            is_owner: false,
+            in_room: true,
+        };
+        let json = member_list_json(&anonymous, &[], &[a]);
+        assert_eq!(json["nickname"], "");
+        assert!(!json["nickname"].is_null());
+        assert_eq!(json["deputized_by"][0], a.to_string());
     }
 
     #[test]
