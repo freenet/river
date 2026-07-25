@@ -1918,4 +1918,188 @@ mod tests {
             "and, consistently, the retained window must be untouched"
         );
     }
+
+    /// Pin the OTHER leg: `apply_delta` may still be handed a cheap
+    /// `ChatRoomStateV1::default()` sentinel.
+    ///
+    /// # Why this needs its own test
+    ///
+    /// `merge_uses_room_state_as_parent_so_horizon_is_correct` above pins the
+    /// `summarize` leg. It cannot pin this one: it drives
+    /// `merge_incoming_state` on both sides of its assertion, and
+    /// `merge_incoming_state` ALWAYS passes the sentinel to `apply_delta`, so
+    /// the sentinel becoming unsafe is invisible to it. This test therefore
+    /// calls `apply_delta` directly, once with each parent.
+    ///
+    /// # The invariant, and what breaks if it goes
+    ///
+    /// The `#[composable]` macro's generated `apply_delta` takes
+    /// `_parent_state` and shadows it with a per-field `self.clone()`
+    /// (`freenet-scaffold-macro/src/lib.rs`, whose own comment calls this
+    /// "ugly" — a description, not a stability promise). Two live call sites
+    /// bet on it: `merge_incoming_state` and the `apply_delta_inner` path.
+    ///
+    /// If a freenet-scaffold bump ever forwarded `_parent_state`, both UI
+    /// ingestion paths would apply every delta against a DEFAULT state:
+    /// `members` empty, so `MessagesV1::apply_delta`'s author-must-be-a-member
+    /// retain drops EVERY message; `bans` empty; `max_members` and
+    /// `max_recent_messages` at their defaults rather than the room's. Silent,
+    /// total, local message loss — with no error anywhere.
+    ///
+    /// The room here deliberately carries a non-default `max_members`,
+    /// `max_recent_messages` and a real ban, because those are exactly the
+    /// `parent_state` fields the per-field `apply_delta`s read.
+    #[test]
+    fn apply_delta_ignores_its_outer_parent_state_so_the_sentinel_is_safe() {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use river_core::room_state::member::{AuthorizedMember, Member, MembersV1};
+        use std::time::Duration;
+
+        let owner_sk = SigningKey::generate(&mut rand::thread_rng());
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let member_sks: Vec<SigningKey> = (0..3)
+            .map(|_| SigningKey::generate(&mut rand::thread_rng()))
+            .collect();
+        let authorize = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+
+        // Every one of these is deliberately NOT the default.
+        let cfg = Configuration {
+            owner_member_id: owner_id,
+            max_recent_messages: 4,
+            max_members: 3,
+            max_message_size: 500,
+            max_user_bans: 5,
+            ..Default::default()
+        };
+
+        let banned_id = MemberId::from(&member_sks[2].verifying_key());
+        let ban = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(9_000),
+                banned_user: banned_id,
+            },
+            owner_id,
+            &owner_sk,
+        );
+
+        let msg_at = |sk: &SigningKey, secs: u64, body: &str| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: MemberId::from(&sk.verifying_key()),
+                    content: RoomMessageBody::public(body.to_string()),
+                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                },
+                sk,
+            )
+        };
+
+        let mut local = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(cfg, &owner_sk),
+            members: MembersV1 {
+                members: vec![authorize(&member_sks[0]), authorize(&member_sks[1])],
+            },
+            bans: BansV1(vec![ban]),
+            ..Default::default()
+        };
+        for i in 0..3u64 {
+            local.recent_messages.messages.push(msg_at(
+                &member_sks[0],
+                2_000 + i,
+                &format!("held-{i}"),
+            ));
+        }
+
+        // An incoming peer with more members and more messages, so the delta
+        // is non-trivial across several fields.
+        let mut incoming = local.clone();
+        incoming.members.members.push(authorize(&member_sks[2]));
+        for i in 0..4u64 {
+            incoming.recent_messages.messages.push(msg_at(
+                &member_sks[1],
+                3_000 + i,
+                &format!("new-{i}"),
+            ));
+        }
+
+        let delta = incoming.delta(&incoming, &params, &local.summarize(&local, &params));
+        assert!(
+            delta.is_some(),
+            "test premise: the incoming state must actually produce a delta"
+        );
+
+        // --- the assertion: both parents must give byte-identical results ---
+        let mut via_sentinel = local.clone();
+        via_sentinel
+            .apply_delta(&ChatRoomStateV1::default(), &params, &delta)
+            .expect("sentinel-parent apply");
+
+        let mut via_self = local.clone();
+        let self_parent = via_self.clone();
+        via_self
+            .apply_delta(&self_parent, &params, &delta)
+            .expect("self-parent apply");
+
+        assert_eq!(
+            via_sentinel, via_self,
+            "applying the same delta against the sentinel parent and against the \
+             room's own state produced DIFFERENT states. The #[composable] macro \
+             has stopped ignoring its outer `parent_state`, so `merge_incoming_state` \
+             and `apply_delta_inner` are now merging every room against a DEFAULT \
+             state — empty members, empty bans, default caps. Fix those call sites \
+             to pass the room's own state (a clone) before this ships."
+        );
+
+        // --- proof the assertion above is not vacuous ---
+        //
+        // The two parents are NOT interchangeable to a field that genuinely
+        // reads its `parent_state`. `MessagesV1::apply_delta` does, so calling
+        // it directly shows the divergence the room WOULD get if the macro
+        // forwarded the argument. Without this, the assertion above would still
+        // pass if the two parents happened to be equivalent, and would be
+        // pinning nothing.
+        let msg_delta = delta
+            .as_ref()
+            .and_then(|d| d.recent_messages.clone())
+            .expect("test premise: the delta must carry messages");
+
+        let mut msgs_sentinel = local.recent_messages.clone();
+        msgs_sentinel
+            .apply_delta(
+                &ChatRoomStateV1::default(),
+                &params,
+                &Some(msg_delta.clone()),
+            )
+            .expect("messages under sentinel parent");
+        let mut msgs_real = local.recent_messages.clone();
+        msgs_real
+            .apply_delta(&local, &params, &Some(msg_delta))
+            .expect("messages under the real parent");
+
+        assert!(
+            msgs_sentinel.messages.is_empty(),
+            "premise: under a DEFAULT parent the members list is empty, so the \
+             author-must-be-a-member retain must drop every message — that is \
+             the silent data loss this pin exists to prevent"
+        );
+        assert_ne!(
+            msgs_sentinel.messages, msgs_real.messages,
+            "the two parents must be distinguishable to a field that reads \
+             parent_state, or the equality assertion above pins nothing"
+        );
+    }
 }

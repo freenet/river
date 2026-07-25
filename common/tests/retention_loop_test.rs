@@ -28,6 +28,7 @@
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
 use rand::rngs::OsRng;
+use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::direct_messages::{
     sign_direct_message, AuthorizedDirectMessage, DirectMessagesDelta, DirectMessagesV1,
@@ -51,6 +52,7 @@ const BASE_SECS: u64 = 1_700_000_000;
 struct Room {
     params: ChatRoomParametersV1,
     state: ChatRoomStateV1,
+    owner_sk: SigningKey,
     author_sk: SigningKey,
     author_id: MemberId,
     owner_id: MemberId,
@@ -105,11 +107,42 @@ fn room(max_recent_messages: usize) -> Room {
             members: MembersV1 { members },
             ..Default::default()
         },
+        owner_sk,
         author_sk,
         author_id,
         owner_id,
         peer_id,
     }
+}
+
+/// The same room, re-signed at a different `max_recent_messages`.
+///
+/// `max_recent_messages` is per-room CONFIGURATION read out of `parent_state`,
+/// so two peers of the same room can legitimately be running different values
+/// (a config update that has reached one peer and not the other). This builds
+/// the second peer's view without regenerating keys, so messages stay
+/// interchangeable between the two.
+fn state_with_cap(r: &Room, cap: usize) -> ChatRoomStateV1 {
+    let mut cfg = r.state.configuration.configuration.clone();
+    cfg.max_recent_messages = cap;
+    ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(cfg, &r.owner_sk),
+        ..r.state.clone()
+    }
+}
+
+/// `messages_holding`, but against an explicit parent state so the caller
+/// chooses which peer's cap normalises the result.
+fn messages_holding_under(
+    r: &Room,
+    parent: &ChatRoomStateV1,
+    offsets: impl IntoIterator<Item = u64>,
+) -> MessagesV1 {
+    let mut m = MessagesV1::default();
+    let delta: Vec<AuthorizedMessageV1> = offsets.into_iter().map(|s| msg_at(r, s)).collect();
+    m.apply_delta(parent, &r.params, &Some(delta))
+        .expect("fixture messages must apply");
+    m
 }
 
 /// A signed message at `BASE_SECS + secs`, with `secs` embedded in the body so
@@ -426,6 +459,281 @@ fn horizon_survives_the_cbor_round_trip_the_contract_does() {
     ciborium::ser::into_writer(&holder.summarize(&holder, &r.params), &mut again)
         .expect("re-encode summary");
     assert_eq!(bytes, again, "summary bytes must be stable across calls");
+}
+
+/// Two peers of the SAME room running DIFFERENT `max_recent_messages`, driven
+/// in both directions.
+///
+/// Every other test in this file gives both peers one cap (`room()` takes a
+/// single value), yet the PR this file accompanies explicitly calls differing
+/// caps legitimate: `max_recent_messages` is per-room configuration read out of
+/// `parent_state`, so a config update that has reached one peer and not the
+/// other leaves exactly this state. It had no coverage.
+///
+/// The asymmetry matters because the horizon is computed against the
+/// RECEIVER's cap while the payload is chosen from the SENDER's window. The
+/// small-cap peer is at capacity and must accept nothing older than its own
+/// oldest; the large-cap peer is far below capacity and must still back-fill
+/// from the small one. Getting either backwards re-opens the loop.
+#[test]
+fn asymmetric_caps_terminate_in_both_directions() {
+    let r = room(200);
+    let small_parent = state_with_cap(&r, 50);
+    let large_parent = state_with_cap(&r, 200);
+
+    // The small peer holds a newer slice; the large peer holds a wider, older
+    // one. They overlap but neither contains the other.
+    let mut small = messages_holding_under(&r, &small_parent, 150..260);
+    let mut large = messages_holding_under(&r, &large_parent, 0..200);
+
+    assert_eq!(
+        held(&small).len(),
+        50,
+        "test premise: the 50-cap peer must be AT capacity"
+    );
+    assert_eq!(
+        held(&large).len(),
+        200,
+        "test premise: the 200-cap peer must be AT capacity too"
+    );
+
+    // --- direction 1: large -> small (the small peer must not be flooded) ---
+    let before_small = held(&small);
+    small
+        .merge(&small_parent, &r.params, &large)
+        .expect("small.merge(large)");
+    assert_eq!(
+        held(&small).len(),
+        50,
+        "the 50-cap peer must still hold exactly 50 after merging a 200-message peer"
+    );
+    assert_eq!(
+        held(&small),
+        before_small,
+        "everything the 200-cap peer holds that the 50-cap peer lacks is OLDER \
+         than its window, so nothing should have changed"
+    );
+    assert_eq!(
+        large.delta(
+            &small_parent,
+            &r.params,
+            &small.summarize(&small_parent, &r.params)
+        ),
+        None,
+        "the 200-cap peer still had a payload for the 50-cap peer — this is the \
+         resend loop, with the receiver's smaller cap as the trigger"
+    );
+
+    // --- direction 2: small -> large (the large peer must back-fill) ---
+    large
+        .merge(&large_parent, &r.params, &small)
+        .expect("large.merge(small)");
+    // The union is 250 distinct messages, NOT a contiguous run: the large peer
+    // holds 0..=199 and the small peer 210..=259, with nothing at 200..=209
+    // (the small peer's own cap already pruned those away). So the newest 200
+    // drops offsets 0..=49 and keeps the rest of both windows, gap included.
+    let expected: Vec<u64> = (50..200).chain(210..260).collect();
+    assert_eq!(
+        expected.len(),
+        200,
+        "sanity: the oracle must be exactly the cap"
+    );
+    assert_eq!(
+        held(&large),
+        expected,
+        "the 200-cap peer must absorb the 50-cap peer's newer messages and keep \
+         the newest 200 of the union"
+    );
+    assert_eq!(
+        small.delta(
+            &large_parent,
+            &r.params,
+            &large.summarize(&large_parent, &r.params)
+        ),
+        None,
+        "the 50-cap peer still had a payload for the 200-cap peer"
+    );
+}
+
+/// KNOWN OPEN BUG — this test pins the loop AS IT CURRENTLY BEHAVES.
+///
+/// A peer whose horizon REGRESSES from `OldestRetained` back to `Open` because
+/// a ban sweep emptied part of its window, driven through the FULL
+/// `ChatRoomStateV1` merge so `post_apply_cleanup` actually runs.
+///
+/// R holds 100 of 100. It bans X, whose 40 messages `post_apply_cleanup` sweeps
+/// out, dropping R to 60 — below its cap, so R now advertises an OPEN horizon.
+/// S has not seen the ban and still holds all 100.
+///
+/// # This still loops, and the retention horizon cannot close it
+///
+/// The horizon governs only what the SENDER withholds, and an OPEN horizon
+/// withholds nothing. The messages R then rejects are dropped by the
+/// ban/membership sweep in `post_apply_cleanup`, which leaves NO trace in R's
+/// summary — so S cannot learn they were refused and recomputes the identical
+/// payload on every fan-out. R's reopened horizon makes it invite MORE, not
+/// less.
+///
+/// There are TWO coupled channels here, not one:
+///
+/// * **messages** — S re-offers X's 40 messages every round; the
+///   author-must-be-a-member retain drops all 40 on arrival.
+/// * **members** — S re-offers X (and the member R's inactivity prune removed)
+///   every round; `post_apply_cleanup` re-prunes them on arrival.
+///
+/// The root cause is that R's BAN never travels to S. That is a genuinely
+/// separate defect from the retention loop this PR fixes: closing it needs the
+/// ban — or some rejection signal — to reach the sender, which is a protocol
+/// change, not a summary change. No horizon can express "I refused this".
+///
+/// # Why this asserts the BROKEN behaviour
+///
+/// Written first as `..._does_not_loop`, it FAILED, correctly. Rather than
+/// weaken the assertion to make it pass, or leave the suite red so the finding
+/// hides behind a failure nobody reads, it is INVERTED into a characterisation
+/// test: it asserts precisely that the loop is present and that each round is a
+/// no-op for R. The day the ban-propagation gap is closed, this test fails and
+/// forces whoever closed it to flip the polarity back.
+#[test]
+fn ban_sweep_reopening_the_horizon_still_loops_known_gap() {
+    let r = room(100);
+
+    // X is a third member whose messages will be swept by the ban.
+    let x_sk = SigningKey::generate(&mut OsRng);
+    let x_vk = x_sk.verifying_key();
+    let x_id = MemberId::from(&x_vk);
+
+    let mut base = r.state.clone();
+    base.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: r.owner_id,
+            invited_by: r.owner_id,
+            member_vk: x_vk,
+        },
+        &r.owner_sk,
+    ));
+
+    // 60 from the regular author, 40 from X, interleaved so X's messages are
+    // not simply the oldest or newest slice.
+    let msg_from = |sk: &SigningKey, author: MemberId, secs: u64| {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: r.owner_id,
+                author,
+                time: SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + secs),
+                content: RoomMessageBody::public(format!("m{secs}")),
+            },
+            sk,
+        )
+    };
+    let mut all = Vec::new();
+    for i in 0..100u64 {
+        if i % 5 == 0 {
+            all.push(msg_from(&x_sk, x_id, i)); // 20 of these
+        } else if i % 5 == 1 {
+            all.push(msg_from(&x_sk, x_id, i)); // 20 more -> 40 total
+        } else {
+            all.push(msg_from(&r.author_sk, r.author_id, i));
+        }
+    }
+    base.recent_messages
+        .apply_delta(&base.clone(), &r.params, &Some(all))
+        .expect("seed messages");
+    assert_eq!(
+        base.recent_messages.messages.len(),
+        100,
+        "test premise: both peers start at exactly the cap"
+    );
+
+    // S never learns about the ban.
+    let sender = base.clone();
+    let mut receiver = base.clone();
+
+    // R bans X, through the full-state apply_delta so post_apply_cleanup runs.
+    let ban = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: r.owner_id,
+            banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + 500),
+            banned_user: x_id,
+        },
+        r.owner_id,
+        &r.owner_sk,
+    );
+    let mut banned_state = receiver.clone();
+    banned_state.bans = BansV1(vec![ban]);
+    let ban_delta = banned_state.delta(
+        &banned_state,
+        &r.params,
+        &receiver.summarize(&receiver, &r.params),
+    );
+    receiver
+        .apply_delta(&ChatRoomStateV1::default(), &r.params, &ban_delta)
+        .expect("apply the ban");
+
+    // Premise: the sweep really did drop R below its cap and reopen its horizon.
+    assert_eq!(
+        receiver.recent_messages.messages.len(),
+        60,
+        "test premise: the ban sweep must remove X's 40 messages"
+    );
+    assert_eq!(
+        receiver
+            .recent_messages
+            .retention_horizon(receiver.configuration.configuration.max_recent_messages),
+        RetentionHorizon::Open,
+        "test premise: below its cap, R must now advertise an OPEN horizon"
+    );
+
+    // Drive the exchange. Every round must offer the SAME payload and leave R
+    // completely unchanged — that is what makes this unbounded rather than
+    // merely slow to settle.
+    let messages_before = receiver.recent_messages.messages.clone();
+    let members_before = receiver.members.members.clone();
+
+    for round in 0..10 {
+        let offered = sender
+            .delta(
+                &sender,
+                &r.params,
+                &receiver.summarize(&receiver, &r.params),
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "round {round}: S had nothing left to offer. The ban-propagation \
+                     gap this test characterises has been CLOSED — that is good news. \
+                     Rename this test back to `..._does_not_loop` and restore the \
+                     terminating assertion."
+                )
+            });
+
+        assert_eq!(
+            offered
+                .recent_messages
+                .as_ref()
+                .map_or(0, |m: &Vec<AuthorizedMessageV1>| m.len()),
+            40,
+            "round {round}: the offer must be exactly X's 40 swept messages"
+        );
+        assert!(
+            offered.members.is_some(),
+            "round {round}: the offer must also re-push the members R pruned — the \
+             membership channel loops alongside the message one"
+        );
+
+        receiver
+            .apply_delta(&ChatRoomStateV1::default(), &r.params, &Some(offered))
+            .unwrap_or_else(|e| panic!("round {round} apply failed: {e}"));
+
+        assert_eq!(
+            receiver.recent_messages.messages, messages_before,
+            "round {round}: applying the offer must leave R's messages untouched — \
+             the sweep discards every one, which is exactly why S never learns"
+        );
+        assert_eq!(
+            receiver.members.members, members_before,
+            "round {round}: and R's member set must be untouched too"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

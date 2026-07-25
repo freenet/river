@@ -212,6 +212,16 @@ fn parent_with_cap(cap: usize) -> ChatRoomStateV1 {
 // Test-runner harness
 // ---------------------------------------------------------------------------
 
+/// Shrinking budget, in wall-clock milliseconds.
+///
+/// A DM case merges states holding a few hundred signed messages, so a single
+/// shrink step is not cheap. Left unbounded, a failing DM property shrinks for
+/// well over ten minutes — measured, while mutation-testing this file — which
+/// on CI reads as a hung job rather than a failed test. 30s is ample to shrink
+/// these index-set generators to a readable counterexample; the cap only ever
+/// costs a slightly larger one.
+const MAX_SHRINK_MS: u32 = 30_000;
+
 fn check<S>(cases: u32, strategy: S, test: impl Fn(S::Value) -> Result<(), TestCaseError>)
 where
     S: Strategy,
@@ -219,7 +229,7 @@ where
 {
     let config = ProptestConfig {
         cases,
-        max_shrink_iters: 8192,
+        max_shrink_time: MAX_SHRINK_MS,
         failure_persistence: None,
         ..ProptestConfig::default()
     };
@@ -1022,6 +1032,10 @@ fn message_summary_bytes_are_independent_of_state_vec_order() {
 /// The DM counterpart. `pair_horizons` is built through a `HashMap` internally,
 /// so it must be sorted before it leaves `summarize` — this is what catches a
 /// regression that drops that sort.
+///
+/// BOTH ordered pairs are loaded, and both reach the cap, or the property is
+/// vacuous: `pair_horizons` only emits an entry for an at-capacity pair, and a
+/// one-entry `Vec` cannot expose a map-iteration-order bug.
 #[test]
 fn dm_summary_bytes_are_independent_of_state_vec_order() {
     let f = fixture();
@@ -1030,9 +1044,14 @@ fn dm_summary_bytes_are_independent_of_state_vec_order() {
         64,
         two_orders(dm_held_indices()),
         |(order_one, order_two)| {
-            let build = |idx: &[usize]| DirectMessagesV1 {
-                messages: idx.iter().map(|i| f.dms_forward[*i].clone()).collect(),
-                ..Default::default()
+            let build = |idx: &[usize]| {
+                let mut messages: Vec<AuthorizedDirectMessage> =
+                    idx.iter().map(|i| f.dms_forward[*i].clone()).collect();
+                messages.extend(idx.iter().map(|i| f.dms_reverse[*i].clone()));
+                DirectMessagesV1 {
+                    messages,
+                    ..Default::default()
+                }
             };
 
             let one = build(&order_one).summarize(&parent, &f.params);
@@ -1079,6 +1098,7 @@ fn the_generator_reaches_at_capacity_peers_with_divergent_windows() {
     // `TestRunner::run` takes an `Fn`, so the tallies live behind `Cell`.
     let divergent_at_capacity = Cell::new(0usize);
     let dm_pair_at_capacity = Cell::new(0usize);
+    let both_pairs_publish_a_horizon = Cell::new(0usize);
     let strategy = (
         held_indices(MSG_POOL),
         held_indices(MSG_POOL),
@@ -1104,12 +1124,21 @@ fn the_generator_reaches_at_capacity_peers_with_divergent_windows() {
             if dms.messages.len() >= MAX_DM_MESSAGES_PER_PAIR {
                 dm_pair_at_capacity.set(dm_pair_at_capacity.get() + 1);
             }
+
+            // `dm_summary_bytes_are_independent_of_state_vec_order` can only
+            // expose a map-iteration-order bug when BOTH ordered pairs publish
+            // a horizon — a one-entry `Vec` has no order to get wrong.
+            let both_pairs = dms_from(&parent, &dm_idx, &dm_idx);
+            if both_pairs.pair_horizons().len() == 2 {
+                both_pairs_publish_a_horizon.set(both_pairs_publish_a_horizon.get() + 1);
+            }
             Ok(())
         })
         .expect("self-check strategy must not fail");
 
     let divergent_at_capacity = divergent_at_capacity.get();
     let dm_pair_at_capacity = dm_pair_at_capacity.get();
+    let both_pairs_publish_a_horizon = both_pairs_publish_a_horizon.get();
     assert!(
         divergent_at_capacity >= 50,
         "only {divergent_at_capacity}/512 cases put an at-capacity peer against a \
@@ -1119,5 +1148,11 @@ fn the_generator_reaches_at_capacity_peers_with_divergent_windows() {
         dm_pair_at_capacity >= 50,
         "only {dm_pair_at_capacity}/512 cases filled a DM pair to \
          MAX_DM_MESSAGES_PER_PAIR — the DM properties would be mostly decorative"
+    );
+    assert!(
+        both_pairs_publish_a_horizon >= 50,
+        "only {both_pairs_publish_a_horizon}/512 cases had BOTH ordered pairs publish a \
+         horizon — dm_summary_bytes_are_independent_of_state_vec_order could not \
+         expose a map-iteration-order bug"
     );
 }

@@ -139,6 +139,29 @@ jobs:
       # newly-added file. The named steps are kept for failure attribution.
       run: cargo test -p river-core --tests
 
+    - name: Test capped-collection retention (prune/resend loop)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # `MessagesV1` and `DirectMessagesV1` REMOVE entries in `apply_delta`, so
+      # `delta` must be filtered by the retention horizon the receiver
+      # publishes or the pair re-sends the same discarded payload forever
+      # (`delta` never returns `None`, so freenet-core's "empty delta -> skip"
+      # never fires). That loop made the room contract 63.7% of all
+      # byte-weighted broadcast work network-wide on 2026-07-25.
+      #
+      # These targets are named EXPLICITLY because this job enumerates test
+      # targets one at a time: `cargo test -p river-core --lib` above does NOT
+      # build integration targets, so a target nobody lists here never runs in
+      # CI at all. `summary_determinism_test` is included because the horizon
+      # travels inside the summary, whose bytes freenet-core compares to decide
+      # staleness (freenet/freenet-core#4857).
+      run: >
+        cargo test -p river-core
+        --test retention_loop_test
+        --test retention_proptest
+        --test summary_determinism_test
+
     - name: Test riverctl (CLI crate unit tests, incl. #292 recovery)
       env:
         RUST_MIN_STACK: 8388608
