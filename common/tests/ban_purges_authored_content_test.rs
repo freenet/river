@@ -8,7 +8,7 @@
 //! `target_author_name` / `target_content_preview`), which the contract does not
 //! validate. After a ban that snapshot is the last surviving copy of the banned
 //! member's text, so both clients refuse to render a quote they cannot re-read
-//! from live state (`resolve_reply_context` in
+//! from live state (`resolve_reply_strip` in
 //! `ui/src/components/conversation.rs`, `reply_context_display_with_secrets` in
 //! `cli/src/api.rs`).
 //!
