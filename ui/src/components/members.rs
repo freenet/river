@@ -1114,11 +1114,31 @@ pub(crate) fn impersonation_checker_for_viewer(
 
 /// The impersonation warning a surface actually RENDERS for one member, if any.
 ///
-/// **Every render surface must go through this**, not
+/// **Any surface that renders the warning must go through this**, not
 /// [`ImpersonationChecker::check`] directly, because it carries the tier
-/// decision — and a surface that skipped it would show a badge the other
-/// surfaces do not, which is exactly the cross-surface drift freenet/river#451
-/// fixed for the shield.
+/// decision and the truthful-tooltip decision — and a surface that skipped it
+/// would show a badge the other surfaces do not, which is exactly the
+/// cross-surface drift freenet/river#451 fixed for the shield.
+///
+/// ## Which surfaces render it, and which do NOT
+///
+/// This used to claim "every render surface must go through this", which was
+/// false and is the class of stale comment this file's credibility depends on
+/// not having. The warning is rendered on **two** surfaces today:
+///
+/// * the member-list row ([`MemberList`]), and
+/// * the conversation's message author line.
+///
+/// It is NOT rendered on the member-info modal, the DM thread and DM rail,
+/// @mention chips and autocomplete, notifications, or reaction tooltips. Those
+/// show a nickname with no warning beside it. The DM thread is the most
+/// consequential of the gaps: it is a 1:1 surface, which is where a victim is
+/// most likely to act on perceived authority.
+///
+/// Adding a surface is a one-line call to this function plus the glyph; the
+/// reason not to do it blindly is that each surface needs its own
+/// [`privilege_in_view`] answer and its own layout for a badge that must not
+/// be clipped.
 ///
 /// ## Only [`ConfusableTier::Identical`] is rendered
 ///
