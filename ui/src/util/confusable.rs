@@ -752,6 +752,60 @@ fn fold_homoglyph(c: char) -> char {
         '\u{03A4}' => 'T', // Τ
         '\u{03A5}' => 'Y', // Υ
         '\u{03A7}' => 'X', // Χ
+        // ---- Shape homoglyphs that NFKC does NOT equate ----
+        //
+        // Unlike `fold_nfkc_letter`, these are NOT normalisation-equal to their
+        // Latin counterparts — they are separate letters that happen to be
+        // drawn the same. So they carry REAL false-positive surface and each is
+        // a judgement, not a lookup. Every script here is covered by
+        // `real_names_in_other_scripts_are_not_flagged` and by the corpus sweep
+        // in `foldable_scripts_do_not_collide_with_latin_names`.
+        //
+        // Greek lunate sigma: the epigraphic forms of sigma, drawn exactly as
+        // Latin C/c.
+        '\u{03F9}' => 'C',
+        '\u{03F2}' => 'c',
+        // Coptic. These capitals are drawn as their Latin lookalikes in every
+        // Coptic font; the lowercase forms sit at +1.
+        '\u{2C80}' => 'A',
+        '\u{2C81}' => 'a',
+        '\u{2C88}' => 'E',
+        '\u{2C8E}' => 'H',
+        '\u{2C92}' => 'I',
+        '\u{2C94}' => 'K',
+        '\u{2C98}' => 'M',
+        '\u{2C9A}' => 'N',
+        '\u{2C9E}' => 'O',
+        '\u{2C9F}' => 'o',
+        '\u{2CA2}' => 'P',
+        '\u{2CA4}' => 'C',
+        '\u{2CA5}' => 'c',
+        '\u{2CA6}' => 'T',
+        '\u{2CAC}' => 'X',
+        // Armenian. ONLY these two: `\u{0585}` and `\u{0578}` are drawn as
+        // Latin `o`/`n`, and BOTH occur in real Armenian names
+        // (`\u{0540}\u{578}\u{57E}\u{570}\u{561}\u{576}\u{576}\u{565}\u{57D}`,
+        // `\u{0533}\u{578}\u{057C}`), which makes this the highest-risk entry
+        // in the file. It is safe only because a collision needs the WHOLE name
+        // to fold and every other Armenian letter stays itself — pinned by the
+        // corpus sweep, not by assertion.
+        '\u{0585}' => 'o',
+        '\u{0578}' => 'n',
+        // Cherokee, and Lisu — which was designed FROM Latin capitals, so its
+        // letters are Latin letterforms outright.
+        '\u{13DF}' => 'C',
+        '\u{A4F2}' => 'I',
+        '\u{A4EA}' => 'W',
+        // Latin-block letters that are not the ASCII letter they resemble:
+        // `\u{01C0}` is a click consonant, `\u{0251}` the IPA script-a, and
+        // `\u{0131}` is Turkish dotless i — a REAL letter in Turkish names,
+        // folded anyway because a reader outside Turkish sees one glyph minus a
+        // dot. That cost is recorded in `documented_accepted_collisions`.
+        '\u{01C0}' => 'l',
+        '\u{0251}' => 'a',
+        '\u{0131}' => 'i',
+        // Mathematical DIVIDES: a bare vertical stroke.
+        '\u{2223}' => 'l',
         // Greek, lowercase — only the three that are genuinely
         // indistinguishable.
         '\u{03BF}' => 'o', // ο
@@ -764,7 +818,18 @@ fn fold_homoglyph(c: char) -> char {
 /// Combining marks, dropped so `"I" + U+0300` folds like `"Ì"`.
 fn is_combining_mark(c: char) -> bool {
     matches!(u32::from(c),
-        0x0300..=0x036F   // Combining Diacritical Marks
+        // Cyrillic combining marks (titlo, palatalisation, psili...). Added
+        // because `"Ian Cla\u{0483}rke"` otherwise EVADED while `U+0300` was
+        // caught — a mark a reader barely registers must not defeat the fold.
+        // These are historic/liturgical ornaments, not part of how any modern
+        // Cyrillic name is spelled, so folding them is safe.
+        //
+        // Hebrew niqqud, Arabic harakat and Indic/Thai vowel signs are still
+        // NOT here, deliberately: in those scripts marks are far more often
+        // meaning-bearing, and widening the strip would start flagging real
+        // people in scripts this repo has no corpus for. See the module header.
+        0x0483..=0x0489
+        | 0x0300..=0x036F   // Combining Diacritical Marks
         | 0x1AB0..=0x1AFF // Combining Diacritical Marks Extended
         | 0x1DC0..=0x1DFF // Combining Diacritical Marks Supplement
         | 0x20D0..=0x20F0 // Combining Diacritical Marks for Symbols
@@ -787,6 +852,9 @@ fn fold_presentation_form(c: char) -> Option<char> {
     if let Some(letter) = fold_letterlike(cp) {
         return Some(letter);
     }
+    if let Some(letter) = fold_nfkc_letter(c) {
+        return Some(letter);
+    }
     // Mathematical Alphanumeric Symbols: consecutive 52-letter (A-Z then a-z)
     // blocks.
     //
@@ -807,6 +875,122 @@ fn fold_presentation_form(c: char) -> Option<char> {
         return Some((b'0' + ((cp - 0x1D7CE) % 10) as u8) as char);
     }
     None
+}
+
+/// Characters whose Unicode NFKC normalisation IS a single ASCII letter, and
+/// which survive [`is_display_hidden`].
+///
+/// **This is the low-risk half of the confusable table and it is GENERATED, not
+/// curated.** Every entry is one a conforming NFKC implementation already
+/// treats as equal to its ASCII letter, so folding them adds no false-positive
+/// surface: none is a letter in any living orthography's normal spelling of a
+/// personal name. They are modifier letters (linguistics/IPA), super/subscripts,
+/// Roman numerals, ordinal indicators, the Kelvin and Angstrom signs, and the
+/// double-struck italics.
+///
+/// Without them the bypasses are trivial and total — Roman numerals render as
+/// plain Latin, so `U+2160 U+216D U+217C` spells `Ian Clarke` to any reader.
+///
+/// Produced by sweeping `0x80..0x30000` for `NFKC(c)` being one ASCII letter
+/// and subtracting what the other tables already fold; regenerate the same way
+/// if those ranges change. `roman_numerals_and_nfkc_letters_fold` pins a
+/// representative of each family.
+///
+/// Contrast [`fold_homoglyph`]'s shape entries, which NFKC does NOT equate and
+/// which therefore carry real false-positive risk.
+fn fold_nfkc_letter(c: char) -> Option<char> {
+    Some(match u32::from(c) {
+        // 88 characters, generated from Unicode NFKC data.
+        0x00AA => 'a',  // FEMININE ORDINAL INDICATOR
+        0x00BA => 'o',  // MASCULINE ORDINAL INDICATOR
+        0x02B0 => 'h',  // MODIFIER LETTER SMALL H
+        0x02B2 => 'j',  // MODIFIER LETTER SMALL J
+        0x02B3 => 'r',  // MODIFIER LETTER SMALL R
+        0x02B7 => 'w',  // MODIFIER LETTER SMALL W
+        0x02B8 => 'y',  // MODIFIER LETTER SMALL Y
+        0x02E1 => 'l',  // MODIFIER LETTER SMALL L
+        0x02E2 => 's',  // MODIFIER LETTER SMALL S
+        0x02E3 => 'x',  // MODIFIER LETTER SMALL X
+        0x1D2C => 'A',  // MODIFIER LETTER CAPITAL A
+        0x1D2E => 'B',  // MODIFIER LETTER CAPITAL B
+        0x1D30 => 'D',  // MODIFIER LETTER CAPITAL D
+        0x1D31 => 'E',  // MODIFIER LETTER CAPITAL E
+        0x1D33 => 'G',  // MODIFIER LETTER CAPITAL G
+        0x1D34 => 'H',  // MODIFIER LETTER CAPITAL H
+        0x1D35 => 'I',  // MODIFIER LETTER CAPITAL I
+        0x1D36 => 'J',  // MODIFIER LETTER CAPITAL J
+        0x1D37 => 'K',  // MODIFIER LETTER CAPITAL K
+        0x1D38 => 'L',  // MODIFIER LETTER CAPITAL L
+        0x1D39 => 'M',  // MODIFIER LETTER CAPITAL M
+        0x1D3A => 'N',  // MODIFIER LETTER CAPITAL N
+        0x1D3C => 'O',  // MODIFIER LETTER CAPITAL O
+        0x1D3E => 'P',  // MODIFIER LETTER CAPITAL P
+        0x1D3F => 'R',  // MODIFIER LETTER CAPITAL R
+        0x1D40 => 'T',  // MODIFIER LETTER CAPITAL T
+        0x1D41 => 'U',  // MODIFIER LETTER CAPITAL U
+        0x1D42 => 'W',  // MODIFIER LETTER CAPITAL W
+        0x1D43 => 'a',  // MODIFIER LETTER SMALL A
+        0x1D47 => 'b',  // MODIFIER LETTER SMALL B
+        0x1D48 => 'd',  // MODIFIER LETTER SMALL D
+        0x1D49 => 'e',  // MODIFIER LETTER SMALL E
+        0x1D4D => 'g',  // MODIFIER LETTER SMALL G
+        0x1D4F => 'k',  // MODIFIER LETTER SMALL K
+        0x1D50 => 'm',  // MODIFIER LETTER SMALL M
+        0x1D52 => 'o',  // MODIFIER LETTER SMALL O
+        0x1D56 => 'p',  // MODIFIER LETTER SMALL P
+        0x1D57 => 't',  // MODIFIER LETTER SMALL T
+        0x1D58 => 'u',  // MODIFIER LETTER SMALL U
+        0x1D5B => 'v',  // MODIFIER LETTER SMALL V
+        0x1D62 => 'i',  // LATIN SUBSCRIPT SMALL LETTER I
+        0x1D63 => 'r',  // LATIN SUBSCRIPT SMALL LETTER R
+        0x1D64 => 'u',  // LATIN SUBSCRIPT SMALL LETTER U
+        0x1D65 => 'v',  // LATIN SUBSCRIPT SMALL LETTER V
+        0x1D9C => 'c',  // MODIFIER LETTER SMALL C
+        0x1DA0 => 'f',  // MODIFIER LETTER SMALL F
+        0x1DBB => 'z',  // MODIFIER LETTER SMALL Z
+        0x2071 => 'i',  // SUPERSCRIPT LATIN SMALL LETTER I
+        0x207F => 'n',  // SUPERSCRIPT LATIN SMALL LETTER N
+        0x2090 => 'a',  // LATIN SUBSCRIPT SMALL LETTER A
+        0x2091 => 'e',  // LATIN SUBSCRIPT SMALL LETTER E
+        0x2092 => 'o',  // LATIN SUBSCRIPT SMALL LETTER O
+        0x2093 => 'x',  // LATIN SUBSCRIPT SMALL LETTER X
+        0x2095 => 'h',  // LATIN SUBSCRIPT SMALL LETTER H
+        0x2096 => 'k',  // LATIN SUBSCRIPT SMALL LETTER K
+        0x2097 => 'l',  // LATIN SUBSCRIPT SMALL LETTER L
+        0x2098 => 'm',  // LATIN SUBSCRIPT SMALL LETTER M
+        0x2099 => 'n',  // LATIN SUBSCRIPT SMALL LETTER N
+        0x209A => 'p',  // LATIN SUBSCRIPT SMALL LETTER P
+        0x209B => 's',  // LATIN SUBSCRIPT SMALL LETTER S
+        0x209C => 't',  // LATIN SUBSCRIPT SMALL LETTER T
+        0x212A => 'K',  // KELVIN SIGN
+        0x2139 => 'i',  // INFORMATION SOURCE
+        0x2145 => 'D',  // DOUBLE-STRUCK ITALIC CAPITAL D
+        0x2146 => 'd',  // DOUBLE-STRUCK ITALIC SMALL D
+        0x2147 => 'e',  // DOUBLE-STRUCK ITALIC SMALL E
+        0x2148 => 'i',  // DOUBLE-STRUCK ITALIC SMALL I
+        0x2149 => 'j',  // DOUBLE-STRUCK ITALIC SMALL J
+        0x2160 => 'I',  // ROMAN NUMERAL ONE
+        0x2164 => 'V',  // ROMAN NUMERAL FIVE
+        0x2169 => 'X',  // ROMAN NUMERAL TEN
+        0x216C => 'L',  // ROMAN NUMERAL FIFTY
+        0x216D => 'C',  // ROMAN NUMERAL ONE HUNDRED
+        0x216E => 'D',  // ROMAN NUMERAL FIVE HUNDRED
+        0x216F => 'M',  // ROMAN NUMERAL ONE THOUSAND
+        0x2170 => 'i',  // SMALL ROMAN NUMERAL ONE
+        0x2174 => 'v',  // SMALL ROMAN NUMERAL FIVE
+        0x2179 => 'x',  // SMALL ROMAN NUMERAL TEN
+        0x217C => 'l',  // SMALL ROMAN NUMERAL FIFTY
+        0x217D => 'c',  // SMALL ROMAN NUMERAL ONE HUNDRED
+        0x217E => 'd',  // SMALL ROMAN NUMERAL FIVE HUNDRED
+        0x217F => 'm',  // SMALL ROMAN NUMERAL ONE THOUSAND
+        0x2C7C => 'j',  // LATIN SUBSCRIPT SMALL LETTER J
+        0x2C7D => 'V',  // MODIFIER LETTER CAPITAL V
+        0xA7F2 => 'C',  // MODIFIER LETTER CAPITAL C
+        0xA7F3 => 'F',  // MODIFIER LETTER CAPITAL F
+        0xA7F4 => 'Q',  // MODIFIER LETTER CAPITAL Q
+        0x107A5 => 'q', // MODIFIER LETTER SMALL Q
+        _ => return None,
+    })
 }
 
 /// Letterlike Symbols (U+2100..U+214F) that NFKC folds to a plain letter.
@@ -1436,6 +1620,150 @@ mod tests {
         );
     }
 
+    /// **BLOCKING C — whole NFKC-equivalent blocks were missing.** A sweep for
+    /// "NFKC yields one ASCII letter, survives `is_display_hidden`, but the fold
+    /// does not fold it" returned ~87 characters. Roman numerals are the
+    /// cleanest bypass: they are letterforms and render as plain Latin.
+    #[test]
+    fn roman_numerals_and_nfkc_letters_fold() {
+        for (label, attacker, real) in [
+            (
+                "Roman numerals",
+                "\u{2160}an \u{216D}\u{217C}arke",
+                "Ian Clarke",
+            ),
+            ("Roman numeral V", "\u{2164}era Voss", "Vera Voss"),
+            ("Roman numeral X", "\u{2169}ander Doe", "Xander Doe"),
+            ("KELVIN SIGN", "\u{212A}ai Chen", "Kai Chen"),
+            ("ANGSTROM SIGN", "\u{212B}da Lovelace", "Ada Lovelace"),
+            ("ordinal indicators", "B\u{00BA}b", "Bob"),
+            ("modifier letters", "\u{1D2C}da", "Ada"),
+            ("double-struck italic", "\u{2145}an", "Dan"),
+            ("subscript letters", "B\u{2092}b", "Bob"),
+        ] {
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                real,
+                mid(1),
+            )]);
+            assert!(
+                checker.check(mid(2), attacker).is_some(),
+                "{label}: {attacker:?} must be flagged against {real:?}"
+            );
+        }
+    }
+
+    /// The shape homoglyphs — the half NFKC does NOT equate, so each is a
+    /// judgement rather than a lookup.
+    #[test]
+    fn shape_homoglyphs_fold() {
+        for (label, attacker, real) in [
+            ("Greek lunate sigma", "\u{03F9}larke", "Clarke"),
+            ("Coptic O", "\u{2C9E}wner", "Owner"),
+            ("Coptic C+A", "\u{2CA4}\u{2C80}rl", "Carl"),
+            ("Armenian o", "B\u{0585}b", "Bob"),
+            ("Armenian vo", "Da\u{0578}", "Dan"),
+            ("Cherokee C", "\u{13DF}arl", "Carl"),
+            ("Lisu I", "\u{A4F2}an Clarke", "Ian Clarke"),
+            ("dental click", "\u{01C0}an Clarke", "Ian Clarke"),
+            ("DIVIDES", "\u{2223}an Clarke", "Ian Clarke"),
+            ("IPA alpha", "\u{0251}da", "Ada"),
+            ("dotless i", "\u{0131}an Clarke", "Ian Clarke"),
+            ("Cyrillic titlo", "Ian Cla\u{0483}rke", "Ian Clarke"),
+        ] {
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                real,
+                mid(1),
+            )]);
+            assert!(
+                checker.check(mid(2), attacker).is_some(),
+                "{label}: {attacker:?} must be flagged against {real:?}"
+            );
+        }
+    }
+
+    /// **The false-positive sweep for the shape homoglyphs, and the reason the
+    /// C table could not just be pasted in.**
+    ///
+    /// `fold_nfkc_letter` is safe by construction — NFKC already equates its
+    /// entries, and none is a letter in a living orthography. The SHAPE table is
+    /// different: Armenian `ո`/`օ`, the Coptic letters and Cherokee `Ꮯ` are real
+    /// letters in real names, and folding them moves those names toward Latin.
+    ///
+    /// The property that makes it safe is that a collision needs the WHOLE name
+    /// to fold, and every other letter in those scripts stays itself. This
+    /// asserts it directly: no name in the corpus collides with a Latin
+    /// protected name, and no two corpus names collide with each other.
+    #[test]
+    fn foldable_scripts_do_not_collide_with_latin_names() {
+        // Real names in every script the shape table touches, chosen to CONTAIN
+        // the folded letters where possible — `Հովհաննես` and `Գոռ` both carry
+        // Armenian `ո`, which is the highest-risk entry in the table.
+        let corpus = [
+            "Հովհաննես",
+            "Գոռ",
+            "Նոր Օհան",
+            "Արամ Խաչատրյան",
+            "Օհան",
+            "ⲡⲁⲡⲛⲟⲩⲧⲉ",
+            "Ⲡⲉⲧⲣⲟⲥ",
+            "ᏣᎳᎩ ᎠᏰᎵ",
+            "Γιώργος Παπαδόπουλος",
+            "Νίκος Παπαδόπουλος",
+            "Иван Петров",
+            "Ольга Иванова",
+            "Işık Yılmaz",
+            "Cılız Demir",
+        ];
+        let latin_protected = [
+            "Ian Clarke",
+            "Room Owner",
+            "Bob",
+            "Owner",
+            "Carl",
+            "Dan",
+            "Ada",
+            "Nora",
+            "Ohan",
+        ];
+
+        for name in corpus {
+            for protected in latin_protected {
+                let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                    ProtectedRole::Deputy,
+                    protected,
+                    mid(1),
+                )]);
+                assert_eq!(
+                    checker.check(mid(2), name),
+                    None,
+                    "a legitimate name folded onto a Latin protected name: \
+                     {name:?} vs {protected:?} — the shape table is too \
+                     aggressive and the offending entry must come back out"
+                );
+            }
+        }
+
+        // And no two DIFFERENT corpus names may fold together either, which is
+        // the same harm one level down (a deputy holding one would flag the
+        // other).
+        for (i, a) in corpus.iter().enumerate() {
+            for b in corpus.iter().skip(i + 1) {
+                let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                    ProtectedRole::Deputy,
+                    *a,
+                    mid(1),
+                )]);
+                assert_eq!(
+                    checker.check(mid(2), b),
+                    None,
+                    "two distinct real names now fold together: {a:?} / {b:?}"
+                );
+            }
+        }
+    }
+
     /// **BLOCKING B — uppercase homoglyphs whose LOWERCASE is in the table.**
     ///
     /// `fold_homoglyph` originally ran only before `to_lowercase`. Any uppercase
@@ -1722,6 +2050,9 @@ mod tests {
             ("Muller", "M\u{00FC}ller", "accent stripping"),
             ("Boll", "B\u{00F6}ll", "accent stripping"),
             ("Moller", "M\u{00F6}ller", "accent stripping"),
+            // Turkish dotless i: a REAL letter in Turkish names, but a reader
+            // outside Turkish sees one glyph minus a dot.
+            ("Isik", "Is\u{0131}k", "Turkish dotless i"),
         ] {
             let checker = ImpersonationChecker::new(vec![ProtectedName::new(
                 ProtectedRole::Deputy,
