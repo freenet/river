@@ -5006,8 +5006,7 @@ mod resolve_reply_strip_tests {
             20,
         );
 
-        // Two records for Alice; the higher version is canonical. Listed with
-        // the STALE one last so a naive `.collect()` into a map would pick it.
+        // Two records for Alice; the higher version is canonical.
         let canonical = AuthorizedMemberInfo::new(
             MemberInfo::new_public(member_id_of(&alice_sk), 2, "Alice v2".to_string()),
             &alice_sk,
@@ -5016,18 +5015,30 @@ mod resolve_reply_strip_tests {
             MemberInfo::new_public(member_id_of(&alice_sk), 1, "Alice v1".to_string()),
             &alice_sk,
         );
-        let member_info = info(vec![canonical, stale]);
 
-        let (author, _) = expect_quote(resolve(
-            &reply,
-            &state(vec![original, reply.clone()]),
-            &member_info,
-        ));
-        assert_eq!(
-            author, "Alice v2",
-            "must match `member_info.canonical()`, which is what the message \
-             header uses"
-        );
+        // BOTH orderings. A single ordering only pins one of the two ways this
+        // regresses, while looking deliberate: `[canonical, stale]` catches a
+        // last-wins `.collect()` into a map but a first-match `.find()` sails
+        // through it, and `[stale, canonical]` catches the reverse. Only
+        // `canonical()`'s rank comparison satisfies both.
+        for (order, member_info) in [
+            (
+                "canonical first",
+                info(vec![canonical.clone(), stale.clone()]),
+            ),
+            ("stale first", info(vec![stale, canonical])),
+        ] {
+            let (author, _) = expect_quote(resolve(
+                &reply,
+                &state(vec![original.clone(), reply.clone()]),
+                &member_info,
+            ));
+            assert_eq!(
+                author, "Alice v2",
+                "must match `member_info.canonical()`, which is what the \
+                 message header uses ({order})"
+            );
+        }
     }
 
     /// Deleting a message removes its text from the room; quotes of it included.
