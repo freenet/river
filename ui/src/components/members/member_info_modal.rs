@@ -321,6 +321,7 @@ pub fn MemberInfoModal() -> Element {
                                     "data-testid": "member-info-deputy-tag",
                                     class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-purple-500/20 text-purple-400",
                                     title: "{deputy_tooltip}",
+                                    "aria-label": "{deputy_tooltip}",
                                     "🛡 Deputy"
                                 }
                             }

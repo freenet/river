@@ -220,7 +220,10 @@ pub fn CreateRoomModal() -> Element {
                     }
                     button {
                         "data-testid": "create-room-submit-button",
-                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
+                        class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                        // Disabled rather than silently no-op, matching the
+                        // accept-invitation modal's nickname gate.
+                        disabled: nickname_has_emoji,
                         onclick: create_room,
                         "Create Room"
                     }

@@ -597,19 +597,33 @@ pub(crate) fn relevant_deputizer_names(
     self_member_id: MemberId,
     target: MemberId,
 ) -> Vec<String> {
-    // Resolve an appointer's id to a display name (owner -> "room owner",
+    // Resolve an appointer's id to a display name (owner -> "the room owner",
     // self -> "you", else the appointer's decrypted preferred nickname).
+    //
+    // A real nickname is QUOTED and the two role labels are not, because they
+    // share one flat, comma-joined list and a nickname is attacker-chosen.
+    // Without the quotes a member who is a strict ancestor of the viewer can
+    // set their nickname to `room owner`, deputize anyone, and make that
+    // member's shield read `Deputy (appointed by room owner). Can ban you.` —
+    // a forged global-moderator appointment, in the one place the badge
+    // communicates the SCOPE of someone's authority. Sanitising cannot help:
+    // `room owner` is plain ASCII.
     let name_of = |id: MemberId| -> String {
         if id == owner_id {
-            return "room owner".to_string();
+            return "the room owner".to_string();
         }
         if id == self_member_id {
             return "you".to_string();
         }
         member_info
             .canonical(id)
-            .map(|mi| display_nickname(&mi.member_info.preferred_nickname, room_secrets))
-            .unwrap_or_else(|| "Unknown".to_string())
+            .map(|mi| {
+                format!(
+                    "\u{201c}{}\u{201d}",
+                    display_nickname(&mi.member_info.preferred_nickname, room_secrets)
+                )
+            })
+            .unwrap_or_else(|| "an unknown member".to_string())
     };
     relevant_deputizers(
         deputizers_of.get(&target).map(Vec::as_slice).unwrap_or(&[]),
@@ -968,6 +982,10 @@ pub fn MemberList() -> Element {
                                 span {
                                     class: "member-icon",
                                     title: "{tooltip}",
+                                    // The glyph alone means nothing to a
+                                    // screen reader, and the deputy shield is
+                                    // now a security-relevant signal.
+                                    "aria-label": "{tooltip}",
                                     " {icon}"
                                 }
                             }
@@ -2937,7 +2955,7 @@ mod tests {
         );
 
         display.deputy_badge = Some(DeputyBadge {
-            deputized_by: vec!["room owner".to_string()],
+            deputized_by: vec!["the room owner".to_string()],
             can_ban_viewer: Some(true),
         });
         let parts = member_display_parts(&display);
@@ -2948,18 +2966,21 @@ mod tests {
             .expect("a deputy must show the 🛡 shield");
         // Identical wording to the conversation author line and the modal
         // chip — all three call `DeputyBadge::tooltip`.
-        assert_eq!(shield.1, "Deputy (appointed by room owner). Can ban you.");
+        assert_eq!(
+            shield.1,
+            "Deputy (appointed by the room owner). Can ban you."
+        );
 
         // On the viewer's OWN row the ban clause is dropped: "can they ban
         // you" is meaningless about yourself.
         display.deputy_badge = Some(DeputyBadge {
-            deputized_by: vec!["room owner".to_string()],
+            deputized_by: vec!["the room owner".to_string()],
             can_ban_viewer: None,
         });
         let parts = member_display_parts(&display);
         assert_eq!(
             parts.tags.iter().find(|(icon, _)| *icon == "🛡").unwrap().1,
-            "Deputy (appointed by room owner)"
+            "Deputy (appointed by the room owner)"
         );
     }
 
@@ -3026,7 +3047,7 @@ mod tests {
                 viewer_id,
                 mod_id,
             ),
-            vec!["room owner".to_string()],
+            vec!["the room owner".to_string()],
         );
         // A member nobody deputized shows no shield.
         assert!(relevant_deputizer_names(
@@ -3115,11 +3136,11 @@ mod tests {
         let global = badges
             .get(&id(&global_mod_sk))
             .expect("a deputy of the owner must show the shield to every viewer");
-        assert_eq!(global.deputized_by, vec!["room owner".to_string()]);
+        assert_eq!(global.deputized_by, vec!["the room owner".to_string()]);
         assert_eq!(global.can_ban_viewer, Some(true));
         assert_eq!(
             global.tooltip(),
-            "Deputy (appointed by room owner). Can ban you."
+            "Deputy (appointed by the room owner). Can ban you."
         );
 
         // 1b. Deputy of a strict ancestor of the viewer → badge, named after
@@ -3127,7 +3148,12 @@ mod tests {
         let by_alpha = badges
             .get(&id(&deputy_alpha_sk))
             .expect("a deputy of the viewer's inviter must show the shield");
-        assert_eq!(by_alpha.deputized_by, vec!["Alpha".to_string()]);
+        // A real nickname is quoted so it cannot masquerade as the unquoted
+        // `the room owner` / `you` role labels in the same comma-joined list.
+        assert_eq!(
+            by_alpha.deputized_by,
+            vec!["\u{201c}Alpha\u{201d}".to_string()]
+        );
         assert_eq!(by_alpha.can_ban_viewer, Some(true));
 
         // 2. Deputy of a member OUTSIDE the viewer's invite ancestry → NO
@@ -3211,7 +3237,7 @@ mod tests {
         let other = badges
             .get(&id(&other_mod_sk))
             .expect("a fellow deputy must still show the shield to a deputy viewer");
-        assert_eq!(other.deputized_by, vec!["room owner".to_string()]);
+        assert_eq!(other.deputized_by, vec!["the room owner".to_string()]);
         assert_eq!(
             other.can_ban_viewer,
             Some(true),
@@ -3225,7 +3251,7 @@ mod tests {
             .get(&viewer_id)
             .expect("a deputy viewer sees the shield on their own row");
         assert_eq!(own.can_ban_viewer, None);
-        assert_eq!(own.tooltip(), "Deputy (appointed by room owner)");
+        assert_eq!(own.tooltip(), "Deputy (appointed by the room owner)");
     }
 
     /// The room owner's OWN view. `viewer_relevant_deputizer_set` gives the
@@ -3272,7 +3298,7 @@ mod tests {
         // so an owner viewing their own appointee reads "room owner", not
         // "you". Pinned rather than "fixed": the label describes the role that
         // granted the authority, and every other viewer sees the same word.
-        assert_eq!(m.deputized_by, vec!["room owner".to_string()]);
+        assert_eq!(m.deputized_by, vec!["the room owner".to_string()]);
         assert_eq!(
             m.can_ban_viewer,
             Some(false),
@@ -3542,8 +3568,32 @@ mod tests {
         let badges =
             deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
         let badge = badges.get(&id(&deputy_sk)).expect("shield expected");
-        assert_eq!(badge.deputized_by, vec!["Eve".to_string()]);
+        assert_eq!(badge.deputized_by, vec!["\u{201c}Eve\u{201d}".to_string()]);
         assert!(!badge.tooltip().contains('🛡'));
+
+        // The role labels are unquoted, so a nickname of `room owner` reads as
+        // the nickname it is rather than as an owner appointment.
+        let liar = deputy_badges_for_viewer(
+            &members,
+            &MemberInfoV1 {
+                member_info: vec![
+                    signed_member_info(&owner_sk, "Owner", vec![]),
+                    signed_member_info(&appointer_sk, "room owner", vec![id(&deputy_sk)]),
+                    signed_member_info(&deputy_sk, "Deputy", vec![]),
+                    signed_member_info(&viewer_sk, "Viewer", vec![]),
+                ],
+            },
+            &secrets,
+            owner_id,
+            id(&viewer_sk),
+        );
+        assert_eq!(
+            liar.get(&id(&deputy_sk))
+                .expect("shield expected")
+                .deputized_by,
+            vec!["\u{201c}room owner\u{201d}".to_string()],
+            "a nickname of `room owner` must not forge an owner appointment"
+        );
     }
 
     /// `build_deputizers_of` must order each deputy's appointers

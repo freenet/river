@@ -373,7 +373,16 @@ pub fn show_notification(
     // Gateway iframe: hand the notification to the shell (real origin) over the
     // postMessage bridge — the sandboxed iframe can't use the Notifications API.
     if is_in_shell_iframe() {
-        let body = format!("{}: {}", sender_name, message_preview);
+        // Flatten line breaks out of the message text. The body renders as
+        // `sender: message`, so a message starting with a newline lets its author
+        // paint a second line that reads exactly like a notification from someone
+        // else — including a moderator with a 🛡 in it. The sender name itself is
+        // already sanitised.
+        let body = format!(
+            "{}: {}",
+            sender_name,
+            message_preview.replace(['\n', '\r'], " ")
+        );
         post_notification_to_shell(room_key, room_name, &body);
         return;
     }
@@ -415,7 +424,16 @@ fn create_notification_internal(
     sender_name: &str,
     message_preview: &str,
 ) {
-    let body = format!("{}: {}", sender_name, message_preview);
+    // Flatten line breaks out of the message text. The body renders as
+    // `sender: message`, so a message starting with a newline lets its author
+    // paint a second line that reads exactly like a notification from someone
+    // else — including a moderator with a 🛡 in it. The sender name itself is
+    // already sanitised.
+    let body = format!(
+        "{}: {}",
+        sender_name,
+        message_preview.replace(['\n', '\r'], " ")
+    );
     info!(
         "Creating notification - title: '{}', body: '{}'",
         room_name, body

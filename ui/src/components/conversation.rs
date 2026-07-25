@@ -2655,7 +2655,10 @@ pub fn Conversation() -> Element {
                                             ),
                                         )
                                     })
-                                    .filter(|(_, name)| !name.trim().is_empty())
+                                    // `display_nickname` never returns an empty
+                                    // string, so the old is-empty filter became
+                                    // dead: the placeholder is what to exclude.
+                                    .filter(|(_, name)| name != crate::util::display_name::UNNAMED)
                                     .collect();
                                 mention_members
                                     .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
@@ -2877,7 +2880,9 @@ fn MessageGroupComponent(
         let mut v: Vec<(MemberId, String)> = member_names
             .iter()
             .filter(|(id, _)| **id != self_member_id)
-            .filter(|(_, name)| !name.trim().is_empty())
+            // `display_nickname` never returns an empty string, so the old
+            // is-empty filter became dead: the placeholder is what to exclude.
+            .filter(|(_, name)| *name != crate::util::display_name::UNNAMED)
             .map(|(id, name)| (*id, name.clone()))
             .collect();
         v.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));

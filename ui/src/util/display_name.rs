@@ -31,8 +31,14 @@
 //!   It cannot forge a badge, which is what this module is for.
 //! * Sanitising can CREATE a collision: `"B⭐ob"` and `"Bob"` render alike, as
 //!   do two nicknames that differ only in stripped characters. Nicknames were
-//!   never unique in River, so this grants no new capability, but it is worth
-//!   knowing that identical rendered names are possible by construction.
+//!   never unique in River, so this grants no new capability, but identical
+//!   rendered names are possible by construction. The specific vectors that
+//!   are cheap to close ARE closed — invisible-but-not-whitespace characters
+//!   are stripped, space-lookalikes are normalised, and a joiner is only kept
+//!   between two non-ASCII letters — but a joiner inside a CJK name still
+//!   clones it, and homoglyphs always will. Note that
+//!   `conversation::mention::duplicate_candidate_names` compares name STRINGS,
+//!   so it does not flag a pair that differs only in kept characters.
 //!
 //! ## What gets removed
 //!
@@ -46,11 +52,14 @@
 //!   which would defeat telling a moderator from an impersonator even with the
 //!   badge itself correct.
 //!
-//!   Deliberately NOT removed: `U+200C` ZWNJ and `U+200D` ZWJ. They look like
-//!   emoji machinery, but they are orthography in Persian, Sinhala and
-//!   Malayalam, and stripping them mangles real names. They are safe to keep
-//!   because every emoji a joiner could assemble is itself removed; a joiner
-//!   left stranded at an edge by that removal is dropped as an orphan.
+//!   `U+200C` ZWNJ and `U+200D` ZWJ are a special case. They look like emoji
+//!   machinery, but they are orthography in Persian, Sinhala and Malayalam,
+//!   and blanket-stripping them mangles real names. They are kept only where
+//!   they can be doing that work — between two non-ASCII letters, or trailing
+//!   one (Malayalam chillu ends a name) — and dropped everywhere else, which
+//!   covers both the orphans the emoji strip leaves behind and the
+//!   `"Bo\u{200D}b"` clone of `"Bob"`. Keeping them is safe because every
+//!   emoji a joiner could assemble is itself removed.
 //! * **Private-use area** codepoints. Fonts are free to map these to any glyph
 //!   at all (Nerd Fonts map a large PUA range to icons, including shields), so
 //!   a PUA nickname renders as a badge on any machine with such a font
@@ -150,12 +159,30 @@ pub fn is_display_hidden(c: char) -> bool {
         // nothing; U+FFF9..U+FFFB are interlinear annotation anchors that hide
         // the text between them.
         | 0x00AD | 0x061C | 0x180E | 0xFFF9..=0xFFFB
-        // Blank glyphs that are not whitespace, so `split_whitespace` would
-        // not collapse them: they let two members share a pixel-identical
+        // Blank glyphs that are not whitespace, so the space collapse below
+        // would not remove them: they let two members share a pixel-identical
         // rendered name (`Alice` vs `Alice\u{3164}`), which undermines the
         // "you can tell members apart by name" assumption the badge sits on.
         // U+2800 BRAILLE PATTERN BLANK, and the Hangul fillers.
         | 0x115F | 0x1160 | 0x2800 | 0x3164 | 0xFFA0
+        // The rest of the Default_Ignorable characters, which render as
+        // nothing. Without these a nickname made ENTIRELY of them is
+        // non-empty (so it never becomes `UNNAMED`) yet renders blank, which
+        // makes a message header look like a continuation of the group above
+        // it — including a badged moderator's group.
+        // U+034F combining grapheme joiner, the Mongolian free variation
+        // selectors, the Khmer inherent vowels, U+2065, the Variation
+        // Selectors Supplement (U+FE00..FE0F's big brother), and the
+        // shorthand-format and musical beam/slur/phrase controls.
+        | 0x034F | 0x180B..=0x180D | 0x180F | 0x17B4..=0x17B5 | 0x2065
+        | 0xE0100..=0xE01EF | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        // Text-presentation symbols that read as a badge in the fonts that
+        // carry them: ۞ (ornate star, present wherever Arabic renders), ٭,
+        // ꙳, and the Phaistos shield. Plus Symbols for Legacy Computing and
+        // its supplement, which contain an inverse check mark and stick
+        // figures.
+        | 0x066D | 0x06DE | 0xA673 | 0x101DB
+        | 0x1FB00..=0x1FBFF | 0x1CC00..=0x1CEBF
         // Private Use Area (BMP). Font-defined glyphs, and River's own
         // mention sentinels live at U+E000/U+E001.
         | 0xE000..=0xF8FF
@@ -209,32 +236,50 @@ pub fn sanitize_display_name(raw: &str) -> String {
         })
         .collect();
 
-    // 2. Drop ORPHANED joiners. U+200C/U+200D are kept above because they are
-    //    orthography between letters, but step 1 can leave one stranded at an
-    //    edge or beside a space — `"Bob 👮🏽‍♀️"` strips down to `"Bob ‍"`. A
-    //    joiner only means anything between two non-space characters, so drop
-    //    the rest rather than leave an invisible character in a name.
+    // 2. Keep a joiner only where it can be doing orthographic work, which is
+    //    between two NON-ASCII letters (Persian `علی‌رضا`, Sinhala `සූර්‍ය`,
+    //    Malayalam chillu — which is consonant + virama + ZWJ and legitimately
+    //    ENDS a name, so a trailing joiner after a non-ASCII letter is kept
+    //    too). Everywhere else it is dropped, which covers two cases:
+    //
+    //    * Orphans left by step 1: `"Bob 👮🏽‍♀️"` strips down to `"Bob ‍"`.
+    //    * The clone attack `"Bo\u{200D}b"`, which renders exactly like
+    //      `"Bob"` in any Latin font. Latin script never needs a joiner, so
+    //      requiring a non-ASCII neighbour costs nothing and closes it.
+    //
+    //    A joiner between two non-ASCII letters is still kept, so a CJK name
+    //    can still be cloned this way. That is the residual documented in the
+    //    module header, and it is the same shape as the homoglyph problem.
     let is_joiner = |c: char| c == '\u{200C}' || c == '\u{200D}';
+    let joins_letters =
+        |c: Option<&char>| c.is_some_and(|c| !c.is_ascii() && !c.is_whitespace() && !is_joiner(*c));
     let kept: Vec<char> = stripped
         .iter()
         .enumerate()
         .filter(|(i, c)| {
             !is_joiner(**c)
                 || (*i > 0
-                    && !stripped[i - 1].is_whitespace()
-                    && !is_joiner(stripped[i - 1])
-                    && stripped
-                        .get(i + 1)
-                        .is_some_and(|n| !n.is_whitespace() && !is_joiner(*n)))
+                    && joins_letters(stripped.get(i - 1))
+                    // A trailing joiner is legitimate (Malayalam chillu), so
+                    // "no next character" is allowed; a next character that is
+                    // present must itself be a non-ASCII letter.
+                    && stripped.get(i + 1).is_none_or(|n| joins_letters(Some(n))))
         })
         .map(|(_, c)| *c)
         .collect();
 
-    // 3. Collapse the double spaces the removal leaves behind
-    //    ("Alice 🛡 Smith" -> "Alice  Smith").
+    // 3. Normalise the spaces that are visually IDENTICAL to U+0020 (NBSP and
+    //    friends) down to it, then collapse runs. Normalising loses nothing a
+    //    reader can see, and it closes the `"Alice\u{00A0}Smith"` clone of
+    //    `"Alice Smith"`. U+3000 IDEOGRAPHIC SPACE is deliberately NOT in this
+    //    set: it renders double-width, it is visibly different, and it is the
+    //    conventional separator in a Japanese name (`山田　太郎`).
+    let looks_like_a_plain_space =
+        |c: char| matches!(u32::from(c), 0x00A0 | 0x2000..=0x200A | 0x202F | 0x205F);
     let mut collapsed = String::with_capacity(kept.len());
     let mut last_was_space = false;
     for c in kept {
+        let c = if looks_like_a_plain_space(c) { ' ' } else { c };
         let is_space = c == ' ';
         if !(is_space && last_was_space) {
             collapsed.push(c);
@@ -419,7 +464,6 @@ mod tests {
             "user_42",                 // underscores/digits
             "山田\u{3000}太郎",        // U+3000, the Japanese name separator
             "佐々木",                  // U+3005 iteration mark
-            "Jean\u{00A0}Luc",         // non-breaking space
             "สมชาย ใจดี",               // Thai
             "Արամ Խաչատրյան",          // Armenian
             "გიორგი ბერიძე",           // Georgian
@@ -457,11 +501,72 @@ mod tests {
         assert_eq!(sanitize_display_name("  Alice  "), "Alice");
     }
 
+    /// Spaces that render IDENTICALLY to U+0020 are normalised to it, so a
+    /// nickname cannot clone another member's rendered name by swapping one
+    /// in. U+3000 is not one of them: it is double-width, visibly different,
+    /// and the conventional separator in a Japanese name.
+    #[test]
+    fn space_lookalikes_are_normalised_but_ideographic_space_is_not() {
+        for lookalike in ['\u{00A0}', '\u{2002}', '\u{2007}', '\u{202F}', '\u{205F}'] {
+            assert_eq!(
+                sanitize_display_name(&format!("Jean{lookalike}Luc")),
+                "Jean Luc",
+                "U+{:04X} can clone a name that uses a plain space",
+                u32::from(lookalike)
+            );
+        }
+        assert_eq!(
+            sanitize_display_name("山田\u{3000}太郎"),
+            "山田\u{3000}太郎",
+            "the ideographic space is part of the name, not a lookalike"
+        );
+    }
+
+    /// A joiner between two ASCII letters is invisible, so `"Bo\u{200D}b"`
+    /// renders exactly like `"Bob"` — a pixel-perfect clone of another
+    /// member's name that no font distinguishes. Latin script never needs a
+    /// joiner, so it is dropped there; a Malayalam chillu, which legitimately
+    /// ENDS a name as consonant + virama + ZWJ, is kept.
+    #[test]
+    fn joiners_are_dropped_where_they_only_clone() {
+        assert_eq!(sanitize_display_name("Bo\u{200D}b"), "Bob");
+        assert_eq!(sanitize_display_name("Ali\u{200C}ce Smith"), "Alice Smith");
+        // Non-ASCII on one side only is still Latin-adjacent: drop.
+        assert_eq!(sanitize_display_name("Ali\u{200D}سce"), "Aliسce");
+        // Malayalam legacy chillu at the end of a name: keep.
+        let mohan = "മോഹന\u{0D4D}\u{200D}";
+        assert_eq!(sanitize_display_name(mohan), mohan);
+    }
+
     #[test]
     fn all_emoji_nickname_falls_back_to_placeholder() {
         assert_eq!(sanitize_display_name("🛡👑⭐"), UNNAMED);
         assert_eq!(sanitize_display_name(""), UNNAMED);
         assert_eq!(sanitize_display_name("   "), UNNAMED);
+    }
+
+    /// A nickname that renders BLANK but is not whitespace would otherwise
+    /// skip the `UNNAMED` placeholder and produce a nameless message header,
+    /// which reads as a continuation of the group above it — including a
+    /// badged moderator's group.
+    #[test]
+    fn nicknames_that_render_blank_become_unnamed() {
+        for blank in [
+            "\u{1BCA0}",        // shorthand format letter overlap
+            "\u{1D173}",        // musical symbol begin beam
+            "\u{E0100}",        // variation selector-17
+            "\u{180B}",         // Mongolian free variation selector one
+            "\u{034F}",         // combining grapheme joiner
+            "\u{2065}",         // unassigned Default_Ignorable
+            "\u{3164}\u{2800}", // Hangul filler + Braille blank
+            "\u{200D}",         // a lone joiner
+        ] {
+            assert_eq!(
+                sanitize_display_name(blank),
+                UNNAMED,
+                "a nickname rendering blank must not pass as a name: {blank:?}"
+            );
+        }
     }
 
     #[test]
@@ -493,9 +598,17 @@ mod tests {
     /// hand. Walking the tree rather than listing files means a NEW component
     /// is covered the day it is written.
     ///
+    /// Three shapes are flagged. The third exists because the first two missed
+    /// a live bug: `BanButton { nickname: …preferred_nickname.clone() }` handed
+    /// a `SealedBytes` to a `String` prop, which the Dioxus props derive
+    /// silently converts via `Display` (i.e. `to_string_lossy`) — no unseal, no
+    /// sanitise, and neither literal pattern present. That coercion is a
+    /// repeatable footgun in this codebase, so it gets its own check.
+    ///
     /// If this fires on a genuinely non-display use of the field, route it
-    /// through [`display_nickname`] anyway or move it below `#[cfg(test)]` —
-    /// do not weaken the scan.
+    /// through [`display_nickname`] anyway. Do NOT weaken the scan, and note
+    /// that moving code into a test module does not help: the walk reads whole
+    /// files on purpose (see the comment on `source` below).
     #[test]
     fn nickname_render_paths_go_through_display_nickname() {
         use std::path::{Path, PathBuf};
@@ -528,7 +641,8 @@ mod tests {
             // `conversation.rs` has a `#[cfg(test)]` helper at line ~770, so
             // the cut hid 2,800 lines including a real offender. No test
             // fixture in this crate needs the pattern anyway.
-            let production = std::fs::read_to_string(&path).expect("readable source file");
+            let source = std::fs::read_to_string(&path).expect("readable source file");
+            let production = source.as_str();
             let rel = path
                 .strip_prefix(&src)
                 .unwrap_or(&path)
@@ -538,9 +652,37 @@ mod tests {
             if production.contains("preferred_nickname.to_string_lossy()") {
                 offenders.push(format!("{rel}: preferred_nickname.to_string_lossy()"));
             }
+
+            // A `SealedBytes` handed to a name-shaped component prop. Matches
+            // `nickname:` / `name:` / `author:` (but not the struct field
+            // `preferred_nickname:`, which is how a record is BUILT) followed
+            // closely by the field.
+            for prop in ["nickname:", "name:", "author:"] {
+                let mut rest = production;
+                let mut consumed = 0usize;
+                while let Some(idx) = rest.find(prop) {
+                    let abs = consumed + idx;
+                    let preceded_by_ident = production[..abs]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    if !preceded_by_ident {
+                        let window: String = production[abs..].chars().take(120).collect();
+                        if window.contains("preferred_nickname") {
+                            offenders.push(format!(
+                                "{rel}: `{prop}` prop fed from preferred_nickname \
+                                 (Dioxus converts a String prop via Display, so this \
+                                 bypasses both the unseal and the sanitiser)"
+                            ));
+                        }
+                    }
+                    rest = &rest[idx + prop.len()..];
+                    consumed = abs + prop.len();
+                }
+            }
             // An unseal whose argument is the nickname field. The window is
             // generous because rustfmt often breaks the call across lines.
-            let mut rest = production.as_str();
+            let mut rest = production;
             while let Some(idx) = rest.find("unseal_bytes_with_secrets(") {
                 let after = &rest[idx..];
                 // Take CHARS, not bytes: these files are full of multi-byte
