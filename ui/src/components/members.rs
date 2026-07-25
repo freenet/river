@@ -3712,10 +3712,18 @@ mod tests {
             prod.contains("ban_gate("),
             "the modal must gate Ban through `ban_gate` (#478)"
         );
+        // The reason must be RENDERED, not merely computed. Checking only that
+        // the gate is destructured would let someone delete the explanation
+        // element and keep the pin green — a Ban button that vanishes with no
+        // explanation is exactly the bug report this is here to prevent.
+        let reason_at = prod
+            .find("if let Some(reason) = ban_refusal {")
+            .expect("the modal must render the refusal reason when the rule withholds Ban (#478)");
+        let reason_block = &prod[reason_at..];
         assert!(
-            prod.contains("BanGate::WouldRemoveViewer(reason) => Some(reason)"),
-            "the modal must surface the refusal REASON — a Ban button that \
-             vanishes with no explanation is a bug report waiting to happen \
+            reason_block.contains("\"data-testid\": \"ban-withheld-reason\"")
+                && reason_block.contains("\"{reason}\""),
+            "the withheld-Ban explanation must actually display the reason text \
              (#478)"
         );
 
