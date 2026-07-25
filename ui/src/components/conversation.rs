@@ -3814,6 +3814,47 @@ fn MessageGroupComponent(
 mod tests {
     use super::*;
 
+    /// Source-grep pin, mirroring `member_info_modal`'s: the conversation's
+    /// author line must take BOTH the shield's visibility and its tooltip from
+    /// the shared `DeputyBadge` machinery, never a private copy of the
+    /// viewer-relevance rule. Three surfaces show this shield (author line,
+    /// member-list row, member-info modal); freenet/river#451 is what happens
+    /// when two of them drift.
+    #[test]
+    fn author_deputy_badge_uses_the_shared_helper() {
+        let source = include_str!("conversation.rs");
+        let prod = &source[..source
+            .rfind("#[cfg(test)]")
+            .expect("conversation.rs should have a #[cfg(test)] block")];
+
+        assert!(
+            prod.contains("message-author-deputy-badge"),
+            "the conversation must render the 🛡 author badge"
+        );
+        assert!(
+            prod.contains("deputy_badges_for_viewer"),
+            "author-badge visibility must come from the shared \
+             `deputy_badges_for_viewer` map"
+        );
+        assert!(
+            prod.contains("badge.tooltip()"),
+            "the author badge's tooltip must come from `DeputyBadge::tooltip` \
+             so the wording cannot drift between surfaces"
+        );
+    }
+
+    /// Nicknames reach the author line through `display_nickname`, so an emoji
+    /// nickname cannot render a second, fake shield beside the real one. The
+    /// crate-wide render-path scan lives in `crate::util::display_name`; this
+    /// is the conversation-local statement of the same requirement.
+    #[test]
+    fn author_names_are_stripped_of_badge_glyphs() {
+        use crate::util::display_name::sanitize_display_name;
+        for spoof in ["Mallory 🛡", "Mallory 👑", "Mallory \u{1F6E1}\u{FE0F}"] {
+            assert_eq!(sanitize_display_name(spoof), "Mallory");
+        }
+    }
+
     /// Issue #315 — pin that the markdown renderer never passes raw HTML
     /// through to the DOM. `markdown_to_html` feeds attacker-controlled
     /// message text into `markdown::to_html_with_options(_, Options::gfm())`,

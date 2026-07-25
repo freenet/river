@@ -173,10 +173,11 @@ struct MemberDisplay {
     sponsored_you: bool,
     invited_by_you: bool,
     in_your_network: bool,
-    /// Display names of the members who have deputized this member (the owner
-    /// shows as "room owner"). Empty means not a deputy. Drives the 🛡 badge
-    /// and its tooltip (#410).
-    deputized_by: Vec<String>,
+    /// The 🛡 badge to show for this member in the current viewer's view, or
+    /// `None` for no badge (#410). Same value — and therefore the same
+    /// visibility rule and the same tooltip — the conversation's author line
+    /// and the member-info modal use.
+    deputy_badge: Option<DeputyBadge>,
 }
 
 fn is_member_sponsor(
@@ -246,11 +247,8 @@ fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
     } else if member.sponsored_you {
         tags.push(("🔭", "In Your Invite Chain".to_string()));
     }
-    if !member.deputized_by.is_empty() {
-        tags.push((
-            "🛡",
-            format!("Deputy (appointed by {})", member.deputized_by.join(", ")),
-        ));
+    if let Some(badge) = member.deputy_badge.as_ref() {
+        tags.push(("🛡", badge.tooltip()));
     }
 
     MemberDisplayParts {
@@ -652,18 +650,27 @@ pub(crate) struct DeputyBadge {
     /// nickname. Never empty: an empty result means no badge at all, which is
     /// represented by the member being absent from the map.
     pub deputized_by: Vec<String>,
-    /// Whether this member may actually ban the viewer right now.
-    pub can_ban_viewer: bool,
+    /// Whether this member may actually ban the viewer right now, or `None`
+    /// when the badge is on the VIEWER'S OWN row — "can they ban you" is not a
+    /// meaningful thing to say about yourself, and `is_ban_authorized` happily
+    /// answers `true` for a global moderator asked about themselves.
+    pub can_ban_viewer: Option<bool>,
 }
 
 impl DeputyBadge {
     /// The `title=` text: who appointed them, and what that means for you.
+    ///
+    /// One definition for all three surfaces (message author line, member-list
+    /// row, member-info modal chip) so the shield cannot say different things
+    /// in different places — the drift freenet/river#451 fixed for visibility,
+    /// applied to the wording too.
     pub fn tooltip(&self) -> String {
-        format!(
-            "Deputy (appointed by {}) — {} ban you",
-            self.deputized_by.join(", "),
-            if self.can_ban_viewer { "can" } else { "cannot" }
-        )
+        let appointers = self.deputized_by.join(", ");
+        match self.can_ban_viewer {
+            Some(true) => format!("Deputy (appointed by {appointers}) — can ban you"),
+            Some(false) => format!("Deputy (appointed by {appointers}) — cannot ban you"),
+            None => format!("Deputy (appointed by {appointers})"),
+        }
     }
 }
 
@@ -705,13 +712,15 @@ pub(crate) fn deputy_badges_for_viewer(
             if deputized_by.is_empty() {
                 return None;
             }
-            let can_ban_viewer = MembersV1::is_ban_authorized(
-                target,
-                self_member_id,
-                &members_by_id,
-                member_info,
-                owner_id,
-            );
+            let can_ban_viewer = (target != self_member_id).then(|| {
+                MembersV1::is_ban_authorized(
+                    target,
+                    self_member_id,
+                    &members_by_id,
+                    member_info,
+                    owner_id,
+                )
+            });
             Some((
                 target,
                 DeputyBadge {
@@ -758,6 +767,11 @@ pub fn MemberList() -> Element {
         // with the modal legend via `viewer_relevant_deputizer_set` (#451).
         let viewer_relevant = viewer_relevant_deputizer_set(members, owner_id, self_member_id);
 
+        // The badge (visibility + tooltip) for every member, shared verbatim
+        // with the conversation's author lines.
+        let deputy_badges =
+            deputy_badges_for_viewer(members, member_info, room_secrets, owner_id, self_member_id);
+
         // Order the list as a DISPLAY tree, VIEWER-SCOPED: a member renders under
         // a deputizer only if that deputizer is viewer-relevant — so a global mod
         // rises to the top for everyone (including the owner's own view), a
@@ -802,16 +816,10 @@ pub fn MemberList() -> Element {
                 // appointed them). A deputy of the OWNER (global mod) shows in
                 // every view including the owner's own; a mod you appointed
                 // shows in your view; a deputy of an unrelated subtree is hidden.
-                // Same helper the member-info modal legend uses (#451).
-                deputized_by: relevant_deputizer_names(
-                    member_info,
-                    room_secrets,
-                    &deputizers_of,
-                    &viewer_relevant,
-                    owner_id,
-                    self_member_id,
-                    member_id,
-                ),
+                // Same map the conversation's author line uses (#451), so the
+                // shield's visibility AND its tooltip stay identical across
+                // the sidebar, the modal and the conversation.
+                deputy_badge: deputy_badges.get(&member_id).cloned(),
             };
 
             all_members.push((member_display_parts(&member_display), member_id));
@@ -2520,7 +2528,7 @@ mod tests {
             sponsored_you: false,
             invited_by_you: false,
             in_your_network: false,
-            deputized_by: Vec::new(),
+            deputy_badge: None,
         }
     }
 
@@ -2850,14 +2858,31 @@ mod tests {
             "no shield when the member is not a deputy"
         );
 
-        display.deputized_by = vec!["room owner".to_string()];
+        display.deputy_badge = Some(DeputyBadge {
+            deputized_by: vec!["room owner".to_string()],
+            can_ban_viewer: Some(true),
+        });
         let parts = member_display_parts(&display);
         let shield = parts
             .tags
             .iter()
             .find(|(icon, _)| *icon == "🛡")
             .expect("a deputy must show the 🛡 shield");
-        assert_eq!(shield.1, "Deputy (appointed by room owner)");
+        // Identical wording to the conversation author line and the modal
+        // chip — all three call `DeputyBadge::tooltip`.
+        assert_eq!(shield.1, "Deputy (appointed by room owner) — can ban you");
+
+        // On the viewer's OWN row the ban clause is dropped: "can they ban
+        // you" is meaningless about yourself.
+        display.deputy_badge = Some(DeputyBadge {
+            deputized_by: vec!["room owner".to_string()],
+            can_ban_viewer: None,
+        });
+        let parts = member_display_parts(&display);
+        assert_eq!(
+            parts.tags.iter().find(|(icon, _)| *icon == "🛡").unwrap().1,
+            "Deputy (appointed by room owner)"
+        );
     }
 
     /// End-to-end pin of the shared deputy helpers the member row AND the
@@ -3013,7 +3038,7 @@ mod tests {
             .get(&id(&global_mod_sk))
             .expect("a deputy of the owner must show the shield to every viewer");
         assert_eq!(global.deputized_by, vec!["room owner".to_string()]);
-        assert!(global.can_ban_viewer);
+        assert_eq!(global.can_ban_viewer, Some(true));
         assert_eq!(
             global.tooltip(),
             "Deputy (appointed by room owner) — can ban you"
@@ -3025,7 +3050,7 @@ mod tests {
             .get(&id(&deputy_alpha_sk))
             .expect("a deputy of the viewer's inviter must show the shield");
         assert_eq!(by_alpha.deputized_by, vec!["Alpha".to_string()]);
-        assert!(by_alpha.can_ban_viewer);
+        assert_eq!(by_alpha.can_ban_viewer, Some(true));
 
         // 2. Deputy of a member OUTSIDE the viewer's invite ancestry → NO
         //    badge. Deputy authority is scoped to the deputizer's subtree, so
@@ -3045,8 +3070,9 @@ mod tests {
             .get(&id(&my_deputy_sk))
             .expect("a deputy the viewer appointed must still show the shield");
         assert_eq!(mine.deputized_by, vec!["you".to_string()]);
-        assert!(
-            !mine.can_ban_viewer,
+        assert_eq!(
+            mine.can_ban_viewer,
+            Some(false),
             "a deputy cannot ban the member who deputized them"
         );
         assert_eq!(mine.tooltip(), "Deputy (appointed by you) — cannot ban you");
@@ -3108,11 +3134,20 @@ mod tests {
             .get(&id(&other_mod_sk))
             .expect("a fellow deputy must still show the shield to a deputy viewer");
         assert_eq!(other.deputized_by, vec!["room owner".to_string()]);
-        assert!(
+        assert_eq!(
             other.can_ban_viewer,
+            Some(true),
             "owner-appointed moderators have absolute authority, including \
              over other moderators"
         );
+
+        // The viewer is a deputy too, so their OWN row carries a shield — with
+        // the ban clause dropped rather than a nonsensical "can ban you".
+        let own = badges
+            .get(&viewer_id)
+            .expect("a deputy viewer sees the shield on their own row");
+        assert_eq!(own.can_ban_viewer, None);
+        assert_eq!(own.tooltip(), "Deputy (appointed by room owner)");
     }
 
     /// The room owner's OWN view. `viewer_relevant_deputizer_set` gives the
@@ -3160,7 +3195,11 @@ mod tests {
         // "you". Pinned rather than "fixed": the label describes the role that
         // granted the authority, and every other viewer sees the same word.
         assert_eq!(m.deputized_by, vec!["room owner".to_string()]);
-        assert!(!m.can_ban_viewer, "the owner is never a valid ban target");
+        assert_eq!(
+            m.can_ban_viewer,
+            Some(false),
+            "the owner is never a valid ban target"
+        );
         // Someone else's deputy is not relevant to the owner's view.
         assert!(!badges.contains_key(&id(&their_deputy_sk)));
     }

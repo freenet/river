@@ -223,29 +223,21 @@ pub fn MemberInfoModal() -> Element {
         // the member-list row uses, so the modal shows the shield under exactly
         // the same condition — and with the same "appointed by …" tooltip — as
         // the row does. Empty ⇒ this member does not show the shield here.
-        let deputizer_names: Vec<String> = owner_key_signal
-            .as_ref()
-            .map(|owner| {
-                let owner_id = MemberId::from(&*owner);
-                let member_info_all = &room_state.room_state.member_info;
-                let deputizers_of = super::build_deputizers_of(member_info_all);
-                let viewer_relevant = super::viewer_relevant_deputizer_set(
+        let deputy_badge: Option<super::DeputyBadge> =
+            owner_key_signal.as_ref().and_then(|owner| {
+                super::deputy_badges_for_viewer(
                     &room_state.room_state.members,
-                    owner_id,
-                    self_member_id,
-                );
-                super::relevant_deputizer_names(
-                    member_info_all,
+                    &room_state.room_state.member_info,
                     &room_state.secrets,
-                    &deputizers_of,
-                    &viewer_relevant,
-                    owner_id,
+                    MemberId::from(&*owner),
                     self_member_id,
-                    member_id,
                 )
-            })
+                .remove(&member_id)
+            });
+        let deputy_tooltip = deputy_badge
+            .as_ref()
+            .map(super::DeputyBadge::tooltip)
             .unwrap_or_default();
-        let deputy_tooltip = format!("Deputy (appointed by {})", deputizer_names.join(", "));
         // Decrypted display nickname for the target (for the deputy action copy).
         let target_nickname = display_nickname(
             &member_info.member_info.preferred_nickname,
@@ -322,7 +314,7 @@ pub fn MemberInfoModal() -> Element {
                             // (freenet/river#451). Shown under the same
                             // viewer-relevant condition as the row, with the
                             // appointer names in the tooltip.
-                            if !deputizer_names.is_empty() {
+                            if deputy_badge.is_some() {
                                 span {
                                     "data-testid": "member-info-deputy-tag",
                                     class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-purple-500/20 text-purple-400",
@@ -548,10 +540,15 @@ mod ban_gate_tests {
 
     /// Source-grep pin for freenet/river#451: the modal's icon legend must
     /// render the 🛡 deputy chip, driven by the SAME shared helper the
-    /// member-list row uses. The reported bug was that the row showed the
-    /// shield but this modal did not; without this pin a future refactor could
-    /// silently drop the chip again, or reintroduce a private, drifting copy of
-    /// the viewer-relevance logic instead of the shared helper.
+    /// member-list row and the conversation's author line use. The reported bug
+    /// was that the row showed the shield but this modal did not; without this
+    /// pin a future refactor could silently drop the chip again, or reintroduce
+    /// a private, drifting copy of the viewer-relevance logic.
+    ///
+    /// The pin now covers the TOOLTIP as well as visibility: all three surfaces
+    /// must go through `DeputyBadge::tooltip`, so the shield cannot say
+    /// "appointed by X — can ban you" in the conversation and something else
+    /// here.
     #[test]
     fn modal_renders_deputy_shield_via_shared_helper() {
         let source = include_str!("member_info_modal.rs");
@@ -564,9 +561,15 @@ mod ban_gate_tests {
             "the member-info modal must render the 🛡 deputy legend chip (#451)"
         );
         assert!(
-            prod.contains("relevant_deputizer_names"),
-            "the deputy chip must be driven by the shared `relevant_deputizer_names` \
-             helper so it cannot drift from the member-list row (#451)"
+            prod.contains("deputy_badges_for_viewer"),
+            "the deputy chip's visibility must come from the shared \
+             `deputy_badges_for_viewer` map so it cannot drift from the \
+             member-list row or the conversation author line (#451)"
+        );
+        assert!(
+            prod.contains("DeputyBadge::tooltip"),
+            "the deputy chip's tooltip must come from `DeputyBadge::tooltip` \
+             so the wording cannot drift between surfaces (#451)"
         );
     }
 }
