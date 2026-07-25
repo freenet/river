@@ -170,8 +170,67 @@ riverctl identity import < my-identity.token     # On another machine.
 ```bash
 riverctl member list         <room-owner-vk>
 riverctl member set-nickname <room-owner-vk> "New Nickname"
-riverctl member ban          <room-owner-vk> <member-vk>   # Owner only.
+riverctl member ban          <room-owner-vk> <member-id>
 ```
+
+`member ban` is not owner-only: the room owner can ban anyone, and so can a
+member banning within their own invite subtree, or a deputy of such a member
+(see below).
+
+### Deputies
+
+A deputy can ban within their deputizer's invite subtree. Deputies are
+**per-deputizer**, not a room-wide flag: "is X a deputy?" is only meaningful as
+"whose deputy is X?", so both queries name the deputizer explicitly.
+
+```bash
+riverctl member deputize      <room-owner-vk> <member-id>  # Grant.
+riverctl member revoke-deputy <room-owner-vk> <member-id>  # Revoke.
+
+riverctl member deputies      <room-owner-vk> [member-id]  # Who has X deputized?
+riverctl member deputized-by  <room-owner-vk> <member-id>  # Who has deputized X?
+```
+
+`member deputies` defaults to your own identity in the room (the identity that
+would sign, so `--signing-key-file` applies).
+`member deputized-by` is the one that answers "does this member have moderation
+authority, and from whom?" The room owner's grant covers every member; anyone
+else's covers only the members they invited, directly or indirectly, which is
+often nobody.
+
+Both accept `--format json`, emitting `{room_id, direction, subject, grants[]}`.
+Each grant carries `deputizer`, `deputy`, `scope` (`room-wide` /
+`invite-subtree`), `active`, and `reaches_members`.
+
+`reaches_members` is how many members the grant can currently be used against,
+computed from the contract's own rules: `0` for an inactive grant, every member
+for an owner grant, otherwise the deputizer's invite subtree minus anyone in it
+who has themselves deputized this deputy (a member cannot be banned by someone
+they deputized). It is often `0` even for a live grant, because most members
+have invited nobody. `reaches_members > 0` is the check for "this member
+actually has moderation authority here".
+
+A grant whose deputizer or deputy has left the room is reported with
+`active: false`; the contract does not honour such a grant. `in_room` is `true`
+for the room owner even though the owner never appears in the member list.
+
+Nicknames are quoted and escaped in terminal output. They are set by the member
+themselves and are printed next to an authority claim, so an unescaped one could
+forge a line that reads as a real deputy grant. The `-f json` output carries the
+faithful nickname.
+
+`member list --format json` gains `deputies` (who this member deputized) and
+`deputized_by` (who deputized them) alongside the existing `member_id` and
+`nickname`. `debug room-state` gains `deputy_grant_count` and `deputy_grants`.
+
+Two caveats worth knowing:
+
+- The read commands reject an ambiguous partial member ID and list the matches;
+  the write commands (`ban`, `deputize`, `revoke-deputy`) still resolve a
+  partial ID to the first match. Pass the full 8-character ID to be certain.
+- Like every riverctl command that reads a room, these fetch through the
+  standard path, which may PUT migrated state or publish a `member_info` heal
+  for your own identity. They never write deputy state.
 
 ## Command reference
 
@@ -179,7 +238,7 @@ riverctl member ban          <room-owner-vk> <member-vk>   # Owner only.
 |------------|-------------------------------------------------------------------------|
 | `room`     | `create`, `list`, `join`, `leave`, `republish`, `config`                |
 | `message`  | `send`, `list`, `stream`, `edit`, `delete`, `react`, `unreact`, `reply` |
-| `member`   | `list`, `set-nickname`, `ban`                                           |
+| `member`   | `list`, `set-nickname`, `ban`, `deputize`, `revoke-deputy`, `deputies`, `deputized-by` |
 | `invite`   | `create`, `accept`                                                      |
 | `dm`       | `send`, `list`, `purge`, `accept`                                       |
 | `identity` | `whoami`, `export`, `import`                                            |
