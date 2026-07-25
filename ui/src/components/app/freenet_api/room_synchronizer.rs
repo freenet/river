@@ -2261,28 +2261,46 @@ mod tests {
         );
     }
 
-    /// A locally-composed message must reach the wire even when its timestamp
-    /// sorts at or below the local baseline's oldest retained key.
+    /// A locally-retained message must reach the wire even when its timestamp
+    /// sorts at or below the BASELINE's oldest-retained key.
     ///
     /// # The bug this pins
     ///
     /// `compute_update_data` used `baseline.summarize(baseline, params)`
     /// directly. `baseline` is `last_synced_state` — this device's own
     /// snapshot, NOT a receiver — so the retention horizon inside it filtered
-    /// the device's own outgoing update against its own retention window.
+    /// the device's outgoing update against a STALE view of its own retention
+    /// window. Anything sorting at or below that horizon was dropped from the
+    /// delta and never put on the wire; `compute_update_data` then returned
+    /// `None`, which in `process_rooms` still calls
+    /// `sync_info.state_updated(..)` and advances the baseline, so it was never
+    /// retried either.
     ///
-    /// `message.time` is the browser wall clock, so a device whose clock is
-    /// behind by more than the room's retention window composes messages that
-    /// sort below its own baseline's oldest key. Those were filtered out of the
-    /// outgoing delta and never put on the wire. `compute_update_data` then
-    /// returned `None`, which in `process_rooms` still calls
-    /// `sync_info.state_updated(..)` and advances the baseline — so the message
-    /// was never retried either. It sits in the sender's own UI forever while
-    /// no other peer ever receives it: silent, local, permanent loss.
+    /// # Reachability — narrower than first described, and worth stating
     ///
-    /// The horizon is a RECEIVER-published quantity and has no meaning on the
-    /// outbound path. `outbound_summary` neutralises it, restoring the pure
-    /// id-set difference and leaving retention to the contract.
+    /// An earlier version of this comment (and of the commit that introduced
+    /// the fix) claimed a clock-skewed device would simply never send anything.
+    /// **That is wrong and is corrected here.** The UI send path applies the
+    /// composed message through `room_data.room_state.apply_delta` before any
+    /// sync tick (`conversation.rs`), and `MessagesV1::apply_delta` sorts by
+    /// `(time, id)` and drains from the FRONT — so on a device already AT
+    /// capacity, a message sorting below the local window is dropped LOCALLY at
+    /// compose time and never reaches `compute_update_data` at all.
+    ///
+    /// The reachable trigger needs `current` to be BELOW cap while `baseline`
+    /// was AT cap publishing a real horizon. Two routes:
+    ///
+    /// * `max_recent_messages` is RAISED, so back-filled older messages are
+    ///   retained locally but still sort below the stale horizon. Modelled
+    ///   here.
+    /// * `post_apply_cleanup`'s ban/member sweep shrinks the local set while
+    ///   `last_synced_state` still holds the pre-sweep snapshot.
+    ///
+    /// This test models the first route rather than an unreachable state: the
+    /// baseline is at its cap of 3 and publishes a real `OldestRetained`, and
+    /// `current` has the cap raised to 10 and holds a back-filled older message
+    /// below that horizon. The configuration bump rides along in the delta,
+    /// which is why the whole-delta assertion expects two fields.
     #[test]
     fn outbound_update_is_not_filtered_by_the_senders_own_horizon() {
         use river_core::room_state::configuration::AuthorizedConfigurationV1;
@@ -2290,10 +2308,6 @@ mod tests {
 
         let (mut room_state, params, owner_sk) = create_test_room();
         add_members_and_bans(&mut room_state, &owner_sk);
-
-        let mut cfg = room_state.configuration.configuration.clone();
-        cfg.max_recent_messages = 3;
-        room_state.configuration = AuthorizedConfigurationV1::new(cfg, &owner_sk);
 
         let msg_at = |secs: u64, body: &str| {
             AuthorizedMessageV1::new(
@@ -2307,14 +2321,17 @@ mod tests {
             )
         };
 
-        // The baseline is AT capacity, so it publishes a real horizon.
+        // BASELINE: cap 3, exactly 3 messages, so it publishes a real horizon.
+        let mut baseline = room_state.clone();
+        let mut cfg = baseline.configuration.configuration.clone();
+        cfg.max_recent_messages = 3;
+        baseline.configuration = AuthorizedConfigurationV1::new(cfg.clone(), &owner_sk);
         for i in 0..3u64 {
-            room_state
+            baseline
                 .recent_messages
                 .messages
                 .push(msg_at(5_000 + i, &format!("synced-{i}")));
         }
-        let baseline = room_state.clone();
         assert!(
             matches!(
                 baseline
@@ -2325,22 +2342,32 @@ mod tests {
             "test premise: the baseline must be at capacity and publish a real horizon"
         );
 
-        // Messages this device just composed. `skewed` carries a clock-derived
-        // timestamp BELOW everything the baseline retains (the skewed-clock
-        // case); the other two are ordinary newer ones. More than one new
-        // message so the "exactly the set difference" assertion below is a real
-        // set comparison and not a 1-vs-N count that a broken id-set difference
-        // could still satisfy.
-        let skewed = msg_at(1_000, "composed-with-a-slow-clock");
+        // CURRENT: the room raised its cap, so a back-filled older message is
+        // now retained locally even though it sorts below the stale horizon.
+        let mut current = baseline.clone();
+        let mut raised = cfg;
+        raised.max_recent_messages = 10;
+        raised.configuration_version += 1;
+        current.configuration = AuthorizedConfigurationV1::new(raised, &owner_sk);
+        let backfilled = msg_at(1_000, "back-filled-below-the-stale-horizon");
         let newer_a = msg_at(9_001, "newer-a");
         let newer_b = msg_at(9_002, "newer-b");
-        let mut current = room_state.clone();
-        current.recent_messages.messages.push(skewed.clone());
+        current.recent_messages.messages.push(backfilled.clone());
         current.recent_messages.messages.push(newer_a.clone());
         current.recent_messages.messages.push(newer_b.clone());
 
+        // Premise: `current` is genuinely BELOW its cap, so this state is
+        // reachable through `apply_delta` — the earlier version of this test
+        // held 6 messages against a cap of 3, which `apply_delta` can never
+        // produce.
+        assert!(
+            current.recent_messages.messages.len()
+                <= current.configuration.configuration.max_recent_messages,
+            "test premise: `current` must be below its own cap, or the state is unreachable"
+        );
+
         let update = compute_update_data(&current, Some(&baseline), &params)
-            .expect("a newly composed message must produce an outgoing update");
+            .expect("a locally-retained message must produce an outgoing update");
 
         let bytes = match update {
             UpdateData::Delta(d) => d.into_bytes(),
@@ -2356,24 +2383,17 @@ mod tests {
             .unwrap_or_default();
         sent.sort();
         assert!(
-            sent.contains(&skewed.id()),
-            "the locally-composed message was filtered out of the OUTGOING update by \
-             this device's OWN retention horizon. `message.time` is the browser clock, \
-             so a device running behind would silently never send anything — and the \
-             `None` branch in process_rooms advances the baseline, so it is never \
-             retried. See `outbound_summary`."
+            sent.contains(&backfilled.id()),
+            "the locally-RETAINED message was filtered out of the OUTGOING update by \
+             this device's OWN stale horizon. `compute_update_data` would then return \
+             None, and the `None` branch in process_rooms advances the baseline, so it \
+             is never retried. See `outbound_summary`."
         );
 
-        // The other direction, which is the way this fix would go wrong:
+        // The other direction, which is how this fix would go wrong:
         // neutralising the horizon must NOT widen the update into a resend of
-        // everything already synced.
-        //
-        // Asserted as an EXACT set equality against the set difference, not a
-        // count. `outbound_summary` clears only the horizons and keeps
-        // `message_ids`, so `delta` still performs the id-set difference; if it
-        // ever stopped doing so, the baseline's 3 already-synced messages would
-        // appear here too.
-        let mut expected = vec![skewed.id(), newer_a.id(), newer_b.id()];
+        // everything already synced. Exact set equality, not a count.
+        let mut expected = vec![backfilled.id(), newer_a.id(), newer_b.id()];
         expected.sort();
         assert_eq!(
             sent, expected,
@@ -2383,13 +2403,13 @@ mod tests {
              filtering the send path."
         );
 
-        // ...and EXACTLY that field. `current` and `baseline` differ only in
-        // `recent_messages`, so any other populated field means
-        // `outbound_summary` over-cleared something and every sync tick now
-        // re-sends it.
+        // ...and exactly the fields that genuinely differ: the messages, plus
+        // the configuration bump that raised the cap. Any OTHER populated field
+        // means `outbound_summary` over-cleared something and every sync tick
+        // now re-sends it.
         assert_eq!(
             populated_delta_fields(&delta),
-            vec!["recent_messages"],
+            vec!["configuration", "recent_messages"],
             "the outgoing update touched fields the baseline already has"
         );
     }
