@@ -277,7 +277,10 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
           if (
             rule instanceof CSSStyleRule &&
             rule.selectorText &&
-            rule.selectorText.includes(".reply-strip") &&
+            // Boundary-aware: `.reply-strip-unavailable` (the inert
+            // placeholder, which is deliberately not focusable) must not
+            // satisfy this assertion about the interactive strip.
+            /\.reply-strip(?![\w-])/.test(rule.selectorText) &&
             rule.selectorText.includes(":focus-visible")
           ) {
             return true;
@@ -592,18 +595,29 @@ test.describe("Unavailable reply quote", () => {
     // Inert — there is no original message to scroll to.
     await expect(placeholder).not.toHaveAttribute("role", "button");
     await expect(placeholder).not.toHaveAttribute("tabindex", "0");
-    await expect(placeholder).toHaveCount(1);
+    // Count on the UNFILTERED locator — `placeholder` is `.first()`, which
+    // resolves to at most one element, so counting it proves nothing.
+    await expect(
+      page.locator('[data-testid="reply-strip-unavailable"]')
+    ).toHaveCount(1);
+
+    // Resolvable quotes must STILL render — otherwise "no snapshot in the DOM"
+    // above would be satisfied by a build that dropped every reply strip.
+    await expect(
+      page.locator('[data-testid="reply-strip"]')
+    ).not.toHaveCount(0);
 
     // Mutually exclusive with the quote strip: no bubble carries both.
-    const bothInOneBubble = await page
-      .locator(".max-w-prose")
-      .evaluateAll((bubbles) =>
-        bubbles.filter(
+    const bubbles = page.locator(".max-w-prose");
+    expect(await bubbles.count()).toBeGreaterThan(0);
+    const bothInOneBubble = await bubbles.evaluateAll(
+      (els) =>
+        els.filter(
           (b) =>
             b.querySelector('[data-testid="reply-strip"]') &&
             b.querySelector('[data-testid="reply-strip-unavailable"]')
         ).length
-      );
+    );
     expect(bothInOneBubble).toBe(0);
   });
 });

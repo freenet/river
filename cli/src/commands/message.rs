@@ -263,24 +263,13 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // stream via crate::api::reply_context_display so the
                             // two renderings can't drift, including the truncation
                             // marker appended by truncate_reply_preview).
-                            let reply_prefix = match crate::api::reply_context_display_with_secrets(
-                                &room_state,
-                                msg,
-                                &secrets,
-                            ) {
-                                crate::api::ReplyContextDisplay::Quote { author, preview } => {
-                                    format!("[reply to {}: {}] ", author, preview)
-                                }
-                                // The quoted message can no longer be read back
-                                // (its author was banned and their messages
-                                // purged, it was deleted, or it aged out), so
-                                // the replier's snapshot of it is unverifiable
-                                // and is not printed.
-                                crate::api::ReplyContextDisplay::Unavailable => {
-                                    "[reply to an unavailable message] ".to_string()
-                                }
-                                crate::api::ReplyContextDisplay::NotAReply => String::new(),
-                            };
+                            let reply_prefix = crate::api::reply_prefix_display(
+                                &crate::api::reply_context_display_with_secrets(
+                                    &room_state,
+                                    msg,
+                                    &secrets,
+                                ),
+                            );
 
                             // Get reactions
                             let reactions_str = room_state
@@ -360,27 +349,14 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // Reply context (null for non-replies) — same shape
                             // as the monitor stream's JSON, so a bridge sees
                             // reply_to on both the backfill and the live feed.
-                            //
-                            // An UNVERIFIABLE quote is also emitted as null
-                            // rather than as a new shape: a bridge reading
-                            // `reply_to.author` must never receive the
-                            // replier-authored snapshot of a banned member's
-                            // message, and null is the one value every existing
-                            // consumer already handles. The cost is that a
-                            // bridge cannot tell "not a reply" from "reply we
-                            // could not verify"; the human-readable output does
-                            // distinguish them.
-                            let reply_to = match crate::api::reply_context_display_with_secrets(
-                                &room_state,
-                                msg,
-                                &secrets,
-                            ) {
-                                crate::api::ReplyContextDisplay::Quote { author, preview } => {
-                                    Some(json!({ "author": author, "preview": preview }))
-                                }
-                                crate::api::ReplyContextDisplay::Unavailable
-                                | crate::api::ReplyContextDisplay::NotAReply => None,
-                            };
+                            // Shared helper so the two cannot drift.
+                            let reply_to = crate::api::reply_to_json(
+                                &crate::api::reply_context_display_with_secrets(
+                                    &room_state,
+                                    msg,
+                                    &secrets,
+                                ),
+                            );
 
                             json!({
                                 "message_id": message_id_str,

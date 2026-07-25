@@ -402,12 +402,14 @@ fn add_example_messages(
     // (see `resolve_reply_context`). A fabricated target id reproduces that
     // end state without having to simulate a ban, and is deterministic.
     {
-        let (author_id, author_signing_key) = authors[0];
+        // Authored by the OWNER (i.e. self) so the placeholder's `is_self`
+        // styling branch is the one Playwright exercises, deterministically —
+        // `authors[0]` comes from a HashMap iteration and is not stable.
         current_time_ms += 30_000;
         let orphan_reply = AuthorizedMessageV1::new(
             MessageV1 {
                 room_owner: *owner_id,
-                author: author_id,
+                author: *owner_id,
                 time: get_time_from_millis(current_time_ms),
                 content: RoomMessageBody::reply(
                     "That was out of line.".to_string(),
@@ -418,7 +420,7 @@ fn add_example_messages(
                     "snapshot text that must never be rendered".to_string(),
                 ),
             },
-            author_signing_key,
+            owner_key,
         );
         messages.messages.push(orphan_reply);
     }

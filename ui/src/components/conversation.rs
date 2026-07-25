@@ -241,9 +241,19 @@ fn resolve_reply_context(
     secrets: &HashMap<u32, [u8; 32]>,
     member_names: &HashMap<MemberId, String>,
 ) -> ReplyStrip {
+    use river_core::room_state::content::CONTENT_TYPE_REPLY;
+
     let (_snapshot_author, _snapshot_preview, target_id) = extract_reply_context(content, secrets);
     let Some(target_id) = target_id else {
-        return ReplyStrip::None;
+        // A reply we cannot decode — a private one whose secret we do not hold,
+        // or a malformed body — is still a REPLY: `content_type` is cleartext
+        // even on the `Private` variant. Say so rather than silently dropping
+        // the strip, so the two clients agree (riverctl reports the same).
+        return if content.content_type() == CONTENT_TYPE_REPLY {
+            ReplyStrip::Unavailable
+        } else {
+            ReplyStrip::None
+        };
     };
 
     let quote = messages_state
@@ -332,6 +342,9 @@ fn target_plaintext(
     let plaintext =
         crate::util::ecies::decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
             .ok()?;
+    // Adding a content type? Add it here (and to riverctl's
+    // `reply_context_display_with_secrets`) or replies quoting it will render
+    // the "unavailable" placeholder even on a client that supports it.
     match *content_type {
         CONTENT_TYPE_TEXT => TextContentV1::decode(&plaintext).ok().map(|c| c.text),
         CONTENT_TYPE_REPLY => ReplyContentV1::decode(&plaintext).ok().map(|r| r.text),
@@ -5266,6 +5279,70 @@ mod resolve_reply_context_tests {
             &info(vec![named(&alice_sk, "Alice")]),
         ));
         assert_eq!(preview.chars().count(), 100);
+    }
+
+    /// A private reply whose own secret we lack cannot even be decoded, so we
+    /// cannot tell what it quotes. It is still a REPLY (`content_type` is
+    /// cleartext on the `Private` variant), so it reports `Unavailable` rather
+    /// than silently dropping the strip — and riverctl reports the same.
+    #[test]
+    fn undecodable_private_reply_reports_unavailable() {
+        use crate::util::ecies::encrypt_with_symmetric_key;
+        use river_core::room_state::content::{ReplyContentV1, REPLY_CONTENT_VERSION};
+
+        let owner_sk = signing_key(1);
+        let alice_sk = signing_key(2);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+        let member_info = info(vec![named(&alice_sk, "Alice")]);
+
+        let secret = [3u8; 32];
+        let target = authored(
+            owner,
+            &alice_sk,
+            RoomMessageBody::public("target text".to_string()),
+            10,
+        );
+        let (ciphertext, nonce) = encrypt_with_symmetric_key(
+            &secret,
+            &ReplyContentV1::new(
+                "sealed reply".to_string(),
+                target.id(),
+                "SNAPSHOT AUTHOR".to_string(),
+                "SNAPSHOT PREVIEW".to_string(),
+            )
+            .encode(),
+        );
+        let reply = authored(
+            owner,
+            &bob_sk,
+            RoomMessageBody::private(
+                river_core::room_state::content::CONTENT_TYPE_REPLY,
+                REPLY_CONTENT_VERSION,
+                ciphertext,
+                nonce,
+                4,
+            ),
+            20,
+        );
+        let messages = state(vec![target, reply.clone()]);
+
+        // With the secret the quote resolves against the live target.
+        let with_secret = resolve_reply_context(
+            &reply.message.content,
+            &messages,
+            &member_info,
+            &HashMap::from([(4u32, secret)]),
+            &HashMap::new(),
+        );
+        assert_eq!(expect_quote(with_secret).1, "target text");
+
+        // Without it, we cannot read the reply at all — but we still know it IS
+        // one, so say so rather than rendering nothing.
+        assert_eq!(
+            resolve(&reply, &messages, &member_info),
+            ReplyStrip::Unavailable
+        );
     }
 
     /// A plain message is not a reply, so it gets no strip of either kind.

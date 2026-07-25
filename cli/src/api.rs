@@ -790,10 +790,15 @@ pub(crate) fn reply_context_display_with_secrets(
         .and_then(|target| {
             // Never fall back to a `<encrypted>` / decode-failure placeholder
             // here: an undecryptable target has NOT been re-read, so it must be
-            // reported unavailable rather than quoted.
+            // reported unavailable rather than quoted. Deliberately NOT
+            // `decrypt_private_body_text`, whose catch-all returns the raw
+            // decrypted bytes as lossy UTF-8 for an unrecognised content type —
+            // fine for rendering a BODY, but in a quote it would present raw
+            // bytes as the quoted author's words (and ship them to bridges in
+            // `reply_to.preview`). Mirrors the UI's `target_plaintext`.
             let text = messages
                 .effective_text(target)
-                .or_else(|| decrypt_private_body_text(&target.message.content, secrets))?;
+                .or_else(|| decrypt_private_quote_text(&target.message.content, secrets))?;
             let author = room_state
                 .member_info
                 .canonical(target.message.author)
@@ -808,6 +813,78 @@ pub(crate) fn reply_context_display_with_secrets(
             preview: truncate_reply_preview(&render_mentions_for_terminal(room_state, &text)),
         },
         None => ReplyContextDisplay::Unavailable,
+    }
+}
+
+/// A private QUOTE target's plaintext, or `None` when it cannot be read.
+///
+/// Strict sibling of [`decrypt_private_body_text`]: identical up to the
+/// unrecognised-content-type case, where that one returns the raw decrypted
+/// bytes and this one returns `None`. See the call site for why a quote must
+/// not fall back to raw bytes. Mirrors `target_plaintext` in
+/// `ui/src/components/conversation.rs`; adding a content type means touching
+/// both.
+fn decrypt_private_quote_text(
+    content: &river_core::room_state::message::RoomMessageBody,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> Option<String> {
+    use river_core::room_state::content::{
+        ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
+    };
+    use river_core::room_state::message::RoomMessageBody;
+
+    let RoomMessageBody::Private {
+        content_type,
+        ciphertext,
+        nonce,
+        secret_version,
+        ..
+    } = content
+    else {
+        return None;
+    };
+    let secret = secrets.get(secret_version)?;
+    let plaintext =
+        river_core::ecies::decrypt_with_symmetric_key(secret, ciphertext, nonce).ok()?;
+    match *content_type {
+        CONTENT_TYPE_TEXT => TextContentV1::decode(&plaintext).ok().map(|c| c.text),
+        CONTENT_TYPE_REPLY => ReplyContentV1::decode(&plaintext).ok().map(|r| r.text),
+        _ => None,
+    }
+}
+
+/// The `[reply to …] ` prefix for the human-readable stream.
+///
+/// SINGLE SOURCE OF TRUTH for both emit sites (the `message list` backfill and
+/// the `monitor` stream) so the two renderings cannot drift — they are
+/// explicitly required to match.
+pub(crate) fn reply_prefix_display(ctx: &ReplyContextDisplay) -> String {
+    match ctx {
+        ReplyContextDisplay::Quote { author, preview } => {
+            format!("[reply to {}: {}] ", author, preview)
+        }
+        // The quoted message could not be read back — its author was banned and
+        // their messages purged, it was deleted, it aged out, or (for a private
+        // reply we cannot decrypt) we cannot tell what it quotes at all.
+        ReplyContextDisplay::Unavailable => "[reply to an unavailable message] ".to_string(),
+        ReplyContextDisplay::NotAReply => String::new(),
+    }
+}
+
+/// The `reply_to` value for the JSON / JSONL streams.
+///
+/// An UNVERIFIABLE quote is emitted as `null`, exactly like a non-reply, rather
+/// than as a new shape: a bridge reading `reply_to.author` must never receive
+/// the replier-authored snapshot of a banned member's message, and `null` is
+/// the one value every existing consumer already handles. The cost is that a
+/// bridge cannot tell "not a reply" from "reply we could not verify"; the
+/// human-readable stream does distinguish them.
+pub(crate) fn reply_to_json(ctx: &ReplyContextDisplay) -> Option<serde_json::Value> {
+    match ctx {
+        ReplyContextDisplay::Quote { author, preview } => {
+            Some(json!({ "author": author, "preview": preview }))
+        }
+        ReplyContextDisplay::Unavailable | ReplyContextDisplay::NotAReply => None,
     }
 }
 
@@ -4327,19 +4404,7 @@ impl ApiClient {
                 // Re-emission of an edited message — distinguish it from a fresh
                 // one for a downstream relay reading the human stream.
                 let edit_prefix = if is_edit { "[edit] " } else { "" };
-                let reply_prefix = match &reply {
-                    ReplyContextDisplay::Quote { author, preview } => {
-                        format!("[reply to {}: {}] ", author, preview)
-                    }
-                    // The quoted message can no longer be read back (its author
-                    // was banned and their messages purged, it was deleted, or
-                    // it aged out), so the replier's snapshot of it is
-                    // unverifiable and is not printed.
-                    ReplyContextDisplay::Unavailable => {
-                        "[reply to an unavailable message] ".to_string()
-                    }
-                    ReplyContextDisplay::NotAReply => String::new(),
-                };
+                let reply_prefix = reply_prefix_display(&reply);
                 let reactions_str = reactions
                     .map(|r| {
                         if r.is_empty() {
@@ -4385,16 +4450,7 @@ impl ApiClient {
 
                 // Reply context (null for non-replies) so a relay can thread the
                 // message; previously absent from the monitor's JSON output.
-                // An UNVERIFIABLE quote is emitted as null rather than as a
-                // new shape — see the matching comment on the backfill path in
-                // `commands/message.rs`. A bridge must never receive the
-                // replier-authored snapshot of a banned member's message.
-                let reply_to = match &reply {
-                    ReplyContextDisplay::Quote { author, preview } => {
-                        Some(json!({ "author": author, "preview": preview }))
-                    }
-                    ReplyContextDisplay::Unavailable | ReplyContextDisplay::NotAReply => None,
-                };
+                let reply_to = reply_to_json(&reply);
 
                 // Output as JSONL (one JSON object per line). `type` is "edit"
                 // for a re-emitted message whose content changed, else "message".
@@ -7136,8 +7192,10 @@ mod display_text_tests {
         let alice_sk = SigningKey::from_bytes(&[42u8; 32]);
         let (t_ct, t_nonce) = river_core::ecies::encrypt_with_symmetric_key(
             &secret,
-            &river_core::room_state::content::TextContentV1::new("quoted original".to_string())
-                .encode(),
+            &river_core::room_state::content::TextContentV1::new(
+                "the real decrypted target".to_string(),
+            )
+            .encode(),
         );
         let target = AuthorizedMessageV1::new(
             MessageV1 {
@@ -7169,11 +7227,13 @@ mod display_text_tests {
                 &alice_sk,
             ));
         // Re-issue the reply now pointing at the real target.
+        // Snapshot fields deliberately DIFFER from the live target, so these
+        // assertions fail if the code ever falls back to the snapshot.
         let reply = ReplyContentV1::new(
             "my reply".to_string(),
             target_id,
-            "Alice".to_string(),
-            "quoted original".to_string(),
+            "SNAPSHOT AUTHOR MUST NOT RENDER".to_string(),
+            "SNAPSHOT PREVIEW MUST NOT RENDER".to_string(),
         );
         let (ciphertext, nonce) =
             river_core::ecies::encrypt_with_symmetric_key(&secret, &reply.encode());
@@ -7198,13 +7258,26 @@ mod display_text_tests {
         else {
             panic!("private reply context should resolve to a quote");
         };
-        assert_eq!(author, "Alice");
-        assert_eq!(preview, "quoted original");
+        assert_eq!(author, "Alice", "canonical nickname, not the snapshot name");
+        assert_eq!(
+            preview, "the real decrypted target",
+            "the target's decrypted text, not the snapshot preview"
+        );
 
         // And the reply body itself decrypts to the reply text.
         assert_eq!(
             message_display_text_with_secrets(&state, &msg, &secrets),
             "my reply"
+        );
+
+        // Same state, same reply, secret removed: the target can no longer be
+        // read, so the quote must disappear rather than fall back to the
+        // snapshot. Asserted against the FINAL state (where the target DOES
+        // exist), so it isolates decryptability rather than target presence.
+        assert_eq!(
+            reply_context_display_with_secrets(&state, &msg, &HashMap::new()),
+            ReplyContextDisplay::Unavailable,
+            "without the secret neither the target nor the reply can be read"
         );
     }
 
@@ -8352,5 +8425,101 @@ mod mention_cli_tests {
             "neither the snapshot text nor the snapshot author name may be \
              rendered once the quoted message is gone"
         );
+    }
+
+    /// riverctl must refuse the same target classes the UI refuses, or a bridge
+    /// reading `reply_to.preview` republishes what the UI declined to show.
+    /// Each case is asserted against a state where the quote WOULD otherwise
+    /// resolve, so it isolates the refusal.
+    #[test]
+    fn unquotable_targets_are_reported_unavailable() {
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let base = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
+
+        // Soft-deleted target.
+        let mut state = base.clone();
+        let reply = reply_quoting(&mut state, &alice, "regrettable");
+        let target_id = state.recent_messages.messages[0].id();
+        assert!(matches!(
+            reply_context_display(&state, &reply),
+            ReplyContextDisplay::Quote { .. }
+        ));
+        state
+            .recent_messages
+            .actions_state
+            .deleted
+            .insert(target_id.clone());
+        assert_eq!(
+            reply_context_display(&state, &reply),
+            ReplyContextDisplay::Unavailable,
+            "a deleted target must not be quoted"
+        );
+
+        // Action and event targets: present in `messages`, never rendered as
+        // rows, so quoting one emits machine copy ("[Reaction 👍 to …]",
+        // "joined the room") as if it were the author's words.
+        for body in [
+            RoomMessageBody::reaction(target_id, "\u{1f44d}".to_string()),
+            RoomMessageBody::join_event(),
+        ] {
+            let mut state = base.clone();
+            let non_message = AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(&alice.verifying_key()),
+                    author: MemberId::from(&alice.verifying_key()),
+                    content: body,
+                    time: SystemTime::UNIX_EPOCH,
+                },
+                &alice,
+            );
+            let sender = SigningKey::from_bytes(&[200u8; 32]);
+            let reply = AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(&sender.verifying_key()),
+                    author: MemberId::from(&sender.verifying_key()),
+                    content: RoomMessageBody::reply(
+                        "quoting a non-message".to_string(),
+                        non_message.id(),
+                        "SNAPSHOT AUTHOR MUST NOT RENDER".to_string(),
+                        "SNAPSHOT PREVIEW MUST NOT RENDER".to_string(),
+                    ),
+                    time: SystemTime::UNIX_EPOCH,
+                },
+                &sender,
+            );
+            state.recent_messages.messages.push(non_message);
+            state.recent_messages.messages.push(reply.clone());
+            assert_eq!(
+                reply_context_display(&state, &reply),
+                ReplyContextDisplay::Unavailable,
+                "an action/event target must not be quoted"
+            );
+        }
+    }
+
+    /// The two emit sites (the `message list` backfill and the `monitor`
+    /// stream) must map `ReplyContextDisplay` the same way. Both go through
+    /// these helpers; this pins the mapping itself.
+    #[test]
+    fn unverifiable_quotes_are_omitted_from_json_and_neutral_in_text() {
+        let quote = ReplyContextDisplay::Quote {
+            author: "Alice".to_string(),
+            preview: "hello".to_string(),
+        };
+        assert_eq!(reply_prefix_display(&quote), "[reply to Alice: hello] ");
+        assert_eq!(
+            reply_to_json(&quote),
+            Some(json!({ "author": "Alice", "preview": "hello" }))
+        );
+
+        // Never a snapshot, and never a shape a bridge has not seen before.
+        assert_eq!(
+            reply_prefix_display(&ReplyContextDisplay::Unavailable),
+            "[reply to an unavailable message] "
+        );
+        assert_eq!(reply_to_json(&ReplyContextDisplay::Unavailable), None);
+
+        assert_eq!(reply_prefix_display(&ReplyContextDisplay::NotAReply), "");
+        assert_eq!(reply_to_json(&ReplyContextDisplay::NotAReply), None);
     }
 }
