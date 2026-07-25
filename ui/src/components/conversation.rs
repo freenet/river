@@ -101,7 +101,7 @@ struct GroupedMessage {
     edited: bool,
     reactions: HashMap<String, Vec<MemberId>>,
     /// What the reply-quote strip should render, already resolved against live
-    /// room state — see [`ReplyStrip`] and [`resolve_reply_context`].
+    /// room state — see [`ReplyStrip`] and [`resolve_reply_strip`].
     reply_strip: ReplyStrip,
     /// Propagation delay in seconds (send → receive), if known and significant
     #[allow(dead_code)]
@@ -163,21 +163,22 @@ enum DisplayRow {
 }
 
 /// What the reply-quote strip should render, resolved against live room state
-/// by [`resolve_reply_context`].
+/// by [`resolve_reply_strip`].
 ///
 /// An enum rather than co-varying `Option` fields plus a flag: the renderer has
 /// two mutually exclusive arms, and the freenet "paired `Option` fields that
 /// must co-occur" bug pattern is exactly the shape where a later edit sets one
-/// half and silently renders both strips at once. Matching on this makes that
-/// unrepresentable.
+/// half and the strip silently renders wrong (or not at all). Matching on this
+/// makes the inconsistent state unrepresentable.
 ///
 /// Distinct from [`ReplyContext`], which is the reply-in-progress the composer
 /// holds while the user is writing a reply.
 #[derive(Clone, Debug, Default, PartialEq)]
 enum ReplyStrip {
-    /// Not a reply — no strip at all.
+    /// Not a reply — no strip at all. Also the "still decrypting" state, which
+    /// must look like nothing rather than like a failure.
     #[default]
-    None,
+    NotAReply,
     /// A reply whose quoted message could not be read back from room state.
     Unavailable,
     /// A quote verified against the message it quotes. Every field is re-read
@@ -234,7 +235,7 @@ enum ReplyStrip {
 /// the target is readable, both its text and its attribution are re-read from
 /// it, so edits and renames propagate and neither half of the replier-supplied
 /// snapshot is ever displayed.
-fn resolve_reply_context(
+fn resolve_reply_strip(
     content: &RoomMessageBody,
     messages_state: &MessagesV1,
     member_info: &MemberInfoV1,
@@ -243,64 +244,98 @@ fn resolve_reply_context(
 ) -> ReplyStrip {
     use river_core::room_state::content::CONTENT_TYPE_REPLY;
 
-    let (_snapshot_author, _snapshot_preview, target_id) = extract_reply_context(content, secrets);
-    let Some(target_id) = target_id else {
-        // A reply we cannot decode — a private one whose secret we do not hold,
-        // or a malformed body — is still a REPLY: `content_type` is cleartext
-        // even on the `Private` variant. Say so rather than silently dropping
-        // the strip, so the two clients agree (riverctl reports the same).
-        return if content.content_type() == CONTENT_TYPE_REPLY {
-            ReplyStrip::Unavailable
+    let Some(target_id) = extract_reply_target_id(content, secrets) else {
+        // We could not decode the reply at all.
+        //
+        // "Still decrypting" is NOT "unavailable" — see `pending_decryption`.
+        // Otherwise this is a REPLY we cannot read (`content_type` is cleartext
+        // even on the `Private` variant, and a public body can carry undecodable
+        // `data`), so say so rather than silently dropping the strip. riverctl
+        // reports the same for the same inputs.
+        return if pending_decryption(content, secrets)
+            || content.content_type() != CONTENT_TYPE_REPLY
+        {
+            ReplyStrip::NotAReply
         } else {
-            ReplyStrip::None
+            ReplyStrip::Unavailable
         };
     };
 
-    let quote = messages_state
+    let target = messages_state
         .messages
         .iter()
         .find(|m| m.id() == target_id)
         // Mirror `display_messages()` and then some: `messages` retains
         // soft-deleted messages and action messages, and events render as a
         // merged summary rather than a `msg-{id}` row. None of those is a
-        // quotable message — resolving one would render machine copy
-        // ("[Reaction 👍 to …]") as if it were the author's words and leave the
-        // scroll-to-original handler pointing at an element that never exists.
+        // quotable message.
+        //
+        // The event filter is load-bearing, not tidiness: an EVENT is editable
+        // by its author (`rebuild_actions_state_with_decrypted` excludes only
+        // `is_action()` from `message_authors`), and `effective_text` consults
+        // `edited_content` BEFORE any content-type decode. So without this a
+        // member could post a join event, edit it to arbitrary text, and quote
+        // it — surfacing text that is rendered nowhere else in the app, since
+        // events render through `format_event_summary`. Do NOT drop this filter.
+        // Quoting an action or event would also aim scroll-to-original at a
+        // `msg-{id}` element that never exists.
         .filter(|target_msg| {
             !messages_state.is_deleted(&target_id)
                 && !target_msg.message.content.is_action()
                 && !target_msg.message.content.is_event()
-        })
-        .and_then(|target_msg| {
-            let text = target_plaintext(messages_state, target_msg, secrets)?;
-            // Attribute to the CURRENT nickname of the message's ACTUAL author
-            // rather than the snapshot's `target_author_name`, which can name
-            // anyone and does not track renames. Routed through the same
-            // `canonical()` lookup the message header uses, so a member with
-            // duplicate `member_info` records cannot be labelled one way in the
-            // quote and another way on their own message.
-            let author = resolve_member_nickname(member_info, target_msg.message.author, secrets);
-            Some((author, text))
         });
+    let Some(target_msg) = target else {
+        return ReplyStrip::Unavailable;
+    };
 
-    match quote {
+    let Some(text) = target_plaintext(messages_state, target_msg, secrets) else {
+        return if pending_decryption(&target_msg.message.content, secrets) {
+            ReplyStrip::NotAReply
+        } else {
+            ReplyStrip::Unavailable
+        };
+    };
+
+    // Attribute to the CURRENT nickname of the message's ACTUAL author rather
+    // than the snapshot's `target_author_name`, which can name anyone and does
+    // not track renames. Routed through the same `canonical()` lookup the
+    // message header uses, so a member with duplicate `member_info` records
+    // cannot be labelled one way in the quote and another way on their own
+    // message.
+    let author = resolve_member_nickname(member_info, target_msg.message.author, secrets);
+
+    ReplyStrip::Quote {
+        author,
         // Clean the preview for display: resolve @mention tokens to plain
         // `@name` (current nickname) and strip markdown, so the quote reads as
         // plain text rather than showing raw `@[name](rv:id)` / `**` /
         // `[text](url)` syntax. Truncate after cleaning.
-        Some((author, text)) => ReplyStrip::Quote {
-            author,
-            preview: clean_reply_preview(&text, member_names)
-                .chars()
-                .take(100)
-                .collect::<String>(),
-            target_id,
-        },
-        // The author name is dropped along with the text: "Alice: [removed]"
-        // still attributes the quoted content to Alice, and the name is exactly
-        // as unverifiable as the text it labels.
-        None => ReplyStrip::Unavailable,
+        preview: clean_reply_preview(&text, member_names)
+            .chars()
+            .take(100)
+            .collect::<String>(),
+        target_id,
     }
+}
+
+/// Whether an unreadable private body is merely WAITING on the room secrets
+/// rather than genuinely unreadable.
+///
+/// `RoomData.secrets` is `#[serde(skip)]`, so every cold start of an
+/// established private room transiently holds NO secrets until
+/// `repopulate_secrets_from_state` rehydrates them from the encrypted blobs.
+/// In that window nothing is verifiable and nothing is being hidden (the
+/// snapshot is unreadable too), so the strip must render as if the message
+/// simply were not a reply — flashing "Original message unavailable" over every
+/// reply on every page load is the alarming-placeholder failure that
+/// freenet/river#284 was filed to remove. The message body itself takes the
+/// same view, rendering a calm "Decrypting messages…".
+///
+/// The discriminator is deliberately "no secrets AT ALL", not "this version is
+/// missing": a rotated-past version is genuinely unavailable and must keep
+/// showing the placeholder.
+fn pending_decryption(content: &RoomMessageBody, secrets: &HashMap<u32, [u8; 32]>) -> bool {
+    matches!(content, RoomMessageBody::Private { .. }) && secrets.is_empty()
 }
 
 /// The quoted message's plaintext, or `None` when it genuinely cannot be read.
@@ -342,9 +377,10 @@ fn target_plaintext(
     let plaintext =
         crate::util::ecies::decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
             .ok()?;
-    // Adding a content type? Add it here (and to riverctl's
-    // `reply_context_display_with_secrets`) or replies quoting it will render
-    // the "unavailable" placeholder even on a client that supports it.
+    // Adding a content type? Add it here, to riverctl's mirror
+    // `decrypt_private_quote_text`, and (for a public body) to
+    // `DecodedContent::as_text` — otherwise replies quoting it render the
+    // "unavailable" placeholder even on a client that supports it.
     match *content_type {
         CONTENT_TYPE_TEXT => TextContentV1::decode(&plaintext).ok().map(|c| c.text),
         CONTENT_TYPE_REPLY => ReplyContentV1::decode(&plaintext).ok().map(|r| r.text),
@@ -449,7 +485,7 @@ fn group_messages(
             .unwrap_or_default();
 
         // Resolve the reply quote (if any) against live room state.
-        let reply_strip = resolve_reply_context(
+        let reply_strip = resolve_reply_strip(
             &message.message.content,
             messages_state,
             member_info,
@@ -670,26 +706,26 @@ fn collect_mdast_text(node: &markdown::mdast::Node, out: &mut String) {
     }
 }
 
-/// Extract reply context from a message body, if it is a reply.
-/// Returns (author_name, content_preview, target_message_id) or (None, None, None).
-pub(crate) fn extract_reply_context(
+/// The id of the message this reply quotes, or `None` if it is not a reply (or
+/// cannot be decoded).
+///
+/// Deliberately returns ONLY the id. `ReplyContentV1` also carries
+/// `target_author_name` and `target_content_preview` — a snapshot written and
+/// signed by the REPLIER and validated by nothing — and the whole point of
+/// `resolve_reply_strip` is that neither is ever rendered. Not returning them
+/// makes that structural instead of a convention every caller has to honour.
+pub(crate) fn extract_reply_target_id(
     content: &RoomMessageBody,
     secrets: &HashMap<u32, [u8; 32]>,
-) -> (Option<String>, Option<String>, Option<MessageId>) {
+) -> Option<MessageId> {
     use river_core::room_state::content::{ReplyContentV1, CONTENT_TYPE_REPLY};
 
     match content {
         RoomMessageBody::Public {
             content_type, data, ..
-        } if *content_type == CONTENT_TYPE_REPLY => {
-            if let Ok(reply) = ReplyContentV1::decode(data) {
-                return (
-                    Some(reply.target_author_name),
-                    Some(reply.target_content_preview),
-                    Some(reply.target_message_id),
-                );
-            }
-        }
+        } if *content_type == CONTENT_TYPE_REPLY => ReplyContentV1::decode(data)
+            .ok()
+            .map(|r| r.target_message_id),
         RoomMessageBody::Private {
             content_type,
             ciphertext,
@@ -697,24 +733,17 @@ pub(crate) fn extract_reply_context(
             secret_version,
             ..
         } if *content_type == CONTENT_TYPE_REPLY => {
-            if let Some(secret) = secrets.get(secret_version) {
-                use crate::util::ecies::decrypt_with_symmetric_key;
-                if let Ok(decrypted_bytes) =
-                    decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
-                {
-                    if let Ok(reply) = ReplyContentV1::decode(&decrypted_bytes) {
-                        return (
-                            Some(reply.target_author_name),
-                            Some(reply.target_content_preview),
-                            Some(reply.target_message_id),
-                        );
-                    }
-                }
-            }
+            use crate::util::ecies::decrypt_with_symmetric_key;
+            secrets
+                .get(secret_version)
+                .and_then(|secret| {
+                    decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce).ok()
+                })
+                .and_then(|plaintext| ReplyContentV1::decode(&plaintext).ok())
+                .map(|r| r.target_message_id)
         }
-        _ => {}
+        _ => None,
     }
-    (None, None, None)
 }
 
 /// Convert message text to HTML with clickable links that open in new tabs.
@@ -3164,7 +3193,7 @@ fn MessageGroupComponent(
                                                     // composited to the same colour as the bubble.
                                                     {
                                                         match reply_strip_inner {
-                                                            ReplyStrip::None => rsx! {},
+                                                            ReplyStrip::NotAReply => rsx! {},
                                                             // Deliberately inert — no `role`/`tabindex`/
                                                             // `onclick` — because there is no original
                                                             // message to scroll to. It therefore carries
@@ -4703,7 +4732,7 @@ mod tests {
     }
 }
 
-/// Tests for [`resolve_reply_context`] — the rule that a reply's quoted
+/// Tests for [`resolve_reply_strip`] — the rule that a reply's quoted
 /// snapshot is rendered only when it can be re-read from live room state.
 ///
 /// These target the helper rather than `group_messages` because the latter
@@ -4711,7 +4740,7 @@ mod tests {
 /// runtime. The render side (which arm of [`ReplyStrip`] produces what markup)
 /// is covered by `ui/tests/message-layout.spec.ts`.
 #[cfg(test)]
-mod resolve_reply_context_tests {
+mod resolve_reply_strip_tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use river_core::room_state::content::{TextContentV1, CONTENT_TYPE_TEXT, TEXT_CONTENT_VERSION};
@@ -4769,7 +4798,7 @@ mod resolve_reply_context_tests {
         messages: &MessagesV1,
         member_info: &MemberInfoV1,
     ) -> ReplyStrip {
-        resolve_reply_context(
+        resolve_reply_strip(
             &reply.message.content,
             messages,
             member_info,
@@ -5121,12 +5150,23 @@ mod resolve_reply_context_tests {
                 ),
                 20,
             );
-            let messages = state(vec![
+            let mut messages = state(vec![
                 anchor.clone(),
                 action.clone(),
                 event.clone(),
                 reply.clone(),
             ]);
+            // Give the target an EDIT. Without this the filter is untestable:
+            // resolution would already fail inside `target_plaintext` (an
+            // action/event body has no text), so deleting the filter would keep
+            // the test green. `effective_text` consults `edited_content` BEFORE
+            // any content-type decode, and an event IS editable by its author —
+            // so this is the real attack: post a join event, edit it to
+            // arbitrary text, quote it. The filter is what stops that.
+            messages
+                .actions_state
+                .edited_content
+                .insert(target.id(), "attacker-chosen text".to_string());
             assert_eq!(
                 resolve(&reply, &messages, &member_info),
                 ReplyStrip::Unavailable,
@@ -5184,7 +5224,7 @@ mod resolve_reply_context_tests {
         let messages = state(vec![target, reply.clone()]);
 
         // Holding v1: the target is genuinely re-read.
-        let with_secret = resolve_reply_context(
+        let with_secret = resolve_reply_strip(
             &reply.message.content,
             &messages,
             &member_info,
@@ -5193,25 +5233,37 @@ mod resolve_reply_context_tests {
         );
         assert_eq!(expect_quote(with_secret).1, "private words");
 
-        // Rotated past v1 (holding only v2), and the cold-start case of holding
-        // nothing yet. Both must be `Unavailable`, NOT a quote of the
-        // "[Encrypted message - secret vN unavailable]" / "Decrypting
-        // messages..." diagnostics.
-        for secrets in [HashMap::from([(2u32, [9u8; 32])]), HashMap::new()] {
-            let ctx = resolve_reply_context(
+        // Rotated past v1 (holding only v2): genuinely unavailable. Must NOT
+        // quote the "[Encrypted message - secret vN unavailable]" diagnostic.
+        assert_eq!(
+            resolve_reply_strip(
                 &reply.message.content,
                 &messages,
                 &member_info,
-                &secrets,
+                &HashMap::from([(2u32, [9u8; 32])]),
                 &HashMap::new(),
-            );
-            assert_eq!(
-                ctx,
-                ReplyStrip::Unavailable,
-                "an undecryptable target must not be quoted (secrets held: {:?})",
-                secrets.keys().collect::<Vec<_>>()
-            );
-        }
+            ),
+            ReplyStrip::Unavailable,
+            "a target encrypted under a rotated-past version is unavailable"
+        );
+
+        // Cold start: `RoomData.secrets` is `#[serde(skip)]`, so an established
+        // private room transiently holds NOTHING on every page load. That is
+        // "still decrypting", not "unavailable" — flashing the placeholder over
+        // every reply on every load is the freenet/river#284 alarm class. No
+        // strip at all, matching what the pre-fix code rendered here.
+        assert_eq!(
+            resolve_reply_strip(
+                &reply.message.content,
+                &messages,
+                &member_info,
+                &HashMap::new(),
+                &HashMap::new(),
+            ),
+            ReplyStrip::NotAReply,
+            "a room whose secrets have not rehydrated yet must not flash the \
+             unavailable placeholder over every reply"
+        );
     }
 
     /// A target whose author has no `member_info` record yet (sync lag) still
@@ -5328,7 +5380,7 @@ mod resolve_reply_context_tests {
         let messages = state(vec![target, reply.clone()]);
 
         // With the secret the quote resolves against the live target.
-        let with_secret = resolve_reply_context(
+        let with_secret = resolve_reply_strip(
             &reply.message.content,
             &messages,
             &member_info,
@@ -5337,11 +5389,25 @@ mod resolve_reply_context_tests {
         );
         assert_eq!(expect_quote(with_secret).1, "target text");
 
-        // Without it, we cannot read the reply at all — but we still know it IS
-        // one, so say so rather than rendering nothing.
+        // Holding a DIFFERENT version — the room rotated past v4 — we cannot
+        // read the reply at all, but we still know it IS one, so say so.
+        assert_eq!(
+            resolve_reply_strip(
+                &reply.message.content,
+                &messages,
+                &member_info,
+                &HashMap::from([(5u32, [1u8; 32])]),
+                &HashMap::new(),
+            ),
+            ReplyStrip::Unavailable
+        );
+
+        // Holding NO secrets at all is the cold-start window, not a real
+        // failure: render nothing rather than alarming the user.
         assert_eq!(
             resolve(&reply, &messages, &member_info),
-            ReplyStrip::Unavailable
+            ReplyStrip::NotAReply,
+            "cold start must not flash the placeholder"
         );
     }
 
@@ -5360,6 +5426,6 @@ mod resolve_reply_context_tests {
         );
 
         let ctx = resolve(&plain, &state(vec![plain.clone()]), &info(vec![]));
-        assert_eq!(ctx, ReplyStrip::None);
+        assert_eq!(ctx, ReplyStrip::NotAReply);
     }
 }

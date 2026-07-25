@@ -484,7 +484,7 @@ fn mentions_or_replies_to_self(
     room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
     recent: &[AuthorizedMessageV1],
 ) -> bool {
-    use crate::components::conversation::{decrypt_message_content, extract_reply_context};
+    use crate::components::conversation::{decrypt_message_content, extract_reply_target_id};
 
     // (a) An @mention of self anywhere in the (decrypted) message text.
     let text = decrypt_message_content(&msg.message.content, room_secrets);
@@ -493,8 +493,7 @@ fn mentions_or_replies_to_self(
     }
 
     // (b) A reply to a message authored by self.
-    let (_, _, target_id) = extract_reply_context(&msg.message.content, room_secrets);
-    if let Some(target_id) = target_id {
+    if let Some(target_id) = extract_reply_target_id(&msg.message.content, room_secrets) {
         return recent
             .iter()
             .any(|m| m.id() == target_id && m.message.author == self_member_id);
