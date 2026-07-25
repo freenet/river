@@ -240,36 +240,89 @@ fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: Memb
 #[derive(Clone, PartialEq)]
 struct MemberDisplayParts {
     nickname: String,
-    tags: Vec<(&'static str, String)>,
+    tags: Vec<MemberTag>,
+}
+
+/// One badge in a member row.
+///
+/// `test_id` is what makes a badge addressable from a browser test. Every badge
+/// carries one rather than only the ⚠, because they all share a single
+/// anonymous render loop: giving one of them a handle and leaving the rest
+/// glyph-matched just moves the brittleness. The ⚠ is the reason this exists —
+/// the clipping bug it has already had once is exactly the class a browser test
+/// catches and a unit test structurally cannot.
+#[derive(Clone, PartialEq)]
+struct MemberTag {
+    glyph: &'static str,
+    tooltip: String,
+    test_id: &'static str,
+}
+
+impl MemberTag {
+    fn new(glyph: &'static str, test_id: &'static str, tooltip: String) -> Self {
+        Self {
+            glyph,
+            tooltip,
+            test_id,
+        }
+    }
 }
 
 fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
-    let mut tags: Vec<(&'static str, String)> = Vec::new();
+    let mut tags: Vec<MemberTag> = Vec::new();
 
     // FIRST, so the warning sits immediately after the name it is about rather
     // than at the end of a run of relationship tags. A reader scanning the list
     // for an impostor should not have to parse "🔑 🌐 🎪" before reaching it.
+    //
+    // The test id mirrors the conversation side's
+    // `message-author-impersonation-warning`, so one spec can address the same
+    // badge on both surfaces.
     if let Some(warning) = member.impersonation.as_ref() {
-        tags.push((crate::util::confusable::WARNING_GLYPH, warning.tooltip()));
+        tags.push(MemberTag::new(
+            crate::util::confusable::WARNING_GLYPH,
+            "member-list-impersonation-warning",
+            warning.tooltip(),
+        ));
     }
     if member.is_owner {
-        tags.push(("👑", "Room Owner".to_string()));
+        tags.push(MemberTag::new(
+            "👑",
+            "member-list-owner",
+            "Room Owner".into(),
+        ));
     }
     if member.is_self {
-        tags.push(("⭐", "You".to_string()));
+        tags.push(MemberTag::new("⭐", "member-list-self", "You".into()));
     }
     if member.invited_by_you {
-        tags.push(("🔑", "Invited by You".to_string()));
+        tags.push(MemberTag::new(
+            "🔑",
+            "member-list-invited-by-you",
+            "Invited by You".into(),
+        ));
     } else if member.in_your_network {
-        tags.push(("🌐", "In Your Network".to_string()));
+        tags.push(MemberTag::new(
+            "🌐",
+            "member-list-in-your-network",
+            "In Your Network".into(),
+        ));
     }
     if member.invited_you {
-        tags.push(("🎪", "Invited You".to_string()));
+        tags.push(MemberTag::new(
+            "🎪",
+            "member-list-invited-you",
+            "Invited You".into(),
+        ));
     } else if member.sponsored_you {
-        tags.push(("🔭", "In Your Invite Chain".to_string()));
+        tags.push(MemberTag::new(
+            "🔭",
+            "member-list-invite-chain",
+            "In Your Invite Chain".into(),
+        ));
     }
     if let Some(badge) = member.deputy_badge.as_ref() {
-        tags.push(("🛡", badge.tooltip()));
+        tags.push(MemberTag::new("🛡", "member-list-deputy", badge.tooltip()));
     }
 
     MemberDisplayParts {
@@ -1488,15 +1541,22 @@ pub fn MemberList() -> Element {
                             // bytes from `MemberInfoV1.preferred_nickname` MUST NOT be
                             // routed through `dangerous_inner_html` (freenet/river#227).
                             span { class: "truncate min-w-0", "{parts.nickname}" }
-                            for (icon, tooltip) in parts.tags {
+                            for tag in parts.tags {
                                 span {
+                                    // Addressable from a browser test — see
+                                    // `MemberTag`. `title=` does not fire on
+                                    // touch, so the badge's explanation is
+                                    // unreachable on a phone and a spec is the
+                                    // only thing that can check it renders at
+                                    // all at narrow widths.
+                                    "data-testid": "{tag.test_id}",
                                     class: "member-icon flex-shrink-0",
-                                    title: "{tooltip}",
+                                    title: "{tag.tooltip}",
                                     // The glyph alone means nothing to a
                                     // screen reader, and the deputy shield is
                                     // now a security-relevant signal.
-                                    "aria-label": "{tooltip}",
-                                    " {icon}"
+                                    "aria-label": "{tag.tooltip}",
+                                    " {tag.glyph}"
                                 }
                             }
                         }
@@ -3444,7 +3504,7 @@ mod tests {
         let parts = member_display_parts(&display);
 
         assert_eq!(parts.nickname, "alice");
-        let icons: Vec<&str> = parts.tags.iter().map(|(icon, _)| *icon).collect();
+        let icons: Vec<&str> = parts.tags.iter().map(|t| t.glyph).collect();
         assert!(icons.contains(&"👑"));
         assert!(icons.contains(&"⭐"));
     }
@@ -3461,7 +3521,7 @@ mod tests {
             !member_display_parts(&display)
                 .tags
                 .iter()
-                .any(|(icon, _)| *icon == "🛡"),
+                .any(|t| t.glyph == "🛡"),
             "no shield when the member is not a deputy"
         );
 
@@ -3473,12 +3533,12 @@ mod tests {
         let shield = parts
             .tags
             .iter()
-            .find(|(icon, _)| *icon == "🛡")
+            .find(|t| t.glyph == "🛡")
             .expect("a deputy must show the 🛡 shield");
         // Identical wording to the conversation author line and the modal
         // chip — all three call `DeputyBadge::tooltip`.
         assert_eq!(
-            shield.1,
+            shield.tooltip,
             "Deputy (appointed by the room owner). Can ban you."
         );
 
@@ -3490,7 +3550,7 @@ mod tests {
         });
         let parts = member_display_parts(&display);
         assert_eq!(
-            parts.tags.iter().find(|(icon, _)| *icon == "🛡").unwrap().1,
+            parts.tags.iter().find(|t| t.glyph == "🛡").unwrap().tooltip,
             "Deputy (appointed by the room owner)"
         );
     }
@@ -6683,13 +6743,14 @@ mod tests {
         });
 
         let parts = member_display_parts(&display);
-        let (glyph, tooltip) = parts.tags.first().expect("at least one tag");
+        let first = parts.tags.first().expect("at least one tag");
+        let (glyph, tooltip) = (&first.glyph, &first.tooltip);
         assert_eq!(
             *glyph,
             crate::util::confusable::WARNING_GLYPH,
             "the impersonation warning must be the FIRST tag, next to the name; \
              tags were {:?}",
-            parts.tags.iter().map(|(g, _)| *g).collect::<Vec<_>>()
+            parts.tags.iter().map(|t| t.glyph).collect::<Vec<_>>()
         );
         assert!(tooltip.contains("is NOT a moderator"), "{tooltip}");
         // The row's tooltip is flat hover text, so it must carry no nickname —
@@ -6704,7 +6765,7 @@ mod tests {
         assert!(!member_display_parts(&display)
             .tags
             .iter()
-            .any(|(g, _)| *g == crate::util::confusable::WARNING_GLYPH));
+            .any(|t| t.glyph == crate::util::confusable::WARNING_GLYPH));
     }
 
     /// **The residual #488 knowingly left open, and this warning is its only
@@ -6917,6 +6978,34 @@ mod tests {
             )
             .contains("WARNING_GLYPH"),
             "the member row no longer renders the warning glyph"
+        );
+        // ...and it must stay ADDRESSABLE. Without a test id the only handle a
+        // browser spec has on this badge is glyph-matching ⚠ inside
+        // `member-item-{id}`, which rots the moment the row gains any other
+        // symbol. Mirrors the conversation side's
+        // `message-author-impersonation-warning`, asserted below.
+        assert!(
+            between(
+                members_src,
+                "fn member_display_parts(",
+                "\n/// Order member IDs",
+                "member_display_parts",
+            )
+            .contains("\"member-list-impersonation-warning\""),
+            "the member-list warning lost its `data-testid`, so a Playwright \
+             spec can only reach it by glyph-matching. The id must be on the \
+             WARNING tag specifically — on the wrong badge it is worse than \
+             none, because the spec then passes against the shield"
+        );
+        assert!(
+            between(
+                members_src,
+                "pub fn MemberList()",
+                "// Action buttons",
+                "MemberList render",
+            )
+            .contains("\"data-testid\": \"{tag.test_id}\""),
+            "the member row no longer emits each tag's `data-testid`"
         );
 
         // --- Message author line ------------------------------------------
