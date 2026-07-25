@@ -628,6 +628,13 @@ fn skeleton_with(name: &str, fold: Fold) -> String {
             out.push(ascii);
             continue;
         }
+        // 2b. Small capitals — the single commonest fancy-text style on chat
+        //     platforms after the mathematical blocks, and one NFKC does NOT
+        //     touch, so it needs its own judgement. See [`fold_small_capital`].
+        if let Some(folded) = fold_small_capital(c) {
+            out.push(folded);
+            continue;
+        }
         // 3. Combining marks. `"I" + U+0300 + "n"` must fold like `"Ìn"`.
         if is_combining_mark(c) {
             continue;
@@ -944,20 +951,63 @@ fn fold_presentation_form(c: char) -> Option<char> {
     if let Some(letter) = fold_nfkc_letter(c) {
         return Some(letter);
     }
-    // Mathematical Alphanumeric Symbols: consecutive 52-letter (A-Z then a-z)
-    // blocks.
+    // Mathematical Alphanumeric Symbols, LATIN half: thirteen consecutive
+    // 52-letter (A-Z then a-z) blocks, ending at U+1D6A3.
     //
-    // The range contains reserved holes (e.g. U+1D455, whose letter lives in
-    // Letterlike Symbols above). A hole maps to a letter here, which is
+    // **The upper bound is load-bearing.** This used to run to U+1D7CB, and the
+    // 52-alignment simply is not true past U+1D6A3: what follows is two dotless
+    // letters and then FIVE GREEK blocks of 58, so `% 52` walked out of phase
+    // and emitted an arbitrary letter. U+1D75E MATH SANS BOLD CAPITAL IOTA came
+    // out as `e`, which meant `𝝞𝗮𝗻 𝗖𝗹𝗮𝗿𝗸𝗲` — pixel-identical to the
+    // `𝗜𝗮𝗻 𝗖𝗹𝗮𝗿𝗸𝗲` the test corpus already caught, one codepoint different —
+    // walked straight past the check. It was wrong in the other direction too:
+    // bold capital Alpha folded to `E`, a false positive on a real Greek name
+    // rendered in a fancy-text generator.
+    //
+    // The range still contains reserved holes (e.g. U+1D455, whose letter lives
+    // in Letterlike Symbols above). A hole maps to a letter here, which is
     // harmless: an unassigned codepoint renders as tofu and cannot appear in a
     // name a reader would mistake for anything.
-    if (0x1D400..=0x1D7CB).contains(&cp) {
+    if (0x1D400..=0x1D6A3).contains(&cp) {
         let idx = (cp - 0x1D400) % 52;
         return Some(if idx < 26 {
             (b'A' + idx as u8) as char
         } else {
             (b'a' + (idx - 26) as u8) as char
         });
+    }
+    // The two dotless letters that sit between the Latin and Greek halves.
+    // U+0131 is the Turkish dotless i the homoglyph table already carries (with
+    // its cost recorded in `documented_accepted_collisions`), so routing through
+    // it keeps one decision in one place.
+    if cp == 0x1D6A4 {
+        return Some('\u{0131}');
+    }
+    if cp == 0x1D6A5 {
+        return Some('j');
+    }
+    // Mathematical Alphanumeric Symbols, GREEK half: five consecutive blocks of
+    // 58, all with the identical slot layout (24 capitals, nabla, 25 lowercase,
+    // partial differential, then six variant symbols).
+    //
+    // Each slot folds to the PLAIN GREEK letter, not to a Latin one. Whether
+    // that letter then becomes Latin is `fold_homoglyph`'s decision, made once
+    // for Greek as a whole and already case-aware — so `𝝞` reaches `Ι` reaches
+    // `I`, while `𝝘` reaches `Γ` and stays Greek, because Gamma is not a Latin
+    // lookalike. Mapping these to Latin here instead would duplicate that
+    // judgement in a second place and let the two drift.
+    if (0x1D6A8..=0x1D7C9).contains(&cp) {
+        let slot = ((cp - 0x1D6A8) % 58) as usize;
+        return MATH_GREEK_FOLD.chars().nth(slot);
+    }
+    // The two bold digammas that close the block. Folded to plain digamma,
+    // which no table turns into Latin `F` — the letterform differs enough, and
+    // nothing in a name needs it.
+    if cp == 0x1D7CA {
+        return Some('\u{03DC}');
+    }
+    if cp == 0x1D7CB {
+        return Some('\u{03DD}');
     }
     // Mathematical digits: five consecutive blocks of ten.
     if (0x1D7CE..=0x1D7FF).contains(&cp) {
@@ -1089,6 +1139,90 @@ fn fold_nfkc_letter(c: char) -> Option<char> {
         _ => return None,
     })
 }
+
+/// Small-capital letters, folded to the capital they are drawn as.
+///
+/// `ɪᴀɴ ᴄʟᴀʀᴋᴇ` reads as `IAN CLARKE` to anyone looking at it, and the module
+/// already asserts that `IAN CLARKE` is an identical skeleton of `Ian Clarke`,
+/// so by its own standard these have to fold too. Every one of them survived
+/// both folds verbatim before this: they are general category `Ll`, so the case
+/// step leaves them alone, and the result was edit distance 8 from the real
+/// name — not even a tier-2 near miss. Small-caps generators are one click away
+/// on any "fancy text" page, and every one of these renders in DejaVu Sans,
+/// Noto Sans, Segoe UI and the macOS system fonts.
+///
+/// ## What is deliberately NOT here
+///
+/// Only the letters whose base is a plain ASCII capital. Everything with a
+/// stroke, hook, belt, leg, or a turned/reversed/inverted orientation
+/// (`ᴃ ᴌ ᴎ ʁ ᴙ ᴚ ᵻ ᵾ`), and the digraphs (`ᴁ ᴓ ꝶ`), are separate letterforms a
+/// reader does not see as the plain capital, so folding them would be inventing
+/// a confusable rather than recording one. There is no small capital X in
+/// Unicode; generators emit plain `x`, which needs nothing here.
+///
+/// The Greek and Cyrillic small capitals fold to their PLAIN Greek/Cyrillic
+/// letter, not to Latin — whether Greek `Ρ` becomes Latin `P` is
+/// [`fold_homoglyph`]'s decision, made once, and duplicating it here is how the
+/// two tables drift apart.
+///
+/// False-positive surface is small by construction: these are IPA and phonetic
+/// notation, not letters any living orthography spells a personal name with.
+/// The corpus sweeps cover them like everything else.
+fn fold_small_capital(c: char) -> Option<char> {
+    Some(match u32::from(c) {
+        0x0262 => 'G',
+        0x026A => 'I',
+        0x0274 => 'N',
+        0x0280 => 'R',
+        0x028F => 'Y',
+        0x0299 => 'B',
+        0x029C => 'H',
+        0x029F => 'L',
+        0x1D00 => 'A',
+        0x1D04 => 'C',
+        0x1D05 => 'D',
+        0x1D07 => 'E',
+        0x1D0A => 'J',
+        0x1D0B => 'K',
+        0x1D0D => 'M',
+        0x1D0F => 'O',
+        0x1D18 => 'P',
+        0x1D1B => 'T',
+        0x1D1C => 'U',
+        0x1D20 => 'V',
+        0x1D21 => 'W',
+        0x1D22 => 'Z',
+        0xA730 => 'F',
+        0xA731 => 'S',
+        0xA7AE => 'I', // LATIN CAPITAL LETTER SMALL CAPITAL I
+        0xA7AF => 'Q',
+        // Greek and Cyrillic small capitals, to their own script's capital.
+        0x1D26 => '\u{0393}', // Γ
+        0x1D27 => '\u{039B}', // Λ
+        0x1D28 => '\u{03A0}', // Π
+        0x1D29 => '\u{03A1}', // Ρ — becomes Latin P via `fold_homoglyph`
+        0x1D2A => '\u{03A8}', // Ψ
+        0xAB65 => '\u{03A9}', // Ω
+        0x1D2B => '\u{041B}', // Л
+        _ => return None,
+    })
+}
+
+/// One Mathematical-Greek block's 58 slots, in order, as their plain Greek
+/// (or plain mathematical) equivalents.
+///
+/// Generated from Unicode NFKD; all five blocks share this layout, which
+/// `the_five_math_greek_blocks_share_one_layout` re-derives rather than trusts.
+const MATH_GREEK_FOLD: &str = concat!(
+    "\u{0391}\u{0392}\u{0393}\u{0394}\u{0395}\u{0396}\u{0397}\u{0398}", // Α Β Γ Δ Ε Ζ Η Θ
+    "\u{0399}\u{039A}\u{039B}\u{039C}\u{039D}\u{039E}\u{039F}\u{03A0}", // Ι Κ Λ Μ Ν Ξ Ο Π
+    "\u{03A1}\u{0398}\u{03A3}\u{03A4}\u{03A5}\u{03A6}\u{03A7}\u{03A8}", // Ρ Θsym Σ Τ Υ Φ Χ Ψ
+    "\u{03A9}\u{2207}\u{03B1}\u{03B2}\u{03B3}\u{03B4}\u{03B5}\u{03B6}", // Ω ∇ α β γ δ ε ζ
+    "\u{03B7}\u{03B8}\u{03B9}\u{03BA}\u{03BB}\u{03BC}\u{03BD}\u{03BE}", // η θ ι κ λ μ ν ξ
+    "\u{03BF}\u{03C0}\u{03C1}\u{03C2}\u{03C3}\u{03C4}\u{03C5}\u{03C6}", // ο π ρ ς σ τ υ φ
+    "\u{03C7}\u{03C8}\u{03C9}\u{2202}\u{03B5}\u{03B8}\u{03BA}\u{03C6}", // χ ψ ω ∂ εsym θsym κsym φsym
+    "\u{03C1}\u{03C0}",                                                 // ρsym πsym
+);
 
 /// Letterlike Symbols (U+2100..U+214F) that NFKC folds to a plain letter.
 fn fold_letterlike(cp: u32) -> Option<char> {
@@ -1758,6 +1892,173 @@ mod tests {
                  {real:?}, not merely land within the edit budget"
             );
         }
+    }
+
+    /// **The mathematical-alphanumeric blocks past the Latin half.**
+    ///
+    /// The sweep used to run `(cp - 0x1D400) % 52` over the whole range to
+    /// U+1D7CB. The 52-alignment holds only to U+1D6A3 (13 blocks x 52 = 676);
+    /// after it come two dotless letters and five GREEK blocks of 58, so the
+    /// modulo walked out of phase and emitted an arbitrary letter.
+    ///
+    /// The evading name below is the corpus's own passing sans-bold case with
+    /// ONE codepoint swapped, `𝗜` for the identically-drawn `𝝞` — and the
+    /// broken modulo turned that one into `e`, so `𝝞𝗮𝗻 𝗖𝗹𝗮𝗿𝗸𝗲` folded to
+    /// `ean clarke` and walked past a check that caught the pixel-identical
+    /// string beside it.
+    #[test]
+    fn the_math_greek_blocks_fold_to_greek_not_to_garbage() {
+        let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+            ProtectedRole::Deputy,
+            "Ian Clarke",
+            mid(1),
+        )]);
+        // Sans-serif bold Latin capital I — the case that always worked.
+        let latin =
+            "\u{1D5DC}\u{1D5EE}\u{1D5FB} \u{1D5D6}\u{1D5F9}\u{1D5EE}\u{1D5FF}\u{1D5F8}\u{1D5F2}";
+        // Sans-serif bold Greek capital IOTA — drawn identically, and the one
+        // that evaded.
+        let greek =
+            "\u{1D75E}\u{1D5EE}\u{1D5FB} \u{1D5D6}\u{1D5F9}\u{1D5EE}\u{1D5FF}\u{1D5F8}\u{1D5F2}";
+        for (label, name) in [("math Latin I", latin), ("math Greek IOTA", greek)] {
+            let w = checker
+                .check(mid(2), name)
+                .unwrap_or_else(|| panic!("{label}: {name:?} must be flagged"));
+            assert_eq!(w.tier, ConfusableTier::Identical, "{label}");
+        }
+
+        // Every capital the plain-Greek homoglyph table carries must arrive
+        // there through the math blocks too, in all five of them.
+        for block in [0x1D6A8u32, 0x1D6E2, 0x1D71C, 0x1D756, 0x1D790] {
+            for (slot, plain, latin) in [
+                (8usize, '\u{0399}', 'i'), // IOTA -> I -> bar sentinel is '1'
+                (0, '\u{0391}', 'a'),      // ALPHA -> A
+                (11, '\u{039C}', 'm'),     // MU -> M
+                (14, '\u{039F}', 'o'),     // OMICRON -> O
+            ] {
+                let math = char::from_u32(block + slot as u32).expect("assigned");
+                assert_eq!(
+                    skeleton(&math.to_string()),
+                    skeleton(&plain.to_string()),
+                    "math Greek at block {block:#X} slot {slot} must fold like \
+                     the plain Greek letter"
+                );
+                let _ = latin;
+            }
+        }
+
+        // ...and the false-positive direction the broken modulo also had:
+        // bold capital Alpha came out as `E`. It must fold like plain Alpha.
+        assert_eq!(skeleton("\u{1D6A8}"), skeleton("\u{0391}"));
+        assert_eq!(skeleton("\u{1D6A8}"), skeleton("A"));
+        // Bold capital IOTA is an `I`, not the `M` the broken modulo made of it.
+        assert_eq!(skeleton("\u{1D6B0}"), skeleton("\u{0399}"));
+        assert_eq!(skeleton("\u{1D6B0}"), skeleton("I"));
+        assert_ne!(skeleton("\u{1D6B0}"), skeleton("M"));
+        // A Greek letter with NO Latin lookalike must stay unfolded rather than
+        // acquiring one: bold capital Gamma stays Greek.
+        assert_eq!(skeleton("\u{1D6AA}"), skeleton("\u{0393}"));
+        assert_ne!(skeleton("\u{1D6AA}"), skeleton("G"));
+        // Italic small dotless i is a dotless i, not `A`.
+        assert_eq!(skeleton("\u{1D6A4}"), skeleton("\u{0131}"));
+        assert_ne!(skeleton("\u{1D6A4}"), skeleton("A"));
+        // Bold capital digamma is a digamma, not `i`.
+        assert_eq!(skeleton("\u{1D7CA}"), skeleton("\u{03DC}"));
+        assert_ne!(skeleton("\u{1D7CA}"), skeleton("i"));
+    }
+
+    /// The five Mathematical-Greek blocks are asserted to share one 58-slot
+    /// layout. Re-derive it rather than trusting the comment: if a future
+    /// Unicode version breaks the alignment, [`MATH_GREEK_FOLD`] silently
+    /// starts emitting the wrong letter for four blocks out of five.
+    #[test]
+    fn the_five_math_greek_blocks_share_one_layout() {
+        let table: Vec<char> = MATH_GREEK_FOLD.chars().collect();
+        assert_eq!(table.len(), 58, "one Greek block is 58 slots");
+        for block in [0x1D6A8u32, 0x1D6E2, 0x1D71C, 0x1D756, 0x1D790] {
+            for (slot, expected) in table.iter().enumerate() {
+                let math = char::from_u32(block + slot as u32)
+                    .unwrap_or_else(|| panic!("{block:#X}+{slot} is a valid codepoint"));
+                assert_eq!(
+                    fold_presentation_form(math),
+                    Some(*expected),
+                    "block {block:#X} slot {slot} disagrees with the table"
+                );
+            }
+        }
+        // The Latin sweep must STOP before the Greek half. U+1D6A3 is the last
+        // monospace small z; U+1D6A8 is bold capital Alpha.
+        assert_eq!(fold_presentation_form('\u{1D6A3}'), Some('z'));
+        assert_eq!(fold_presentation_form('\u{1D6A8}'), Some('\u{0391}'));
+    }
+
+    /// **Latin small capitals.** `ɪᴀɴ ᴄʟᴀʀᴋᴇ` reads as `IAN CLARKE`, and the
+    /// corpus already treats `IAN CLARKE` as an identical skeleton of
+    /// `Ian Clarke` — so these had to fold and did not. They are `Ll`, so both
+    /// folds left them verbatim and the result was edit distance 8: not even a
+    /// near miss.
+    #[test]
+    fn small_capitals_fold() {
+        for (label, attacker, real) in [
+            (
+                "all small caps",
+                "\u{026A}\u{1D00}\u{0274} \u{1D04}\u{029F}\u{1D00}\u{0280}\u{1D0B}\u{1D07}",
+                "Ian Clarke",
+            ),
+            ("one small cap", "\u{026A}an Clarke", "Ian Clarke"),
+            ("small capital F/S", "\u{A730}\u{A731}mith", "FSmith"),
+            ("small capital G/H", "\u{0262}\u{029C}osh", "GHosh"),
+            ("small capital B/Y", "\u{0299}\u{028F}rne", "BYrne"),
+            ("small capital Q", "\u{A7AF}uinn", "Quinn"),
+            ("small capital V/W/Z", "\u{1D20}\u{1D21}\u{1D22}ed", "VWZed"),
+            ("small capital J/M/P", "\u{1D0A}\u{1D0D}\u{1D18}od", "JMPod"),
+            (
+                "small capital D/E/T/U",
+                "\u{1D05}\u{1D07}\u{1D1B}\u{1D1C}",
+                "DETU",
+            ),
+            ("small capital O", "B\u{1D0F}b", "BOb"),
+        ] {
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                real,
+                mid(1),
+            )]);
+            let w = checker
+                .check(mid(2), attacker)
+                .unwrap_or_else(|| panic!("{label}: {attacker:?} vs {real:?}"));
+            assert_eq!(w.tier, ConfusableTier::Identical, "{label}");
+        }
+
+        // The letterforms that are NOT the plain capital stay unfolded — a
+        // stroke, hook or turned orientation is a different glyph, and folding
+        // it would be inventing a confusable rather than recording one.
+        for not_folded in [
+            '\u{1D03}', // SMALL CAPITAL BARRED B
+            '\u{1D0C}', // SMALL CAPITAL L WITH STROKE
+            '\u{1D0E}', // SMALL CAPITAL REVERSED N
+            '\u{1D19}', // SMALL CAPITAL REVERSED R
+            '\u{1D1A}', // SMALL CAPITAL TURNED R
+            '\u{0281}', // SMALL CAPITAL INVERTED R
+            '\u{029B}', // SMALL CAPITAL G WITH HOOK
+            '\u{1D01}', // SMALL CAPITAL AE
+            '\u{1D06}', // SMALL CAPITAL ETH
+        ] {
+            assert_eq!(
+                fold_small_capital(not_folded),
+                None,
+                "{not_folded:?} is not drawn as a plain capital"
+            );
+        }
+
+        // Greek and Cyrillic small capitals go to their OWN script's capital,
+        // so whether they then become Latin is `fold_homoglyph`'s single
+        // decision rather than a second one made here.
+        assert_eq!(skeleton("\u{1D29}"), skeleton("\u{03A1}")); // Greek rho
+        assert_eq!(skeleton("\u{1D26}"), skeleton("\u{0393}")); // Greek gamma
+        assert_ne!(skeleton("\u{1D26}"), skeleton("G"));
+        assert_eq!(skeleton("\u{1D2B}"), skeleton("\u{041B}")); // Cyrillic el
+        assert_ne!(skeleton("\u{1D2B}"), skeleton("L"));
     }
 
     /// The shape homoglyphs — the half NFKC does NOT equate, so each is a
