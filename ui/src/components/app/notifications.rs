@@ -357,6 +357,32 @@ pub fn request_permission_on_first_message() {
     });
 }
 
+/// Every character a renderer may start a new line on, flattened to a space by
+/// [`notification_body`]: LF, CR, U+0085 NEXT LINE, U+2028 LINE SEPARATOR and
+/// U+2029 PARAGRAPH SEPARATOR.
+const NOTIFICATION_LINE_BREAKS: [char; 5] = ['\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}'];
+
+/// Build the `sender: message` body a notification displays.
+///
+/// The body is ONE flat string, so a message that can start a new line lets its
+/// author paint a second line reading exactly like a notification from someone
+/// else, including a moderator with a 🛡 in it. Every line-break character is
+/// therefore flattened to a space. The sender name needs no such treatment: it
+/// arrives already sanitised from
+/// [`crate::util::display_name::display_nickname`].
+///
+/// BOTH notification paths build their body here (the gateway shell bridge in
+/// [`show_notification`], and the direct Notifications API in
+/// [`create_notification_internal`]), so the guard cannot be half-applied and a
+/// third path cannot ship without it. Pinned by
+/// `both_notification_paths_go_through_notification_body`.
+fn notification_body(sender_name: &str, message_preview: &str) -> String {
+    format!(
+        "{sender_name}: {}",
+        message_preview.replace(NOTIFICATION_LINE_BREAKS, " ")
+    )
+}
+
 /// Show a notification for new messages in a room
 ///
 /// # Arguments
@@ -373,16 +399,7 @@ pub fn show_notification(
     // Gateway iframe: hand the notification to the shell (real origin) over the
     // postMessage bridge — the sandboxed iframe can't use the Notifications API.
     if is_in_shell_iframe() {
-        // Flatten line breaks out of the message text. The body renders as
-        // `sender: message`, so a message starting with a newline lets its author
-        // paint a second line that reads exactly like a notification from someone
-        // else — including a moderator with a 🛡 in it. The sender name itself is
-        // already sanitised.
-        let body = format!(
-            "{}: {}",
-            sender_name,
-            message_preview.replace(['\n', '\r', '\u{2028}', '\u{2029}', '\u{0085}'], " ")
-        );
+        let body = notification_body(sender_name, message_preview);
         post_notification_to_shell(room_key, room_name, &body);
         return;
     }
@@ -424,16 +441,7 @@ fn create_notification_internal(
     sender_name: &str,
     message_preview: &str,
 ) {
-    // Flatten line breaks out of the message text. The body renders as
-    // `sender: message`, so a message starting with a newline lets its author
-    // paint a second line that reads exactly like a notification from someone
-    // else — including a moderator with a 🛡 in it. The sender name itself is
-    // already sanitised.
-    let body = format!(
-        "{}: {}",
-        sender_name,
-        message_preview.replace(['\n', '\r', '\u{2028}', '\u{2029}', '\u{0085}'], " ")
-    );
+    let body = notification_body(sender_name, message_preview);
     info!(
         "Creating notification - title: '{}', body: '{}'",
         room_name, body
@@ -815,6 +823,70 @@ mod notify_gate_tests {
             },
             author_sk,
         )
+    }
+
+    /// A notification body renders as one flat `sender: message` line. Any
+    /// character the renderer breaks on lets a message author paint a second
+    /// line that reads as a notification from someone else, which is the exact
+    /// impersonation this guard exists to stop.
+    #[test]
+    fn notification_body_flattens_every_line_break() {
+        for (label, c) in [
+            ("LINE FEED", '\n'),
+            ("CARRIAGE RETURN", '\r'),
+            ("NEXT LINE", '\u{0085}'),
+            ("LINE SEPARATOR", '\u{2028}'),
+            ("PARAGRAPH SEPARATOR", '\u{2029}'),
+        ] {
+            let forged = format!("hi{c}Ian Clarke \u{1F6E1}: everyone is banned");
+            let body = notification_body("Mallory", &forged);
+            assert!(
+                !body.contains(c),
+                "U+{:04X} {label} survived into a notification body: {body:?}",
+                u32::from(c)
+            );
+            assert!(
+                body.starts_with("Mallory: hi Ian"),
+                "U+{:04X} {label} was not flattened to a space: {body:?}",
+                u32::from(c)
+            );
+        }
+    }
+
+    #[test]
+    fn notification_body_leaves_ordinary_text_alone() {
+        assert_eq!(
+            notification_body("Alice", "hello there"),
+            "Alice: hello there"
+        );
+        // The multi-message summary path passes an empty sender name.
+        assert_eq!(notification_body("", "3 new messages"), ": 3 new messages");
+    }
+
+    /// Both notification paths must build their body through
+    /// [`notification_body`]. They are `wasm`-only, so no behavioural test in
+    /// this crate can reach them: re-inlining the `format!` on either one
+    /// re-opens the hole on that path alone and every other test stays green.
+    #[test]
+    fn both_notification_paths_go_through_notification_body() {
+        let source = include_str!("notifications.rs");
+        let (production, _) = source
+            .split_once("mod notify_gate_tests")
+            .expect("this test module's own declaration marks the end of production code");
+
+        assert_eq!(
+            production
+                .matches("notification_body(sender_name, message_preview)")
+                .count(),
+            2,
+            "expected exactly two call sites (`show_notification` and \
+             `create_notification_internal`); a path stopped delegating"
+        );
+        assert!(
+            !production.contains("\"{}: {}\""),
+            "a notification path re-inlined the `sender: message` join, which \
+             skips the line-break strip that only `notification_body` applies"
+        );
     }
 
     #[test]

@@ -203,9 +203,10 @@ pub fn is_display_hidden(c: char) -> bool {
         // Pictographs, Emoticons, Transport, Supplemental Symbols and
         // Pictographs, Symbols and Pictographs Extended-A. 🛡 is U+1F6E1.
         | 0x1F000..=0x1FAFF
-        // ALL of plane 14. It is Default_Ignorable end to end (HarfBuzz, which
-        // backs Chrome/Firefox/Android, treats the whole plane that way), so
-        // every codepoint in it renders as nothing. Naming only the tag block
+        // Plane 14's Default_Ignorable range. `E0000..E0FFF` is the whole set
+        // Unicode marks ignorable in that plane, so every codepoint in it
+        // renders as nothing; the rest of plane 14 (`E1000..EFFFF`) is not
+        // ignorable and is left alone. Naming only the tag block
         // (`E0000..E007F`, the flag-sequence assembler 🏴󠁧󠁢󠁳󠁣󠁴󠁿) and the variation
         // selectors supplement left ~3,700 invisible characters through, each
         // of which clones another member's rendered name.
@@ -773,6 +774,111 @@ mod tests {
         ] {
             let out = sanitize_display_name(name);
             assert_eq!(out, want, "{label}: got {out:?}");
+        }
+    }
+
+    /// Both ends of every range widened here, plus the two codepoints the
+    /// widening comments name by hand (`U+20E0`, `U+20E3`).
+    ///
+    /// The tests above sample INTERIOR points, which catches a deleted range
+    /// but not a range narrowed by one, and off-by-one is the likelier edit.
+    /// Every entry below is a codepoint whose loss reopens a real vector: a
+    /// combining mark that rebuilds a badge by composition, an interlinear
+    /// annotation anchor that hides the text between two of them, or an
+    /// invisible plane-14 codepoint that clones another member's name.
+    #[test]
+    fn widened_range_endpoints_are_hidden() {
+        for (label, c) in [
+            // Combining Diacritical Marks for Symbols, 0x20D0..=0x20F0.
+            ("U+20D0 combining left harpoon above", '\u{20D0}'),
+            ("U+20E0 combining enclosing circle backslash", '\u{20E0}'),
+            ("U+20E3 combining enclosing keycap", '\u{20E3}'),
+            ("U+20F0 combining asterisk above", '\u{20F0}'),
+            // Halfwidth geometric shapes, 0xFFED..=0xFFEE.
+            ("U+FFED halfwidth black square", '\u{FFED}'),
+            ("U+FFEE halfwidth white circle", '\u{FFEE}'),
+            // Reserved Default_Ignorables + interlinear annotation,
+            // 0xFFF0..=0xFFFB.
+            ("U+FFF0 reserved Default_Ignorable", '\u{FFF0}'),
+            ("U+FFFB interlinear annotation terminator", '\u{FFFB}'),
+            // Aegean Numbers + Phaistos Disc, 0x10100..=0x101FC.
+            ("U+10100 aegean word separator line", '\u{10100}'),
+            ("U+101FC phaistos disc sign wavy band", '\u{101FC}'),
+            // Plane 14's Default_Ignorable range, 0xE0000..=0xE0FFF.
+            ("U+E0000 reserved tag codepoint", '\u{E0000}'),
+            ("U+E0FFF reserved Default_Ignorable", '\u{E0FFF}'),
+        ] {
+            assert!(
+                is_display_hidden(c),
+                "{label} is not stripped, so it can forge a badge or clone a name"
+            );
+            let cloned = format!("Ian{c} Clarke");
+            assert_eq!(
+                sanitize_display_name(&cloned),
+                "Ian Clarke",
+                "{label} survived sanitisation"
+            );
+            assert!(
+                contains_hidden_chars(&cloned),
+                "{label} is not rejected at the nickname input"
+            );
+        }
+    }
+
+    /// The upper constraint on every range widened here.
+    ///
+    /// Endpoint and interior assertions only pin a range from BELOW: they all
+    /// still pass if a future edit widens it further, which is how a strip rule
+    /// starts mangling real names. Widening `0xFFF0..=0xFFFB` to swallow
+    /// U+FFFD REPLACEMENT CHARACTER, or plane 14 to `0xEFFFF`, passes every
+    /// other test in this module.
+    #[test]
+    fn characters_just_outside_the_widened_ranges_stay_visible() {
+        for (label, c) in [
+            // Either side of 0x20D0..=0x20F0. Reserved codepoints render as a
+            // tofu box, so they are visible and cannot clone a name.
+            (
+                "U+20CF reserved, below the symbol combining marks",
+                '\u{20CF}',
+            ),
+            (
+                "U+20F1 reserved, above the symbol combining marks",
+                '\u{20F1}',
+            ),
+            // Below 0xFFED..=0xFFEE.
+            ("U+FFEC halfwidth downwards arrow", '\u{FFEC}'),
+            // The one-codepoint gap between 0xFFED..=0xFFEE and 0xFFF0..=0xFFFB,
+            // so this pins the top of one range and the bottom of the other.
+            ("U+FFEF reserved", '\u{FFEF}'),
+            // Above 0xFFF0..=0xFFFB. U+FFFD is what `String::from_utf8_lossy`
+            // emits, and `display_nickname`'s undecryptable fallback goes
+            // through it, so stripping it would blank a whole nickname.
+            ("U+FFFC object replacement character", '\u{FFFC}'),
+            ("U+FFFD replacement character", '\u{FFFD}'),
+            // Either side of 0x10100..=0x101FC.
+            ("U+100FF reserved, below Aegean Numbers", '\u{100FF}'),
+            (
+                "U+101FD phaistos disc combining oblique stroke",
+                '\u{101FD}',
+            ),
+            // Either side of 0xE0000..=0xE0FFF. Unicode's Default_Ignorable set
+            // for plane 14 ends at E0FFF; E1000 and up are ordinary reserved
+            // codepoints, and plane 13 below it is unassigned throughout.
+            ("U+DFFFF reserved, below plane 14", '\u{DFFFF}'),
+            ("U+E1000 reserved, above plane 14's ignorables", '\u{E1000}'),
+            ("U+EFFFF reserved, top of plane 14", '\u{EFFFF}'),
+        ] {
+            assert!(
+                !is_display_hidden(c),
+                "{label} is treated as hidden, so a widened range is now \
+                 stripping characters that are not invisible"
+            );
+            let name = format!("Ian{c} Clarke");
+            assert_eq!(
+                sanitize_display_name(&name),
+                name,
+                "{label} was stripped out of a name"
+            );
         }
     }
 
