@@ -139,28 +139,27 @@ jobs:
       # newly-added file. The named steps are kept for failure attribution.
       run: cargo test -p river-core --tests
 
-    - name: Test capped-collection retention (prune/resend loop)
+    - name: Test river-core integration targets (ALL of tests/)
       env:
         RUST_MIN_STACK: 8388608
         CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      # `MessagesV1` and `DirectMessagesV1` REMOVE entries in `apply_delta`, so
-      # `delta` must be filtered by the retention horizon the receiver
-      # publishes or the pair re-sends the same discarded payload forever
-      # (`delta` never returns `None`, so freenet-core's "empty delta -> skip"
-      # never fires). That loop made the room contract 63.7% of all
-      # byte-weighted broadcast work network-wide on 2026-07-25.
+      # `--tests` builds and runs EVERY target under `common/tests/`, plus the
+      # lib test target. Deliberately NOT an enumeration of `--test <name>`
+      # flags: the steps above enumerate, and that enumeration had silently
+      # drifted to cover only 7 of 14 targets. `convergence_tests` (the CRDT
+      # convergence suite), `direct_messages_test`, `deputy_ban_test`,
+      # `private_room_test`, `import_merge_test`, `memberid_test` and
+      # `stdlib_compat_test` had NO CI coverage at all, and neither did the
+      # retention suite this PR depends on — `cargo test -p river-core --lib`
+      # does not build integration targets, so a file nobody lists is invisible.
       #
-      # These targets are named EXPLICITLY because this job enumerates test
-      # targets one at a time: `cargo test -p river-core --lib` above does NOT
-      # build integration targets, so a target nobody lists here never runs in
-      # CI at all. `summary_determinism_test` is included because the horizon
-      # travels inside the summary, whose bytes freenet-core compares to decide
-      # staleness (freenet/freenet-core#4857).
-      run: >
-        cargo test -p river-core
-        --test retention_loop_test
-        --test retention_proptest
-        --test summary_determinism_test
+      # A new file under common/tests/ is now covered the moment it is added,
+      # with no workflow edit. The enumerated steps above are kept because a
+      # named failing step attributes a breakage at a glance; they are a
+      # strict subset of this one, and cost ~0.1s each.
+      #
+      # Runtime is ~72s, ~64s of which is `retention_proptest`.
+      run: cargo test -p river-core --tests
 
     - name: Test riverctl (CLI crate unit tests, incl. #292 recovery)
       env:
