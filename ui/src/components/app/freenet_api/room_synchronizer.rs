@@ -28,7 +28,7 @@ use freenet_stdlib::{
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
-use river_core::room_state::message::AuthorizedMessageV1;
+use river_core::room_state::message::{AuthorizedMessageV1, RetentionHorizon};
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::collections::HashMap;
@@ -83,12 +83,60 @@ fn compute_update_data(
     // None, so no upgrade sub-delta is ever emitted here.
     let state = strip_upgrade_pointer(state);
     if let Some(baseline) = baseline {
-        let summary = baseline.summarize(baseline, params);
+        let summary = outbound_summary(baseline, params);
         let delta = state.delta(baseline, params, &summary)?;
         Some(UpdateData::Delta(to_cbor_vec(&delta).into()))
     } else {
         Some(UpdateData::State(to_cbor_vec(&state).into()))
     }
+}
+
+/// The baseline summary for an OUTGOING update, with every retention horizon
+/// neutralised.
+///
+/// # Why the horizons must not survive here
+///
+/// A retention horizon is a **receiver-published** quantity: it says "do not
+/// offer me entries I would discard on arrival", and it is only meaningful
+/// when the summary came from the peer that will apply the delta.
+///
+/// `compute_update_data`'s `baseline` is NOT a receiver. It is
+/// `last_synced_state` — this device's own snapshot of what it last pushed.
+/// Feeding its horizon to `delta` therefore filters the sender's outgoing
+/// update against the SENDER's own retention window, which is meaningless at
+/// best and lossy at worst:
+///
+/// `message.time` is the browser's wall clock (`get_current_system_time`), so
+/// a device whose clock is behind by more than the room's retention window
+/// composes messages whose `order_key()` sorts at or below its own baseline's
+/// oldest retained key. Those get filtered OUT of the outgoing delta and are
+/// never put on the wire at all. Worse, `compute_update_data` returning `None`
+/// takes the `None` branch in `process_rooms`, which still calls
+/// `sync_info.state_updated(..)` and advances the baseline — so the message is
+/// never retried. It sits in the sender's own UI forever while no other peer
+/// ever sees it.
+///
+/// Before the retention horizon existed, such a message went out and the
+/// contract's own cap-prune decided its fate. Two things changed and both are
+/// regressions: it is now dropped BEFORE the wire, losing the case where
+/// canonical state is below cap and would have KEPT it; and the failure is
+/// silent and purely local.
+///
+/// So the outbound path takes the id-set difference ONLY — exactly the
+/// pre-horizon behaviour — and leaves retention to the contract, which is the
+/// only party that knows the canonical state and the room's real cap. The
+/// horizon still does its job on the RECEIVE path (`merge_incoming_state`),
+/// which is where the summary genuinely belongs to the applying peer.
+///
+/// Pinned by `outbound_update_is_not_filtered_by_the_senders_own_horizon`.
+fn outbound_summary(
+    baseline: &ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+) -> river_core::room_state::ChatRoomStateV1Summary {
+    let mut summary = baseline.summarize(baseline, params);
+    summary.recent_messages.horizon = RetentionHorizon::Open;
+    summary.direct_messages.pair_horizons.clear();
+    summary
 }
 
 /// Send a member-info self-heal as a standalone, member_info-only UPDATE.
@@ -2100,6 +2148,110 @@ mod tests {
             msgs_sentinel.messages, msgs_real.messages,
             "the two parents must be distinguishable to a field that reads \
              parent_state, or the equality assertion above pins nothing"
+        );
+    }
+
+    /// A locally-composed message must reach the wire even when its timestamp
+    /// sorts at or below the local baseline's oldest retained key.
+    ///
+    /// # The bug this pins
+    ///
+    /// `compute_update_data` used `baseline.summarize(baseline, params)`
+    /// directly. `baseline` is `last_synced_state` — this device's own
+    /// snapshot, NOT a receiver — so the retention horizon inside it filtered
+    /// the device's own outgoing update against its own retention window.
+    ///
+    /// `message.time` is the browser wall clock, so a device whose clock is
+    /// behind by more than the room's retention window composes messages that
+    /// sort below its own baseline's oldest key. Those were filtered out of the
+    /// outgoing delta and never put on the wire. `compute_update_data` then
+    /// returned `None`, which in `process_rooms` still calls
+    /// `sync_info.state_updated(..)` and advances the baseline — so the message
+    /// was never retried either. It sits in the sender's own UI forever while
+    /// no other peer ever receives it: silent, local, permanent loss.
+    ///
+    /// The horizon is a RECEIVER-published quantity and has no meaning on the
+    /// outbound path. `outbound_summary` neutralises it, restoring the pure
+    /// id-set difference and leaving retention to the contract.
+    #[test]
+    fn outbound_update_is_not_filtered_by_the_senders_own_horizon() {
+        use river_core::room_state::configuration::AuthorizedConfigurationV1;
+        use std::time::Duration;
+
+        let (mut room_state, params, owner_sk) = create_test_room();
+
+        let mut cfg = room_state.configuration.configuration.clone();
+        cfg.max_recent_messages = 3;
+        room_state.configuration = AuthorizedConfigurationV1::new(cfg, &owner_sk);
+
+        let msg_at = |secs: u64, body: &str| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: room_state.configuration.configuration.owner_member_id,
+                    author: MemberId::from(&owner_sk.verifying_key()),
+                    content: RoomMessageBody::public(body.to_string()),
+                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                },
+                &owner_sk,
+            )
+        };
+
+        // The baseline is AT capacity, so it publishes a real horizon.
+        for i in 0..3u64 {
+            room_state
+                .recent_messages
+                .messages
+                .push(msg_at(5_000 + i, &format!("synced-{i}")));
+        }
+        let baseline = room_state.clone();
+        assert!(
+            matches!(
+                baseline
+                    .recent_messages
+                    .retention_horizon(baseline.configuration.configuration.max_recent_messages),
+                river_core::room_state::message::RetentionHorizon::OldestRetained(_)
+            ),
+            "test premise: the baseline must be at capacity and publish a real horizon"
+        );
+
+        // A message this device just composed, but whose clock-derived
+        // timestamp lands BELOW everything the baseline retains. This is the
+        // skewed-clock case; it must still go out.
+        let skewed = msg_at(1_000, "composed-with-a-slow-clock");
+        let mut current = room_state.clone();
+        current.recent_messages.messages.push(skewed.clone());
+
+        let update = compute_update_data(&current, Some(&baseline), &params)
+            .expect("a newly composed message must produce an outgoing update");
+
+        let bytes = match update {
+            UpdateData::Delta(d) => d.into_bytes(),
+            other => panic!("expected a delta, got {other:?}"),
+        };
+        let delta: ChatRoomStateV1Delta =
+            ciborium::de::from_reader(bytes.as_slice()).expect("decode outgoing delta");
+
+        let sent: Vec<_> = delta
+            .recent_messages
+            .as_ref()
+            .map(|m: &Vec<AuthorizedMessageV1>| m.iter().map(|m| m.id()).collect())
+            .unwrap_or_default();
+        assert!(
+            sent.contains(&skewed.id()),
+            "the locally-composed message was filtered out of the OUTGOING update by \
+             this device's OWN retention horizon. `message.time` is the browser clock, \
+             so a device running behind would silently never send anything — and the \
+             `None` branch in process_rooms advances the baseline, so it is never \
+             retried. See `outbound_summary`."
+        );
+
+        // Guard the other direction: neutralising the horizon must not turn the
+        // outgoing delta into a full resend of everything already synced.
+        assert_eq!(
+            sent.len(),
+            1,
+            "only the genuinely-new message should be sent; the id-set difference \
+             still does its job"
         );
     }
 }
