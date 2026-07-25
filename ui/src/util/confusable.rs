@@ -901,68 +901,76 @@ fn fold_presentation_form(c: char) -> Option<char> {
 fn fold_nfkc_letter(c: char) -> Option<char> {
     Some(match u32::from(c) {
         // 88 characters, generated from Unicode NFKC data.
-        0x00AA => 'a',  // FEMININE ORDINAL INDICATOR
-        0x00BA => 'o',  // MASCULINE ORDINAL INDICATOR
-        0x02B0 => 'h',  // MODIFIER LETTER SMALL H
-        0x02B2 => 'j',  // MODIFIER LETTER SMALL J
-        0x02B3 => 'r',  // MODIFIER LETTER SMALL R
-        0x02B7 => 'w',  // MODIFIER LETTER SMALL W
-        0x02B8 => 'y',  // MODIFIER LETTER SMALL Y
-        0x02E1 => 'l',  // MODIFIER LETTER SMALL L
-        0x02E2 => 's',  // MODIFIER LETTER SMALL S
-        0x02E3 => 'x',  // MODIFIER LETTER SMALL X
-        0x1D2C => 'A',  // MODIFIER LETTER CAPITAL A
-        0x1D2E => 'B',  // MODIFIER LETTER CAPITAL B
-        0x1D30 => 'D',  // MODIFIER LETTER CAPITAL D
-        0x1D31 => 'E',  // MODIFIER LETTER CAPITAL E
-        0x1D33 => 'G',  // MODIFIER LETTER CAPITAL G
-        0x1D34 => 'H',  // MODIFIER LETTER CAPITAL H
-        0x1D35 => 'I',  // MODIFIER LETTER CAPITAL I
-        0x1D36 => 'J',  // MODIFIER LETTER CAPITAL J
-        0x1D37 => 'K',  // MODIFIER LETTER CAPITAL K
-        0x1D38 => 'L',  // MODIFIER LETTER CAPITAL L
-        0x1D39 => 'M',  // MODIFIER LETTER CAPITAL M
-        0x1D3A => 'N',  // MODIFIER LETTER CAPITAL N
-        0x1D3C => 'O',  // MODIFIER LETTER CAPITAL O
-        0x1D3E => 'P',  // MODIFIER LETTER CAPITAL P
-        0x1D3F => 'R',  // MODIFIER LETTER CAPITAL R
-        0x1D40 => 'T',  // MODIFIER LETTER CAPITAL T
-        0x1D41 => 'U',  // MODIFIER LETTER CAPITAL U
-        0x1D42 => 'W',  // MODIFIER LETTER CAPITAL W
-        0x1D43 => 'a',  // MODIFIER LETTER SMALL A
-        0x1D47 => 'b',  // MODIFIER LETTER SMALL B
-        0x1D48 => 'd',  // MODIFIER LETTER SMALL D
-        0x1D49 => 'e',  // MODIFIER LETTER SMALL E
-        0x1D4D => 'g',  // MODIFIER LETTER SMALL G
-        0x1D4F => 'k',  // MODIFIER LETTER SMALL K
-        0x1D50 => 'm',  // MODIFIER LETTER SMALL M
-        0x1D52 => 'o',  // MODIFIER LETTER SMALL O
-        0x1D56 => 'p',  // MODIFIER LETTER SMALL P
-        0x1D57 => 't',  // MODIFIER LETTER SMALL T
-        0x1D58 => 'u',  // MODIFIER LETTER SMALL U
-        0x1D5B => 'v',  // MODIFIER LETTER SMALL V
-        0x1D62 => 'i',  // LATIN SUBSCRIPT SMALL LETTER I
-        0x1D63 => 'r',  // LATIN SUBSCRIPT SMALL LETTER R
-        0x1D64 => 'u',  // LATIN SUBSCRIPT SMALL LETTER U
-        0x1D65 => 'v',  // LATIN SUBSCRIPT SMALL LETTER V
-        0x1D9C => 'c',  // MODIFIER LETTER SMALL C
-        0x1DA0 => 'f',  // MODIFIER LETTER SMALL F
-        0x1DBB => 'z',  // MODIFIER LETTER SMALL Z
-        0x2071 => 'i',  // SUPERSCRIPT LATIN SMALL LETTER I
-        0x207F => 'n',  // SUPERSCRIPT LATIN SMALL LETTER N
-        0x2090 => 'a',  // LATIN SUBSCRIPT SMALL LETTER A
-        0x2091 => 'e',  // LATIN SUBSCRIPT SMALL LETTER E
-        0x2092 => 'o',  // LATIN SUBSCRIPT SMALL LETTER O
-        0x2093 => 'x',  // LATIN SUBSCRIPT SMALL LETTER X
-        0x2095 => 'h',  // LATIN SUBSCRIPT SMALL LETTER H
-        0x2096 => 'k',  // LATIN SUBSCRIPT SMALL LETTER K
-        0x2097 => 'l',  // LATIN SUBSCRIPT SMALL LETTER L
-        0x2098 => 'm',  // LATIN SUBSCRIPT SMALL LETTER M
-        0x2099 => 'n',  // LATIN SUBSCRIPT SMALL LETTER N
-        0x209A => 'p',  // LATIN SUBSCRIPT SMALL LETTER P
-        0x209B => 's',  // LATIN SUBSCRIPT SMALL LETTER S
-        0x209C => 't',  // LATIN SUBSCRIPT SMALL LETTER T
-        0x212A => 'K',  // KELVIN SIGN
+        0x00AA => 'a', // FEMININE ORDINAL INDICATOR
+        0x00BA => 'o', // MASCULINE ORDINAL INDICATOR
+        0x02B0 => 'h', // MODIFIER LETTER SMALL H
+        0x02B2 => 'j', // MODIFIER LETTER SMALL J
+        0x02B3 => 'r', // MODIFIER LETTER SMALL R
+        0x02B7 => 'w', // MODIFIER LETTER SMALL W
+        0x02B8 => 'y', // MODIFIER LETTER SMALL Y
+        0x02E1 => 'l', // MODIFIER LETTER SMALL L
+        0x02E2 => 's', // MODIFIER LETTER SMALL S
+        0x02E3 => 'x', // MODIFIER LETTER SMALL X
+        0x1D2C => 'A', // MODIFIER LETTER CAPITAL A
+        0x1D2E => 'B', // MODIFIER LETTER CAPITAL B
+        0x1D30 => 'D', // MODIFIER LETTER CAPITAL D
+        0x1D31 => 'E', // MODIFIER LETTER CAPITAL E
+        0x1D33 => 'G', // MODIFIER LETTER CAPITAL G
+        0x1D34 => 'H', // MODIFIER LETTER CAPITAL H
+        0x1D35 => 'I', // MODIFIER LETTER CAPITAL I
+        0x1D36 => 'J', // MODIFIER LETTER CAPITAL J
+        0x1D37 => 'K', // MODIFIER LETTER CAPITAL K
+        0x1D38 => 'L', // MODIFIER LETTER CAPITAL L
+        0x1D39 => 'M', // MODIFIER LETTER CAPITAL M
+        0x1D3A => 'N', // MODIFIER LETTER CAPITAL N
+        0x1D3C => 'O', // MODIFIER LETTER CAPITAL O
+        0x1D3E => 'P', // MODIFIER LETTER CAPITAL P
+        0x1D3F => 'R', // MODIFIER LETTER CAPITAL R
+        0x1D40 => 'T', // MODIFIER LETTER CAPITAL T
+        0x1D41 => 'U', // MODIFIER LETTER CAPITAL U
+        0x1D42 => 'W', // MODIFIER LETTER CAPITAL W
+        0x1D43 => 'a', // MODIFIER LETTER SMALL A
+        0x1D47 => 'b', // MODIFIER LETTER SMALL B
+        0x1D48 => 'd', // MODIFIER LETTER SMALL D
+        0x1D49 => 'e', // MODIFIER LETTER SMALL E
+        0x1D4D => 'g', // MODIFIER LETTER SMALL G
+        0x1D4F => 'k', // MODIFIER LETTER SMALL K
+        0x1D50 => 'm', // MODIFIER LETTER SMALL M
+        0x1D52 => 'o', // MODIFIER LETTER SMALL O
+        0x1D56 => 'p', // MODIFIER LETTER SMALL P
+        0x1D57 => 't', // MODIFIER LETTER SMALL T
+        0x1D58 => 'u', // MODIFIER LETTER SMALL U
+        0x1D5B => 'v', // MODIFIER LETTER SMALL V
+        0x1D62 => 'i', // LATIN SUBSCRIPT SMALL LETTER I
+        0x1D63 => 'r', // LATIN SUBSCRIPT SMALL LETTER R
+        0x1D64 => 'u', // LATIN SUBSCRIPT SMALL LETTER U
+        0x1D65 => 'v', // LATIN SUBSCRIPT SMALL LETTER V
+        0x1D9C => 'c', // MODIFIER LETTER SMALL C
+        0x1DA0 => 'f', // MODIFIER LETTER SMALL F
+        0x1DBB => 'z', // MODIFIER LETTER SMALL Z
+        0x2071 => 'i', // SUPERSCRIPT LATIN SMALL LETTER I
+        0x207F => 'n', // SUPERSCRIPT LATIN SMALL LETTER N
+        0x2090 => 'a', // LATIN SUBSCRIPT SMALL LETTER A
+        0x2091 => 'e', // LATIN SUBSCRIPT SMALL LETTER E
+        0x2092 => 'o', // LATIN SUBSCRIPT SMALL LETTER O
+        0x2093 => 'x', // LATIN SUBSCRIPT SMALL LETTER X
+        0x2095 => 'h', // LATIN SUBSCRIPT SMALL LETTER H
+        0x2096 => 'k', // LATIN SUBSCRIPT SMALL LETTER K
+        0x2097 => 'l', // LATIN SUBSCRIPT SMALL LETTER L
+        0x2098 => 'm', // LATIN SUBSCRIPT SMALL LETTER M
+        0x2099 => 'n', // LATIN SUBSCRIPT SMALL LETTER N
+        0x209A => 'p', // LATIN SUBSCRIPT SMALL LETTER P
+        0x209B => 's', // LATIN SUBSCRIPT SMALL LETTER S
+        0x209C => 't', // LATIN SUBSCRIPT SMALL LETTER T
+        0x212A => 'K', // KELVIN SIGN
+        // ANGSTROM SIGN. NFKC gives `\u{00C5}` (A-with-ring), NOT an ASCII
+        // letter, so the generated sweep correctly skipped it — but that is one
+        // more step, not a different answer: `\u{00C5}` is then accent-stripped
+        // to `A` like any other ring-A. Added by hand so the two-step path
+        // lands where the one-step path does. Found by requiring tier 1 in
+        // `roman_numerals_and_nfkc_letters_fold`; under the weaker `is_some()`
+        // assertion it read as a match at NearMiss.
+        0x212B => 'A',  // ANGSTROM SIGN
         0x2139 => 'i',  // INFORMATION SOURCE
         0x2145 => 'D',  // DOUBLE-STRUCK ITALIC CAPITAL D
         0x2146 => 'd',  // DOUBLE-STRUCK ITALIC SMALL D
@@ -1646,9 +1654,19 @@ mod tests {
                 real,
                 mid(1),
             )]);
-            assert!(
-                checker.check(mid(2), attacker).is_some(),
-                "{label}: {attacker:?} must be flagged against {real:?}"
+            // Must be TIER 1. Asserting only `is_some()` was too weak:
+            // a missing fold entry leaves a one-character difference, which
+            // still matches at NearMiss — a tier this UI does not render. Two
+            // mutants (dropping the lunate-sigma and Cyrillic-combining
+            // entries) survived against the weaker assertion.
+            let w = checker.check(mid(2), attacker).unwrap_or_else(|| {
+                panic!("{label}: {attacker:?} must be flagged against {real:?}")
+            });
+            assert_eq!(
+                w.tier,
+                ConfusableTier::Identical,
+                "{label}: {attacker:?} must fold to the SAME skeleton as \
+                 {real:?}, not merely land within the edit budget"
             );
         }
     }
@@ -1676,9 +1694,19 @@ mod tests {
                 real,
                 mid(1),
             )]);
-            assert!(
-                checker.check(mid(2), attacker).is_some(),
-                "{label}: {attacker:?} must be flagged against {real:?}"
+            // Must be TIER 1. Asserting only `is_some()` was too weak:
+            // a missing fold entry leaves a one-character difference, which
+            // still matches at NearMiss — a tier this UI does not render. Two
+            // mutants (dropping the lunate-sigma and Cyrillic-combining
+            // entries) survived against the weaker assertion.
+            let w = checker.check(mid(2), attacker).unwrap_or_else(|| {
+                panic!("{label}: {attacker:?} must be flagged against {real:?}")
+            });
+            assert_eq!(
+                w.tier,
+                ConfusableTier::Identical,
+                "{label}: {attacker:?} must fold to the SAME skeleton as \
+                 {real:?}, not merely land within the edit budget"
             );
         }
     }
