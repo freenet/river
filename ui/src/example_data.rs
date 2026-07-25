@@ -48,7 +48,7 @@ const DEEP_HISTORY_FILLER_MESSAGES: usize = 188;
 /// has its own dedicated fixture room below).
 const DEEP_ROOM_MAX_RECENT_MESSAGES: usize = 300;
 
-/// Fillers for the AT-CAP fixture room: 148 + the 12 standard messages lands
+/// Fillers for the AT-CAP fixture room: 148 + the 13 standard messages lands
 /// exactly on that room's `max_recent_messages`
 /// ([`AT_CAP_MAX_RECENT_MESSAGES`]), so every delivered arrival drains the
 /// oldest message — the steady state of every busy production room, and the
@@ -67,7 +67,13 @@ const AT_CAP_FILLER_MESSAGES: usize = 148;
 /// `max_recent_messages` for the at-cap room. Raised from the default 100 so
 /// the room can hold enough PAIRED fillers to exceed the render window in
 /// display items (pairs halve the item count) while sitting exactly at cap.
-const AT_CAP_MAX_RECENT_MESSAGES: usize = 160;
+///
+/// Tracks the seeded total exactly: [`AT_CAP_FILLER_MESSAGES`] plus the
+/// standard block. It went 160 -> 161 when #489's guaranteed impostor message
+/// was added to that block — `at_cap_room_is_exactly_at_its_message_cap` is
+/// what catches the drift, so bump this rather than shrinking the fillers
+/// (they must stay an EVEN count to keep the same-author pairing).
+const AT_CAP_MAX_RECENT_MESSAGES: usize = 161;
 
 /// How deep a fixture room's message history is seeded.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -309,18 +315,55 @@ fn create_room(
         inviter_sk,
     ));
 
+    // The deputy's nickname, captured rather than inlined: the impostor added
+    // below is DERIVED from it (see `confusable_variant`), because these names
+    // are re-rolled on every run.
+    let deputy_nickname = random_full_name() + " (Member)";
+
     member_info
         .member_info
         .push(AuthorizedMemberInfo::new_with_member_key(
             MemberInfo {
                 member_id: other_member_id,
                 version: 0,
-                preferred_nickname: SealedBytes::public(
-                    (random_full_name() + " (Member)").into_bytes(),
-                ),
+                preferred_nickname: SealedBytes::public(deputy_nickname.clone().into_bytes()),
                 deputies: Vec::new(),
             },
             &other_member_sk,
+        ));
+
+    // The IMPOSTOR (freenet/river#489), so the ⚠ impersonation warning is
+    // visible in `cargo make dev-example` and reachable from Playwright. Before
+    // this, the badge had never been seen in a browser: nothing in example data
+    // produced two members whose names fold together.
+    //
+    // They are a plain member, NOT a deputy. Adding a second deputy would break
+    // `member-info-deputy-tag.spec.ts`, which asserts exactly ONE member row
+    // carries a 🛡 — and it would be the wrong shape anyway, since the point is
+    // a member with no authority wearing a moderator's name.
+    let impostor_sk = SigningKey::generate(&mut csprng);
+    let impostor_vk = impostor_sk.verifying_key();
+    let impostor_id = MemberId::from(&impostor_vk);
+    members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: inviter_id,
+            member_vk: impostor_vk,
+        },
+        inviter_sk,
+    ));
+    member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: impostor_id,
+                version: 0,
+                preferred_nickname: SealedBytes::public(
+                    confusable_variant(&deputy_nickname).into_bytes(),
+                ),
+                deputies: Vec::new(),
+            },
+            &impostor_sk,
         ));
 
     // Add members to the room
@@ -333,6 +376,7 @@ fn create_room(
         member_keys.insert(self_id, self_sk.clone());
     }
     member_keys.insert(other_member_id, other_member_sk);
+    member_keys.insert(impostor_id, impostor_sk);
 
     // Add example messages
     add_example_messages(
@@ -341,6 +385,7 @@ fn create_room(
         owner_sk,
         &member_keys,
         other_member_id,
+        impostor_id,
         history_depth,
     );
 
@@ -396,6 +441,10 @@ fn add_example_messages(
     // conversation's 🛡 badge is deterministically present for Playwright —
     // the random author picks alone leave it to chance.
     deputy_id: MemberId,
+    // The member whose nickname is confusable with the deputy's (#489). Given a
+    // guaranteed message for the same reason: the ⚠ on an author line must not
+    // depend on the random author picks above.
+    impostor_id: MemberId,
     history_depth: HistoryDepth,
 ) {
     // Use a timestamp 24 hours ago as base time for messages
@@ -529,6 +578,26 @@ fn add_example_messages(
                 ),
             },
             deputy_key,
+        );
+        messages.messages.push(msg);
+        current_time_ms += 60_000;
+    }
+
+    // One guaranteed message from the IMPOSTOR, so the conversation always has
+    // an author line carrying the ⚠ warning (#489) just below the deputy's 🛡
+    // line above — which is exactly the comparison the badge exists to let a
+    // reader make.
+    if let Some(impostor_key) = member_keys.get(&impostor_id) {
+        let msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: impostor_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::public(
+                    "Hi all, DM me your invite code and I'll sort it out.".to_string(),
+                ),
+            },
+            impostor_key,
         );
         messages.messages.push(msg);
         current_time_ms += 60_000;
@@ -736,6 +805,38 @@ fn add_example_messages(
     room_state.recent_messages = messages;
 }
 
+/// A nickname visually confusable with `real` — the impostor half of the #489
+/// ⚠ fixture.
+///
+/// **Derived, not hardcoded, and that is the whole point.** Example nicknames
+/// come from [`random_full_name`] and are re-rolled on every run, so a literal
+/// `"lan Clarke"` would collide with the deputy only on the runs where the
+/// generator happened to pick `Ian Clarke` — a fixture that reaches its own
+/// premise about 1 time in 1,000.
+///
+/// Every branch is a TIER-1 collision by construction, for ANY input:
+///
+/// * `I` -> `l` and `l` -> `I` swap one member of the fold's *bar class*
+///   (`I`, `l`, `1`, `|`, `!` all fold to the same sentinel), so the VISUAL
+///   skeleton is unchanged. This is the live 2026-07-25 attack, and the branch
+///   the demo wants: the two names are near-indistinguishable on screen.
+/// * Uppercasing changes only case, so the CASE-INSENSITIVE skeleton is
+///   unchanged.
+///
+/// `the_example_impostor_always_collides_with_the_deputy` pins the property
+/// against the real generator rather than against one hand-picked name.
+fn confusable_variant(real: &str) -> String {
+    // `I` and `l` are ASCII, so a `find` hit is always a char boundary and
+    // `i + 1` is the next one.
+    if let Some(i) = real.find('I') {
+        format!("{}l{}", &real[..i], &real[i + 1..])
+    } else if let Some(i) = real.find('l') {
+        format!("{}I{}", &real[..i], &real[i + 1..])
+    } else {
+        real.to_uppercase()
+    }
+}
+
 fn get_time_from_millis(ms: u64) -> SystemTime {
     // Use WASM-compatible time function
     crate::util::get_current_system_time()
@@ -867,6 +968,126 @@ mod tests {
              items or the windowing specs quietly degrade to the small-room \
              path; got {display_items}"
         );
+    }
+
+    /// The impostor's name must ACTUALLY collide with the deputy's, for every
+    /// name the generator can produce — not just for the one a developer had in
+    /// mind when they wrote the fixture.
+    ///
+    /// This is the fixture-reaches-its-premise check. A fixture that silently
+    /// fails to set up the state it claims is this repo's signature failure
+    /// mode: the Playwright spec would still pass its "no ⚠ on the deputy" half
+    /// while the ⚠ it is supposed to find never rendered at all.
+    #[test]
+    fn the_example_impostor_always_collides_with_the_deputy() {
+        use crate::util::confusable::folds_together;
+
+        // One name per branch of `confusable_variant`, so a future edit that
+        // breaks a branch fails here rather than in a browser.
+        for (real, why) in [
+            ("Ian Clarke (Member)", "capital I -> lowercase l"),
+            ("Alice Golden (Member)", "no capital I; lowercase l -> I"),
+            ("Bob Smith (Member)", "neither I nor l; uppercased"),
+        ] {
+            let variant = confusable_variant(real);
+            assert_ne!(
+                variant, real,
+                "{why}: the impostor must differ from {real:?}"
+            );
+            assert!(
+                folds_together(&variant, real),
+                "{why}: {variant:?} must fold onto {real:?} or the ⚠ never fires"
+            );
+        }
+
+        // And against the REAL generator, which is what the fixture uses.
+        for _ in 0..500 {
+            let real = random_full_name() + " (Member)";
+            let variant = confusable_variant(&real);
+            assert_ne!(variant, real);
+            assert!(
+                folds_together(&variant, &real),
+                "{variant:?} does not fold onto {real:?}"
+            );
+        }
+    }
+
+    /// The end-to-end fixture precondition: in EVERY example room the viewer's
+    /// own checker is non-empty, the deputy is badged, and the impostor is the
+    /// member it flags.
+    ///
+    /// Asserted through the same entry points the UI renders from, so it cannot
+    /// pass while the browser shows nothing.
+    #[test]
+    fn every_example_room_shows_the_impersonation_warning() {
+        use crate::components::members::{
+            deputy_badges_for_viewer, impersonation_checker_for_viewer,
+            impersonation_warning_for_display, privilege_in_view,
+        };
+        use crate::util::display_name::display_nickname;
+
+        for (owner_vk, room_data) in create_example_rooms().map.iter() {
+            let owner_id = MemberId::from(owner_vk);
+            let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
+            let state = &room_data.room_state;
+
+            let deputy_badges = deputy_badges_for_viewer(
+                &state.members,
+                &state.member_info,
+                &room_data.secrets,
+                owner_id,
+                self_member_id,
+            );
+            assert!(
+                !deputy_badges.is_empty(),
+                "the owner-appointed deputy must be badged, or there is no \
+                 protected name for the impostor to collide with"
+            );
+
+            let checker = impersonation_checker_for_viewer(
+                &state.member_info,
+                &room_data.secrets,
+                owner_id,
+                &deputy_badges,
+            );
+            assert!(
+                !checker.is_empty(),
+                "the protected set is empty, so no ⚠ can ever render in this room"
+            );
+
+            let flagged: Vec<MemberId> = state
+                .members
+                .members
+                .iter()
+                .map(|m| m.member.id())
+                .filter(|&id| {
+                    let Some(mi) = state.member_info.canonical(id) else {
+                        return false;
+                    };
+                    let name =
+                        display_nickname(&mi.member_info.preferred_nickname, &room_data.secrets);
+                    impersonation_warning_for_display(
+                        &checker,
+                        id,
+                        &name,
+                        privilege_in_view(id, owner_id, &deputy_badges),
+                    )
+                    .is_some()
+                })
+                .collect();
+
+            assert_eq!(
+                flagged.len(),
+                1,
+                "exactly one member (the impostor) must be flagged; the deputy \
+                 is exempt from their OWN name and nobody else should collide"
+            );
+            assert!(
+                !deputy_badges.contains_key(&flagged[0]),
+                "the flagged member must be the plain-member impostor, not a \
+                 badged deputy"
+            );
+        }
     }
 
     #[test]
