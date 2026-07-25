@@ -66,15 +66,21 @@ pub struct DeputyGrant {
     pub deputizer: DeputyParty,
     pub deputy: DeputyParty,
     pub scope: DeputyScope,
-    /// How many members this grant currently reaches: the size of the
-    /// deputizer's invite subtree, or the whole member list for an owner grant.
+    /// How many members this grant can currently be used against.
     ///
-    /// This is what separates "the grant exists" from "the grant does anything".
-    /// Per `MembersV1::is_ban_authorized`, a non-owner deputizer's grant only
-    /// fires where that deputizer is a strict invite ancestor of the ban target,
-    /// so a deputizer who has invited nobody confers nothing even while
-    /// [`Self::active`] is true. Most members have invited nobody, so that is
-    /// the common case, not a corner.
+    /// This is what separates "the grant exists" from "the grant does anything",
+    /// and it is computed from `MembersV1::is_ban_authorized`'s actual rules:
+    ///
+    /// * `0` whenever [`Self::active`] is false, since the contract honours
+    ///   nothing in that case.
+    /// * For an owner grant, every member. That grant is absolute (step 3,
+    ///   checked before the guardrail), and the owner is never a valid target.
+    /// * Otherwise the deputizer's invite subtree (step 5), minus any member of
+    ///   it who has themselves deputized this deputy, since step 4 denies a ban
+    ///   whose target lists the banner in their own `deputies`.
+    ///
+    /// Frequently `0` for a live grant: most members have invited nobody, so a
+    /// grant from them reaches no one. That is the common case, not a corner.
     pub reaches_members: usize,
     /// Whether the grant is structurally live: both parties are currently in the
     /// room. The load-bearing half is the DEPUTY: `is_ban_authorized` gates both
@@ -120,9 +126,9 @@ pub struct RoomDeputies<'a> {
     deputies_by_deputizer: BTreeMap<MemberId, Vec<MemberId>>,
     /// Every id this room mentions anywhere (see [`Self::resolve_short_id`]).
     known_ids: BTreeSet<MemberId>,
-    /// `member -> number of members they invited, directly or indirectly`, for
-    /// every member with a non-empty subtree.
-    subtree_sizes: HashMap<MemberId, usize>,
+    /// `member -> the members they invited, directly or indirectly`, for every
+    /// member with a non-empty subtree.
+    subtrees: HashMap<MemberId, HashSet<MemberId>>,
 }
 
 impl<'a> RoomDeputies<'a> {
@@ -152,7 +158,11 @@ impl<'a> RoomDeputies<'a> {
         let mut deputies_by_deputizer: BTreeMap<MemberId, Vec<MemberId>> = BTreeMap::new();
         for deputizer in candidates {
             let mut ids: Vec<MemberId> = state.member_info.deputies_of(deputizer).to_vec();
-            ids.sort_by_key(|id| id.to_string());
+            // Sort by (printed id, id) rather than printed id alone: the printed
+            // form is 40 bits of a 64-bit hash, so two distinct ids CAN print
+            // the same, and under a printed-id-only sort they need not land
+            // adjacent, which would defeat `dedup`.
+            ids.sort_by_key(|id| (id.to_string(), *id));
             ids.dedup();
             deputies_by_deputizer.insert(deputizer, ids);
         }
@@ -171,7 +181,7 @@ impl<'a> RoomDeputies<'a> {
             known_ids.extend(deputies.iter().copied());
         }
 
-        let subtree_sizes = invite_subtree_sizes(state);
+        let subtrees = invite_subtrees(state);
 
         Self {
             state,
@@ -180,7 +190,7 @@ impl<'a> RoomDeputies<'a> {
             current_members,
             deputies_by_deputizer,
             known_ids,
-            subtree_sizes,
+            subtrees,
         }
     }
 
@@ -240,12 +250,14 @@ impl<'a> RoomDeputies<'a> {
     }
 
     /// Resolve one member for display.
+    ///
+    /// `nickname` is the FAITHFUL decoded value, not an escaped one: it is
+    /// serialized into `-f json`, where a relay or bridge needs the real string
+    /// and JSON escaping already makes it safe. Escaping happens at the terminal
+    /// print sites ([`party_label`] / [`display_nickname`]).
     pub fn party(&self, id: MemberId) -> DeputyParty {
         let nickname = self.member_info().canonical(id).map(|info| {
-            sanitize_for_terminal(&crate::api::unseal_nickname_display(
-                &info.member_info.preferred_nickname,
-                self.secrets,
-            ))
+            crate::api::unseal_nickname_display(&info.member_info.preferred_nickname, self.secrets)
         });
         DeputyParty {
             member_id: id.to_string(),
@@ -255,26 +267,50 @@ impl<'a> RoomDeputies<'a> {
         }
     }
 
-    /// How many members `id`'s grants reach: everyone for the owner, otherwise
-    /// the size of `id`'s invite subtree.
-    fn reach_of(&self, id: MemberId) -> usize {
-        if id == self.owner_id {
-            self.current_members.len()
-        } else {
-            self.subtree_sizes.get(&id).copied().unwrap_or(0)
+    /// How many members a `deputizer -> deputy` grant can actually be used
+    /// against, per `MembersV1::is_ban_authorized`.
+    ///
+    /// The owner's grant is absolute (step 3, checked BEFORE the guardrail), so
+    /// it reaches every member. A non-owner's grant reaches only that member's
+    /// invite subtree (step 5), minus any subtree member who has themselves
+    /// deputized this deputy: step 4 denies a ban whose TARGET lists the banner
+    /// in their own `deputies`, so those members are not reachable.
+    fn reach_of(&self, deputizer: MemberId, deputy: MemberId) -> usize {
+        if deputizer == self.owner_id {
+            // The owner is never in `members.members`, and `is_ban_authorized`
+            // refuses `target == owner` outright, so the member list is already
+            // exactly the set of valid targets.
+            return self.current_members.len();
         }
+        self.subtrees
+            .get(&deputizer)
+            .map(|subtree| {
+                subtree
+                    .iter()
+                    .filter(|target| !self.deputies_of(**target).contains(&deputy))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Build the resolved view of a single `deputizer -> deputy` grant.
     pub fn grant(&self, deputizer: MemberId, deputy: MemberId) -> DeputyGrant {
+        let active = self.in_room(deputizer) && self.in_room(deputy);
         DeputyGrant {
             scope: if deputizer == self.owner_id {
                 DeputyScope::RoomWide
             } else {
                 DeputyScope::InviteSubtree
             },
-            active: self.in_room(deputizer) && self.in_room(deputy),
-            reaches_members: self.reach_of(deputizer),
+            // Zero when the grant is inert, so a script filtering
+            // `reaches_members > 0` for real moderation authority cannot get a
+            // false positive from a grant the contract would refuse outright.
+            reaches_members: if active {
+                self.reach_of(deputizer, deputy)
+            } else {
+                0
+            },
+            active,
             deputizer: self.party(deputizer),
             deputy: self.party(deputy),
         }
@@ -335,15 +371,19 @@ impl<'a> RoomDeputies<'a> {
     }
 }
 
-/// `member -> number of members they invited, directly or indirectly`, for every
+/// `member -> the members they invited, directly or indirectly`, for every
 /// member with a non-empty invite subtree.
 ///
-/// Mirrors the traversal `MembersV1::get_downstream_members` performs (which is
-/// private to the contract crate), including its visited-set cycle guard, so the
-/// reach reported here matches the subtree `is_ban_authorized` grants authority
-/// over. The owner is excluded: they are never in `members.members`, and their
-/// reach is the whole room, handled separately.
-fn invite_subtree_sizes(state: &ChatRoomStateV1) -> HashMap<MemberId, usize> {
+/// Computes the same set `MembersV1::get_downstream_members` does (which is
+/// private to the contract crate), so the reach reported here matches the
+/// subtree `is_ban_authorized` grants authority over. It additionally carries a
+/// visited-set guard that the contract's version omits: the contract can rely on
+/// `verify` having rejected circular invite chains, whereas this reads a fetched
+/// state directly and must not hang on a malformed one.
+///
+/// The owner is excluded: they are never in `members.members`, and their reach
+/// is the whole room, handled separately.
+fn invite_subtrees(state: &ChatRoomStateV1) -> HashMap<MemberId, HashSet<MemberId>> {
     let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
     for member in &state.members.members {
         children
@@ -352,50 +392,67 @@ fn invite_subtree_sizes(state: &ChatRoomStateV1) -> HashMap<MemberId, usize> {
             .push(member.member.id());
     }
 
-    let mut sizes = HashMap::new();
+    let mut subtrees = HashMap::new();
     for root in children.keys().copied() {
         let mut seen: HashSet<MemberId> = HashSet::new();
         let mut stack = vec![root];
         while let Some(current) = stack.pop() {
             for child in children.get(&current).into_iter().flatten() {
-                // A self-invite or an invite cycle would otherwise loop forever;
-                // `seen` also stops a descendant from being counted twice.
+                // `*child != root` keeps a member out of their own subtree (a
+                // strict-ancestor relation, matching `is_ban_authorized`), and
+                // `seen.insert` gates the push so a cycle terminates.
                 if *child != root && seen.insert(*child) {
                     stack.push(*child);
                 }
             }
         }
         if !seen.is_empty() {
-            sizes.insert(root, seen.len());
+            subtrees.insert(root, seen);
         }
     }
-    sizes
+    subtrees
 }
 
-/// Strip C0 control characters from a nickname before it is printed.
+/// Render a nickname for TERMINAL output: quoted, with every non-printable
+/// character escaped to a visible `\u{…}` form.
 ///
 /// Nicknames are attacker-controlled and `unseal_nickname_display` is a lossy
-/// UTF-8 decode with no filtering, so an embedded newline or ANSI escape could
-/// forge an extra output row. That was cosmetic before deputy status was
-/// printed; now a forged row would claim moderation authority, so filter it.
-fn sanitize_for_terminal(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_control() && c != '\t' {
-                char::REPLACEMENT_CHARACTER
-            } else {
-                c
-            }
-        })
-        .collect()
+/// UTF-8 decode with no filtering. Unescaped, a nickname could forge an entire
+/// output row: a newline starts one, and a bidi override (U+202E) reverses the
+/// rest of the line including the member id and the deputy annotation. That was
+/// cosmetic before deputy status was printed; a forged row now claims moderation
+/// authority. The quotes matter independently of escaping, because a nickname of
+/// purely printable characters like `Bob (AAAAAAAA)  deputy of: Room Owner`
+/// otherwise renders as a plausible second row, and `colored` drops the colour
+/// that would distinguish it as soon as output is piped.
+///
+/// `str`'s `Debug` is the escape used deliberately: it covers control (Cc),
+/// format (Cf, which is where the bidi overrides and zero-width joiners live)
+/// and separator (Zl/Zp) characters via the standard library's own printability
+/// table, rather than a hand-maintained range list that would silently miss a
+/// category. It escapes `"` and `\` but leaves `'` alone, so ordinary names read
+/// normally.
+pub fn display_nickname(nickname: &str) -> String {
+    format!("{:?}", nickname)
 }
 
-/// Render a party as `Nickname (SHORTID)`, or `(unknown) (SHORTID)` when they
-/// have no `member_info` record in this room.
+/// Render a party as `"Nickname" (SHORTID)`, or `(unknown) (SHORTID)` when they
+/// have no `member_info` record in this room. The nickname is escaped and quoted
+/// by [`display_nickname`]; `(unknown)` is unquoted precisely so it cannot be
+/// confused with a member whose nickname is literally `unknown`.
 pub fn party_label(party: &DeputyParty) -> String {
     match &party.nickname {
-        Some(nickname) => format!("{} ({})", nickname, party.member_id),
+        Some(nickname) => format!("{} ({})", display_nickname(nickname), party.member_id),
         None => format!("(unknown) ({})", party.member_id),
+    }
+}
+
+/// `"1 member"` / `"N members"`.
+fn members(count: usize) -> String {
+    if count == 1 {
+        "1 member".to_string()
+    } else {
+        format!("{count} members")
     }
 }
 
@@ -411,31 +468,37 @@ pub fn party_label(party: &DeputyParty) -> String {
 /// old "may ban within X's invite subtree" phrasing overstated.
 pub fn grant_status_line(grant: &DeputyGrant) -> String {
     if !grant.active {
-        let absent = if !grant.deputy.in_room {
-            &grant.deputy
-        } else {
-            &grant.deputizer
+        return match (grant.deputizer.in_room, grant.deputy.in_room) {
+            (false, false) => format!(
+                "inactive: neither {} nor {} is currently in this room",
+                party_label(&grant.deputizer),
+                party_label(&grant.deputy)
+            ),
+            (_, false) => format!(
+                "inactive: {} is not currently in this room",
+                party_label(&grant.deputy)
+            ),
+            _ => format!(
+                "inactive: {} is not currently in this room",
+                party_label(&grant.deputizer)
+            ),
         };
-        return format!(
-            "inactive: {} is not currently in this room",
-            party_label(absent)
-        );
     }
     match grant.scope {
         // `is_ban_authorized` refuses `target == owner` outright, so even an
         // owner-appointed deputy cannot ban the owner.
         DeputyScope::RoomWide => format!(
-            "active: may ban any of the {} member(s) in the room (granted by the room owner)",
-            grant.reaches_members
+            "active: may ban any of the {} in the room (granted by the room owner)",
+            members(grant.reaches_members)
         ),
         DeputyScope::InviteSubtree if grant.reaches_members == 0 => format!(
-            "active but reaches no one: {} has invited nobody, so this grant currently \
-             confers no ban authority",
+            "active but reaches no one: there is currently nobody in {}'s invite \
+             subtree that this deputy may ban",
             party_label(&grant.deputizer)
         ),
         DeputyScope::InviteSubtree => format!(
-            "active: may ban the {} member(s) {} invited, directly or indirectly",
-            grant.reaches_members,
+            "active: may ban {} in {}'s invite subtree",
+            members(grant.reaches_members),
             party_label(&grant.deputizer)
         ),
     }
@@ -869,7 +932,7 @@ mod tests {
         assert!(from_alice.active);
         assert_eq!(from_alice.reaches_members, 2);
         let line = grant_status_line(&from_alice);
-        assert!(line.contains("2 member(s)"), "{line}");
+        assert!(line.contains("2 members"), "{line}");
         assert!(line.contains("Alice"), "must name the deputizer: {line}");
 
         // Bob invited nobody, so his grant is live but reaches no one. This
@@ -885,10 +948,20 @@ mod tests {
         assert!(bob_line.contains("Bob"), "{bob_line}");
     }
 
+    /// Sizes of every invite subtree, for the tests that only care about counts.
+    fn subtree_sizes(state: &ChatRoomStateV1) -> HashMap<MemberId, usize> {
+        invite_subtrees(state)
+            .into_iter()
+            .map(|(k, v)| (k, v.len()))
+            .collect()
+    }
+
     #[test]
-    fn invite_subtree_sizes_survives_a_cycle_and_a_self_invite() {
-        // `get_downstream_members` carries a visited-set cycle guard; the CLI
-        // mirror must too, or a malformed invite graph hangs the command.
+    fn invite_subtrees_survives_a_cycle_and_a_self_invite() {
+        // The contract's own `get_downstream_members` has NO visited guard (it
+        // relies on `verify` rejecting circular invite chains). This mirror
+        // reads a fetched state directly, so it must not hang on a malformed
+        // one.
         let owner = key(1);
         let alice = key(2);
         let bob = key(3);
@@ -900,7 +973,7 @@ mod tests {
         // descendant). `AuthorizedMember::new` would assert, so build it raw.
         state.members.members[0].member.invited_by = id(&bob);
 
-        let sizes = invite_subtree_sizes(&state);
+        let sizes = subtree_sizes(&state);
         assert_eq!(sizes.get(&id(&alice)).copied().unwrap_or(0), 1);
         assert_eq!(sizes.get(&id(&bob)).copied().unwrap_or(0), 1);
 
@@ -910,9 +983,28 @@ mod tests {
         push_member(&mut selfie, &owner, &owner, &alice);
         selfie.members.members[0].member.invited_by = id(&alice);
         assert_eq!(
-            invite_subtree_sizes(&selfie).get(&id(&alice)).copied(),
+            subtree_sizes(&selfie).get(&id(&alice)).copied(),
             None,
             "self-invite is not a subtree"
+        );
+
+        // A deep chain: each ancestor counts every descendant below them.
+        let carol = key(4);
+        let dave = key(5);
+        let mut chain = ChatRoomStateV1::default();
+        push_member(&mut chain, &owner, &owner, &alice);
+        push_member(&mut chain, &owner, &alice, &bob);
+        push_member(&mut chain, &owner, &bob, &carol);
+        push_member(&mut chain, &owner, &carol, &dave);
+        let sizes = subtree_sizes(&chain);
+        assert_eq!(sizes.get(&id(&alice)).copied(), Some(3));
+        assert_eq!(sizes.get(&id(&bob)).copied(), Some(2));
+        assert_eq!(sizes.get(&id(&carol)).copied(), Some(1));
+        assert_eq!(sizes.get(&id(&dave)).copied(), None);
+        assert_eq!(
+            sizes.get(&id(&owner)).copied(),
+            Some(4),
+            "the owner's own entry counts the whole chain"
         );
     }
 
@@ -935,7 +1027,7 @@ mod tests {
 
         let line = grant_status_line(&d.grant(id(&alice), id(&bob)));
         assert!(line.contains("Alice"), "must name the deputizer: {line}");
-        assert!(line.contains("invited"), "must scope it: {line}");
+        assert!(line.contains("invite subtree"), "must scope it: {line}");
 
         let owner_line = grant_status_line(&d.grant(id(&owner), id(&bob)));
         assert!(
@@ -945,7 +1037,7 @@ mod tests {
 
         assert_eq!(
             party_label(&d.party(id(&alice))),
-            format!("Alice ({})", id(&alice))
+            format!("\"Alice\" ({})", id(&alice))
         );
         assert_eq!(
             party_label(&d.party(id(&key(9)))),
@@ -957,32 +1049,187 @@ mod tests {
     #[test]
     fn a_hostile_nickname_cannot_forge_an_extra_output_row() {
         // Nicknames are attacker-controlled and printed next to an authority
-        // claim, so an embedded newline must not produce a second line that
-        // looks like a real grant.
+        // claim. Three separate forgery vectors must all be neutralised.
         let owner = key(1);
         let evil = key(2);
-        let mut state = room(&owner, &[&evil]);
+
+        // 1. A newline starts a second line that reads as a real row.
+        let newline = "Eve\n  Admin (AAAAAAAA)  deputy of: Room Owner";
+        // 2. An ANSI escape can repaint or erase what follows.
+        let ansi = "Eve\u{1b}[2K\u{1b}[31mAdmin";
+        // 3. A bidi override reverses the rendering of the REST of the line,
+        //    including the member id and the deputy annotation (Trojan Source).
+        //    U+202E is category Cf, which `char::is_control()` does NOT cover.
+        let bidi = "Eve\u{202e} rewonR mooR :fo ytuped";
+        // 4. Zero-width characters can hide text inside an apparent name.
+        let zero_width = "Ev\u{200b}e\u{feff}";
+
+        for hostile in [newline, ansi, bidi, zero_width] {
+            let mut state = room(&owner, &[&evil]);
+            push_info(&mut state, &owner, 0, "Room Owner", vec![]);
+            push_info(&mut state, &evil, 0, hostile, vec![]);
+
+            let secrets = no_secrets();
+            let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+            let label = party_label(&d.party(id(&evil)));
+
+            for forbidden in [
+                '\n', '\r', '\t', '\u{1b}', '\u{202e}', '\u{200b}', '\u{feff}',
+            ] {
+                assert!(
+                    !label.contains(forbidden),
+                    "{forbidden:?} must not survive into terminal output: {label:?}"
+                );
+            }
+            assert!(
+                label.starts_with('"'),
+                "the nickname must be quoted so it cannot be mistaken for \
+                 surrounding structure: {label:?}"
+            );
+            assert!(
+                label.ends_with(&format!("({})", id(&evil))),
+                "the real member id must still terminate the label: {label:?}"
+            );
+
+            // The JSON side keeps the faithful value: JSON escaping already
+            // makes it safe, and a bridge relaying nicknames needs the real
+            // string rather than a mangled one.
+            assert_eq!(
+                d.party(id(&evil)).nickname.as_deref(),
+                Some(hostile),
+                "DeputyParty.nickname must not be lossily rewritten"
+            );
+        }
+
+        // A nickname of purely PRINTABLE characters can forge a row too, which
+        // escaping alone does not stop; the quotes are what close that hole.
+        let plausible = "Bob (AAAAAAAA)  deputy of: Room Owner";
+        assert_eq!(
+            display_nickname(plausible),
+            format!("\"{plausible}\""),
+            "a printable forgery attempt must be visibly delimited"
+        );
+
+        // Ordinary names are untouched apart from the quotes.
+        assert_eq!(display_nickname("Ian Clarke"), "\"Ian Clarke\"");
+        assert_eq!(display_nickname("O'Brien"), "\"O'Brien\"");
+        assert_eq!(display_nickname("emoji \u{1f600}"), "\"emoji \u{1f600}\"");
+    }
+
+    #[test]
+    fn reach_excludes_subtree_members_who_deputized_this_deputy() {
+        // `is_ban_authorized` step 4 denies a ban whose TARGET lists the banner
+        // in their own deputies ("you cannot ban the member who deputized
+        // you"). Those subtree members are not reachable, so counting them
+        // would overstate the authority the grant confers.
+        let owner = key(1);
+        let alice = key(2);
+        let target = key(3);
+        let other = key(4);
+        let deputy = key(5);
+
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &alice, &target);
+        push_member(&mut state, &owner, &alice, &other);
+        push_member(&mut state, &owner, &owner, &deputy);
+
+        push_info(&mut state, &owner, 0, "Room Owner", vec![]);
+        push_info(&mut state, &alice, 0, "Alice", vec![id(&deputy)]);
+        // `target` has ALSO deputized `deputy`, so `deputy` cannot ban them.
+        push_info(&mut state, &target, 0, "Target", vec![id(&deputy)]);
+        push_info(&mut state, &other, 0, "Other", vec![]);
+        push_info(&mut state, &deputy, 0, "Deputy", vec![]);
+
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+
+        let grant = d.grant(id(&alice), id(&deputy));
+        assert_eq!(
+            grant.reaches_members, 1,
+            "Alice's subtree is {{target, other}}, but target deputized this \
+             deputy so only `other` is reachable"
+        );
+
+        // The owner's grant is absolute (step 3 precedes the guardrail), so the
+        // same guardrail must NOT reduce it.
+        let owner_grant = d.grant(id(&owner), id(&deputy));
+        assert_eq!(owner_grant.reaches_members, 4, "every member is a target");
+    }
+
+    #[test]
+    fn an_inactive_grant_reaches_nobody() {
+        // A script filtering `reaches_members > 0` for real moderation
+        // authority must not get a false positive from a grant the contract
+        // would refuse outright.
+        let owner = key(1);
+        let alice = key(2);
+        let child = key(3);
+        let pruned = key(4);
+
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &alice, &child);
+        push_info(&mut state, &owner, 0, "Room Owner", vec![]);
+        push_info(&mut state, &alice, 0, "Alice", vec![id(&pruned)]);
+        push_info(&mut state, &child, 0, "Child", vec![]);
+
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+
+        let grant = d.grant(id(&alice), id(&pruned));
+        assert!(!grant.active, "the deputy has left the room");
+        assert_eq!(
+            grant.reaches_members, 0,
+            "Alice has a real subtree, but this grant confers nothing"
+        );
+    }
+
+    #[test]
+    fn inactive_line_names_both_parties_when_both_are_absent() {
+        let owner = key(1);
+        let gone_deputizer = key(2);
+        let gone_deputy = key(3);
+        let mut state = ChatRoomStateV1::default();
         push_info(&mut state, &owner, 0, "Room Owner", vec![]);
         push_info(
             &mut state,
-            &evil,
+            &gone_deputizer,
             0,
-            "Eve\n  Admin (AAAAAAAA)  deputy of: Room Owner",
-            vec![],
+            "Gone",
+            vec![id(&gone_deputy)],
         );
 
         let secrets = no_secrets();
         let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
 
-        let label = party_label(&d.party(id(&evil)));
-        assert!(!label.contains('\n'), "newline must be stripped: {label:?}");
-        assert!(!label.contains('\r'));
-        assert!(!label.contains('\u{1b}'), "ANSI escapes must be stripped");
-        assert!(label.starts_with("Eve"), "the readable part survives");
+        let line = grant_status_line(&d.grant(id(&gone_deputizer), id(&gone_deputy)));
+        assert!(line.starts_with("inactive: neither"), "{line}");
+        assert!(line.contains(&id(&gone_deputizer).to_string()), "{line}");
+        assert!(line.contains(&id(&gone_deputy).to_string()), "{line}");
+    }
 
-        assert_eq!(sanitize_for_terminal("plain"), "plain");
-        assert_eq!(sanitize_for_terminal("keep\ttab"), "keep\ttab");
-        assert_eq!(sanitize_for_terminal("emoji \u{1f600}"), "emoji \u{1f600}");
+    #[test]
+    fn status_line_uses_singular_for_a_reach_of_one() {
+        let owner = key(1);
+        let alice = key(2);
+        let child = key(3);
+        let deputy = key(4);
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &alice, &child);
+        push_member(&mut state, &owner, &owner, &deputy);
+        push_info(&mut state, &owner, 0, "Room Owner", vec![]);
+        push_info(&mut state, &alice, 0, "Alice", vec![id(&deputy)]);
+        push_info(&mut state, &child, 0, "Child", vec![]);
+        push_info(&mut state, &deputy, 0, "Deputy", vec![]);
+
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+
+        let line = grant_status_line(&d.grant(id(&alice), id(&deputy)));
+        assert!(line.contains("1 member in"), "{line}");
+        assert!(!line.contains("member(s)"), "{line}");
     }
 
     #[test]

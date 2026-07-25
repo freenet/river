@@ -200,11 +200,24 @@ often nobody.
 
 Both accept `--format json`, emitting `{room_id, direction, subject, grants[]}`.
 Each grant carries `deputizer`, `deputy`, `scope` (`room-wide` /
-`invite-subtree`), `reaches_members` (how many members the grant actually
-covers) and `active`. A grant whose deputizer or deputy has left the room is
-reported with `active: false`; the contract does not honour such a grant.
-`in_room` is `true` for the room owner even though the owner never appears in
-the member list.
+`invite-subtree`), `active`, and `reaches_members`.
+
+`reaches_members` is how many members the grant can currently be used against,
+computed from the contract's own rules: `0` for an inactive grant, every member
+for an owner grant, otherwise the deputizer's invite subtree minus anyone in it
+who has themselves deputized this deputy (a member cannot be banned by someone
+they deputized). It is often `0` even for a live grant, because most members
+have invited nobody. `reaches_members > 0` is the check for "this member
+actually has moderation authority here".
+
+A grant whose deputizer or deputy has left the room is reported with
+`active: false`; the contract does not honour such a grant. `in_room` is `true`
+for the room owner even though the owner never appears in the member list.
+
+Nicknames are quoted and escaped in terminal output. They are set by the member
+themselves and are printed next to an authority claim, so an unescaped one could
+forge a line that reads as a real deputy grant. The `-f json` output carries the
+faithful nickname.
 
 `member list --format json` gains `deputies` (who this member deputized) and
 `deputized_by` (who deputized them) alongside the existing `member_id` and

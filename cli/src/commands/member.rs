@@ -1,5 +1,7 @@
 use crate::api::ApiClient;
-use crate::deputies::{grant_status_line, party_label, ResolveError, RoomDeputies};
+use crate::deputies::{
+    display_nickname, grant_status_line, party_label, ResolveError, RoomDeputies,
+};
 use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
@@ -127,7 +129,15 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                     } else {
                         println!("\n{} member(s) found:\n", members.len());
                         for (party, _own_deputies, granted_by) in &members {
-                            let nickname = party.nickname.as_deref().unwrap_or("(unknown)");
+                            // Escaped and quoted: an unescaped nickname can
+                            // forge a row that reads as a real deputy grant,
+                            // and `colored` drops the colour that would
+                            // distinguish it as soon as output is piped.
+                            let nickname = party
+                                .nickname
+                                .as_deref()
+                                .map(display_nickname)
+                                .unwrap_or_else(|| "(unknown)".to_string());
                             print!("  {} ({})", nickname.green(), party.member_id);
                             if !granted_by.is_empty() {
                                 let names: Vec<String> = granted_by
@@ -318,10 +328,12 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
             let secrets = api.room_display_secrets(&owner_vk, &mut room_state);
             let deputies = RoomDeputies::new(&room_state, &owner_vk, &secrets);
 
-            let subject_id = match (&member_id, own_id) {
-                (Some(short), _) => resolve_or_explain(&deputies, short)?,
-                (None, Some(id)) => id,
-                (None, None) => unreachable!("own_id is set whenever member_id is None"),
+            let subject_id = match member_id.as_deref() {
+                Some(short) => resolve_or_explain(&deputies, short)?,
+                // `own_id` was resolved above on exactly this branch.
+                None => {
+                    own_id.ok_or_else(|| anyhow!("no member ID given and no local identity"))?
+                }
             };
 
             let subject = deputies.party(subject_id);
