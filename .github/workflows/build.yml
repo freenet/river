@@ -126,6 +126,17 @@ jobs:
       # --test target from migration_test, so it needs its own invocation.
       run: cargo test -p river-core --test room_contract_migration_test
 
+    - name: Test ban purges authored content (reply-quote premise)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Pins that an enforced ban purges the banned member's messages AND their
+      # member_info. Both clients' reply-quote suppression keys on that absence
+      # (there is no other link from a reply's quoted-author NAME back to a
+      # MemberId), so if this sweep regressed, a banned member's text would
+      # start rendering again with every client-side test still green.
+      run: cargo test -p river-core --test ban_purges_authored_content_test
+
     - name: Test riverctl (CLI crate unit tests, incl. #292 recovery)
       env:
         RUST_MIN_STACK: 8388608

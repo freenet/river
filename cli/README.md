@@ -263,7 +263,9 @@ Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags.
 | `edit` | A previously-streamed message's content changed | same as `message` (with the new `content` and `edited: true`) |
 | `delete` | A previously-streamed message was deleted | `message_id`, `room`, `author`, `nickname`, `timestamp` (no `content`) |
 
-`reply_to` is `null` for non-replies, otherwise `{ "author", "preview" }`. `edit`/`delete` events are emitted only for messages the stream actually surfaced. Bridges should key off `type` and tolerate unknown future types.
+`reply_to` is `{ "author", "preview" }` only when the quoted message could be read back from live room state. It is `null` both for non-replies **and** for a reply whose quoted message could not be verified — its author was banned (which purges their messages), it was deleted, or it aged out of the room's `max_recent_messages` window. The quoted author and preview stored in a reply are a snapshot written by the *replier* and validated by nothing, so riverctl never emits them unverified; a bridge would otherwise republish a banned member's text after the ban. The human-readable output distinguishes the two cases with a `[reply to an unavailable message]` prefix; the JSON deliberately does not, so no existing consumer breaks on a new shape.
+
+`edit`/`delete` events are emitted only for messages the stream actually surfaced. Bridges should key off `type` and tolerate unknown future types.
 
 The top-level `author` is the sending member's ID; get your own with `riverctl
 identity whoami <room-owner-vk>` and compare against it to recognise your own

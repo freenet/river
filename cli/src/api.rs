@@ -702,8 +702,14 @@ pub(crate) fn reply_context_display(
 }
 
 /// What a message's reply context should render as, resolved against LIVE room
-/// state. Mirrors the UI's `ReplyStrip` (`ui/src/components/conversation.rs`);
-/// the two must stay in step, since they render the same contract data.
+/// state. Mirrors the UI's `ReplyStrip` (`ui/src/components/conversation.rs`).
+///
+/// The RESOLUTION (which targets are quotable, and when a quote is refused)
+/// must stay in step between the two clients — they read the same contract
+/// data, and a divergence means one client shows text the other suppressed.
+/// The RENDERING deliberately differs: riverctl truncates to 50 chars with a
+/// "..." marker and leaves markdown intact; the UI truncates to 100 and strips
+/// markdown.
 #[derive(Debug, PartialEq)]
 pub(crate) enum ReplyContextDisplay {
     /// Not a reply.
@@ -746,33 +752,36 @@ pub(crate) fn reply_context_display_with_secrets(
     if msg.message.content.content_type() != CONTENT_TYPE_REPLY {
         return ReplyContextDisplay::NotAReply;
     }
-    let reply = match msg.message.content.decode_content() {
+    let decoded = match msg.message.content.decode_content() {
         // Public reply — decoded directly.
-        Some(DecodedContent::Reply(reply)) => reply,
-        // Private reply — decrypt then decode the sealed ReplyContentV1.
-        _ => {
-            let RoomMessageBody::Private {
+        Some(DecodedContent::Reply(reply)) => Some(reply),
+        // Private reply — decrypt then decode the sealed ReplyContentV1. A
+        // PUBLIC body with an undecodable payload also lands here and stays
+        // `None`, which is correct: it is a reply we cannot read.
+        _ => match &msg.message.content {
+            RoomMessageBody::Private {
                 ciphertext,
                 nonce,
                 secret_version,
                 ..
-            } = &msg.message.content
-            else {
-                return ReplyContextDisplay::NotAReply;
-            };
-            let decoded = secrets
+            } => secrets
                 .get(secret_version)
                 .and_then(|secret| {
                     river_core::ecies::decrypt_with_symmetric_key(secret, ciphertext, nonce).ok()
                 })
-                .and_then(|plaintext| ReplyContentV1::decode(&plaintext).ok());
-            match decoded {
-                Some(reply) => reply,
-                // We cannot even tell what this reply quotes, so we certainly
-                // cannot verify it.
-                None => return ReplyContextDisplay::Unavailable,
-            }
+                .and_then(|plaintext| ReplyContentV1::decode(&plaintext).ok()),
+            _ => None,
+        },
+    };
+    let reply = match decoded {
+        Some(reply) => reply,
+        // We cannot even tell what this reply quotes, so we certainly cannot
+        // verify it — unless we simply hold no room secrets yet, which is not
+        // the same thing (see `pending_decryption`). Mirrors the UI.
+        None if pending_decryption(&msg.message.content, secrets) => {
+            return ReplyContextDisplay::NotAReply
         }
+        None => return ReplyContextDisplay::Unavailable,
     };
 
     let messages = &room_state.recent_messages;
@@ -782,6 +791,12 @@ pub(crate) fn reply_context_display_with_secrets(
         .find(|m| m.id() == reply.target_message_id)
         // Soft-deleted messages stay in `messages`, and action / event records
         // are never rendered as message rows. None of them is quotable.
+        //
+        // The event filter is load-bearing: an EVENT is editable by its author,
+        // and `effective_text` consults `edited_content` before any
+        // content-type decode, so without it a member could post a join event,
+        // edit it to arbitrary text, and quote that. Do NOT drop it. Mirrors
+        // the UI's `resolve_reply_context`.
         .filter(|target| {
             !messages.is_deleted(&reply.target_message_id)
                 && !target.message.content.is_action()
@@ -816,12 +831,29 @@ pub(crate) fn reply_context_display_with_secrets(
     }
 }
 
+/// Whether an unreadable private body is merely WAITING on the room secrets
+/// rather than genuinely unreadable — riverctl holds no secrets for a room it
+/// has no local storage for. Mirrors the UI's `pending_decryption`
+/// (`ui/src/components/conversation.rs`); the discriminator is "no secrets AT
+/// ALL", not "this version is missing", because a rotated-past version IS
+/// genuinely unavailable.
+fn pending_decryption(
+    content: &river_core::room_state::message::RoomMessageBody,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> bool {
+    matches!(
+        content,
+        river_core::room_state::message::RoomMessageBody::Private { .. }
+    ) && secrets.is_empty()
+}
+
 /// A private QUOTE target's plaintext, or `None` when it cannot be read.
 ///
-/// Strict sibling of [`decrypt_private_body_text`]: identical up to the
-/// unrecognised-content-type case, where that one returns the raw decrypted
-/// bytes and this one returns `None`. See the call site for why a quote must
-/// not fall back to raw bytes. Mirrors `target_plaintext` in
+/// Strict sibling of [`decrypt_private_body_text`], which returns the raw
+/// decrypted bytes as lossy UTF-8 in TWO cases this one refuses: an
+/// unrecognised content type, and a recognised one whose payload fails to
+/// decode. See the call site for why a quote must not fall back to raw bytes.
+/// Mirrors `target_plaintext` in
 /// `ui/src/components/conversation.rs`; adding a content type means touching
 /// both.
 fn decrypt_private_quote_text(
@@ -7178,9 +7210,16 @@ mod display_text_tests {
         );
         let (mut state, msg) = state_with_message(body);
 
-        // Opaque without the secret — we cannot even tell what it quotes.
+        // Holding NO secrets at all is the "not loaded yet / no local storage"
+        // case, not a real failure — no prefix, same as the UI renders no strip.
         assert_eq!(
             reply_context_display(&state, &msg),
+            ReplyContextDisplay::NotAReply
+        );
+        // Holding a DIFFERENT version — the room rotated past v0 — is a genuine
+        // failure to read a message we know IS a reply.
+        assert_eq!(
+            reply_context_display_with_secrets(&state, &msg, &HashMap::from([(9u32, [1u8; 32])])),
             ReplyContextDisplay::Unavailable
         );
 
@@ -7270,14 +7309,14 @@ mod display_text_tests {
             "my reply"
         );
 
-        // Same state, same reply, secret removed: the target can no longer be
-        // read, so the quote must disappear rather than fall back to the
-        // snapshot. Asserted against the FINAL state (where the target DOES
+        // Same state, same reply, rotated past the secret: the target can no
+        // longer be read, so the quote must disappear rather than fall back to
+        // the snapshot. Asserted against the FINAL state (where the target DOES
         // exist), so it isolates decryptability rather than target presence.
         assert_eq!(
-            reply_context_display_with_secrets(&state, &msg, &HashMap::new()),
+            reply_context_display_with_secrets(&state, &msg, &HashMap::from([(9u32, [1u8; 32])])),
             ReplyContextDisplay::Unavailable,
-            "without the secret neither the target nor the reply can be read"
+            "without the right secret neither the target nor the reply can be read"
         );
     }
 
@@ -8487,8 +8526,19 @@ mod mention_cli_tests {
                 },
                 &sender,
             );
+            let non_message_id = non_message.id();
             state.recent_messages.messages.push(non_message);
             state.recent_messages.messages.push(reply.clone());
+            // Give the target an EDIT, or the filter is untestable: resolution
+            // would already fail for lack of body text, so deleting the filter
+            // would keep this green. `effective_text` reads `edited_content`
+            // before any content-type decode, and an event IS editable by its
+            // author — post a join event, edit it to arbitrary text, quote it.
+            state
+                .recent_messages
+                .actions_state
+                .edited_content
+                .insert(non_message_id, "attacker-chosen text".to_string());
             assert_eq!(
                 reply_context_display(&state, &reply),
                 ReplyContextDisplay::Unavailable,
