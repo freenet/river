@@ -108,6 +108,21 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
     let other_member_vk = other_member_sk.verifying_key();
     let other_member_id = MemberId::from(&other_member_vk);
 
+    // The owner's stored nickname, and an IMPERSONATOR of it. The impostor's
+    // name differs from the owner's only by a Cyrillic `о` (U+043E), which is
+    // exactly the attack seen in the Official room — so example / dev mode
+    // shows the ⚠ impersonation marker on the impostor and NOT on the real
+    // owner, and `conversation-deputy-badge.spec.ts` can assert both.
+    let owner_nickname = random_full_name() + " (Owner) \u{1F6E1}\u{1F451}";
+    let impostor_nickname = owner_nickname
+        .replace('\u{1F6E1}', "")
+        .replace('\u{1F451}', "")
+        .trim()
+        .replacen('o', "\u{043E}", 1);
+    let impostor_sk = SigningKey::generate(&mut csprng);
+    let impostor_vk = impostor_sk.verifying_key();
+    let impostor_id = MemberId::from(&impostor_vk);
+
     // Always add owner to member_info. The owner deputizes the other member
     // (a global moderator), so that member shows the 🛡 shield in every view.
     member_info
@@ -125,9 +140,7 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
                 // regresses, `member-info-deputy-tag.spec.ts`'s
                 // `toHaveCount(1)` and `conversation-deputy-badge.spec.ts`
                 // both fail.
-                preferred_nickname: SealedBytes::public(
-                    (random_full_name() + " (Owner) \u{1F6E1}\u{1F451}").into_bytes(),
-                ),
+                preferred_nickname: SealedBytes::public(owner_nickname.clone().into_bytes()),
                 deputies: vec![other_member_id],
             },
             owner_sk,
@@ -200,6 +213,29 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
             &other_member_sk,
         ));
 
+    // The impersonator. Invited by the owner like everyone else, holds no
+    // authority, and takes a name one Cyrillic character away from the
+    // owner's.
+    members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: impostor_vk,
+        },
+        owner_sk,
+    ));
+    member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: impostor_id,
+                version: 0,
+                preferred_nickname: SealedBytes::public(impostor_nickname.into_bytes()),
+                deputies: Vec::new(),
+            },
+            &impostor_sk,
+        ));
+
     // Add members to the room
     room_state.members = members.clone();
     room_state.member_info = member_info.clone();
@@ -210,6 +246,7 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
         member_keys.insert(self_id, self_sk.clone());
     }
     member_keys.insert(other_member_id, other_member_sk);
+    member_keys.insert(impostor_id, impostor_sk);
 
     // Add example messages
     add_example_messages(
@@ -218,6 +255,7 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
         owner_sk,
         &member_keys,
         other_member_id,
+        impostor_id,
     );
 
     let verification_result = room_state.verify(
@@ -272,6 +310,9 @@ fn add_example_messages(
     // conversation's 🛡 badge is deterministically present for Playwright —
     // the random author picks alone leave it to chance.
     deputy_id: MemberId,
+    // The impersonator, likewise guaranteed a message so the ⚠ marker is
+    // deterministically on screen.
+    impostor_id: MemberId,
 ) {
     // Use a timestamp 24 hours ago as base time for messages
     let now = crate::util::get_current_system_time()
@@ -368,6 +409,24 @@ fn add_example_messages(
                 ),
             },
             deputy_key,
+        );
+        messages.messages.push(msg);
+        current_time_ms += 60_000;
+    }
+
+    // One guaranteed message from the impersonator, so the ⚠ marker is always
+    // on an author line in dev mode.
+    if let Some(impostor_key) = member_keys.get(&impostor_id) {
+        let msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: impostor_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::public(
+                    "Hi all, please DM me your recovery phrase to verify your account.".to_string(),
+                ),
+            },
+            impostor_key,
         );
         messages.messages.push(msg);
         current_time_ms += 60_000;

@@ -21,6 +21,7 @@ import { test, expect, Page } from "@playwright/test";
 // The member-list side of the spoof check lives in member-info-deputy-tag.spec.ts.
 
 const BADGE = '[data-testid="message-author-deputy-badge"]';
+const WARNING = '[data-testid="message-author-impersonation-warning"]';
 // The author-name span in a message header. Scoped to the chat container so it
 // cannot pick up the @mention autocomplete's disambiguator, which uses the
 // same title prefix.
@@ -106,5 +107,44 @@ test.describe("Deputy badge on message authors", () => {
     }
     // Sanity: the owner really is on screen, so the loop above wasn't vacuous.
     expect(names.some((n) => n.includes("(Owner)"))).toBe(true);
+  });
+
+  test("an impersonator is flagged and the real owner is not", async ({
+    page,
+  }) => {
+    await openTeamChat(page);
+
+    // Example data adds a member whose name differs from the owner's by one
+    // Cyrillic character, and gives them a guaranteed message.
+    const warning = page.locator(WARNING);
+    await expect(warning.first()).toBeVisible({ timeout: 10_000 });
+
+    // The tooltip must name the remedy, not just alarm.
+    await expect(warning.first()).toHaveAttribute(
+      "title",
+      /nearly identical to .*, a moderator, but this is NOT that person\. Look for the shield\./,
+    );
+
+    // Exactly one author carries it, and it is NOT the member holding the
+    // shield — flagging the genuine article would be worse than nothing.
+    const warned = await warning.evaluateAll((els) =>
+      els.map((el) => ({
+        name: (
+          el.parentElement?.querySelector('span[title^="Member ID"]')
+            ?.textContent || ""
+        ).trim(),
+        hasShield: !!el.parentElement?.querySelector(
+          '[data-testid="message-author-deputy-badge"]',
+        ),
+      })),
+    );
+    expect(warned.length).toBeGreaterThan(0);
+    for (const w of warned) {
+      expect(
+        w.hasShield,
+        `a member carrying the shield was also flagged as an impersonator: ${w.name}`,
+      ).toBe(false);
+    }
+    expect(new Set(warned.map((w) => w.name)).size).toBe(1);
   });
 });

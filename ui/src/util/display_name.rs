@@ -22,11 +22,13 @@
 //!   write `Alice 🛡` into the contract; River just never renders the shield.
 //!   Enforcing the rule in the room contract would change the contract WASM
 //!   and re-key every live room, which is not worth it for a display concern.
-//! * Homoglyphs are **not** addressed and cannot be, without breaking the
-//!   non-Latin names this function deliberately preserves. A Cyrillic `а` is a
-//!   legitimate letter; so is every character in a Chinese, Arabic or Greek
-//!   name. Confusable-script detection is a different problem with a different
-//!   (much worse) false-positive profile.
+//! * Homoglyphs are **not** stripped, and must not be: a Cyrillic `а` is a
+//!   legitimate letter, as is every character in a Chinese, Arabic or Greek
+//!   name, and this function's job is to preserve them. Homoglyph
+//!   impersonation is handled separately and non-destructively, by
+//!   [`collision_key`] + `components::members::name_flags_for_viewer`, which
+//!   MARK a confusable name rather than altering it. Detection can afford
+//!   false positives; rewriting a name cannot.
 //! * Combining marks are preserved, so a "Zalgo" nickname can still be ugly.
 //!   It cannot forge a badge, which is what this module is for.
 //! * Sanitising can CREATE a collision: `"B⭐ob"` and `"Bob"` render alike, as
@@ -293,6 +295,130 @@ pub fn sanitize_display_name(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Fold a display name to a key for detecting members who LOOK like each
+/// other, for the duplicate-name and impersonation markers in
+/// `components::members`.
+///
+/// Deliberately far more aggressive than any name comparison used for
+/// enforcement. The automated impersonator ban must match near-exactly,
+/// because a false positive there bans an innocent person; a marker in the UI
+/// costs nothing when it is occasionally wrong, so it should catch the whole
+/// class the ban deliberately will not. **Do not "harmonise" the two.**
+///
+/// The fold, in order: [`sanitize_display_name`] (emoji, invisibles, space
+/// lookalikes), lowercase, map confusable characters onto one ASCII
+/// representative, then drop everything that is not alphanumeric. So
+/// `Ian Clarke`, `IAN CLARKE`, `Ian_Clarke`, `IanClarke`, `lan Clarke` (with a
+/// lowercase L) and `Ian Clarkе` (with a Cyrillic е) all fold to `ianclarke`.
+///
+/// Returns an empty string for a name with no alphanumeric content; callers
+/// must treat that as "no key" rather than as a match, or every such member
+/// would collide with every other.
+pub fn collision_key(name: &str) -> String {
+    sanitize_display_name(name)
+        .to_lowercase()
+        .chars()
+        .map(fold_confusable)
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// Map a lowercased character onto the ASCII letter it is confusable with.
+///
+/// Covers the Cyrillic and Greek lookalikes that make a homoglyph attack work,
+/// plus the two digit/letter pairs that are confusable in essentially every
+/// font (`0`/`o`, `1`/`l`/`i`). Deliberately NOT full leetspeak: folding `3`
+/// into `e` would make `bob3` collide with `bobe`, which is surprising for a
+/// marker that is meant to be quiet unless something is wrong.
+fn fold_confusable(c: char) -> char {
+    match c {
+        'а' | 'α' => 'a',
+        'ь' | 'ъ' => 'b',
+        'с' | 'ϲ' => 'c',
+        'ԁ' => 'd',
+        'е' | 'ε' | 'э' => 'e',
+        'ɡ' | 'ց' => 'g',
+        'һ' | 'հ' => 'h',
+        // `l` and `1` fold into `i`: `lan Clarke` / `1an Clarke` are the
+        // classic impersonations of `Ian Clarke`.
+        'l' | '1' | 'ı' | 'і' | 'ⅰ' | 'ⅼ' | 'ӏ' | 'ǀ' => 'i',
+        'ј' | 'ȷ' => 'j',
+        'κ' | 'к' => 'k',
+        'м' | 'ｍ' => 'm',
+        'п' | 'ո' => 'n',
+        'о' | 'ο' | '0' | 'օ' => 'o',
+        'р' | 'ρ' => 'p',
+        'ԛ' => 'q',
+        'ѕ' | 'ș' => 's',
+        'т' | 'τ' => 't',
+        'υ' | 'ս' => 'u',
+        'ν' | 'ѵ' => 'v',
+        'ԝ' | 'ա' => 'w',
+        'х' | 'χ' => 'x',
+        'у' | 'γ' | 'ү' => 'y',
+        'ᴢ' => 'z',
+        other => other,
+    }
+}
+
+/// Whether two [`collision_key`]s are close enough that one could be mistaken
+/// for the other: equal, or one edit apart.
+///
+/// The edit-distance tier only applies from four characters up, so short
+/// handles (`bob` / `rob`) do not all flag each other. Empty keys never match:
+/// a name with no alphanumeric content is "no key", not "matches everything".
+pub fn keys_are_confusable(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    if a.chars().count() < 4 || b.chars().count() < 4 {
+        return false;
+    }
+    within_one_edit(a, b)
+}
+
+/// Levenshtein distance <= 1, without building a matrix.
+fn within_one_edit(a: &str, b: &str) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (long, short) = if a.len() >= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+
+    let mut i = 0;
+    let mut j = 0;
+    let mut edited = false;
+    while i < long.len() && j < short.len() {
+        if long[i] == short[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        if edited {
+            return false;
+        }
+        edited = true;
+        if long.len() == short.len() {
+            // Substitution: advance both.
+            i += 1;
+            j += 1;
+        } else {
+            // Deletion from the longer side only.
+            i += 1;
+        }
+    }
+    // Any unconsumed tail must be the single remaining edit.
+    edited || (long.len() - i) + (short.len() - j) <= 1
 }
 
 /// Decrypt a member's sealed nickname and sanitise it for display.
@@ -704,6 +830,112 @@ mod tests {
              nickname can forge a 🛡 deputy badge there:\n  {}",
             offenders.join("\n  ")
         );
+    }
+
+    /// The real campaign this exists for: six accounts named "Ian Clarke" in
+    /// the Official room, plus the near-miss variants an exact-match ban
+    /// deliberately will not touch.
+    #[test]
+    fn impersonation_variants_fold_together() {
+        let real = collision_key("Ian Clarke");
+        assert_eq!(real, "ianciarke", "the fold is not what the cases assume");
+
+        for variant in [
+            "Ian Clarke",
+            "IAN CLARKE",
+            "ian clarke",
+            "Ian_Clarke",
+            "IanClarke",
+            "Ian  Clarke",
+            "  Ian Clarke  ",
+            "lan Clarke",           // lowercase L for I
+            "1an Clarke",           // digit one for I
+            "Ian Clarkе",           // Cyrillic е
+            "Іan Clarke",           // Cyrillic І
+            "Ian Cl\u{0430}rke",    // Cyrillic а
+            "Ian Clarke\u{200B}",   // zero-width space
+            "Ian Clarke \u{1F6E1}", // the emoji-badge spoof
+        ] {
+            assert_eq!(
+                collision_key(variant),
+                real,
+                "{variant:?} must fold onto the real name's key"
+            );
+        }
+
+        // One edit away: caught by the warning tier, not by exact folding.
+        for near in ["Ian Clark", "Ian Clarkes", "Ian Carke"] {
+            let k = collision_key(near);
+            assert_ne!(k, real, "{near:?} should not fold exactly");
+            assert!(
+                keys_are_confusable(&k, &real),
+                "{near:?} must still be flagged as confusable"
+            );
+        }
+    }
+
+    /// Warning fatigue is the failure mode: if this fires on ordinary names
+    /// nobody reads it. Unrelated members must not be confusable.
+    #[test]
+    fn unrelated_names_are_not_confusable() {
+        let pairs = [
+            ("Ian Clarke", "Nacho Duart"),
+            ("Ian Clarke", "Hector Santos"),
+            ("Alice", "Bob"),
+            ("Cipher Daylight", "Neon Falcon"),
+            ("李小龍", "王小明"),
+            ("Иван Петров", "Ivan Sokolov"),
+        ];
+        for (a, b) in pairs {
+            assert!(
+                !keys_are_confusable(&collision_key(a), &collision_key(b)),
+                "{a:?} and {b:?} must not be flagged as confusable"
+            );
+        }
+
+        // Short handles differing by one character are NOT flagged, or every
+        // three-letter name in the room would warn about every other.
+        assert!(!keys_are_confusable(
+            &collision_key("Bob"),
+            &collision_key("Rob")
+        ));
+        // ...but from four characters up, one edit is enough.
+        assert!(keys_are_confusable(
+            &collision_key("Bobby"),
+            &collision_key("Robby")
+        ));
+    }
+
+    /// A key with no alphanumeric content is "no key". If it matched, every
+    /// such member would be flagged as impersonating every privileged member.
+    #[test]
+    fn empty_keys_never_match() {
+        assert_eq!(collision_key("---"), "");
+        assert_eq!(collision_key("!?"), "");
+        assert!(!keys_are_confusable("", ""));
+        assert!(!keys_are_confusable("", "ianclarke"));
+        assert!(!keys_are_confusable("ianclarke", ""));
+
+        // A name that sanitises to the placeholder keys on the PLACEHOLDER,
+        // not on nothing — several such members really do render the same
+        // name, so they should be told apart by id like any other collision.
+        assert_eq!(collision_key("🛡👑"), collision_key(UNNAMED));
+        assert!(keys_are_confusable(
+            &collision_key("🛡👑"),
+            &collision_key(UNNAMED)
+        ));
+    }
+
+    #[test]
+    fn within_one_edit_boundaries() {
+        assert!(within_one_edit("abcd", "abcd")); // 0 edits
+        assert!(within_one_edit("abcd", "abcde")); // insertion at end
+        assert!(within_one_edit("abcd", "xabcd")); // insertion at start
+        assert!(within_one_edit("abcd", "abxd")); // substitution
+        assert!(within_one_edit("abcde", "abde")); // deletion in the middle
+        assert!(!within_one_edit("abcd", "abxy")); // 2 substitutions
+        assert!(!within_one_edit("abcd", "abcdef")); // 2 insertions
+        assert!(!within_one_edit("abcd", "dcba"));
     }
 
     #[test]

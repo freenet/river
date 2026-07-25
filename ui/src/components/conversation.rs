@@ -7,7 +7,9 @@ use crate::components::app::{
     MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
     ROOMS,
 };
-use crate::components::members::{deputy_badges_for_viewer, DeputyBadge};
+use crate::components::members::{
+    deputy_badges_for_viewer, name_flags_for_viewer, DeputyBadge, NameFlags,
+};
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::display_name::{display_nickname, sanitize_display_name};
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
@@ -84,6 +86,10 @@ struct MessageGroup {
     /// See [`DeputyBadge`] for the predicate and why visibility and the
     /// "can ban you" wording are separate questions.
     author_badge: Option<DeputyBadge>,
+    /// Duplicate-name id and impersonation warning for this author. Messages
+    /// are where the deception actually happens, so this matters more here
+    /// than in the member list.
+    author_flags: NameFlags,
     is_self: bool,
     first_time: DateTime<Utc>,
     /// True if any message in this group had a future timestamp that was clamped
@@ -428,6 +434,8 @@ fn group_messages(
     // Which members show a 🛡 shield in THIS viewer's conversation, built once
     // per render by `deputy_badges_for_viewer`. Absent ⇒ no shield.
     deputy_badges: &HashMap<MemberId, DeputyBadge>,
+    // Duplicate-name / impersonation markers, from `name_flags_for_viewer`.
+    name_flags: &HashMap<MemberId, NameFlags>,
 ) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
@@ -543,6 +551,7 @@ fn group_messages(
                 author_id,
                 author_name,
                 author_badge: deputy_badges.get(&author_id).cloned(),
+                author_flags: name_flags.get(&author_id).cloned().unwrap_or_default(),
                 is_self,
                 first_time: message_time,
                 time_clamped,
@@ -1405,6 +1414,13 @@ pub fn Conversation() -> Element {
                         MemberId::from(&key),
                         self_member_id,
                     );
+                    let name_flags = name_flags_for_viewer(
+                        &room_state.members,
+                        &room_state.member_info,
+                        &room_data.secrets,
+                        MemberId::from(&key),
+                        &deputy_badges,
+                    );
                     let groups = group_messages(
                         &room_state.recent_messages,
                         &room_state.member_info,
@@ -1412,6 +1428,7 @@ pub fn Conversation() -> Element {
                         &room_data.secrets,
                         &member_names,
                         &deputy_badges,
+                        &name_flags,
                     );
                     return Some((groups, self_member_id, member_names));
                 }
@@ -2932,6 +2949,36 @@ fn MessageGroupComponent(
                                 });
                             },
                             "{group.author_name}"
+                        }
+                        // Short member id when someone else in this room
+                        // renders the same name. The shield says "this is
+                        // real"; this says "there is more than one of these".
+                        if group.author_flags.ambiguous {
+                            {
+                                let short_id = crate::components::members::short_member_id(&group.author_id);
+                                rsx! {
+                                    span {
+                                        "data-testid": "message-author-short-id",
+                                        class: "text-xs text-text-muted font-mono cursor-default",
+                                        title: "Another member uses this name — this one is #{short_id}",
+                                        "#{short_id}"
+                                    }
+                                }
+                            }
+                        }
+                        // Impersonation warning. The shield's ABSENCE is a weak
+                        // signal — most members have no shield — so a name that
+                        // collides with a moderator's gets an active marker
+                        // rather than relying on the reader to notice what is
+                        // missing.
+                        if let Some(warning) = group.author_flags.impersonation_tooltip() {
+                            span {
+                                "data-testid": "message-author-impersonation-warning",
+                                class: "text-sm text-amber-400 cursor-default",
+                                title: "{warning}",
+                                "aria-label": "{warning}",
+                                "⚠️"
+                            }
                         }
                         // Deputy shield. Same glyph, same visibility rule and
                         // the same tooltip as the member-list row and the

@@ -178,6 +178,8 @@ struct MemberDisplay {
     /// visibility rule and the same tooltip — the conversation's author line
     /// and the member-info modal use.
     deputy_badge: Option<DeputyBadge>,
+    /// Duplicate-name / impersonation markers for this member.
+    name_flags: NameFlags,
 }
 
 fn is_member_sponsor(
@@ -225,6 +227,9 @@ fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: Memb
 #[derive(Clone, PartialEq)]
 struct MemberDisplayParts {
     nickname: String,
+    /// Shown immediately after the nickname when another member renders the
+    /// same name, so the two can be told apart without opening either profile.
+    short_id: Option<String>,
     tags: Vec<(&'static str, String)>,
 }
 
@@ -250,9 +255,17 @@ fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
     if let Some(badge) = member.deputy_badge.as_ref() {
         tags.push(("🛡", badge.tooltip()));
     }
+    // Impersonation warning LAST, so it reads as the final word on the row.
+    if let Some(tooltip) = member.name_flags.impersonation_tooltip() {
+        tags.push(("⚠️", tooltip));
+    }
 
     MemberDisplayParts {
         nickname: member.nickname.clone(),
+        short_id: member
+            .name_flags
+            .ambiguous
+            .then(|| short_member_id(&member._member_id)),
         tags,
     }
 }
@@ -646,6 +659,23 @@ pub(crate) fn viewer_can_ban(
     target: MemberId,
     owner_id: MemberId,
 ) -> bool {
+    // NOBODY MAY BAN THEMSELVES (freenet/river#478).
+    //
+    // The CONTRACT permits it: `is_ban_authorized` has no self-check, and step
+    // 3 (owner-appointed global moderator) fires before anything that would
+    // stop it, so `is_ban_authorized(d, d)` is `true` for every deputy. Such a
+    // ban is fully valid — `verify` accepts it, and `check_banned_members`
+    // then cascades removal to `get_downstream_members`, taking the deputy's
+    // ENTIRE INVITE SUBTREE with them. On the Official room that is ~105
+    // members for one misclick on your own profile.
+    //
+    // This is therefore a gate at the interaction layer, not a contract fix.
+    // Do NOT "simplify" it away on the assumption that the contract prevents
+    // self-bans: it does not. Removing it re-arms the misclick, which is why
+    // `viewer_can_ban_refuses_self` pins it.
+    if viewer == target {
+        return false;
+    }
     let members_by_id = members.members_by_member_id();
     MembersV1::is_ban_authorized(viewer, target, &members_by_id, member_info, owner_id)
 }
@@ -741,6 +771,134 @@ pub(crate) fn deputy_badges_for_viewer(
             .map(|badge| (target, badge))
         })
         .collect()
+}
+
+/// What to show beside a member's name because of who ELSE shares it.
+///
+/// The deputy shield authenticates on something unforgeable (member id and
+/// signed deputy grants) rather than on a name string, which is the durable
+/// answer to impersonation. But its ABSENCE is a weak signal: most legitimate
+/// members carry no shield either, so "Ian Clarke with no shield" looks like
+/// any ordinary member unless the reader already knows Ian should have one.
+/// These two markers make the signal active rather than passive.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub(crate) struct NameFlags {
+    /// At least one other member renders the SAME display name. Show the short
+    /// member id beside each of them so "which one is real?" has an answer even
+    /// when neither holds any authority.
+    pub ambiguous: bool,
+    /// This member's name is confusable with a PRIVILEGED member's (the owner,
+    /// or someone carrying a shield in this view) and this is not that member.
+    /// Carries the impersonated display name for the tooltip.
+    pub impersonates: Option<String>,
+}
+
+impl NameFlags {
+    pub fn is_empty(&self) -> bool {
+        !self.ambiguous && self.impersonates.is_none()
+    }
+
+    /// Tooltip for the ⚠ marker. Names the remedy, because a bare warning
+    /// glyph teaches the reader nothing.
+    ///
+    /// Deliberately avoids the word "close": these tooltips end up inside the
+    /// member-row BUTTON, and Playwright's accessible-name matching is
+    /// substring-based, so "closely matches" made every flagged row satisfy a
+    /// `getByRole("button", { name: "Close" })` query and broke an unrelated
+    /// spec. Keep new UI copy in this file clear of common control words.
+    pub fn impersonation_tooltip(&self) -> Option<String> {
+        self.impersonates.as_ref().map(|target| {
+            format!(
+                "This member's name is nearly identical to {target}, \
+                 a moderator, but this is NOT that person. Look for the shield."
+            )
+        })
+    }
+}
+
+/// Duplicate-name and impersonation markers for every member, in this viewer's
+/// view.
+///
+/// `badges` is the output of [`deputy_badges_for_viewer`]; together with the
+/// owner it defines "privileged". Resolution is by MEMBER ID against the real
+/// deputy grant, so the genuine article is never the one warned about — it is
+/// the thing everyone else is compared to.
+///
+/// Matching is deliberately looser than the automated impersonator ban's:
+/// see [`crate::util::display_name::collision_key`] for why the two must not
+/// be harmonised.
+pub(crate) fn name_flags_for_viewer(
+    members: &MembersV1,
+    member_info: &river_core::room_state::member_info::MemberInfoV1,
+    room_secrets: &HashMap<u32, [u8; 32]>,
+    owner_id: MemberId,
+    badges: &HashMap<MemberId, DeputyBadge>,
+) -> HashMap<MemberId, NameFlags> {
+    use crate::util::display_name::{collision_key, keys_are_confusable};
+
+    // Every member with a name, owner included (the owner is not in `members`).
+    let ids: Vec<MemberId> = std::iter::once(owner_id)
+        .chain(members.members.iter().map(|m| m.member.id()))
+        .collect();
+    let named: Vec<(MemberId, String, String)> = ids
+        .iter()
+        .filter_map(|&id| {
+            let name = member_info
+                .canonical(id)
+                .map(|mi| display_nickname(&mi.member_info.preferred_nickname, room_secrets))?;
+            let key = collision_key(&name);
+            Some((id, name, key))
+        })
+        .collect();
+
+    let mut sharing: HashMap<&str, usize> = HashMap::new();
+    for (_, _, key) in &named {
+        if !key.is_empty() {
+            *sharing.entry(key.as_str()).or_default() += 1;
+        }
+    }
+
+    // Privileged = the owner plus everyone carrying a shield in this view.
+    // Viewer-relative on purpose, so it means the same thing as the shield
+    // beside it: a deputy of an unrelated subtree shows no shield here and is
+    // not someone this viewer would recognise as a moderator either.
+    let privileged: Vec<&(MemberId, String, String)> = named
+        .iter()
+        .filter(|(id, _, key)| !key.is_empty() && (*id == owner_id || badges.contains_key(id)))
+        .collect();
+
+    named
+        .iter()
+        .map(|(id, _, key)| {
+            let ambiguous = !key.is_empty() && sharing.get(key.as_str()).copied().unwrap_or(0) > 1;
+            let is_privileged = *id == owner_id || badges.contains_key(id);
+            let impersonates = if is_privileged || key.is_empty() {
+                // Never warn on the genuine article. Two moderators with
+                // similar names flag neither: that would be worse than
+                // nothing.
+                None
+            } else {
+                privileged
+                    .iter()
+                    .find(|(_, _, pkey)| keys_are_confusable(key, pkey))
+                    .map(|(_, pname, _)| pname.clone())
+            };
+            (
+                *id,
+                NameFlags {
+                    ambiguous,
+                    impersonates,
+                },
+            )
+        })
+        .filter(|(_, flags)| !flags.is_empty())
+        .collect()
+}
+
+/// The short member-id suffix shown beside an ambiguous name, e.g. `#7XSOGJTK`.
+/// Matches the 8-character prefix the DM surfaces and the CLI already use.
+pub(crate) fn short_member_id(id: &MemberId) -> String {
+    id.to_string().chars().take(8).collect()
 }
 
 /// [`deputy_badges_for_viewer`] for a SINGLE member.
@@ -863,6 +1021,10 @@ pub fn MemberList() -> Element {
         // with the conversation's author lines.
         let deputy_badges =
             deputy_badges_for_viewer(members, member_info, room_secrets, owner_id, self_member_id);
+        // Duplicate-name ids and impersonation warnings, computed from the same
+        // badge map so "privileged" means exactly what the shield means.
+        let name_flags =
+            name_flags_for_viewer(members, member_info, room_secrets, owner_id, &deputy_badges);
 
         // Order the list as a DISPLAY tree, VIEWER-SCOPED: a member renders under
         // a deputizer only if that deputizer is viewer-relevant — so a global mod
@@ -912,6 +1074,7 @@ pub fn MemberList() -> Element {
                 // shield's visibility AND its tooltip stay identical across
                 // the sidebar, the modal and the conversation.
                 deputy_badge: deputy_badges.get(&member_id).cloned(),
+                name_flags: name_flags.get(&member_id).cloned().unwrap_or_default(),
             };
 
             all_members.push((member_display_parts(&member_display), member_id));
@@ -978,14 +1141,31 @@ pub fn MemberList() -> Element {
                             // bytes from `MemberInfoV1.preferred_nickname` MUST NOT be
                             // routed through `dangerous_inner_html` (freenet/river#227).
                             span { "{parts.nickname}" }
+                            // Short member id when another member renders the
+                            // same name. Answers "which one is real?" even for
+                            // members with no authority, where the shield says
+                            // nothing either way.
+                            if let Some(short_id) = parts.short_id.clone() {
+                                span {
+                                    class: "ml-1 text-xs text-text-muted font-mono",
+                                    title: "Another member uses this name. This one is #{short_id}",
+                                    "#{short_id}"
+                                }
+                            }
                             for (icon, tooltip) in parts.tags {
                                 span {
                                     class: "member-icon",
+                                    // `title` only — deliberately NOT
+                                    // `aria-label`. These spans are children of
+                                    // the member-row BUTTON, so an aria-label
+                                    // here is concatenated into the button's
+                                    // accessible name: the impersonation
+                                    // tooltip's "closely matches" made every
+                                    // flagged row match a `name: "Close"`
+                                    // query and broke an unrelated spec. The
+                                    // conversation and modal markers are not
+                                    // inside a button and do carry aria-label.
                                     title: "{tooltip}",
-                                    // The glyph alone means nothing to a
-                                    // screen reader, and the deputy shield is
-                                    // now a security-relevant signal.
-                                    "aria-label": "{tooltip}",
                                     " {icon}"
                                 }
                             }
@@ -2625,6 +2805,7 @@ mod tests {
             invited_by_you: false,
             in_your_network: false,
             deputy_badge: None,
+            name_flags: NameFlags::default(),
         }
     }
 
@@ -3308,6 +3489,115 @@ mod tests {
         assert!(!badges.contains_key(&id(&their_deputy_sk)));
     }
 
+    /// freenet/river#478: nobody may ban themselves.
+    ///
+    /// The precondition assertion is the point of this test. The CONTRACT says
+    /// yes — `is_ban_authorized(deputy, deputy)` returns `true`, because step 3
+    /// (owner-appointed global moderator) fires before anything that would stop
+    /// it — and such a ban cascades to the deputy's whole invite subtree. So
+    /// this test would still pass with the guard removed if it only checked
+    /// `viewer_can_ban`; asserting the contract answer FIRST proves the guard,
+    /// and not the contract, is what produces `false`.
+    #[test]
+    fn viewer_can_ban_refuses_self() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let deputy_sk = SigningKey::generate(&mut rng);
+        let plain_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let deputy_id = id(&deputy_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &deputy_sk.verifying_key()),
+                authorized_member(&owner_sk, &plain_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Owner", vec![deputy_id]),
+                signed_member_info(&deputy_sk, "Deputy", vec![]),
+                signed_member_info(&plain_sk, "Plain", vec![]),
+            ],
+        };
+
+        // Precondition: the contract really does authorise a self-ban.
+        assert!(
+            MembersV1::is_ban_authorized(
+                deputy_id,
+                deputy_id,
+                &members.members_by_member_id(),
+                &member_info,
+                owner_id
+            ),
+            "precondition: the contract permits a deputy to ban themselves, \
+             which is exactly why the UI must refuse"
+        );
+
+        // The UI gate refuses it.
+        assert!(
+            !viewer_can_ban(&members, &member_info, deputy_id, deputy_id, owner_id),
+            "a deputy must not be able to ban themselves"
+        );
+        // ...without disturbing the ban authority they legitimately hold.
+        assert!(viewer_can_ban(
+            &members,
+            &member_info,
+            deputy_id,
+            id(&plain_sk),
+            owner_id
+        ));
+    }
+
+    /// The second layer of the #478 guard: the Ban action must not even RENDER
+    /// on your own profile. Source-scrape, because the render is a Dioxus
+    /// component tree with no headless harness here — but it fails loudly if
+    /// someone moves `BanButton` back outside the self-check.
+    #[test]
+    fn ban_action_is_not_rendered_for_self() {
+        let source = include_str!("members/member_info_modal.rs");
+        let prod = &source[..source
+            .find("#[cfg(test)]")
+            .expect("member_info_modal.rs should have a #[cfg(test)] block")];
+
+        let ban_at = prod
+            .find("BanButton {")
+            .expect("the modal must render a BanButton");
+        let guard = "if member_id != self_member_id {";
+        let guard_at = prod[..ban_at].rfind(guard).unwrap_or_else(|| {
+            panic!("no `{guard}` guard anywhere above the BanButton render (#478)")
+        });
+
+        // The guard must still be OPEN where the button renders. Track the
+        // MINIMUM running brace depth between the two, not the final depth:
+        // the modal has an earlier `if member_id != self_member_id` block (the
+        // DM / Share-invite row) that closes again, and a final-depth check
+        // reads that as satisfying the guard because a later block re-opens.
+        // Dipping below zero means the guard closed.
+        let between = &prod[guard_at + guard.len()..ban_at];
+        let mut depth = 0i32;
+        let mut min_depth = 0i32;
+        for c in between.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            min_depth = min_depth.min(depth);
+        }
+        assert!(
+            min_depth >= 0,
+            "the nearest `{guard}` above `BanButton` closes before the button \
+             renders, so a deputy can still ban themselves from their own \
+             profile (#478)"
+        );
+    }
+
     /// "Cannot ban you" must not lie. A ban cascades to the banned member's
     /// whole invite subtree, so a deputy who cannot ban the viewer DIRECTLY but
     /// can ban the viewer's inviter still gets the viewer removed.
@@ -3528,6 +3818,167 @@ mod tests {
                 ),
                 sweep.get(&target).cloned(),
                 "single-target lookup disagrees with the sweep for {target}"
+            );
+        }
+    }
+
+    /// The impersonation campaign, modelled: the room owner is "Ian Clarke",
+    /// and three other members take names that look like his. The genuine
+    /// owner must never be the one warned about, and an unrelated member must
+    /// not be warned at all.
+    #[test]
+    fn impersonators_of_a_privileged_member_are_flagged_not_the_real_one() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let exact_sk = SigningKey::generate(&mut rng);
+        let homoglyph_sk = SigningKey::generate(&mut rng);
+        let near_sk = SigningKey::generate(&mut rng);
+        let unrelated_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &exact_sk.verifying_key()),
+                authorized_member(&owner_sk, &homoglyph_sk.verifying_key()),
+                authorized_member(&owner_sk, &near_sk.verifying_key()),
+                authorized_member(&owner_sk, &unrelated_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Ian Clarke", vec![]),
+                signed_member_info(&exact_sk, "Ian Clarke", vec![]),
+                // Cyrillic е in "Clarkе".
+                signed_member_info(&homoglyph_sk, "Ian Clark\u{0435}", vec![]),
+                signed_member_info(&near_sk, "Ian Clark", vec![]),
+                signed_member_info(&unrelated_sk, "Nacho Duart", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+            ],
+        };
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        let flags = name_flags_for_viewer(&members, &member_info, &secrets, owner_id, &badges);
+
+        // The genuine owner is never warned about — that would be worse than
+        // no warning at all.
+        assert_eq!(
+            flags.get(&owner_id).and_then(|f| f.impersonates.clone()),
+            None,
+            "the real Ian Clarke must not be flagged as an impersonator"
+        );
+
+        for (label, sk) in [
+            ("exact copy", &exact_sk),
+            ("Cyrillic homoglyph", &homoglyph_sk),
+            ("one edit away", &near_sk),
+        ] {
+            assert_eq!(
+                flags
+                    .get(&id(sk))
+                    .and_then(|f| f.impersonates.clone())
+                    .as_deref(),
+                Some("Ian Clarke"),
+                "{label} must be flagged as impersonating the owner"
+            );
+        }
+
+        // An unrelated member gets nothing: warning fatigue is the failure
+        // mode for this feature.
+        assert!(flags.get(&id(&unrelated_sk)).is_none());
+        assert!(flags.get(&id(&viewer_sk)).is_none());
+
+        // The exact copy ALSO renders the same string as the owner, so both
+        // get a short id; the near-miss renders differently and does not.
+        assert!(flags[&owner_id].ambiguous, "owner shares a rendered name");
+        assert!(flags[&id(&exact_sk)].ambiguous);
+        assert!(!flags[&id(&near_sk)].ambiguous);
+
+        // The tooltip names the remedy rather than just alarming.
+        let tip = flags[&id(&exact_sk)].impersonation_tooltip().unwrap();
+        assert!(tip.contains("Ian Clarke"), "{tip}");
+        assert!(tip.contains("NOT that person"), "{tip}");
+        assert!(tip.contains("shield"), "{tip}");
+    }
+
+    /// A deputy is privileged too, so impersonating one is flagged — and two
+    /// members who merely share a name with EACH OTHER, neither privileged,
+    /// get short ids but no warning.
+    #[test]
+    fn deputies_are_privileged_and_ordinary_collisions_are_not_warnings() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let deputy_sk = SigningKey::generate(&mut rng);
+        let faker_sk = SigningKey::generate(&mut rng);
+        let dave_a_sk = SigningKey::generate(&mut rng);
+        let dave_b_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &deputy_sk.verifying_key()),
+                authorized_member(&owner_sk, &faker_sk.verifying_key()),
+                authorized_member(&owner_sk, &dave_a_sk.verifying_key()),
+                authorized_member(&owner_sk, &dave_b_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Owner", vec![id(&deputy_sk)]),
+                signed_member_info(&deputy_sk, "Nacho Duart", vec![]),
+                signed_member_info(&faker_sk, "NachoDuart", vec![]),
+                signed_member_info(&dave_a_sk, "Dave Smith", vec![]),
+                signed_member_info(&dave_b_sk, "Dave Smith", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+            ],
+        };
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        // Precondition: the deputy really does carry a shield in this view,
+        // otherwise "privileged" would be doing nothing here.
+        assert!(badges.contains_key(&id(&deputy_sk)));
+
+        let flags = name_flags_for_viewer(&members, &member_info, &secrets, owner_id, &badges);
+
+        assert_eq!(
+            flags
+                .get(&id(&faker_sk))
+                .and_then(|f| f.impersonates.clone())
+                .as_deref(),
+            Some("Nacho Duart"),
+            "a name colliding with a DEPUTY's must be flagged"
+        );
+        assert_eq!(
+            flags
+                .get(&id(&deputy_sk))
+                .and_then(|f| f.impersonates.clone()),
+            None,
+            "the real deputy must not be flagged"
+        );
+
+        // Two ordinary members sharing a name: ids, no warning.
+        for sk in [&dave_a_sk, &dave_b_sk] {
+            let f = flags.get(&id(sk)).expect("a shared name gets a short id");
+            assert!(f.ambiguous);
+            assert_eq!(
+                f.impersonates, None,
+                "two ordinary members sharing a name is not an impersonation \
+                 warning — firing here is how the marker gets ignored"
             );
         }
     }

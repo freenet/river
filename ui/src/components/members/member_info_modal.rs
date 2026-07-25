@@ -240,6 +240,32 @@ pub fn MemberInfoModal() -> Element {
             .as_ref()
             .map(super::DeputyBadge::tooltip)
             .unwrap_or_default();
+        // Duplicate-name / impersonation markers for this member, from the
+        // same helpers the member list and the conversation use.
+        let name_flags: super::NameFlags = owner_key_signal
+            .as_ref()
+            .map(|owner| {
+                let owner_id = MemberId::from(&*owner);
+                let badges = super::deputy_badges_for_viewer(
+                    &room_state.room_state.members,
+                    &room_state.room_state.member_info,
+                    &room_state.secrets,
+                    owner_id,
+                    self_member_id,
+                );
+                super::name_flags_for_viewer(
+                    &room_state.room_state.members,
+                    &room_state.room_state.member_info,
+                    &room_state.secrets,
+                    owner_id,
+                    &badges,
+                )
+                .remove(&member_id)
+                .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let impersonation_tooltip = name_flags.impersonation_tooltip();
+        let member_short_id = super::short_member_id(&member_id);
         // Decrypted display nickname for the target (for the deputy action copy).
         let target_nickname = display_nickname(
             &member_info.member_info.preferred_nickname,
@@ -323,6 +349,26 @@ pub fn MemberInfoModal() -> Element {
                                     title: "{deputy_tooltip}",
                                     "aria-label": "{deputy_tooltip}",
                                     "🛡 Deputy"
+                                }
+                            }
+                            // Impersonation warning. Deliberately rendered as
+                            // its own chip rather than folded into the shield
+                            // row: it is the opposite claim.
+                            if let Some(warning) = impersonation_tooltip.clone() {
+                                span {
+                                    "data-testid": "member-info-impersonation-tag",
+                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-amber-500/20 text-amber-400",
+                                    title: "{warning}",
+                                    "aria-label": "{warning}",
+                                    "⚠️ Possible impersonation"
+                                }
+                            }
+                            if name_flags.ambiguous {
+                                span {
+                                    "data-testid": "member-info-ambiguous-name-tag",
+                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-surface text-text-muted font-mono",
+                                    title: "Another member in this room uses the same name",
+                                    "#{member_short_id}"
                                 }
                             }
                         }
@@ -413,26 +459,34 @@ pub fn MemberInfoModal() -> Element {
                             // Ban + Deputize sit in one row (Ban on the left,
                             // Deputize on the right), matching the DM /
                             // Share-invite button row above.
-                            div { class: "mt-4 flex items-start gap-3",
-                                BanButton {
-                                    member_to_ban: member_id,
-                                    can_ban: can_ban,
-                                    // The DECRYPTED, sanitised name — the same
-                                    // value `DeputyButton` gets. This used to
-                                    // pass the raw `SealedBytes`, which Dioxus
-                                    // silently coerced through `Display` (i.e.
-                                    // `to_string_lossy`): the ban dialog showed
-                                    // an unsanitised nickname in the one place
-                                    // a moderator is judging authority, and
-                                    // showed "[Encrypted: N bytes, vN]" instead
-                                    // of a name in private rooms.
-                                    nickname: target_nickname.clone()
-                                }
+                            //
+                            // BOTH are gated on the target not being yourself.
+                            // Ban used to sit outside this guard, so a deputy
+                            // opening their own profile saw an enabled "Ban
+                            // User" — and the resulting self-ban is
+                            // contract-VALID and cascades to their whole invite
+                            // subtree (freenet/river#478). `viewer_can_ban`
+                            // refuses self as well; this is the second layer.
+                            if member_id != self_member_id {
+                                div { class: "mt-4 flex items-start gap-3",
+                                    BanButton {
+                                        member_to_ban: member_id,
+                                        can_ban: can_ban,
+                                        // The DECRYPTED, sanitised name — the same
+                                        // value `DeputyButton` gets. This used to
+                                        // pass the raw `SealedBytes`, which Dioxus
+                                        // silently coerced through `Display` (i.e.
+                                        // `to_string_lossy`): the ban dialog showed
+                                        // an unsanitised nickname in the one place
+                                        // a moderator is judging authority, and
+                                        // showed "[Encrypted: N bytes, vN]" instead
+                                        // of a name in private rooms.
+                                        nickname: target_nickname.clone()
+                                    }
 
-                                // Deputize / revoke-deputy (#410). Any non-owner
-                                // member (except self) may be deputized; the action
-                                // hides itself when the viewer lacks authority.
-                                if member_id != self_member_id {
+                                    // Deputize / revoke-deputy (#410). Any non-owner
+                                    // member (except self) may be deputized; the action
+                                    // hides itself when the viewer lacks authority.
                                     DeputyButton {
                                         target: member_id,
                                         viewer_has_authority: viewer_has_authority,
