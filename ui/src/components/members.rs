@@ -5487,51 +5487,106 @@ mod tests {
     /// documents).
     #[test]
     fn impersonation_warning_is_wired_into_both_render_surfaces() {
-        for (label, source) in [
-            ("member list", include_str!("members.rs")),
-            ("message author line", include_str!("conversation.rs")),
-        ] {
-            assert!(
-                source.contains("impersonation_warning_for_display("),
-                "{label} no longer renders the impersonation warning"
-            );
-            let built = source.matches("impersonation_checker_for_viewer(").count();
-            assert!(
-                built >= 1,
-                "{label} no longer builds an impersonation checker"
-            );
+        let members_src = include_str!("members.rs");
+        let conversation = include_str!("conversation.rs");
+
+        /// The source between two anchors, so a check is scoped to ONE
+        /// function rather than the whole file.
+        ///
+        /// The whole-file version of this test PASSED against a mutation that
+        /// deleted the `MemberList` call site, because `members.rs` also
+        /// contains the function's own DEFINITION and its tests. Scoping is
+        /// the entire point — do not widen these ranges.
+        fn between<'a>(src: &'a str, from: &str, to: &str, what: &str) -> &'a str {
+            let start = src
+                .find(from)
+                .unwrap_or_else(|| panic!("anchor {from:?} not found ({what})"));
+            let end = src[start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("anchor {to:?} not found after {from:?} ({what})"))
+                + start;
+            &src[start..end]
         }
 
-        // The conversation must compute the warning per GROUP and the checker
-        // once per render — never inside `group_messages`, which would rebuild
-        // the protected set for every message.
-        let conversation = include_str!("conversation.rs");
-        let group_fn = conversation
-            .find("fn group_messages(")
-            .expect("group_messages must exist");
-        let body_end = conversation[group_fn..]
-            .find("\n/// Format an event summary")
-            .expect("group_messages is followed by format_event_summary")
-            + group_fn;
-        assert!(
-            !conversation[group_fn..body_end].contains("impersonation_checker_for_viewer("),
-            "`group_messages` builds the checker itself; it must receive one \
-             built once per render (see `impersonation_warning_for_display`)"
+        // --- Member list -------------------------------------------------
+        let member_memo = between(
+            members_src,
+            "pub fn MemberList()",
+            "let handle_member_click",
+            "MemberList memo",
         );
-
-        // The member list must build the checker outside the per-member loop.
-        let members_src = include_str!("members.rs");
-        let memo = members_src
-            .find("pub fn MemberList()")
-            .expect("MemberList must exist");
-        let loop_at = members_src[memo..]
-            .find("for &member_id in &ordered_ids")
-            .expect("the per-member loop must exist")
-            + memo;
         assert!(
-            members_src[memo..loop_at].contains("impersonation_checker_for_viewer("),
+            member_memo.contains("impersonation_warning_for_display("),
+            "MemberList no longer computes an impersonation warning, so the \
+             member list shows no warning however confusable a name is"
+        );
+        assert!(
+            member_memo.contains("impersonation_checker_for_viewer("),
+            "MemberList no longer builds an impersonation checker"
+        );
+        // Built ONCE, before the per-member loop — not per row, which would
+        // re-fold every protected name (and re-unseal every protected
+        // nickname in a private room) for each member.
+        assert!(
+            between(
+                member_memo,
+                "pub fn MemberList()",
+                "for &member_id in &ordered_ids",
+                "MemberList per-member loop",
+            )
+            .contains("impersonation_checker_for_viewer("),
             "MemberList must build the impersonation checker BEFORE the \
              per-member loop, not inside it"
+        );
+        // ...and the row must actually RENDER it. A warning computed but not
+        // rendered protects nobody.
+        assert!(
+            between(
+                members_src,
+                "fn member_display_parts(",
+                "\n/// Order member IDs",
+                "member_display_parts",
+            )
+            .contains("WARNING_GLYPH"),
+            "the member row no longer renders the warning glyph"
+        );
+
+        // --- Message author line ------------------------------------------
+        let group_fn = between(
+            conversation,
+            "fn group_messages(",
+            "\n/// Format an event summary",
+            "group_messages",
+        );
+        assert!(
+            group_fn.contains("impersonation_warning_for_display("),
+            "`group_messages` no longer computes an impersonation warning, so \
+             message author lines show no warning"
+        );
+        assert!(
+            !group_fn.contains("impersonation_checker_for_viewer("),
+            "`group_messages` builds the checker itself; it must receive one \
+             built once per render, or the protected set is refolded for \
+             every message"
+        );
+        assert!(
+            conversation.contains("impersonation_checker_for_viewer("),
+            "the conversation no longer builds an impersonation checker"
+        );
+        // The rendered element, anchored on its test id.
+        assert!(
+            conversation.contains("\"data-testid\": \"message-author-impersonation-warning\""),
+            "the message author line no longer renders the warning element"
+        );
+        assert!(
+            between(
+                conversation,
+                "\"data-testid\": \"message-author-impersonation-warning\"",
+                "// Deputy shield.",
+                "author-line warning element",
+            )
+            .contains("WARNING_GLYPH"),
+            "the author-line warning element no longer renders the warning glyph"
         );
     }
 }
