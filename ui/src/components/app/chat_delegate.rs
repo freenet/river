@@ -1904,13 +1904,16 @@ mod tests {
     /// (freenet/river#398 moved codegen to `freenet-migrate-build`) must
     /// reproduce it byte-identically, or every user silently re-runs legacy
     /// migration once. Pinned to the value computed from the current
-    /// `legacy_delegates.toml` (25 entries spanning V1..V28 — V4–V6 removed —
+    /// `legacy_delegates.toml` (26 entries spanning V1..V29 — V4–V6 removed —
     /// in file order). This value
     /// SHOULD change when a genuinely new legacy entry is added — update the
     /// constant then — but must NEVER change from a codegen/tooling swap.
+    ///
+    /// V29 registers the pre-retention-horizon delegate generation (the
+    /// messages / direct-messages prune-resend loop fix re-keyed both WASMs).
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
-        assert_eq!(legacy_set_fingerprint(), "b2824be852437587");
+        assert_eq!(legacy_set_fingerprint(), "323a2f640bfd7a7f");
     }
 
     /// The "migration in progress" and "migration done" localStorage keys MUST
