@@ -394,13 +394,18 @@ fn target_plaintext(
     }
 }
 
-/// A member's current nickname, decrypted when the room is private.
+/// A member's current nickname, decrypted when the room is private and
+/// sanitised for display.
 ///
 /// Routes through [`MemberInfoV1::canonical`] rather than a pre-collected
 /// `member_id -> name` map: River accepts duplicate `member_info` records until
 /// `post_apply_cleanup` dedups them, and a raw `.collect()` keeps whichever
 /// record happens to come last. Every by-id read must agree on the canonical
 /// (highest-rank) record.
+///
+/// The sanitisation is [`crate::util::display_name::display_nickname`], which
+/// strips emoji so a nickname cannot forge the 🛡 deputy badge rendered beside
+/// it. Every nickname that reaches the screen goes through it.
 fn resolve_member_nickname(
     member_info: &MemberInfoV1,
     member_id: MemberId,
@@ -3828,9 +3833,17 @@ mod tests {
     #[test]
     fn author_deputy_badge_uses_the_shared_helper() {
         let source = include_str!("conversation.rs");
+        // Cut at THIS test module specifically, by a needle that cannot match
+        // itself (it contains an escaped newline in the source, not a literal
+        // one). Neither `find("#[cfg(test)]")` nor `rfind` works here: the
+        // first lands on the `clear_message_html_cache` helper above and hides
+        // most of the file, and the last lands on whichever test module was
+        // appended most recently — freenet/river#471 added one, which silently
+        // made every assertion below self-satisfying because the needles were
+        // then inside the scanned text.
         let prod = &source[..source
-            .rfind("#[cfg(test)]")
-            .expect("conversation.rs should have a #[cfg(test)] block")];
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
 
         assert!(
             prod.contains("message-author-deputy-badge"),
@@ -5000,6 +5013,49 @@ mod resolve_reply_strip_tests {
             } => (author, preview),
             other => panic!("expected a rendered quote, got {other:?}"),
         }
+    }
+
+    /// The quote's author label is the target author's CURRENT nickname, so it
+    /// goes through the same sanitiser as the message header above it. Without
+    /// this, `Alice 🛡` would paint a shield into the reply strip — one line
+    /// under the real author line and its real badge.
+    ///
+    /// This covers the LIVE path. `extract_reply_context`'s own sanitisation of
+    /// the sender-written snapshot name is defence in depth: both of its
+    /// callers now discard that field.
+    #[test]
+    fn quote_author_label_is_sanitised() {
+        let owner_sk = signing_key(1);
+        let alice_sk = signing_key(2);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+
+        let quoted = authored(
+            owner,
+            &alice_sk,
+            RoomMessageBody::public("morning".to_string()),
+            10,
+        );
+        let reply = authored(
+            owner,
+            &bob_sk,
+            RoomMessageBody::reply(
+                "morning!".to_string(),
+                quoted.id(),
+                "whatever the sender claims".to_string(),
+                "morning".to_string(),
+            ),
+            20,
+        );
+        let member_info = info(vec![named(&alice_sk, "Alice \u{1F6E1}")]);
+
+        let (author, preview) = expect_quote(resolve(
+            &reply,
+            &state(vec![quoted, reply.clone()]),
+            &member_info,
+        ));
+        assert_eq!(author, "Alice", "quote author kept a badge glyph");
+        assert_eq!(preview, "morning");
     }
 
     const ABUSE: &str = "you are all worthless, buy my coin at scam.example";
