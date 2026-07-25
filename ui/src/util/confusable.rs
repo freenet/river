@@ -345,6 +345,31 @@ impl ImpersonationWarning {
     /// ID River shows on hover). Pinned by
     /// `crate::components::members::a_shield_and_a_warning_can_both_render`.
     ///
+    /// ## Rewording this text can break browser tests in unrelated files
+    ///
+    /// Read this before changing a word of it. Every surface puts this string
+    /// in an `aria-label`, and an element's accessible name is composed from
+    /// its descendants — so this text becomes part of the accessible name of
+    /// the whole member ROW, message header, or chip that contains the badge.
+    ///
+    /// Playwright's `getByRole(role, { name })` matches that accessible name by
+    /// case-insensitive SUBSTRING unless the caller passes `exact: true`. The
+    /// two consequences are not obvious and have already cost one debugging
+    /// session:
+    ///
+    /// * A word in here can capture a locator in a spec that has nothing to do
+    ///   with impersonation. "…but their name **close**ly resembles one" made
+    ///   every flagged row answer to `getByRole("button", { name: "Close" })`,
+    ///   and the Export Identity spec failed on a strict-mode violation
+    ///   pointing at a member row (freenet/river#494). The mitigation is
+    ///   `exact: true` at the locator, not softer wording here.
+    /// * There is more than one wording, because the sentence branches on
+    ///   `flagged_privilege`, so a collision can appear in only one of them and
+    ///   look intermittent.
+    ///
+    /// If you reword this, grep the Playwright specs for `getByRole` name
+    /// locators and check each against the NEW text.
+    ///
     /// Pinned by `tooltip_contains_no_nickname_content`.
     pub fn tooltip(&self) -> String {
         if self.flagged_privilege.is_some() {
