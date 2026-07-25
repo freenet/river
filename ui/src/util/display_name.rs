@@ -142,8 +142,13 @@ pub fn is_display_hidden(c: char) -> bool {
         | 0x2900..=0x297F
         // Miscellaneous Symbols and Arrows (⬛ ⭐ …).
         | 0x2B00..=0x2BFF
-        // Combining enclosing keycap (the `1️⃣` assembler).
-        | 0x20E3
+        // Combining Diacritical Marks for Symbols. Includes the keycap
+        // assembler (`1️⃣`) but also the ENCLOSING marks — U+20DD circle,
+        // U+20DE square, U+20E0 circle-backslash, U+20E4 triangle — which
+        // rebuild by composition the very glyphs `0x2460..=0x24FF` is stripped
+        // for: `A\u{20DD}` is Ⓐ, `!\u{20E4}` reads as ⚠. The block has no
+        // letter content.
+        | 0x20D0..=0x20F0
         // 〰 〽 and the two emoji-presented enclosed ideographs ㊗ ㊙. The
         // rest of the CJK punctuation and Enclosed CJK blocks is untouched.
         | 0x3030 | 0x303D | 0x3297 | 0x3299
@@ -158,7 +163,7 @@ pub fn is_display_hidden(c: char) -> bool {
         // U+00AD SOFT HYPHEN and U+180E MONGOLIAN VOWEL SEPARATOR render as
         // nothing; U+FFF9..U+FFFB are interlinear annotation anchors that hide
         // the text between them.
-        | 0x00AD | 0x061C | 0x180E | 0xFFF9..=0xFFFB
+        | 0x00AD | 0x061C | 0x180E | 0xFFF0..=0xFFFB
         // Blank glyphs that are not whitespace, so the space collapse below
         // would not remove them: they let two members share a pixel-identical
         // rendered name (`Alice` vs `Alice\u{3164}`), which undermines the
@@ -175,13 +180,20 @@ pub fn is_display_hidden(c: char) -> bool {
         // Selectors Supplement (U+FE00..FE0F's big brother), and the
         // shorthand-format and musical beam/slur/phrase controls.
         | 0x034F | 0x180B..=0x180D | 0x180F | 0x17B4..=0x17B5 | 0x2065
-        | 0xE0100..=0xE01EF | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
         // Text-presentation symbols that read as a badge in the fonts that
         // carry them: ۞ (ornate star, present wherever Arabic renders), ٭,
         // ꙳, and the Phaistos shield. Plus Symbols for Legacy Computing and
         // its supplement, which contain an inverse check mark and stick
         // figures.
-        | 0x066D | 0x06DE | 0xA673 | 0x101DB
+        | 0x066D | 0x06DE | 0xA673
+        // Aegean/Phaistos: picking out only the shield (U+101DB) left the
+        // helmet, tiara, rosette and — the one that matters — U+10102 AEGEAN
+        // CHECK MARK, which renders as ✓ wherever Noto Sans Symbols is
+        // installed (stock Ubuntu/Fedora).
+        | 0x10100..=0x101FC
+        // Halfwidth clones of the geometric shapes stripped above.
+        | 0xFFED..=0xFFEE
         | 0x1FB00..=0x1FBFF | 0x1CC00..=0x1CEBF
         // Private Use Area (BMP). Font-defined glyphs, and River's own
         // mention sentinels live at U+E000/U+E001.
@@ -191,8 +203,13 @@ pub fn is_display_hidden(c: char) -> bool {
         // Pictographs, Emoticons, Transport, Supplemental Symbols and
         // Pictographs, Symbols and Pictographs Extended-A. 🛡 is U+1F6E1.
         | 0x1F000..=0x1FAFF
-        // Tags — the flag-sequence assembler (🏴󠁧󠁢󠁳󠁣󠁴󠁿).
-        | 0xE0000..=0xE007F
+        // ALL of plane 14. It is Default_Ignorable end to end (HarfBuzz, which
+        // backs Chrome/Firefox/Android, treats the whole plane that way), so
+        // every codepoint in it renders as nothing. Naming only the tag block
+        // (`E0000..E007F`, the flag-sequence assembler 🏴󠁧󠁢󠁳󠁣󠁴󠁿) and the variation
+        // selectors supplement left ~3,700 invisible characters through, each
+        // of which clones another member's rendered name.
+        | 0xE0000..=0xE0FFF
         // Supplementary Private Use Areas A and B.
         | 0xF0000..=0xFFFFD
         | 0x100000..=0x10FFFD
@@ -704,6 +721,59 @@ mod tests {
              nickname can forge a 🛡 deputy badge there:\n  {}",
             offenders.join("\n  ")
         );
+    }
+
+    /// Every Default_Ignorable character renders as nothing, so any one of
+    /// them clones another member's rendered name — the exact capability an
+    /// impersonation campaign wants. The first pass named only the ranges it
+    /// happened to think of and left ~3,700 through, including all of plane 14
+    /// and `U+FFF0..U+FFF8`. These are NOT riverctl-only: `contains_hidden_chars`
+    /// gates the nickname input, so a miss means the UI accepts them too.
+    #[test]
+    fn default_ignorable_characters_cannot_clone_a_name() {
+        for c in [
+            '\u{FFF0}',
+            '\u{FFF4}',
+            '\u{FFF8}', // the FFFx reserved-DI gap
+            '\u{E0001}',
+            '\u{E0080}',
+            '\u{E00FF}', // plane 14 outside the tag block
+            '\u{E01F0}',
+            '\u{E0FFF}', // plane 14 above the variation selectors
+            '\u{E0100}', // variation selectors supplement
+        ] {
+            let cloned = format!("Ian{c} Clarke");
+            assert_eq!(
+                sanitize_display_name(&cloned),
+                "Ian Clarke",
+                "U+{:04X} survived and clones another member's name",
+                u32::from(c)
+            );
+            assert!(
+                contains_hidden_chars(&cloned),
+                "U+{:04X} is not rejected at the nickname input",
+                u32::from(c)
+            );
+            // Alone, it must not pass as a name at all.
+            assert_eq!(sanitize_display_name(&c.to_string()), UNNAMED);
+        }
+    }
+
+    /// Enclosing combining marks rebuild by composition the badge-shaped
+    /// glyphs the enclosed-alphanumeric block is stripped for, and the Aegean
+    /// check mark renders as ✓ on a stock Linux desktop.
+    #[test]
+    fn composed_and_stray_badge_glyphs_are_stripped() {
+        for (label, name, want) in [
+            ("enclosing circle (Ⓐ)", "Mod A\u{20DD}", "Mod A"),
+            ("enclosing square", "Mod A\u{20DE}", "Mod A"),
+            ("enclosing triangle (⚠-ish)", "Mod !\u{20E4}", "Mod !"),
+            ("Aegean check mark", "Mod \u{10102}", "Mod"),
+            ("halfwidth black square", "Mod \u{FFED}", "Mod"),
+        ] {
+            let out = sanitize_display_name(name);
+            assert_eq!(out, want, "{label}: got {out:?}");
+        }
     }
 
     #[test]

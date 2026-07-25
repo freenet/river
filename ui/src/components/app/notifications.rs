@@ -381,7 +381,7 @@ pub fn show_notification(
         let body = format!(
             "{}: {}",
             sender_name,
-            message_preview.replace(['\n', '\r'], " ")
+            message_preview.replace(['\n', '\r', '\u{2028}', '\u{2029}', '\u{0085}'], " ")
         );
         post_notification_to_shell(room_key, room_name, &body);
         return;
@@ -432,7 +432,7 @@ fn create_notification_internal(
     let body = format!(
         "{}: {}",
         sender_name,
-        message_preview.replace(['\n', '\r'], " ")
+        message_preview.replace(['\n', '\r', '\u{2028}', '\u{2029}', '\u{0085}'], " ")
     );
     info!(
         "Creating notification - title: '{}', body: '{}'",

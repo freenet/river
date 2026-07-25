@@ -533,7 +533,13 @@ pub(crate) fn build_deputizers_of(
             if *deputy == appointer {
                 continue;
             }
-            deputizers_of.entry(*deputy).or_default().push(appointer);
+            // `MAX_DEPUTIES` bounds the LENGTH but nothing rejects repeats, so
+            // `deputies: [sockpuppet; 64]` would otherwise name the same
+            // appointer 64 times in the tooltip and bury the real content.
+            let entry = deputizers_of.entry(*deputy).or_default();
+            if !entry.contains(&appointer) {
+                entry.push(appointer);
+            }
         }
     }
     deputizers_of
@@ -618,10 +624,17 @@ pub(crate) fn relevant_deputizer_names(
         member_info
             .canonical(id)
             .map(|mi| {
-                format!(
-                    "\u{201c}{}\u{201d}",
-                    display_nickname(&mi.member_info.preferred_nickname, room_secrets)
-                )
+                // Strip the quote characters from the nickname before wrapping
+                // it. Without this the quoting is decorative, not protective:
+                // the appointers are joined into ONE flat string, so a
+                // nickname of `Bob\u{201d}, the room owner, \u{201c}Carol`
+                // renders as `appointed by \u{201c}Bob\u{201d}, the room
+                // owner, \u{201c}Carol\u{201d}` — the forged owner
+                // appointment the quotes exist to prevent. Sanitising cannot
+                // help here; the payload IS the quote characters.
+                let name = display_nickname(&mi.member_info.preferred_nickname, room_secrets)
+                    .replace(['\u{201c}', '\u{201d}'], "");
+                format!("\u{201c}{name}\u{201d}")
             })
             .unwrap_or_else(|| "an unknown member".to_string())
     };
@@ -3060,6 +3073,86 @@ mod tests {
             viewer_id,
         )
         .is_empty());
+    }
+
+    /// The shield tooltip joins appointer names into ONE flat string, with the
+    /// two role labels (`the room owner`, `you`) left unquoted so a nickname
+    /// cannot masquerade as them. That only works if the nickname cannot
+    /// supply its own quote characters.
+    #[test]
+    fn appointer_names_cannot_inject_a_role_label() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let liar_sk = SigningKey::generate(&mut rng);
+        let puppet_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+
+        // The liar invited the viewer, so the liar is a viewer-relevant
+        // appointer and their puppet carries a shield in the viewer's view.
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &liar_sk.verifying_key()),
+                authorized_member(&owner_sk, &puppet_sk.verifying_key()),
+                member_invited_by(&liar_sk, owner_id, &viewer_sk.verifying_key()),
+            ],
+        };
+        let payload = "Bob\u{201d}, the room owner, \u{201c}Carol";
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Owner", vec![]),
+                signed_member_info(&liar_sk, payload, vec![id(&puppet_sk)]),
+                signed_member_info(&puppet_sk, "Puppet", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+            ],
+        };
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        let tooltip = badges
+            .get(&id(&puppet_sk))
+            .expect("the puppet carries a shield in this view")
+            .tooltip();
+
+        assert!(
+            !tooltip.contains("\u{201d}, the room owner, \u{201c}"),
+            "a nickname injected an unquoted role label into the tooltip: {tooltip}"
+        );
+        assert!(
+            tooltip.contains("\u{201c}Bob, the room owner, Carol\u{201d}"),
+            "the whole nickname should sit inside one quoted span: {tooltip}"
+        );
+    }
+
+    /// A repeated deputy entry must not repeat the appointer in the tooltip.
+    #[test]
+    fn duplicate_deputy_entries_are_collapsed() {
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let appointer_sk = SigningKey::generate(&mut rng);
+        let deputy_sk = SigningKey::generate(&mut rng);
+        let deputy_id = MemberId::from(&deputy_sk.verifying_key());
+
+        let member_info = MemberInfoV1 {
+            member_info: vec![signed_member_info(
+                &appointer_sk,
+                "Spammer",
+                vec![deputy_id; 64],
+            )],
+        };
+        let deputizers = build_deputizers_of(&member_info);
+        assert_eq!(
+            deputizers.get(&deputy_id).map(Vec::len),
+            Some(1),
+            "64 repeated grants must collapse to one appointer"
+        );
     }
 
     /// The conversation's 🛡 badge predicate, end to end.
