@@ -294,14 +294,14 @@ test.describe("Sandboxed iframe embedding", () => {
   const sandboxAttrs =
     "allow-scripts allow-forms allow-popups allow-same-origin";
 
-  test("app renders inside a sandboxed iframe", async ({ page }) => {
+  test("app renders inside a sandboxed iframe", async ({ page, baseURL }) => {
     await page.setContent(`
       <!DOCTYPE html>
       <html>
       <body style="margin:0;padding:0;height:100vh;">
         <iframe
           sandbox="${sandboxAttrs}"
-          src="http://localhost:8082"
+          src="${baseURL}"
           style="width:100%;height:100%;border:none;"
         ></iframe>
       </body>
@@ -317,6 +317,7 @@ test.describe("Sandboxed iframe embedding", () => {
 
   test("3-column layout works inside sandboxed iframe at desktop width", async ({
     page,
+    baseURL,
   }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.setContent(`
@@ -325,7 +326,7 @@ test.describe("Sandboxed iframe embedding", () => {
       <body style="margin:0;padding:0;height:100vh;">
         <iframe
           sandbox="${sandboxAttrs}"
-          src="http://localhost:8082"
+          src="${baseURL}"
           style="width:100%;height:100%;border:none;"
         ></iframe>
       </body>

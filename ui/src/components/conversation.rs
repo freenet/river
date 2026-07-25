@@ -1991,6 +1991,54 @@ pub fn Conversation() -> Element {
         }
     };
 
+    // Stable handles for the per-message-group callbacks.
+    //
+    // A closure written inline in `rsx!` becomes a fresh `Callback` on every
+    // render, and `Callback`'s `PartialEq` is pointer identity. The props
+    // `PartialEq` that Dioxus uses to decide whether a child can be memoized
+    // compares EVERY prop, callbacks included — so inline closures made
+    // `MessageGroupComponent` un-memoizable: every re-render of `Conversation`
+    // re-rendered all N message groups even when nothing about them changed.
+    // Measured on a 90-message room: one sent message re-rendered every group
+    // 4 times, and merely scrolling past the bottom sentinel re-rendered all of
+    // them once.
+    //
+    // `use_callback` allocates the handle once and swaps the inner closure each
+    // render, so the identity is stable (props compare equal → group memoizes)
+    // while the captured state stays current. Dioxus additionally re-points the
+    // old handle at the newest closure inside `memoize`, so a memoized group
+    // still invokes the latest logic.
+    let on_react_cb = use_callback({
+        let handle_toggle_reaction = handle_toggle_reaction.clone();
+        move |(msg_id, emoji): (MessageId, String)| {
+            let handle_toggle_reaction = handle_toggle_reaction.clone();
+            handle_toggle_reaction(msg_id, emoji);
+        }
+    });
+    let on_request_delete_cb = use_callback(move |msg_id: MessageId| {
+        pending_delete.set(Some(msg_id));
+    });
+    let on_edit_cb = use_callback({
+        let handle_edit_message = handle_edit_message.clone();
+        move |(msg_id, new_text): (MessageId, String)| {
+            let handle_edit_message = handle_edit_message.clone();
+            handle_edit_message(msg_id, new_text);
+        }
+    });
+    let on_reply_cb = use_callback(move |ctx: ReplyContext| {
+        replying_to.set(Some(ctx));
+        #[cfg(target_arch = "wasm32")]
+        if let Some(window) = web_sys::window() {
+            if let Some(doc) = window.document() {
+                if let Some(el) = doc.get_element_by_id("message-input") {
+                    if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                        let _ = el.focus();
+                    }
+                }
+            }
+        }
+    });
+
     rsx! {
         div { class: "flex-1 flex flex-col min-w-0 bg-bg",
             // Room header
@@ -2185,12 +2233,9 @@ pub fn Conversation() -> Element {
                                     Some(rsx! {
                                         div { class: "space-y-4",
                                             {rows.into_iter().enumerate().map({
-                                                let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
                                                 move |(row_idx, row)| {
                                                 let is_last_group = row_idx == rows_len - 1;
-                                                let handle_toggle_reaction = handle_toggle_reaction.clone();
-                                                let handle_edit_message = handle_edit_message.clone();
                                                 let member_names = member_names.clone();
                                                 match row {
                                                     DisplayRow::DateSeparator { key, label } => rsx! {
@@ -2237,27 +2282,13 @@ pub fn Conversation() -> Element {
                                                                 is_private: edit_is_private,
                                                                 last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
                                                                 edit_trigger: edit_trigger,
-                                                                on_react: move |(msg_id, emoji)| {
-                                                                    handle_toggle_reaction(msg_id, emoji);
-                                                                },
-                                                                on_request_delete: move |msg_id| {
-                                                                    pending_delete.set(Some(msg_id));
-                                                                },
-                                                                on_edit: move |(msg_id, new_text)| {
-                                                                    handle_edit_message(msg_id, new_text);
-                                                                },
-                                                                on_reply: move |ctx: ReplyContext| {
-                                                                    replying_to.set(Some(ctx));
-                                                                    if let Some(window) = web_sys::window() {
-                                                                        if let Some(doc) = window.document() {
-                                                                            if let Some(el) = doc.get_element_by_id("message-input") {
-                                                                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                                                                    let _ = el.focus();
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                },
+                                                                // Stable handles (see `use_callback` above): passing
+                                                                // inline closures here would defeat memoization of
+                                                                // every message group.
+                                                                on_react: on_react_cb,
+                                                                on_request_delete: on_request_delete_cb,
+                                                                on_edit: on_edit_cb,
+                                                                on_reply: on_reply_cb,
                                                                 open_action_menu: open_action_menu,
                                                             }
                                                         }
@@ -4496,6 +4527,78 @@ mod tests {
         assert!(
             html.contains("river-mention-self"),
             "legacy self-mention must get the self class: {html}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Message-group memoization (over-rendering regression guard)
+    // -----------------------------------------------------------------
+    #[test]
+    fn message_group_callbacks_are_stable_handles() {
+        let src = include_str!("conversation.rs");
+
+        // Dioxus decides whether a child component can be skipped by comparing
+        // ALL of its props with PartialEq — event handlers included. A closure
+        // written inline in `rsx!` allocates a fresh `Callback` every render and
+        // `Callback`'s PartialEq is pointer identity, so an inline handler makes
+        // the child permanently un-memoizable.
+        //
+        // Before this was fixed, every re-render of `Conversation` re-rendered
+        // EVERY message group: sending one message into a 90-message room
+        // re-rendered all 85 groups 4 times over (340 group renders), and simply
+        // scrolling past the bottom sentinel re-rendered all 85. That cost ~1.1s
+        // of blocked main thread per sent message on a mid-range phone.
+        //
+        // The four handlers must therefore keep a stable identity via
+        // `use_callback`, which allocates the handle once and swaps the inner
+        // closure each render.
+        for cb in [
+            "let on_react_cb = use_callback(",
+            "let on_request_delete_cb = use_callback(",
+            "let on_edit_cb = use_callback(",
+            "let on_reply_cb = use_callback(",
+        ] {
+            assert!(
+                src.contains(cb),
+                "MessageGroupComponent's handlers must be created with `use_callback` \
+                 so their identity is stable across renders; missing: {cb}"
+            );
+        }
+
+        // ...and the call site must pass those handles, not inline closures.
+        for wiring in [
+            "on_react: on_react_cb",
+            "on_request_delete: on_request_delete_cb",
+            "on_edit: on_edit_cb",
+            "on_reply: on_reply_cb",
+        ] {
+            assert!(
+                src.contains(wiring),
+                "The MessageGroupComponent call site must pass the stable \
+                 use_callback handle. Passing an inline `move |..| {{ .. }}` closure \
+                 here silently un-memoizes every message group. Missing: {wiring}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_date_formatters_are_cached() {
+        let src = include_str!("../util.rs");
+
+        // `toLocaleTimeString`/`toLocaleString` with an options object construct
+        // a new Intl.DateTimeFormat per call (~70us in Chromium, vs ~4.5us for a
+        // cached formatter). These run once per message group per render, so the
+        // uncached form cost ~12ms of pure date formatting per re-render of a
+        // 90-message room.
+        assert!(
+            src.contains("_timeFmt") && src.contains("_fullFmt"),
+            "format_time_local / format_full_datetime_local must reuse cached \
+             Intl.DateTimeFormat instances rather than building one per call."
+        );
+        assert!(
+            !src.contains("date.toLocaleTimeString(") && !src.contains("date.toLocaleString("),
+            "Do not call toLocaleTimeString/toLocaleString with an options object \
+             per message — build the Intl.DateTimeFormat once and reuse it."
         );
     }
 }
