@@ -1141,7 +1141,13 @@ pub(crate) fn impersonation_checker_for_viewer(
 /// the member ID, on hover, next to every name.
 ///
 /// So the rendered signal means something narrow and checkable: **these two
-/// names fold to the same skeleton — they are visually the same string.**
+/// names fold to the same skeleton.** That is *almost* "they are visually the
+/// same string", and the difference matters enough to state: the fold also
+/// drops spaces, so `Host Fat` matches `HostFat` and `Jo Anna` matches
+/// `Joanna` — names a reader can plainly tell apart. That rule earns its place
+/// by catching `IanClarke`, and its cost is enumerated in
+/// [`crate::util::confusable`]'s "Honest limits" and pinned row by row in
+/// `documented_accepted_collisions`.
 pub(crate) fn impersonation_warning_for_display(
     checker: &ImpersonationChecker,
     member_id: MemberId,
@@ -4812,33 +4818,69 @@ mod tests {
     #[test]
     fn the_warning_badge_cannot_be_clipped_by_a_long_nickname() {
         let src = include_str!("members.rs");
-        let start = src
-            .find("\"data-testid\": \"member-item-")
+        // LINE-scoped, not byte-offset-scoped. The previous version sliced
+        // `src[start..start + 2600]`, which lands on a char boundary today only
+        // by luck: this file is full of multibyte glyphs (⚠ 🛡 👑 and the
+        // homoglyph literals in the tests), and any edit that shifts one into
+        // the cut panics the test with a slice error instead of a finding.
+        let lines: Vec<&str> = src.lines().collect();
+        let row_start = lines
+            .iter()
+            .position(|l| l.contains("\"data-testid\": \"member-item-"))
             .expect("the row");
-        let row = &src[start..start + 2600];
+        let row_lines = &lines[row_start..(row_start + 40).min(lines.len())];
 
-        let button = row.find("button {").expect("the row is a button");
-        let button_class_end = row[button..].find('\n').unwrap_or(0) + button;
-        let button_line = &row[button..button_class_end + 200];
+        let button_line = row_lines
+            .iter()
+            .skip_while(|l| !l.contains("button {"))
+            .nth(1)
+            .expect("the row button's class line");
         assert!(
-            !button_line.contains("transition-colors truncate"),
-            "`truncate` must not sit on the row BUTTON — it clips the badges \
-             along with the name, so a long nickname hides the warning"
+            button_line.contains("class:"),
+            "expected the class attribute on the line after `button {{`, got \
+             {button_line:?}"
+        );
+        // `!contains("transition-colors truncate")` was strictly weaker than
+        // the revert it blocks: `class: "truncate w-full ... transition-colors"`
+        // reintroduces the bug and passes. The button carries no `truncate` at
+        // all today, so assert exactly that.
+        assert!(
+            !button_line.contains("truncate"),
+            "`truncate` must not sit on the row BUTTON in any position — it \
+             clips the badge spans along with the name, so a long nickname \
+             hides the warning: {button_line:?}"
+        );
+        // `min-w-0` is load-bearing for the same behaviour: without it the
+        // flex item refuses to shrink below its content width, the row
+        // overflows instead of truncating, and the badges go off the edge.
+        assert!(
+            button_line.contains("min-w-0"),
+            "the row button must be `min-w-0` so the name can shrink instead \
+             of pushing the badges out of the row: {button_line:?}"
         );
 
-        let name = row
-            .find("\"{parts.nickname}\"")
+        let name_line = row_lines
+            .iter()
+            .find(|l| l.contains("\"{parts.nickname}\""))
             .expect("the nickname span exists");
         assert!(
-            row[name.saturating_sub(120)..name].contains("truncate"),
-            "the NAME span must be the thing that truncates"
+            name_line.contains("truncate"),
+            "the NAME span must be the thing that truncates: {name_line:?}"
+        );
+        assert!(
+            name_line.contains("min-w-0"),
+            "the name span must be `min-w-0`, or `truncate` has nothing to \
+             shrink against and the badges are pushed out: {name_line:?}"
         );
 
-        let tag = row.find("member-icon").expect("the tag span exists");
+        let tag_line = row_lines
+            .iter()
+            .find(|l| l.contains("member-icon"))
+            .expect("the tag span exists");
         assert!(
-            row[tag..tag + 60].contains("flex-shrink-0"),
+            tag_line.contains("flex-shrink-0"),
             "every badge span must be `flex-shrink-0` so it can never be \
-             clipped, whatever the nickname's length"
+             clipped, whatever the nickname's length: {tag_line:?}"
         );
     }
 

@@ -83,6 +83,29 @@
 //!   Both are listed in `documented_accepted_collisions`, which fails if either
 //!   silently stops holding — the point is that the accepted list is short,
 //!   named, and testable rather than discovered by an accused member.
+//! * **A REMOVED SPACE still counts as a match, so the signal is not literally
+//!   "visually the same string".** Both folds are compared with all spaces
+//!   dropped. That is what catches `IanClarke` for `Ian Clarke`, a validated
+//!   row, so the rule stays — but it collides genuinely different names wherever
+//!   a surname particle can be joined or split. LIVE INSTANCE against the real
+//!   moderator list: `Host Fat` collides with `HostFat`. Also
+//!   `Mac Donald`/`Macdonald`, `Le Roy`/`Leroy`, `Di Marco`/`DiMarco`,
+//!   `Jo Anna`/`Joanna`, `Mary Ann`/`Maryann`. All are rows in
+//!   `documented_accepted_collisions`.
+//! * **Greek and Cyrillic ALL-CAPS names fold onto Latin.** `ΑΝΝΑ` folds to
+//!   `Anna`, `ΝΙΝΑ` to `Nina`, `ТОМ` to `Tom`. Every letter involved is in the
+//!   uppercase homoglyph table, and the whole point of that table is that those
+//!   letters are drawn identically — so a reader really cannot tell `ΑΝΝΑ` from
+//!   `ANNA`. Mixed-case Greek does NOT fold, because the lowercase letters are
+//!   deliberately absent from the table.
+//! * **The fold is not normalisation-stable.** Combining marks U+0300..U+036F
+//!   are stripped and precomposed letters are decomposed by table, so `Nguyễn`
+//!   reaches the same skeleton either way — but only for the ranges the tables
+//!   cover. Outside them (Hebrew, Arabic, Indic; see the next bullet) an NFC
+//!   spelling and an NFD spelling of the SAME name can fold differently,
+//!   depending on nothing more than which keyboard the person used. There is no
+//!   normalisation pass here because the crate carries no Unicode dependency;
+//!   `latin_names_fold_the_same_in_nfc_and_nfd` pins the ranges that do work.
 //! * **The accent strip is Latin-only.** `is_combining_mark` covers the Latin
 //!   combining ranges but NOT Hebrew niqqud (U+0591..U+05C7), Arabic harakat
 //!   (U+064B..U+065F), or Devanagari/Thai vowel signs. So a Hebrew or Arabic
@@ -443,7 +466,6 @@ impl ImpersonationChecker {
         Some(CandidateFolds {
             visual_no_space: strip_spaces(&visual),
             case_insensitive_no_space: strip_spaces(&case_insensitive),
-            visual_chars: visual.chars().collect(),
             visual,
             case_insensitive,
         })
@@ -480,7 +502,12 @@ impl ImpersonationChecker {
     /// [`check_identical`](Self::check_identical) — but kept, computed and
     /// tested so the tier decision stays reversible and measurable.
     fn tier_two_for(&self, id: MemberId, c: &CandidateFolds) -> Option<ImpersonationWarning> {
-        let budget = edit_budget(c.visual_chars.len());
+        // Allocated HERE rather than in `candidate_folds`, because
+        // `check_identical` — the only production entry point — returns before
+        // this function and would otherwise pay for a `Vec<char>` of every
+        // NON-matching member's name on every render, in both surfaces.
+        let visual_chars: Vec<char> = c.visual.chars().collect();
+        let budget = edit_budget(visual_chars.len());
         if budget == 0 {
             return None;
         }
@@ -490,7 +517,7 @@ impl ImpersonationChecker {
                 continue;
             }
             let p_chars: Vec<char> = p.visual.chars().collect();
-            if damerau_within(&c.visual_chars, &p_chars, budget) <= budget {
+            if damerau_within(&visual_chars, &p_chars, budget) <= budget {
                 // Owner outranks deputy so the more severe impersonation is the
                 // one named, and the result does not depend on set order.
                 let better = best.as_ref().is_none_or(|b| {
@@ -513,7 +540,6 @@ impl ImpersonationChecker {
 struct CandidateFolds {
     visual: String,
     visual_no_space: String,
-    visual_chars: Vec<char>,
     case_insensitive: String,
     case_insensitive_no_space: String,
 }
@@ -1110,7 +1136,6 @@ fn fold_nfkc_letter(c: char) -> Option<char> {
         // `roman_numerals_and_nfkc_letters_fold`; under the weaker `is_some()`
         // assertion it read as a match at NearMiss.
         0x212B => 'A',  // ANGSTROM SIGN
-        0x2139 => 'i',  // INFORMATION SOURCE
         0x2145 => 'D',  // DOUBLE-STRUCK ITALIC CAPITAL D
         0x2146 => 'd',  // DOUBLE-STRUCK ITALIC SMALL D
         0x2147 => 'e',  // DOUBLE-STRUCK ITALIC SMALL E
@@ -1266,6 +1291,8 @@ fn strip_latin_accent(c: char) -> Option<char> {
     match cp {
         0x00C0..=0x00FF => table_char(LATIN1_FOLD, 0x00C0),
         0x0100..=0x017F => table_char(LATIN_EXT_A_FOLD, 0x0100),
+        0x0180..=0x024F => table_char(LATIN_EXT_B_FOLD, 0x0180),
+        0x1E00..=0x1EFF => table_char(LATIN_EXT_ADD_FOLD, 0x1E00),
         _ => None,
     }
 }
@@ -1304,6 +1331,101 @@ const LATIN_EXT_A_FOLD: &str = concat!(
     "UuUuUuUu",    // Ũ ũ Ū ū Ŭ ŭ Ů ů
     "UuUuWwYy",    // Ű ű Ų ų Ŵ ŵ Ŷ ŷ
     "YZzZzZzs",    // Ÿ Ź ź Ż ż Ž ž ſ
+);
+
+/// U+0180..U+024F (Latin Extended-B), in order. `\0` = leave the character
+/// alone.
+///
+/// **Generated, not curated**, by the same sweep that produced
+/// [`fold_nfkc_letter`]: a slot folds exactly when the codepoint's NFD is one
+/// ASCII letter followed only by combining marks. That is the definition the
+/// two tables above already implement by hand for their ranges, so this simply
+/// stops the coverage ending at U+017F for no reason.
+///
+/// 83 of the 208 slots fold. The rest are letters in their own right, exactly
+/// as NFD leaves them.
+///
+/// This range carries the Vietnamese horn letters, which is why
+/// `H\u{01B0}\u{01A1}ng` needs it.
+const LATIN_EXT_B_FOLD: &str = concat!(
+    "\0\0\0\0\0\0\0\0", // U+0180 ƀ Ɓ Ƃ ƃ Ƅ ƅ Ɔ Ƈ
+    "\0\0\0\0\0\0\0\0", // U+0188 ƈ Ɖ Ɗ Ƌ ƌ ƍ Ǝ Ə
+    "\0\0\0\0\0\0\0\0", // U+0190 Ɛ Ƒ ƒ Ɠ Ɣ ƕ Ɩ Ɨ
+    "\0\0\0\0\0\0\0\0", // U+0198 Ƙ ƙ ƚ ƛ Ɯ Ɲ ƞ Ɵ
+    "Oo\0\0\0\0\0\0",   // U+01A0 Ơ ơ Ƣ ƣ Ƥ ƥ Ʀ Ƨ
+    "\0\0\0\0\0\0\0U",  // U+01A8 ƨ Ʃ ƪ ƫ Ƭ ƭ Ʈ Ư
+    "u\0\0\0\0\0\0\0",  // U+01B0 ư Ʊ Ʋ Ƴ ƴ Ƶ ƶ Ʒ
+    "\0\0\0\0\0\0\0\0", // U+01B8 Ƹ ƹ ƺ ƻ Ƽ ƽ ƾ ƿ
+    "\0\0\0\0\0\0\0\0", // U+01C0 ǀ ǁ ǂ ǃ Ǆ ǅ ǆ Ǉ
+    "\0\0\0\0\0AaI",    // U+01C8 ǈ ǉ Ǌ ǋ ǌ Ǎ ǎ Ǐ
+    "iOoUuUuU",         // U+01D0 ǐ Ǒ ǒ Ǔ ǔ Ǖ ǖ Ǘ
+    "uUuUu\0Aa",        // U+01D8 ǘ Ǚ ǚ Ǜ ǜ ǝ Ǟ ǟ
+    "Aa\0\0\0\0Gg",     // U+01E0 Ǡ ǡ Ǣ ǣ Ǥ ǥ Ǧ ǧ
+    "KkOoOo\0\0",       // U+01E8 Ǩ ǩ Ǫ ǫ Ǭ ǭ Ǯ ǯ
+    "j\0\0\0Gg\0\0",    // U+01F0 ǰ Ǳ ǲ ǳ Ǵ ǵ Ƕ Ƿ
+    "NnAa\0\0\0\0",     // U+01F8 Ǹ ǹ Ǻ ǻ Ǽ ǽ Ǿ ǿ
+    "AaAaEeEe",         // U+0200 Ȁ ȁ Ȃ ȃ Ȅ ȅ Ȇ ȇ
+    "IiIiOoOo",         // U+0208 Ȉ ȉ Ȋ ȋ Ȍ ȍ Ȏ ȏ
+    "RrRrUuUu",         // U+0210 Ȑ ȑ Ȓ ȓ Ȕ ȕ Ȗ ȗ
+    "SsTt\0\0Hh",       // U+0218 Ș ș Ț ț Ȝ ȝ Ȟ ȟ
+    "\0\0\0\0\0\0Aa",   // U+0220 Ƞ ȡ Ȣ ȣ Ȥ ȥ Ȧ ȧ
+    "EeOoOoOo",         // U+0228 Ȩ ȩ Ȫ ȫ Ȭ ȭ Ȯ ȯ
+    "OoYy\0\0\0\0",     // U+0230 Ȱ ȱ Ȳ ȳ ȴ ȵ ȶ ȷ
+    "\0\0\0\0\0\0\0\0", // U+0238 ȸ ȹ Ⱥ Ȼ ȼ Ƚ Ⱦ ȿ
+    "\0\0\0\0\0\0\0\0", // U+0240 ɀ Ɂ ɂ Ƀ Ʉ Ʌ Ɇ ɇ
+    "\0\0\0\0\0\0\0\0", // U+0248 Ɉ ɉ Ɋ ɋ Ɍ ɍ Ɏ ɏ
+);
+
+/// U+1E00..U+1EFF (Latin Extended Additional), in order. `\0` = leave the
+/// character alone.
+///
+/// Generated the same way as [`LATIN_EXT_B_FOLD`]. 244 of the 256 slots fold,
+/// which makes this by far the largest gap the accent strip had: the block is
+/// **all of Vietnamese**, plus the Latin dot-above/dot-below letters. Every one
+/// of them was an evasion — `I\u{1EA1}n Clarke`, an `a` with a dot below that
+/// at member-list size is a speck, folded to itself and never came near
+/// `Ian Clarke`.
+///
+/// The cost is the accent-stripping cost already accepted for `Muller`, scaled
+/// up: Vietnamese tone marks are meaning-bearing, so `Nguy\u{1EC5}n`,
+/// `Nguy\u{00EA}n` and `Nguyen` all reach one skeleton. Recorded in
+/// `documented_accepted_collisions`; the surface that matters is bounded,
+/// because a collision only produces a badge when it lands on a PROTECTED name,
+/// and `real_names_in_other_scripts_are_not_flagged` sweeps a Vietnamese corpus
+/// against the real moderator list.
+const LATIN_EXT_ADD_FOLD: &str = concat!(
+    "AaBbBbBb",       // U+1E00 Ḁ ḁ Ḃ ḃ Ḅ ḅ Ḇ ḇ
+    "CcDdDdDd",       // U+1E08 Ḉ ḉ Ḋ ḋ Ḍ ḍ Ḏ ḏ
+    "DdDdEeEe",       // U+1E10 Ḑ ḑ Ḓ ḓ Ḕ ḕ Ḗ ḗ
+    "EeEeEeFf",       // U+1E18 Ḙ ḙ Ḛ ḛ Ḝ ḝ Ḟ ḟ
+    "GgHhHhHh",       // U+1E20 Ḡ ḡ Ḣ ḣ Ḥ ḥ Ḧ ḧ
+    "HhHhIiIi",       // U+1E28 Ḩ ḩ Ḫ ḫ Ḭ ḭ Ḯ ḯ
+    "KkKkKkLl",       // U+1E30 Ḱ ḱ Ḳ ḳ Ḵ ḵ Ḷ ḷ
+    "LlLlLlMm",       // U+1E38 Ḹ ḹ Ḻ ḻ Ḽ ḽ Ḿ ḿ
+    "MmMmNnNn",       // U+1E40 Ṁ ṁ Ṃ ṃ Ṅ ṅ Ṇ ṇ
+    "NnNnOoOo",       // U+1E48 Ṉ ṉ Ṋ ṋ Ṍ ṍ Ṏ ṏ
+    "OoOoPpPp",       // U+1E50 Ṑ ṑ Ṓ ṓ Ṕ ṕ Ṗ ṗ
+    "RrRrRrRr",       // U+1E58 Ṙ ṙ Ṛ ṛ Ṝ ṝ Ṟ ṟ
+    "SsSsSsSs",       // U+1E60 Ṡ ṡ Ṣ ṣ Ṥ ṥ Ṧ ṧ
+    "SsTtTtTt",       // U+1E68 Ṩ ṩ Ṫ ṫ Ṭ ṭ Ṯ ṯ
+    "TtUuUuUu",       // U+1E70 Ṱ ṱ Ṳ ṳ Ṵ ṵ Ṷ ṷ
+    "UuUuVvVv",       // U+1E78 Ṹ ṹ Ṻ ṻ Ṽ ṽ Ṿ ṿ
+    "WwWwWwWw",       // U+1E80 Ẁ ẁ Ẃ ẃ Ẅ ẅ Ẇ ẇ
+    "WwXxXxYy",       // U+1E88 Ẉ ẉ Ẋ ẋ Ẍ ẍ Ẏ ẏ
+    "ZzZzZzht",       // U+1E90 Ẑ ẑ Ẓ ẓ Ẕ ẕ ẖ ẗ
+    "wy\0\0\0\0\0\0", // U+1E98 ẘ ẙ ẚ ẛ ẜ ẝ ẞ ẟ
+    "AaAaAaAa",       // U+1EA0 Ạ ạ Ả ả Ấ ấ Ầ ầ
+    "AaAaAaAa",       // U+1EA8 Ẩ ẩ Ẫ ẫ Ậ ậ Ắ ắ
+    "AaAaAaAa",       // U+1EB0 Ằ ằ Ẳ ẳ Ẵ ẵ Ặ ặ
+    "EeEeEeEe",       // U+1EB8 Ẹ ẹ Ẻ ẻ Ẽ ẽ Ế ế
+    "EeEeEeEe",       // U+1EC0 Ề ề Ể ể Ễ ễ Ệ ệ
+    "IiIiOoOo",       // U+1EC8 Ỉ ỉ Ị ị Ọ ọ Ỏ ỏ
+    "OoOoOoOo",       // U+1ED0 Ố ố Ồ ồ Ổ ổ Ỗ ỗ
+    "OoOoOoOo",       // U+1ED8 Ộ ộ Ớ ớ Ờ ờ Ở ở
+    "OoOoUuUu",       // U+1EE0 Ỡ ỡ Ợ ợ Ụ ụ Ủ ủ
+    "UuUuUuUu",       // U+1EE8 Ứ ứ Ừ ừ Ử ử Ữ ữ
+    "UuYyYyYy",       // U+1EF0 Ự ự Ỳ ỳ Ỵ ỵ Ỷ ỷ
+    "Yy\0\0\0\0\0\0", // U+1EF8 Ỹ ỹ Ỻ ỻ Ỽ ỽ Ỿ ỿ
 );
 
 /// Damerau-Levenshtein distance between `a` and `b`, giving up once it exceeds
@@ -1660,6 +1782,8 @@ mod tests {
     fn latin_fold_tables_are_aligned() {
         assert_eq!(LATIN1_FOLD.chars().count(), 64);
         assert_eq!(LATIN_EXT_A_FOLD.chars().count(), 128);
+        assert_eq!(LATIN_EXT_B_FOLD.chars().count(), 208);
+        assert_eq!(LATIN_EXT_ADD_FOLD.chars().count(), 256);
         for (input, want) in [
             ('\u{00C0}', Some('A')), // À
             ('\u{00C7}', Some('C')), // Ç
@@ -1691,6 +1815,27 @@ mod tests {
             ('\u{010F}', Some('d')), // ď
             ('\u{0119}', Some('e')), // ę
             ('\u{0121}', Some('g')), // ġ
+            // Latin Extended-B: the Vietnamese horn letters and the caron
+            // vowels, plus the letters that are their own thing.
+            ('\u{01A0}', Some('O')), // Ơ O with horn
+            ('\u{01B0}', Some('u')), // ư u with horn
+            ('\u{01CE}', Some('a')), // ǎ a with caron
+            ('\u{0201}', Some('a')), // ȁ a with double grave
+            ('\u{021B}', Some('t')), // ț t with comma below
+            ('\u{0233}', Some('y')), // ȳ y with macron
+            ('\u{0180}', None),      // ƀ b with stroke is its own letter
+            ('\u{0186}', None),      // Ɔ open O
+            ('\u{01C4}', None),      // Ǆ DZ with caron is a digraph
+            ('\u{01E2}', None),      // Ǣ AE with macron: base is not ASCII
+            // Latin Extended Additional: all of Vietnamese.
+            ('\u{1E00}', Some('A')), // Ḁ A with ring below
+            ('\u{1EA1}', Some('a')), // ạ a with dot below
+            ('\u{1EC5}', Some('e')), // ễ e with circumflex and tilde
+            ('\u{1ECA}', Some('I')), // Ị I with dot below
+            ('\u{1EE9}', Some('u')), // ứ u with horn and acute
+            ('\u{1EF9}', Some('y')), // ỹ y with tilde
+            ('\u{1E9E}', None),      // ẞ capital sharp s is its own letter
+            ('\u{1EFA}', None),      // Ỻ middle-Welsh LL is a digraph
             ('\u{0130}', Some('I')), // İ
             ('\u{0135}', Some('j')), // ĵ
             ('\u{0136}', Some('K')), // Ķ
@@ -1763,6 +1908,16 @@ mod tests {
             "François Müller",
             "Ægir Þórsson",
             "Nguyễn Thị Hương",
+            // The Latin Extended Additional block is now stripped, so the
+            // Vietnamese corpus is where a false positive would land first.
+            "Trần Văn Bảy",
+            "Lê Thị Ngọc Ánh",
+            "Phạm Hoàng Đức",
+            "Đặng Quốc Việt",
+            "Vũ Thị Mỹ Hạnh",
+            "Bùi Thanh Tùng",
+            "Hồ Chí Cường",
+            "Ngô Bảo Châu",
             "José Ñuñez",
             "O'Brien-Smith Jr.",
             "山田\u{3000}太郎",
@@ -1793,24 +1948,104 @@ mod tests {
     /// is why the UI renders tier 1 only.
     #[test]
     fn generated_handles_never_fold_to_the_same_skeleton() {
-        let mut seen: std::collections::HashMap<String, (&str, &str)> =
-            std::collections::HashMap::new();
+        // ALL FOUR comparisons `tier_one_for` makes, not just the visual fold.
+        // Pinning one of four left three quarters of the property unmeasured:
+        // two handles could disagree on `visual` and still collide under
+        // `case_insensitive_no_space`, and the check that is supposed to prove
+        // "River never accuses its own members" would not have noticed.
+        let folds: [(&str, fn(&ProtectedName) -> &String); 4] = [
+            ("visual", |p| &p.visual),
+            ("visual_no_space", |p| &p.visual_no_space),
+            ("case_insensitive", |p| &p.case_insensitive),
+            ("case_insensitive_no_space", |p| {
+                &p.case_insensitive_no_space
+            }),
+        ];
         let mut count = 0usize;
+        let mut seen: Vec<std::collections::HashMap<String, (&str, &str)>> =
+            vec![std::collections::HashMap::new(); folds.len()];
         for first in crate::nickname::FIRST_NAMES {
             for last in crate::nickname::LAST_NAMES {
                 let handle = format!("{first} {last}");
-                let sk = skeleton(&handle);
-                if let Some(prev) = seen.insert(sk.clone(), (first, last)) {
-                    panic!(
-                        "generated handles {prev:?} and {:?} fold to the same skeleton {sk:?}; \
-                         a deputy holding one would make the other look like an impostor",
-                        (first, last)
-                    );
+                let folded = ProtectedName::new(ProtectedRole::Deputy, &handle, mid(1));
+                for (i, (label, get)) in folds.iter().enumerate() {
+                    let sk = get(&folded).clone();
+                    if let Some(prev) = seen[i].insert(sk.clone(), (first, last)) {
+                        panic!(
+                            "generated handles {prev:?} and {:?} collide under the {label} fold \
+                             ({sk:?}); a deputy holding one would make the other look like an \
+                             impostor",
+                            (first, last)
+                        );
+                    }
                 }
                 count += 1;
             }
         }
         assert_eq!(count, 10_000);
+    }
+
+    /// **Named rows for names that are ONE step from being flagged**, so a
+    /// future change that renders tier 2, or widens a fold, cannot make that
+    /// change without seeing whose name it lands on.
+    ///
+    /// `Ivvor2` is a real member of the Freenet Official room and the
+    /// moderator is `Ivvor`. Tier 1 is clean (`1wor2` vs `1wor`) — but the two
+    /// are at Damerau distance exactly 1, so the moment tier 2 renders, a real
+    /// member gets an impersonation badge on day one.
+    #[test]
+    fn near_miss_rows_that_would_accuse_a_real_member() {
+        for (deputy, member) in [("Ivvor", "Ivvor2")] {
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                deputy,
+                mid(1),
+            )]);
+            assert_eq!(
+                checker.check_identical(mid(2), member),
+                None,
+                "{member:?} must stay CLEAN at tier 1 against the moderator \
+                 {deputy:?} — it is a real member of the Freenet Official room"
+            );
+            let near = checker
+                .check(mid(2), member)
+                .expect("...but it IS a tier-2 near miss");
+            assert_eq!(
+                near.tier,
+                ConfusableTier::NearMiss,
+                "{member:?} is one edit from {deputy:?}. If this UI ever renders \
+                 tier 2, this real member is badged as an impostor on day one — \
+                 that is the cost of the change, decide it deliberately"
+            );
+        }
+    }
+
+    /// The fold must not depend on which normalisation form the person's
+    /// keyboard produced. Two spellings of one name are one name.
+    ///
+    /// This holds for the ranges the tables cover — Latin combining marks are
+    /// stripped, and precomposed Latin letters are decomposed by table — and
+    /// NOT outside them. The module header records the gap; this pins what
+    /// does work, so a future table change cannot quietly shrink it.
+    #[test]
+    fn latin_names_fold_the_same_in_nfc_and_nfd() {
+        for (nfc, nfd) in [
+            // Vietnamese, the case with the most precomposed letters.
+            ("Nguy\u{1EC5}n", "Nguy\u{0065}\u{0302}\u{0303}n"),
+            ("Th\u{1ECB}", "Th\u{0069}\u{0323}"),
+            ("H\u{01B0}\u{01A1}ng", "H\u{0075}\u{031B}\u{006F}\u{031B}ng"),
+            // Latin-1 and Latin Extended-A.
+            ("M\u{00FC}ller", "M\u{0075}\u{0308}ller"),
+            ("\u{010C}apek", "\u{0043}\u{030C}apek"),
+            ("Ian Clark\u{00E9}", "Ian Clark\u{0065}\u{0301}"),
+        ] {
+            assert_eq!(
+                skeleton(nfc),
+                skeleton(nfd),
+                "{nfc:?} and {nfd:?} are the same name typed two ways and must \
+                 fold identically"
+            );
+        }
     }
 
     /// **The measurement behind the tier decision.** The near-miss tier flags a
@@ -2059,6 +2294,64 @@ mod tests {
         assert_ne!(skeleton("\u{1D26}"), skeleton("G"));
         assert_eq!(skeleton("\u{1D2B}"), skeleton("\u{041B}")); // Cyrillic el
         assert_ne!(skeleton("\u{1D2B}"), skeleton("L"));
+    }
+
+    /// **Precomposed Latin outside U+00C0..U+017F.** The accent strip stopped
+    /// at Latin Extended-A for no stated reason, leaving 327 letters that carry
+    /// a diacritic and no separate combining mark to drop: 83 in Latin
+    /// Extended-B and 244 in Latin Extended Additional, which is all of
+    /// Vietnamese.
+    ///
+    /// The dot-below letters are the sharpest of these — at member-list size
+    /// `\u{1EA1}` is `a` with a speck under it — but every row here folded to
+    /// ITSELF before, so none came anywhere near the protected name.
+    #[test]
+    fn precomposed_latin_outside_the_first_two_blocks_folds() {
+        for (label, attacker, real) in [
+            ("a with dot below", "I\u{1EA1}n Clarke", "Ian Clarke"),
+            ("a with caron", "I\u{01CE}n Clarke", "Ian Clarke"),
+            ("e with dot below", "Ian Clark\u{1EB9}", "Ian Clarke"),
+            ("I with dot below", "\u{1ECA}an Clarke", "Ian Clarke"),
+            ("a with double grave", "I\u{0201}n Clarke", "Ian Clarke"),
+            ("o with horn", "R\u{01A1}om Owner", "Room Owner"),
+            ("u with horn and acute", "I\u{1EE9}an", "Iuan"),
+            ("A with ring below", "\u{1E00}da", "Ada"),
+            ("t with comma below", "Ma\u{021B}ei", "Matei"),
+            ("y with macron", "Br\u{0233}an", "Bryan"),
+        ] {
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                real,
+                mid(1),
+            )]);
+            let w = checker
+                .check(mid(2), attacker)
+                .unwrap_or_else(|| panic!("{label}: {attacker:?} vs {real:?}"));
+            assert_eq!(
+                w.tier,
+                ConfusableTier::Identical,
+                "{label}: {attacker:?} must fold to the SAME skeleton as {real:?}"
+            );
+        }
+
+        // The letters in these ranges that are NOT an accented ASCII base must
+        // stay themselves, exactly as NFD leaves them. Folding them would be
+        // inventing an equivalence rather than recording one.
+        for own_letter in [
+            '\u{0180}', // b with stroke
+            '\u{0186}', // open O
+            '\u{0189}', // African D
+            '\u{01C4}', // DZ with caron
+            '\u{01E2}', // AE with macron
+            '\u{1E9E}', // capital sharp s
+            '\u{1EFA}', // middle-Welsh LL
+        ] {
+            assert_eq!(
+                strip_latin_accent(own_letter),
+                None,
+                "{own_letter:?} is a letter in its own right"
+            );
+        }
     }
 
     /// The shape homoglyphs — the half NFKC does NOT equate, so each is a
@@ -2471,6 +2764,44 @@ mod tests {
             // Turkish dotless i: a REAL letter in Turkish names, but a reader
             // outside Turkish sees one glyph minus a dot.
             ("Isik", "Is\u{0131}k", "Turkish dotless i"),
+            // Vietnamese tone marks are meaning-bearing and are stripped, so
+            // distinct names reach one skeleton. This is the accent-stripping
+            // trade already accepted for German, at Vietnamese scale; it
+            // arrived with the Latin Extended Additional table.
+            ("Nguyen", "Nguy\u{1EC5}n", "Vietnamese tone marks"),
+            ("Nguyen", "Nguy\u{00EA}n", "Vietnamese tone marks"),
+            ("Le", "L\u{00EA}", "Vietnamese tone marks"),
+            ("Ha", "H\u{1EA1}", "Vietnamese tone marks"),
+            // `vv -> w`. `Iwor` is an attested Welsh name and collides with the
+            // Freenet Official moderator `Ivvor`. Nobody in the room holds it
+            // today; recorded so it is a known cost rather than a surprise.
+            ("Ivvor", "Iwor", "vv reads as w"),
+            // **Space REMOVAL.** `strip_spaces` compares both folds with all
+            // spaces dropped, which is what catches `IanClarke` for
+            // `Ian Clarke` — a validated row, so the rule stays. The cost is
+            // that a deleted space is not "visually the same string", and
+            // surname particles collide freely. LIVE INSTANCE: the moderator
+            // `HostFat` collides with anyone calling themselves `Host Fat`.
+            ("HostFat", "Host Fat", "space removal"),
+            ("Macdonald", "Mac Donald", "space removal"),
+            ("Leroy", "Le Roy", "space removal"),
+            ("DiMarco", "Di Marco", "space removal"),
+            ("Vandyke", "Van Dyke", "space removal"),
+            ("Delacruz", "De La Cruz", "space removal"),
+            ("StJohn", "St John", "space removal"),
+            ("Joanna", "Jo Anna", "space removal"),
+            ("Maryann", "Mary Ann", "space removal"),
+            ("Annmarie", "Ann Marie", "space removal"),
+            ("Kimberly", "Kim Berly", "space removal"),
+            // **Greek and Cyrillic ALL-CAPS.** Every letter in these names is
+            // in the uppercase homoglyph table, so the whole name folds onto
+            // its Latin twin. The corpus otherwise carries only MIXED-case
+            // Greek, which cannot fold (the lowercase letters are not in the
+            // table), so this class was real, undocumented and untested.
+            ("Anna", "\u{0391}\u{039D}\u{039D}\u{0391}", "Greek all-caps"),
+            ("Nina", "\u{039D}\u{0399}\u{039D}\u{0391}", "Greek all-caps"),
+            ("Emma", "\u{0395}\u{039C}\u{039C}\u{0391}", "Greek all-caps"),
+            ("Tom", "\u{0422}\u{041E}\u{041C}", "Cyrillic all-caps"),
         ] {
             let checker = ImpersonationChecker::new(vec![ProtectedName::new(
                 ProtectedRole::Deputy,
