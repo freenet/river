@@ -2214,12 +2214,19 @@ mod tests {
             "test premise: the baseline must be at capacity and publish a real horizon"
         );
 
-        // A message this device just composed, but whose clock-derived
-        // timestamp lands BELOW everything the baseline retains. This is the
-        // skewed-clock case; it must still go out.
+        // Messages this device just composed. `skewed` carries a clock-derived
+        // timestamp BELOW everything the baseline retains (the skewed-clock
+        // case); the other two are ordinary newer ones. More than one new
+        // message so the "exactly the set difference" assertion below is a real
+        // set comparison and not a 1-vs-N count that a broken id-set difference
+        // could still satisfy.
         let skewed = msg_at(1_000, "composed-with-a-slow-clock");
+        let newer_a = msg_at(9_001, "newer-a");
+        let newer_b = msg_at(9_002, "newer-b");
         let mut current = room_state.clone();
         current.recent_messages.messages.push(skewed.clone());
+        current.recent_messages.messages.push(newer_a.clone());
+        current.recent_messages.messages.push(newer_b.clone());
 
         let update = compute_update_data(&current, Some(&baseline), &params)
             .expect("a newly composed message must produce an outgoing update");
@@ -2231,11 +2238,12 @@ mod tests {
         let delta: ChatRoomStateV1Delta =
             ciborium::de::from_reader(bytes.as_slice()).expect("decode outgoing delta");
 
-        let sent: Vec<_> = delta
+        let mut sent: Vec<_> = delta
             .recent_messages
             .as_ref()
             .map(|m: &Vec<AuthorizedMessageV1>| m.iter().map(|m| m.id()).collect())
             .unwrap_or_default();
+        sent.sort();
         assert!(
             sent.contains(&skewed.id()),
             "the locally-composed message was filtered out of the OUTGOING update by \
@@ -2245,13 +2253,23 @@ mod tests {
              retried. See `outbound_summary`."
         );
 
-        // Guard the other direction: neutralising the horizon must not turn the
-        // outgoing delta into a full resend of everything already synced.
+        // The other direction, which is the way this fix would go wrong:
+        // neutralising the horizon must NOT widen the update into a resend of
+        // everything already synced.
+        //
+        // Asserted as an EXACT set equality against the set difference, not a
+        // count. `outbound_summary` clears only the horizons and keeps
+        // `message_ids`, so `delta` still performs the id-set difference; if it
+        // ever stopped doing so, the baseline's 3 already-synced messages would
+        // appear here too.
+        let mut expected = vec![skewed.id(), newer_a.id(), newer_b.id()];
+        expected.sort();
         assert_eq!(
-            sent.len(),
-            1,
-            "only the genuinely-new message should be sent; the id-set difference \
-             still does its job"
+            sent, expected,
+            "the outgoing update must be EXACTLY the messages the baseline lacks. \
+             Anything more means clearing the horizon has widened it into a resend \
+             of already-synced state; anything less means something is still \
+             filtering the send path."
         );
     }
 
@@ -2309,11 +2327,14 @@ mod tests {
             "test premise: the pair must be AT capacity so a horizon is published"
         );
 
-        // A DM this device just composed whose clock-derived timestamp lands
-        // below everything the baseline's pair retains.
+        // DMs this device just composed. `skewed`'s clock-derived timestamp
+        // lands below everything the baseline's pair retains; the other is an
+        // ordinary newer one, so the assertion below is a real set comparison.
         let skewed = dm_at(1_000, 2);
+        let newer = dm_at(9_001, 3);
         let mut current = room_state.clone();
         current.direct_messages.messages.push(skewed.clone());
+        current.direct_messages.messages.push(newer.clone());
 
         let update = compute_update_data(&current, Some(&baseline), &params)
             .expect("a newly composed DM must produce an outgoing update");
@@ -2339,11 +2360,19 @@ mod tests {
              otherwise a clock-skewed device silently never delivers a DM to any pair \
              it holds at capacity."
         );
+        // Exact set equality, for the same reason as the messages test: this is
+        // the direction the fix would go wrong in. `outbound_summary` clears
+        // only `pair_horizons` and keeps `message_signatures`, so the
+        // signature-set difference still bounds the payload.
+        let mut sent_sigs: Vec<_> = sent_dms.iter().map(|m| m.sender_signature).collect();
+        sent_sigs.sort_by_key(|s| s.to_bytes());
+        let mut expected = vec![skewed.sender_signature, newer.sender_signature];
+        expected.sort_by_key(|s| s.to_bytes());
         assert_eq!(
-            sent_dms.len(),
-            1,
-            "only the genuinely-new DM should be sent; the signature-set difference \
-             still does its job"
+            sent_sigs, expected,
+            "the outgoing update must be EXACTLY the DMs the baseline lacks — not the \
+             whole at-capacity pair, which is what clearing the pair horizon would \
+             widen it to if the signature-set difference stopped applying."
         );
     }
 }
