@@ -2,6 +2,9 @@ use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatu
 use crate::components::app::{
     MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS, SYNC_STATUS,
 };
+use crate::util::confusable::{
+    ConfusableTier, ImpersonationChecker, ImpersonationWarning, ProtectedName, ProtectedRole,
+};
 use crate::util::display_name::display_nickname;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
@@ -178,6 +181,18 @@ struct MemberDisplay {
     /// visibility rule and the same tooltip — the conversation's author line
     /// and the member-info modal use.
     deputy_badge: Option<DeputyBadge>,
+    /// The ⚠ impersonation warning for this member, or `None`. Same value, and
+    /// therefore the same tier rule and tooltip, the conversation's author line
+    /// uses — both go through
+    /// [`impersonation_warning_for_display`].
+    ///
+    /// **NOT mutually exclusive with `deputy_badge`.** The exemption is keyed on
+    /// the name's SOURCE, not on the flagged member's privilege, so a deputy
+    /// whose name collides with another protected name carries both badges.
+    /// `a_shield_and_a_warning_can_both_render` pins it, and
+    /// [`ImpersonationWarning::flagged_privilege`] is why the tooltip stays
+    /// truthful in that case.
+    impersonation: Option<ImpersonationWarning>,
 }
 
 fn is_member_sponsor(
@@ -225,30 +240,89 @@ fn did_you_invite_member(member_id: MemberId, members: &MembersV1, self_id: Memb
 #[derive(Clone, PartialEq)]
 struct MemberDisplayParts {
     nickname: String,
-    tags: Vec<(&'static str, String)>,
+    tags: Vec<MemberTag>,
+}
+
+/// One badge in a member row.
+///
+/// `test_id` is what makes a badge addressable from a browser test. Every badge
+/// carries one rather than only the ⚠, because they all share a single
+/// anonymous render loop: giving one of them a handle and leaving the rest
+/// glyph-matched just moves the brittleness. The ⚠ is the reason this exists —
+/// the clipping bug it has already had once is exactly the class a browser test
+/// catches and a unit test structurally cannot.
+#[derive(Clone, PartialEq)]
+struct MemberTag {
+    glyph: &'static str,
+    tooltip: String,
+    test_id: &'static str,
+}
+
+impl MemberTag {
+    fn new(glyph: &'static str, test_id: &'static str, tooltip: String) -> Self {
+        Self {
+            glyph,
+            tooltip,
+            test_id,
+        }
+    }
 }
 
 fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
-    let mut tags: Vec<(&'static str, String)> = Vec::new();
+    let mut tags: Vec<MemberTag> = Vec::new();
 
+    // FIRST, so the warning sits immediately after the name it is about rather
+    // than at the end of a run of relationship tags. A reader scanning the list
+    // for an impostor should not have to parse "🔑 🌐 🎪" before reaching it.
+    //
+    // The test id mirrors the conversation side's
+    // `message-author-impersonation-warning`, so one spec can address the same
+    // badge on both surfaces.
+    if let Some(warning) = member.impersonation.as_ref() {
+        tags.push(MemberTag::new(
+            crate::util::confusable::WARNING_GLYPH,
+            "member-list-impersonation-warning",
+            warning.tooltip(),
+        ));
+    }
     if member.is_owner {
-        tags.push(("👑", "Room Owner".to_string()));
+        tags.push(MemberTag::new(
+            "👑",
+            "member-list-owner",
+            "Room Owner".into(),
+        ));
     }
     if member.is_self {
-        tags.push(("⭐", "You".to_string()));
+        tags.push(MemberTag::new("⭐", "member-list-self", "You".into()));
     }
     if member.invited_by_you {
-        tags.push(("🔑", "Invited by You".to_string()));
+        tags.push(MemberTag::new(
+            "🔑",
+            "member-list-invited-by-you",
+            "Invited by You".into(),
+        ));
     } else if member.in_your_network {
-        tags.push(("🌐", "In Your Network".to_string()));
+        tags.push(MemberTag::new(
+            "🌐",
+            "member-list-in-your-network",
+            "In Your Network".into(),
+        ));
     }
     if member.invited_you {
-        tags.push(("🎪", "Invited You".to_string()));
+        tags.push(MemberTag::new(
+            "🎪",
+            "member-list-invited-you",
+            "Invited You".into(),
+        ));
     } else if member.sponsored_you {
-        tags.push(("🔭", "In Your Invite Chain".to_string()));
+        tags.push(MemberTag::new(
+            "🔭",
+            "member-list-invite-chain",
+            "In Your Invite Chain".into(),
+        ));
     }
     if let Some(badge) = member.deputy_badge.as_ref() {
-        tags.push(("🛡", badge.tooltip()));
+        tags.push(MemberTag::new("🛡", "member-list-deputy", badge.tooltip()));
     }
 
     MemberDisplayParts {
@@ -936,6 +1010,265 @@ pub(crate) fn deputy_badges_for_viewer(
         .collect()
 }
 
+/// The impersonation checker for one viewer's view of one room (#488 follow-up).
+///
+/// ## The protected set is derived from room state, never hard-coded
+///
+/// It is exactly **the room owner, plus every member who shows a 🛡 shield in
+/// this viewer's view**, each under whatever nickname they currently hold. That
+/// is deliberately the SAME notion of "deputy" the shield uses — this takes
+/// `deputy_badges` as a parameter rather than recomputing it, so there is
+/// physically only one answer to "who is a deputy" and a deputize/revoke moves
+/// the protected set with it on the next render. No list to maintain, and no
+/// second definition to drift.
+///
+/// Reusing the viewer-relative badge map also makes the *scope* right: a
+/// protected name is one whose authority this viewer would be fooled by, which
+/// is precisely the set whose shield they can see.
+///
+/// ## Which names get protected: the filters in `claimed_name`
+///
+/// A privileged member contributes a name only if they CHOSE it. Four ways a
+/// rendered name is not a chosen one, and all four are filtered:
+///
+/// * **No `member_info` record, or a nickname that fails to decrypt ⇒ not
+///   protected.** The unseal is tested directly, so a change to the
+///   `"[Encrypted: …]"` placeholder's wording cannot reopen it.
+/// * **`"Unknown"` ⇒ not protected.** That is the fallback both render surfaces
+///   use for a member with no record yet, so protecting it would flag every
+///   such member at once during a sync gap.
+/// * **`UNNAMED` ⇒ not protected.** The placeholder for a nickname that
+///   sanitises to nothing, shared by a whole class of members.
+/// * **A generated handle ⇒ not protected.** A member who never typed a
+///   nickname wears one of the 10,000 handles River derived from their key
+///   ([`crate::nickname::is_generated_handle`]). Two members can be assigned the
+///   same one, which is a collision River created rather than an imitation
+///   either of them performed; with ~120 members in a room it is more likely
+///   than not that some pair shares a handle. Protecting an unclaimed name would
+///   turn that birthday collision into an accusation.
+///
+/// **The last three are compared by SKELETON, not by string equality**, because
+/// the matcher they gate compares skeletons. An exact-string filter is a guard
+/// that is weaker than the thing it guards: `amber worm`, `AmberWorm` and
+/// `Arnber Worm` are all "not a generated handle" to `==`, yet all three tier-1
+/// match the member River assigned `Amber Worm`. No attacker is needed — a
+/// moderator who simply styles their own name in lower case would otherwise put
+/// "this member is NOT a moderator" on every member holding that handle.
+/// `a_confusable_variant_of_a_generated_handle_is_not_protected` and
+/// `an_unknown_named_deputy_is_not_protected` pin it.
+///
+/// The identity exemption must never depend on a name: a member filtered out
+/// here is still exempt from being accused of impersonating *themselves*,
+/// because the exemption is keyed on [`ProtectedName::source`] and a name that
+/// never enters the set can never accuse anyone. See
+/// [`ImpersonationChecker::check`].
+pub(crate) fn impersonation_checker_for_viewer(
+    member_info: &river_core::room_state::member_info::MemberInfoV1,
+    room_secrets: &HashMap<u32, [u8; 32]>,
+    owner_id: MemberId,
+    deputy_badges: &HashMap<MemberId, DeputyBadge>,
+) -> ImpersonationChecker {
+    // The name this member has CLAIMED, or `None` if they have not claimed one.
+    //
+    // `display_nickname` can return three strings the member never chose, and
+    // ALL THREE must be filtered — each is a pure function of something other
+    // than the nickname, so it is shared by a whole CLASS of members, and
+    // protecting it accuses every one of them at once:
+    //
+    //   * no `member_info` record  -> `"Unknown"`   (the `?` below)
+    //   * sanitises to empty       -> `UNNAMED`
+    //   * decryption failed        -> `"[Encrypted: {len} bytes, v{version}]"`
+    //
+    // The third is the worst. In a private room the viewer's `secrets` map is
+    // `#[serde(skip)]` and rebuilt after every ingestion, so there is a real
+    // window where it is empty or missing a version. During it the owner's name
+    // becomes e.g. `"[Encrypted: 12 bytes, v0]"` — and so does the name of
+    // EVERY member whose nickname is also 12 bytes at v0. In a large room that
+    // is a dozen simultaneous false accusations with no attacker present.
+    //
+    // The unseal is tested DIRECTLY rather than by matching the `"[Encrypted:"`
+    // prefix, so a future change to the placeholder's wording cannot silently
+    // reopen this. (`conversation.rs` filters `UNNAMED` out of mention
+    // autocomplete for the same reason.)
+    //
+    // **The placeholder and handle checks compare SKELETONS, not strings.** The
+    // matcher these filters gate compares folds, so an `==` filter is weaker
+    // than the thing it guards and is simply walked around: `unknown`,
+    // `Unkn0wn` and `Unknovvn` are all `!= "Unknown"` yet all three tier-1 match
+    // every member rendering as `Unknown`, and the whole `Amber Worm` family
+    // (`amber worm`, `AmberWorm`, `Arnber Worm`, ...) does the same to a
+    // generated handle. See [`crate::nickname::folds_to_generated_handle`].
+    let claimed_name = |id: MemberId| -> Option<String> {
+        let sealed = &member_info.canonical(id)?.member_info.preferred_nickname;
+        if unseal_bytes_with_secrets(sealed, room_secrets).is_err() {
+            return None;
+        }
+        let name = display_nickname(sealed, room_secrets);
+        for placeholder in [
+            crate::util::display_name::UNNAMED,
+            crate::util::display_name::UNKNOWN_MEMBER,
+        ] {
+            if crate::util::confusable::folds_together(&name, placeholder) {
+                return None;
+            }
+        }
+        (!crate::nickname::folds_to_generated_handle(&name)).then_some(name)
+    };
+
+    let mut protected = Vec::new();
+    if let Some(name) = claimed_name(owner_id) {
+        protected.push(ProtectedName::new(ProtectedRole::Owner, name, owner_id));
+    }
+    // Sorted, because `deputy_badges` is a `HashMap` and two deputies can share
+    // a skeleton (a sockpuppet deputised under a real deputy's name). Raw map
+    // order would let the tooltip name a different victim between renders — the
+    // same nondeterminism `build_deputizers_of` sorts away for the shield.
+    let mut deputies: Vec<MemberId> = deputy_badges.keys().copied().collect();
+    deputies.sort_unstable();
+    for id in deputies {
+        // **EVERY badged deputy contributes a name, whoever appointed them.**
+        //
+        // There was a gate here that admitted only deputies appointed by the
+        // OWNER or by the viewer themselves. It was removed deliberately, and
+        // it must not come back — see
+        // `the_protected_set_is_not_gated_on_the_appointer`, which pins its
+        // absence.
+        //
+        // The gate was written on the assumption that the owner appoints the
+        // moderators. In the live Freenet Official room that is simply false:
+        // all five deputy grants are issued by `Invite Bot`, not by the owner.
+        // So the gate protected exactly one name — the owner's own — and left
+        // every actual moderator's name unprotected, which is the impersonation
+        // this feature exists to catch. A gate that switches the feature off in
+        // the only room that has ever needed it is worse than no gate.
+        //
+        // **The accepted cost, stated plainly.** `MemberInfoV1::verify`
+        // validates only the LENGTH of a `deputies` list and the signer's own
+        // signature — never who is in it. So any strict ancestor of the viewer
+        // can deputise a sockpuppet, name it after an innocent member, and have
+        // that innocent member render "this member is NOT a moderator" across
+        // the attacker's invite subtree. That is a real harm and it is now
+        // reachable; `a_sockpuppet_can_inject_a_protected_name` pins it as an
+        // accepted cost rather than letting it be rediscovered by an accused
+        // member. It is bounded by the three filters below (`claimed_name`),
+        // which are skeleton-based precisely because an exact-string filter is
+        // trivially side-stepped by the same attacker.
+        //
+        // Self-deputisation is still ignored, upstream in
+        // `viewer_relevant_deputizer_set` — a member cannot bootstrap
+        // themselves into the badge map, so they cannot reach this loop alone.
+        if let Some(name) = claimed_name(id) {
+            protected.push(ProtectedName::new(ProtectedRole::Deputy, name, id));
+        }
+    }
+
+    ImpersonationChecker::new(protected)
+}
+
+/// The impersonation warning a surface actually RENDERS for one member, if any.
+///
+/// **Any surface that renders the warning must go through this**, not
+/// [`ImpersonationChecker::check`] directly, because it carries the tier
+/// decision and the truthful-tooltip decision — and a surface that skipped it
+/// would show a badge the other surfaces do not, which is exactly the
+/// cross-surface drift freenet/river#451 fixed for the shield.
+///
+/// ## Which surfaces render it, and which do NOT
+///
+/// This used to claim "every render surface must go through this", which was
+/// false and is the class of stale comment this file's credibility depends on
+/// not having. The warning is rendered on **two** surfaces today:
+///
+/// * the member-list row ([`MemberList`]), and
+/// * the conversation's message author line.
+///
+/// It is NOT rendered on the member-info modal, the DM thread and DM rail,
+/// @mention chips and autocomplete, notifications, or reaction tooltips. Those
+/// show a nickname with no warning beside it. The DM thread is the most
+/// consequential of the gaps: it is a 1:1 surface, which is where a victim is
+/// most likely to act on perceived authority.
+///
+/// Adding a surface is a one-line call to this function plus the glyph; the
+/// reason not to do it blindly is that each surface needs its own
+/// [`privilege_in_view`] answer and its own layout for a badge that must not
+/// be clipped.
+///
+/// ## Only [`ConfusableTier::Identical`] is rendered
+///
+/// The engine also reports [`ConfusableTier::NearMiss`] (within a small,
+/// length-scaled edit distance). This UI drops it, on measured evidence rather
+/// than taste: River assigns every member one of 10,000 generated handles, and
+/// `Amber Worm` / `Ember Worm` are one edit apart, so the near-miss tier accuses
+/// a pair of members River itself created — before any attacker acts. Tier 1 is
+/// clean on the same population (no two handles share a skeleton). Both facts
+/// are pinned in [`crate::util::confusable`] by
+/// `generated_handles_never_fold_to_the_same_skeleton` and
+/// `generated_handles_are_within_the_near_miss_budget`.
+///
+/// The cost is real and accepted: `Ian Clark` no longer warns for the moderator
+/// `Ian Clarke`. That is the right trade here, because a false accusation is
+/// not a symmetric error — it lands on an innocent member, it is visible to the
+/// whole room, and a badge that fires on ordinary near-duplicates trains people
+/// to ignore the badge that catches the real thing. What remains for the
+/// near-miss case is the disambiguator River already shows on both surfaces:
+/// the member ID, on hover, next to every name.
+///
+/// So the rendered signal means something narrow and checkable: **these two
+/// names fold to the same skeleton.** That is *almost* "they are visually the
+/// same string", and the difference matters enough to state: the fold also
+/// drops spaces, so `Host Fat` matches `HostFat` and `Jo Anna` matches
+/// `Joanna` — names a reader can plainly tell apart. That rule earns its place
+/// by catching `IanClarke`, and its cost is enumerated in
+/// [`crate::util::confusable`]'s "Honest limits" and pinned row by row in
+/// `documented_accepted_collisions`.
+pub(crate) fn impersonation_warning_for_display(
+    checker: &ImpersonationChecker,
+    member_id: MemberId,
+    display_name: &str,
+    // The privilege the FLAGGED member holds in this viewer's view, from
+    // [`privilege_in_view`]. Not derivable from the checker: it is the badge
+    // map's answer, not the protected set's. Drives the tooltip only — it never
+    // suppresses the badge.
+    flagged_privilege: Option<ProtectedRole>,
+) -> Option<ImpersonationWarning> {
+    // `check_identical` rather than `check(..).filter(..)`: the filtered form
+    // still ran the full Damerau sweep for every NON-matching member on every
+    // render, in both surfaces, only to throw the result away.
+    let warning = checker.check_identical(member_id, display_name);
+    debug_assert!(
+        warning
+            .as_ref()
+            .is_none_or(|w| w.tier == ConfusableTier::Identical),
+        "only the Identical tier may reach a render surface"
+    );
+    warning.map(|w| ImpersonationWarning {
+        flagged_privilege,
+        ..w
+    })
+}
+
+/// The privilege `member_id` holds in this viewer's view, if any.
+///
+/// One definition for every surface, from the same badge map the 🛡 and the
+/// protected set come from, so "does this member hold privilege" cannot get
+/// three answers in three places.
+///
+/// The owner outranks a deputy grant: a room owner who is also somehow in
+/// `deputy_badges` is described as the owner.
+pub(crate) fn privilege_in_view(
+    member_id: MemberId,
+    owner_id: MemberId,
+    deputy_badges: &HashMap<MemberId, DeputyBadge>,
+) -> Option<ProtectedRole> {
+    if member_id == owner_id {
+        Some(ProtectedRole::Owner)
+    } else if deputy_badges.contains_key(&member_id) {
+        Some(ProtectedRole::Deputy)
+    } else {
+        None
+    }
+}
+
 /// [`deputy_badges_for_viewer`] for a SINGLE member.
 ///
 /// The member-info modal wants one member's badge and is not memoised, so
@@ -1057,6 +1390,13 @@ pub fn MemberList() -> Element {
         let deputy_badges =
             deputy_badges_for_viewer(members, member_info, room_secrets, owner_id, self_member_id);
 
+        // The ⚠ impersonation checker, built ONCE here from the badge map above
+        // — never inside the per-member loop below, which would re-fold every
+        // protected name (and, in a private room, re-unseal every protected
+        // nickname) once per member. `check` is the per-member hot path.
+        let impersonation =
+            impersonation_checker_for_viewer(member_info, room_secrets, owner_id, &deputy_badges);
+
         // Order the list as a DISPLAY tree, VIEWER-SCOPED: a member renders under
         // a deputizer only if that deputizer is viewer-relevant — so a global mod
         // rises to the top for everyone (including the owner's own view), a
@@ -1072,7 +1412,24 @@ pub fn MemberList() -> Element {
             let nickname = member_info
                 .canonical(member_id)
                 .map(|mi| display_nickname(&mi.member_info.preferred_nickname, room_secrets))
-                .unwrap_or_else(|| "Unknown".to_string());
+                .unwrap_or_else(|| crate::util::display_name::UNKNOWN_MEMBER.to_string());
+
+            // Computed from the RENDERED `nickname` above, not the raw sealed
+            // bytes: the checker compares what the reader actually sees, so it
+            // must be fed post-`display_nickname` text. Feeding it the raw
+            // nickname would compare a string nobody is shown.
+            //
+            // `member_id` is the id of the member this ROW is for. Passing
+            // `self_member_id` here compiles, passes every behavioural test, and
+            // puts ⚠ on the genuine owner and every genuine moderator — the
+            // argument is pinned by
+            // `impersonation_warning_is_wired_into_both_render_surfaces`.
+            let impersonation_warning = impersonation_warning_for_display(
+                &impersonation,
+                member_id,
+                &nickname,
+                privilege_in_view(member_id, owner_id, &deputy_badges),
+            );
 
             let member_display = MemberDisplay {
                 nickname,
@@ -1105,6 +1462,7 @@ pub fn MemberList() -> Element {
                 // shield's visibility AND its tooltip stay identical across
                 // the sidebar, the modal and the conversation.
                 deputy_badge: deputy_badges.get(&member_id).cloned(),
+                impersonation: impersonation_warning,
             };
 
             all_members.push((member_display_parts(&member_display), member_id));
@@ -1163,23 +1521,42 @@ pub fn MemberList() -> Element {
                         // Stable per-member hook for automation (freenet/river#25).
                         // Entity-ID pattern: `member-item-{member_id}`.
                         "data-testid": "member-item-{member_id}",
+                        // `truncate` used to sit on the BUTTON, which clipped
+                        // the badge spans along with the name: a long enough
+                        // nickname pushed the ⚠ (and its `title`/`aria-label`)
+                        // out of view entirely. That is reachable well inside
+                        // the nickname limit, because the sanitiser
+                        // deliberately does NOT normalise `U+3000` IDEOGRAPHIC
+                        // SPACE — `"Ian Clarke" + "\u{3000}".repeat(13) + "."`
+                        // renders as `Ian Clarke…` with the warning clipped off.
+                        //
+                        // Now the row is a flex line: only the NAME truncates,
+                        // and every badge is `flex-shrink-0` so it can never be
+                        // clipped, whatever the name's length.
                         button {
-                            class: "w-full text-left px-3 py-1.5 rounded-lg text-sm text-text hover:bg-surface transition-colors truncate",
+                            class: "w-full text-left px-3 py-1.5 rounded-lg text-sm text-text hover:bg-surface transition-colors flex items-center min-w-0",
                             title: "Member ID: {member_id}",
                             onclick: move |_| handle_member_click(member_id),
                             // Nickname rendered as a plain text node — attacker-controlled
                             // bytes from `MemberInfoV1.preferred_nickname` MUST NOT be
                             // routed through `dangerous_inner_html` (freenet/river#227).
-                            span { "{parts.nickname}" }
-                            for (icon, tooltip) in parts.tags {
+                            span { class: "truncate min-w-0", "{parts.nickname}" }
+                            for tag in parts.tags {
                                 span {
-                                    class: "member-icon",
-                                    title: "{tooltip}",
+                                    // Addressable from a browser test — see
+                                    // `MemberTag`. `title=` does not fire on
+                                    // touch, so the badge's explanation is
+                                    // unreachable on a phone and a spec is the
+                                    // only thing that can check it renders at
+                                    // all at narrow widths.
+                                    "data-testid": "{tag.test_id}",
+                                    class: "member-icon flex-shrink-0",
+                                    title: "{tag.tooltip}",
                                     // The glyph alone means nothing to a
                                     // screen reader, and the deputy shield is
                                     // now a security-relevant signal.
-                                    "aria-label": "{tooltip}",
-                                    " {icon}"
+                                    "aria-label": "{tag.tooltip}",
+                                    " {tag.glyph}"
                                 }
                             }
                         }
@@ -2818,6 +3195,7 @@ mod tests {
             invited_by_you: false,
             in_your_network: false,
             deputy_badge: None,
+            impersonation: None,
         }
     }
 
@@ -3126,7 +3504,7 @@ mod tests {
         let parts = member_display_parts(&display);
 
         assert_eq!(parts.nickname, "alice");
-        let icons: Vec<&str> = parts.tags.iter().map(|(icon, _)| *icon).collect();
+        let icons: Vec<&str> = parts.tags.iter().map(|t| t.glyph).collect();
         assert!(icons.contains(&"👑"));
         assert!(icons.contains(&"⭐"));
     }
@@ -3143,7 +3521,7 @@ mod tests {
             !member_display_parts(&display)
                 .tags
                 .iter()
-                .any(|(icon, _)| *icon == "🛡"),
+                .any(|t| t.glyph == "🛡"),
             "no shield when the member is not a deputy"
         );
 
@@ -3155,12 +3533,12 @@ mod tests {
         let shield = parts
             .tags
             .iter()
-            .find(|(icon, _)| *icon == "🛡")
+            .find(|t| t.glyph == "🛡")
             .expect("a deputy must show the 🛡 shield");
         // Identical wording to the conversation author line and the modal
         // chip — all three call `DeputyBadge::tooltip`.
         assert_eq!(
-            shield.1,
+            shield.tooltip,
             "Deputy (appointed by the room owner). Can ban you."
         );
 
@@ -3172,7 +3550,7 @@ mod tests {
         });
         let parts = member_display_parts(&display);
         assert_eq!(
-            parts.tags.iter().find(|(icon, _)| *icon == "🛡").unwrap().1,
+            parts.tags.iter().find(|t| t.glyph == "🛡").unwrap().tooltip,
             "Deputy (appointed by the room owner)"
         );
     }
@@ -4505,6 +4883,87 @@ mod tests {
         }
     }
 
+    /// **SHOULD-FIX E — the warning must not be clippable.**
+    ///
+    /// `truncate` used to sit on the member-row BUTTON, which clipped the badge
+    /// spans along with the name. Two consequences: a long nickname pushed the
+    /// ⚠ and its `title`/`aria-label` out of view entirely, and because the
+    /// sanitiser deliberately does NOT normalise `U+3000` IDEOGRAPHIC SPACE, a
+    /// nickname like `"Ian Clarke" + "\u{3000}".repeat(13) + "."` rendered as
+    /// `Ian Clarke…` — a visual clone whose warning was clipped off, well
+    /// inside the nickname length limit.
+    ///
+    /// Source-scrape: this is a Dioxus tree with no headless harness here, and
+    /// the property is a class on a specific element.
+    #[test]
+    fn the_warning_badge_cannot_be_clipped_by_a_long_nickname() {
+        let src = include_str!("members.rs");
+        // LINE-scoped, not byte-offset-scoped. The previous version sliced
+        // `src[start..start + 2600]`, which lands on a char boundary today only
+        // by luck: this file is full of multibyte glyphs (⚠ 🛡 👑 and the
+        // homoglyph literals in the tests), and any edit that shifts one into
+        // the cut panics the test with a slice error instead of a finding.
+        let lines: Vec<&str> = src.lines().collect();
+        let row_start = lines
+            .iter()
+            .position(|l| l.contains("\"data-testid\": \"member-item-"))
+            .expect("the row");
+        let row_lines = &lines[row_start..(row_start + 40).min(lines.len())];
+
+        let button_line = row_lines
+            .iter()
+            .skip_while(|l| !l.contains("button {"))
+            .nth(1)
+            .expect("the row button's class line");
+        assert!(
+            button_line.contains("class:"),
+            "expected the class attribute on the line after `button {{`, got \
+             {button_line:?}"
+        );
+        // `!contains("transition-colors truncate")` was strictly weaker than
+        // the revert it blocks: `class: "truncate w-full ... transition-colors"`
+        // reintroduces the bug and passes. The button carries no `truncate` at
+        // all today, so assert exactly that.
+        assert!(
+            !button_line.contains("truncate"),
+            "`truncate` must not sit on the row BUTTON in any position — it \
+             clips the badge spans along with the name, so a long nickname \
+             hides the warning: {button_line:?}"
+        );
+        // `min-w-0` is load-bearing for the same behaviour: without it the
+        // flex item refuses to shrink below its content width, the row
+        // overflows instead of truncating, and the badges go off the edge.
+        assert!(
+            button_line.contains("min-w-0"),
+            "the row button must be `min-w-0` so the name can shrink instead \
+             of pushing the badges out of the row: {button_line:?}"
+        );
+
+        let name_line = row_lines
+            .iter()
+            .find(|l| l.contains("\"{parts.nickname}\""))
+            .expect("the nickname span exists");
+        assert!(
+            name_line.contains("truncate"),
+            "the NAME span must be the thing that truncates: {name_line:?}"
+        );
+        assert!(
+            name_line.contains("min-w-0"),
+            "the name span must be `min-w-0`, or `truncate` has nothing to \
+             shrink against and the badges are pushed out: {name_line:?}"
+        );
+
+        let tag_line = row_lines
+            .iter()
+            .find(|l| l.contains("member-icon"))
+            .expect("the tag span exists");
+        assert!(
+            tag_line.contains("flex-shrink-0"),
+            "every badge span must be `flex-shrink-0` so it can never be \
+             clipped, whatever the nickname's length: {tag_line:?}"
+        );
+    }
+
     /// Source-grep pin: the member-row render MUST keep `parts.nickname`
     /// as a Dioxus text-node interpolation — `span { "{parts.nickname}" }`
     /// — not pass it through any string concatenation or attribute that
@@ -4513,11 +4972,30 @@ mod tests {
     #[test]
     fn member_row_renders_nickname_as_text_node() {
         let prod = production_source();
+        let needle = "\"{parts.nickname}\"";
+        let at = prod
+            .find(needle)
+            .expect("MemberList must still render `parts.nickname`");
+        // Check the interpolation's POSITION, not the whole element literally.
+        // The literal form broke the moment the span gained a `class` — and it
+        // would have passed unchanged for `dangerous_inner_html:
+        // "{parts.nickname}"` had the element otherwise matched. In rsx a text
+        // node follows `{` or `,`; an attribute value follows `:`.
+        let preceding = prod[..at]
+            .trim_end()
+            .chars()
+            .next_back()
+            .expect("something precedes the interpolation");
         assert!(
-            prod.contains("span { \"{parts.nickname}\" }"),
-            "MemberList must render the nickname as a Dioxus text node \
-             (`span {{ \"{{parts.nickname}}\" }}`). Concatenating it into \
-             an HTML string reopens freenet/river#227."
+            preceding == '{' || preceding == ',',
+            "`parts.nickname` must be a Dioxus TEXT NODE (preceded by `{{` or \
+             `,`), but it is preceded by {preceding:?} — an attribute-value \
+             position. If that attribute is `dangerous_inner_html`, this \
+             reopens freenet/river#227."
+        );
+        assert!(
+            prod[at.saturating_sub(200)..at].contains("span {"),
+            "`parts.nickname` is no longer rendered inside a `span`"
         );
     }
 
@@ -4749,5 +5227,1834 @@ mod tests {
         let decoded =
             Invitation::from_encoded_string(&encoded).expect("legacy invitation should decode");
         assert!(decoded.room_secrets.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Impersonation warning (⚠) — wiring of `crate::util::confusable`
+    // ---------------------------------------------------------------
+
+    /// A room with `owner` (nickname `Room Owner`), a global moderator `mod`
+    /// (nickname `Ian Clarke`, deputised by the owner), the `viewer`, and one
+    /// extra member whose nickname the caller chooses.
+    ///
+    /// Returns the checker as the VIEWER sees it, plus the extra member's id —
+    /// which is the shape every test below wants.
+    fn impersonation_fixture(
+        stranger_nickname: &str,
+    ) -> (ImpersonationChecker, MemberId, MemberId, MemberId) {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let stranger_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &stranger_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                signed_member_info(&mod_sk, "Ian Clarke", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&stranger_sk, stranger_nickname, vec![]),
+            ],
+        };
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        // Precondition: the moderator really does carry a shield in this view.
+        assert!(
+            badges.contains_key(&id(&mod_sk)),
+            "fixture precondition: the moderator must show a shield to the viewer"
+        );
+
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+        // **Precondition, and the one that matters for every "is NOT flagged"
+        // test below.** A non-empty shield map does not imply a non-empty
+        // PROTECTED set — `claimed_name` filters placeholder and generated
+        // names, so the checker can come out empty while badges are populated.
+        // Without this, `plainly_different_names_are_not_flagged` and
+        // `legitimate_non_latin_names_are_not_flagged` would both pass against
+        // a checker that can never flag anything.
+        assert!(
+            !checker.is_empty(),
+            "fixture precondition: the protected set must be non-empty, or the \
+             negative assertions below prove nothing"
+        );
+        (checker, owner_id, id(&mod_sk), id(&stranger_sk))
+    }
+
+    /// A room whose OWNER and DEPUTY both carry non-Latin names, so the
+    /// cross-script folds are exercised against a non-Latin protected name —
+    /// the direction that actually bites. Every other test protects a Latin
+    /// name, where a Cyrillic candidate can only ever fold *toward* Latin.
+    fn non_latin_fixture() -> (ImpersonationChecker, MemberId) {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let stranger_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &stranger_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                // Cyrillic owner, CJK deputy.
+                signed_member_info(&owner_sk, "Дмитрий Волков", vec![id(&mod_sk)]),
+                signed_member_info(&mod_sk, "李小龍", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&stranger_sk, "Stranger", vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        assert!(badges.contains_key(&id(&mod_sk)));
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+        assert!(!checker.is_empty(), "non-Latin names must be protectable");
+        (checker, id(&stranger_sk))
+    }
+
+    /// A protected name in a non-Latin script is still protected, and still does
+    /// not swallow unrelated names in the same script.
+    #[test]
+    fn a_non_latin_protected_name_is_protected_without_over_matching() {
+        let (checker, stranger) = non_latin_fixture();
+
+        // A Latin-homoglyph attack on the Cyrillic owner: `Дмитрий` with a
+        // Latin `T`-lookalike is not reachable, but the reverse IS — an
+        // attacker who copies the name verbatim collides by construction.
+        assert!(
+            impersonation_warning_for_display(&checker, stranger, "Дмитрий Волков", None).is_some(),
+            "a verbatim copy of the owner's Cyrillic name must be flagged"
+        );
+        assert!(
+            impersonation_warning_for_display(&checker, stranger, "李小龍", None).is_some(),
+            "a verbatim copy of the deputy's CJK name must be flagged"
+        );
+
+        // Other real names in the SAME scripts must not be caught.
+        for name in [
+            "Иван Петров",
+            "Ольга Иванова",
+            "Дмитрий Соколов", // shares a given name with the owner only
+            "王小明",
+            "李連杰",
+            "さくら 田中",
+            "Γιώργος Παπαδόπουλος",
+        ] {
+            assert_eq!(
+                impersonation_warning_for_display(&checker, stranger, name, None),
+                None,
+                "{name:?} is an unrelated name in a protected script and must \
+                 not be flagged"
+            );
+        }
+    }
+
+    /// **Regression: placeholder display names must never be protected.**
+    ///
+    /// `display_nickname` returns `"[Encrypted: {len} bytes, v{version}]"` when
+    /// the unseal fails, which it does whenever the viewer's in-memory
+    /// `secrets` map is missing the version — a real window, because `secrets`
+    /// is `#[serde(skip)]` and rebuilt after every state ingestion.
+    ///
+    /// That string is a pure function of (nickname LENGTH, secret version), so
+    /// it is shared by every member whose nickname is the same length. If it
+    /// entered the protected set, one un-decryptable owner would flag a whole
+    /// CLASS of innocent members at once, with no attacker present.
+    #[test]
+    fn undecryptable_and_placeholder_names_are_never_protected() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+        use river_core::room_state::privacy::SealedBytes;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let a_sk = SigningKey::generate(&mut rng);
+        let b_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+
+        // A private room whose secret this viewer does not hold.
+        let sealed =
+            |len: usize, version: u32| SealedBytes::private(vec![7u8; len], [0u8; 12], version, 3);
+        let signed_sealed = |sk: &SigningKey, nickname: SealedBytes| {
+            use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+            AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo {
+                    member_id: MemberId::from(&sk.verifying_key()),
+                    version: 0,
+                    preferred_nickname: nickname,
+                    deputies: vec![],
+                },
+                sk,
+            )
+        };
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &a_sk.verifying_key()),
+                authorized_member(&owner_sk, &b_sk.verifying_key()),
+            ],
+        };
+        // The owner, the deputy and two ordinary members ALL have 12-byte
+        // nicknames at v0, so all four render the identical placeholder.
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                {
+                    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+                    AuthorizedMemberInfo::new_with_member_key(
+                        MemberInfo {
+                            member_id: owner_id,
+                            version: 0,
+                            preferred_nickname: sealed(12, 0),
+                            deputies: vec![id(&mod_sk)],
+                        },
+                        &owner_sk,
+                    )
+                },
+                signed_sealed(&mod_sk, sealed(12, 0)),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_sealed(&a_sk, sealed(12, 0)),
+                signed_sealed(&b_sk, sealed(12, 0)),
+            ],
+        };
+        let no_secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        // Precondition: they really do all render the same placeholder string,
+        // so a name-based protected set WOULD flag them all.
+        let rendered = |sk: &SigningKey| {
+            display_nickname(
+                &member_info
+                    .canonical(MemberId::from(&sk.verifying_key()))
+                    .expect("record")
+                    .member_info
+                    .preferred_nickname,
+                &no_secrets,
+            )
+        };
+        assert_eq!(rendered(&a_sk), rendered(&mod_sk));
+        assert_eq!(rendered(&a_sk), rendered(&b_sk));
+        assert!(
+            rendered(&a_sk).contains("Encrypted"),
+            "precondition: the undecryptable placeholder is what renders, got {:?}",
+            rendered(&a_sk)
+        );
+
+        let badges = deputy_badges_for_viewer(
+            &members,
+            &member_info,
+            &no_secrets,
+            owner_id,
+            id(&viewer_sk),
+        );
+        assert!(
+            badges.contains_key(&id(&mod_sk)),
+            "precondition: the deputy still carries a shield"
+        );
+        let checker =
+            impersonation_checker_for_viewer(&member_info, &no_secrets, owner_id, &badges);
+
+        // Nothing is protected, so nobody is accused.
+        assert!(
+            checker.is_empty(),
+            "no name in this room is a CLAIMED name, so the protected set must \
+             be empty"
+        );
+        for sk in [&a_sk, &b_sk] {
+            assert_eq!(
+                impersonation_warning_for_display(&checker, id(sk), &rendered(sk), None),
+                None,
+                "an ordinary member must not be accused of impersonating an \
+                 owner whose name merely failed to decrypt"
+            );
+        }
+    }
+
+    /// The `UNNAMED` placeholder is the same shape: a deputy whose nickname
+    /// sanitises to nothing would otherwise flag every other member whose
+    /// nickname also sanitises to nothing. `riverctl` writes `member_info`
+    /// directly, so the nickname input's emoji rejection is not a boundary here.
+    #[test]
+    fn an_unnamed_deputy_is_not_protected() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let other_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &other_sk.verifying_key()),
+            ],
+        };
+        // Emoji-only nicknames sanitise to `UNNAMED`.
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                signed_member_info(&mod_sk, "\u{1F6E1}\u{1F451}", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&other_sk, "\u{2B50}\u{1F3AA}", vec![]),
+            ],
+        };
+        let unnamed = display_nickname(
+            &member_info
+                .canonical(id(&other_sk))
+                .expect("record")
+                .member_info
+                .preferred_nickname,
+            &secrets,
+        );
+        assert_eq!(
+            unnamed,
+            crate::util::display_name::UNNAMED,
+            "precondition: an emoji-only nickname renders as the placeholder"
+        );
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+
+        assert_eq!(
+            impersonation_warning_for_display(&checker, id(&other_sk), &unnamed, None),
+            None,
+            "`UNNAMED` is the placeholder for EVERY blank nickname, so it must \
+             not be a protected name"
+        );
+        // The owner's real name is still protected, so this is not vacuous —
+        // and it is protected AS THE OWNER. Mutating `ProtectedRole::Owner` to
+        // `Deputy` in the builder survives every other test in this file, and
+        // then the tooltip tells readers to hunt for a shield the owner does
+        // not have.
+        let owner_hit =
+            impersonation_warning_for_display(&checker, id(&other_sk), "R00m 0wner", None)
+                .expect("the owner's name must still be protected");
+        assert_eq!(
+            owner_hit.impersonated.role,
+            ProtectedRole::Owner,
+            "the owner's name must be protected as the OWNER — the tooltip's \
+             remedy clause (a crown in the member list, not a shield) is \
+             chosen from this role"
+        );
+        assert!(owner_hit.tooltip().contains("is NOT the room owner"));
+    }
+
+    /// A room where an ATTACKER (a strict ancestor of the viewer, so a
+    /// viewer-relevant appointer) deputises a sockpuppet and names it whatever
+    /// the caller asks. Returns the checker as the viewer sees it, plus the
+    /// sockpuppet's id, an innocent bystander's id, and the real moderator's id.
+    fn attacker_sockpuppet_fixture(
+        puppet_nickname: &str,
+    ) -> (ImpersonationChecker, MemberId, MemberId, MemberId) {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let attacker_sk = SigningKey::generate(&mut rng);
+        let puppet_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let innocent_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        // The attacker invited the viewer, making the attacker a STRICT
+        // ANCESTOR — which is all `viewer_relevant_deputizer_set` requires.
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &attacker_sk.verifying_key()),
+                authorized_member(&owner_sk, &puppet_sk.verifying_key()),
+                authorized_member(&owner_sk, &innocent_sk.verifying_key()),
+                member_invited_by(&attacker_sk, owner_id, &viewer_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                // The owner appoints the REAL moderator.
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                signed_member_info(&mod_sk, "Ian Clarke", vec![]),
+                // The attacker appoints their sockpuppet. Nothing in
+                // `MemberInfoV1::verify` stops this.
+                signed_member_info(&attacker_sk, "Attacker", vec![id(&puppet_sk)]),
+                signed_member_info(&puppet_sk, puppet_nickname, vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&innocent_sk, "Bob Smith", vec![]),
+            ],
+        };
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        // Precondition: the attack primitive works — the sockpuppet really does
+        // carry a shield in the viewer's view. If this ever stops holding, the
+        // tests below would pass for the wrong reason.
+        assert!(
+            badges.contains_key(&id(&puppet_sk)),
+            "precondition: an ancestor's sockpuppet IS badged to the viewer, \
+             which is exactly why the protected set must not follow the badge"
+        );
+        assert!(badges.contains_key(&id(&mod_sk)));
+
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+        (checker, id(&puppet_sk), id(&innocent_sk), id(&mod_sk))
+    }
+
+    /// **The accepted cost of protecting every deputy, pinned so it stays
+    /// deliberate.**
+    ///
+    /// The protected set IS attacker-writable: any strict ancestor of the viewer
+    /// can deputise a sockpuppet and name it after an innocent member, and the
+    /// innocent member then renders "this member is NOT a moderator" across the
+    /// attacker's invite subtree, invisibly to the victim. `MemberInfoV1::verify`
+    /// validates only the LENGTH of a `deputies` list, never who is in it, so
+    /// nothing below the UI stops it.
+    ///
+    /// There was a gate here that admitted only owner- or viewer-appointed
+    /// deputies. It closed this hole and, in the process, switched the feature
+    /// off in the one room that has needed it: every deputy grant in the live
+    /// Freenet Official room is issued by `Invite Bot`, not by the owner, so the
+    /// gate protected the owner's name and nobody else's. The owner chose the
+    /// wider set with this cost known.
+    ///
+    /// This test asserts the CURRENT behaviour rather than the desirable one. If
+    /// it starts failing because someone re-narrowed the set, that is a policy
+    /// change and needs the same sign-off — do not "fix" it by re-adding a gate.
+    #[test]
+    fn a_sockpuppet_can_inject_a_protected_name() {
+        // The sockpuppet is named after the innocent member.
+        let (checker, _puppet, innocent, _mod_id) = attacker_sockpuppet_fixture("Bob Smith");
+
+        assert!(
+            impersonation_warning_for_display(&checker, innocent, "Bob Smith", None).is_some(),
+            "ACCEPTED COST: an ancestor's sockpuppet CAN aim the badge at an \
+             innocent member. If this now returns None the protected set was \
+             re-narrowed — see the doc comment before changing this assertion"
+        );
+
+        // And the room's REAL protected names still work, so this is not
+        // vacuous: the owner-appointed moderator's name is still protected.
+        assert!(
+            impersonation_warning_for_display(&checker, innocent, "\u{0399}an Clarke", None)
+                .is_some(),
+            "the owner-appointed moderator's name must still be protected"
+        );
+    }
+
+    /// **BLOCKING A2 — warning SUPPRESSION.** Being deputised must not buy
+    /// immunity from impersonating someone else.
+    ///
+    /// The same primitive, aimed the other way: the sockpuppet names itself
+    /// after the REAL moderator. Under a room-wide "privileged ⇒ never warned"
+    /// exemption it rendered a genuine 🛡 and no ⚠ — and on the message author
+    /// line that is worse than shipping nothing, because the real Ian is the
+    /// OWNER and 👑 renders only in the member list, so the fake visually
+    /// outranked the real one in the conversation.
+    #[test]
+    fn a_deputised_sockpuppet_cannot_suppress_its_own_warning() {
+        let (checker, puppet, _innocent, mod_id) = attacker_sockpuppet_fixture("Ian Clarke");
+
+        // The sockpuppet carries a GENUINE 🛡 in this viewer's view — that is
+        // the whole primitive — so this is the case where a
+        // "privileged ⇒ suppress" rule would hand it immunity. It must not.
+        let warning = impersonation_warning_for_display(
+            &checker,
+            puppet,
+            "Ian Clarke",
+            Some(ProtectedRole::Deputy),
+        )
+        .expect("a sockpuppet wearing the moderator's name MUST be flagged");
+        assert_eq!(warning.impersonated.display_name, "Ian Clarke");
+        assert_eq!(warning.impersonated.role, ProtectedRole::Deputy);
+
+        // Homoglyph variants too, not just the literal string.
+        assert!(impersonation_warning_for_display(
+            &checker,
+            puppet,
+            "\u{0399}an Clarke",
+            Some(ProtectedRole::Deputy)
+        )
+        .is_some());
+
+        // The REAL moderator is now flagged TOO, and that is the honest
+        // outcome: the room genuinely contains two shielded members with the
+        // same name, and the viewer genuinely cannot tell them apart. What must
+        // NOT happen is the badge asserting something false about either of
+        // them — neither is "NOT a moderator", because both hold a grant.
+        let real = impersonation_warning_for_display(
+            &checker,
+            mod_id,
+            "Ian Clarke",
+            Some(ProtectedRole::Deputy),
+        )
+        .expect("the collision is symmetric: both shielded members are marked");
+        for tip in [warning.tooltip(), real.tooltip()] {
+            assert!(
+                !tip.contains("is NOT"),
+                "the tooltip asserts something false about a member who does \
+                 hold a grant: {tip}"
+            );
+            assert!(tip.contains("Name conflict"), "{tip}");
+            assert!(tip.contains("member ID"), "{tip}");
+        }
+
+        // The identity exemption is still keyed on the name's SOURCE, so the
+        // real moderator is not accused of impersonating THEMSELVES: the
+        // warning they get names the sockpuppet's entry, not their own.
+        assert_ne!(real.impersonated.source, mod_id);
+    }
+
+    /// **Every deputy the viewer can see a shield for contributes a name**,
+    /// whoever appointed them — owner, the viewer, or any other ancestor.
+    ///
+    /// The scope is deliberately the same set as the shield: a protected name is
+    /// one whose authority this viewer would be fooled by, which is precisely
+    /// the set whose 🛡 they can see. Narrowing it to owner-appointed grants
+    /// protects nobody in the live Freenet Official room, where every grant
+    /// comes from `Invite Bot`.
+    #[test]
+    fn every_badged_deputy_contributes_a_protected_name() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let mine_sk = SigningKey::generate(&mut rng);
+        let ancestor_sk = SigningKey::generate(&mut rng);
+        let theirs_sk = SigningKey::generate(&mut rng);
+        let stranger_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &ancestor_sk.verifying_key()),
+                authorized_member(&owner_sk, &theirs_sk.verifying_key()),
+                authorized_member(&owner_sk, &stranger_sk.verifying_key()),
+                member_invited_by(&ancestor_sk, owner_id, &viewer_sk.verifying_key()),
+                member_invited_by(&viewer_sk, owner_id, &mine_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![]),
+                // The viewer appoints `mine`; an unrelated ancestor appoints
+                // `theirs`. Both are badged to the viewer.
+                signed_member_info(&viewer_sk, "Viewer", vec![id(&mine_sk)]),
+                signed_member_info(&ancestor_sk, "Ancestor", vec![id(&theirs_sk)]),
+                signed_member_info(&mine_sk, "Trusted Mod", vec![]),
+                signed_member_info(&theirs_sk, "Untrusted Mod", vec![]),
+                signed_member_info(&stranger_sk, "Stranger", vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        assert!(
+            badges.contains_key(&id(&mine_sk)) && badges.contains_key(&id(&theirs_sk)),
+            "precondition: BOTH deputies are badged to this viewer"
+        );
+
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+        assert!(
+            impersonation_warning_for_display(&checker, id(&stranger_sk), "Trusted Mod", None)
+                .is_some(),
+            "a deputy the VIEWER appointed is trusted, so their name is protected"
+        );
+        assert!(
+            impersonation_warning_for_display(&checker, id(&stranger_sk), "Untrusted Mod", None)
+                .is_some(),
+            "a deputy appointed by ANOTHER ancestor is badged to this viewer, so \
+             their name must be protected too — this is the case the live \
+             Freenet Official room is entirely made of (every grant there comes \
+             from `Invite Bot`, not the owner)"
+        );
+    }
+
+    /// **Wiring pin for the ABSENCE of the appointer gate.**
+    ///
+    /// Source-scrape, because the gate this replaces was a single `continue`,
+    /// and re-adding one is the obvious "fix" for
+    /// `a_sockpuppet_can_inject_a_protected_name`. It is not a fix, it is a
+    /// policy reversal: it switches the feature off for every real moderator in
+    /// the Freenet Official room. Behavioural tests would not catch it either,
+    /// because a fixture whose deputies happen to be owner-appointed passes
+    /// under both policies.
+    #[test]
+    fn the_protected_set_is_not_gated_on_the_appointer() {
+        let src = include_str!("members.rs");
+        let start = src
+            .find("pub(crate) fn impersonation_checker_for_viewer")
+            .expect("the builder must exist");
+        let end = src[start..]
+            .find("\n/// The impersonation warning a surface actually RENDERS")
+            .expect("the builder is followed by the render boundary")
+            + start;
+        // Comments in the body legitimately NAME the removed gate, so strip
+        // them: the scrape must see code, not the explanation of why the code
+        // is gone.
+        let body: String = src[start..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("Appointer::"),
+            "`impersonation_checker_for_viewer` gates the protected set on the \
+             appointer again. That is a POLICY REVERSAL, not a bug fix — it \
+             leaves every moderator in the Freenet Official room unprotected, \
+             because every deputy grant there is issued by `Invite Bot` rather \
+             than by the owner. See the doc on \
+             `a_sockpuppet_can_inject_a_protected_name`."
+        );
+    }
+
+    /// **The live Freenet Official topology, end to end.**
+    ///
+    /// This is the configuration the removed appointer gate broke, and the
+    /// reason it was removed: in the real room every deputy grant is issued by
+    /// `Invite Bot` (`PMAQEUP5`), not by the owner (`NRKA4WVX`) — verified
+    /// 2026-07-25 with `riverctl debug room-state`. Under the gate the
+    /// protected set was `{"Room Owner"}` and every actual moderator's name was
+    /// unprotected, which is exactly the impersonation this feature exists to
+    /// catch.
+    ///
+    /// Named after the real room on purpose: a fixture of anonymous `mod_a` /
+    /// `mod_b` deputised by the owner passes under BOTH policies, which is why
+    /// the gate survived review in the first place.
+    #[test]
+    fn the_live_freenet_official_topology_protects_every_moderator() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let bot_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let mods: Vec<(SigningKey, &str)> =
+            ["Ian Clarke", "HostFat", "Ivvor", "ofansifkapital-xmpp"]
+                .into_iter()
+                .map(|name| (SigningKey::generate(&mut rng), name))
+                .collect();
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        // The bot invited the viewer, so it is a strict ancestor and its grants
+        // are viewer-relevant — the real room's shape.
+        let mut members = vec![
+            authorized_member(&owner_sk, &bot_sk.verifying_key()),
+            member_invited_by(&bot_sk, owner_id, &viewer_sk.verifying_key()),
+        ];
+        let mut records = vec![
+            // The owner deputizes NOBODY. Every grant comes from the bot.
+            signed_member_info(&owner_sk, "Room Owner", vec![]),
+            signed_member_info(
+                &bot_sk,
+                "Invite Bot",
+                mods.iter().map(|(sk, _)| id(sk)).collect(),
+            ),
+            signed_member_info(&viewer_sk, "Viewer", vec![]),
+        ];
+        for (sk, name) in &mods {
+            members.push(member_invited_by(&bot_sk, owner_id, &sk.verifying_key()));
+            records.push(signed_member_info(sk, name, vec![]));
+        }
+        let members = MembersV1 { members };
+        let member_info = MemberInfoV1 {
+            member_info: records,
+        };
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        for (sk, name) in &mods {
+            assert!(
+                badges.contains_key(&id(sk)),
+                "precondition: {name} carries a shield in the viewer's view"
+            );
+        }
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+
+        // An impostor joins under a homoglyph of each moderator's name and of
+        // the owner's. Every one must be flagged.
+        let impostor = MemberId::from(&SigningKey::generate(&mut rng).verifying_key());
+        for spoof in [
+            "\u{0399}an Clarke",          // Greek capital iota — the live attack
+            "lan Clarke",                 // lowercase L
+            "IAN CLARKE",                 // case
+            "Ian Clarke",                 // exact
+            "H0stFat",                    // zero for O
+            "lvvor",                      // lowercase L for capital I
+            "IVVOR",                      // case, through the second fold
+            "\u{2C9E}fansifkapital-xmpp", // Coptic O
+            "R00m 0wner",
+        ] {
+            assert!(
+                impersonation_warning_for_display(&checker, impostor, spoof, None).is_some(),
+                "an impostor wearing {spoof:?} must be flagged — this is the \
+                 exact room the feature was built for"
+            );
+        }
+
+        // ...and every genuine moderator, under their own name, is untouched.
+        for (sk, name) in &mods {
+            assert_eq!(
+                impersonation_warning_for_display(
+                    &checker,
+                    id(sk),
+                    name,
+                    Some(ProtectedRole::Deputy)
+                ),
+                None,
+                "the real {name} must never be badged for their own name"
+            );
+        }
+        assert_eq!(
+            impersonation_warning_for_display(
+                &checker,
+                owner_id,
+                "Room Owner",
+                Some(ProtectedRole::Owner)
+            ),
+            None
+        );
+    }
+
+    /// **P3.5 — the guards must be as wide as the matcher they gate.**
+    ///
+    /// `is_generated_handle` is exact-string; the matcher compares folds. So a
+    /// moderator who merely styles their own name in lower case used to inject
+    /// a protected name that tier-1 matches the handle River assigned to
+    /// somebody else — putting "this member is NOT a moderator" on a member who
+    /// never typed anything. No attacker required.
+    #[test]
+    fn a_confusable_variant_of_a_generated_handle_is_not_protected() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        // Every one of these is `!= "Amber Worm"`, so the old exact filter let
+        // it through, and every one is a tier-1 match for `Amber Worm`.
+        for styled in [
+            "amber worm",
+            "AMBER WORM",
+            "AmberWorm",
+            "Amber\u{3000}Worm",
+            "Arnber Worm",
+            "Amber W0rm",
+            "Amber Worrn",
+        ] {
+            assert!(
+                !crate::nickname::is_generated_handle(styled),
+                "precondition: `{styled}` is NOT an exact generated handle, \
+                 which is why the exact filter passed it"
+            );
+
+            let mut rng = rand::thread_rng();
+            let owner_sk = SigningKey::generate(&mut rng);
+            let mod_sk = SigningKey::generate(&mut rng);
+            let holder_sk = SigningKey::generate(&mut rng);
+
+            let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+            let owner_id = id(&owner_sk);
+            let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+            let members = MembersV1 {
+                members: vec![
+                    authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                    authorized_member(&owner_sk, &holder_sk.verifying_key()),
+                ],
+            };
+            let member_info = MemberInfoV1 {
+                member_info: vec![
+                    signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                    signed_member_info(&mod_sk, styled, vec![]),
+                    signed_member_info(&holder_sk, "Amber Worm", vec![]),
+                ],
+            };
+            let badges = deputy_badges_for_viewer(
+                &members,
+                &member_info,
+                &secrets,
+                owner_id,
+                id(&holder_sk),
+            );
+            assert!(
+                badges.contains_key(&id(&mod_sk)),
+                "precondition: the styled moderator is badged"
+            );
+
+            let checker =
+                impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+            assert_eq!(
+                impersonation_warning_for_display(&checker, id(&holder_sk), "Amber Worm", None),
+                None,
+                "the member River ASSIGNED `Amber Worm` was accused because a \
+                 moderator styled their own name `{styled}` — the handle filter \
+                 must compare skeletons, not strings"
+            );
+        }
+    }
+
+    /// **P3.6 — `"Unknown"` is the no-record fallback and must be filtered.**
+    ///
+    /// A deputy whose `member_info` record literally SAYS `Unknown` (or any
+    /// fold of it) would flag every member whose record has not synced yet —
+    /// simultaneously, with no attacker, during an ordinary sync gap. The
+    /// existing `a_privileged_member_without_member_info_is_not_protected` covers a deputy
+    /// with NO record; this covers one whose record carries the placeholder.
+    #[test]
+    fn an_unknown_named_deputy_is_not_protected() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        for spelled in ["Unknown", "unknown", "UNKNOWN", "Unkn0wn", "Unknovvn"] {
+            let mut rng = rand::thread_rng();
+            let owner_sk = SigningKey::generate(&mut rng);
+            let mod_sk = SigningKey::generate(&mut rng);
+            let viewer_sk = SigningKey::generate(&mut rng);
+            let nameless_sk = SigningKey::generate(&mut rng);
+
+            let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+            let owner_id = id(&owner_sk);
+            let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+            let members = MembersV1 {
+                members: vec![
+                    authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                    authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                    authorized_member(&owner_sk, &nameless_sk.verifying_key()),
+                ],
+            };
+            // `nameless` deliberately has NO member_info record, so both render
+            // surfaces fall back to `UNKNOWN_MEMBER` for them.
+            let member_info = MemberInfoV1 {
+                member_info: vec![
+                    signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                    signed_member_info(&mod_sk, spelled, vec![]),
+                    signed_member_info(&viewer_sk, "Viewer", vec![]),
+                ],
+            };
+            let badges = deputy_badges_for_viewer(
+                &members,
+                &member_info,
+                &secrets,
+                owner_id,
+                id(&viewer_sk),
+            );
+            assert!(badges.contains_key(&id(&mod_sk)), "precondition: badged");
+
+            let checker =
+                impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+            assert_eq!(
+                impersonation_warning_for_display(
+                    &checker,
+                    id(&nameless_sk),
+                    crate::util::display_name::UNKNOWN_MEMBER,
+                    None,
+                ),
+                None,
+                "a deputy whose record says `{spelled}` accused every member \
+                 waiting for their member_info to sync"
+            );
+        }
+    }
+
+    /// **The motivating attack.** `Ιan Clarke` with a Greek capital iota
+    /// (U+0399) renders identically to the moderator's `Ian Clarke` and walks
+    /// past every character-blocking rule River has: U+0399 is a letter, and
+    /// rejecting it would break real Greek names.
+    #[test]
+    fn a_greek_homoglyph_of_a_deputys_name_is_flagged() {
+        let homoglyph = "\u{0399}an Clarke";
+        assert_ne!(homoglyph, "Ian Clarke", "precondition: different bytes");
+        assert!(
+            !crate::util::display_name::contains_hidden_chars(homoglyph),
+            "precondition: the existing invisible-character defence does NOT \
+             catch this, which is why the confusable check exists"
+        );
+
+        let (checker, _owner, mod_id, stranger) = impersonation_fixture(homoglyph);
+        let warning = impersonation_warning_for_display(&checker, stranger, homoglyph, None)
+            .expect("a Greek-iota homoglyph of a moderator's name must be flagged");
+
+        assert_eq!(warning.tier, ConfusableTier::Identical);
+        assert_eq!(warning.impersonated.role, ProtectedRole::Deputy);
+        assert_eq!(warning.impersonated.display_name, "Ian Clarke");
+        // The identified victim is on the WARNING, for a surface that can render
+        // it as its own DOM node. It is deliberately NOT in the flat tooltip —
+        // see `ImpersonationWarning::tooltip`, which names the role instead.
+        assert!(
+            !warning.tooltip().contains("Ian Clarke"),
+            "no nickname may reach the flat tooltip: {}",
+            warning.tooltip()
+        );
+        assert!(warning.tooltip().contains("is NOT a moderator"));
+
+        // ...and the real moderator, under the real name, is untouched.
+        assert_eq!(
+            impersonation_warning_for_display(&checker, mod_id, "Ian Clarke", None),
+            None
+        );
+    }
+
+    /// Requirement one: identity beats name. The genuine article is resolved by
+    /// `MemberId`, which is derived from a keypair and cannot be chosen, so no
+    /// nickname can make a real moderator or the owner look like an impostor.
+    #[test]
+    fn the_genuine_owner_and_deputy_are_never_flagged() {
+        let (checker, owner_id, mod_id, stranger) = impersonation_fixture("Bystander");
+
+        // Each under their own name.
+        assert_eq!(
+            impersonation_warning_for_display(&checker, mod_id, "Ian Clarke", None),
+            None,
+            "the real moderator must never be flagged for their own name"
+        );
+        assert_eq!(
+            impersonation_warning_for_display(&checker, owner_id, "Room Owner", None),
+            None,
+            "the owner must never be flagged for their own name"
+        );
+
+        // Including under FOLDED variants of their own name — the exemption is
+        // per-identity, not per-literal-string.
+        for name in ["\u{0399}an Clarke", "lan Clarke", "IAN CLARKE"] {
+            assert_eq!(
+                impersonation_warning_for_display(&checker, mod_id, name, None),
+                None,
+                "the real moderator was flagged for a variant of their OWN name: {name:?}"
+            );
+        }
+        assert_eq!(
+            impersonation_warning_for_display(&checker, owner_id, "R00m 0wner", None),
+            None
+        );
+
+        // **The invariant is narrow, and deliberately so.** Taking a name that
+        // is NOT yours is flagged even when you hold privilege: the exemption
+        // is keyed on the member a protected name was TAKEN FROM, not on a
+        // room-wide "privileged" set. The broad version was attacker-extendable
+        // — a strict ancestor of the viewer can deputise a sockpuppet, which
+        // put the sockpuppet in that set and let it wear `"Ian Clarke"` with a
+        // genuine shield and no warning.
+        assert!(
+            impersonation_warning_for_display(&checker, owner_id, "Ian Clarke", None).is_some(),
+            "the owner renaming themselves after a moderator IS impersonating \
+             that moderator, and must be flagged"
+        );
+
+        // The exemption is identity-scoped, not name-scoped: the SAME names on
+        // an unprivileged member are flagged. Without this half the test above
+        // would pass against a checker that never flags anything.
+        assert!(
+            impersonation_warning_for_display(&checker, stranger, "\u{0399}an Clarke", None)
+                .is_some(),
+            "an unprivileged member using the moderator's name must be flagged"
+        );
+        assert!(
+            impersonation_warning_for_display(&checker, stranger, "R00m 0wner", None).is_some(),
+            "an unprivileged member using the owner's name must be flagged"
+        );
+    }
+
+    /// The other half of the bargain: ordinary members must not be accused.
+    #[test]
+    fn plainly_different_names_are_not_flagged() {
+        let (checker, _owner, _mod, stranger) = impersonation_fixture("Bystander");
+        for name in [
+            "Bystander",
+            "Alice",
+            "HostFat",
+            "Clark Kent",
+            "Linus Clarke",
+            "Ian Clarke's Dad",
+            "zorolin",
+            "Bob Smith",
+        ] {
+            assert_eq!(
+                impersonation_warning_for_display(&checker, stranger, name, None),
+                None,
+                "{name:?} is an ordinary name and must not be accused"
+            );
+        }
+    }
+
+    /// A confusable check that flags real people's names is worse than the
+    /// problem it solves — and it would land hardest on the users least able to
+    /// argue with it. Same guard `display_name::real_names_in_other_scripts_are_untouched`
+    /// provides for sanitisation, applied to the rendered warning.
+    #[test]
+    fn legitimate_non_latin_names_are_not_flagged() {
+        let (checker, _owner, _mod, stranger) = impersonation_fixture("Bystander");
+        for name in [
+            "Иван Петров",          // Russian
+            "Ольга Иванова",        // Russian
+            "Γιώργος Παπαδόπουλος", // Greek
+            "Νίκος Παπαδόπουλος",   // Greek
+            "さくら 田中",          // Japanese
+            "山田\u{3000}太郎",     // Japanese, ideographic space
+            "李小龍",               // Chinese
+            "김민준",               // Korean
+            "محمد عبد الله",        // Arabic
+            "علی\u{200C}رضا",       // Persian, ZWNJ as orthography
+            "דָּוִד",                  // Hebrew with niqqud
+            "अमिताभ बच्चन",          // Devanagari
+            "Nguyễn Thị Hương",     // Vietnamese
+            "François Müller",      // accented Latin
+        ] {
+            assert_eq!(
+                impersonation_warning_for_display(&checker, stranger, name, None),
+                None,
+                "a legitimate name was accused of impersonation: {name:?}"
+            );
+        }
+    }
+
+    /// **The tier decision.** The engine reports near-misses; this UI does not
+    /// render them. Asserting the engine still FINDS the near-miss is the point
+    /// — otherwise this passes for the wrong reason (an engine that stopped
+    /// detecting it) and the tier rule would be untested.
+    #[test]
+    fn near_miss_is_never_rendered() {
+        let (checker, _owner, _mod, stranger) = impersonation_fixture("Bystander");
+
+        for (name, why) in [
+            ("Ian Clark", "one character short"),
+            ("Ian Clrake", "transposition"),
+            ("Ian Clarkee", "one character long"),
+        ] {
+            // The engine finds it...
+            let raw = checker
+                .check(stranger, name)
+                .unwrap_or_else(|| panic!("engine should still detect {name:?} ({why})"));
+            assert_eq!(
+                raw.tier,
+                ConfusableTier::NearMiss,
+                "{name:?} should be a near-miss, not an identical skeleton"
+            );
+            // ...and the render boundary drops it.
+            assert_eq!(
+                impersonation_warning_for_display(&checker, stranger, name, None),
+                None,
+                "{name:?} ({why}) is a near-miss and must not render a badge"
+            );
+        }
+    }
+
+    /// The protected set is DERIVED from room state, so it tracks a deputize and
+    /// a revoke with no hand-maintained list anywhere.
+    #[test]
+    fn the_protected_set_follows_deputize_and_revoke() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let impostor_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &impostor_sk.verifying_key()),
+            ],
+        };
+
+        // The one thing that varies between the two states: whether the owner's
+        // signed `deputies` list names the moderator.
+        let build = |deputies: Vec<MemberId>| {
+            let member_info = MemberInfoV1 {
+                member_info: vec![
+                    signed_member_info(&owner_sk, "Room Owner", deputies),
+                    signed_member_info(&mod_sk, "Ian Clarke", vec![]),
+                    signed_member_info(&viewer_sk, "Viewer", vec![]),
+                    signed_member_info(&impostor_sk, "\u{0399}an Clarke", vec![]),
+                ],
+            };
+            let badges = deputy_badges_for_viewer(
+                &members,
+                &member_info,
+                &secrets,
+                owner_id,
+                id(&viewer_sk),
+            );
+            impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges)
+        };
+
+        // Deputised: the moderator's name is protected, so the homoglyph warns.
+        let deputised = build(vec![id(&mod_sk)]);
+        assert!(
+            impersonation_warning_for_display(
+                &deputised,
+                id(&impostor_sk),
+                "\u{0399}an Clarke",
+                None
+            )
+            .is_some(),
+            "while the moderator is deputised their name must be protected"
+        );
+
+        // Revoked: the same room, the same nicknames, the same impostor — and
+        // no warning, because `Ian Clarke` is now an ordinary member's name.
+        let revoked = build(vec![]);
+        assert_eq!(
+            impersonation_warning_for_display(
+                &revoked,
+                id(&impostor_sk),
+                "\u{0399}an Clarke",
+                None
+            ),
+            None,
+            "after the deputy grant is revoked the name is no longer protected"
+        );
+
+        // The owner is protected in BOTH states — the owner's protection comes
+        // from being the owner, not from any deputy grant.
+        for (label, checker) in [("deputised", &deputised), ("revoked", &revoked)] {
+            assert!(
+                impersonation_warning_for_display(checker, id(&impostor_sk), "R00m 0wner", None)
+                    .is_some(),
+                "the owner must stay protected in the {label} state"
+            );
+        }
+    }
+
+    /// A member who never typed a nickname wears a handle River derived from
+    /// their key. Two members can be assigned the same one — with ~120 members
+    /// in a room, more likely than not — and that collision is River's doing,
+    /// not an imitation either of them performed. Protecting an unclaimed name
+    /// would turn it into an accusation.
+    #[test]
+    fn a_deputys_generated_handle_is_not_protected() {
+        // A real assignable handle, so this cannot pass because the string
+        // happens not to match.
+        let handle = format!(
+            "{} {}",
+            crate::nickname::FIRST_NAMES[0],
+            crate::nickname::LAST_NAMES[0]
+        );
+        assert!(
+            crate::nickname::is_generated_handle(&handle),
+            "precondition: {handle:?} must be a handle River can assign"
+        );
+
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let twin_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &twin_sk.verifying_key()),
+            ],
+        };
+        // The moderator never chose a nickname; an unrelated member drew the
+        // same handle.
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                signed_member_info(&mod_sk, &handle, vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&twin_sk, &handle, vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        assert!(
+            badges.contains_key(&id(&mod_sk)),
+            "precondition: the moderator still carries a shield"
+        );
+
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+        assert_eq!(
+            impersonation_warning_for_display(&checker, id(&twin_sk), &handle, None),
+            None,
+            "an assigned handle is not a claimed identity; colliding with one \
+             must not put an impersonation badge on a member who did nothing"
+        );
+
+        // But the identity exemption is still wider than the protected set: the
+        // owner's CHOSEN name stays protected in the same room, so this test
+        // cannot pass by producing an empty checker.
+        assert!(
+            impersonation_warning_for_display(&checker, id(&twin_sk), "R00m 0wner", None).is_some(),
+            "the owner's chosen name must still be protected"
+        );
+    }
+
+    /// A member with no `member_info` record renders as `"Unknown"`, and so does
+    /// every other member without one. Protecting that string would flag all of
+    /// them for impersonating each other.
+    #[test]
+    fn a_privileged_member_without_member_info_is_not_protected() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let nameless_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &nameless_sk.verifying_key()),
+            ],
+        };
+        // The moderator is deputised but has NO member_info record at all.
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+
+        // `"Unknown"` is what the member list renders for a member with no
+        // record; it must not be a protected name.
+        assert_eq!(
+            impersonation_warning_for_display(&checker, id(&nameless_sk), "Unknown", None),
+            None,
+            "`Unknown` is the placeholder for EVERY record-less member, so \
+             protecting it would accuse all of them"
+        );
+        // The owner's real name is still protected.
+        assert!(
+            impersonation_warning_for_display(&checker, id(&nameless_sk), "R00m 0wner", None)
+                .is_some()
+        );
+    }
+
+    /// A shielded deputy with a name of their own shows no ⚠, and two
+    /// owner-appointed deputies whose names COLLIDE both do.
+    ///
+    /// **This used to claim the two badges are mutually exclusive, which is no
+    /// longer true and should not be restored.** That held only because a
+    /// privileged member was exempt from every protected name — the broad rule
+    /// an attacker extended by deputising a sockpuppet. With the exemption
+    /// keyed per-name, two genuine deputies with confusable names warn about
+    /// each other, which is the honest answer: the owner appointed two people a
+    /// reader cannot tell apart, and surfacing that is the feature working.
+    #[test]
+    fn a_deputy_shows_no_warning_unless_a_protected_name_collides() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_a_sk = SigningKey::generate(&mut rng);
+        let mod_b_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_a_sk.verifying_key()),
+                authorized_member(&owner_sk, &mod_b_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+            ],
+        };
+        // Case 1: two owner-appointed deputies with DISTINCT names. Neither
+        // shows a warning — the common case, and the one that matters for not
+        // badging the people the shield is meant to vouch for.
+        let distinct = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_a_sk), id(&mod_b_sk)]),
+                signed_member_info(&mod_a_sk, "Ian Clarke", vec![]),
+                signed_member_info(&mod_b_sk, "Nacho Duart", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &distinct, &secrets, owner_id, id(&viewer_sk));
+        let checker = impersonation_checker_for_viewer(&distinct, &secrets, owner_id, &badges);
+        for (sk, name) in [(&mod_a_sk, "Ian Clarke"), (&mod_b_sk, "Nacho Duart")] {
+            assert!(
+                badges.contains_key(&id(sk)),
+                "precondition: {name:?} carries a shield"
+            );
+            assert_eq!(
+                impersonation_warning_for_display(&checker, id(sk), name, None),
+                None,
+                "a shielded deputy with a name of their own must show no warning"
+            );
+        }
+
+        // Case 2: two owner-appointed deputies whose names COLLIDE. Both are
+        // flagged, each naming the other — the exemption covers only your own
+        // identity.
+        let colliding = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_a_sk), id(&mod_b_sk)]),
+                signed_member_info(&mod_a_sk, "Ian Clarke", vec![]),
+                signed_member_info(&mod_b_sk, "\u{0399}an Clarke", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &colliding, &secrets, owner_id, id(&viewer_sk));
+        let checker = impersonation_checker_for_viewer(&colliding, &secrets, owner_id, &badges);
+        for (sk, name) in [(&mod_a_sk, "Ian Clarke"), (&mod_b_sk, "\u{0399}an Clarke")] {
+            assert!(
+                impersonation_warning_for_display(&checker, id(sk), name, None).is_some(),
+                "two deputies a reader cannot tell apart must BOTH be flagged; \
+                 exempting them is the broad rule an attacker extended"
+            );
+        }
+    }
+
+    /// **A shield and a warning CAN both render**, and the tooltip must not
+    /// then assert something false.
+    ///
+    /// Three comments in this codebase used to claim the two badges were
+    /// mutually exclusive, citing a pin test that was never written; one of
+    /// them went on to describe the pair as "a single badge position in
+    /// practice", which invites a refactor that collapses the slots. Case 2 of
+    /// `a_deputy_shows_no_warning_unless_a_protected_name_collides` disproves
+    /// the claim, so this is the pin the comments should always have had.
+    #[test]
+    fn a_shield_and_a_warning_can_both_render() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_a_sk = SigningKey::generate(&mut rng);
+        let mod_b_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_a_sk.verifying_key()),
+                authorized_member(&owner_sk, &mod_b_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+            ],
+        };
+        // Two deputies a reader cannot tell apart, plus an OWNER whose name
+        // collides with them — the second reachable case, and the one where the
+        // old tooltip told the room owner they were not a moderator.
+        let colliding = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "lan Clarke", vec![id(&mod_a_sk), id(&mod_b_sk)]),
+                signed_member_info(&mod_a_sk, "Ian Clarke", vec![]),
+                signed_member_info(&mod_b_sk, "\u{0399}an Clarke", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &colliding, &secrets, owner_id, id(&viewer_sk));
+        let checker = impersonation_checker_for_viewer(&colliding, &secrets, owner_id, &badges);
+
+        for (member, name) in [
+            (id(&mod_a_sk), "Ian Clarke"),
+            (id(&mod_b_sk), "\u{0399}an Clarke"),
+            (owner_id, "lan Clarke"),
+        ] {
+            let privilege = privilege_in_view(member, owner_id, &badges);
+            assert!(
+                privilege.is_some(),
+                "precondition: {name:?} holds privilege, so a badge renders"
+            );
+            let warning = impersonation_warning_for_display(&checker, member, name, privilege)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name:?} shares a skeleton with another protected name, so it is flagged"
+                    )
+                });
+            assert_eq!(warning.flagged_privilege, privilege);
+
+            // The badge is NOT suppressed — suppression is the immunity a
+            // deputised sockpuppet wants — but the sentence is true of a
+            // member who does hold a grant.
+            let tip = warning.tooltip();
+            assert!(
+                !tip.contains("is NOT"),
+                "a privileged member was told they are not privileged: {tip}"
+            );
+            assert!(tip.contains("Name conflict"), "{tip}");
+        }
+
+        // ...and an ordinary member colliding with the same names still gets
+        // the accusing wording, so the rewrite is scoped, not blanket.
+        let stranger = MemberId::from(&SigningKey::generate(&mut rng).verifying_key());
+        let tip = impersonation_warning_for_display(&checker, stranger, "Ian Clarke", None)
+            .expect("an unprivileged impostor is still flagged")
+            .tooltip();
+        assert!(tip.contains("is NOT"), "{tip}");
+    }
+
+    /// The protected set is built from a `HashMap`, so its iteration order is
+    /// per-process random. Two protected members CAN share a skeleton (a
+    /// sockpuppet deputised under a real moderator's name), and without the sort
+    /// in `impersonation_checker_for_viewer` the tooltip would name a different
+    /// victim between renders of the same room.
+    #[test]
+    fn the_named_victim_is_stable_across_rebuilds() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_a_sk = SigningKey::generate(&mut rng);
+        let mod_b_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let impostor_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_a_sk.verifying_key()),
+                authorized_member(&owner_sk, &mod_b_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &impostor_sk.verifying_key()),
+            ],
+        };
+        // Two deputies whose names fold to the SAME skeleton.
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_a_sk), id(&mod_b_sk)]),
+                signed_member_info(&mod_a_sk, "Ian Clarke", vec![]),
+                signed_member_info(&mod_b_sk, "lan Clarke", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&impostor_sk, "1an Clarke", vec![]),
+            ],
+        };
+
+        let named = || {
+            let badges = deputy_badges_for_viewer(
+                &members,
+                &member_info,
+                &secrets,
+                owner_id,
+                id(&viewer_sk),
+            );
+            let checker =
+                impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+            impersonation_warning_for_display(&checker, id(&impostor_sk), "1an Clarke", None)
+                .expect("the impostor is flagged")
+                .impersonated
+                .display_name
+        };
+
+        let first = named();
+        for _ in 0..24 {
+            assert_eq!(
+                named(),
+                first,
+                "the tooltip named a different victim on a rebuild of the same \
+                 room state; the protected set is not deterministically ordered"
+            );
+        }
+    }
+
+    /// The member row renders the warning as its own tag, FIRST, carrying the
+    /// unforgeable glyph and the full tooltip.
+    #[test]
+    fn the_member_row_renders_the_warning_first() {
+        let mut display = make_member_display("\u{0399}an Clarke");
+        // A member wearing several relationship tags, so "first" is a real
+        // assertion rather than the only possibility.
+        display.is_self = true;
+        display.invited_by_you = true;
+        display.impersonation = Some(ImpersonationWarning {
+            impersonated: ProtectedName::new(
+                ProtectedRole::Deputy,
+                "Ian Clarke",
+                MemberId(freenet_scaffold::util::FastHash(1)),
+            ),
+            tier: ConfusableTier::Identical,
+            flagged_privilege: None,
+        });
+
+        let parts = member_display_parts(&display);
+        let first = parts.tags.first().expect("at least one tag");
+        let (glyph, tooltip) = (&first.glyph, &first.tooltip);
+        assert_eq!(
+            *glyph,
+            crate::util::confusable::WARNING_GLYPH,
+            "the impersonation warning must be the FIRST tag, next to the name; \
+             tags were {:?}",
+            parts.tags.iter().map(|t| t.glyph).collect::<Vec<_>>()
+        );
+        assert!(tooltip.contains("is NOT a moderator"), "{tooltip}");
+        // The row's tooltip is flat hover text, so it must carry no nickname —
+        // the member row is one of the surfaces that cannot render separate
+        // nodes for it.
+        assert!(!tooltip.contains("Ian Clarke"), "{tooltip}");
+        // The relationship tags are still rendered, after it.
+        assert!(parts.tags.len() > 1);
+
+        // And no warning ⇒ no tag.
+        display.impersonation = None;
+        assert!(!member_display_parts(&display)
+            .tags
+            .iter()
+            .any(|t| t.glyph == crate::util::confusable::WARNING_GLYPH));
+    }
+
+    /// **The residual #488 knowingly left open, and this warning is its only
+    /// mitigation.**
+    ///
+    /// An Ideographic Variation Selector is legitimate orthography — `辻` has
+    /// the registered variant `辻\u{E0100}` — so #488 deliberately KEEPS one
+    /// after an ideograph rather than stripping it. The cost is that
+    /// `"李\u{E0100}小龍"` and `"李小龍"` render identically on any font without
+    /// an IVD entry for the sequence, which is a clone of another member's
+    /// rendered name that `sanitize_display_name` will not remove.
+    ///
+    /// The layering is what closes it. `is_display_hidden` keeps the selectors
+    /// INSIDE its plane-14 range and the in-context exception is applied ON TOP
+    /// by `sanitize_display_name` / `contains_hidden_chars`, so
+    /// `confusable::skeleton` — which calls `is_display_hidden` DIRECTLY — still
+    /// folds the two names together and this warning fires.
+    ///
+    /// That makes the dependency mutual and easy to break from either side:
+    /// moving the carve-out INTO `is_display_hidden` (punching a hole in the
+    /// range instead of layering over it) would silently switch this warning
+    /// off and leave the residual undetectable. #488 documents that at the call
+    /// site; this test is the CI gate on our side of it.
+    #[test]
+    fn an_ideographic_variation_selector_clone_is_flagged() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        const IVS: char = '\u{E0100}';
+        let real = "李小龍";
+        let clone = format!("李{IVS}小龍");
+
+        // Preconditions, and the reason this test has to exist.
+        //
+        // 1. The IVS SURVIVES sanitisation, so the two members really do render
+        //    a pixel-identical name — the existing invisible-character defence
+        //    does not catch this one, by design.
+        assert_eq!(
+            crate::util::display_name::sanitize_display_name(&clone),
+            clone,
+            "#488 keeps an IVS after an ideograph; if that changed, this \
+             residual is closed elsewhere and this test should be revisited"
+        );
+        assert!(
+            !crate::util::display_name::contains_hidden_chars(&clone),
+            "the nickname input accepts it too — the residual is real"
+        );
+        assert_ne!(clone, real, "different strings, identical rendering");
+
+        // 2. But `skeleton` folds them together, because it consults
+        //    `is_display_hidden` directly and the selectors are still inside
+        //    its plane-14 range.
+        assert_eq!(
+            crate::util::confusable::skeleton(&clone),
+            crate::util::confusable::skeleton(real),
+            "the confusable fold must see through an IVS, or the warning \
+             cannot fire on this residual"
+        );
+
+        // End to end, through the real protected-set derivation.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let impostor_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &impostor_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                signed_member_info(&mod_sk, real, vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&impostor_sk, &clone, vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        assert!(
+            badges.contains_key(&id(&mod_sk)),
+            "precondition: the CJK-named moderator carries a shield"
+        );
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+
+        let warning = impersonation_warning_for_display(&checker, id(&impostor_sk), &clone, None)
+            .expect("an IVS clone of a moderator's name must be flagged");
+        assert_eq!(
+            warning.tier,
+            ConfusableTier::Identical,
+            "an IVS clone renders as the SAME string, so it is a tier-1 match, \
+             not a near-miss (which this UI does not render)"
+        );
+        assert_eq!(warning.impersonated.display_name, real);
+
+        // And the real moderator is untouched, so the fold has not simply made
+        // everything match.
+        assert_eq!(
+            impersonation_warning_for_display(&checker, id(&mod_sk), real, None),
+            None
+        );
+        assert_eq!(
+            impersonation_warning_for_display(&checker, id(&viewer_sk), "Viewer", None),
+            None
+        );
+    }
+
+    /// **Wiring pin.** The warning only protects anyone if the surfaces actually
+    /// render it. Both go through `impersonation_warning_for_display`, and both
+    /// must build the checker OUTSIDE their per-member loop — rebuilding it per
+    /// member re-folds every protected name (and, in a private room, re-unseals
+    /// every protected nickname) once per row.
+    ///
+    /// Source-scrape, because these are Dioxus component trees with no headless
+    /// harness in this crate. Scans the WHOLE file rather than cutting at
+    /// `#[cfg(test)]`: `conversation.rs` has an earlier `#[cfg(test)]` block, so
+    /// a cut would silently skip the code this pins (the mistake
+    /// `display_name::nickname_render_paths_go_through_display_nickname`
+    /// documents).
+    #[test]
+    fn impersonation_warning_is_wired_into_both_render_surfaces() {
+        let members_src = include_str!("members.rs");
+        let conversation = include_str!("conversation.rs");
+
+        /// The source between two anchors, so a check is scoped to ONE
+        /// function rather than the whole file.
+        ///
+        /// The whole-file version of this test PASSED against a mutation that
+        /// deleted the `MemberList` call site, because `members.rs` also
+        /// contains the function's own DEFINITION and its tests. Scoping is
+        /// the entire point — do not widen these ranges.
+        /// Whitespace-insensitive form, so an argument-list pin survives
+        /// `cargo fmt` rewrapping a call across different line breaks while
+        /// still failing if an ARGUMENT changes.
+        fn squashed(src: &str) -> String {
+            src.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        fn between<'a>(src: &'a str, from: &str, to: &str, what: &str) -> &'a str {
+            let start = src
+                .find(from)
+                .unwrap_or_else(|| panic!("anchor {from:?} not found ({what})"));
+            let end = src[start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("anchor {to:?} not found after {from:?} ({what})"))
+                + start;
+            &src[start..end]
+        }
+
+        // --- Member list -------------------------------------------------
+        let member_memo = between(
+            members_src,
+            "pub fn MemberList()",
+            "let handle_member_click",
+            "MemberList memo",
+        );
+        assert!(
+            member_memo.contains("impersonation_warning_for_display("),
+            "MemberList no longer computes an impersonation warning, so the \
+             member list shows no warning however confusable a name is"
+        );
+        // **The ARGUMENTS, not just the call.** Swapping `member_id` for
+        // `self_member_id` here compiles and passes every behavioural test in
+        // this file, and puts ⚠ on the genuine owner and every genuine
+        // moderator — the worst mutation this feature has, and the one a
+        // bare `contains("impersonation_warning_for_display(")` cannot see.
+        assert!(
+            squashed(member_memo).contains(
+                "impersonation_warning_for_display( &impersonation, member_id, &nickname, \
+                 privilege_in_view(member_id, owner_id, &deputy_badges), )"
+            ),
+            "the member row no longer passes `member_id` (and that row's own \
+             privilege) to `impersonation_warning_for_display`. Passing any \
+             other id flags the genuine owner and every genuine moderator"
+        );
+        assert!(
+            member_memo.contains("impersonation_checker_for_viewer("),
+            "MemberList no longer builds an impersonation checker"
+        );
+        // Built ONCE, before the per-member loop — not per row, which would
+        // re-fold every protected name (and re-unseal every protected
+        // nickname in a private room) for each member.
+        assert!(
+            between(
+                member_memo,
+                "pub fn MemberList()",
+                "for &member_id in &ordered_ids",
+                "MemberList per-member loop",
+            )
+            .contains("impersonation_checker_for_viewer("),
+            "MemberList must build the impersonation checker BEFORE the \
+             per-member loop, not inside it"
+        );
+        // ...and the row must actually RENDER it. A warning computed but not
+        // rendered protects nobody.
+        assert!(
+            between(
+                members_src,
+                "fn member_display_parts(",
+                "\n/// Order member IDs",
+                "member_display_parts",
+            )
+            .contains("WARNING_GLYPH"),
+            "the member row no longer renders the warning glyph"
+        );
+        // ...and it must stay ADDRESSABLE. Without a test id the only handle a
+        // browser spec has on this badge is glyph-matching ⚠ inside
+        // `member-item-{id}`, which rots the moment the row gains any other
+        // symbol. Mirrors the conversation side's
+        // `message-author-impersonation-warning`, asserted below.
+        assert!(
+            between(
+                members_src,
+                "fn member_display_parts(",
+                "\n/// Order member IDs",
+                "member_display_parts",
+            )
+            .contains("\"member-list-impersonation-warning\""),
+            "the member-list warning lost its `data-testid`, so a Playwright \
+             spec can only reach it by glyph-matching. The id must be on the \
+             WARNING tag specifically — on the wrong badge it is worse than \
+             none, because the spec then passes against the shield"
+        );
+        assert!(
+            between(
+                members_src,
+                "pub fn MemberList()",
+                "// Action buttons",
+                "MemberList render",
+            )
+            .contains("\"data-testid\": \"{tag.test_id}\""),
+            "the member row no longer emits each tag's `data-testid`"
+        );
+
+        // --- Message author line ------------------------------------------
+        let group_fn = between(
+            conversation,
+            "fn group_messages(",
+            "\n/// Format an event summary",
+            "group_messages",
+        );
+        assert!(
+            group_fn.contains("impersonation_warning_for_display("),
+            "`group_messages` no longer computes an impersonation warning, so \
+             message author lines show no warning"
+        );
+        // Same mutation, same blast radius: `author_id` -> `self_member_id`
+        // compiles, passes, and brands the real owner and every real
+        // moderator across the whole conversation.
+        assert!(
+            squashed(group_fn).contains(
+                "impersonation_warning_for_display( impersonation, author_id, &author_name, \
+                 privilege_in_view(author_id, owner_id, deputy_badges), )"
+            ),
+            "the author line no longer passes `author_id` (and that author's \
+             own privilege) to `impersonation_warning_for_display`"
+        );
+        assert!(
+            !group_fn.contains("impersonation_checker_for_viewer("),
+            "`group_messages` builds the checker itself; it must receive one \
+             built once per render, or the protected set is refolded for \
+             every message"
+        );
+        assert!(
+            conversation.contains("impersonation_checker_for_viewer("),
+            "the conversation no longer builds an impersonation checker"
+        );
+        // The rendered element, anchored on its test id.
+        assert!(
+            conversation.contains("\"data-testid\": \"message-author-impersonation-warning\""),
+            "the message author line no longer renders the warning element"
+        );
+        assert!(
+            between(
+                conversation,
+                "\"data-testid\": \"message-author-impersonation-warning\"",
+                "// Deputy shield.",
+                "author-line warning element",
+            )
+            .contains("WARNING_GLYPH"),
+            "the author-line warning element no longer renders the warning glyph"
+        );
     }
 }

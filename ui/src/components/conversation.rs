@@ -7,8 +7,12 @@ use crate::components::app::{
     MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
     ROOMS,
 };
-use crate::components::members::{deputy_badges_for_viewer, DeputyBadge};
+use crate::components::members::{
+    deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
+    privilege_in_view, DeputyBadge,
+};
 use crate::room_data::{NotificationMode, SendMessageError};
+use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
 use crate::util::display_name::{display_nickname, sanitize_display_name};
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use crate::util::{
@@ -84,6 +88,20 @@ struct MessageGroup {
     /// See [`DeputyBadge`] for the predicate and why visibility and the
     /// "can ban you" wording are separate questions.
     author_badge: Option<DeputyBadge>,
+    /// The ⚠ impersonation warning for this author, or `None`. Same value, and
+    /// therefore the same tier rule and tooltip, the member-list row shows —
+    /// both go through
+    /// [`crate::components::members::impersonation_warning_for_display`].
+    ///
+    /// **NOT mutually exclusive with `author_badge`.** A deputy IS warned about
+    /// when their name collides with another protected name — two deputies
+    /// sharing a name each render 🛡 *and* ⚠ — so both slots can be occupied at
+    /// once and the layout must handle it. The warning renders FIRST, and its
+    /// tooltip switches wording when the flagged member holds privilege (see
+    /// [`ImpersonationWarning::flagged_privilege`]) rather than being
+    /// suppressed: suppression is what a deputised sockpuppet wants.
+    /// `a_shield_and_a_warning_can_both_render` pins the co-occurrence.
+    author_impersonation: Option<ImpersonationWarning>,
     is_self: bool,
     first_time: DateTime<Utc>,
     /// True if any message in this group had a future timestamp that was clamped
@@ -419,7 +437,7 @@ fn resolve_member_nickname(
     member_info
         .canonical(member_id)
         .map(|ami| display_nickname(&ami.member_info.preferred_nickname, secrets))
-        .unwrap_or_else(|| "Unknown".to_string())
+        .unwrap_or_else(|| crate::util::display_name::UNKNOWN_MEMBER.to_string())
 }
 
 /// Group consecutive messages from the same sender within 5 minutes,
@@ -433,6 +451,13 @@ fn group_messages(
     // Which members show a 🛡 shield in THIS viewer's conversation, built once
     // per render by `deputy_badges_for_viewer`. Absent ⇒ no shield.
     deputy_badges: &HashMap<MemberId, DeputyBadge>,
+    // The ⚠ impersonation checker for this viewer, built once per render by
+    // `impersonation_checker_for_viewer` — passed in rather than built here so
+    // the protected set is folded once, not once per call.
+    impersonation: &ImpersonationChecker,
+    // The room owner, so an author line can tell whether the member it is
+    // flagging holds privilege themselves — see `privilege_in_view`.
+    owner_id: MemberId,
 ) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
@@ -544,10 +569,26 @@ fn group_messages(
                 group.messages.push(grouped_message);
             }
         } else {
+            // Once per GROUP, not once per message: consecutive messages from
+            // one author share a header, so the warning is a property of the
+            // group.
+            //
+            // `author_id` is the id of the member whose NAME is on this line.
+            // Passing `self_member_id` compiles and passes every behavioural
+            // test while putting ⚠ on the genuine owner and every genuine
+            // moderator; the argument is pinned by
+            // `impersonation_warning_is_wired_into_both_render_surfaces`.
+            let author_impersonation = impersonation_warning_for_display(
+                impersonation,
+                author_id,
+                &author_name,
+                privilege_in_view(author_id, owner_id, deputy_badges),
+            );
             items.push(DisplayItem::Messages(MessageGroup {
                 author_id,
                 author_name,
                 author_badge: deputy_badges.get(&author_id).cloned(),
+                author_impersonation,
                 is_self,
                 first_time: message_time,
                 time_clamped,
@@ -1410,6 +1451,15 @@ pub fn Conversation() -> Element {
                         MemberId::from(&key),
                         self_member_id,
                     );
+                    // The ⚠ impersonation checker, from the SAME badge map, so
+                    // "who is a deputy" has one answer across the conversation
+                    // and the member list. Built once here, like the badges.
+                    let impersonation = impersonation_checker_for_viewer(
+                        &room_state.member_info,
+                        &room_data.secrets,
+                        MemberId::from(&key),
+                        &deputy_badges,
+                    );
                     let groups = group_messages(
                         &room_state.recent_messages,
                         &room_state.member_info,
@@ -1417,6 +1467,8 @@ pub fn Conversation() -> Element {
                         &room_data.secrets,
                         &member_names,
                         &deputy_badges,
+                        &impersonation,
+                        MemberId::from(&key),
                     );
                     return Some((groups, self_member_id, member_names));
                 }
@@ -2937,6 +2989,37 @@ fn MessageGroupComponent(
                                 });
                             },
                             "{group.author_name}"
+                        }
+                        // Impersonation warning. Sits immediately after the
+                        // name, before the shield slot. The two are NOT
+                        // mutually exclusive — two deputies whose names collide
+                        // each carry a shield AND a warning — so these really
+                        // are two badge positions and both can be filled at
+                        // once. Do not collapse them into one slot, and do not
+                        // suppress the warning when a shield is present: a
+                        // deputised sockpuppet carries a genuine shield, and
+                        // suppressing on it is the exact immunity
+                        // `a_deputised_sockpuppet_cannot_suppress_its_own_warning`
+                        // denies.
+                        //
+                        // The nickname above cannot forge this glyph: U+26A0 is
+                        // inside the range `display_name::is_display_hidden`
+                        // strips, so it can never survive into a rendered
+                        // nickname. `the_warning_glyph_cannot_appear_in_a_nickname`
+                        // pins that.
+                        if let Some(warning) = group.author_impersonation.as_ref() {
+                            {
+                                let tooltip = warning.tooltip();
+                                rsx! {
+                                    span {
+                                        "data-testid": "message-author-impersonation-warning",
+                                        class: "text-sm cursor-default",
+                                        title: "{tooltip}",
+                                        "aria-label": "{tooltip}",
+                                        {crate::util::confusable::WARNING_GLYPH}
+                                    }
+                                }
+                            }
                         }
                         // Deputy shield. Same glyph, same visibility rule and
                         // the same tooltip as the member-list row and the
