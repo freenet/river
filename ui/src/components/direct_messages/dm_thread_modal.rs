@@ -163,13 +163,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 .map(|info| {
                     (
                         info.member_info.member_id,
-                        match unseal_bytes_with_secrets(
+                        crate::util::display_name::display_nickname(
                             &info.member_info.preferred_nickname,
                             &room_data.secrets,
-                        ) {
-                            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                            Err(_) => info.member_info.preferred_nickname.to_string_lossy(),
-                        },
+                        ),
                     )
                 })
                 .collect::<std::collections::HashMap<_, _>>();

@@ -9,33 +9,12 @@ use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::deputy_button::DeputyButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
-use crate::util::ecies::unseal_bytes_with_secrets;
+use crate::components::members::viewer_can_ban;
+use crate::util::display_name::display_nickname;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::ChatRoomParametersV1;
-
-/// Whether `viewer` may ban `target` — the Ban-button gate (#410 / #411 round 4
-/// D). Uses [`MembersV1::is_ban_authorized`] (owner / invite-ancestor / deputy),
-/// NOT bare invite-chain ancestry, so a DEPUTY sees the Ban action for members in
-/// their deputizer's subtree. Bare downstream ancestry (`is_downstream`, still
-/// used for the "🔑 Invited by You" relationship tag) would have hidden it.
-fn viewer_can_ban(
-    members: &river_core::room_state::member::MembersV1,
-    member_info: &river_core::room_state::member_info::MemberInfoV1,
-    viewer: MemberId,
-    target: MemberId,
-    owner_id: MemberId,
-) -> bool {
-    let members_by_id = members.members_by_member_id();
-    river_core::room_state::member::MembersV1::is_ban_authorized(
-        viewer,
-        target,
-        &members_by_id,
-        member_info,
-        owner_id,
-    )
-}
 
 #[component]
 pub fn MemberInfoModal() -> Element {
@@ -197,13 +176,7 @@ pub fn MemberInfoModal() -> Element {
                 let nickname = member_info_v1
                     .canonical(inviter_id)
                     .map(|mi| {
-                        match unseal_bytes_with_secrets(
-                            &mi.member_info.preferred_nickname,
-                            &room_state.secrets,
-                        ) {
-                            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                            Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
-                        }
+                        display_nickname(&mi.member_info.preferred_nickname, &room_state.secrets)
                     })
                     .unwrap_or_else(|| "Unknown".to_string());
                 (nickname, Some(inviter_id))
@@ -274,13 +247,10 @@ pub fn MemberInfoModal() -> Element {
             .unwrap_or_default();
         let deputy_tooltip = format!("Deputy (appointed by {})", deputizer_names.join(", "));
         // Decrypted display nickname for the target (for the deputy action copy).
-        let target_nickname = match unseal_bytes_with_secrets(
+        let target_nickname = display_nickname(
             &member_info.member_info.preferred_nickname,
             &room_state.secrets,
-        ) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-            Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
-        };
+        );
 
         // Get the member ID string to display
         let member_id_str = member_id.to_string();

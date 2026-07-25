@@ -365,7 +365,15 @@ fn add_example_messages(
             .member_info
             .iter()
             .find(|m| m.member_info.member_id == target_author_id)
-            .map(|m| m.member_info.preferred_nickname.to_string_lossy())
+            .map(|m| {
+                // Example rooms are public, so the secret map is empty. Routed
+                // through the shared helper anyway so the render-path pin test
+                // has no exceptions to carve out.
+                crate::util::display_name::display_nickname(
+                    &m.member_info.preferred_nickname,
+                    &HashMap::new(),
+                )
+            })
             .unwrap_or_else(|| "someone".to_string());
         let target_preview = match &target.message.content {
             RoomMessageBody::Public { data, .. } => {
@@ -460,7 +468,15 @@ fn add_example_messages(
             .member_info
             .iter()
             .find(|m| m.member_info.member_id == target_author_id)
-            .map(|m| m.member_info.preferred_nickname.to_string_lossy())
+            .map(|m| {
+                // Example rooms are public, so the secret map is empty. Routed
+                // through the shared helper anyway so the render-path pin test
+                // has no exceptions to carve out.
+                crate::util::display_name::display_nickname(
+                    &m.member_info.preferred_nickname,
+                    &HashMap::new(),
+                )
+            })
             .unwrap_or_else(|| "someone".to_string());
         let target_preview = match &long_url_msg.message.content {
             RoomMessageBody::Public { data, .. } => {

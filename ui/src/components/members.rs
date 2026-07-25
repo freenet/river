@@ -2,6 +2,7 @@ use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatu
 use crate::components::app::{
     MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS, SYNC_STATUS,
 };
+use crate::util::display_name::display_nickname;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaArrowLeft, FaFileExport, FaUserPlus, FaUsers};
@@ -596,12 +597,7 @@ pub(crate) fn relevant_deputizer_names(
         }
         member_info
             .canonical(id)
-            .map(|mi| {
-                match unseal_bytes_with_secrets(&mi.member_info.preferred_nickname, room_secrets) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                    Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
-                }
-            })
+            .map(|mi| display_nickname(&mi.member_info.preferred_nickname, room_secrets))
             .unwrap_or_else(|| "Unknown".to_string())
     };
     relevant_deputizers(
@@ -611,6 +607,120 @@ pub(crate) fn relevant_deputizer_names(
     .into_iter()
     .map(name_of)
     .collect()
+}
+
+/// Whether `viewer` may ban `target` — the Ban-button gate (#410 / #411 round 4
+/// D). Uses [`MembersV1::is_ban_authorized`] (owner / invite-ancestor / deputy),
+/// NOT bare invite-chain ancestry, so a DEPUTY sees the Ban action for members in
+/// their deputizer's subtree. Bare downstream ancestry (`is_downstream`, still
+/// used for the "🔑 Invited by You" relationship tag) would have hidden it.
+pub(crate) fn viewer_can_ban(
+    members: &MembersV1,
+    member_info: &river_core::room_state::member_info::MemberInfoV1,
+    viewer: MemberId,
+    target: MemberId,
+    owner_id: MemberId,
+) -> bool {
+    let members_by_id = members.members_by_member_id();
+    MembersV1::is_ban_authorized(viewer, target, &members_by_id, member_info, owner_id)
+}
+
+/// The 🛡 shield one member shows in one viewer's view.
+///
+/// Ian's semantics for the shield (2026-07): *"a deputy shield indicates 'this
+/// user has been deputized WHICH ALLOWS THEM TO BAN ME', unless I'm also a
+/// deputy in which case they can't ban me but I can still see that they're a
+/// deputy."* So the shield is about the AUTHOR's authority over the VIEWER, and
+/// it must NOT disappear when the viewer happens to be immune.
+///
+/// Those two halves are deliberately separate fields:
+///
+/// * `deputized_by` decides **visibility** — non-empty means show the shield.
+///   It is the pre-existing viewer-relative predicate the member list and the
+///   member-info modal already use ([`relevant_deputizer_names`]), which never
+///   consults the viewer's own deputy status, so the "still shows when I'm
+///   immune" half holds by construction.
+/// * `can_ban_viewer` decides only the **tooltip wording**, and is the real
+///   contract-level answer from [`MembersV1::is_ban_authorized`] rather than an
+///   approximation of it. The two can legitimately disagree: a deputy the
+///   viewer appointed themselves shows the shield but cannot ban the viewer
+///   (the "cannot ban the member who deputized you" guardrail in
+///   `is_ban_authorized` step 4).
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct DeputyBadge {
+    /// Viewer-relevant appointer display names — `"room owner"`, `"you"`, or a
+    /// nickname. Never empty: an empty result means no badge at all, which is
+    /// represented by the member being absent from the map.
+    pub deputized_by: Vec<String>,
+    /// Whether this member may actually ban the viewer right now.
+    pub can_ban_viewer: bool,
+}
+
+impl DeputyBadge {
+    /// The `title=` text: who appointed them, and what that means for you.
+    pub fn tooltip(&self) -> String {
+        format!(
+            "Deputy (appointed by {}) — {} ban you",
+            self.deputized_by.join(", "),
+            if self.can_ban_viewer { "can" } else { "cannot" }
+        )
+    }
+}
+
+/// Every member who shows a 🛡 shield in `self_member_id`'s view, keyed by
+/// member id. Absent from the map ⇒ no shield.
+///
+/// Computed once per render rather than per message: the conversation asks this
+/// for every message author, and the underlying `deputizers_of` /
+/// `viewer_relevant` maps are O(members) to build.
+///
+/// Deliberately built from the SAME helpers as the member-list row and the
+/// member-info modal legend, so the shield cannot mean one thing in the
+/// conversation and another in the sidebar — the drift freenet/river#451 fixed
+/// between the row and the modal.
+pub(crate) fn deputy_badges_for_viewer(
+    members: &MembersV1,
+    member_info: &river_core::room_state::member_info::MemberInfoV1,
+    room_secrets: &HashMap<u32, [u8; 32]>,
+    owner_id: MemberId,
+    self_member_id: MemberId,
+) -> HashMap<MemberId, DeputyBadge> {
+    let deputizers_of = build_deputizers_of(member_info);
+    let viewer_relevant = viewer_relevant_deputizer_set(members, owner_id, self_member_id);
+    // `is_ban_authorized` needs this map; build it once for the whole sweep.
+    let members_by_id = members.members_by_member_id();
+
+    deputizers_of
+        .keys()
+        .filter_map(|&target| {
+            let deputized_by = relevant_deputizer_names(
+                member_info,
+                room_secrets,
+                &deputizers_of,
+                &viewer_relevant,
+                owner_id,
+                self_member_id,
+                target,
+            );
+            if deputized_by.is_empty() {
+                return None;
+            }
+            let can_ban_viewer = MembersV1::is_ban_authorized(
+                target,
+                self_member_id,
+                &members_by_id,
+                member_info,
+                owner_id,
+            );
+            Some((
+                target,
+                DeputyBadge {
+                    deputized_by,
+                    can_ban_viewer,
+                },
+            ))
+        })
+        .collect()
 }
 
 #[component]
@@ -662,15 +772,7 @@ pub fn MemberList() -> Element {
 
             let nickname = member_info
                 .canonical(member_id)
-                .map(|mi| {
-                    match unseal_bytes_with_secrets(
-                        &mi.member_info.preferred_nickname,
-                        room_secrets,
-                    ) {
-                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                        Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
-                    }
-                })
+                .map(|mi| display_nickname(&mi.member_info.preferred_nickname, room_secrets))
                 .unwrap_or_else(|| "Unknown".to_string());
 
             let member_display = MemberDisplay {
@@ -1782,6 +1884,40 @@ mod tests {
         AuthorizedMember::new(member, owner_sk)
     }
 
+    /// Like [`authorized_member`] but for a NON-owner inviter, so tests can
+    /// build an invite tree deeper than one level (the deputy badge is scoped
+    /// to invite subtrees, so depth is the whole point).
+    fn member_invited_by(
+        inviter_sk: &SigningKey,
+        owner_id: MemberId,
+        invitee_vk: &VerifyingKey,
+    ) -> AuthorizedMember {
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: MemberId::from(&inviter_sk.verifying_key()),
+            member_vk: *invitee_vk,
+        };
+        AuthorizedMember::new(member, inviter_sk)
+    }
+
+    /// A signed `member_info` record with a chosen nickname and deputy list.
+    fn signed_member_info(
+        sk: &SigningKey,
+        nickname: &str,
+        deputies: Vec<MemberId>,
+    ) -> river_core::room_state::member_info::AuthorizedMemberInfo {
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+        let mi = MemberInfo {
+            member_id: MemberId::from(&sk.verifying_key()),
+            version: 0,
+            preferred_nickname: river_core::room_state::privacy::SealedBytes::public(
+                nickname.as_bytes().to_vec(),
+            ),
+            deputies,
+        };
+        AuthorizedMemberInfo::new_with_member_key(mi, sk)
+    }
+
     /// An empty [`Rooms`](crate::room_data::Rooms) for the overwrite-import
     /// tests (`Rooms` derives no `Default`, so build it field-by-field —
     /// mirrors the `empty_rooms` helper in `chat_delegate.rs`).
@@ -2800,6 +2936,273 @@ mod tests {
             viewer_id,
         )
         .is_empty());
+    }
+
+    /// The conversation's 🛡 badge predicate, end to end.
+    ///
+    /// Ian's semantics: the shield means *"this user has been deputized, which
+    /// allows them to ban ME"*, and it stays visible even when the viewer
+    /// happens to be immune. One room exercises every case at once so the
+    /// cases cannot drift apart:
+    ///
+    /// ```text
+    /// owner ──┬── alpha ── viewer      alpha deputizes deputy_alpha
+    ///         ├── unrelated            unrelated deputizes deputy_unrelated
+    ///         ├── global_mod           owner deputizes global_mod
+    ///         ├── my_deputy            viewer deputizes my_deputy
+    ///         ├── deputy_alpha
+    ///         ├── deputy_unrelated
+    ///         └── plain
+    /// ```
+    #[test]
+    fn deputy_badge_is_viewer_relative_and_survives_viewer_immunity() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let alpha_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let unrelated_sk = SigningKey::generate(&mut rng);
+        let global_mod_sk = SigningKey::generate(&mut rng);
+        let deputy_alpha_sk = SigningKey::generate(&mut rng);
+        let deputy_unrelated_sk = SigningKey::generate(&mut rng);
+        let my_deputy_sk = SigningKey::generate(&mut rng);
+        let plain_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let viewer_id = id(&viewer_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &alpha_sk.verifying_key()),
+                authorized_member(&owner_sk, &unrelated_sk.verifying_key()),
+                authorized_member(&owner_sk, &global_mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &deputy_alpha_sk.verifying_key()),
+                authorized_member(&owner_sk, &deputy_unrelated_sk.verifying_key()),
+                authorized_member(&owner_sk, &my_deputy_sk.verifying_key()),
+                authorized_member(&owner_sk, &plain_sk.verifying_key()),
+                // The viewer sits INSIDE alpha's subtree, so alpha is a strict
+                // ancestor and alpha's deputies have authority over the viewer.
+                member_invited_by(&alpha_sk, owner_id, &viewer_sk.verifying_key()),
+            ],
+        };
+
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Owner", vec![id(&global_mod_sk)]),
+                signed_member_info(&alpha_sk, "Alpha", vec![id(&deputy_alpha_sk)]),
+                signed_member_info(&unrelated_sk, "Unrelated", vec![id(&deputy_unrelated_sk)]),
+                signed_member_info(&viewer_sk, "Viewer", vec![id(&my_deputy_sk)]),
+                signed_member_info(&global_mod_sk, "GlobalMod", vec![]),
+                signed_member_info(&deputy_alpha_sk, "DeputyAlpha", vec![]),
+                signed_member_info(&deputy_unrelated_sk, "DeputyUnrelated", vec![]),
+                signed_member_info(&my_deputy_sk, "MyDeputy", vec![]),
+                signed_member_info(&plain_sk, "Plain", vec![]),
+            ],
+        };
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, viewer_id);
+
+        // 1. Deputy of the room owner, viewer is an ordinary member → badge,
+        //    and they really can ban the viewer (owner-appointed global mod).
+        let global = badges
+            .get(&id(&global_mod_sk))
+            .expect("a deputy of the owner must show the shield to every viewer");
+        assert_eq!(global.deputized_by, vec!["room owner".to_string()]);
+        assert!(global.can_ban_viewer);
+        assert_eq!(
+            global.tooltip(),
+            "Deputy (appointed by room owner) — can ban you"
+        );
+
+        // 1b. Deputy of a strict ancestor of the viewer → badge, named after
+        //     the appointer, and they can ban the viewer (subtree authority).
+        let by_alpha = badges
+            .get(&id(&deputy_alpha_sk))
+            .expect("a deputy of the viewer's inviter must show the shield");
+        assert_eq!(by_alpha.deputized_by, vec!["Alpha".to_string()]);
+        assert!(by_alpha.can_ban_viewer);
+
+        // 2. Deputy of a member OUTSIDE the viewer's invite ancestry → NO
+        //    badge. Deputy authority is scoped to the deputizer's subtree, so
+        //    this member holds no authority that bears on the viewer, and
+        //    Ian's shield means "authority over me". They still show the
+        //    shield in THEIR OWN subtree's views.
+        assert!(
+            !badges.contains_key(&id(&deputy_unrelated_sk)),
+            "a deputy of an unrelated subtree must not show the shield here"
+        );
+
+        // 3. Viewer is immune (they appointed this deputy themselves, so
+        //    `is_ban_authorized` step 4 denies the ban) → the badge STILL
+        //    shows. This is the half Ian called out explicitly; only the
+        //    tooltip reflects the immunity.
+        let mine = badges
+            .get(&id(&my_deputy_sk))
+            .expect("a deputy the viewer appointed must still show the shield");
+        assert_eq!(mine.deputized_by, vec!["you".to_string()]);
+        assert!(
+            !mine.can_ban_viewer,
+            "a deputy cannot ban the member who deputized them"
+        );
+        assert_eq!(mine.tooltip(), "Deputy (appointed by you) — cannot ban you");
+
+        // 4. No deputy authority at all → no badge.
+        assert!(!badges.contains_key(&id(&plain_sk)));
+
+        // 5. The room OWNER gets no deputy shield. Their authority is
+        //    inherent, not delegated, so "Deputy (appointed by …)" would be a
+        //    lie; the member list already marks them with 👑.
+        assert!(
+            !badges.contains_key(&owner_id),
+            "the owner is not a deputy of anyone"
+        );
+
+        // The viewer themselves is not a deputy in this room.
+        assert!(!badges.contains_key(&viewer_id));
+    }
+
+    /// The other reading of "unless I'm also a deputy": the viewer holds
+    /// deputy authority of their own. The badge must not be suppressed — and,
+    /// pinned here because it is counter-intuitive, being a deputy does NOT
+    /// make the viewer immune. Two deputies of the same appointer can ban each
+    /// other, so the tooltip says "can ban you".
+    #[test]
+    fn deputy_viewer_still_sees_the_shield_on_a_fellow_deputy() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let other_mod_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let viewer_id = id(&viewer_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &other_mod_sk.verifying_key()),
+            ],
+        };
+        // The owner deputizes BOTH the viewer and the other moderator.
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Owner", vec![id(&viewer_sk), id(&other_mod_sk)]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&other_mod_sk, "OtherMod", vec![]),
+            ],
+        };
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, viewer_id);
+
+        let other = badges
+            .get(&id(&other_mod_sk))
+            .expect("a fellow deputy must still show the shield to a deputy viewer");
+        assert_eq!(other.deputized_by, vec!["room owner".to_string()]);
+        assert!(
+            other.can_ban_viewer,
+            "owner-appointed moderators have absolute authority, including \
+             over other moderators"
+        );
+    }
+
+    /// The room owner's OWN view. `viewer_relevant_deputizer_set` gives the
+    /// owner no strict ancestors, so only deputies the owner appointed are
+    /// relevant — which is every global moderator. Pinned because an
+    /// off-by-one here would blank the owner's whole moderator list.
+    #[test]
+    fn owner_sees_the_shield_on_their_own_appointees() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let other_sk = SigningKey::generate(&mut rng);
+        let their_deputy_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &other_sk.verifying_key()),
+                member_invited_by(&other_sk, owner_id, &their_deputy_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Owner", vec![id(&mod_sk)]),
+                signed_member_info(&other_sk, "Other", vec![id(&their_deputy_sk)]),
+                signed_member_info(&mod_sk, "Mod", vec![]),
+                signed_member_info(&their_deputy_sk, "TheirDeputy", vec![]),
+            ],
+        };
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let badges = deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, owner_id);
+
+        let m = badges
+            .get(&id(&mod_sk))
+            .expect("the owner must see the shield on their own appointee");
+        // `relevant_deputizer_names` resolves the owner id BEFORE the self id,
+        // so an owner viewing their own appointee reads "room owner", not
+        // "you". Pinned rather than "fixed": the label describes the role that
+        // granted the authority, and every other viewer sees the same word.
+        assert_eq!(m.deputized_by, vec!["room owner".to_string()]);
+        assert!(!m.can_ban_viewer, "the owner is never a valid ban target");
+        // Someone else's deputy is not relevant to the owner's view.
+        assert!(!badges.contains_key(&id(&their_deputy_sk)));
+    }
+
+    /// An emoji nickname must not be able to paint an appointer name that
+    /// looks like a second badge inside the tooltip.
+    #[test]
+    fn deputizer_names_are_sanitised() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let appointer_sk = SigningKey::generate(&mut rng);
+        let deputy_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &appointer_sk.verifying_key()),
+                authorized_member(&owner_sk, &deputy_sk.verifying_key()),
+                member_invited_by(&appointer_sk, owner_id, &viewer_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Owner", vec![]),
+                signed_member_info(&appointer_sk, "Eve 🛡👑", vec![id(&deputy_sk)]),
+                signed_member_info(&deputy_sk, "Deputy", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+            ],
+        };
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        let badge = badges.get(&id(&deputy_sk)).expect("shield expected");
+        assert_eq!(badge.deputized_by, vec!["Eve".to_string()]);
+        assert!(!badge.tooltip().contains('🛡'));
     }
 
     /// `build_deputizers_of` must order each deputy's appointers

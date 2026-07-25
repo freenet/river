@@ -664,10 +664,10 @@ pub fn notify_new_messages(
     let sender_name = member_info
         .canonical(msg.message.author)
         .map(|ami| {
-            match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, room_secrets) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
-            }
+            crate::util::display_name::display_nickname(
+                &ami.member_info.preferred_nickname,
+                room_secrets,
+            )
         })
         .unwrap_or_else(|| "Someone".to_string());
 

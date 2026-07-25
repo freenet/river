@@ -1,4 +1,5 @@
 use crate::components::app::{CREATE_ROOM_MODAL, CURRENT_ROOM, ROOMS};
+use crate::util::display_name::{contains_hidden_chars, EMOJI_REJECTION_MESSAGE};
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 
@@ -14,6 +15,10 @@ pub fn CreateRoomModal() -> Element {
         let name = room_name.read().clone();
         if name.is_empty() {
             info!("🔴 Room name is empty, returning");
+            return;
+        }
+        if contains_hidden_chars(&nickname.read()) {
+            info!("🔴 {EMOJI_REJECTION_MESSAGE} — room creation blocked");
             return;
         }
         info!("🔵 Room name: {}", name);
@@ -122,6 +127,11 @@ pub fn CreateRoomModal() -> Element {
         return rsx! {};
     }
 
+    // Input-time rejection (UX, not the security boundary — see
+    // `crate::util::display_name`). Emoji would be stripped at render time
+    // anyway; telling the user up front beats silently losing characters.
+    let nickname_has_emoji = contains_hidden_chars(&nickname());
+
     rsx! {
         // Backdrop
         div {
@@ -162,10 +172,23 @@ pub fn CreateRoomModal() -> Element {
                         label { class: "block text-sm font-medium text-text mb-1", "Your Nickname" }
                         input {
                             "data-testid": "create-room-nickname-input",
-                            class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent",
+                            class: if nickname_has_emoji {
+                                "w-full px-3 py-2 bg-surface border border-red-500 rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-red-500/50 focus:border-red-500"
+                            } else {
+                                "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent"
+                            },
+                            "aria-invalid": if nickname_has_emoji { "true" } else { "false" },
                             value: "{nickname}",
                             placeholder: "Enter your nickname",
-                            onchange: move |evt| nickname.set(evt.value().to_string())
+                            oninput: move |evt| nickname.set(evt.value().to_string())
+                        }
+                        if nickname_has_emoji {
+                            p {
+                                "data-testid": "create-room-nickname-emoji-error",
+                                class: "mt-1 text-xs text-red-400",
+                                role: "alert",
+                                "{EMOJI_REJECTION_MESSAGE}"
+                            }
                         }
                     }
 

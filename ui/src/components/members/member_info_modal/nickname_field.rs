@@ -1,5 +1,6 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
-use crate::util::ecies::{seal_for_room, unseal_bytes_with_secrets};
+use crate::util::display_name::{contains_hidden_chars, display_nickname, EMOJI_REJECTION_MESSAGE};
+use crate::util::ecies::seal_for_room;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaPencil;
@@ -46,13 +47,11 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         .map(|smi| smi == &member_id)
         .unwrap_or(false);
 
-    // Decrypt nickname for display (version-aware)
+    // Decrypt nickname for display (version-aware) and sanitise it, so a
+    // nickname written by `riverctl` (which never runs the input validation
+    // below) shows here exactly as it renders everywhere else — no emoji.
     let initial_nickname =
-        match unseal_bytes_with_secrets(&member_info.member_info.preferred_nickname, &room_secrets)
-        {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-            Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
-        };
+        display_nickname(&member_info.member_info.preferred_nickname, &room_secrets);
     let initial_nickname_for_revert = initial_nickname.clone();
     let mut temp_nickname = use_signal(|| initial_nickname);
     let mut input_element = use_signal(|| None as Option<Rc<MountedData>>);
@@ -67,6 +66,17 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         move |new_value: String| {
             if new_value.is_empty() {
                 warn!("Nickname cannot be empty");
+                return;
+            }
+
+            // Input-time rejection (UX, NOT the security boundary — see
+            // `crate::util::display_name`). Emoji in a nickname would be
+            // stripped at render time anyway, so saving one silently loses
+            // characters; refuse the edit and revert the field so the user
+            // gets told why instead.
+            if contains_hidden_chars(&new_value) {
+                warn!("{EMOJI_REJECTION_MESSAGE}");
+                temp_nickname.set(initial_nickname_for_revert.clone());
                 return;
             }
 
@@ -250,7 +260,9 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_blur = {
-        let save_changes = save_changes.clone();
+        // `mut` because the emoji-rejection branch reverts `temp_nickname`,
+        // which makes the closure `FnMut`.
+        let mut save_changes = save_changes.clone();
         move |_| {
             let new_value = temp_nickname();
             save_changes(new_value);
@@ -258,7 +270,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
     };
 
     let on_keydown = {
-        let save_changes = save_changes.clone();
+        let mut save_changes = save_changes.clone();
         move |evt: dioxus_core::Event<KeyboardData>| {
             if evt.key() == Key::Enter {
                 let new_value = temp_nickname();
@@ -274,6 +286,9 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
         }
     };
 
+    // Live validity of what is currently typed, for the inline hint below.
+    let has_emoji = contains_hidden_chars(&temp_nickname());
+
     rsx! {
         div {
             class: "mb-4",
@@ -281,7 +296,12 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
             div {
                 class: "relative",
                 input {
-                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
+                    class: if has_emoji {
+                        "w-full px-3 py-2 bg-surface border border-red-500 rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                    } else {
+                        "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent"
+                    },
+                    "aria-invalid": if has_emoji { "true" } else { "false" },
                     value: "{temp_nickname}",
                     readonly: !is_self,
                     oninput: on_input,
@@ -294,6 +314,14 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                         class: "absolute right-3 top-1/2 -translate-y-1/2 text-text-muted",
                         Icon { icon: FaPencil, width: 14, height: 14 }
                     }
+                }
+            }
+            if has_emoji {
+                p {
+                    "data-testid": "nickname-emoji-error",
+                    class: "mt-1 text-xs text-red-400",
+                    role: "alert",
+                    "{EMOJI_REJECTION_MESSAGE}"
                 }
             }
         }

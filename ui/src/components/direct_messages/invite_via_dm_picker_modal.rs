@@ -175,11 +175,10 @@ pub fn InviteViaDmPickerModal() -> Element {
                     .member_info
                     .canonical(target_peer)
                     .map(|mi| {
-                        match unseal_bytes_with_secrets(&mi.member_info.preferred_nickname, secrets)
-                        {
-                            Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                            Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
-                        }
+                        crate::util::display_name::display_nickname(
+                            &mi.member_info.preferred_nickname,
+                            secrets,
+                        )
                     })
             });
         nickname.unwrap_or_else(|| target_peer.to_string().chars().take(8).collect())

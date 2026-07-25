@@ -7,7 +7,9 @@ use crate::components::app::{
     MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
     ROOMS,
 };
+use crate::components::members::{deputy_badges_for_viewer, DeputyBadge};
 use crate::room_data::{NotificationMode, SendMessageError};
+use crate::util::display_name::{display_nickname, sanitize_display_name};
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
@@ -78,6 +80,10 @@ struct ReplyContext {
 struct MessageGroup {
     author_id: MemberId,
     author_name: String,
+    /// The 🛡 shield to show next to this author's name, or `None` for none.
+    /// See [`DeputyBadge`] for the predicate and why visibility and the
+    /// "can ban you" wording are separate questions.
+    author_badge: Option<DeputyBadge>,
     is_self: bool,
     first_time: DateTime<Utc>,
     /// True if any message in this group had a future timestamp that was clamped
@@ -402,12 +408,7 @@ fn resolve_member_nickname(
 ) -> String {
     member_info
         .canonical(member_id)
-        .map(
-            |ami| match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, secrets) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
-            },
-        )
+        .map(|ami| display_nickname(&ami.member_info.preferred_nickname, secrets))
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
@@ -419,6 +420,9 @@ fn group_messages(
     self_member_id: MemberId,
     secrets: &HashMap<u32, [u8; 32]>,
     member_names: &HashMap<MemberId, String>,
+    // Which members show a 🛡 shield in THIS viewer's conversation, built once
+    // per render by `deputy_badges_for_viewer`. Absent ⇒ no shield.
+    deputy_badges: &HashMap<MemberId, DeputyBadge>,
 ) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
@@ -533,6 +537,7 @@ fn group_messages(
             items.push(DisplayItem::Messages(MessageGroup {
                 author_id,
                 author_name,
+                author_badge: deputy_badges.get(&author_id).cloned(),
                 is_self,
                 first_time: message_time,
                 time_clamped,
@@ -663,12 +668,29 @@ pub(crate) fn decrypt_message_content(
 /// the token snapshot as fallback) and strip markdown formatting, so the preview
 /// reads as plain text. Caller truncates the result.
 fn clean_reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> String {
-    let with_mentions = river_core::mention::render_plaintext(text, |r| {
-        member_names
-            .iter()
-            .find(|(id, _)| r.matches(**id))
-            .map(|(_, name)| name.clone())
-    });
+    use river_core::mention::{parse_segments, MentionSegment};
+
+    // Mirrors `river_core::mention::render_plaintext`, except the fallback
+    // display name — the `[name]` snapshot the SENDER embedded in the message
+    // — is sanitised. That snapshot is arbitrary attacker text, so an
+    // unsanitised fallback would let `@[Alice 🛡](rv:…)` paint a shield into a
+    // reply preview for a member id nobody in the room resolves. Names that DO
+    // resolve come from `member_names`, which is already sanitised at source.
+    let mut with_mentions = String::with_capacity(text.len());
+    for seg in parse_segments(text) {
+        match seg {
+            MentionSegment::Text(t) => with_mentions.push_str(&t),
+            MentionSegment::Mention(m) => {
+                let name = member_names
+                    .iter()
+                    .find(|(id, _)| m.member_ref.matches(**id))
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| sanitize_display_name(&m.display_name));
+                with_mentions.push('@');
+                with_mentions.push_str(&name);
+            }
+        }
+    }
     strip_markdown(&with_mentions)
 }
 
@@ -824,9 +846,14 @@ pub(crate) fn message_to_html_with_mentions(
                 // known members so the chip stays clickable and self-highlighted.
                 // An unknown member yields `None` -> non-clickable snapshot chip.
                 let resolved = m.member_ref.resolve(member_names.keys().copied());
+                // The `[name]` snapshot is sender-controlled text, so an
+                // unresolved mention must be sanitised before it becomes a
+                // chip — otherwise `@[Admin 🛡](rv:…)` paints a shield inside
+                // a message. Resolved names come from `member_names`, which is
+                // already sanitised at source.
                 let name = resolved
                     .and_then(|id| member_names.get(&id).cloned())
-                    .unwrap_or(m.display_name);
+                    .unwrap_or_else(|| sanitize_display_name(&m.display_name));
                 chips.push(render_mention_chip_html(
                     resolved,
                     &name,
@@ -1354,22 +1381,32 @@ pub fn Conversation() -> Element {
                         .member_info
                         .iter()
                         .map(|ami| {
-                            let name = match unseal_bytes_with_secrets(
-                                &ami.member_info.preferred_nickname,
-                                &room_data.secrets,
-                            ) {
-                                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                                Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
-                            };
-                            (ami.member_info.member_id, name)
+                            (
+                                ami.member_info.member_id,
+                                display_nickname(
+                                    &ami.member_info.preferred_nickname,
+                                    &room_data.secrets,
+                                ),
+                            )
                         })
                         .collect();
+                    // Which authors show a 🛡 shield in this viewer's view.
+                    // Computed once here, not per message: the maps behind it
+                    // are O(members) to build.
+                    let deputy_badges = deputy_badges_for_viewer(
+                        &room_state.members,
+                        &room_state.member_info,
+                        &room_data.secrets,
+                        MemberId::from(&key),
+                        self_member_id,
+                    );
                     let groups = group_messages(
                         &room_state.recent_messages,
                         &room_state.member_info,
                         self_member_id,
                         &room_data.secrets,
                         &member_names,
+                        &deputy_badges,
                     );
                     return Some((groups, self_member_id, member_names));
                 }
@@ -2610,14 +2647,13 @@ pub fn Conversation() -> Element {
                                     .iter()
                                     .filter(|ami| ami.member_info.member_id != self_id)
                                     .map(|ami| {
-                                        let name = match unseal_bytes_with_secrets(
-                                            &ami.member_info.preferred_nickname,
-                                            &room_data.secrets,
-                                        ) {
-                                            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                                            Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
-                                        };
-                                        (ami.member_info.member_id, name)
+                                        (
+                                            ami.member_info.member_id,
+                                            display_nickname(
+                                                &ami.member_info.preferred_nickname,
+                                                &room_data.secrets,
+                                            ),
+                                        )
                                     })
                                     .filter(|(_, name)| !name.trim().is_empty())
                                     .collect();
@@ -2886,6 +2922,25 @@ fn MessageGroupComponent(
                                 });
                             },
                             "{group.author_name}"
+                        }
+                        // Deputy shield. Same glyph and `member-icon` styling
+                        // as the member-list row and the member-info modal, so
+                        // the three surfaces read as one badge. The nickname
+                        // above cannot forge it: nicknames are stripped of
+                        // emoji by `crate::util::display_name`.
+                        if let Some(badge) = group.author_badge.as_ref() {
+                            {
+                                let tooltip = badge.tooltip();
+                                rsx! {
+                                    span {
+                                        "data-testid": "message-author-deputy-badge",
+                                        class: "member-icon text-sm cursor-default",
+                                        title: "{tooltip}",
+                                        "aria-label": "{tooltip}",
+                                        "🛡"
+                                    }
+                                }
+                            }
                         }
                         span {
                             class: if time_clamped {

@@ -3,6 +3,7 @@ use crate::components::app::{PENDING_INVITES, ROOMS, SYNCHRONIZER};
 use crate::components::members::Invitation;
 use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
+use crate::util::display_name::{contains_hidden_chars, EMOJI_REJECTION_MESSAGE};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -833,6 +834,12 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
     // Create a signal for the nickname
     let mut nickname = use_signal(|| default_nickname);
 
+    // Input-time rejection (UX, not the security boundary — see
+    // `crate::util::display_name`). Emoji would be stripped at render time
+    // anyway; telling the user up front beats silently losing characters.
+    let nickname_has_emoji = contains_hidden_chars(&nickname());
+    let accept_disabled = nickname.read().trim().is_empty() || nickname_has_emoji;
+
     rsx! {
         p { class: "text-text mb-2", "You have been invited to join a new room." }
         p { class: "text-text-muted mb-4", "Choose a nickname to use in this room:" }
@@ -840,7 +847,12 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
         div { class: "mb-4",
             input {
                 "data-testid": "receive-invitation-nickname-input",
-                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
+                class: if nickname_has_emoji {
+                    "w-full px-3 py-2 bg-surface border border-red-500 rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                } else {
+                    "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent"
+                },
+                "aria-invalid": if nickname_has_emoji { "true" } else { "false" },
                 r#type: "text",
                 value: "{nickname}",
                 onmounted: move |cx| {
@@ -851,12 +863,20 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
                 },
                 oninput: move |evt| nickname.set(evt.value().clone()),
                 onkeydown: move |evt: KeyboardEvent| {
-                    if evt.key() == Key::Enter && !nickname.read().trim().is_empty() {
+                    if evt.key() == Key::Enter && !accept_disabled {
                         evt.prevent_default();
                         accept_invitation(inv_for_enter.clone(), nickname.read().clone());
                     }
                 },
                 placeholder: "Your preferred nickname"
+            }
+            if nickname_has_emoji {
+                p {
+                    "data-testid": "receive-invitation-nickname-emoji-error",
+                    class: "mt-1 text-xs text-red-400",
+                    role: "alert",
+                    "{EMOJI_REJECTION_MESSAGE}"
+                }
             }
         }
 
@@ -866,7 +886,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
             button {
                 "data-testid": "receive-invitation-accept-button",
                 class: "px-4 py-2 bg-accent hover:bg-accent-hover text-white font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
-                disabled: nickname.read().trim().is_empty(),
+                disabled: accept_disabled,
                 onclick: move |_| {
                     accept_invitation(inv_for_accept.clone(), nickname.read().clone());
                 },
