@@ -633,6 +633,17 @@ impl AuthorizedDirectMessage {
     pub fn purge_token(&self) -> PurgeToken {
         PurgeToken::from_signature(&self.sender_signature)
     }
+
+    /// This message's position in the per-pair retention order — the key
+    /// [`trim_pairs_to_cap`] prunes by, and the same `(timestamp, signature)`
+    /// order [`sort_state`] uses within a pair. Must stay in step with both;
+    /// see [`DmPairHorizon`].
+    pub fn order_key(&self) -> DmOrderKey {
+        DmOrderKey {
+            timestamp: self.message.timestamp,
+            signature: SignatureBytes(self.sender_signature.to_bytes()),
+        }
+    }
 }
 
 impl AuthorizedRecipientPurges {
@@ -676,6 +687,51 @@ impl DirectMessagesV1 {
             out.insert(p.recipient_id);
         }
         out
+    }
+
+    /// The [`DmPairHorizon`] entries this peer publishes: one per ordered
+    /// `(sender, recipient)` pair that has reached [`MAX_DM_MESSAGES_PER_PAIR`],
+    /// carrying the oldest key that pair still holds.
+    ///
+    /// Computed as the MINIMUM held key rather than the exact post-trim cutoff,
+    /// and only once the pair is at or over the cap, so it never over-states:
+    /// a sender is never told to withhold a DM the pair would in fact have
+    /// kept. Under-stating merely costs an extra round, and the horizon rises
+    /// strictly each round, so the exchange still terminates.
+    ///
+    /// Returned sorted, because these bytes are part of what freenet-core
+    /// byte-compares to decide staleness.
+    pub fn pair_horizons(&self) -> Vec<DmPairHorizon> {
+        let mut by_pair: HashMap<(MemberId, MemberId), (usize, DmOrderKey)> = HashMap::new();
+        for m in &self.messages {
+            let key = m.order_key();
+            match by_pair.entry((m.message.sender, m.message.recipient)) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let (count, oldest) = e.get_mut();
+                    *count += 1;
+                    if key < *oldest {
+                        *oldest = key;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((1, key));
+                }
+            }
+        }
+
+        let mut horizons: Vec<DmPairHorizon> = by_pair
+            .into_iter()
+            .filter(|(_, (count, _))| *count >= MAX_DM_MESSAGES_PER_PAIR)
+            .map(
+                |((sender, recipient), (_, oldest_retained))| DmPairHorizon {
+                    sender,
+                    recipient,
+                    oldest_retained,
+                },
+            )
+            .collect();
+        horizons.sort();
+        horizons
     }
 
     /// Drop any DM whose sender or recipient is banned (`banned_ids`),
@@ -850,6 +906,7 @@ impl ComposableState for DirectMessagesV1 {
         DirectMessagesSummary {
             message_signatures,
             purge_versions,
+            pair_horizons: self.pair_horizons(),
         }
     }
 
@@ -862,6 +919,15 @@ impl ComposableState for DirectMessagesV1 {
         let prior_versions: HashMap<MemberId, u64> =
             old_state_summary.purge_versions.iter().copied().collect();
 
+        // A DM the receiver's per-pair cap would discard the instant it applied
+        // it must never be offered, or the pair loops forever re-sending it.
+        // See [`DmPairHorizon`].
+        let horizons: HashMap<(MemberId, MemberId), &DmOrderKey> = old_state_summary
+            .pair_horizons
+            .iter()
+            .map(|h| ((h.sender, h.recipient), &h.oldest_retained))
+            .collect();
+
         let new_messages: Vec<AuthorizedDirectMessage> = self
             .messages
             .iter()
@@ -870,6 +936,13 @@ impl ComposableState for DirectMessagesV1 {
                     .message_signatures
                     .contains(&SignatureBytes(m.sender_signature.to_bytes()))
             })
+            .filter(
+                |m| match horizons.get(&(m.message.sender, m.message.recipient)) {
+                    // The receiver's pair is below the cap: it keeps anything.
+                    None => true,
+                    Some(oldest) => m.order_key() > **oldest,
+                },
+            )
             .cloned()
             .collect();
 
@@ -992,13 +1065,6 @@ impl ComposableState for DirectMessagesV1 {
         }
 
         // ---- 2. Apply new messages, gated by the up-to-date purges ----
-        let mut per_pair_existing: HashMap<(MemberId, MemberId), usize> = HashMap::new();
-        for m in &self.messages {
-            *per_pair_existing
-                .entry((m.message.sender, m.message.recipient))
-                .or_insert(0) += 1;
-        }
-
         let mut existing_sigs: HashSet<SignatureBytes> = self
             .messages
             .iter()
@@ -1050,16 +1116,20 @@ impl ComposableState for DirectMessagesV1 {
                 }
             }
 
-            // Per-pair cap - drop overflow rather than failing the
-            // whole delta (one over-eager sender shouldn't poison the
-            // merge for every peer).
-            let pair_key = (msg.message.sender, msg.message.recipient);
-            let pair_count = per_pair_existing.entry(pair_key).or_insert(0);
-            if *pair_count >= MAX_DM_MESSAGES_PER_PAIR {
-                continue;
-            }
-            *pair_count += 1;
-
+            // The per-pair cap is NOT applied here. It used to be, as
+            // first-come-wins ("already at the cap? drop the arrival"), and
+            // that was wrong twice over:
+            //
+            //  * Convergence: which messages a peer ends up holding depended on
+            //    ARRIVAL ORDER, so two peers could sit at the cap with
+            //    different sets, each re-offering what the other discards, and
+            //    `delta` never emptied. See [`DmPairHorizon`].
+            //  * Behaviour: once a pair filled up, every later DM from that
+            //    sender was silently dropped forever.
+            //
+            // Accept everything that passes authorisation and let
+            // `trim_pairs_to_cap` below keep the NEWEST `MAX_DM_MESSAGES_PER_PAIR`
+            // — a deterministic function of the union, so peers converge.
             existing_sigs.insert(sig);
             self.messages.push(msg.clone());
         }
@@ -1079,10 +1149,53 @@ impl ComposableState for DirectMessagesV1 {
                 .is_some_and(|set| set.contains(&m.purge_token()))
         });
 
-        // ---- 4. Deterministic ordering for CRDT convergence ----
+        // ---- 4. Enforce the per-pair cap, newest-first ----
+        trim_pairs_to_cap(self);
+
+        // ---- 5. Deterministic ordering for CRDT convergence ----
         sort_state(self);
 
         Ok(())
+    }
+}
+
+/// Keep only the newest [`MAX_DM_MESSAGES_PER_PAIR`] messages in each ordered
+/// `(sender, recipient)` pair, by [`AuthorizedDirectMessage::order_key`].
+///
+/// A pure function of the held set, so every peer that ends up with the same
+/// union trims to the same result regardless of the order the messages arrived
+/// in. That determinism is what makes the pair converge; the paired
+/// [`DmPairHorizon`] in the summary is what stops a sender re-offering the
+/// entries this drops.
+fn trim_pairs_to_cap(s: &mut DirectMessagesV1) {
+    // No single pair can exceed the cap while the whole set is within it.
+    if s.messages.len() <= MAX_DM_MESSAGES_PER_PAIR {
+        return;
+    }
+
+    let mut by_pair: HashMap<(MemberId, MemberId), Vec<(DmOrderKey, SignatureBytes)>> =
+        HashMap::new();
+    for m in &s.messages {
+        by_pair
+            .entry((m.message.sender, m.message.recipient))
+            .or_default()
+            .push((m.order_key(), SignatureBytes(m.sender_signature.to_bytes())));
+    }
+
+    let mut dropped: HashSet<SignatureBytes> = HashSet::new();
+    for entries in by_pair.values_mut() {
+        if entries.len() <= MAX_DM_MESSAGES_PER_PAIR {
+            continue;
+        }
+        // Ascending, so the oldest — the ones that go — are at the front.
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let excess = entries.len() - MAX_DM_MESSAGES_PER_PAIR;
+        dropped.extend(entries.iter().take(excess).map(|(_, sig)| *sig));
+    }
+
+    if !dropped.is_empty() {
+        s.messages
+            .retain(|m| !dropped.contains(&SignatureBytes(m.sender_signature.to_bytes())));
     }
 }
 
@@ -1125,6 +1238,49 @@ pub struct DirectMessagesSummary {
     /// it as a map key.
     #[serde(default)]
     pub purge_versions: Vec<(MemberId, u64)>,
+
+    /// One entry per ordered `(sender, recipient)` pair that has reached
+    /// [`MAX_DM_MESSAGES_PER_PAIR`], carrying the oldest message that pair
+    /// still holds. See [`DmPairHorizon`] for why this is here.
+    ///
+    /// Sorted (by the whole tuple) and stored as a `Vec` for the same two
+    /// reasons as `purge_versions`: canonical bytes for freenet-core's
+    /// summary comparison, and `serde_json` compatibility.
+    #[serde(default)]
+    pub pair_horizons: Vec<DmPairHorizon>,
+}
+
+/// The retention horizon for one ordered `(sender, recipient)` pair.
+///
+/// # Why this exists
+///
+/// [`DirectMessagesV1::apply_delta`] caps each ordered pair at
+/// [`MAX_DM_MESSAGES_PER_PAIR`], which makes the merge non-monotonic in exactly
+/// the way [`crate::room_state::message::RetentionHorizon`] documents for room
+/// messages. Without a horizon, `delta` is a pure signature-set difference: a
+/// peer whose window for the pair differs from its neighbour's re-offers DMs
+/// the neighbour discards, on every fan-out, forever. At up to 32 KiB of
+/// ciphertext each that is a heavy loop.
+///
+/// `oldest_retained` is the smallest key the pair currently holds, published
+/// only once the pair is at capacity. A sender offers only strictly-greater
+/// keys; applying one pushes the pair over the cap, so the trim drops at least
+/// the horizon message itself and the horizon strictly increases. A pair below
+/// capacity publishes no entry at all and accepts anything.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DmPairHorizon {
+    pub sender: MemberId,
+    pub recipient: MemberId,
+    pub oldest_retained: DmOrderKey,
+}
+
+/// Retention order for direct messages within one pair: `(timestamp,
+/// signature)`, matching [`sort_state`]'s within-pair ordering. The signature
+/// breaks timestamp ties deterministically.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DmOrderKey {
+    pub timestamp: u64,
+    pub signature: SignatureBytes,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

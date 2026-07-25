@@ -106,8 +106,10 @@ mod tests {
         for hash in LEGACY_ROOM_CONTRACT_CODE_HASHES {
             hasher.update(hash);
         }
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 28);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "0b83bd665d97c514");
+        // V29 registers the pre-retention-horizon generation (the messages /
+        // direct-messages prune-resend loop fix), which re-keys the contract.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 29);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "f233c450ba141ff4");
     }
 
     #[test]

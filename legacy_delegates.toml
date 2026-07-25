@@ -209,3 +209,10 @@ description = "Action payload encoded as CBOR byte string (issue #443)"
 date = "2026-07-22"
 delegate_key = "992155c30b554f334c8869874fea4ce277af3a5b16f072e7893d8502f028e8cd"
 code_hash = "82da3a0ea2b7d393b5a88674e7fda4768d73bce97c1d161d7793a46f316bb5a1"
+
+[[entry]]
+version = "V29"
+description = "Before retention-horizon summaries for capped collections (messages/DM prune-resend loop): last pre-horizon chat-delegate generation"
+date = "2026-07-25"
+delegate_key = "d46b5363858c82ed91f0709d179c620c74c1ab84483b114181594c08a3d4b915"
+code_hash = "2f8c5f1d5c517e57208538fb2a7ec819e882eafa29bc43047eb6c025b37eba8e"
