@@ -218,21 +218,23 @@ pub fn MemberInfoModal() -> Element {
             .deputies_of(self_member_id)
             .contains(&member_id);
 
-        // Viewer-relevant deputizer names for the target, for the 🛡 legend
-        // chip below (freenet/river#451). Computed with the SAME shared helpers
-        // the member-list row uses, so the modal shows the shield under exactly
-        // the same condition — and with the same "appointed by …" tooltip — as
-        // the row does. Empty ⇒ this member does not show the shield here.
+        // The 🛡 legend chip below (freenet/river#451). Computed with the SAME
+        // shared helper the member-list row and the conversation's author line
+        // use, so the modal shows the shield under exactly the same condition,
+        // and with the same tooltip, as they do. `None` means no shield here.
+        //
+        // Single-target variant: this component is not memoised, and the sweep
+        // decrypts every deputy's appointer nicknames.
         let deputy_badge: Option<super::DeputyBadge> =
             owner_key_signal.as_ref().and_then(|owner| {
-                super::deputy_badges_for_viewer(
+                super::deputy_badge_for_viewer(
                     &room_state.room_state.members,
                     &room_state.room_state.member_info,
                     &room_state.secrets,
                     MemberId::from(&*owner),
                     self_member_id,
+                    member_id,
                 )
-                .remove(&member_id)
             });
         let deputy_tooltip = deputy_badge
             .as_ref()
@@ -414,7 +416,16 @@ pub fn MemberInfoModal() -> Element {
                                 BanButton {
                                     member_to_ban: member_id,
                                     can_ban: can_ban,
-                                    nickname: member_info.member_info.preferred_nickname.clone()
+                                    // The DECRYPTED, sanitised name — the same
+                                    // value `DeputyButton` gets. This used to
+                                    // pass the raw `SealedBytes`, which Dioxus
+                                    // silently coerced through `Display` (i.e.
+                                    // `to_string_lossy`): the ban dialog showed
+                                    // an unsanitised nickname in the one place
+                                    // a moderator is judging authority, and
+                                    // showed "[Encrypted: N bytes, vN]" instead
+                                    // of a name in private rooms.
+                                    nickname: target_nickname.clone()
                                 }
 
                                 // Deputize / revoke-deputy (#410). Any non-owner
@@ -561,9 +572,9 @@ mod ban_gate_tests {
             "the member-info modal must render the 🛡 deputy legend chip (#451)"
         );
         assert!(
-            prod.contains("deputy_badges_for_viewer"),
+            prod.contains("deputy_badge_for_viewer"),
             "the deputy chip's visibility must come from the shared \
-             `deputy_badges_for_viewer` map so it cannot drift from the \
+             `deputy_badge_for_viewer` helper so it cannot drift from the \
              member-list row or the conversation author line (#451)"
         );
         assert!(

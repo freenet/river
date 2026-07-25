@@ -43,6 +43,11 @@ test.describe("Member-info modal deputy shield legend (#451)", () => {
 
     // The deputy is the one member whose row carries the shield glyph. Exactly
     // one member (the owner-appointed "(Member)") is a deputy in example data.
+    //
+    // This count is ALSO the member-list regression gate for nickname emoji
+    // stripping: example_data.rs deliberately gives the OWNER the stored
+    // nickname "… (Owner) 🛡👑", so if `crate::util::display_name` ever stops
+    // stripping it, the owner's row matches too and this becomes 2.
     const deputyRow = page
       .locator('button[title^="Member ID"]')
       .filter({ hasText: "🛡" });

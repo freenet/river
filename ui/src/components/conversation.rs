@@ -2923,18 +2923,18 @@ fn MessageGroupComponent(
                             },
                             "{group.author_name}"
                         }
-                        // Deputy shield. Same glyph and `member-icon` styling
-                        // as the member-list row and the member-info modal, so
-                        // the three surfaces read as one badge. The nickname
-                        // above cannot forge it: nicknames are stripped of
-                        // emoji by `crate::util::display_name`.
+                        // Deputy shield. Same glyph, same visibility rule and
+                        // the same tooltip as the member-list row and the
+                        // member-info modal chip, so the three read as one
+                        // badge. The nickname above cannot forge it: nicknames
+                        // are stripped of emoji by `crate::util::display_name`.
                         if let Some(badge) = group.author_badge.as_ref() {
                             {
                                 let tooltip = badge.tooltip();
                                 rsx! {
                                     span {
                                         "data-testid": "message-author-deputy-badge",
-                                        class: "member-icon text-sm cursor-default",
+                                        class: "text-sm cursor-default",
                                         title: "{tooltip}",
                                         "aria-label": "{tooltip}",
                                         "🛡"
@@ -3853,6 +3853,90 @@ mod tests {
         for spoof in ["Mallory 🛡", "Mallory 👑", "Mallory \u{1F6E1}\u{FE0F}"] {
             assert_eq!(sanitize_display_name(spoof), "Mallory");
         }
+    }
+
+    /// A mention token carries a `[name]` SNAPSHOT written by the sender. When
+    /// the member reference doesn't resolve, that snapshot is what renders —
+    /// so `@[Admin 🛡](rv:<nobody>)` would paint a shield inside a message with
+    /// no nickname involved at all. Any member can type this into any message,
+    /// which makes it a broader vector than the nickname one.
+    #[test]
+    fn unresolved_mention_chip_snapshot_is_sanitised() {
+        let unknown = MemberId(freenet_scaffold::util::FastHash(0xDEAD_BEEF));
+        let me = MemberId(freenet_scaffold::util::FastHash(1));
+        let token = river_core::mention::encode_mention(unknown, "Admin 🛡");
+
+        let html = message_to_html_with_mentions(&token, &HashMap::new(), me);
+        assert!(
+            !html.contains('\u{1F6E1}'),
+            "an unresolved mention rendered a badge glyph from its snapshot: {html}"
+        );
+        assert!(
+            html.contains("Admin"),
+            "the name itself must survive: {html}"
+        );
+    }
+
+    /// Same snapshot, the other renderer: the quoted reply preview resolves
+    /// mention tokens to plain `@name` and falls back to the sender-written
+    /// snapshot for an unknown member.
+    #[test]
+    fn reply_preview_sanitises_an_unresolved_mention_snapshot() {
+        let unknown = MemberId(freenet_scaffold::util::FastHash(0xDEAD_BEEF));
+        let token = river_core::mention::encode_mention(unknown, "Admin 🛡");
+
+        let preview = clean_reply_preview(&token, &HashMap::new());
+        assert!(
+            !preview.contains('\u{1F6E1}'),
+            "reply preview rendered a badge glyph from a mention snapshot: {preview}"
+        );
+        assert!(preview.contains("@Admin"), "got: {preview}");
+    }
+
+    /// `ReplyContentV1.target_author_name` is a name the REPLYING client wrote
+    /// into the message body, never checked against the target message's real
+    /// author. It renders as `↩ @name:` directly under the real author line and
+    /// its badge, so it must be sanitised on BOTH the public and the private
+    /// (encrypted-room) decode paths. Sanitising only one of them is exactly
+    /// the bug this test exists to prevent.
+    #[test]
+    fn reply_context_author_name_is_sanitised_on_both_paths() {
+        use river_core::room_state::content::ReplyContentV1;
+
+        let target_id = MessageId(freenet_scaffold::util::FastHash(7));
+        let spoof = "Admin \u{1F6E1}";
+
+        // Public room.
+        let public = RoomMessageBody::reply(
+            "sure".to_string(),
+            target_id.clone(),
+            spoof.to_string(),
+            "the original".to_string(),
+        );
+        let (author, _, _) = extract_reply_context(&public, &HashMap::new());
+        assert_eq!(author.as_deref(), Some("Admin"), "public reply path");
+
+        // Private room: same payload, encrypted with a known secret.
+        let secret = [42u8; 32];
+        let plaintext = ReplyContentV1::new(
+            "sure".to_string(),
+            target_id,
+            spoof.to_string(),
+            "the original".to_string(),
+        )
+        .encode();
+        let (ciphertext, nonce) =
+            crate::util::ecies::encrypt_with_symmetric_key(&secret, &plaintext);
+        let private = RoomMessageBody::private(
+            river_core::room_state::content::CONTENT_TYPE_REPLY,
+            river_core::room_state::content::REPLY_CONTENT_VERSION,
+            ciphertext,
+            nonce,
+            3,
+        );
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::from([(3u32, secret)]);
+        let (author, _, _) = extract_reply_context(&private, &secrets);
+        assert_eq!(author.as_deref(), Some("Admin"), "private reply path");
     }
 
     /// Issue #315 — pin that the markdown renderer never passes raw HTML

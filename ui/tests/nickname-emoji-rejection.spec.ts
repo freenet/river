@@ -48,35 +48,49 @@ test.describe("Nickname inputs reject emoji", () => {
     await expect(nickname).toBeVisible();
     await expect(error).toBeVisible();
 
-    // Clearing the emoji clears the error again.
+    // Clearing the emoji clears the error again, and NOW the same submit
+    // works. Without this positive control the assertion above would also
+    // pass if the button were broken for some unrelated reason.
     await nickname.fill("Alice");
     await expect(
       page.getByTestId("create-room-nickname-emoji-error"),
     ).toHaveCount(0);
+    await page.getByTestId("create-room-submit-button").click();
+    await expect(page.getByTestId("create-room-modal")).toHaveCount(0);
+    await expect(page.getByText("Emoji Test Room").first()).toBeVisible();
   });
 
   test("a non-Latin nickname is NOT rejected", async ({ page }) => {
-    // The rule must not mangle real names. A rule that flags 李小龍 or محمد is
-    // worse than the problem it solves.
+    // The rule must not mangle real names. A rule that flags 李小龍, محمد or
+    // علی‌رضا (whose ZWNJ is orthography, not emoji machinery) is worse than
+    // the problem it solves.
     await page.goto("/");
     await waitForApp(page);
 
     await page.getByTestId("create-room-button").click();
     const nickname = page.getByTestId("create-room-nickname-input");
     await expect(nickname).toBeVisible({ timeout: 10_000 });
+    const error = page.getByTestId("create-room-nickname-emoji-error");
 
     for (const name of [
       "李小龍",
       "محمد عبد الله",
+      "علی\u{200C}رضا", // Persian compound name, contains ZWNJ
+      "සූර්\u{200D}ය", // Sinhala touching letters, contains ZWJ
+      "山田\u{3000}太郎", // ideographic space separator
       "Иван Петров",
       "François Müller",
       "Nguyễn Thị Hương",
     ]) {
+      // Drive the field INVALID first, and wait for the error to appear.
+      // Asserting `toHaveCount(0)` straight after a `fill` would pass
+      // instantly on a render that hasn't happened yet — i.e. the single most
+      // important test here would be unable to fail for the right reason.
+      await nickname.fill("x 🛡");
+      await expect(error).toBeVisible();
+
       await nickname.fill(name);
-      await expect(
-        page.getByTestId("create-room-nickname-emoji-error"),
-        `rejected a legitimate name: ${name}`,
-      ).toHaveCount(0);
+      await expect(error, `rejected a legitimate name: ${name}`).toHaveCount(0);
     }
   });
 });

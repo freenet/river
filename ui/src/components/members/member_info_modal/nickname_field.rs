@@ -69,6 +69,17 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 return;
             }
 
+            // Nothing typed: do not republish. `initial_nickname` is the
+            // SANITISED value, so without this guard merely focusing and
+            // leaving your own nickname field would rewrite a `riverctl`-set
+            // nickname network-wide (a `member_info` republish at version + 1
+            // plus a sync) with no edit and no confirmation. Render-time
+            // stripping deliberately HIDES emoji rather than deleting them;
+            // this keeps that promise.
+            if new_value == initial_nickname_for_revert {
+                return;
+            }
+
             // Input-time rejection (UX, NOT the security boundary — see
             // `crate::util::display_name`). Emoji in a nickname would be
             // stripped at render time anyway, so saving one silently loses

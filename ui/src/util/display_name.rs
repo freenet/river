@@ -29,16 +29,28 @@
 //!   (much worse) false-positive profile.
 //! * Combining marks are preserved, so a "Zalgo" nickname can still be ugly.
 //!   It cannot forge a badge, which is what this module is for.
+//! * Sanitising can CREATE a collision: `"B⭐ob"` and `"Bob"` render alike, as
+//!   do two nicknames that differ only in stripped characters. Nicknames were
+//!   never unique in River, so this grants no new capability, but it is worth
+//!   knowing that identical rendered names are possible by construction.
 //!
 //! ## What gets removed
 //!
 //! Emoji and pictographic symbols (the badge-forgery vector), plus two classes
 //! that exist purely to deceive the reader:
 //!
-//! * **Invisible formatting** — zero-width joiners/spaces, bidi embedding and
-//!   override controls, word joiners. These let a nickname reorder or hide
-//!   text around itself (`Alice\u{202E}...`), and ZWJ is how multi-codepoint
-//!   emoji sequences are assembled in the first place.
+//! * **Invisible and blank characters** — zero-width space, bidi embedding and
+//!   override controls, soft hyphen, interlinear annotation, the Hangul
+//!   fillers, Braille blank. These either reorder the text around them
+//!   (`Alice\u{202E}...`) or let two members render a pixel-identical name,
+//!   which would defeat telling a moderator from an impersonator even with the
+//!   badge itself correct.
+//!
+//!   Deliberately NOT removed: `U+200C` ZWNJ and `U+200D` ZWJ. They look like
+//!   emoji machinery, but they are orthography in Persian, Sinhala and
+//!   Malayalam, and stripping them mangles real names. They are safe to keep
+//!   because every emoji a joiner could assemble is itself removed; a joiner
+//!   left stranded at an edge by that removal is dropped as an orphan.
 //! * **Private-use area** codepoints. Fonts are free to map these to any glyph
 //!   at all (Nerd Fonts map a large PUA range to icons, including shields), so
 //!   a PUA nickname renders as a badge on any machine with such a font
@@ -88,9 +100,18 @@ pub fn is_display_hidden(c: char) -> bool {
         0x00A9 | 0x00AE
         // ‼ ⁉
         | 0x203C | 0x2049
-        // Zero-width space/non-joiner/joiner, LTR/RTL marks. ZWJ is how
-        // multi-codepoint emoji sequences are built.
-        | 0x200B..=0x200F
+        // Zero-width space, and the LTR/RTL marks.
+        //
+        // NOT U+200C ZWNJ or U+200D ZWJ. Those look like emoji machinery — ZWJ
+        // is what joins 👩 + ZWJ + 💻 — but they are orthography in several
+        // scripts, and stripping them mangles real names: Persian compounds
+        // (`علی‌رضا` Alireza, `حسین‌زاده` Hosseinzadeh) need ZWNJ to keep the
+        // preceding letter in its final form, Sinhala touching letters
+        // (`සූර්‍ය` Surya) need ZWJ, and several Malayalam IMEs emit chillu as
+        // consonant + virama + ZWJ. Keeping them is safe here because every
+        // emoji a ZWJ could join is itself stripped, so the joiner has nothing
+        // left to assemble.
+        | 0x200B | 0x200E | 0x200F
         // Line/paragraph separators.
         | 0x2028..=0x2029
         // Bidi embedding / override controls (the `\u{202E}` reversal trick).
@@ -122,6 +143,19 @@ pub fn is_display_hidden(c: char) -> bool {
         | 0xFE00..=0xFE0F
         // Zero-width no-break space / BOM.
         | 0xFEFF
+        // The remaining invisible `Cf` formatting characters that no range
+        // above covers, and that `char::is_control()` (which is `Cc` only)
+        // misses. U+061C ARABIC LETTER MARK is a bidi control like U+200E/F;
+        // U+00AD SOFT HYPHEN and U+180E MONGOLIAN VOWEL SEPARATOR render as
+        // nothing; U+FFF9..U+FFFB are interlinear annotation anchors that hide
+        // the text between them.
+        | 0x00AD | 0x061C | 0x180E | 0xFFF9..=0xFFFB
+        // Blank glyphs that are not whitespace, so `split_whitespace` would
+        // not collapse them: they let two members share a pixel-identical
+        // rendered name (`Alice` vs `Alice\u{3164}`), which undermines the
+        // "you can tell members apart by name" assumption the badge sits on.
+        // U+2800 BRAILLE PATTERN BLANK, and the Hangul fillers.
+        | 0x115F | 0x1160 | 0x2800 | 0x3164 | 0xFFA0
         // Private Use Area (BMP). Font-defined glyphs, and River's own
         // mention sentinels live at U+E000/U+E001.
         | 0xE000..=0xF8FF
@@ -158,8 +192,15 @@ pub fn contains_hidden_chars(s: &str) -> bool {
 /// separator) becomes a space rather than vanishing, so `"Alice\nBob"` stays
 /// two words instead of collapsing to `"AliceBob"`. Zero-width characters are
 /// not whitespace, so `"A\u{200B}lice"` correctly rejoins as `"Alice"`.
+///
+/// Only runs of ASCII space are collapsed, and only interior ones. Non-ASCII
+/// spaces are left alone: U+3000 IDEOGRAPHIC SPACE is the conventional
+/// separator between a Japanese surname and given name (`山田　太郎`), and
+/// normalising it to `' '` would quietly rewrite a real name.
 pub fn sanitize_display_name(raw: &str) -> String {
-    let stripped: String = raw
+    // 1. Remove the hidden characters. A hidden character that was itself
+    //    whitespace becomes a space so words don't run together.
+    let stripped: Vec<char> = raw
         .chars()
         .filter_map(|c| match (is_display_hidden(c), c.is_whitespace()) {
             (true, true) => Some(' '),
@@ -168,15 +209,44 @@ pub fn sanitize_display_name(raw: &str) -> String {
         })
         .collect();
 
-    // Collapse whitespace runs left behind by the removal. `split_whitespace`
-    // handles every Unicode space, and the join normalises exotic spaces to a
-    // plain one — deliberate, since a nickname has no use for U+2007.
-    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    // 2. Drop ORPHANED joiners. U+200C/U+200D are kept above because they are
+    //    orthography between letters, but step 1 can leave one stranded at an
+    //    edge or beside a space — `"Bob 👮🏽‍♀️"` strips down to `"Bob ‍"`. A
+    //    joiner only means anything between two non-space characters, so drop
+    //    the rest rather than leave an invisible character in a name.
+    let is_joiner = |c: char| c == '\u{200C}' || c == '\u{200D}';
+    let kept: Vec<char> = stripped
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| {
+            !is_joiner(**c)
+                || (*i > 0
+                    && !stripped[i - 1].is_whitespace()
+                    && !is_joiner(stripped[i - 1])
+                    && stripped
+                        .get(i + 1)
+                        .is_some_and(|n| !n.is_whitespace() && !is_joiner(*n)))
+        })
+        .map(|(_, c)| *c)
+        .collect();
 
-    if collapsed.is_empty() {
+    // 3. Collapse the double spaces the removal leaves behind
+    //    ("Alice 🛡 Smith" -> "Alice  Smith").
+    let mut collapsed = String::with_capacity(kept.len());
+    let mut last_was_space = false;
+    for c in kept {
+        let is_space = c == ' ';
+        if !(is_space && last_was_space) {
+            collapsed.push(c);
+        }
+        last_was_space = is_space;
+    }
+
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
         UNNAMED.to_string()
     } else {
-        collapsed
+        trimmed.to_string()
     }
 }
 
@@ -231,9 +301,68 @@ mod tests {
 
     #[test]
     fn zwj_sequences_and_skin_tones_are_stripped() {
-        // 👮🏽‍♀️ = U+1F46E U+1F3FD ZWJ U+2640 U+FE0F
+        // 👮🏽‍♀️ = U+1F46E U+1F3FD ZWJ U+2640 U+FE0F. Every component is
+        // hidden; the ZWJ is kept by `is_display_hidden` (it is orthography in
+        // other scripts) and then dropped as an orphan, so nothing is left.
         let officer = "Bob \u{1F46E}\u{1F3FD}\u{200D}\u{2640}\u{FE0F}";
         assert_eq!(sanitize_display_name(officer), "Bob");
+        assert!(!sanitize_display_name(officer).contains('\u{200D}'));
+
+        // A joiner alone, or beside a space, is also an orphan.
+        assert_eq!(sanitize_display_name("\u{200D}Alice"), "Alice");
+        assert_eq!(sanitize_display_name("Alice\u{200D}"), "Alice");
+        assert_eq!(sanitize_display_name("Alice \u{200D} Bob"), "Alice Bob");
+    }
+
+    /// U+200C ZWNJ and U+200D ZWJ look like emoji machinery but are letters in
+    /// effect in Persian, Sinhala and Malayalam. Stripping them mangles real
+    /// names — and, because `contains_hidden_chars` gates three inputs, it
+    /// would have locked those users out of creating a room or accepting an
+    /// invitation while telling them their name contained emoji.
+    #[test]
+    fn joiners_between_letters_are_preserved() {
+        for name in [
+            "علی\u{200C}رضا",   // Alireza (Persian compound given name)
+            "حسین\u{200C}زاده", // Hosseinzadeh
+            "නික\u{200D}නම",     // Sinhala touching letters
+            "മോഹ\u{200D}ൻ",     // Malayalam chillu (consonant + virama + ZWJ)
+        ] {
+            assert_eq!(
+                sanitize_display_name(name),
+                name,
+                "sanitisation broke a name whose joiner is orthography: {name:?}"
+            );
+            assert!(
+                !contains_hidden_chars(name),
+                "a name with an interior joiner must not be rejected at input: {name:?}"
+            );
+        }
+    }
+
+    /// Blank-but-not-whitespace characters let two members render a
+    /// pixel-identical name, which defeats telling a moderator from an
+    /// impersonator even with the badge correct.
+    #[test]
+    fn invisible_and_blank_characters_are_stripped() {
+        for (label, blank) in [
+            ("HANGUL FILLER", '\u{3164}'),
+            ("HANGUL CHOSEONG FILLER", '\u{115F}'),
+            ("HANGUL JUNGSEONG FILLER", '\u{1160}'),
+            ("HALFWIDTH HANGUL FILLER", '\u{FFA0}'),
+            ("BRAILLE PATTERN BLANK", '\u{2800}'),
+            ("SOFT HYPHEN", '\u{00AD}'),
+            ("ARABIC LETTER MARK", '\u{061C}'),
+            ("MONGOLIAN VOWEL SEPARATOR", '\u{180E}'),
+            ("INTERLINEAR ANNOTATION ANCHOR", '\u{FFF9}'),
+        ] {
+            let name = format!("Alice{blank}");
+            assert_eq!(
+                sanitize_display_name(&name),
+                "Alice",
+                "{label} survived and can clone another member's name"
+            );
+            assert!(contains_hidden_chars(&name), "{label} not flagged");
+        }
     }
 
     #[test]
@@ -288,6 +417,14 @@ mod tests {
             "O'Brien-Smith Jr.",       // punctuation
             "Anne-Marie (Ann)",        // more punctuation
             "user_42",                 // underscores/digits
+            "山田\u{3000}太郎",        // U+3000, the Japanese name separator
+            "佐々木",                  // U+3005 iteration mark
+            "Jean\u{00A0}Luc",         // non-breaking space
+            "สมชาย ใจดี",               // Thai
+            "Արամ Խաչատրյան",          // Armenian
+            "გიორგი ბერიძე",           // Georgian
+            "ኃይሌ ገብረሥላሴ",              // Ethiopic
+            "ᏣᎳᎩ ᎠᏰᎵ",                 // Cherokee
             "山田 太郎、はじめまして", // CJK punctuation 、
         ] {
             assert_eq!(
@@ -406,7 +543,11 @@ mod tests {
             let mut rest = production.as_str();
             while let Some(idx) = rest.find("unseal_bytes_with_secrets(") {
                 let after = &rest[idx..];
-                let window = &after[..after.len().min(160)];
+                // Take CHARS, not bytes: these files are full of multi-byte
+                // characters (em-dashes and emoji in comments), and a byte
+                // slice would panic on a char boundary and be blamed on
+                // whichever unrelated change happened to move the text.
+                let window: String = after.chars().take(160).collect();
                 if window.contains("preferred_nickname") {
                     offenders.push(format!("{rel}: unseal of preferred_nickname"));
                 }
