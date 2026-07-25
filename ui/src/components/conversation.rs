@@ -5076,8 +5076,6 @@ mod resolve_reply_context_tests {
     /// scroll-to-original at a `msg-{id}` element that does not exist.
     #[test]
     fn quote_of_an_action_or_event_message_is_hidden() {
-        use river_core::room_state::content::ActionContentV1;
-
         let owner_sk = signing_key(1);
         let alice_sk = signing_key(2);
         let bob_sk = signing_key(3);

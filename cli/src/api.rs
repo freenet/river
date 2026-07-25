@@ -697,26 +697,54 @@ fn reply_context(
 pub(crate) fn reply_context_display(
     room_state: &ChatRoomStateV1,
     msg: &river_core::room_state::message::AuthorizedMessageV1,
-) -> Option<(String, String)> {
+) -> ReplyContextDisplay {
     reply_context_display_with_secrets(room_state, msg, &HashMap::new())
+}
+
+/// What a message's reply context should render as, resolved against LIVE room
+/// state. Mirrors the UI's `ReplyStrip` (`ui/src/components/conversation.rs`);
+/// the two must stay in step, since they render the same contract data.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReplyContextDisplay {
+    /// Not a reply.
+    NotAReply,
+    /// A reply whose quoted message could not be read back from room state.
+    Unavailable,
+    /// A quote verified against the message it quotes. Both fields are re-read
+    /// from that message; neither comes from the replier's snapshot.
+    Quote { author: String, preview: String },
 }
 
 /// Like [`reply_context_display`], but able to decrypt the reply context of a
 /// **private** reply when the caller supplies the room's `secrets` map. A
 /// private reply seals its `ReplyContentV1` (target author name + quoted
 /// preview) alongside the reply text, so without the secret the whole reply
-/// context is opaque and no `[reply to …]` prefix could be shown. Public
-/// replies decode directly, exactly as before. Returns `None` for a non-reply,
-/// or when a private reply's secret is unavailable / undecodable.
+/// context is opaque.
+///
+/// The quoted author name and preview stored in `ReplyContentV1` are a SNAPSHOT
+/// written and signed by the REPLIER, validated by nothing, so they are only
+/// trustworthy while the quoted message can be re-read from room state. This
+/// resolves against `recent_messages` and returns [`ReplyContextDisplay::Quote`]
+/// ONLY for a target that is actually there, taking both the text and the
+/// attribution from it.
+///
+/// The case that matters: an ENFORCED ban removes the member, which makes
+/// `post_apply_cleanup` purge their messages, so the snapshot embedded in every
+/// reply that quoted them becomes the last surviving copy of their text.
+/// Rendering it would keep a banned member's abusive message in circulation —
+/// and `riverctl`'s JSON output feeds bridges, which would republish it. See
+/// `resolve_reply_context` in `ui/src/components/conversation.rs` for why this
+/// cannot instead be keyed on the room's ban list, and for the deliberate
+/// trade-off that a merely aged-out target is treated the same way.
 pub(crate) fn reply_context_display_with_secrets(
     room_state: &ChatRoomStateV1,
     msg: &river_core::room_state::message::AuthorizedMessageV1,
     secrets: &HashMap<u32, [u8; 32]>,
-) -> Option<(String, String)> {
+) -> ReplyContextDisplay {
     use river_core::room_state::content::{DecodedContent, ReplyContentV1, CONTENT_TYPE_REPLY};
     use river_core::room_state::message::RoomMessageBody;
     if msg.message.content.content_type() != CONTENT_TYPE_REPLY {
-        return None;
+        return ReplyContextDisplay::NotAReply;
     }
     let reply = match msg.message.content.decode_content() {
         // Public reply — decoded directly.
@@ -730,17 +758,57 @@ pub(crate) fn reply_context_display_with_secrets(
                 ..
             } = &msg.message.content
             else {
-                return None;
+                return ReplyContextDisplay::NotAReply;
             };
-            let secret = secrets.get(secret_version)?;
-            let plaintext =
-                river_core::ecies::decrypt_with_symmetric_key(secret, ciphertext, nonce).ok()?;
-            ReplyContentV1::decode(&plaintext).ok()?
+            let decoded = secrets
+                .get(secret_version)
+                .and_then(|secret| {
+                    river_core::ecies::decrypt_with_symmetric_key(secret, ciphertext, nonce).ok()
+                })
+                .and_then(|plaintext| ReplyContentV1::decode(&plaintext).ok());
+            match decoded {
+                Some(reply) => reply,
+                // We cannot even tell what this reply quotes, so we certainly
+                // cannot verify it.
+                None => return ReplyContextDisplay::Unavailable,
+            }
         }
     };
-    let rendered = render_mentions_for_terminal(room_state, &reply.target_content_preview);
-    let preview = truncate_reply_preview(&rendered);
-    Some((reply.target_author_name, preview))
+
+    let messages = &room_state.recent_messages;
+    let resolved = messages
+        .messages
+        .iter()
+        .find(|m| m.id() == reply.target_message_id)
+        // Soft-deleted messages stay in `messages`, and action / event records
+        // are never rendered as message rows. None of them is quotable.
+        .filter(|target| {
+            !messages.is_deleted(&reply.target_message_id)
+                && !target.message.content.is_action()
+                && !target.message.content.is_event()
+        })
+        .and_then(|target| {
+            // Never fall back to a `<encrypted>` / decode-failure placeholder
+            // here: an undecryptable target has NOT been re-read, so it must be
+            // reported unavailable rather than quoted.
+            let text = messages
+                .effective_text(target)
+                .or_else(|| decrypt_private_body_text(&target.message.content, secrets))?;
+            let author = room_state
+                .member_info
+                .canonical(target.message.author)
+                .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets))
+                .unwrap_or_else(|| "Unknown".to_string());
+            Some((author, text))
+        });
+
+    match resolved {
+        Some((author, text)) => ReplyContextDisplay::Quote {
+            author,
+            preview: truncate_reply_preview(&render_mentions_for_terminal(room_state, &text)),
+        },
+        None => ReplyContextDisplay::Unavailable,
+    }
 }
 
 /// Rebuild a room's message `actions_state` (edits / deletes / reactions) using
@@ -4259,10 +4327,19 @@ impl ApiClient {
                 // Re-emission of an edited message — distinguish it from a fresh
                 // one for a downstream relay reading the human stream.
                 let edit_prefix = if is_edit { "[edit] " } else { "" };
-                let reply_prefix = reply
-                    .as_ref()
-                    .map(|(author, preview)| format!("[reply to {}: {}] ", author, preview))
-                    .unwrap_or_default();
+                let reply_prefix = match &reply {
+                    ReplyContextDisplay::Quote { author, preview } => {
+                        format!("[reply to {}: {}] ", author, preview)
+                    }
+                    // The quoted message can no longer be read back (its author
+                    // was banned and their messages purged, it was deleted, or
+                    // it aged out), so the replier's snapshot of it is
+                    // unverifiable and is not printed.
+                    ReplyContextDisplay::Unavailable => {
+                        "[reply to an unavailable message] ".to_string()
+                    }
+                    ReplyContextDisplay::NotAReply => String::new(),
+                };
                 let reactions_str = reactions
                     .map(|r| {
                         if r.is_empty() {
@@ -4308,9 +4385,16 @@ impl ApiClient {
 
                 // Reply context (null for non-replies) so a relay can thread the
                 // message; previously absent from the monitor's JSON output.
-                let reply_to = reply
-                    .as_ref()
-                    .map(|(author, preview)| json!({ "author": author, "preview": preview }));
+                // An UNVERIFIABLE quote is emitted as null rather than as a
+                // new shape — see the matching comment on the backfill path in
+                // `commands/message.rs`. A bridge must never receive the
+                // replier-authored snapshot of a banned member's message.
+                let reply_to = match &reply {
+                    ReplyContextDisplay::Quote { author, preview } => {
+                        Some(json!({ "author": author, "preview": preview }))
+                    }
+                    ReplyContextDisplay::Unavailable | ReplyContextDisplay::NotAReply => None,
+                };
 
                 // Output as JSONL (one JSON object per line). `type` is "edit"
                 // for a re-emitted message whose content changed, else "message".
@@ -7036,15 +7120,84 @@ mod display_text_tests {
             nonce,
             0,
         );
-        let (state, msg) = state_with_message(body);
+        let (mut state, msg) = state_with_message(body);
 
-        // Opaque without the secret.
-        assert_eq!(reply_context_display(&state, &msg), None);
+        // Opaque without the secret — we cannot even tell what it quotes.
+        assert_eq!(
+            reply_context_display(&state, &msg),
+            ReplyContextDisplay::Unavailable
+        );
 
-        // Author + quoted preview decrypt with the secret.
+        // The quoted message itself must be present and readable for the quote
+        // to render, so put it in the room, encrypted under the same secret,
+        // and name its author. (`reply` above targets `FastHash(0)`; build the
+        // target so its id matches by re-signing a message and re-pointing the
+        // reply at it.)
+        let alice_sk = SigningKey::from_bytes(&[42u8; 32]);
+        let (t_ct, t_nonce) = river_core::ecies::encrypt_with_symmetric_key(
+            &secret,
+            &river_core::room_state::content::TextContentV1::new("quoted original".to_string())
+                .encode(),
+        );
+        let target = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: msg.message.room_owner,
+                author: MemberId::from(&alice_sk.verifying_key()),
+                content: RoomMessageBody::private(
+                    river_core::room_state::content::CONTENT_TYPE_TEXT,
+                    river_core::room_state::content::TEXT_CONTENT_VERSION,
+                    t_ct,
+                    t_nonce,
+                    0,
+                ),
+                time: SystemTime::UNIX_EPOCH,
+            },
+            &alice_sk,
+        );
+        let target_id = target.id();
+        state.recent_messages.messages.push(target);
+        state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo {
+                    member_id: MemberId::from(&alice_sk.verifying_key()),
+                    version: 0,
+                    preferred_nickname: SealedBytes::public(b"Alice".to_vec()),
+                    deputies: Vec::new(),
+                },
+                &alice_sk,
+            ));
+        // Re-issue the reply now pointing at the real target.
+        let reply = ReplyContentV1::new(
+            "my reply".to_string(),
+            target_id,
+            "Alice".to_string(),
+            "quoted original".to_string(),
+        );
+        let (ciphertext, nonce) =
+            river_core::ecies::encrypt_with_symmetric_key(&secret, &reply.encode());
+        let msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                content: RoomMessageBody::private(
+                    CONTENT_TYPE_REPLY,
+                    REPLY_CONTENT_VERSION,
+                    ciphertext,
+                    nonce,
+                    0,
+                ),
+                ..msg.message.clone()
+            },
+            &SigningKey::from_bytes(&[11u8; 32]),
+        );
+
+        // Author + quoted text decrypt with the secret.
         let secrets = HashMap::from([(0u32, secret)]);
-        let (author, preview) = reply_context_display_with_secrets(&state, &msg, &secrets)
-            .expect("private reply context decrypts");
+        let ReplyContextDisplay::Quote { author, preview } =
+            reply_context_display_with_secrets(&state, &msg, &secrets)
+        else {
+            panic!("private reply context should resolve to a quote");
+        };
         assert_eq!(author, "Alice");
         assert_eq!(preview, "quoted original");
 
@@ -7956,6 +8109,56 @@ mod mention_cli_tests {
         AuthorizedMessageV1::new(m, &author)
     }
 
+    /// Push `text` into `state` as a real message authored by `author`, then
+    /// return a reply quoting it.
+    ///
+    /// Reply context resolves against LIVE room state, so a test exercising
+    /// preview rendering must have the quoted message actually present — a
+    /// reply pointing at a `MessageId` that is not in `recent_messages` is
+    /// (correctly) reported `Unavailable` and renders no preview at all. The
+    /// snapshot fields are filled with obviously-wrong values so any test that
+    /// accidentally starts reading them fails loudly.
+    fn reply_quoting(
+        state: &mut ChatRoomStateV1,
+        author: &SigningKey,
+        text: &str,
+    ) -> AuthorizedMessageV1 {
+        let sender = SigningKey::from_bytes(&[200u8; 32]);
+        let target = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(sender.verifying_key()),
+                author: member_id(author),
+                content: RoomMessageBody::public(text.to_string()),
+                time: SystemTime::UNIX_EPOCH,
+            },
+            author,
+        );
+        let target_id = target.id();
+        state.recent_messages.messages.push(target);
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(sender.verifying_key()),
+                author: member_id(&sender),
+                content: RoomMessageBody::reply(
+                    "ok".to_string(),
+                    target_id,
+                    "SNAPSHOT AUTHOR MUST NOT RENDER".to_string(),
+                    "SNAPSHOT PREVIEW MUST NOT RENDER".to_string(),
+                ),
+                time: SystemTime::UNIX_EPOCH,
+            },
+            &sender,
+        )
+    }
+
+    /// Destructure a resolved quote, failing loudly with the actual variant.
+    fn expect_quote(ctx: ReplyContextDisplay) -> (String, String) {
+        match ctx {
+            ReplyContextDisplay::Quote { author, preview } => (author, preview),
+            other => panic!("expected a resolved quote, got {other:?}"),
+        }
+    }
+
     // --- resolve_outgoing_mentions (send path) ---
 
     #[test]
@@ -8058,27 +8261,13 @@ mod mention_cli_tests {
 
     #[test]
     fn reply_context_display_renders_mention_in_preview() {
-        use river_core::room_state::message::MessageId;
         let alice = SigningKey::from_bytes(&[1u8; 32]);
         let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
-        // A reply whose quoted preview snapshot contains a mention token.
-        let preview = format!("re: {}", encode_mention(member_id(&alice), "Alice"));
-        let sender = SigningKey::from_bytes(&[200u8; 32]);
-        let reply = AuthorizedMessageV1::new(
-            MessageV1 {
-                room_owner: MemberId::from(sender.verifying_key()),
-                author: member_id(&sender),
-                content: RoomMessageBody::reply(
-                    "ok".to_string(),
-                    MessageId(freenet_scaffold::util::FastHash(0)),
-                    "Bob".to_string(),
-                    preview,
-                ),
-                time: SystemTime::UNIX_EPOCH,
-            },
-            &sender,
-        );
-        let (_, rendered) = reply_context_display(&state, &reply).expect("is a reply");
+        // A reply whose quoted message contains a mention token.
+        let mut state = state;
+        let quoted = format!("re: {}", encode_mention(member_id(&alice), "Alice"));
+        let reply = reply_quoting(&mut state, &alice, &quoted);
+        let (_, rendered) = expect_quote(reply_context_display(&state, &reply));
         assert!(
             rendered.contains("@Alice"),
             "mention rendered in preview: {rendered}"
@@ -8088,32 +8277,18 @@ mod mention_cli_tests {
 
     #[test]
     fn reply_context_display_does_not_slice_a_boundary_mention_token() {
-        use river_core::room_state::message::MessageId;
         let alice = SigningKey::from_bytes(&[1u8; 32]);
         let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
         // Pad so the raw token would straddle the 50-char display cutoff; the
         // token must be resolved before truncation, never sliced into raw syntax.
-        let preview = format!(
+        let mut state = state;
+        let quoted = format!(
             "{}{}",
             "x".repeat(45),
             encode_mention(member_id(&alice), "Alice")
         );
-        let sender = SigningKey::from_bytes(&[200u8; 32]);
-        let reply = AuthorizedMessageV1::new(
-            MessageV1 {
-                room_owner: MemberId::from(sender.verifying_key()),
-                author: member_id(&sender),
-                content: RoomMessageBody::reply(
-                    "ok".to_string(),
-                    MessageId(freenet_scaffold::util::FastHash(0)),
-                    "Bob".to_string(),
-                    preview,
-                ),
-                time: SystemTime::UNIX_EPOCH,
-            },
-            &sender,
-        );
-        let (_, rendered) = reply_context_display(&state, &reply).expect("is a reply");
+        let reply = reply_quoting(&mut state, &alice, &quoted);
+        let (_, rendered) = expect_quote(reply_context_display(&state, &reply));
         assert!(
             !rendered.contains("rv:") && !rendered.contains("@["),
             "no raw/partial token in boundary preview: {rendered}"
@@ -8127,38 +8302,55 @@ mod mention_cli_tests {
     /// rather than silently ending mid-word. freenet/river XMPP-bridge request.
     #[test]
     fn reply_context_display_marks_truncation() {
-        use river_core::room_state::message::MessageId;
         let alice = SigningKey::from_bytes(&[1u8; 32]);
         let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
-        let sender = SigningKey::from_bytes(&[200u8; 32]);
-        let reply_with = |preview: &str| {
-            AuthorizedMessageV1::new(
-                MessageV1 {
-                    room_owner: MemberId::from(sender.verifying_key()),
-                    author: member_id(&sender),
-                    content: RoomMessageBody::reply(
-                        "ok".to_string(),
-                        MessageId(freenet_scaffold::util::FastHash(0)),
-                        "Bob".to_string(),
-                        preview.to_string(),
-                    ),
-                    time: SystemTime::UNIX_EPOCH,
-                },
-                &sender,
-            )
-        };
+        let mut state = state;
 
-        // Long preview (no mention tokens) → clipped + marked.
+        // Long quoted message (no mention tokens) → clipped + marked.
         let long = "y".repeat(120);
-        let (_, clipped) = reply_context_display(&state, &reply_with(&long)).expect("is a reply");
+        let long_reply = reply_quoting(&mut state, &alice, &long);
+        let (_, clipped) = expect_quote(reply_context_display(&state, &long_reply));
         assert!(
             clipped.ends_with("..."),
             "long preview is marked as truncated: {clipped}"
         );
         assert_eq!(clipped.chars().count(), 53, "50 content chars + ellipsis");
 
-        // Short preview → shown verbatim, no marker.
-        let (_, whole) = reply_context_display(&state, &reply_with("short")).expect("is a reply");
+        // Short quoted message → shown verbatim, no marker.
+        let short_reply = reply_quoting(&mut state, &alice, "short");
+        let (_, whole) = expect_quote(reply_context_display(&state, &short_reply));
         assert_eq!(whole, "short");
+    }
+
+    /// The CLI must not keep a banned member's text alive either. Banning
+    /// purges their messages, so the replier-authored snapshot in
+    /// `ReplyContentV1` becomes the last surviving copy — and `riverctl`'s JSON
+    /// output feeds bridges, which would republish it.
+    #[test]
+    fn quoted_text_is_dropped_once_the_quoted_message_is_gone() {
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let mut state =
+            state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
+        let reply = reply_quoting(&mut state, &alice, "abusive message");
+
+        // While Alice's message is present the quote renders — so the
+        // assertion below is about the purge, not a dead fixture.
+        let (author, preview) = expect_quote(reply_context_display(&state, &reply));
+        assert_eq!(author, "Alice");
+        assert_eq!(preview, "abusive message");
+
+        // Ban: `post_apply_cleanup` drops Alice's messages and her member_info.
+        state
+            .recent_messages
+            .messages
+            .retain(|m| m.message.author != MemberId::from(&alice.verifying_key()));
+        state.member_info.member_info.clear();
+
+        assert_eq!(
+            reply_context_display(&state, &reply),
+            ReplyContextDisplay::Unavailable,
+            "neither the snapshot text nor the snapshot author name may be \
+             rendered once the quoted message is gone"
+        );
     }
 }
