@@ -307,10 +307,10 @@ impl<'a> RoomDeputies<'a> {
     /// or is an owner-appointed global moderator. An earlier version of this
     /// function approximated the guardrail by hand and undercounted both cases.
     ///
-    /// ONE local narrowing is applied on top: the deputy is not counted against
-    /// themselves (see the filter below). Scope is the grant's: every member for
-    /// an owner grant (whose subtree is the room), otherwise the deputizer's
-    /// invite subtree.
+    /// ONE local narrowing is applied on top: targets whose ban would remove the
+    /// deputy themselves are not counted (see the filter below). Scope is the
+    /// grant's: every member for an owner grant (whose subtree is the room),
+    /// otherwise the deputizer's invite subtree.
     fn reach_of(&self, deputizer: MemberId, deputy: MemberId) -> usize {
         let empty = HashSet::new();
         let targets = if deputizer == self.owner_id {
@@ -321,19 +321,21 @@ impl<'a> RoomDeputies<'a> {
         targets
             .iter()
             .filter(|target| {
-                // Exclude the deputy themselves. `is_ban_authorized` has no
-                // `banner == target` check and self-ban really is contract-
-                // permitted (a deputy whose deputizer is their own invite
-                // ancestor satisfies step 5 against themselves), but counting
-                // it makes the number answer the wrong question: a deputy who
-                // can only "ban" themselves holds no moderation authority.
+                // Exclude every target whose ban would remove the DEPUTY: the
+                // deputy themselves, and the deputy's own invite ancestors
+                // (whose cascade sweeps the deputy up). `is_ban_authorized` has
+                // no such check and both really are contract-permitted (step 3
+                // grants an owner-appointed global moderator authority over
+                // their own ancestors), but counting them makes the number
+                // answer the wrong question: authority you can only spend by
+                // removing yourself is not moderation authority.
                 //
-                // riverctl's own WRITE path already refuses it -- `ban_member`
-                // returns "Cannot ban yourself" (`api.rs`) -- so before this
-                // the read path advertised a capability the CLI will not
-                // exercise. Keep the two in step: if either is relaxed, revisit
-                // the other.
-                **target != deputy
+                // riverctl's own WRITE path refuses exactly this set --
+                // `ban_member` goes through `self_removing_ban_reason` -- so
+                // the read path must not advertise a capability the CLI will
+                // not exercise. Keep the two in step: if either is relaxed,
+                // revisit the other.
+                !self.ban_would_remove(deputy, **target)
                     && MembersV1::is_ban_authorized(
                         deputy,
                         **target,
@@ -343,6 +345,17 @@ impl<'a> RoomDeputies<'a> {
                     )
             })
             .count()
+    }
+
+    /// Whether a ban of `target` would remove `banner` from the room — the same
+    /// question [`self_removing_ban_reason`] answers, off the subtrees this
+    /// struct already built.
+    fn ban_would_remove(&self, banner: MemberId, target: MemberId) -> bool {
+        banner == target
+            || self
+                .subtrees
+                .get(&target)
+                .is_some_and(|downstream| downstream.contains(&banner))
     }
 
     /// Build the resolved view of a single `deputizer -> deputy` grant.
@@ -464,6 +477,58 @@ fn invite_subtrees(state: &ChatRoomStateV1) -> HashMap<MemberId, HashSet<MemberI
         }
     }
     subtrees
+}
+
+/// Everyone a ban of `target` would remove from the room: `target` themselves
+/// PLUS their entire transitive invite subtree — exactly what the contract's
+/// `check_banned_members` inserts (the banned user) and then extends with
+/// (`get_downstream_members`).
+pub fn ban_removal_set(state: &ChatRoomStateV1, target: MemberId) -> HashSet<MemberId> {
+    let mut removed = invite_subtrees(state).remove(&target).unwrap_or_default();
+    removed.insert(target);
+    removed
+}
+
+/// NOBODY MAY BAN THEMSELVES OUT OF THE ROOM (freenet/river#478).
+///
+/// ONE rule, stated once: compute the set the ban would remove
+/// ([`ban_removal_set`]) and refuse if `banner` is in it. That covers the direct
+/// self-ban (`banner == target`) and the transitive one (`target` is a strict
+/// invite ancestor of `banner`, so the cascade sweeps the banner up with them)
+/// as the single case they are — do NOT split this back into two special cases.
+///
+/// The CONTRACT permits both: `MembersV1::is_ban_authorized` has no self-check,
+/// and step 3 (owner-appointed global moderator) fires before anything that
+/// would stop it, so an owner-appointed deputy is authorized to ban themselves
+/// AND their own ancestors. The resulting ban is fully valid and cascades to the
+/// banner's whole invite subtree. So this is a client-side gate, not a contract
+/// fix — and it must be applied to the OUTPUT of `is_ban_authorized`, never
+/// wired into one branch of its priority ladder, or it would miss exactly the
+/// global moderators who can reach the most members.
+///
+/// The UI enforces the identical rule in
+/// `ui/src/components/members.rs::self_removing_ban_reason`; the two clients are
+/// deliberately kept in step (the rule cannot live in `river-core` without
+/// changing the room-contract WASM, and therefore the contract key).
+///
+/// Returns the user-visible reason when the ban is refused, `None` when the rule
+/// does not apply.
+pub fn self_removing_ban_reason(
+    state: &ChatRoomStateV1,
+    banner: MemberId,
+    target: MemberId,
+) -> Option<&'static str> {
+    if !ban_removal_set(state, target).contains(&banner) {
+        return None;
+    }
+    Some(if banner == target {
+        "Cannot ban yourself. The ban would remove you, and everyone you \
+         invited, from the room."
+    } else {
+        "Cannot ban a member you joined the room through. A ban also removes \
+         everyone the banned member invited, so this one would remove you, and \
+         everyone you invited, along with them."
+    })
 }
 
 /// Render a nickname for TERMINAL output: quoted, with every non-printable
@@ -1616,5 +1681,140 @@ mod tests {
         assert_eq!(json["scope"], "invite-subtree");
         assert_eq!(json["active"], false);
         assert!(json["deputy"]["nickname"].is_null());
+    }
+
+    // ------------------------------------------------------------------
+    // freenet/river#478: nobody may ban themselves OUT OF THE ROOM.
+    //
+    // owner -> alpha -> beta -> deputy -> child, plus an unrelated stranger.
+    // `deputy` is an OWNER-APPOINTED GLOBAL MODERATOR, which is the only grant
+    // in `is_ban_authorized` that reaches a member's own ancestors — and it is
+    // granted at step 3, ahead of the step-4 guardrail.
+    // ------------------------------------------------------------------
+
+    /// The chain above, with `deputy` deputized by the owner.
+    fn ban_chain() -> ChatRoomStateV1 {
+        let (owner, alpha, beta, deputy, child, stranger) =
+            (key(1), key(2), key(3), key(4), key(5), key(6));
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alpha);
+        push_member(&mut state, &owner, &alpha, &beta);
+        push_member(&mut state, &owner, &beta, &deputy);
+        push_member(&mut state, &owner, &deputy, &child);
+        push_member(&mut state, &owner, &owner, &stranger);
+        push_info(&mut state, &owner, 0, "Owner", vec![id(&deputy)]);
+        for (sk, name) in [
+            (&alpha, "Alpha"),
+            (&beta, "Beta"),
+            (&deputy, "Deputy"),
+            (&child, "Child"),
+            (&stranger, "Stranger"),
+        ] {
+            push_info(&mut state, sk, 0, name, vec![]);
+        }
+        state
+    }
+
+    /// riverctl refuses a self-ban AND a ban of any strict ancestor, and keeps
+    /// refusing for the reason the rule states rather than for want of
+    /// authority — the precondition assertions are what prove that.
+    #[test]
+    fn self_removing_bans_are_refused_directly_and_transitively() {
+        let state = ban_chain();
+        let (owner, alpha, beta, deputy) = (key(1), key(2), key(3), key(4));
+        let members_by_id = state.members.members_by_member_id();
+
+        for (label, target) in [
+            ("self", id(&deputy)),
+            ("direct inviter (parent)", id(&beta)),
+            ("grandparent", id(&alpha)),
+        ] {
+            assert!(
+                MembersV1::is_ban_authorized(
+                    id(&deputy),
+                    target,
+                    &members_by_id,
+                    &state.member_info,
+                    id(&owner)
+                ),
+                "precondition ({label}): the contract AUTHORIZES this ban, so a \
+                 refusal below is the #478 rule and not missing authority"
+            );
+            assert!(
+                ban_removal_set(&state, target).contains(&id(&deputy)),
+                "precondition ({label}): the cascade really does remove the banner"
+            );
+            assert!(
+                self_removing_ban_reason(&state, id(&deputy), target).is_some(),
+                "riverctl must refuse a ban of {label} (#478)"
+            );
+        }
+    }
+
+    /// The over-broadness case: legitimate bans stay legitimate.
+    #[test]
+    fn bans_that_do_not_remove_the_banner_are_not_refused() {
+        let state = ban_chain();
+        let (owner, alpha, deputy, child, stranger) = (key(1), key(2), key(4), key(5), key(6));
+
+        for (label, banner, target) in [
+            ("an unrelated member", id(&deputy), id(&stranger)),
+            ("the deputy's own downstream", id(&deputy), id(&child)),
+            ("the owner banning mid-chain", id(&owner), id(&alpha)),
+        ] {
+            assert!(
+                self_removing_ban_reason(&state, banner, target).is_none(),
+                "banning {label} does not remove the banner and must stay \
+                 available (#478 must not be over-broad)"
+            );
+        }
+    }
+
+    /// The reported reach must not advertise authority riverctl's write path
+    /// refuses. Before #478's transitive case, a global moderator's reach
+    /// counted their own ancestors — bans `ban_member` now rejects.
+    #[test]
+    fn reach_excludes_targets_whose_ban_would_remove_the_deputy() {
+        let state = ban_chain();
+        let (owner, deputy) = (key(1), key(4));
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+
+        // Room is alpha, beta, deputy, child, stranger. A global moderator can
+        // ban all of them per the contract, but alpha + beta (their ancestors)
+        // and the deputy themselves would take the deputy down too, leaving
+        // child + stranger.
+        assert_eq!(
+            d.grant(id(&owner), id(&deputy)).members_deputy_can_ban,
+            2,
+            "reach must exclude the deputy AND their own invite ancestors"
+        );
+    }
+
+    /// The write path must go through the shared rule, not re-derive it.
+    /// Source-scraped: `ban_member` needs a live node connection, so the guard
+    /// itself cannot be unit-tested here — this pins the wiring.
+    #[test]
+    fn ban_member_is_wired_to_the_self_removal_rule() {
+        let source = include_str!("api.rs");
+        let prod = source
+            .lines()
+            .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let fn_at = prod
+            .find("pub async fn ban_member(")
+            .expect("api.rs must define ban_member");
+        let build_at = prod[fn_at..]
+            .find("let user_ban = UserBan {")
+            .expect("ban_member must build a UserBan")
+            + fn_at;
+        assert!(
+            prod[fn_at..build_at].contains("self_removing_ban_reason("),
+            "`ban_member` must refuse a self-removing ban BEFORE building the \
+             UserBan, through the shared rule so riverctl and the UI cannot \
+             disagree (#478)"
+        );
     }
 }
