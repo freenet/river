@@ -4973,7 +4973,15 @@ mod tests {
         assert_eq!(warning.tier, ConfusableTier::Identical);
         assert_eq!(warning.impersonated.role, ProtectedRole::Deputy);
         assert_eq!(warning.impersonated.display_name, "Ian Clarke");
-        assert!(warning.tooltip().contains("Ian Clarke"));
+        // The identified victim is on the WARNING, for a surface that can render
+        // it as its own DOM node. It is deliberately NOT in the flat tooltip —
+        // see `ImpersonationWarning::tooltip`, which names the role instead.
+        assert!(
+            !warning.tooltip().contains("Ian Clarke"),
+            "no nickname may reach the flat tooltip: {}",
+            warning.tooltip()
+        );
+        assert!(warning.tooltip().contains("is NOT a moderator"));
 
         // ...and the real moderator, under the real name, is untouched.
         assert_eq!(
@@ -5460,8 +5468,11 @@ mod tests {
              tags were {:?}",
             parts.tags.iter().map(|(g, _)| *g).collect::<Vec<_>>()
         );
-        assert!(tooltip.contains("Ian Clarke"), "{tooltip}");
         assert!(tooltip.contains("is NOT a moderator"), "{tooltip}");
+        // The row's tooltip is flat hover text, so it must carry no nickname —
+        // the member row is one of the surfaces that cannot render separate
+        // nodes for it.
+        assert!(!tooltip.contains("Ian Clarke"), "{tooltip}");
         // The relationship tags are still rendered, after it.
         assert!(parts.tags.len() > 1);
 

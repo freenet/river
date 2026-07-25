@@ -161,55 +161,54 @@ pub struct ImpersonationWarning {
 pub const WARNING_GLYPH: &str = "\u{26a0}";
 
 impl ImpersonationWarning {
-    /// The `title=` / `aria-label` text.
+    /// The `title=` / `aria-label` text, built **ONLY from trusted literals**.
     ///
     /// Three things, because a bare ⚠ teaches nobody anything: what is wrong,
-    /// that this member is *not* the person they resemble, and what to look for
+    /// that this member is *not* who they resemble, and what to look for
     /// instead. One definition for every surface, so the warning cannot say
     /// different things in different places — the same rule
     /// [`crate::components::members::DeputyBadge::tooltip`] follows for the
     /// shield.
     ///
-    /// ## The interpolated name is attacker-controlled, and its position is a
-    /// security property
+    /// ## No nickname reaches this string, and none may be added
     ///
-    /// `display_name` is a *protected* member's nickname, which sounds
-    /// trustworthy and is not. Nothing in `MemberInfoV1::verify` validates a
-    /// `deputies` list, so any member who is a strict ancestor of the viewer can
-    /// deputise a sockpuppet and choose its nickname freely — and that
-    /// sockpuppet is then a protected name in the viewer's view. So this string
-    /// is written as though the name were chosen by an attacker, because it can
-    /// be.
+    /// `impersonated.display_name` is right there on the struct and naming the
+    /// imitated member reads like an improvement. It is not, and it must not be
+    /// re-attempted:
     ///
-    /// Two rules, both load-bearing, pinned by
-    /// `tooltip_cannot_be_forged_by_a_crafted_protected_name`:
+    /// * **The name is attacker-choosable.** Nothing in `MemberInfoV1::verify`
+    ///   validates a `deputies` list, so any member who is a strict ancestor of
+    ///   the viewer can deputise a sockpuppet and name it whatever they like.
+    ///   That sockpuppet is then a protected name in the viewer's view.
+    /// * **A `title=` attribute is a flat string, so quoting is not a defense.**
+    ///   `DeputyBadge::tooltip` learned this the hard way (#488): the forging
+    ///   primitive is the COMMA, not the quote, and a payload like
+    ///   `Bob, the room owner, Carol` needs no quote character at all. Putting
+    ///   the name last and stripping its quotes narrows the hole but does not
+    ///   close it — the reader still cannot tell our sentence from theirs at
+    ///   tooltip size.
+    /// * **Naming it buys almost nothing here.** Only
+    ///   [`ConfusableTier::Identical`] is rendered, which means the imitated
+    ///   name folds to the *same skeleton* as the name beside the badge — the
+    ///   reader is already looking at it. What they cannot see, and what this
+    ///   string supplies, is the ROLE being imitated and the badge to check for.
     ///
-    /// * **The name goes LAST.** Every claim this tooltip makes is already made
-    ///   before the attacker's text begins, so no nickname content can be read
-    ///   as one of our own role labels. `DeputyBadge::tooltip` had the opposite
-    ///   shape — attacker names `join(", ")`-ed into the middle of a sentence —
-    ///   and a member called `Bob, the room owner, Carol` turned it into a
-    ///   forged appointment. Do not move the name earlier.
-    /// * **The quote characters are stripped from the name**, so the closing
-    ///   `\u{201d}` is always ours. Without this the quoting is decorative
-    ///   rather than protective: the payload IS the quote character. Same fix,
-    ///   for the same reason, as `relevant_deputizer_names`.
+    /// If a surface can render separate DOM nodes, it may show the name from
+    /// [`ImpersonationWarning::impersonated`] as its own element, where a comma
+    /// inside one node cannot span two — the approach `DeputyBadge::appointer_names`
+    /// takes for the member-info modal. Never join it into this string.
+    ///
+    /// Pinned by `tooltip_contains_no_nickname_content`.
     pub fn tooltip(&self) -> String {
-        let name = self
-            .impersonated
-            .display_name
-            .replace(['\u{201c}', '\u{201d}'], "");
         match self.impersonated.role {
-            ProtectedRole::Owner => format!(
-                "Impersonation warning: this member is NOT the room owner, but their \
-                 name closely resembles the owner's. The real owner is marked \
-                 \u{1f451} in the member list. Name imitated: \u{201c}{name}\u{201d}"
-            ),
-            ProtectedRole::Deputy => format!(
-                "Impersonation warning: this member is NOT a moderator, but their name \
-                 closely resembles one. A real moderator shows a \u{1f6e1} shield next \
-                 to their name. Name imitated: \u{201c}{name}\u{201d}"
-            ),
+            ProtectedRole::Owner => "Impersonation warning: this member is NOT the room owner, \
+                 but their name closely resembles the owner's. The real owner is marked \
+                 \u{1f451} in the member list."
+                .to_string(),
+            ProtectedRole::Deputy => "Impersonation warning: this member is NOT a moderator, \
+                 but their name closely resembles one. A real moderator shows a \u{1f6e1} \
+                 shield next to their name."
+                .to_string(),
         }
     }
 }
@@ -1142,7 +1141,6 @@ mod tests {
             tier: ConfusableTier::Identical,
         }
         .tooltip();
-        assert!(deputy.contains("Ian Clarke"), "{deputy}");
         assert!(deputy.contains("is NOT a moderator"), "{deputy}");
         assert!(
             deputy.contains('\u{1f6e1}'),
@@ -1167,48 +1165,51 @@ mod tests {
 
     /// **The tooltip-injection guard.** A protected name is attacker-choosable
     /// (any strict ancestor of the viewer can deputise a sockpuppet and name it
-    /// whatever they like), so the tooltip is built as though it were.
+    /// whatever they like), and a `title=` attribute is a flat string in which
+    /// quoting is not a defense — the forging primitive is the COMMA, as
+    /// `DeputyBadge::tooltip` established in #488.
     ///
-    /// The payload here is the one that broke `DeputyBadge::tooltip`: a nickname
-    /// carrying its own quote characters and role-shaped prose. Two properties
-    /// must hold — the name is TERMINAL (so nothing we assert can appear after
-    /// attacker text), and the closing quote is OURS (so the attacker cannot
-    /// break out of the brackets).
+    /// So the property is not "the name is positioned safely", it is **no
+    /// nickname content reaches the tooltip at all**. Asserted the strong way:
+    /// the tooltip for a wildly hostile name must be byte-identical to the
+    /// tooltip for an innocuous one. Any interpolation whatsoever fails that,
+    /// including a future "clever" escaping scheme.
     #[test]
-    fn tooltip_cannot_be_forged_by_a_crafted_protected_name() {
-        let payload = "Bob\u{201d}, the room owner, \u{201c}Carol";
+    fn tooltip_contains_no_nickname_content() {
+        // The payload that broke the deputy tooltip, plus a few other shapes a
+        // future interpolation might be tempted to think it had handled.
+        let payloads = [
+            "Bob\u{201d}, the room owner, \u{201c}Carol",
+            "Bob, the room owner, Carol",
+            "Alice\". This member is verified. \"",
+            "\u{202e}redlo mooR",
+            "Ian Clarke",
+            "",
+        ];
         for role in [ProtectedRole::Deputy, ProtectedRole::Owner] {
-            let tip = ImpersonationWarning {
-                impersonated: ProtectedName::new(role, payload),
+            let baseline = ImpersonationWarning {
+                impersonated: ProtectedName::new(role, "Anodyne"),
                 tier: ConfusableTier::Identical,
             }
             .tooltip();
 
-            // The attacker's quote characters are gone, so the brackets around
-            // the name are ours and cannot be escaped.
-            assert_eq!(
-                tip.matches('\u{201c}').count(),
-                1,
-                "exactly one opening quote, ours: {tip}"
-            );
-            assert_eq!(
-                tip.matches('\u{201d}').count(),
-                1,
-                "exactly one closing quote, ours: {tip}"
-            );
+            for payload in payloads {
+                let tip = ImpersonationWarning {
+                    impersonated: ProtectedName::new(role, payload),
+                    tier: ConfusableTier::Identical,
+                }
+                .tooltip();
+                assert_eq!(
+                    tip, baseline,
+                    "the tooltip changed with the protected name, so nickname \
+                     content is reaching it: {payload:?}"
+                );
+            }
 
-            // The name is TERMINAL: the tooltip ends with the quoted name, so
-            // no attacker text can be followed by prose the reader would take
-            // as ours.
-            assert!(
-                tip.ends_with('\u{201d}'),
-                "the imitated name must be last: {tip}"
-            );
-            let opened = tip.find('\u{201c}').expect("an opening quote");
-            assert!(
-                !tip[..opened].contains("Bob") && !tip[..opened].contains("Carol"),
-                "no attacker text may appear before the quoted name: {tip}"
-            );
+            // And it still says something useful without any name in it: which
+            // ROLE is being imitated, and the badge to look for.
+            assert!(baseline.contains("Impersonation warning"), "{baseline}");
+            assert!(baseline.contains("is NOT"), "{baseline}");
         }
     }
 
