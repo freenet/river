@@ -352,9 +352,9 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                         );
                     } else {
                         println!(
-                            "\nDeputies appointed by {} ({} grant(s)):\n",
+                            "\nDeputies appointed by {} ({}):\n",
                             party_label(&subject),
-                            grants.len()
+                            count(grants.len(), "grant")
                         );
                         for grant in &grants {
                             println!(
@@ -417,9 +417,9 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                         );
                     } else {
                         println!(
-                            "\n{} has been deputized by {} member(s):\n",
+                            "\n{} has been deputized by {}:\n",
                             party_label(&subject),
-                            grants.len()
+                            count(grants.len(), "member")
                         );
                         for grant in &grants {
                             let owner_tag = if grant.deputizer.is_owner {
@@ -457,6 +457,16 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
 /// Render a list of member ids as their short-id strings, for JSON output.
 fn ids_to_strings(ids: &[MemberId]) -> Vec<String> {
     ids.iter().map(|id| id.to_string()).collect()
+}
+
+/// `"1 grant"` / `"3 grants"`, so counted output reads as English rather than
+/// as the `N thing(s)` form.
+fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// Resolve a short member id, turning the structured failure into the same
