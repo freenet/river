@@ -3911,51 +3911,13 @@ mod tests {
         assert!(preview.contains("@Admin"), "got: {preview}");
     }
 
-    /// `ReplyContentV1.target_author_name` is a name the REPLYING client wrote
-    /// into the message body, never checked against the target message's real
-    /// author. It renders as `↩ @name:` directly under the real author line and
-    /// its badge, so it must be sanitised on BOTH the public and the private
-    /// (encrypted-room) decode paths. Sanitising only one of them is exactly
-    /// the bug this test exists to prevent.
-    #[test]
-    fn reply_context_author_name_is_sanitised_on_both_paths() {
-        use river_core::room_state::content::ReplyContentV1;
-
-        let target_id = MessageId(freenet_scaffold::util::FastHash(7));
-        let spoof = "Admin \u{1F6E1}";
-
-        // Public room.
-        let public = RoomMessageBody::reply(
-            "sure".to_string(),
-            target_id.clone(),
-            spoof.to_string(),
-            "the original".to_string(),
-        );
-        let (author, _, _) = extract_reply_context(&public, &HashMap::new());
-        assert_eq!(author.as_deref(), Some("Admin"), "public reply path");
-
-        // Private room: same payload, encrypted with a known secret.
-        let secret = [42u8; 32];
-        let plaintext = ReplyContentV1::new(
-            "sure".to_string(),
-            target_id,
-            spoof.to_string(),
-            "the original".to_string(),
-        )
-        .encode();
-        let (ciphertext, nonce) =
-            crate::util::ecies::encrypt_with_symmetric_key(&secret, &plaintext);
-        let private = RoomMessageBody::private(
-            river_core::room_state::content::CONTENT_TYPE_REPLY,
-            river_core::room_state::content::REPLY_CONTENT_VERSION,
-            ciphertext,
-            nonce,
-            3,
-        );
-        let secrets: HashMap<u32, [u8; 32]> = HashMap::from([(3u32, secret)]);
-        let (author, _, _) = extract_reply_context(&private, &secrets);
-        assert_eq!(author.as_deref(), Some("Admin"), "private reply path");
-    }
+    // A previous revision of this branch sanitised
+    // `ReplyContentV1.target_author_name` on both decode paths, because the
+    // reply strip rendered that sender-written snapshot. freenet/river#480
+    // removed the field from the decoder's return type entirely, so there is
+    // no longer a value to sanitise: the quote author comes from
+    // `resolve_member_nickname` on live state, covered by
+    // `resolve_reply_strip_tests::quote_author_label_is_sanitised`.
 
     /// Issue #315 — pin that the markdown renderer never passes raw HTML
     /// through to the DOM. `markdown_to_html` feeds attacker-controlled
