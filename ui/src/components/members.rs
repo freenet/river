@@ -639,6 +639,27 @@ pub(crate) fn relevant_deputizer_names(
 /// NOT bare invite-chain ancestry, so a DEPUTY sees the Ban action for members in
 /// their deputizer's subtree. Bare downstream ancestry (`is_downstream`, still
 /// used for the "🔑 Invited by You" relationship tag) would have hidden it.
+///
+/// SELF-BAN IS REFUSED HERE, and that refusal is the UI's own — do NOT
+/// "simplify" it away believing the contract already prevents it, because it
+/// does not (freenet/river#478). `is_ban_authorized(P, P)` genuinely returns
+/// `true` for most deputies: the strict-ancestor walk seeds its visited set with
+/// `target`, so a member is never their own strict ancestor and step 2 never
+/// fires, but step 3 (owner-appointed global moderator) or step 5 (a strict
+/// non-owner ancestor deputized them — the ordinary case, since you usually
+/// deputize someone you invited) does. `validate_single_ban` does not refuse
+/// `banned_by == banned_user` either, and enforcement re-runs the same
+/// predicate, so a self-ban is accepted and then CASCADES:
+/// `MembersV1::check_banned_members` extends removal to
+/// `get_downstream_members(target)`, taking the member's whole invite subtree
+/// with them.
+///
+/// Refusing at the predicate rather than only at the render site means every
+/// caller inherits the guard, and it makes the UI's read path agree with
+/// riverctl's write path, which already refuses self-ban outright
+/// (`ApiClient::ban_member`: "Cannot ban yourself"). Whether the CONTRACT should
+/// reject `banned_by == banned_user` is a separate, wire-format-adjacent
+/// question and is deliberately not decided here.
 pub(crate) fn viewer_can_ban(
     members: &MembersV1,
     member_info: &river_core::room_state::member_info::MemberInfoV1,
@@ -646,6 +667,9 @@ pub(crate) fn viewer_can_ban(
     target: MemberId,
     owner_id: MemberId,
 ) -> bool {
+    if viewer == target {
+        return false;
+    }
     let members_by_id = members.members_by_member_id();
     MembersV1::is_ban_authorized(viewer, target, &members_by_id, member_info, owner_id)
 }
@@ -3947,5 +3971,96 @@ mod tests {
         let decoded =
             Invitation::from_encoded_string(&encoded).expect("legacy invitation should decode");
         assert!(decoded.room_secrets.is_empty());
+    }
+    /// freenet/river#478: a deputy must never be offered the Ban action on
+    /// THEMSELVES. The contract permits that ban — `is_ban_authorized(P, P)` is
+    /// `true` for most deputies — and `MembersV1::check_banned_members` then
+    /// cascades the removal to `get_downstream_members(P)`, so one misclick
+    /// costs the moderator their membership AND their whole invite subtree.
+    ///
+    /// Both self-ban routes are covered, because they reach `true` through
+    /// different branches of `is_ban_authorized`: step 3 (the owner listed you
+    /// in their `deputies`) and step 5 (a strict non-owner ancestor listed you
+    /// — the ordinary case, since you usually deputize someone you invited).
+    ///
+    /// Each case asserts the raw CONTRACT predicate first. Without that
+    /// precondition the test would pass for the wrong reason: if a future
+    /// contract change started refusing self-bans, the UI guard could be
+    /// deleted and this test would stay green while pinning nothing.
+    #[test]
+    fn viewer_can_ban_refuses_self_even_though_the_contract_permits_it() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let global_mod_sk = SigningKey::generate(&mut rng);
+        let parent_sk = SigningKey::generate(&mut rng);
+        let subtree_mod_sk = SigningKey::generate(&mut rng);
+        let bystander_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+
+        // owner -> {global_mod, parent, bystander}; parent -> subtree_mod.
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &global_mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &parent_sk.verifying_key()),
+                authorized_member(&owner_sk, &bystander_sk.verifying_key()),
+                member_invited_by(&parent_sk, owner_id, &subtree_mod_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                // Owner appoints a global moderator (step-3 authority).
+                signed_member_info(&owner_sk, "Owner", vec![id(&global_mod_sk)]),
+                signed_member_info(&global_mod_sk, "GlobalMod", vec![]),
+                // Parent deputizes someone they invited (step-5 authority).
+                signed_member_info(&parent_sk, "Parent", vec![id(&subtree_mod_sk)]),
+                signed_member_info(&subtree_mod_sk, "SubtreeMod", vec![]),
+                signed_member_info(&bystander_sk, "Bystander", vec![]),
+            ],
+        };
+        let members_by_id = members.members_by_member_id();
+
+        for (label, sk) in [
+            ("owner-appointed global moderator (step 3)", &global_mod_sk),
+            (
+                "deputy of a strict non-owner ancestor (step 5)",
+                &subtree_mod_sk,
+            ),
+        ] {
+            let who = id(sk);
+            assert!(
+                MembersV1::is_ban_authorized(who, who, &members_by_id, &member_info, owner_id),
+                "precondition: the CONTRACT must permit this self-ban ({label}). \
+                 This test pins a UI-layer guard and is worthless if the \
+                 contract already refuses"
+            );
+            assert!(
+                !viewer_can_ban(&members, &member_info, who, who, owner_id),
+                "the UI must refuse a self-ban ({label}): it is contract-valid \
+                 and cascades to the member's whole invite subtree \
+                 (freenet/river#478)"
+            );
+        }
+
+        // The guard must be exactly `viewer == target` and nothing wider — both
+        // deputies keep the authority they genuinely have over other members.
+        assert!(viewer_can_ban(
+            &members,
+            &member_info,
+            id(&global_mod_sk),
+            id(&bystander_sk),
+            owner_id
+        ));
+        assert!(viewer_can_ban(
+            &members,
+            &member_info,
+            id(&parent_sk),
+            id(&subtree_mod_sk),
+            owner_id
+        ));
     }
 }

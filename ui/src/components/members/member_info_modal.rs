@@ -414,19 +414,34 @@ pub fn MemberInfoModal() -> Element {
                             // Deputize on the right), matching the DM /
                             // Share-invite button row above.
                             div { class: "mt-4 flex items-start gap-3",
-                                BanButton {
-                                    member_to_ban: member_id,
-                                    can_ban: can_ban,
-                                    // The DECRYPTED, sanitised name — the same
-                                    // value `DeputyButton` gets. This used to
-                                    // pass the raw `SealedBytes`, which Dioxus
-                                    // silently coerced through `Display` (i.e.
-                                    // `to_string_lossy`): the ban dialog showed
-                                    // an unsanitised nickname in the one place
-                                    // a moderator is judging authority, and
-                                    // showed "[Encrypted: N bytes, vN]" instead
-                                    // of a name in private rooms.
-                                    nickname: target_nickname.clone()
+                                // Never offer Ban on your OWN row
+                                // (freenet/river#478). This is the second half of
+                                // a deliberate belt-and-braces pair: the other is
+                                // the `viewer == target` refusal inside
+                                // `viewer_can_ban`, which every caller inherits.
+                                // Keep BOTH. `can_ban` arrives here as a plain
+                                // `bool`, so a future call site that computes it
+                                // some other way (the deputy-badge code calls
+                                // `is_ban_authorized` directly, for instance)
+                                // would bypass the predicate guard entirely.
+                                // The contract PERMITS a self-ban and cascades it
+                                // to the whole invite subtree — see
+                                // `viewer_can_ban`'s docs.
+                                if member_id != self_member_id {
+                                    BanButton {
+                                        member_to_ban: member_id,
+                                        can_ban: can_ban,
+                                        // The DECRYPTED, sanitised name — the same
+                                        // value `DeputyButton` gets. This used to
+                                        // pass the raw `SealedBytes`, which Dioxus
+                                        // silently coerced through `Display` (i.e.
+                                        // `to_string_lossy`): the ban dialog showed
+                                        // an unsanitised nickname in the one place
+                                        // a moderator is judging authority, and
+                                        // showed "[Encrypted: N bytes, vN]" instead
+                                        // of a name in private rooms.
+                                        nickname: target_nickname.clone()
+                                    }
                                 }
 
                                 // Deputize / revoke-deputy (#410). Any non-owner
@@ -582,6 +597,48 @@ mod ban_gate_tests {
             prod.contains("DeputyBadge::tooltip"),
             "the deputy chip's tooltip must come from `DeputyBadge::tooltip` \
              so the wording cannot drift between surfaces (#451)"
+        );
+    }
+    /// freenet/river#478: the `BanButton` render site must be self-guarded, the
+    /// way `DeputyButton` right beside it already is.
+    ///
+    /// This pins the SECOND half of a deliberate belt-and-braces pair. The
+    /// first half — the `viewer == target` refusal inside `viewer_can_ban` — is
+    /// pinned behaviourally by
+    /// `components::members::tests::viewer_can_ban_refuses_self_even_though_the_contract_permits_it`.
+    /// Because EITHER guard alone hides the button, no behavioural test can
+    /// detect the loss of just one of them; this source pin is what fails when
+    /// the render-site half is deleted.
+    #[test]
+    fn ban_button_render_site_is_self_guarded() {
+        let source = include_str!("member_info_modal.rs");
+        // Cut at the FIRST `#[cfg(test)]` so the needle below cannot match
+        // itself — the failure mode where a pin quietly stops pinning.
+        let prod = &source[..source
+            .find("#[cfg(test)]")
+            .expect("member_info_modal.rs should have a #[cfg(test)] block")];
+
+        let ban_site = prod
+            .find("BanButton {")
+            .expect("the member-info modal must render `BanButton`");
+        // Only the text immediately preceding the button counts. Wide enough to
+        // survive a comment between the guard and the button, narrow enough
+        // that `DeputyButton`'s own guard — which sits well AFTER the ban site —
+        // can never satisfy it. `char_indices` keeps the slice on a UTF-8
+        // boundary (this file is full of emoji).
+        let head = &prod[..ban_site];
+        let window_start = head
+            .char_indices()
+            .rev()
+            .nth(200)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        assert!(
+            head[window_start..].contains("member_id != self_member_id"),
+            "the `BanButton` render site must be guarded by \
+             `member_id != self_member_id` (freenet/river#478): a deputy's \
+             self-ban is contract-VALID and cascades to their entire invite \
+             subtree"
         );
     }
 }
