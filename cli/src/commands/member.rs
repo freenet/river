@@ -99,30 +99,24 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
             let secrets = api.room_display_secrets(&owner_vk, &mut room_state);
 
             // Deputy grants are attributed per-deputizer (#410), so a member row
-            // carries the members who deputized THEM — never a bare badge, which
-            // in the UI is viewer-scoped and routinely misread as room-wide.
+            // carries the members who deputized THEM, never a bare badge (the
+            // UI's badge is viewer-scoped and routinely misread as room-wide).
             let deputies = RoomDeputies::new(&room_state, &owner_vk, &secrets);
             let deputized_by = deputies.deputizers_by_deputy();
 
-            // Collect member info
-            let members: Vec<_> = room_state
-                .member_info
-                .member_info
-                .iter()
-                .map(|info| {
-                    let nickname = crate::api::unseal_nickname_display(
-                        &info.member_info.preferred_nickname,
-                        &secrets,
-                    );
-                    let id = info.member_info.member_id;
+            // One row per MEMBER, not per `member_info` record: `verify`
+            // deliberately accepts several records for the same member
+            // (migration-safety), so iterating the raw vector emitted duplicate
+            // rows whose nickname came from a losing record while the deputy
+            // annotation came from the canonical one. `members_with_info` is
+            // deduplicated and `party` reads the canonical record.
+            let members: Vec<_> = deputies
+                .members_with_info()
+                .map(|id| {
+                    let party = deputies.party(id);
                     let granted_by: Vec<MemberId> =
                         deputized_by.get(&id).cloned().unwrap_or_default();
-                    (
-                        id.to_string(),
-                        nickname,
-                        deputies.deputies_of(id),
-                        granted_by,
-                    )
+                    (party, deputies.deputies_of(id).to_vec(), granted_by)
                 })
                 .collect();
 
@@ -132,22 +126,17 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                         println!("No members found in room.");
                     } else {
                         println!("\n{} member(s) found:\n", members.len());
-                        for (member_id, nickname, _own_deputies, granted_by) in &members {
-                            let suffix = if granted_by.is_empty() {
-                                String::new()
-                            } else {
+                        for (party, _own_deputies, granted_by) in &members {
+                            let nickname = party.nickname.as_deref().unwrap_or("(unknown)");
+                            print!("  {} ({})", nickname.green(), party.member_id);
+                            if !granted_by.is_empty() {
                                 let names: Vec<String> = granted_by
                                     .iter()
                                     .map(|id| party_label(&deputies.party(*id)))
                                     .collect();
-                                format!("  deputy of: {}", names.join(", "))
-                            };
-                            println!(
-                                "  {} ({}){}",
-                                nickname.green(),
-                                &member_id[..8],
-                                suffix.yellow()
-                            );
+                                print!("{}", format!("  deputy of: {}", names.join(", ")).yellow());
+                            }
+                            println!();
                         }
                         println!();
                     }
@@ -155,10 +144,16 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                 OutputFormat::Json => {
                     let json_members: Vec<_> = members
                         .into_iter()
-                        .map(|(member_id, nickname, own_deputies, granted_by)| {
+                        .map(|(party, own_deputies, granted_by)| {
                             serde_json::json!({
-                                "member_id": member_id,
-                                "nickname": nickname,
+                                "member_id": party.member_id,
+                                // Unchanged shape: the pre-#470 output rendered
+                                // a member with no readable nickname as the
+                                // lossy placeholder string, never null, and
+                                // `party.nickname` is only None for a member
+                                // with no member_info record, which cannot
+                                // appear in this listing.
+                                "nickname": party.nickname.unwrap_or_default(),
                                 // Members this member has deputized.
                                 "deputies": ids_to_strings(&own_deputies),
                                 // Members who have deputized this member.
@@ -304,23 +299,36 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
         }
         MemberCommands::Deputies { room_id, member_id } => {
             let owner_vk = parse_room_id(&room_id)?;
+
+            // No MEMBER_ID means the identity this CLI joined the room as.
+            // Deputy grants are per-deputizer, so "my deputies" is the only
+            // sensible default; there is no room-wide list to fall back to.
+            // Resolved BEFORE the fetch so a caller with no local room record
+            // gets the error immediately instead of after a full GET.
+            let own_id = match &member_id {
+                Some(_) => None,
+                None => Some(own_member_id(&api, &owner_vk)?),
+            };
+
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Listing deputies in room: {}", room_id);
+            }
+
             let mut room_state = api.get_room(&owner_vk, false).await?;
             let secrets = api.room_display_secrets(&owner_vk, &mut room_state);
             let deputies = RoomDeputies::new(&room_state, &owner_vk, &secrets);
 
-            // No MEMBER_ID → the identity this CLI joined the room as. Deputy
-            // grants are per-deputizer, so "my deputies" is the only sensible
-            // default; there is no room-wide list to fall back to.
-            let subject_id = match &member_id {
-                Some(short) => resolve_or_explain(&deputies, short)?,
-                None => own_member_id(&api, &owner_vk)?,
+            let subject_id = match (&member_id, own_id) {
+                (Some(short), _) => resolve_or_explain(&deputies, short)?,
+                (None, Some(id)) => id,
+                (None, None) => unreachable!("own_id is set whenever member_id is None"),
             };
 
             let subject = deputies.party(subject_id);
             let grants: Vec<_> = deputies
                 .deputies_of(subject_id)
-                .into_iter()
-                .map(|deputy| deputies.grant(subject_id, deputy))
+                .iter()
+                .map(|deputy| deputies.grant(subject_id, *deputy))
                 .collect();
 
             match format {
@@ -345,7 +353,9 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                         }
                         println!();
                     }
-                    println!(
+                    // stderr, like every other `member` subcommand's chatter, so
+                    // piping the human output does not mix prose into the data.
+                    eprintln!(
                         "{}",
                         "Deputy authority is per-deputizer: this lists only the members \
                          the member above deputized."
@@ -368,6 +378,12 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
         }
         MemberCommands::DeputizedBy { room_id, member_id } => {
             let owner_vk = parse_room_id(&room_id)?;
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!(
+                    "Looking up who deputized '{}' in room: {}",
+                    member_id, room_id
+                );
+            }
             let mut room_state = api.get_room(&owner_vk, false).await?;
             let secrets = api.room_display_secrets(&owner_vk, &mut room_state);
             let deputies = RoomDeputies::new(&room_state, &owner_vk, &secrets);
@@ -448,18 +464,26 @@ fn resolve_or_explain(deputies: &RoomDeputies<'_>, short: &str) -> Result<Member
     })
 }
 
-/// The member id of the identity this CLI joined `room_owner_key` as.
+/// The member id this CLI would currently sign as in `room_owner_key`.
+///
+/// Routes through `Storage::self_identity`, the same derivation `identity
+/// whoami` and every send path use, rather than re-deriving from a signing key
+/// (see the "do not re-inline" note on `api::author_member_id`). It therefore
+/// honours `--signing-key-file` / `RIVER_SIGNING_KEY_FILE`: with an override in
+/// effect this is the OVERRIDE identity, not the persisted one.
 fn own_member_id(
     api: &ApiClient,
     room_owner_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<MemberId> {
-    let (signing_key, _, _) = api.storage().get_room(room_owner_key)?.ok_or_else(|| {
-        anyhow!(
-            "Room not found in local storage, so there is no 'your own' identity to \
-             default to. Pass a member ID explicitly."
-        )
-    })?;
-    Ok(MemberId::from(&signing_key.verifying_key()))
+    api.storage()
+        .self_identity(room_owner_key)?
+        .map(|identity| identity.member_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "Room not found in local storage, so there is no 'your own' identity to \
+                 default to. Pass a member ID explicitly."
+            )
+        })
 }
 
 /// Decode a base58 room id (owner verifying key) into a `VerifyingKey`.

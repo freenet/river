@@ -170,8 +170,12 @@ riverctl identity import < my-identity.token     # On another machine.
 ```bash
 riverctl member list         <room-owner-vk>
 riverctl member set-nickname <room-owner-vk> "New Nickname"
-riverctl member ban          <room-owner-vk> <member-vk>   # Owner only.
+riverctl member ban          <room-owner-vk> <member-id>
 ```
+
+`member ban` is not owner-only: the room owner can ban anyone, and so can a
+member banning within their own invite subtree, or a deputy of such a member
+(see below).
 
 ### Deputies
 
@@ -187,17 +191,33 @@ riverctl member deputies      <room-owner-vk> [member-id]  # Who has X deputized
 riverctl member deputized-by  <room-owner-vk> <member-id>  # Who has deputized X?
 ```
 
-`member deputies` defaults to your own identity in the room.
+`member deputies` defaults to your own identity in the room (the identity that
+would sign, so `--signing-key-file` applies).
 `member deputized-by` is the one that answers "does this member have moderation
-authority, and from whom?" — the room owner's grant is room-wide, anyone else's
-is limited to their own invite subtree.
+authority, and from whom?" The room owner's grant covers every member; anyone
+else's covers only the members they invited, directly or indirectly, which is
+often nobody.
 
-Both accept `--format json`, emitting `{room_id, direction, subject, grants[]}`
-where each grant carries `deputizer`, `deputy`, `scope`
-(`room-wide` / `invite-subtree`) and `active`. A grant is inactive when either
-party is no longer in the room, which the contract does not honour. `member
-list` also annotates each member with who deputized them, and `debug room-state`
-reports every grant in the room.
+Both accept `--format json`, emitting `{room_id, direction, subject, grants[]}`.
+Each grant carries `deputizer`, `deputy`, `scope` (`room-wide` /
+`invite-subtree`), `reaches_members` (how many members the grant actually
+covers) and `active`. A grant whose deputizer or deputy has left the room is
+reported with `active: false`; the contract does not honour such a grant.
+`in_room` is `true` for the room owner even though the owner never appears in
+the member list.
+
+`member list --format json` gains `deputies` (who this member deputized) and
+`deputized_by` (who deputized them) alongside the existing `member_id` and
+`nickname`. `debug room-state` gains `deputy_grant_count` and `deputy_grants`.
+
+Two caveats worth knowing:
+
+- The read commands reject an ambiguous partial member ID and list the matches;
+  the write commands (`ban`, `deputize`, `revoke-deputy`) still resolve a
+  partial ID to the first match. Pass the full 8-character ID to be certain.
+- Like every riverctl command that reads a room, these fetch through the
+  standard path, which may PUT migrated state or publish a `member_info` heal
+  for your own identity. They never write deputy state.
 
 ## Command reference
 
