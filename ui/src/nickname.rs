@@ -175,6 +175,25 @@ pub fn generate_default_nickname(vk: &VerifyingKey) -> String {
     format!("{first} {last}")
 }
 
+/// Whether `name` is one of the 10,000 handles this module can assign.
+///
+/// Used by [`crate::util::confusable`] to tell an *assigned* name from a
+/// *chosen* one. A member who never typed a nickname is wearing a handle River
+/// derived from their key, so two members holding neighbouring assignments
+/// (`Amber Worm` / `Ember Worm`) is a collision River created, not an imitation
+/// either of them performed — and warning about it would put an impersonation
+/// badge on someone who did nothing.
+///
+/// Deliberately case- and spacing-exact: this answers "could River have
+/// assigned this exact string", not "does this look like a handle". A member
+/// who types `amber worm` chose that name, and is treated as having chosen it.
+pub fn is_generated_handle(name: &str) -> bool {
+    let Some((first, last)) = name.split_once(' ') else {
+        return false;
+    };
+    FIRST_NAMES.contains(&first) && LAST_NAMES.contains(&last)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
