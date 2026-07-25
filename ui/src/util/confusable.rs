@@ -97,7 +97,17 @@
 
 use crate::util::display_name::is_display_hidden;
 use river_core::room_state::member::MemberId;
-use std::collections::HashSet;
+
+/// A `MemberId` no real member can hold, used by [`check_name`] so a test that
+/// does not care about identity still routes through the same per-name
+/// exemption logic production uses.
+///
+/// `MemberId` wraps a `FastHash(i64)`; production ids are BLAKE3-derived from a
+/// verifying key, so `i64::MIN` is not reachable in practice. Nothing depends on
+/// it being unreachable for CORRECTNESS — the worst case is that a test's
+/// candidate is exempted from one protected name — but keeping it out of band
+/// keeps the tests honest.
+const NO_SUCH_MEMBER: MemberId = MemberId(freenet_scaffold::util::FastHash(i64::MIN));
 
 /// How close a name is to a protected one.
 ///
@@ -141,6 +151,10 @@ pub struct ProtectedName {
     pub role: ProtectedRole,
     /// The privileged member's display name, already sanitised.
     pub display_name: String,
+    /// **The member this name was taken from.** The exemption is keyed on this
+    /// rather than on a room-wide "privileged" set: see
+    /// [`ImpersonationChecker::check`].
+    pub source: MemberId,
     visual: String,
     visual_no_space: String,
     case_insensitive: String,
@@ -148,12 +162,13 @@ pub struct ProtectedName {
 }
 
 impl ProtectedName {
-    pub fn new(role: ProtectedRole, display_name: impl Into<String>) -> Self {
+    pub fn new(role: ProtectedRole, display_name: impl Into<String>, source: MemberId) -> Self {
         let display_name = display_name.into();
         let visual = skeleton_with(&display_name, Fold::Visual);
         let case_insensitive = skeleton_with(&display_name, Fold::CaseInsensitive);
         Self {
             role,
+            source,
             visual_no_space: strip_spaces(&visual),
             case_insensitive_no_space: strip_spaces(&case_insensitive),
             visual,
@@ -286,17 +301,11 @@ impl ImpersonationWarning {
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct ImpersonationChecker {
     protected: Vec<ProtectedName>,
-    /// IDs that legitimately hold privilege. A member in this set is never
-    /// warned about — see the module header on why identity comes first.
-    privileged_ids: HashSet<MemberId>,
 }
 
 impl ImpersonationChecker {
-    pub fn new(protected: Vec<ProtectedName>, privileged_ids: HashSet<MemberId>) -> Self {
-        Self {
-            protected,
-            privileged_ids,
-        }
+    pub fn new(protected: Vec<ProtectedName>) -> Self {
+        Self { protected }
     }
 
     /// Whether this checker can ever produce a warning.
@@ -307,24 +316,43 @@ impl ImpersonationChecker {
         self.protected.is_empty()
     }
 
-    /// Whether `id` legitimately holds privilege, and so is never warned about.
-    pub fn is_privileged(&self, id: MemberId) -> bool {
-        self.privileged_ids.contains(&id)
-    }
-
     /// The warning for `display_name` as shown for member `id`, if any.
     ///
     /// `display_name` must be the text actually rendered — i.e. the output of
     /// [`crate::util::display_name::display_nickname`]. Checking the raw
     /// nickname instead would compare something the reader never sees.
+    ///
+    /// ## The exemption is PER-NAME, not per-member
+    ///
+    /// A protected name is skipped only for the member it was **taken from**
+    /// ([`ProtectedName::source`], a `MemberId`, which is derived from a keypair
+    /// and cannot be chosen). The property this guarantees is the narrow, true
+    /// one:
+    ///
+    /// > **A member is never accused of impersonating an identity that is
+    /// > genuinely theirs.**
+    ///
+    /// It is deliberately NOT the broader "anyone privileged is immune from all
+    /// accusations", which is what this used to do and what an attacker
+    /// exploited. Because a room-wide privileged set was built from
+    /// `deputy_badges`, and a member who is a strict ancestor of the viewer can
+    /// deputise a sockpuppet, an attacker could put their sockpuppet INTO that
+    /// set and then name it exactly `"Ian Clarke"` — earning a genuine 🛡 and
+    /// suppressing the ⚠. On the message author line that is worse than shipping
+    /// nothing: the real Ian is the OWNER, whose 👑 renders only in the member
+    /// list, so the fake visually outranked the real one in the conversation.
+    ///
+    /// A consequence worth stating plainly: the room owner who renames
+    /// themselves to a moderator's name IS now flagged, and that is correct —
+    /// the name is not theirs.
     pub fn check(&self, id: MemberId, display_name: &str) -> Option<ImpersonationWarning> {
-        // Identity first. A real moderator must never be flagged, and the only
-        // way to guarantee that is to answer "is this actually them?" before
-        // looking at the name at all.
-        if self.privileged_ids.contains(&id) {
+        let Some(folds) = self.candidate_folds(display_name) else {
             return None;
+        };
+        if let Some(hit) = self.tier_one_for(id, &folds) {
+            return Some(hit);
         }
-        self.check_name(display_name)
+        self.tier_two_for(id, &folds)
     }
 
     /// [`check`](Self::check) restricted to [`ConfusableTier::Identical`].
@@ -340,29 +368,18 @@ impl ImpersonationChecker {
         id: MemberId,
         display_name: &str,
     ) -> Option<ImpersonationWarning> {
-        if self.privileged_ids.contains(&id) {
-            return None;
-        }
         let folds = self.candidate_folds(display_name)?;
-        self.tier_one(&folds)
+        self.tier_one_for(id, &folds)
     }
 
-    /// The name half of [`check`](Self::check), with no identity check.
+    /// The name half of [`check`](Self::check), for a member whose id is not
+    /// among any protected name's source.
     ///
-    /// Exposed for tests. Production callers must use `check` or
-    /// `check_identical`, so the identity-first rule cannot be skipped.
+    /// Exposed for tests only. Production callers must use `check` or
+    /// `check_identical`, so the per-name exemption cannot be skipped —
+    /// `impersonation_checker_uses_the_identity_aware_entry_points` pins that.
     pub fn check_name(&self, display_name: &str) -> Option<ImpersonationWarning> {
-        let Some(folds) = self.candidate_folds(display_name) else {
-            return None;
-        };
-        // Tier 1 across the WHOLE protected set before tier 2, so an exact
-        // skeleton match is always reported as `Identical` even when some other
-        // protected name is a near-miss. Otherwise the reported tier would
-        // depend on the order the protected set happened to be built in.
-        if let Some(hit) = self.tier_one(&folds) {
-            return Some(hit);
-        }
-        self.tier_two(&folds)
+        self.check(NO_SUCH_MEMBER, display_name)
     }
 
     /// Both folds of a candidate name, or `None` when no match is possible.
@@ -385,8 +402,14 @@ impl ImpersonationChecker {
     }
 
     /// An exact match under EITHER fold. See [`Fold`] for why one is not enough.
-    fn tier_one(&self, c: &CandidateFolds) -> Option<ImpersonationWarning> {
+    ///
+    /// Skips any protected name whose `source` is `id` — the per-name exemption
+    /// described on [`check`](Self::check).
+    fn tier_one_for(&self, id: MemberId, c: &CandidateFolds) -> Option<ImpersonationWarning> {
         for p in &self.protected {
+            if p.source == id {
+                continue;
+            }
             let hit = c.visual == p.visual
                 || c.visual_no_space == p.visual_no_space
                 || c.case_insensitive == p.case_insensitive
@@ -404,13 +427,16 @@ impl ImpersonationChecker {
     /// A near-miss under the VISUAL fold. Not rendered by this UI — see
     /// [`check_identical`](Self::check_identical) — but kept, computed and
     /// tested so the tier decision stays reversible and measurable.
-    fn tier_two(&self, c: &CandidateFolds) -> Option<ImpersonationWarning> {
+    fn tier_two_for(&self, id: MemberId, c: &CandidateFolds) -> Option<ImpersonationWarning> {
         let budget = edit_budget(c.visual_chars.len());
         if budget == 0 {
             return None;
         }
         let mut best: Option<ImpersonationWarning> = None;
         for p in &self.protected {
+            if p.source == id {
+                continue;
+            }
             let p_chars: Vec<char> = p.visual.chars().collect();
             if damerau_within(&c.visual_chars, &p_chars, budget) <= budget {
                 // Owner outranks deputy so the more severe impersonation is the
@@ -856,14 +882,11 @@ mod tests {
 
     /// The protected set used by the upstream engine's validation fixture.
     fn fixture() -> ImpersonationChecker {
-        ImpersonationChecker::new(
-            vec![
-                ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke"),
-                ProtectedName::new(ProtectedRole::Owner, "Room Owner"),
-                ProtectedName::new(ProtectedRole::Deputy, "Invite Bot"),
-            ],
-            HashSet::new(),
-        )
+        ImpersonationChecker::new(vec![
+            ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke", mid(101)),
+            ProtectedName::new(ProtectedRole::Owner, "Room Owner", mid(102)),
+            ProtectedName::new(ProtectedRole::Deputy, "Invite Bot", mid(103)),
+        ])
     }
 
     /// **The ported test table.** Every row was validated against the live
@@ -947,34 +970,52 @@ mod tests {
     }
 
     /// Requirement one, and the thing that would be worse to get wrong than to
-    /// ship nothing: the real moderator is resolved by member ID and is never
-    /// the one flagged.
+    /// ship nothing — but stated NARROWLY.
+    ///
+    /// **The invariant changed.** It used to be "a privileged member is never
+    /// warned about, whatever they are called", which an attacker exploited: a
+    /// strict ancestor of the viewer can deputise a sockpuppet, putting it in
+    /// the privileged set, and then name it `"Ian Clarke"` to suppress the
+    /// warning while earning a genuine 🛡. It is now the property that is
+    /// actually true and actually needed:
+    ///
+    /// > A member is never accused of impersonating an identity that is
+    /// > genuinely THEIRS — keyed on `MemberId`, which is unforgeable.
     #[test]
-    fn the_real_privileged_member_is_never_flagged() {
+    fn a_member_is_never_flagged_for_their_own_identity() {
         let real_ian = mid(1);
         let real_owner = mid(2);
         let impostor = mid(3);
-        let checker = ImpersonationChecker::new(
-            vec![
-                ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke"),
-                ProtectedName::new(ProtectedRole::Owner, "Room Owner"),
-            ],
-            HashSet::from([real_ian, real_owner]),
-        );
+        let checker = ImpersonationChecker::new(vec![
+            ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke", real_ian),
+            ProtectedName::new(ProtectedRole::Owner, "Room Owner", real_owner),
+        ]);
 
-        // The real moderator, under their own exact name.
+        // Each under their OWN name, and under folded variants of it.
         assert_eq!(checker.check(real_ian, "Ian Clarke"), None);
-        assert_eq!(checker.check(real_owner, "Room Owner"), None);
-        // A privileged member is safe whatever they call themselves, including
-        // a name that collides with a DIFFERENT protected name — the room owner
-        // renaming themselves "Ian Clarke" is not impersonation.
-        assert_eq!(checker.check(real_owner, "Ian Clarke"), None);
         assert_eq!(checker.check(real_ian, "lan Clarke"), None);
-        assert!(checker.is_privileged(real_ian));
-        assert!(!checker.is_privileged(impostor));
+        assert_eq!(checker.check(real_ian, "IAN CLARKE"), None);
+        assert_eq!(checker.check(real_owner, "Room Owner"), None);
+        assert_eq!(checker.check(real_owner, "R00m 0wner"), None);
+
         // The impostor, under the same names, IS flagged.
         assert!(checker.check(impostor, "Ian Clarke").is_some());
         assert!(checker.check(impostor, "lan Clarke").is_some());
+        assert!(checker.check(impostor, "R00m 0wner").is_some());
+
+        // **The changed half.** Taking a name that is NOT yours is flagged even
+        // when you hold privilege yourself: the owner renaming themselves after
+        // a moderator is impersonation of that moderator, and a deputy renaming
+        // themselves after the owner is impersonation of the owner. Under the
+        // old global exemption both returned `None`, which is the hole.
+        let w = checker
+            .check(real_owner, "Ian Clarke")
+            .expect("the owner taking a moderator's name is flagged");
+        assert_eq!(w.impersonated.display_name, "Ian Clarke");
+        let w = checker
+            .check(real_ian, "Room Owner")
+            .expect("a moderator taking the owner's name is flagged");
+        assert_eq!(w.impersonated.display_name, "Room Owner");
     }
 
     /// Two members with confusable ORDINARY names must not warn about each
@@ -989,7 +1030,7 @@ mod tests {
 
     #[test]
     fn an_empty_protected_set_never_warns() {
-        let checker = ImpersonationChecker::new(Vec::new(), HashSet::new());
+        let checker = ImpersonationChecker::new(Vec::new());
         assert!(checker.is_empty());
         assert_eq!(checker.check(mid(1), "Ian Clarke"), None);
         assert_eq!(checker.check_name("lan Clarke"), None);
@@ -999,10 +1040,11 @@ mod tests {
     /// must not match every name in the room.
     #[test]
     fn an_empty_skeleton_matches_nothing() {
-        let checker = ImpersonationChecker::new(
-            vec![ProtectedName::new(ProtectedRole::Deputy, "\u{1F6E1}")],
-            HashSet::new(),
-        );
+        let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+            ProtectedRole::Deputy,
+            "\u{1F6E1}",
+            mid(106),
+        )]);
         assert_eq!(skeleton("\u{1F6E1}"), "");
         assert_eq!(checker.check_name("Alice"), None);
         assert_eq!(checker.check_name(""), None);
@@ -1014,14 +1056,12 @@ mod tests {
     #[test]
     fn identical_outranks_near_miss_regardless_of_order() {
         let names = [
-            ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke"),
-            ProtectedName::new(ProtectedRole::Deputy, "lan Clarkes"),
+            ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke", mid(107)),
+            ProtectedName::new(ProtectedRole::Deputy, "lan Clarkes", mid(108)),
         ];
         for order in [[0, 1], [1, 0]] {
-            let checker = ImpersonationChecker::new(
-                order.iter().map(|i| names[*i].clone()).collect(),
-                HashSet::new(),
-            );
+            let checker =
+                ImpersonationChecker::new(order.iter().map(|i| names[*i].clone()).collect());
             let w = checker.check_name("Ian Clarke").expect("flagged");
             assert_eq!(w.tier, ConfusableTier::Identical);
             assert_eq!(w.impersonated.display_name, "Ian Clarke");
@@ -1032,13 +1072,13 @@ mod tests {
     /// both roles names the owner — deterministically, not by set order.
     #[test]
     fn owner_outranks_deputy_for_a_near_miss() {
-        let owner = ProtectedName::new(ProtectedRole::Owner, "Alexander Doe");
-        let deputy = ProtectedName::new(ProtectedRole::Deputy, "Alexandra Doe");
+        let owner = ProtectedName::new(ProtectedRole::Owner, "Alexander Doe", mid(109));
+        let deputy = ProtectedName::new(ProtectedRole::Deputy, "Alexandra Doe", mid(110));
         for order in [
             vec![owner.clone(), deputy.clone()],
             vec![deputy.clone(), owner.clone()],
         ] {
-            let checker = ImpersonationChecker::new(order, HashSet::new());
+            let checker = ImpersonationChecker::new(order);
             let w = checker.check_name("Alexanderr Doe").expect("flagged");
             assert_eq!(w.tier, ConfusableTier::NearMiss);
             assert_eq!(w.impersonated.role, ProtectedRole::Owner);
@@ -1049,10 +1089,11 @@ mod tests {
     /// turns most names into most other names.
     #[test]
     fn short_names_require_an_identical_skeleton() {
-        let checker = ImpersonationChecker::new(
-            vec![ProtectedName::new(ProtectedRole::Deputy, "Ada")],
-            HashSet::new(),
-        );
+        let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+            ProtectedRole::Deputy,
+            "Ada",
+            mid(111),
+        )]);
         assert_eq!(checker.check_name("Ida"), None, "one edit, but too short");
         assert_eq!(checker.check_name("Adam"), None);
         // The identical-skeleton path still fires.
@@ -1230,14 +1271,11 @@ mod tests {
     /// people's names is worse than the problem it solves.
     #[test]
     fn real_names_in_other_scripts_are_not_flagged() {
-        let checker = ImpersonationChecker::new(
-            vec![
-                ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke"),
-                ProtectedName::new(ProtectedRole::Owner, "Room Owner"),
-                ProtectedName::new(ProtectedRole::Deputy, "Alice Chen"),
-            ],
-            HashSet::new(),
-        );
+        let checker = ImpersonationChecker::new(vec![
+            ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke", mid(112)),
+            ProtectedName::new(ProtectedRole::Owner, "Room Owner", mid(113)),
+            ProtectedName::new(ProtectedRole::Deputy, "Alice Chen", mid(114)),
+        ]);
         for name in [
             "李小龍",
             "さくら 田中",
@@ -1352,10 +1390,11 @@ mod tests {
             ("Jema", "Jenna"),
             ("Ame", "Anne"),
         ] {
-            let checker = ImpersonationChecker::new(
-                vec![ProtectedName::new(ProtectedRole::Deputy, deputy)],
-                HashSet::new(),
-            );
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                deputy,
+                mid(115),
+            )]);
             assert_eq!(
                 checker.check_name(innocent),
                 None,
@@ -1365,10 +1404,11 @@ mod tests {
         }
         // `rn -> m` and `vv -> w` stay — they ARE confusable at UI sizes, and
         // `rn` is what catches `Roorn Owner`.
-        let checker = ImpersonationChecker::new(
-            vec![ProtectedName::new(ProtectedRole::Owner, "Room Owner")],
-            HashSet::new(),
-        );
+        let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+            ProtectedRole::Owner,
+            "Room Owner",
+            mid(116),
+        )]);
         assert!(checker.check_name("Roorn Owner").is_some());
     }
 
@@ -1390,10 +1430,11 @@ mod tests {
             ("Lina", "Iina"), // Arabic / Finnish
         ] {
             for (deputy, innocent) in [(a, b), (b, a)] {
-                let checker = ImpersonationChecker::new(
-                    vec![ProtectedName::new(ProtectedRole::Deputy, deputy)],
-                    HashSet::new(),
-                );
+                let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                    ProtectedRole::Deputy,
+                    deputy,
+                    mid(117),
+                )]);
                 assert_eq!(
                     checker.check_name(innocent),
                     None,
@@ -1462,10 +1503,11 @@ mod tests {
             ("Boll", "B\u{00F6}ll", "accent stripping"),
             ("Moller", "M\u{00F6}ller", "accent stripping"),
         ] {
-            let checker = ImpersonationChecker::new(
-                vec![ProtectedName::new(ProtectedRole::Deputy, deputy)],
-                HashSet::new(),
-            );
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                deputy,
+                mid(118),
+            )]);
             assert!(
                 checker.check_name(other).is_some(),
                 "{other:?} vs {deputy:?} ({why}) is a KNOWN accepted collision; \
@@ -1480,7 +1522,7 @@ mod tests {
     #[test]
     fn tooltip_names_the_remedy() {
         let deputy = ImpersonationWarning {
-            impersonated: ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke"),
+            impersonated: ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke", mid(119)),
             tier: ConfusableTier::Identical,
         }
         .tooltip();
@@ -1491,7 +1533,7 @@ mod tests {
         );
 
         let owner = ImpersonationWarning {
-            impersonated: ProtectedName::new(ProtectedRole::Owner, "Room Owner"),
+            impersonated: ProtectedName::new(ProtectedRole::Owner, "Room Owner", mid(120)),
             tier: ConfusableTier::NearMiss,
         }
         .tooltip();
@@ -1531,14 +1573,14 @@ mod tests {
         ];
         for role in [ProtectedRole::Deputy, ProtectedRole::Owner] {
             let baseline = ImpersonationWarning {
-                impersonated: ProtectedName::new(role, "Anodyne"),
+                impersonated: ProtectedName::new(role, "Anodyne", mid(1)),
                 tier: ConfusableTier::Identical,
             }
             .tooltip();
 
             for payload in payloads {
                 let tip = ImpersonationWarning {
-                    impersonated: ProtectedName::new(role, payload),
+                    impersonated: ProtectedName::new(role, payload, mid(1)),
                     tier: ConfusableTier::Identical,
                 }
                 .tooltip();
