@@ -43,19 +43,19 @@ test.describe("Nickname inputs reject emoji", () => {
     await expect(error).toHaveText("Nicknames can't contain emoji");
     await expect(nickname).toHaveAttribute("aria-invalid", "true");
 
-    // Submitting is a no-op while invalid — the modal stays open.
-    await page.getByTestId("create-room-submit-button").click();
-    await expect(nickname).toBeVisible();
-    await expect(error).toBeVisible();
+    // Submit is disabled while invalid, matching the accept-invitation modal.
+    const submit = page.getByTestId("create-room-submit-button");
+    await expect(submit).toBeDisabled();
 
-    // Clearing the emoji clears the error again, and NOW the same submit
-    // works. Without this positive control the assertion above would also
-    // pass if the button were broken for some unrelated reason.
+    // Clearing the emoji clears the error and re-enables submit, and the room
+    // is really created. Without this positive control the assertion above
+    // would also pass if the button were broken for an unrelated reason.
     await nickname.fill("Alice");
     await expect(
       page.getByTestId("create-room-nickname-emoji-error"),
     ).toHaveCount(0);
-    await page.getByTestId("create-room-submit-button").click();
+    await expect(submit).toBeEnabled();
+    await submit.click();
     await expect(page.getByTestId("create-room-modal")).toHaveCount(0);
     await expect(page.getByText("Emoji Test Room").first()).toBeVisible();
   });

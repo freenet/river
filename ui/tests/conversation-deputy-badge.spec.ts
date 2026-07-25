@@ -57,7 +57,7 @@ test.describe("Deputy badge on message authors", () => {
     // The deputy here was appointed by the room owner and can ban the viewer.
     await expect(page.locator(BADGE).first()).toHaveAttribute(
       "title",
-      "Deputy (appointed by room owner). Can ban you.",
+      "Deputy (appointed by the room owner). Can ban you.",
     );
 
     // Every badge sits next to the SAME author — the one deputy in this room.
