@@ -23,7 +23,10 @@
 //! not actually enforce.
 //!
 //! This module is READ-ONLY. It never builds a delta and never touches contract
-//! state.
+//! state. It does own one predicate the WRITE path consults —
+//! [`self_removing_ban_reason`] (freenet/river#478) — because the invite-subtree
+//! walk it needs already lives here as [`invite_subtrees`]; it is still a pure
+//! query over a fetched state.
 
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::{AuthorizedMember, MemberId, MembersV1};
@@ -483,6 +486,11 @@ fn invite_subtrees(state: &ChatRoomStateV1) -> HashMap<MemberId, HashSet<MemberI
 /// PLUS their entire transitive invite subtree — exactly what the contract's
 /// `check_banned_members` inserts (the banned user) and then extends with
 /// (`get_downstream_members`).
+///
+/// Builds every subtree to read one, which is deliberate: [`invite_subtrees`] is
+/// the already-tested walk, carries the cycle guard the contract omits, and a
+/// room is small enough that a one-off single-root variant would only be a
+/// second thing to keep correct.
 pub fn ban_removal_set(state: &ChatRoomStateV1, target: MemberId) -> HashSet<MemberId> {
     let mut removed = invite_subtrees(state).remove(&target).unwrap_or_default();
     removed.insert(target);
