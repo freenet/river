@@ -83,8 +83,13 @@ pub fn NotificationModal() -> Element {
             class: "fixed inset-0 z-50 flex items-center justify-center",
             div {
                 class: "absolute inset-0 bg-black/50",
+                // Signal mutation from an event handler must be deferred
+                // (dioxus-signal-safety: direct writes here are the Firefox
+                // mobile RefCell re-entrancy crash path).
                 onclick: move |_| {
-                    NOTIFICATION_MODAL.write().room = None;
+                    crate::util::defer(move || {
+                        NOTIFICATION_MODAL.write().room = None;
+                    });
                 }
             }
             // Content — compact (max-w-sm), just the mode picker.
@@ -98,8 +103,12 @@ pub fn NotificationModal() -> Element {
                             "data-testid": "notification-modal-close",
                             class: "p-1.5 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
                             "aria-label": "Close",
+                            // Deferred close — same signal-safety rule as the
+                            // backdrop handler above.
                             onclick: move |_| {
-                                NOTIFICATION_MODAL.write().room = None;
+                                crate::util::defer(move || {
+                                    NOTIFICATION_MODAL.write().room = None;
+                                });
                             },
                             Icon { icon: FaXmark, width: 16, height: 16 }
                         }
