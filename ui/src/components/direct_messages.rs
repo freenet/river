@@ -256,9 +256,6 @@ pub enum SendDmOutcome {
     /// drop the DM. See `dm_thread_modal.rs`'s `SilentDrop` arm for the
     /// full diagnostic — same root cause.
     SenderMissingRejoin,
-    /// The per-pair cap is at the limit; sending another DM would be
-    /// silently dropped by the contract.
-    CapHit,
     /// Body encoding failed (CBOR serialize error) or the resulting
     /// envelope exceeds `MAX_DM_CIPHERTEXT_BYTES`. Carries the error
     /// string from the underlying helper.
@@ -308,9 +305,7 @@ pub async fn send_structured_dm(
     use crate::components::app::chat_delegate::{save_outbound_dm, unhide_dm_thread};
     use crate::components::app::{mark_needs_sync, ROOMS};
     use freenet_scaffold::ComposableState;
-    use river_core::room_state::direct_messages::{
-        compose_direct_message, pair_message_count, DirectMessagesDelta, MAX_DM_MESSAGES_PER_PAIR,
-    };
+    use river_core::room_state::direct_messages::{compose_direct_message, DirectMessagesDelta};
     use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
     // Snapshot what we need from ROOMS. The pre-flight reads go
@@ -373,10 +368,9 @@ pub async fn send_structured_dm(
                     None => return PreflightOutcome::Reject(SendDmOutcome::RecipientNotMember),
                 }
             };
-            let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
-            if existing >= MAX_DM_MESSAGES_PER_PAIR {
-                return PreflightOutcome::Reject(SendDmOutcome::CapHit);
-            }
+            // NO per-pair cap guard — the contract's cap is newest-N now, so a
+            // send at the cap succeeds (evicting the pair's oldest) instead of
+            // being silently dropped. See `dm.rs`'s note for the full rationale.
             // Rejoin bundle: matches `dm_thread_modal.rs::do_send`.
             // Bug #1 (Ivvor, 2026-05-16) — pruned-but-invited senders
             // silently fail without this.
@@ -458,11 +452,6 @@ pub async fn send_structured_dm(
             let Some(rd) = rooms.map.get_mut(&room) else {
                 return SendDmOutcome::RoomGone;
             };
-            if pair_message_count(&rd.room_state.direct_messages, self_id, peer)
-                >= MAX_DM_MESSAGES_PER_PAIR
-            {
-                return SendDmOutcome::CapHit;
-            }
             let parent = rd.room_state.clone();
             if let Err(e) = rd.room_state.apply_delta(&parent, &params, &Some(delta)) {
                 return SendDmOutcome::DeltaFailed(format!("{:?}", e));

@@ -38,7 +38,6 @@ use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
 use proptest::prelude::*;
 use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
-use rand::rngs::OsRng;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::direct_messages::{
     sign_direct_message, AuthorizedDirectMessage, DirectMessagesDelta, DirectMessagesV1,
@@ -102,15 +101,25 @@ fn fixture() -> &'static Fixture {
 }
 
 fn build_fixture() -> Fixture {
-    let owner_sk = SigningKey::generate(&mut OsRng);
+    // FIXED seeds, not `SigningKey::generate(&mut OsRng)`.
+    //
+    // `MessageId` is a hash of the signature, so random keys make every
+    // `MessageId` — and therefore the `(time, id)` tiebreak that
+    // `MSG_PER_TIMESTAMP = 2` exists to exercise — different on every run. The
+    // same goes for `MemberId`, which orders `DmPairHorizon`. With random keys
+    // the module doc's "a failure reproduces by re-running" would be false: the
+    // deterministic RNG would replay the same INDEX choices against different
+    // underlying ids, and `failure_persistence: None` saves nothing to fall
+    // back on. Matches `summary_determinism_test.rs`, which seeds the same way.
+    let owner_sk = SigningKey::from_bytes(&[7u8; 32]);
     let owner_vk = owner_sk.verifying_key();
     let owner_id = MemberId::from(&owner_vk);
 
-    let author_sk = SigningKey::generate(&mut OsRng);
+    let author_sk = SigningKey::from_bytes(&[11u8; 32]);
     let author_vk = author_sk.verifying_key();
     let author_id = MemberId::from(&author_vk);
 
-    let peer_sk = SigningKey::generate(&mut OsRng);
+    let peer_sk = SigningKey::from_bytes(&[23u8; 32]);
     let peer_vk = peer_sk.verifying_key();
     let peer_id = MemberId::from(&peer_vk);
 
@@ -853,6 +862,21 @@ fn absorbing_two_dm_peers_is_associative() {
 }
 
 /// Self-merge is the identity for DMs too.
+///
+/// **STRUCTURALLY WEAK — it cannot fail for any mutation of the DM trim or the
+/// pair horizon, and must not be counted as covering them.** A self-merge
+/// produces `delta == None`, and `DirectMessagesV1::apply_delta` early-returns
+/// on `None` after `sort_state`, *before* `trim_pairs_to_cap` — so neither the
+/// trim nor the horizon filter is on this path at all.
+///
+/// Kept because it is the base case of the monoid and would catch a `delta`
+/// that offered entries the receiver already holds. Labelled explicitly so it
+/// is not mistaken for a retention pin; the load-bearing DM idempotence
+/// property is `re_merging_the_same_dm_peer_changes_neither_state_nor_traffic`
+/// below, which drives a REAL non-empty delta.
+///
+/// (Its messages-side twin, `merging_a_peer_with_itself_is_the_identity`, is
+/// weak for the same reason and is labelled the same way.)
 #[test]
 fn merging_a_dm_peer_with_itself_is_the_identity() {
     let f = fixture();
@@ -872,6 +896,50 @@ fn merging_a_dm_peer_with_itself_is_the_identity() {
         );
         Ok(())
     });
+}
+
+/// Gossip idempotence for DMs: re-merging the SAME neighbour must change
+/// neither state nor traffic.
+///
+/// This is the DM counterpart of
+/// `re_merging_the_same_peer_changes_neither_state_nor_traffic`, and it exists
+/// because the self-merge property above is structurally unable to reach the
+/// trim or the pair horizon. Here the FIRST merge carries a real non-empty
+/// delta, so `apply_delta` runs all the way through `trim_pairs_to_cap`, and
+/// the second merge is the actual fixpoint assertion.
+#[test]
+fn re_merging_the_same_dm_peer_changes_neither_state_nor_traffic() {
+    let f = fixture();
+    let parent = parent_with_cap(MAX_CAP);
+    check(
+        64,
+        (
+            dm_held_indices(),
+            dm_held_indices(),
+            dm_held_indices(),
+            dm_held_indices(),
+        ),
+        |(fwd_a, rev_a, fwd_b, rev_b)| {
+            let mut once = dms_from(&parent, &fwd_a, &rev_a);
+            let b = dms_from(&parent, &fwd_b, &rev_b);
+            once.merge(&parent, &f.params, &b).expect("first merge");
+
+            let mut twice = once.clone();
+            twice.merge(&parent, &f.params, &b).expect("second merge");
+
+            prop_assert_eq!(
+                dm_keys(&twice),
+                dm_keys(&once),
+                "a second merge of the same DM peer changed the retained set"
+            );
+            prop_assert_eq!(
+                b.delta(&parent, &f.params, &twice.summarize(&parent, &f.params)),
+                None,
+                "a second merge of the same DM peer still produced traffic"
+            );
+            Ok(())
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

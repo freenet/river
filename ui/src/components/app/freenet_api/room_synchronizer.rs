@@ -2254,4 +2254,96 @@ mod tests {
              still does its job"
         );
     }
+
+    /// The DM half of the same fix — `pair_horizons.clear()` in
+    /// `outbound_summary`.
+    ///
+    /// This needs its own test because the messages-side test above asserts
+    /// only on `delta.recent_messages`. Deleting the single line
+    /// `summary.direct_messages.pair_horizons.clear()` leaves that test, and
+    /// every other test in the repo, green — while a clock-skewed device's DM
+    /// to an at-capacity pair is silently dropped before the wire. That is the
+    /// exact failure class the messages side was just fixed for, one line away.
+    ///
+    /// `DmPairHorizon` is published per ordered `(sender, recipient)` pair that
+    /// has reached `MAX_DM_MESSAGES_PER_PAIR`, so it is a receiver-published
+    /// quantity for precisely the same reason and must not survive onto the
+    /// outbound path either.
+    #[test]
+    fn outbound_update_is_not_filtered_by_the_senders_own_dm_pair_horizon() {
+        use river_core::room_state::direct_messages::{
+            sign_direct_message, MAX_DM_MESSAGES_PER_PAIR,
+        };
+
+        let (mut room_state, params, owner_sk) = create_test_room();
+
+        let sender_sk = SigningKey::generate(&mut rand::thread_rng());
+        let sender_id = MemberId::from(&sender_sk.verifying_key());
+        let recipient_id = MemberId::from(&owner_sk.verifying_key());
+
+        let dm_at = |ts: u64, tag: u8| {
+            sign_direct_message(
+                &sender_sk,
+                sender_id,
+                recipient_id,
+                &params.owner,
+                ts,
+                vec![tag; 8],
+            )
+            .expect("sign dm")
+        };
+
+        // Fill the ordered pair to capacity so the baseline publishes a real
+        // `DmPairHorizon`. Without this the property is vacuous — a pair below
+        // the cap publishes no entry and nothing could be filtered.
+        for i in 0..MAX_DM_MESSAGES_PER_PAIR {
+            room_state
+                .direct_messages
+                .messages
+                .push(dm_at(5_000 + i as u64, 1));
+        }
+        let baseline = room_state.clone();
+        assert_eq!(
+            baseline.direct_messages.pair_horizons().len(),
+            1,
+            "test premise: the pair must be AT capacity so a horizon is published"
+        );
+
+        // A DM this device just composed whose clock-derived timestamp lands
+        // below everything the baseline's pair retains.
+        let skewed = dm_at(1_000, 2);
+        let mut current = room_state.clone();
+        current.direct_messages.messages.push(skewed.clone());
+
+        let update = compute_update_data(&current, Some(&baseline), &params)
+            .expect("a newly composed DM must produce an outgoing update");
+        let bytes = match update {
+            UpdateData::Delta(d) => d.into_bytes(),
+            other => panic!("expected a delta, got {other:?}"),
+        };
+        let delta: ChatRoomStateV1Delta =
+            ciborium::de::from_reader(bytes.as_slice()).expect("decode outgoing delta");
+
+        let sent_dms = delta
+            .direct_messages
+            .as_ref()
+            .map(|d| d.new_messages.clone())
+            .unwrap_or_default();
+        assert!(
+            sent_dms
+                .iter()
+                .any(|m| m.sender_signature == skewed.sender_signature),
+            "the locally-composed DM was filtered out of the OUTGOING update by this \
+             device's OWN pair horizon. `pair_horizons` is receiver-published, exactly \
+             like the messages horizon, so it must be cleared in `outbound_summary` — \
+             otherwise a clock-skewed device silently never delivers a DM to any pair \
+             it holds at capacity."
+        );
+        assert_eq!(
+            sent_dms.len(),
+            1,
+            "only the genuinely-new DM should be sent; the signature-set difference \
+             still does its job"
+        );
+    }
 }

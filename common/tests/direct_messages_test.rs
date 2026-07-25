@@ -1626,8 +1626,17 @@ fn apply_delta_silently_drops_oversize_ciphertext() {
     assert!(state.direct_messages.messages.is_empty());
 }
 
+/// The per-pair cap keeps the NEWEST `MAX_DM_MESSAGES_PER_PAIR`, evicting the
+/// oldest — it does NOT drop the arrival.
+///
+/// This test was previously named `apply_delta_silently_drops_per_pair_overflow`
+/// and asserted only `len == MAX`, which stayed green across the first-come-wins
+/// -> newest-N change while its name and failure message asserted the OPPOSITE
+/// of what the code now does. A length check cannot tell "kept the arrival,
+/// evicted the oldest" from "dropped the arrival", so it now asserts on the
+/// SET: the newcomer is present and the displaced oldest is gone.
 #[test]
-fn apply_delta_silently_drops_per_pair_overflow() {
+fn apply_delta_evicts_the_oldest_to_admit_a_newer_message_at_the_pair_cap() {
     let f = make_fixture();
     let mut state = f.state.clone();
     // Pre-fill to the cap.
@@ -1637,8 +1646,10 @@ fn apply_delta_silently_drops_per_pair_overflow() {
             .messages
             .push(dm_at(&f, &f.alice_sk, f.alice_id, f.bob_id, i, b"x"));
     }
-    // One more in a delta - must be dropped, not error out the merge.
-    let overflow = dm_at(
+    // One more in a delta, NEWER than everything held. It must be admitted and
+    // must displace the oldest — never rejected, and never take the pair over
+    // the cap.
+    let newcomer = dm_at(
         &f,
         &f.alice_sk,
         f.alice_id,
@@ -1647,17 +1658,36 @@ fn apply_delta_silently_drops_per_pair_overflow() {
         b"over",
     );
     let delta = DirectMessagesDelta {
-        new_messages: vec![overflow],
+        new_messages: vec![newcomer.clone()],
         advanced_purges: vec![],
     };
     state
         .direct_messages
         .apply_delta(&state.clone(), &f.params, &Some(delta))
-        .expect("apply_delta must NOT fail on per-pair overflow");
+        .expect("apply_delta must NOT fail at the per-pair cap");
+
     assert_eq!(
         state.direct_messages.messages.len(),
         MAX_DM_MESSAGES_PER_PAIR,
-        "overflow message must be silently dropped"
+        "the pair must still be exactly at the cap"
+    );
+    assert!(
+        state
+            .direct_messages
+            .messages
+            .iter()
+            .any(|m| m.sender_signature == newcomer.sender_signature),
+        "the NEWER arrival must be admitted — first-come-wins silently discarded \
+         every later DM once a pair filled up, which is the user-visible half of \
+         the bug this change fixes"
+    );
+    assert!(
+        !state
+            .direct_messages
+            .messages
+            .iter()
+            .any(|m| m.message.timestamp == 0),
+        "and the OLDEST held DM must be the one evicted to make room"
     );
 }
 
