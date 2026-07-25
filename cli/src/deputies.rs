@@ -69,14 +69,28 @@ pub struct DeputyGrant {
     /// How many OTHER members, within this grant's scope, the deputy can ban.
     ///
     /// This is what separates "the grant exists" from "the grant does
-    /// anything". Every candidate is decided by calling
-    /// `MembersV1::is_ban_authorized` itself, so the answer cannot drift from
-    /// what the contract enforces; do NOT reintroduce a local re-derivation of
-    /// its rules, which is what an earlier version got wrong. The scope is the
-    /// grant's: every member for an owner grant, otherwise the deputizer's
-    /// invite subtree. The deputy is excluded from their own count (self-ban is
-    /// contract-permitted but is not moderation authority), and so is the room
-    /// owner, who is never a valid ban target.
+    /// anything". The per-target decision is never re-derived locally: each
+    /// candidate is decided by calling `MembersV1::is_ban_authorized` itself.
+    /// Do NOT reintroduce a local copy of its rules, which is what an earlier
+    /// version got wrong twice. The scope is the grant's: every member for an
+    /// owner grant, otherwise the deputizer's invite subtree.
+    ///
+    /// There are exactly TWO deliberate deviations from the raw predicate, both
+    /// narrowing:
+    ///
+    /// * The deputy is not counted against themselves. `is_ban_authorized` has
+    ///   no `banner == target` check and self-ban really is permitted, but a
+    ///   deputy who can only ban themselves holds no moderation authority, and
+    ///   counting it would give a script filtering `reaches_members > 0` a
+    ///   false positive. Nothing is hidden by this: if the self-ban cascade
+    ///   would remove anyone else, those members are already counted
+    ///   individually (they are the deputy's descendants, hence in scope and
+    ///   authorized via step 2).
+    /// * An inactive grant reports `0` outright, without consulting the
+    ///   predicate at all. See [`Self::active`] for why that is safe.
+    ///
+    /// The room owner needs no exclusion: they are never in `members.members`
+    /// and `is_ban_authorized` refuses `target == owner` outright.
     ///
     /// `0` whenever [`Self::active`] is false, since the contract honours
     /// nothing then. Frequently `0` for a LIVE grant too: most members have
@@ -85,9 +99,13 @@ pub struct DeputyGrant {
     ///
     /// This counts CAPABILITY, not attribution: a target the deputy could also
     /// ban by another route (they are that target's own invite ancestor, say)
-    /// still counts. The alternative would print `0` for an owner-appointed
-    /// moderator who can plainly ban the whole subtree, which is the same class
-    /// of false negative this field exists to avoid.
+    /// still counts, so revoking THIS grant may not change the number. The
+    /// alternative would print `0` for an owner-appointed moderator who can
+    /// plainly ban the whole subtree, which is the same class of false negative
+    /// this field exists to avoid. It also counts DIRECT targets: a ban
+    /// cascades to the target's own invite subtree
+    /// (`MembersV1::get_downstream_members`), so the number understates removal
+    /// blast radius for every target, not just the excluded self.
     pub reaches_members: usize,
     /// Whether the grant is structurally live: both parties are currently in the
     /// room. The load-bearing half is the DEPUTY: `is_ban_authorized` gates both
@@ -525,13 +543,19 @@ pub fn grant_status_line(grant: &DeputyGrant) -> String {
             "active: may ban the only other member in the room (granted by the room owner)"
                 .to_string()
         }
+        // "other members", not "members": the count excludes the deputy, so
+        // the bare form would assert a room size one short of the real one, and
+        // `debug room-state` prints the true member count two lines above it.
         DeputyScope::RoomWide => format!(
-            "active: may ban any of the {} in the room (granted by the room owner)",
-            members(grant.reaches_members)
+            "active: may ban any of the {} other members in the room (granted by the room owner)",
+            grant.reaches_members
         ),
+        // "nobody else": when the deputy is themselves inside the deputizer's
+        // subtree, the contract does authorize them to ban themselves, so the
+        // unqualified form would be false.
         DeputyScope::InviteSubtree if grant.reaches_members == 0 => format!(
-            "active but reaches no one: there is currently nobody in {}'s invite \
-             subtree that this deputy may ban",
+            "active but reaches no one: there is currently nobody else in {}'s \
+             invite subtree that this deputy may ban",
             party_label(&grant.deputizer)
         ),
         DeputyScope::InviteSubtree => format!(
@@ -994,6 +1018,11 @@ mod tests {
             bob_line.contains("reaches no one"),
             "an empty subtree must be stated plainly: {bob_line}"
         );
+        assert!(
+            bob_line.contains("nobody else"),
+            "the deputy CAN ban themselves when they are inside the subtree, so \
+             the unqualified 'nobody' would be false: {bob_line}"
+        );
         assert!(bob_line.contains("Bob"), "{bob_line}");
     }
 
@@ -1026,23 +1055,31 @@ mod tests {
         assert_eq!(sizes.get(&id(&alice)).copied().unwrap_or(0), 1);
         assert_eq!(sizes.get(&id(&bob)).copied().unwrap_or(0), 1);
 
-        // The visited set also stops DOUBLE-COUNTING. `invited_by` is a
-        // function, so a well-formed state gives each member one parent, but a
-        // state carrying two entries for one member with DIFFERENT `invited_by`
-        // makes them a child of two parents, and the descendant below them
-        // would otherwise be reached (and counted) twice.
-        let carol = key(4);
-        let mut duplicated = ChatRoomStateV1::default();
-        push_member(&mut duplicated, &owner, &owner, &alice);
-        push_member(&mut duplicated, &owner, &alice, &bob);
-        push_member(&mut duplicated, &owner, &bob, &carol);
-        // A second entry for bob, invited by the owner this time.
-        push_member(&mut duplicated, &owner, &owner, &bob);
-        let sizes = subtree_sizes(&duplicated);
+        // A cycle the root is NOT part of is what the visited set is for, and
+        // it IS reachable: `invited_by` is only a function while each member id
+        // appears once in `members.members`, and nothing in `MembersV1::verify`
+        // enforces that. A second entry for `alice` naming `bob` as her inviter
+        // closes an alice/bob cycle BELOW the owner, so the walk from `owner`
+        // enters it. `*child != root` does not help there (neither cycle member
+        // is the root); only `seen.insert` gating the push terminates it.
+        //
+        // Run on a worker thread with a deadline so a regression FAILS rather
+        // than hanging the whole test binary.
+        let mut disjoint = ChatRoomStateV1::default();
+        push_member(&mut disjoint, &owner, &owner, &alice);
+        push_member(&mut disjoint, &owner, &alice, &bob);
+        push_member(&mut disjoint, &owner, &bob, &alice);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(subtree_sizes(&disjoint));
+        });
+        let sizes = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("invite_subtrees must terminate on a cycle below the root");
         assert_eq!(
             sizes.get(&id(&owner)).copied(),
-            Some(3),
-            "alice, bob and carol counted once each despite bob appearing twice"
+            Some(2),
+            "the owner reaches alice and bob, each counted once"
         );
 
         // A member who invited themselves must not be counted as their own
@@ -1333,7 +1370,7 @@ mod tests {
         assert!(!grant.active, "the deputizer is not in the room");
         assert_eq!(
             grant.reaches_members, 0,
-            "an inactive grant must report no reach even though the departed \\
+            "an inactive grant must report no reach even though the departed \
              deputizer still has a subtree the contract would authorize"
         );
     }
@@ -1472,7 +1509,11 @@ mod tests {
         let grant = d.grant(id(&owner), id(&deputy));
         assert_eq!(grant.reaches_members, 2);
         let line = grant_status_line(&grant);
-        assert!(line.contains("2 members in the room"), "{line}");
+        assert!(
+            line.contains("2 other members in the room"),
+            "the count excludes the deputy, so the line must not assert a room \
+             size one short of the real one: {line}"
+        );
         assert!(line.contains("room owner"), "{line}");
     }
 
