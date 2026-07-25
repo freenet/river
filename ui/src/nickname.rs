@@ -352,6 +352,7 @@ mod tests {
             "Room Owner",
             "HostFat",
             "Ivvor",
+            "ofansifkapital-xmpp",
             "Bob Smith",
             "Nacho Duart",
             "Hector Santos",

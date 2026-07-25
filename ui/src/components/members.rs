@@ -5790,6 +5790,118 @@ mod tests {
         );
     }
 
+    /// **The live Freenet Official topology, end to end.**
+    ///
+    /// This is the configuration the removed appointer gate broke, and the
+    /// reason it was removed: in the real room every deputy grant is issued by
+    /// `Invite Bot` (`PMAQEUP5`), not by the owner (`NRKA4WVX`) — verified
+    /// 2026-07-25 with `riverctl debug room-state`. Under the gate the
+    /// protected set was `{"Room Owner"}` and every actual moderator's name was
+    /// unprotected, which is exactly the impersonation this feature exists to
+    /// catch.
+    ///
+    /// Named after the real room on purpose: a fixture of anonymous `mod_a` /
+    /// `mod_b` deputised by the owner passes under BOTH policies, which is why
+    /// the gate survived review in the first place.
+    #[test]
+    fn the_live_freenet_official_topology_protects_every_moderator() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let bot_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let mods: Vec<(SigningKey, &str)> =
+            ["Ian Clarke", "HostFat", "Ivvor", "ofansifkapital-xmpp"]
+                .into_iter()
+                .map(|name| (SigningKey::generate(&mut rng), name))
+                .collect();
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        // The bot invited the viewer, so it is a strict ancestor and its grants
+        // are viewer-relevant — the real room's shape.
+        let mut members = vec![
+            authorized_member(&owner_sk, &bot_sk.verifying_key()),
+            member_invited_by(&bot_sk, owner_id, &viewer_sk.verifying_key()),
+        ];
+        let mut records = vec![
+            // The owner deputizes NOBODY. Every grant comes from the bot.
+            signed_member_info(&owner_sk, "Room Owner", vec![]),
+            signed_member_info(
+                &bot_sk,
+                "Invite Bot",
+                mods.iter().map(|(sk, _)| id(sk)).collect(),
+            ),
+            signed_member_info(&viewer_sk, "Viewer", vec![]),
+        ];
+        for (sk, name) in &mods {
+            members.push(member_invited_by(&bot_sk, owner_id, &sk.verifying_key()));
+            records.push(signed_member_info(sk, name, vec![]));
+        }
+        let members = MembersV1 { members };
+        let member_info = MemberInfoV1 {
+            member_info: records,
+        };
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        for (sk, name) in &mods {
+            assert!(
+                badges.contains_key(&id(sk)),
+                "precondition: {name} carries a shield in the viewer's view"
+            );
+        }
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+
+        // An impostor joins under a homoglyph of each moderator's name and of
+        // the owner's. Every one must be flagged.
+        let impostor = MemberId::from(&SigningKey::generate(&mut rng).verifying_key());
+        for spoof in [
+            "\u{0399}an Clarke",          // Greek capital iota — the live attack
+            "lan Clarke",                 // lowercase L
+            "IAN CLARKE",                 // case
+            "Ian Clarke",                 // exact
+            "H0stFat",                    // zero for O
+            "lvvor",                      // lowercase L for capital I
+            "IVVOR",                      // case, through the second fold
+            "\u{2C9E}fansifkapital-xmpp", // Coptic O
+            "R00m 0wner",
+        ] {
+            assert!(
+                impersonation_warning_for_display(&checker, impostor, spoof, None).is_some(),
+                "an impostor wearing {spoof:?} must be flagged — this is the \
+                 exact room the feature was built for"
+            );
+        }
+
+        // ...and every genuine moderator, under their own name, is untouched.
+        for (sk, name) in &mods {
+            assert_eq!(
+                impersonation_warning_for_display(
+                    &checker,
+                    id(sk),
+                    name,
+                    Some(ProtectedRole::Deputy)
+                ),
+                None,
+                "the real {name} must never be badged for their own name"
+            );
+        }
+        assert_eq!(
+            impersonation_warning_for_display(
+                &checker,
+                owner_id,
+                "Room Owner",
+                Some(ProtectedRole::Owner)
+            ),
+            None
+        );
+    }
+
     /// **P3.5 — the guards must be as wide as the matcher they gate.**
     ///
     /// `is_generated_handle` is exact-string; the matcher compares folds. So a
