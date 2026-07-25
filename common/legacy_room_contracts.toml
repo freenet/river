@@ -208,6 +208,6 @@ code_hash = "c53ded28a355cb08c83dab4c3ee95475bbdf661dd1e3ba7b4bbbbe93794f4152"
 
 [[entry]]
 version = "V29"
-description = "Before retention-horizon summaries for capped collections (messages prune/resend loop, #TBD): last generation whose MessagesV1/DirectMessagesV1 delta re-offered messages the receiver would immediately discard"
+description = "Before retention-horizon summaries for capped collections (messages prune/resend loop, freenet/river#485): last generation whose MessagesV1/DirectMessagesV1 delta re-offered messages the receiver would immediately discard"
 date = "2026-07-25"
 code_hash = "5ae5930adf5f8749019d359e5863fae0d24ba11208f20f45e220150f2a05b113"

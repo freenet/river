@@ -656,6 +656,52 @@ pub fn seed_dm_last_seen_if_needed() {
 
 #[cfg(test)]
 mod tests {
+    /// The DM send path in this file must NOT carry a client-side per-pair cap
+    /// guard.
+    ///
+    /// It used to block at `MAX_DM_MESSAGES_PER_PAIR` because the contract's
+    /// cap was first-come-wins and silently discarded the arrival. The cap is
+    /// newest-N now, so a send at the cap succeeds (evicting the pair's oldest).
+    /// Re-adding a block here would leave the user unable to send for a purely
+    /// client-side reason and make the contract fix invisible — and this is the
+    /// UI, so that is nearly the whole population.
+    ///
+    /// Source-scrape rather than behavioural: the send path needs a Dioxus
+    /// runtime and a live node. Three deliberate choices:
+    ///
+    /// * **Whole non-test body, not one function.** The CLI's equivalent pin was
+    ///   first written scoped to `execute_send` while the guard actually lived
+    ///   in `deliver_dm`, so it passed while the guard sat untouched. Scope-by-
+    ///   function is how these go vacuous.
+    /// * **Cut at `mod tests`** so this comment and the assertion below cannot
+    ///   satisfy their own check. Verified: this file has exactly ONE
+    ///   `mod tests`, and it is the real module — the cut point resolving
+    ///   correctly is a property of the file, not a guarantee of the technique.
+    /// * **BOTH symbols**, not just `pair_message_count`. Neither has any
+    ///   legitimate non-test use left in this file, so keying on
+    ///   `MAX_DM_MESSAGES_PER_PAIR` too also catches a hand-rolled
+    ///   `.filter(..).count() >= MAX_DM_MESSAGES_PER_PAIR`, which a
+    ///   symbol-only pin would miss. (The CLI pin cannot do this — it uses the
+    ///   constant legitimately for outbound-cache pruning.)
+    ///
+    /// Residual limitation: a guard that inlines the literal 100 and counts by
+    /// hand still slips past. That is tolerated; every realistic re-add goes
+    /// through one of these two symbols.
+    #[test]
+    fn dm_send_path_has_no_client_side_pair_cap_guard() {
+        let src = include_str!("direct_messages.rs");
+        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        for symbol in ["pair_message_count(", "MAX_DM_MESSAGES_PER_PAIR"] {
+            assert!(
+                !body.contains(symbol),
+                "direct_messages.rs references `{symbol}` outside its test module, which means a \
+                 client-side per-pair DM cap guard has been re-added. The contract \
+                 evicts the pair's oldest DM to admit a newer one now, so blocking \
+                 the send here makes that fix invisible to UI users."
+            );
+        }
+    }
+
     use super::*;
     use crate::room_data::{RoomData, Rooms};
     use ed25519_dalek::{SigningKey, VerifyingKey};
