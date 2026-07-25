@@ -200,16 +200,16 @@ often nobody.
 
 Both accept `--format json`, emitting `{room_id, direction, subject, grants[]}`.
 Each grant carries `deputizer`, `deputy`, `scope` (`room-wide` /
-`invite-subtree`), `active`, and `reaches_members`.
+`invite-subtree`), `active`, and `members_deputy_can_ban`.
 
-`reaches_members` is how many **other** members the grant can currently be used
-against. Each candidate is decided by the contract's own authorization rule
+`members_deputy_can_ban` is how many **other** members this deputy can ban
+within the grant's scope. Each candidate is decided by the contract's own authorization rule
 rather than by a summary of it: `0` for an inactive grant; every other member
 for an owner grant; otherwise the members of the deputizer's invite subtree the
 contract authorizes this deputy to ban. The deputy is never counted against
 themselves — banning yourself is permitted but is not moderation authority. It
 is often `0` even for a live grant, because most members have invited nobody.
-`reaches_members > 0` is the check for "this member actually has moderation
+`members_deputy_can_ban > 0` is the check for "this member actually has moderation
 authority here".
 
 The number counts capability, not attribution: a member this deputy could also
