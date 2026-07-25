@@ -1001,7 +1001,7 @@ pub(crate) fn deputy_badges_for_viewer(
 /// match the member River assigned `Amber Worm`. No attacker is needed — a
 /// moderator who simply styles their own name in lower case would otherwise put
 /// "this member is NOT a moderator" on every member holding that handle.
-/// `a_lowercased_generated_handle_is_not_protected` and
+/// `a_confusable_variant_of_a_generated_handle_is_not_protected` and
 /// `an_unknown_named_deputy_is_not_protected` pin it.
 ///
 /// The identity exemption must never depend on a name: a member filtered out
@@ -5982,7 +5982,7 @@ mod tests {
     /// A deputy whose `member_info` record literally SAYS `Unknown` (or any
     /// fold of it) would flag every member whose record has not synced yet —
     /// simultaneously, with no attacker, during an ordinary sync gap. The
-    /// existing `a_member_without_member_info_is_not_protected` covers a deputy
+    /// existing `a_privileged_member_without_member_info_is_not_protected` covers a deputy
     /// with NO record; this covers one whose record carries the placeholder.
     #[test]
     fn an_unknown_named_deputy_is_not_protected() {

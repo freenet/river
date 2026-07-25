@@ -343,7 +343,7 @@ impl ImpersonationWarning {
     /// The badge stays; the SENTENCE changes to one that is true of both
     /// members, and points at the disambiguator that actually works (the member
     /// ID River shows on hover). Pinned by
-    /// `a_privileged_member_is_never_told_they_are_not_privileged`.
+    /// `crate::components::members::a_shield_and_a_warning_can_both_render`.
     ///
     /// Pinned by `tooltip_contains_no_nickname_content`.
     pub fn tooltip(&self) -> String {
@@ -3118,6 +3118,63 @@ mod tests {
     /// protect different entry points: `sanitize_display_name` is the render-time
     /// strip that `riverctl`-written nicknames go through, and
     /// `contains_hidden_chars` is what the nickname `<input>` rejects.
+    #[test]
+    fn every_cited_pin_test_exists() {
+        // `a_`/`an_`/`the_`/`no_`/`every_`/`only_` plus at least ten more
+        // characters is a sentence-style TEST name in this codebase, never a
+        // field or an ordinary function — verified against the whole tree when
+        // this was written. Anything else in backticks is left alone, so this
+        // cannot start failing on a normal identifier.
+        let sources: [(&str, &str); 5] = [
+            ("confusable.rs", include_str!("confusable.rs")),
+            ("display_name.rs", include_str!("display_name.rs")),
+            ("members.rs", include_str!("../components/members.rs")),
+            (
+                "conversation.rs",
+                include_str!("../components/conversation.rs"),
+            ),
+            ("nickname.rs", include_str!("../nickname.rs")),
+        ];
+        let all: String = sources.iter().map(|(_, s)| *s).collect();
+
+        let mut missing = Vec::new();
+        for (file, src) in sources {
+            for cited in cited_test_names(src) {
+                if !all.contains(&format!("fn {cited}(")) {
+                    missing.push(format!("{file} cites `{cited}`"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these comments cite a pin test that does not exist. That is the \
+             most repeated defect in this feature's history: three separate \
+             comments claimed a mutual-exclusivity pin that was never written, \
+             and the invariant they described was false. Write the test or fix \
+             the citation:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
+    /// Backticked identifiers in `src` that are sentence-style test names.
+    fn cited_test_names(src: &str) -> Vec<String> {
+        const PREFIXES: [&str; 6] = ["a_", "an_", "the_", "no_", "every_", "only_"];
+        let mut out = Vec::new();
+        for chunk in src.split('`').skip(1).step_by(2) {
+            let looks_like_a_test = chunk.len() > 12
+                && PREFIXES.iter().any(|p| chunk.starts_with(p))
+                && chunk
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if looks_like_a_test {
+                out.push(chunk.to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     #[test]
     fn the_warning_glyph_cannot_appear_in_a_nickname() {
         let glyph = WARNING_GLYPH.chars().next().expect("one char");
