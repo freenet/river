@@ -9,7 +9,7 @@ use crate::components::app::{
 };
 use crate::components::members::{
     deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
-    DeputyBadge,
+    privilege_in_view, DeputyBadge,
 };
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
@@ -93,8 +93,14 @@ struct MessageGroup {
     /// both go through
     /// [`crate::components::members::impersonation_warning_for_display`].
     ///
-    /// Mutually exclusive with `author_badge`: a shielded author is a deputy,
-    /// and a deputy is never warned about.
+    /// **NOT mutually exclusive with `author_badge`.** A deputy IS warned about
+    /// when their name collides with another protected name — two deputies
+    /// sharing a name each render 🛡 *and* ⚠ — so both slots can be occupied at
+    /// once and the layout must handle it. The warning renders FIRST, and its
+    /// tooltip switches wording when the flagged member holds privilege (see
+    /// [`ImpersonationWarning::flagged_privilege`]) rather than being
+    /// suppressed: suppression is what a deputised sockpuppet wants.
+    /// `a_shield_and_a_warning_can_both_render` pins the co-occurrence.
     author_impersonation: Option<ImpersonationWarning>,
     is_self: bool,
     first_time: DateTime<Utc>,
@@ -431,7 +437,7 @@ fn resolve_member_nickname(
     member_info
         .canonical(member_id)
         .map(|ami| display_nickname(&ami.member_info.preferred_nickname, secrets))
-        .unwrap_or_else(|| "Unknown".to_string())
+        .unwrap_or_else(|| crate::util::display_name::UNKNOWN_MEMBER.to_string())
 }
 
 /// Group consecutive messages from the same sender within 5 minutes,
@@ -449,6 +455,9 @@ fn group_messages(
     // `impersonation_checker_for_viewer` — passed in rather than built here so
     // the protected set is folded once, not once per call.
     impersonation: &ImpersonationChecker,
+    // The room owner, so an author line can tell whether the member it is
+    // flagging holds privilege themselves — see `privilege_in_view`.
+    owner_id: MemberId,
 ) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
@@ -563,8 +572,18 @@ fn group_messages(
             // Once per GROUP, not once per message: consecutive messages from
             // one author share a header, so the warning is a property of the
             // group.
-            let author_impersonation =
-                impersonation_warning_for_display(impersonation, author_id, &author_name);
+            //
+            // `author_id` is the id of the member whose NAME is on this line.
+            // Passing `self_member_id` compiles and passes every behavioural
+            // test while putting ⚠ on the genuine owner and every genuine
+            // moderator; the argument is pinned by
+            // `impersonation_warning_is_wired_into_both_render_surfaces`.
+            let author_impersonation = impersonation_warning_for_display(
+                impersonation,
+                author_id,
+                &author_name,
+                privilege_in_view(author_id, owner_id, deputy_badges),
+            );
             items.push(DisplayItem::Messages(MessageGroup {
                 author_id,
                 author_name,
@@ -1449,6 +1468,7 @@ pub fn Conversation() -> Element {
                         &member_names,
                         &deputy_badges,
                         &impersonation,
+                        MemberId::from(&key),
                     );
                     return Some((groups, self_member_id, member_names));
                 }
@@ -2971,10 +2991,16 @@ fn MessageGroupComponent(
                             "{group.author_name}"
                         }
                         // Impersonation warning. Sits immediately after the
-                        // name, before the shield slot — the two are mutually
-                        // exclusive (a shielded author is a deputy, and a
-                        // deputy is never warned about), so this is a single
-                        // badge position in practice.
+                        // name, before the shield slot. The two are NOT
+                        // mutually exclusive — two deputies whose names collide
+                        // each carry a shield AND a warning — so these really
+                        // are two badge positions and both can be filled at
+                        // once. Do not collapse them into one slot, and do not
+                        // suppress the warning when a shield is present: a
+                        // deputised sockpuppet carries a genuine shield, and
+                        // suppressing on it is the exact immunity
+                        // `a_deputised_sockpuppet_cannot_suppress_its_own_warning`
+                        // denies.
                         //
                         // The nickname above cannot forge this glyph: U+26A0 is
                         // inside the range `display_name::is_display_hidden`

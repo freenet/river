@@ -98,7 +98,7 @@
 use crate::util::display_name::is_display_hidden;
 use river_core::room_state::member::MemberId;
 
-/// A `MemberId` no real member can hold, used by [`check_name`] so a test that
+/// A `MemberId` no real member can hold, used by `check_name` so a test that
 /// does not care about identity still routes through the same per-name
 /// exemption logic production uses.
 ///
@@ -107,6 +107,7 @@ use river_core::room_state::member::MemberId;
 /// it being unreachable for CORRECTNESS — the worst case is that a test's
 /// candidate is exempted from one protected name — but keeping it out of band
 /// keeps the tests honest.
+#[cfg(test)]
 const NO_SUCH_MEMBER: MemberId = MemberId(freenet_scaffold::util::FastHash(i64::MIN));
 
 /// How close a name is to a protected one.
@@ -144,7 +145,7 @@ pub enum ProtectedRole {
 /// A privileged name that must not be impersonated.
 ///
 /// Carries BOTH folds (see [`Fold`]) plus their space-stripped forms, computed
-/// once at construction. `check_name` is the per-member hot path and must not
+/// once at construction. `check` is the per-member hot path and must not
 /// re-fold or re-allocate per candidate.
 #[derive(Clone, PartialEq, Debug)]
 pub struct ProtectedName {
@@ -226,6 +227,20 @@ pub struct ImpersonationWarning {
     /// [`crate::components::members::impersonation_warning_for_display`], which
     /// applies the tier decision (only `Identical` is shown).
     pub tier: ConfusableTier,
+    /// The privilege the **FLAGGED** member themselves holds in this viewer's
+    /// view, if any.
+    ///
+    /// [`ImpersonationChecker`] cannot know this — it is asked about a name and
+    /// an id, not about the room's badge map — so it always leaves this `None`.
+    /// [`crate::components::members::impersonation_warning_for_display`] fills
+    /// it in, from the same badge map the 🛡 comes from.
+    ///
+    /// It exists because [`tooltip`](Self::tooltip) used to switch on the
+    /// IMPERSONATED role alone and therefore stated as fact something that is
+    /// provably false in two reachable cases: two deputies with colliding names
+    /// each render 🛡 **and** "this member is NOT a moderator", and the room
+    /// owner can render 👑 alongside the same sentence. See the tooltip.
+    pub flagged_privilege: Option<ProtectedRole>,
 }
 
 /// The glyph rendered for a warning.
@@ -277,8 +292,35 @@ impl ImpersonationWarning {
     /// inside one node cannot span two — the approach `DeputyBadge::appointer_names`
     /// takes for the member-info modal. Never join it into this string.
     ///
+    /// ## It must not assert something that is false
+    ///
+    /// The two role sentences below say "this member is NOT a moderator" / "NOT
+    /// the room owner". Both are FALSE whenever the flagged member holds
+    /// privilege themselves, and both cases are reachable without any bug:
+    ///
+    /// * Two deputies whose names collide. Each is in the other's protected set
+    ///   and neither is exempt from the other, so both render 🛡 **and** ⚠.
+    /// * The room owner. `tier_one_for` skips only the protected name whose
+    ///   `source` is the owner, so an owner whose name collides with a deputy's
+    ///   renders 👑 and "this member is NOT a moderator".
+    ///
+    /// Suppressing the badge in those cases is NOT the fix, and must not be
+    /// attempted: a deputised sockpuppet carries a genuine 🛡, so suppression
+    /// hands it exactly the immunity
+    /// `a_deputised_sockpuppet_cannot_suppress_its_own_warning` exists to deny.
+    /// The badge stays; the SENTENCE changes to one that is true of both
+    /// members, and points at the disambiguator that actually works (the member
+    /// ID River shows on hover). Pinned by
+    /// `a_privileged_member_is_never_told_they_are_not_privileged`.
+    ///
     /// Pinned by `tooltip_contains_no_nickname_content`.
     pub fn tooltip(&self) -> String {
+        if self.flagged_privilege.is_some() {
+            return "Name conflict: this member's name is visually the same as \
+                 another member's who also has privileges in this room. Both are \
+                 real; check the member ID shown on hover to tell them apart."
+                .to_string();
+        }
         match self.impersonated.role {
             ProtectedRole::Owner => "Impersonation warning: this member is NOT the room owner, \
                  but their name closely resembles the owner's. The real owner is marked \
@@ -375,9 +417,15 @@ impl ImpersonationChecker {
     /// The name half of [`check`](Self::check), for a member whose id is not
     /// among any protected name's source.
     ///
-    /// Exposed for tests only. Production callers must use `check` or
-    /// `check_identical`, so the per-name exemption cannot be skipped —
-    /// `impersonation_checker_uses_the_identity_aware_entry_points` pins that.
+    /// **`#[cfg(test)]`, and it must stay that way.** It routes through
+    /// [`NO_SUCH_MEMBER`], which matches no real member, so it skips the
+    /// per-name identity exemption entirely: a production caller would flag the
+    /// REAL owner and every REAL deputy for wearing their own names. This used
+    /// to be `pub` with a doc comment asking callers not to use it and a
+    /// citation to a pin test that was never written, in a module carrying
+    /// `#![allow(dead_code)]` — three layers of nothing. A `cfg` attribute is
+    /// the one form of "do not call this from production" the compiler enforces.
+    #[cfg(test)]
     pub fn check_name(&self, display_name: &str) -> Option<ImpersonationWarning> {
         self.check(NO_SUCH_MEMBER, display_name)
     }
@@ -418,6 +466,10 @@ impl ImpersonationChecker {
                 return Some(ImpersonationWarning {
                     impersonated: p.clone(),
                     tier: ConfusableTier::Identical,
+                    // The checker is asked about a name and an id; it has no
+                    // view of the room's badge map, so only the render boundary
+                    // can fill this in. See `flagged_privilege`.
+                    flagged_privilege: None,
                 });
             }
         }
@@ -448,6 +500,7 @@ impl ImpersonationChecker {
                     best = Some(ImpersonationWarning {
                         impersonated: p.clone(),
                         tier: ConfusableTier::NearMiss,
+                        flagged_privilege: None,
                     });
                 }
             }
@@ -495,6 +548,42 @@ fn edit_budget(len: usize) -> usize {
 /// faithful copy of the engine these results were validated against.
 pub fn skeleton(name: &str) -> String {
     skeleton_with(name, Fold::Visual)
+}
+
+/// The space-stripped form of BOTH folds of `name`.
+///
+/// This is the pair a *guard* must compare when it wants to answer "could this
+/// name ever tier-1 match that one?". [`ImpersonationChecker::tier_one_for`]
+/// accepts a hit under any of four comparisons, and the two space-stripped ones
+/// subsume the other two: equality WITH spaces implies equality without them.
+/// So two names that disagree on both of these can never be a tier-1 match, and
+/// two that agree on either always are.
+///
+/// It exists because the filters deciding which names ENTER the protected set
+/// used to compare exact strings while the matcher they gate compares folds — a
+/// guard weaker than the thing it guards, which is not a guard. See
+/// [`crate::components::members::impersonation_checker_for_viewer`].
+pub fn comparison_folds(name: &str) -> [String; 2] {
+    [
+        strip_spaces(&skeleton_with(name, Fold::Visual)),
+        strip_spaces(&skeleton_with(name, Fold::CaseInsensitive)),
+    ]
+}
+
+/// Whether `a` and `b` are a tier-1 (same-skeleton) match under either fold.
+///
+/// The identity-free form of [`ImpersonationChecker::check_identical`], for
+/// guards that compare a candidate against a fixed literal rather than against
+/// the room's protected set.
+pub fn folds_together(a: &str, b: &str) -> bool {
+    let [a_visual, a_case] = comparison_folds(a);
+    if a_visual.is_empty() {
+        // A name that folds to nothing can never match: `candidate_folds`
+        // rejects it before any comparison runs.
+        return false;
+    }
+    let [b_visual, b_case] = comparison_folds(b);
+    a_visual == b_visual || a_case == b_case
 }
 
 /// [`skeleton`] under a chosen [`Fold`]. See that type for why there are two.
@@ -2103,6 +2192,7 @@ mod tests {
         let deputy = ImpersonationWarning {
             impersonated: ProtectedName::new(ProtectedRole::Deputy, "Ian Clarke", mid(119)),
             tier: ConfusableTier::Identical,
+            flagged_privilege: None,
         }
         .tooltip();
         assert!(deputy.contains("is NOT a moderator"), "{deputy}");
@@ -2114,6 +2204,7 @@ mod tests {
         let owner = ImpersonationWarning {
             impersonated: ProtectedName::new(ProtectedRole::Owner, "Room Owner", mid(120)),
             tier: ConfusableTier::NearMiss,
+            flagged_privilege: None,
         }
         .tooltip();
         assert!(owner.contains("is NOT the room owner"), "{owner}");
@@ -2154,6 +2245,7 @@ mod tests {
             let baseline = ImpersonationWarning {
                 impersonated: ProtectedName::new(role, "Anodyne", mid(1)),
                 tier: ConfusableTier::Identical,
+                flagged_privilege: None,
             }
             .tooltip();
 
@@ -2161,6 +2253,7 @@ mod tests {
                 let tip = ImpersonationWarning {
                     impersonated: ProtectedName::new(role, payload, mid(1)),
                     tier: ConfusableTier::Identical,
+                    flagged_privilege: None,
                 }
                 .tooltip();
                 assert_eq!(

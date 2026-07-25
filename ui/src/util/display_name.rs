@@ -117,6 +117,17 @@ use std::collections::HashMap;
 /// distinguishable in the UI.
 pub const UNNAMED: &str = "Unnamed";
 
+/// Shown for a member with no `member_info` record at all.
+///
+/// A constant rather than a literal at each fallback because it is a
+/// CLASS-WIDE name: every member whose record has not synced yet renders as
+/// this string simultaneously (see `.claude/rules/private-rooms.md` and the
+/// `build_member_info_heal` path). Anything that treats a display name as
+/// identifying — [`crate::components::members::impersonation_checker_for_viewer`]
+/// above all — has to be able to name it, or it accuses a dozen members at once
+/// during an ordinary sync gap.
+pub const UNKNOWN_MEMBER: &str = "Unknown";
+
 /// Shown next to a nickname `<input>` whose contents would not survive
 /// [`sanitize_display_name`]. One wording, used by every nickname input, so a
 /// user gets the same explanation wherever they hit it.

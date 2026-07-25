@@ -185,13 +185,104 @@ pub fn generate_default_nickname(vk: &VerifyingKey) -> String {
 /// badge on someone who did nothing.
 ///
 /// Deliberately case- and spacing-exact: this answers "could River have
-/// assigned this exact string", not "does this look like a handle". A member
-/// who types `amber worm` chose that name, and is treated as having chosen it.
+/// assigned this exact string", not "does this look like a handle".
+///
+/// **That makes it the wrong function for the impersonation guard.** Use
+/// [`folds_to_generated_handle`] there — see its doc for why an exact-string
+/// answer is not a usable guard on a fold-based matcher.
 pub fn is_generated_handle(name: &str) -> bool {
     let Some((first, last)) = name.split_once(' ') else {
         return false;
     };
     FIRST_NAMES.contains(&first) && LAST_NAMES.contains(&last)
+}
+
+/// Whether `name` could be a tier-1 confusable match for one of the 10,000
+/// handles this module can assign.
+///
+/// **A guard must be at least as wide as the thing it guards.**
+/// [`is_generated_handle`] compares exact strings; the impersonation matcher it
+/// used to gate compares [`crate::util::confusable::comparison_folds`]. Every
+/// one of `amber worm`, `AMBER WORM`, `AmberWorm`, `Amber\u{3000}Worm`,
+/// `Arnber Worm`, `Amber W0rm` and `Amber Worrn` is "not a generated handle" to
+/// `==`, and every one of them is a tier-1 match for the member River assigned
+/// `Amber Worm`. Letting any of them into the protected set puts "this member is
+/// NOT a moderator" on a member who did nothing at all.
+///
+/// **No attacker is required.** A moderator who styles their own name in lower
+/// case — `cipher daylight` — is enough to accuse every member holding the
+/// handle `Cipher Daylight`. That is exactly the birthday-collision harm the
+/// original exact filter was written to prevent, arriving through the filter.
+///
+/// ## Why this is a per-word split rather than 10,000 skeletons
+///
+/// The space-stripped fold of `"First Last"` is the space-stripped fold of
+/// `"First"` followed by that of `"Last"`: the multi-character confusables
+/// (`rn -> m`, `vv -> w`) run BEFORE spaces are removed, so none of them can
+/// span the word boundary, and no word folds to leading or trailing space. So a
+/// name matches some handle exactly when its fold splits into a folded
+/// FIRST_NAME and a folded LAST_NAME — 200 skeletons to build instead of 20,000,
+/// and a linear scan of split points instead of a 10,000-entry set probe.
+///
+/// `every_generated_handle_is_rejected_by_the_fold_guard` proves the equivalence
+/// the cheap way round: it sweeps all 10,000 handles and requires each to be
+/// rejected.
+pub fn folds_to_generated_handle(name: &str) -> bool {
+    let pools = handle_skeletons();
+    for (fold_index, candidate) in crate::util::confusable::comparison_folds(name)
+        .iter()
+        .enumerate()
+    {
+        if candidate.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = candidate.chars().collect();
+        for split in 1..chars.len() {
+            let head: String = chars[..split].iter().collect();
+            if !pools.first[fold_index].contains(&head) {
+                continue;
+            }
+            let tail: String = chars[split..].iter().collect();
+            if pools.last[fold_index].contains(&tail) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The folded word pools backing [`folds_to_generated_handle`], built once.
+///
+/// Indexed by fold: `[0]` is the visual fold, `[1]` the case-insensitive one,
+/// matching the order [`crate::util::confusable::comparison_folds`] returns.
+struct HandleSkeletons {
+    first: [std::collections::HashSet<String>; 2],
+    last: [std::collections::HashSet<String>; 2],
+}
+
+fn handle_skeletons() -> &'static HandleSkeletons {
+    static POOLS: std::sync::OnceLock<HandleSkeletons> = std::sync::OnceLock::new();
+    POOLS.get_or_init(|| {
+        let fold_pool = |words: &[&str]| {
+            let mut sets = [
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            ];
+            for word in words {
+                for (i, folded) in crate::util::confusable::comparison_folds(word)
+                    .into_iter()
+                    .enumerate()
+                {
+                    sets[i].insert(folded);
+                }
+            }
+            sets
+        };
+        HandleSkeletons {
+            first: fold_pool(&FIRST_NAMES),
+            last: fold_pool(&LAST_NAMES),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -205,6 +296,71 @@ mod tests {
         FIRST_NAMES
             .iter()
             .flat_map(|first| LAST_NAMES.iter().map(move |last| format!("{first} {last}")))
+    }
+
+    /// The per-word split in [`folds_to_generated_handle`] must agree with the
+    /// 10,000-skeleton set it stands in for. Proved the cheap way round: every
+    /// handle River can assign is rejected.
+    #[test]
+    fn every_generated_handle_is_rejected_by_the_fold_guard() {
+        for handle in all_handles() {
+            assert!(
+                folds_to_generated_handle(&handle),
+                "River can assign `{handle}`, so it must never enter the \
+                 protected set"
+            );
+        }
+    }
+
+    /// The guard has to be WIDER than [`is_generated_handle`], not merely
+    /// different: every variant here is a tier-1 confusable match for a handle
+    /// River assigns, and every one of them is `!= ` that handle.
+    #[test]
+    fn confusable_variants_of_a_handle_are_rejected_by_the_fold_guard() {
+        for styled in [
+            "amber worm",
+            "AMBER WORM",
+            "AmberWorm",
+            "Amber\u{3000}Worm",
+            "Arnber Worm",
+            "Amber W0rm",
+            "Amber Worrn",
+            "\u{0410}mber Worm", // Cyrillic А
+            "cipher daylight",
+        ] {
+            assert!(
+                !is_generated_handle(styled),
+                "precondition: `{styled}` is not an EXACT handle, which is why \
+                 the exact filter passed it"
+            );
+            assert!(
+                folds_to_generated_handle(styled),
+                "`{styled}` tier-1 matches a handle River assigns, so it must \
+                 not enter the protected set"
+            );
+        }
+    }
+
+    /// ...and not so wide that ordinary chosen names are swallowed. A guard
+    /// that rejects everything protects nobody, which is the failure mode the
+    /// appointer gate had.
+    #[test]
+    fn ordinary_names_are_not_rejected_by_the_fold_guard() {
+        for chosen in [
+            "Ian Clarke",
+            "Invite Bot",
+            "Room Owner",
+            "HostFat",
+            "Ivvor",
+            "Bob Smith",
+            "Nacho Duart",
+            "Hector Santos",
+        ] {
+            assert!(
+                !folds_to_generated_handle(chosen),
+                "`{chosen}` is a chosen name and must stay protectable"
+            );
+        }
     }
 
     #[test]
