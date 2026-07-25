@@ -75,6 +75,23 @@
 //!   the set of ordinary names that fold onto a moderator's — tiny. The
 //!   `no_false_positives_on_ordinary_names` and
 //!   `generated_handles_never_fold_to_the_same_skeleton` tests are the guard.
+//! * **Latin accents are stripped, which is more aggressive than TR39** and is
+//!   an accepted trade rather than an oversight. `Müller`/`Muller`,
+//!   `Böll`/`Boll` and `Möller`/`Moller` are distinct family names and DO
+//!   collide; stripping is what catches `Ìan Clarke`. Likewise `rn -> m` is a
+//!   real confusable that also collides `Marnie`/`Mamie` and `Lorna`/`Loma`.
+//!   Both are listed in `documented_accepted_collisions`, which fails if either
+//!   silently stops holding — the point is that the accepted list is short,
+//!   named, and testable rather than discovered by an accused member.
+//! * **The accent strip is Latin-only.** `is_combining_mark` covers the Latin
+//!   combining ranges but NOT Hebrew niqqud (U+0591..U+05C7), Arabic harakat
+//!   (U+064B..U+065F), or Devanagari/Thai vowel signs. So a Hebrew or Arabic
+//!   name is compared with its marks intact. That is inconsistent, and it is
+//!   also a bypass in principle (marks a reader barely sees are not folded
+//!   away). It is left as-is deliberately: those marks are far more often
+//!   meaning-bearing than the Latin ones, and widening the strip is exactly the
+//!   kind of change that starts flagging real people in scripts this codebase
+//!   has no test corpus for. Revisit only with a corpus.
 //! * This module compares names. It does not, and cannot, tell you whether the
 //!   person behind an unflagged name is who they say they are.
 
@@ -115,26 +132,73 @@ pub enum ProtectedRole {
 }
 
 /// A privileged name that must not be impersonated.
+///
+/// Carries BOTH folds (see [`Fold`]) plus their space-stripped forms, computed
+/// once at construction. `check_name` is the per-member hot path and must not
+/// re-fold or re-allocate per candidate.
 #[derive(Clone, PartialEq, Debug)]
 pub struct ProtectedName {
     pub role: ProtectedRole,
-    /// The privileged member's display name, already sanitised. Quoted back to
-    /// the reader in the tooltip so the warning names who is being imitated.
+    /// The privileged member's display name, already sanitised.
     pub display_name: String,
-    /// Cached [`skeleton`] of `display_name`.
-    skeleton: String,
+    visual: String,
+    visual_no_space: String,
+    case_insensitive: String,
+    case_insensitive_no_space: String,
 }
 
 impl ProtectedName {
     pub fn new(role: ProtectedRole, display_name: impl Into<String>) -> Self {
         let display_name = display_name.into();
-        let skeleton = skeleton(&display_name);
+        let visual = skeleton_with(&display_name, Fold::Visual);
+        let case_insensitive = skeleton_with(&display_name, Fold::CaseInsensitive);
         Self {
             role,
+            visual_no_space: strip_spaces(&visual),
+            case_insensitive_no_space: strip_spaces(&case_insensitive),
+            visual,
+            case_insensitive,
             display_name,
-            skeleton,
         }
     }
+}
+
+fn strip_spaces(s: &str) -> String {
+    s.chars().filter(|c| *c != ' ').collect()
+}
+
+/// The two skeletons a name folds to. **Both are needed, and neither alone is
+/// sufficient** — this is the fix for a false-positive class found in review.
+///
+/// The bar-shaped characters (`I`, `l`, `1`, `|`, `!`) render identically, and
+/// lowercase `i` does NOT (it has a dot). But case-insensitivity says `I` ≡ `i`.
+/// Composing the two transitively gives `i` ≡ `l`, and then any two names
+/// differing only in `i` vs `l` collide:
+///
+/// * `Ilan` (Hebrew) / `Lian` (Chinese)
+/// * `Alia` (Arabic) / `Alla` (Russian), `Ilya` / `Liya`, `Ila` / `Lia`
+///
+/// That transitive collapse is unavoidable in ONE skeleton: `Ian` ≡ `ian` (case)
+/// and `Ian` ≡ `lan` (the live attack) force `i` ≡ `l`. Verified exhaustively —
+/// every single-skeleton variant either keeps those false positives or breaks a
+/// row of the validated table (moving the fold before the case step drops
+/// `IAN CLARKE`, because capital `L` is then no longer folded).
+///
+/// So the collapse is split across two skeletons and a name matches if EITHER
+/// agrees. Each keeps the bar class as a `'1'` sentinel that never merges with
+/// the letter `i`, so neither one alone equates them:
+///
+/// * [`Fold::Visual`] folds the bar class BEFORE case, so `I` and `l` merge and
+///   lowercase `i` stays distinct. Catches `lan Clarke`, `1an Clarke`,
+///   `Ian CIarke`.
+/// * [`Fold::CaseInsensitive`] folds it AFTER case, so `L`/`l` and `I`/`i` merge
+///   as letters. Catches `IAN CLARKE`, `ian clarke`.
+///
+/// `Ilan`/`Lian` agree under neither, so they are no longer flagged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fold {
+    Visual,
+    CaseInsensitive,
 }
 
 /// The warning shown next to an impersonating member's name.
@@ -263,41 +327,92 @@ impl ImpersonationChecker {
         self.check_name(display_name)
     }
 
+    /// [`check`](Self::check) restricted to [`ConfusableTier::Identical`].
+    ///
+    /// **This is what the UI renders** (see
+    /// [`crate::components::members::impersonation_warning_for_display`]), and
+    /// it exists so the render path never pays for the tier it discards: it
+    /// returns before the Damerau-Levenshtein sweep, which is `O(protected x
+    /// len^2)` with a `Vec` allocation per DP row and runs for every
+    /// NON-matching member on every render — i.e. almost all of them.
+    pub fn check_identical(
+        &self,
+        id: MemberId,
+        display_name: &str,
+    ) -> Option<ImpersonationWarning> {
+        if self.privileged_ids.contains(&id) {
+            return None;
+        }
+        let folds = self.candidate_folds(display_name)?;
+        self.tier_one(&folds)
+    }
+
     /// The name half of [`check`](Self::check), with no identity check.
     ///
-    /// Exposed for tests. Production callers must use `check`, so the
-    /// identity-first rule cannot be skipped.
+    /// Exposed for tests. Production callers must use `check` or
+    /// `check_identical`, so the identity-first rule cannot be skipped.
     pub fn check_name(&self, display_name: &str) -> Option<ImpersonationWarning> {
-        if self.protected.is_empty() {
+        let Some(folds) = self.candidate_folds(display_name) else {
             return None;
-        }
-        let sk = skeleton(display_name);
-        if sk.is_empty() {
-            return None;
-        }
-        let sk_chars: Vec<char> = sk.chars().collect();
-        let sk_no_space: String = sk.chars().filter(|c| *c != ' ').collect();
-
+        };
         // Tier 1 across the WHOLE protected set before tier 2, so an exact
         // skeleton match is always reported as `Identical` even when some other
         // protected name is a near-miss. Otherwise the reported tier would
         // depend on the order the protected set happened to be built in.
+        if let Some(hit) = self.tier_one(&folds) {
+            return Some(hit);
+        }
+        self.tier_two(&folds)
+    }
+
+    /// Both folds of a candidate name, or `None` when no match is possible.
+    fn candidate_folds(&self, display_name: &str) -> Option<CandidateFolds> {
+        if self.protected.is_empty() {
+            return None;
+        }
+        let visual = skeleton_with(display_name, Fold::Visual);
+        if visual.is_empty() {
+            return None;
+        }
+        let case_insensitive = skeleton_with(display_name, Fold::CaseInsensitive);
+        Some(CandidateFolds {
+            visual_no_space: strip_spaces(&visual),
+            case_insensitive_no_space: strip_spaces(&case_insensitive),
+            visual_chars: visual.chars().collect(),
+            visual,
+            case_insensitive,
+        })
+    }
+
+    /// An exact match under EITHER fold. See [`Fold`] for why one is not enough.
+    fn tier_one(&self, c: &CandidateFolds) -> Option<ImpersonationWarning> {
         for p in &self.protected {
-            if sk == p.skeleton || sk_no_space == p.skeleton.replace(' ', "") {
+            let hit = c.visual == p.visual
+                || c.visual_no_space == p.visual_no_space
+                || c.case_insensitive == p.case_insensitive
+                || c.case_insensitive_no_space == p.case_insensitive_no_space;
+            if hit {
                 return Some(ImpersonationWarning {
                     impersonated: p.clone(),
                     tier: ConfusableTier::Identical,
                 });
             }
         }
-        let budget = edit_budget(sk_chars.len());
+        None
+    }
+
+    /// A near-miss under the VISUAL fold. Not rendered by this UI — see
+    /// [`check_identical`](Self::check_identical) — but kept, computed and
+    /// tested so the tier decision stays reversible and measurable.
+    fn tier_two(&self, c: &CandidateFolds) -> Option<ImpersonationWarning> {
+        let budget = edit_budget(c.visual_chars.len());
         if budget == 0 {
             return None;
         }
         let mut best: Option<ImpersonationWarning> = None;
         for p in &self.protected {
-            let p_chars: Vec<char> = p.skeleton.chars().collect();
-            if damerau_within(&sk_chars, &p_chars, budget) <= budget {
+            let p_chars: Vec<char> = p.visual.chars().collect();
+            if damerau_within(&c.visual_chars, &p_chars, budget) <= budget {
                 // Owner outranks deputy so the more severe impersonation is the
                 // one named, and the result does not depend on set order.
                 let better = best.as_ref().is_none_or(|b| {
@@ -313,6 +428,15 @@ impl ImpersonationChecker {
         }
         best
     }
+}
+
+/// A candidate name's folds, computed once per `check`.
+struct CandidateFolds {
+    visual: String,
+    visual_no_space: String,
+    visual_chars: Vec<char>,
+    case_insensitive: String,
+    case_insensitive_no_space: String,
 }
 
 /// How many edits away a name may be and still count as a near-miss.
@@ -344,6 +468,11 @@ fn edit_budget(len: usize) -> usize {
 /// considered; that rule is inert, and is kept only so the fold table stays a
 /// faithful copy of the engine these results were validated against.
 pub fn skeleton(name: &str) -> String {
+    skeleton_with(name, Fold::Visual)
+}
+
+/// [`skeleton`] under a chosen [`Fold`]. See that type for why there are two.
+fn skeleton_with(name: &str, fold: Fold) -> String {
     // 1. Drop what a reader cannot see, and fold presentation-only variants of
     //    ASCII. The invisible set is reused from the display-name table rather
     //    than re-listed here, so the two cannot drift. A hidden character that
@@ -386,13 +515,25 @@ pub fn skeleton(name: &str) -> String {
     //    which are all Latin or Cyrillic.)
     let out: String = out.chars().map(fold_homoglyph).collect();
 
-    // 6. Case.
-    let out = out.to_lowercase();
+    // 6/7. The bar class and case, in the order this [`Fold`] calls for.
+    //
+    //   * `Visual` folds bars FIRST, so capital `I` joins lowercase `l` (both
+    //     are a plain vertical stroke) while lowercase `i` — which has a dot —
+    //     stays a separate letter.
+    //   * `CaseInsensitive` lowercases first, so capital `L` has become `l` and
+    //     capital `I` has become `i` before the bar fold runs; that gives the
+    //     case-variant match without ever equating `i` with `l`.
+    //
+    // Both map the bar class to the SENTINEL `'1'`, never to the letter `i`.
+    // That is the whole point: folding to `i` is what made `Alia` and `Alla`
+    // collide. See [`Fold`].
+    let out = match fold {
+        Fold::Visual => fold_bar_class(&out).to_lowercase(),
+        Fold::CaseInsensitive => fold_bar_class(&out.to_lowercase()),
+    };
 
-    // 7. ASCII confusables. `l`/`1`/`|`/`!` all render as `i` in a sans-serif
-    //    UI font, which is the fold that catches `lan Clarke`. Note both sides
-    //    of a comparison are folded, so `"Clarke"` becomes `"ciarke"` for the
-    //    real moderator too and the match still holds.
+    // 7b. The remaining ASCII confusables, which are case-agnostic (they all
+    //     produce a lowercase letter, which the case step above leaves alone).
     let out: String = out.chars().map(fold_ascii_confusable).collect();
 
     // 8. Multi-character confusables: `rn` reads as `m`, `vv` as `w`.
@@ -423,16 +564,40 @@ pub fn skeleton(name: &str) -> String {
 
 /// Multi-character confusables, applied after the single-character map.
 ///
-/// `cl -> d` is inert: the ASCII map has already rewritten `l` to `i`. It is
-/// retained for fidelity with the upstream engine, and
-/// `skeleton_folds_in_reference_order` pins that it stays inert — reordering
-/// the two steps would change which ordinary names fold onto a moderator's.
-const MULTI_CONFUSABLES: [(&str, &str); 4] = [("rn", "m"), ("cl", "d"), ("vv", "w"), ("nn", "m")];
+/// `cl -> d` is inert: the bar fold has already rewritten `l`. It is retained
+/// for fidelity with the upstream engine, and `skeleton_folds_in_reference_order`
+/// pins that it stays inert.
+///
+/// **`nn -> m` was here and was REMOVED.** `rn` and `vv` are genuine visual
+/// confusables — `rn` really does read as `m` at UI sizes, which is what catches
+/// `Roorn Owner`. `nn` does not: `nn` and `m` are different shapes in every
+/// font, joined at the shoulder or not. And doubled-n is one of the commonest
+/// pairs in given names, so the rule accused a long tail of real people —
+/// `Annie`/`Amie`, `Anna`/`Ama` (Akan), `Hanna`/`Hama`, `Donna`/`Doma`,
+/// `Jenna`/`Jema`. It was a straight loss: no attack needs it, and it fired on
+/// names nobody chose to make confusable. Do not re-add it.
+const MULTI_CONFUSABLES: [(&str, &str); 3] = [("rn", "m"), ("cl", "d"), ("vv", "w")];
 
-/// Single-character ASCII lookalikes.
+/// The bar-shaped characters, folded to a `'1'` sentinel.
+///
+/// Deliberately NOT folded to the letter `i`: `i` has a dot and is a different
+/// shape, and merging them is what made `Alia`/`Alla` and `Ilan`/`Lian` collide.
+/// See [`Fold`]. Which characters are in the class depends on whether the case
+/// step has already run — the caller decides by choosing the [`Fold`].
+fn fold_bar_class(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            // `I` is here for the pre-case pass; after `to_lowercase` it can no
+            // longer appear, so the same table serves both directions.
+            'l' | 'I' | '1' | '|' | '!' => '1',
+            other => other,
+        })
+        .collect()
+}
+
+/// Single-character ASCII lookalikes OTHER than the bar class.
 fn fold_ascii_confusable(c: char) -> char {
     match c {
-        'l' | '1' | '|' | '!' => 'i',
         '0' => 'o',
         '5' | '$' => 's',
         '3' => 'e',
@@ -903,21 +1068,60 @@ mod tests {
     /// `"d"` and change which ordinary names land on a moderator's skeleton.
     #[test]
     fn skeleton_folds_in_reference_order() {
-        assert_eq!(skeleton("Clarke"), "ciarke");
+        // The bar class folds to the `'1'` SENTINEL, never to the letter `i` —
+        // folding to `i` is what made `Alia`/`Alla` collide. See [`Fold`].
+        assert_eq!(skeleton("Clarke"), "c1arke");
         assert_ne!(skeleton("Clarke"), "darke");
         // `rn -> m` is still live, because no earlier rule rewrites r or n.
         assert_eq!(skeleton("Roorn"), "room");
-        assert_eq!(skeleton("Ivvor"), "iwor");
-        assert_eq!(skeleton("Annie"), "amie");
+        assert_eq!(skeleton("Ivvor"), "1wor");
+        // `nn -> m` is GONE: `nn` and `m` are different shapes, and doubled-n is
+        // everywhere in real given names. See `MULTI_CONFUSABLES`.
+        assert_eq!(skeleton("Annie"), "annie");
+        assert_ne!(skeleton("Annie"), skeleton("Amie"));
+    }
+
+    /// The two folds differ exactly where they are supposed to: the visual one
+    /// merges `I` with `l`, the case-insensitive one merges the letter cases.
+    /// Neither equates lowercase `i` with `l`.
+    #[test]
+    fn the_two_folds_split_the_bar_class_from_case() {
+        // Visual: capital I and lowercase l both become the sentinel.
+        assert_eq!(skeleton_with("Ian", Fold::Visual), "1an");
+        assert_eq!(skeleton_with("lan", Fold::Visual), "1an");
+        // ...and lowercase `i` does NOT, so `Ilan` and `Lian` stay apart.
+        assert_eq!(skeleton_with("Ilan", Fold::Visual), "11an");
+        assert_eq!(skeleton_with("Lian", Fold::Visual), "lian");
+        assert_ne!(
+            skeleton_with("Ilan", Fold::Visual),
+            skeleton_with("Lian", Fold::Visual)
+        );
+
+        // Case-insensitive: the case row of the validated table.
+        assert_eq!(
+            skeleton_with("IAN CLARKE", Fold::CaseInsensitive),
+            skeleton_with("Ian Clarke", Fold::CaseInsensitive)
+        );
+        assert_eq!(
+            skeleton_with("ian clarke", Fold::CaseInsensitive),
+            skeleton_with("Ian Clarke", Fold::CaseInsensitive)
+        );
+        // ...and it also keeps `i` and `l` apart.
+        assert_ne!(
+            skeleton_with("Alia", Fold::CaseInsensitive),
+            skeleton_with("Alla", Fold::CaseInsensitive)
+        );
     }
 
     #[test]
-    fn skeleton_normalises_case_space_and_invisibles() {
-        assert_eq!(skeleton("  Ian   Clarke  "), "ian ciarke");
-        assert_eq!(skeleton("IAN CLARKE"), "ian ciarke");
-        assert_eq!(skeleton("Ian\u{00A0}Clarke"), "ian ciarke");
-        assert_eq!(skeleton("Ian\u{3000}Clarke"), "ian ciarke");
-        assert_eq!(skeleton("Ian\u{200B}Clarke"), "ianciarke");
+    fn skeleton_normalises_space_and_invisibles() {
+        assert_eq!(skeleton("  Ian   Clarke  "), "1an c1arke");
+        assert_eq!(skeleton("Ian\u{00A0}Clarke"), "1an c1arke");
+        assert_eq!(skeleton("Ian\u{3000}Clarke"), "1an c1arke");
+        assert_eq!(skeleton("Ian\u{200B}Clarke"), "1anc1arke");
+        // Case is the OTHER fold's job now (see the test above), so the visual
+        // skeleton deliberately does not equate these two.
+        assert_ne!(skeleton("IAN CLARKE"), skeleton("Ian Clarke"));
     }
 
     /// Damerau, not Levenshtein: a swap is one edit.
@@ -1005,16 +1209,18 @@ mod tests {
 
     #[test]
     fn presentation_forms_fold_to_ascii() {
-        // Mathematical bold / sans-serif / italic "Ian".
-        assert_eq!(skeleton("\u{1D408}\u{1D41A}\u{1D427}"), "ian");
-        assert_eq!(skeleton("\u{1D5DC}\u{1D5EE}\u{1D5FB}"), "ian");
-        assert_eq!(skeleton("\u{1D470}\u{1D482}\u{1D48F}"), "ian");
+        // Mathematical bold / sans-serif / italic "Ian". The capital I is in
+        // the bar class, so these fold to the sentinel like any other `I`.
+        assert_eq!(skeleton("\u{1D408}\u{1D41A}\u{1D427}"), "1an");
+        assert_eq!(skeleton("\u{1D5DC}\u{1D5EE}\u{1D5FB}"), "1an");
+        assert_eq!(skeleton("\u{1D470}\u{1D482}\u{1D48F}"), "1an");
+        assert_eq!(skeleton("\u{1D408}\u{1D41A}\u{1D427}"), skeleton("Ian"));
         // Fullwidth.
-        assert_eq!(skeleton("\u{FF29}\u{FF41}\u{FF4E}"), "ian");
+        assert_eq!(skeleton("\u{FF29}\u{FF41}\u{FF4E}"), "1an");
         // Letterlike symbols. U+2113 SCRIPT SMALL L folds to `l`, which the
-        // ASCII map then folds to `i` like any other `l`.
+        // bar fold then folds to the sentinel like any other `l`.
         assert_eq!(skeleton("\u{2115}"), "n");
-        assert_eq!(skeleton("\u{2113}"), "i");
+        assert_eq!(skeleton("\u{2113}"), "1");
     }
 
     /// Real names in other scripts must not fold onto a Latin moderator's name.
@@ -1130,6 +1336,143 @@ mod tests {
              justifies rendering tier 1 only no longer holds — re-examine \
              `members::impersonation_warning_for_display`"
         );
+    }
+
+    /// **Regression: the `nn -> m` fold (removed).** Doubled-n is one of the
+    /// commonest pairs in given names, and `nn` is not visually confusable with
+    /// `m`, so the fold accused a long tail of real people. A deputy named
+    /// `Amie` used to flag every `Annie` in the room.
+    #[test]
+    fn doubled_n_names_are_not_flagged_against_m_names() {
+        for (deputy, innocent) in [
+            ("Amie", "Annie"),
+            ("Ama", "Anna"),
+            ("Hama", "Hanna"),
+            ("Doma", "Donna"),
+            ("Jema", "Jenna"),
+            ("Ame", "Anne"),
+        ] {
+            let checker = ImpersonationChecker::new(
+                vec![ProtectedName::new(ProtectedRole::Deputy, deputy)],
+                HashSet::new(),
+            );
+            assert_eq!(
+                checker.check_name(innocent),
+                None,
+                "{innocent:?} must not be flagged against the deputy {deputy:?}: \
+                 `nn` and `m` are different shapes, and this fired on real names"
+            );
+        }
+        // `rn -> m` and `vv -> w` stay — they ARE confusable at UI sizes, and
+        // `rn` is what catches `Roorn Owner`.
+        let checker = ImpersonationChecker::new(
+            vec![ProtectedName::new(ProtectedRole::Owner, "Room Owner")],
+            HashSet::new(),
+        );
+        assert!(checker.check_name("Roorn Owner").is_some());
+    }
+
+    /// **Regression: the `i`/`l` transitive collapse.** The bar-shaped
+    /// characters render alike and lowercase `i` does not, but case-folding says
+    /// `I` = `i`. Composing them in ONE skeleton equated `i` with `l` and
+    /// collided names from several different languages.
+    ///
+    /// Each pair below is two distinct real names. None may be flagged against
+    /// the other, in EITHER direction (which one is the deputy is arbitrary).
+    #[test]
+    fn bar_and_dotted_i_names_are_not_confused() {
+        for (a, b) in [
+            ("Ilan", "Lian"), // Hebrew / Chinese
+            ("Alia", "Alla"), // Arabic / Russian
+            ("Ilya", "Liya"), // Russian / Chinese
+            ("Ila", "Lia"),   // Sanskrit / Italian
+            ("Lisa", "Iisa"), // English / Finnish
+            ("Lina", "Iina"), // Arabic / Finnish
+        ] {
+            for (deputy, innocent) in [(a, b), (b, a)] {
+                let checker = ImpersonationChecker::new(
+                    vec![ProtectedName::new(ProtectedRole::Deputy, deputy)],
+                    HashSet::new(),
+                );
+                assert_eq!(
+                    checker.check_name(innocent),
+                    None,
+                    "{innocent:?} must not be flagged against the deputy \
+                     {deputy:?} — these are different names, and the collapse \
+                     that equated them is what [`Fold`] splits apart"
+                );
+            }
+        }
+    }
+
+    /// The whole validated table still matches after the two-fold split. This
+    /// is the other half of the bargain: fixing the false positives must not
+    /// cost a single true positive.
+    #[test]
+    fn the_validated_table_survives_the_two_fold_split() {
+        let checker = fixture();
+        for name in [
+            "lan Clarke",
+            "1an Clarke",
+            "|an Clarke",
+            "!an Clarke",
+            "Ian CIarke",
+            "Ian C1arke",
+            "IAN CLARKE",
+            "ian clarke",
+            "iAN cLARKE",
+            "Ian Clark\u{0435}",
+            "Ian\u{200B} Clarke",
+            "I\u{00E0}n Clarke",
+            "Ia\u{0300}n Clarke",
+            "Ian  Clarke",
+            "IanClarke",
+            "\u{0399}an Clarke",
+            "Roorn Owner",
+            "lnvite Bot",
+        ] {
+            assert_eq!(
+                checker.check_name(name).map(|w| w.tier),
+                Some(ConfusableTier::Identical),
+                "{name:?} must still be caught after the fold split"
+            );
+        }
+    }
+
+    /// **Accepted collisions, stated explicitly.** These pairs DO fold together
+    /// and a deputy holding one flags a member holding the other. Each is a
+    /// deliberate trade, recorded here so the cost is visible rather than
+    /// discovered by an accused member:
+    ///
+    /// * `rn` really does read as `m` at UI sizes — this is what catches
+    ///   `Roorn Owner`, and the price is `Marnie`/`Mamie`, `Lorna`/`Loma`.
+    /// * Latin accents are stripped, which is more aggressive than TR39
+    ///   (`Müller`/`Muller`, `Böll`/`Boll` are distinct family names). Stripping
+    ///   is what catches `I\u{00E0}n Clarke`.
+    ///
+    /// If one of these ever stops colliding, this test fails and the trade can
+    /// be re-examined — the point is that the list is short, known and
+    /// deliberate.
+    #[test]
+    fn documented_accepted_collisions() {
+        for (deputy, other, why) in [
+            ("Mamie", "Marnie", "rn reads as m"),
+            ("Loma", "Lorna", "rn reads as m"),
+            ("Muller", "M\u{00FC}ller", "accent stripping"),
+            ("Boll", "B\u{00F6}ll", "accent stripping"),
+            ("Moller", "M\u{00F6}ller", "accent stripping"),
+        ] {
+            let checker = ImpersonationChecker::new(
+                vec![ProtectedName::new(ProtectedRole::Deputy, deputy)],
+                HashSet::new(),
+            );
+            assert!(
+                checker.check_name(other).is_some(),
+                "{other:?} vs {deputy:?} ({why}) is a KNOWN accepted collision; \
+                 if it no longer collides, update this list and the module \
+                 header rather than deleting the row"
+            );
+        }
     }
 
     /// The tooltip must name the remedy, not merely alarm. A bare warning

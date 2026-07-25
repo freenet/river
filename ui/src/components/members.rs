@@ -998,11 +998,36 @@ pub(crate) fn impersonation_checker_for_viewer(
     privileged_ids.insert(owner_id);
 
     // The name this member has CLAIMED, or `None` if they have not claimed one.
+    //
+    // `display_nickname` can return three strings the member never chose, and
+    // ALL THREE must be filtered — each is a pure function of something other
+    // than the nickname, so it is shared by a whole CLASS of members, and
+    // protecting it accuses every one of them at once:
+    //
+    //   * no `member_info` record  -> `"Unknown"`   (the `?` below)
+    //   * sanitises to empty       -> `UNNAMED`
+    //   * decryption failed        -> `"[Encrypted: {len} bytes, v{version}]"`
+    //
+    // The third is the worst. In a private room the viewer's `secrets` map is
+    // `#[serde(skip)]` and rebuilt after every ingestion, so there is a real
+    // window where it is empty or missing a version. During it the owner's name
+    // becomes e.g. `"[Encrypted: 12 bytes, v0]"` — and so does the name of
+    // EVERY member whose nickname is also 12 bytes at v0. In a large room that
+    // is a dozen simultaneous false accusations with no attacker present.
+    //
+    // The unseal is tested DIRECTLY rather than by matching the `"[Encrypted:"`
+    // prefix, so a future change to the placeholder's wording cannot silently
+    // reopen this. (`conversation.rs` filters `UNNAMED` out of mention
+    // autocomplete for the same reason.)
     let claimed_name = |id: MemberId| -> Option<String> {
-        let name = display_nickname(
-            &member_info.canonical(id)?.member_info.preferred_nickname,
-            room_secrets,
-        );
+        let sealed = &member_info.canonical(id)?.member_info.preferred_nickname;
+        if unseal_bytes_with_secrets(sealed, room_secrets).is_err() {
+            return None;
+        }
+        let name = display_nickname(sealed, room_secrets);
+        if name == crate::util::display_name::UNNAMED {
+            return None;
+        }
         (!crate::nickname::is_generated_handle(&name)).then_some(name)
     };
 
@@ -1060,9 +1085,17 @@ pub(crate) fn impersonation_warning_for_display(
     member_id: MemberId,
     display_name: &str,
 ) -> Option<ImpersonationWarning> {
-    checker
-        .check(member_id, display_name)
-        .filter(|w| w.tier == ConfusableTier::Identical)
+    // `check_identical` rather than `check(..).filter(..)`: the filtered form
+    // still ran the full Damerau sweep for every NON-matching member on every
+    // render, in both surfaces, only to throw the result away.
+    let warning = checker.check_identical(member_id, display_name);
+    debug_assert!(
+        warning
+            .as_ref()
+            .is_none_or(|w| w.tier == ConfusableTier::Identical),
+        "only the Identical tier may reach a render surface"
+    );
+    warning
 }
 
 /// [`deputy_badges_for_viewer`] for a SINGLE member.
@@ -4940,16 +4973,293 @@ mod tests {
 
         let badges =
             deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
-        // Precondition: the moderator really does carry a shield in this view,
-        // so a later "not flagged" assertion cannot pass merely because the
-        // protected set came out empty.
+        // Precondition: the moderator really does carry a shield in this view.
         assert!(
             badges.contains_key(&id(&mod_sk)),
             "fixture precondition: the moderator must show a shield to the viewer"
         );
 
         let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+        // **Precondition, and the one that matters for every "is NOT flagged"
+        // test below.** A non-empty shield map does not imply a non-empty
+        // PROTECTED set — `claimed_name` filters placeholder and generated
+        // names, so the checker can come out empty while badges are populated.
+        // Without this, `plainly_different_names_are_not_flagged` and
+        // `legitimate_non_latin_names_are_not_flagged` would both pass against
+        // a checker that can never flag anything.
+        assert!(
+            !checker.is_empty(),
+            "fixture precondition: the protected set must be non-empty, or the \
+             negative assertions below prove nothing"
+        );
         (checker, owner_id, id(&mod_sk), id(&stranger_sk))
+    }
+
+    /// A room whose OWNER and DEPUTY both carry non-Latin names, so the
+    /// cross-script folds are exercised against a non-Latin protected name —
+    /// the direction that actually bites. Every other test protects a Latin
+    /// name, where a Cyrillic candidate can only ever fold *toward* Latin.
+    fn non_latin_fixture() -> (ImpersonationChecker, MemberId) {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let stranger_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &stranger_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                // Cyrillic owner, CJK deputy.
+                signed_member_info(&owner_sk, "Дмитрий Волков", vec![id(&mod_sk)]),
+                signed_member_info(&mod_sk, "李小龍", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&stranger_sk, "Stranger", vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        assert!(badges.contains_key(&id(&mod_sk)));
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+        assert!(!checker.is_empty(), "non-Latin names must be protectable");
+        (checker, id(&stranger_sk))
+    }
+
+    /// A protected name in a non-Latin script is still protected, and still does
+    /// not swallow unrelated names in the same script.
+    #[test]
+    fn a_non_latin_protected_name_is_protected_without_over_matching() {
+        let (checker, stranger) = non_latin_fixture();
+
+        // A Latin-homoglyph attack on the Cyrillic owner: `Дмитрий` with a
+        // Latin `T`-lookalike is not reachable, but the reverse IS — an
+        // attacker who copies the name verbatim collides by construction.
+        assert!(
+            impersonation_warning_for_display(&checker, stranger, "Дмитрий Волков").is_some(),
+            "a verbatim copy of the owner's Cyrillic name must be flagged"
+        );
+        assert!(
+            impersonation_warning_for_display(&checker, stranger, "李小龍").is_some(),
+            "a verbatim copy of the deputy's CJK name must be flagged"
+        );
+
+        // Other real names in the SAME scripts must not be caught.
+        for name in [
+            "Иван Петров",
+            "Ольга Иванова",
+            "Дмитрий Соколов", // shares a given name with the owner only
+            "王小明",
+            "李連杰",
+            "さくら 田中",
+            "Γιώργος Παπαδόπουλος",
+        ] {
+            assert_eq!(
+                impersonation_warning_for_display(&checker, stranger, name),
+                None,
+                "{name:?} is an unrelated name in a protected script and must \
+                 not be flagged"
+            );
+        }
+    }
+
+    /// **Regression: placeholder display names must never be protected.**
+    ///
+    /// `display_nickname` returns `"[Encrypted: {len} bytes, v{version}]"` when
+    /// the unseal fails, which it does whenever the viewer's in-memory
+    /// `secrets` map is missing the version — a real window, because `secrets`
+    /// is `#[serde(skip)]` and rebuilt after every state ingestion.
+    ///
+    /// That string is a pure function of (nickname LENGTH, secret version), so
+    /// it is shared by every member whose nickname is the same length. If it
+    /// entered the protected set, one un-decryptable owner would flag a whole
+    /// CLASS of innocent members at once, with no attacker present.
+    #[test]
+    fn undecryptable_and_placeholder_names_are_never_protected() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+        use river_core::room_state::privacy::SealedBytes;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let a_sk = SigningKey::generate(&mut rng);
+        let b_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+
+        // A private room whose secret this viewer does not hold.
+        let sealed =
+            |len: usize, version: u32| SealedBytes::private(vec![7u8; len], [0u8; 12], version, 3);
+        let signed_sealed = |sk: &SigningKey, nickname: SealedBytes| {
+            use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+            AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo {
+                    member_id: MemberId::from(&sk.verifying_key()),
+                    version: 0,
+                    preferred_nickname: nickname,
+                    deputies: vec![],
+                },
+                sk,
+            )
+        };
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &a_sk.verifying_key()),
+                authorized_member(&owner_sk, &b_sk.verifying_key()),
+            ],
+        };
+        // The owner, the deputy and two ordinary members ALL have 12-byte
+        // nicknames at v0, so all four render the identical placeholder.
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                {
+                    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+                    AuthorizedMemberInfo::new_with_member_key(
+                        MemberInfo {
+                            member_id: owner_id,
+                            version: 0,
+                            preferred_nickname: sealed(12, 0),
+                            deputies: vec![id(&mod_sk)],
+                        },
+                        &owner_sk,
+                    )
+                },
+                signed_sealed(&mod_sk, sealed(12, 0)),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_sealed(&a_sk, sealed(12, 0)),
+                signed_sealed(&b_sk, sealed(12, 0)),
+            ],
+        };
+        let no_secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        // Precondition: they really do all render the same placeholder string,
+        // so a name-based protected set WOULD flag them all.
+        let rendered = |sk: &SigningKey| {
+            display_nickname(
+                &member_info
+                    .canonical(MemberId::from(&sk.verifying_key()))
+                    .expect("record")
+                    .member_info
+                    .preferred_nickname,
+                &no_secrets,
+            )
+        };
+        assert_eq!(rendered(&a_sk), rendered(&mod_sk));
+        assert_eq!(rendered(&a_sk), rendered(&b_sk));
+        assert!(
+            rendered(&a_sk).contains("Encrypted"),
+            "precondition: the undecryptable placeholder is what renders, got {:?}",
+            rendered(&a_sk)
+        );
+
+        let badges = deputy_badges_for_viewer(
+            &members,
+            &member_info,
+            &no_secrets,
+            owner_id,
+            id(&viewer_sk),
+        );
+        assert!(
+            badges.contains_key(&id(&mod_sk)),
+            "precondition: the deputy still carries a shield"
+        );
+        let checker =
+            impersonation_checker_for_viewer(&member_info, &no_secrets, owner_id, &badges);
+
+        // Nothing is protected, so nobody is accused.
+        assert!(
+            checker.is_empty(),
+            "no name in this room is a CLAIMED name, so the protected set must \
+             be empty"
+        );
+        for sk in [&a_sk, &b_sk] {
+            assert_eq!(
+                impersonation_warning_for_display(&checker, id(sk), &rendered(sk)),
+                None,
+                "an ordinary member must not be accused of impersonating an \
+                 owner whose name merely failed to decrypt"
+            );
+        }
+    }
+
+    /// The `UNNAMED` placeholder is the same shape: a deputy whose nickname
+    /// sanitises to nothing would otherwise flag every other member whose
+    /// nickname also sanitises to nothing. `riverctl` writes `member_info`
+    /// directly, so the nickname input's emoji rejection is not a boundary here.
+    #[test]
+    fn an_unnamed_deputy_is_not_protected() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let other_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &other_sk.verifying_key()),
+            ],
+        };
+        // Emoji-only nicknames sanitise to `UNNAMED`.
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                signed_member_info(&mod_sk, "\u{1F6E1}\u{1F451}", vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&other_sk, "\u{2B50}\u{1F3AA}", vec![]),
+            ],
+        };
+        let unnamed = display_nickname(
+            &member_info
+                .canonical(id(&other_sk))
+                .expect("record")
+                .member_info
+                .preferred_nickname,
+            &secrets,
+        );
+        assert_eq!(
+            unnamed,
+            crate::util::display_name::UNNAMED,
+            "precondition: an emoji-only nickname renders as the placeholder"
+        );
+
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+
+        assert_eq!(
+            impersonation_warning_for_display(&checker, id(&other_sk), &unnamed),
+            None,
+            "`UNNAMED` is the placeholder for EVERY blank nickname, so it must \
+             not be a protected name"
+        );
+        // The owner's real name is still protected, so this is not vacuous.
+        assert!(impersonation_warning_for_display(&checker, id(&other_sk), "R00m 0wner").is_some());
     }
 
     /// **The motivating attack.** `Ιan Clarke` with a Greek capital iota
