@@ -45,6 +45,26 @@
 //!   `conversation::mention::duplicate_candidate_names` compares name STRINGS,
 //!   so it does not flag a pair that differs only in kept characters.
 //!
+//!   The two characters kept in context — a joiner between non-ASCII letters,
+//!   and an Ideographic Variation Selector after an ideograph — are the whole
+//!   of that residual. `"李\u{E0100}小龍"` and `"李小龍"` render alike on a font
+//!   with no IVD entry for the sequence, exactly as `"李\u{200D}小龍"` does. It
+//!   is bounded: neither survives after an ASCII, Cyrillic or Hangul letter, so
+//!   a Latin name cannot be cloned this way, and a font that DOES carry the IVD
+//!   entry renders the two differently.
+//!
+//!   **This residual is mitigated, and the mitigation is load-bearing on the
+//!   layering below.** `confusable.rs::skeleton` folds a name for
+//!   impersonation detection by dropping every character [`is_display_hidden`]
+//!   reports, and it consults that function DIRECTLY. Because the variation
+//!   selectors stay inside `is_display_hidden`'s plane-14 range and their
+//!   exception is applied on top, `skeleton` still folds `"李\u{E0100}小龍"` and
+//!   `"李小龍"` to the same value, so the confusable warning fires on exactly
+//!   this residual. Anyone tempted to "simplify" by moving the carve-out INTO
+//!   [`is_display_hidden`] — punching a hole in the range rather than layering
+//!   over it — would silently switch that warning off and make the residual
+//!   undetectable. Do not.
+//!
 //! ## What gets removed
 //!
 //! Emoji and pictographic symbols (the badge-forgery vector), plus two classes
@@ -239,7 +259,16 @@ pub fn is_display_hidden(c: char) -> bool {
         // range on purpose, even though they are the one part of it that is
         // legitimate in a name. Their exception is applied ON TOP, in context,
         // by [`sanitize_display_name`] and [`contains_hidden_chars`] — NOT by
-        // punching a hole here. Two complementary hand-written ranges drift:
+        // punching a hole here. TWO separate things depend on that.
+        //
+        // First, `confusable.rs::skeleton` folds names for impersonation
+        // detection by calling THIS function directly. Keeping the selectors
+        // inside the range is what lets it fold `"李\u{E0100}小龍"` and
+        // `"李小龍"` together, so the confusable warning covers the residual
+        // the in-context exception deliberately leaves open (module header).
+        // Punching a hole here would switch that warning off silently.
+        //
+        // Second, two complementary hand-written ranges drift:
         // narrowing the carve-out by one codepoint leaves a character that is
         // neither stripped nor judged, so it survives verbatim in every name
         // while rendering as nothing. Layering makes that gap impossible, and
@@ -1016,8 +1045,10 @@ mod tests {
     /// circled A: byte-for-byte the attack the block was added to stop.
     #[test]
     fn every_enclosing_mark_is_stripped() {
-        // The complete Me category. If Unicode adds a fourteenth, this list is
-        // the thing to update.
+        // The complete Me category, verified against the Unicode 15.0
+        // character database rather than assembled from memory: these thirteen
+        // are every codepoint with `category == "Me"`. If a later revision adds
+        // a fourteenth, this list is the thing to update.
         const ENCLOSING_MARKS: &[(char, &str)] = &[
             ('\u{0488}', "COMBINING CYRILLIC HUNDRED THOUSANDS SIGN"),
             ('\u{0489}', "COMBINING CYRILLIC MILLIONS SIGN"),
