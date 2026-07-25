@@ -228,19 +228,24 @@ pub fn is_display_hidden(c: char) -> bool {
         // Pictographs, Emoticons, Transport, Supplemental Symbols and
         // Pictographs, Symbols and Pictographs Extended-A. 🛡 is U+1F6E1.
         | 0x1F000..=0x1FAFF
-        // Plane 14's Default_Ignorable range, MINUS the Ideographic Variation
-        // Selectors. `E0000..E0FFF` is the whole set Unicode marks ignorable
-        // in that plane, and the rest of plane 14 (`E1000..EFFFF`) is not
-        // ignorable and is left alone. Naming only the tag block
-        // (`E0000..E007F`, the flag-sequence assembler 🏴󠁧󠁢󠁳󠁣󠁴󠁿) left ~3,700
-        // invisible characters through, each of which clones another member's
-        // rendered name.
+        // Plane 14's Default_Ignorable range. `E0000..E0FFF` is the whole set
+        // Unicode marks ignorable in that plane, and the rest of plane 14
+        // (`E1000..EFFFF`) is not ignorable and is left alone. Naming only the
+        // tag block (`E0000..E007F`, the flag-sequence assembler 🏴󠁧󠁢󠁳󠁣󠁴󠁿) left
+        // ~3,700 invisible characters through, each of which clones another
+        // member's rendered name.
         //
-        // The hole in the middle, `E0100..E01EF`, is deliberate: those DO
-        // select a glyph rather than rendering as nothing, so they are handled
-        // in context by [`sanitize_display_name`] instead. See
-        // [`is_variation_selector_supplement`].
-        | 0xE0000..=0xE00FF | 0xE01F0..=0xE0FFF
+        // The Ideographic Variation Selectors (`E0100..E01EF`) are INSIDE this
+        // range on purpose, even though they are the one part of it that is
+        // legitimate in a name. Their exception is applied ON TOP, in context,
+        // by [`sanitize_display_name`] and [`contains_hidden_chars`] — NOT by
+        // punching a hole here. Two complementary hand-written ranges drift:
+        // narrowing the carve-out by one codepoint leaves a character that is
+        // neither stripped nor judged, so it survives verbatim in every name
+        // while rendering as nothing. Layering makes that gap impossible, and
+        // `no_plane_14_codepoint_escapes_both_the_strip_and_the_carve_out`
+        // fails if anyone splits it again.
+        | 0xE0000..=0xE0FFF
         // Supplementary Private Use Areas A and B.
         | 0xF0000..=0xFFFFD
         | 0x100000..=0x10FFFD
@@ -327,12 +332,25 @@ pub fn contains_hidden_chars(s: &str) -> bool {
 pub fn sanitize_display_name(raw: &str) -> String {
     // 1. Remove the hidden characters. A hidden character that was itself
     //    whitespace becomes a space so words don't run together.
-    let stripped: Vec<char> = raw
-        .chars()
-        .filter_map(|c| match (is_display_hidden(c), c.is_whitespace()) {
-            (true, true) => Some(' '),
-            (true, false) => None,
-            (false, _) => Some(c),
+    //
+    //    A variation selector is judged here rather than by the blanket strip,
+    //    because whether it is a Japanese name or invisible filler depends on
+    //    what precedes it. Same decision, same inputs as
+    //    [`contains_hidden_chars`], so the input check and the render strip
+    //    cannot disagree about a given name.
+    let raw_chars: Vec<char> = raw.chars().collect();
+    let stripped: Vec<char> = raw_chars
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &c)| {
+            if is_variation_selector_supplement(c) {
+                return selects_an_ideograph_variant(&raw_chars, i).then_some(c);
+            }
+            match (is_display_hidden(c), c.is_whitespace()) {
+                (true, true) => Some(' '),
+                (true, false) => None,
+                (false, _) => Some(c),
+            }
         })
         .collect();
 
@@ -350,10 +368,6 @@ pub fn sanitize_display_name(raw: &str) -> String {
     //    A joiner between two non-ASCII letters is still kept, so a CJK name
     //    can still be cloned this way. That is the residual documented in the
     //    module header, and it is the same shape as the homoglyph problem.
-    //
-    //    The same pass drops a variation selector that is not selecting an
-    //    ideograph variant — same rule, same reason: kept where it does real
-    //    work, dropped where it is invisible filler.
     let is_joiner = |c: char| c == '\u{200C}' || c == '\u{200D}';
     let joins_letters =
         |c: Option<&char>| c.is_some_and(|c| !c.is_ascii() && !c.is_whitespace() && !is_joiner(*c));
@@ -361,9 +375,6 @@ pub fn sanitize_display_name(raw: &str) -> String {
         .iter()
         .enumerate()
         .filter(|(i, c)| {
-            if is_variation_selector_supplement(**c) {
-                return selects_an_ideograph_variant(&stripped, *i);
-            }
             !is_joiner(**c)
                 || (*i > 0
                     && joins_letters(stripped.get(i - 1))
@@ -907,10 +918,9 @@ mod tests {
             // Aegean Numbers + Phaistos Disc, 0x10100..=0x101FC.
             ("U+10100 aegean word separator line", '\u{10100}'),
             ("U+101FC phaistos disc sign wavy band", '\u{101FC}'),
-            // Plane 14's Default_Ignorable range, split around the
-            // Ideographic Variation Selectors into 0xE0000..=0xE00FF and
-            // 0xE01F0..=0xE0FFF. All four endpoints, so the carve-out cannot
-            // silently grow to swallow invisible codepoints on either side.
+            // Plane 14's Default_Ignorable range, 0xE0000..=0xE0FFF, plus
+            // 0xE01F0..=0xE0FFF, the two codepoints flanking the
+            // variation-selector carve-out layered on top of it.
             ("U+E0000 reserved tag codepoint", '\u{E0000}'),
             (
                 "U+E00FF reserved, just below the IVS carve-out",
@@ -1106,6 +1116,42 @@ mod tests {
             assert!(
                 !contains_hidden_chars(name),
                 "{label}: the nickname input refused a legitimate Japanese name"
+            );
+        }
+    }
+
+    /// No codepoint in plane 14's Default_Ignorable range may fall through BOTH
+    /// the blanket strip and the context-judged variation-selector carve-out.
+    ///
+    /// The two used to be complementary hand-written ranges
+    /// (`E0000..E00FF | E01F0..E0FFF` in [`is_display_hidden`], `E0100..E01EF`
+    /// in [`is_variation_selector_supplement`]). Mutation testing showed that
+    /// narrowing the carve-out by ONE codepoint left `U+E01EF` in neither: not
+    /// stripped, not judged, kept verbatim in every name while rendering as
+    /// nothing — a free clone vector, and every other test still passed. The
+    /// ranges are now layered rather than complementary, so the gap is
+    /// structurally impossible; this sweep is what fails if anyone splits them
+    /// again.
+    #[test]
+    fn no_plane_14_codepoint_escapes_both_the_strip_and_the_carve_out() {
+        for cp in 0xE0000u32..=0xE0FFF {
+            let c = char::from_u32(cp).expect("all of plane 14 is valid scalars");
+            assert!(
+                is_display_hidden(c) || is_variation_selector_supplement(c),
+                "U+{cp:04X} is neither stripped nor context-judged, so it \
+                 survives verbatim while rendering as nothing"
+            );
+            // The decision that matters: after a non-ideograph, every one of
+            // them must go, whichever of the two paths handles it.
+            let cloned = format!("Ian{c} Clarke");
+            assert_eq!(
+                sanitize_display_name(&cloned),
+                "Ian Clarke",
+                "U+{cp:04X} survived after an ASCII letter and clones a name"
+            );
+            assert!(
+                contains_hidden_chars(&cloned),
+                "U+{cp:04X} is not rejected at the nickname input"
             );
         }
     }
