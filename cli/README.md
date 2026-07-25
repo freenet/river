@@ -173,13 +173,39 @@ riverctl member set-nickname <room-owner-vk> "New Nickname"
 riverctl member ban          <room-owner-vk> <member-vk>   # Owner only.
 ```
 
+### Deputies
+
+A deputy can ban within their deputizer's invite subtree. Deputies are
+**per-deputizer**, not a room-wide flag: "is X a deputy?" is only meaningful as
+"whose deputy is X?", so both queries name the deputizer explicitly.
+
+```bash
+riverctl member deputize      <room-owner-vk> <member-id>  # Grant.
+riverctl member revoke-deputy <room-owner-vk> <member-id>  # Revoke.
+
+riverctl member deputies      <room-owner-vk> [member-id]  # Who has X deputized?
+riverctl member deputized-by  <room-owner-vk> <member-id>  # Who has deputized X?
+```
+
+`member deputies` defaults to your own identity in the room.
+`member deputized-by` is the one that answers "does this member have moderation
+authority, and from whom?" — the room owner's grant is room-wide, anyone else's
+is limited to their own invite subtree.
+
+Both accept `--format json`, emitting `{room_id, direction, subject, grants[]}`
+where each grant carries `deputizer`, `deputy`, `scope`
+(`room-wide` / `invite-subtree`) and `active`. A grant is inactive when either
+party is no longer in the room, which the contract does not honour. `member
+list` also annotates each member with who deputized them, and `debug room-state`
+reports every grant in the room.
+
 ## Command reference
 
 | Group      | Commands                                                                |
 |------------|-------------------------------------------------------------------------|
 | `room`     | `create`, `list`, `join`, `leave`, `republish`, `config`                |
 | `message`  | `send`, `list`, `stream`, `edit`, `delete`, `react`, `unreact`, `reply` |
-| `member`   | `list`, `set-nickname`, `ban`                                           |
+| `member`   | `list`, `set-nickname`, `ban`, `deputize`, `revoke-deputy`, `deputies`, `deputized-by` |
 | `invite`   | `create`, `accept`                                                      |
 | `dm`       | `send`, `list`, `purge`, `accept`                                       |
 | `identity` | `whoami`, `export`, `import`                                            |

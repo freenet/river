@@ -1,4 +1,5 @@
 use crate::api::ApiClient;
+use crate::deputies::{grant_status_line, party_label, DeputyGrant, RoomDeputies};
 use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
@@ -53,6 +54,12 @@ struct RoomStateSummary {
     max_members: usize,
     privacy_mode: String,
     configuration_version: u32,
+    /// Number of `deputizer -> deputy` grants in the room (#410). Deputies are
+    /// per-deputizer, so this counts grants, not "deputy members".
+    deputy_grant_count: usize,
+    /// Every grant, read from the CANONICAL `member_info` record per member so
+    /// a revoked grant lingering in a duplicate record is not reported.
+    deputy_grants: Vec<DeputyGrant>,
 }
 
 #[derive(Serialize)]
@@ -277,7 +284,11 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
         }
         DebugCommands::RoomState { room_owner_key } => {
             let owner_vk = parse_owner_key(&room_owner_key)?;
-            let room_state = api.get_room(&owner_vk, false).await?;
+            let mut room_state = api.get_room(&owner_vk, false).await?;
+            // Private-room nicknames are sealed; collect the local member's
+            // secrets so deputy grants render names rather than ciphertext.
+            let secrets = api.room_display_secrets(&owner_vk, &mut room_state);
+            let deputy_grants = RoomDeputies::new(&room_state, &owner_vk, &secrets).all_grants();
 
             let config = &room_state.configuration.configuration;
             let summary = RoomStateSummary {
@@ -289,6 +300,8 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                 max_members: config.max_members,
                 privacy_mode: format!("{:?}", config.privacy_mode),
                 configuration_version: config.configuration_version,
+                deputy_grant_count: deputy_grants.len(),
+                deputy_grants,
             };
 
             match format {
@@ -305,6 +318,15 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                     );
                     println!("Bans: {} / {}", summary.ban_count, summary.max_user_bans);
                     println!("Messages: {}", summary.message_count);
+                    println!("Deputy grants: {}", summary.deputy_grant_count);
+                    for grant in &summary.deputy_grants {
+                        println!(
+                            "  {} -> {}  {}",
+                            party_label(&grant.deputizer),
+                            party_label(&grant.deputy),
+                            grant_status_line(grant)
+                        );
+                    }
                 }
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&summary)?);
