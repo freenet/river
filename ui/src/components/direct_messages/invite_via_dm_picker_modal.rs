@@ -680,11 +680,6 @@ async fn drive_send(
              invitation before sending an invite DM."
                 .into(),
         ),
-        SendDmOutcome::CapHit => Err(
-            "This thread is full. Ask the recipient to delete some older DMs \
-             from you, then try again."
-                .into(),
-        ),
         SendDmOutcome::BodyTooLargeOrEncodeFailed(e) => Err(format!(
             "Couldn't send invite — body too large or encode failed: {}",
             e

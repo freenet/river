@@ -17,8 +17,8 @@ use clap::Subcommand;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::chat_delegate::OutboundDmEntry;
 use river_core::room_state::direct_messages::{
-    advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
-    PurgeToken, MAX_DM_MESSAGES_PER_PAIR,
+    advance_recipient_purges, compose_direct_message, open_direct_message, PurgeToken,
+    MAX_DM_MESSAGES_PER_PAIR,
 };
 use river_core::room_state::dm_body::{decode_body, encode_body, DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
@@ -306,17 +306,18 @@ async fn deliver_dm(
         ));
     }
 
-    // Per-pair cap: contract `apply_delta` silently drops overflow so we
-    // must surface the cap as a hard error here, otherwise the CLI would
-    // print "DM sent" with nothing actually delivered.
-    let existing = pair_message_count(&room_state.direct_messages, self_id, recipient_id);
-    if existing >= MAX_DM_MESSAGES_PER_PAIR {
-        return Err(anyhow!(
-            "Per-pair DM cap reached ({}/{}). Ask the recipient to purge older DMs from this thread before sending more.",
-            existing,
-            MAX_DM_MESSAGES_PER_PAIR
-        ));
-    }
+    // NO per-pair cap guard here — deliberately.
+    //
+    // This used to hard-error at `MAX_DM_MESSAGES_PER_PAIR`, because the
+    // contract's per-pair cap was first-come-wins: at the cap it silently
+    // DROPPED the arrival, so the CLI would otherwise have printed "DM sent"
+    // with nothing delivered. That is no longer true. The cap is now newest-N
+    // (`trim_pairs_to_cap`): a newer DM is admitted and the pair's OLDEST is
+    // evicted, so the send genuinely succeeds.
+    //
+    // Re-adding a client-side block here would make the contract fix invisible
+    // — the user still could not send, now for a purely client-side reason.
+    // Pinned by `dm_send_has_no_client_side_pair_cap_guard`.
 
     let now = unix_now()?;
     let auth = compose_direct_message(
@@ -1421,6 +1422,38 @@ fn format_unix_local(unix_secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The DM send path must NOT carry a client-side per-pair cap guard.
+    ///
+    /// It used to hard-error at `MAX_DM_MESSAGES_PER_PAIR` because the
+    /// contract's cap was first-come-wins and silently discarded the arrival.
+    /// The cap is newest-N now, so the send genuinely succeeds (evicting the
+    /// pair's oldest). Re-adding a block here would leave the user unable to
+    /// send for a purely client-side reason and make the contract fix
+    /// invisible — which is exactly what shipping riverctl with the stale
+    /// guard would have done.
+    ///
+    /// Source-scrape rather than behavioural because the send path needs a
+    /// live node. Scoped to the WHOLE non-test body, not one function: the
+    /// guard actually lived in `deliver_dm`, not `execute_send`, and a pin
+    /// aimed at the wrong function passes while the guard sits untouched a few
+    /// hundred lines away (this test was written that way first, and mutation
+    /// testing caught it). `pair_message_count` has no other caller in the CLI,
+    /// so the whole-body check is both strongest and cleanest. Cutting at
+    /// `mod tests` keeps this assertion's own text from satisfying it.
+    #[test]
+    fn dm_send_has_no_client_side_pair_cap_guard() {
+        let src = include_str!("dm.rs");
+        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        assert!(
+            !body.contains("pair_message_count("),
+            "cli/src/commands/dm.rs calls pair_message_count() outside the test \
+             module, which means a client-side per-pair cap guard has been \
+             re-added. The contract now evicts the pair's oldest DM to admit a \
+             newer one, so blocking the send here makes that fix invisible to \
+             users — and riverctl would ship the block against the new contract."
+        );
+    }
 
     #[test]
     fn hex_token_round_trip() {

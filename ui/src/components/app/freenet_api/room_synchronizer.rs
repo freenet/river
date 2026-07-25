@@ -28,11 +28,46 @@ use freenet_stdlib::{
 };
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
-use river_core::room_state::message::AuthorizedMessageV1;
+use river_core::room_state::message::{AuthorizedMessageV1, RetentionHorizon};
 use river_core::room_state::privacy::PrivacyMode;
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use river_core::room_state::{
+    ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// CRDT-merge `incoming` into `local`, returning the delta that was applied
+/// (`None` when the two were already in agreement).
+///
+/// This is `ComposableState::merge` unrolled, for one reason: the default
+/// `merge` passes ONE `parent_state` to all three legs, and the three legs want
+/// different things.
+///
+/// * `summarize` must see the SUMMARIZING peer's own state.
+///   `MessagesV1::summarize` reads `max_recent_messages` from it to size its
+///   retention horizon; hand it anything else and the horizon is wrong.
+/// * `delta` deliberately reads nothing from it (the default `merge` would hand
+///   the SENDER's `delta` the RECEIVER's state, so anything read there would be
+///   the wrong peer's), but passing `incoming` keeps the argument honest.
+/// * `apply_delta` ignores its outer `parent_state` entirely — the
+///   `#[composable]` macro clones `self` per field — so the cheap default
+///   sentinel stays, saving a full-state clone per network event
+///   (freenet/river#246).
+///
+/// Returning the delta lets tests assert on what was actually pulled over,
+/// which is the only way to catch a regression that produces the right final
+/// state via the wrong amount of traffic.
+fn merge_incoming_state(
+    local: &mut ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    incoming: &ChatRoomStateV1,
+) -> Result<Option<ChatRoomStateV1Delta>, String> {
+    let summary = local.summarize(local, params);
+    let delta = incoming.delta(incoming, params, &summary);
+    let parent_sentinel = ChatRoomStateV1::default();
+    local.apply_delta(&parent_sentinel, params, &delta)?;
+    Ok(delta)
+}
 
 fn compute_update_data(
     state: &ChatRoomStateV1,
@@ -50,11 +85,103 @@ fn compute_update_data(
     // None, so no upgrade sub-delta is ever emitted here.
     let state = strip_upgrade_pointer(state);
     if let Some(baseline) = baseline {
-        let summary = baseline.summarize(baseline, params);
+        let summary = outbound_summary(baseline, params);
         let delta = state.delta(baseline, params, &summary)?;
         Some(UpdateData::Delta(to_cbor_vec(&delta).into()))
     } else {
         Some(UpdateData::State(to_cbor_vec(&state).into()))
+    }
+}
+
+/// The baseline summary for an OUTGOING update, with every retention horizon
+/// neutralised.
+///
+/// # Why the horizons must not survive here
+///
+/// A retention horizon is a **receiver-published** quantity: it says "do not
+/// offer me entries I would discard on arrival", and it is only meaningful
+/// when the summary came from the peer that will apply the delta.
+///
+/// `compute_update_data`'s `baseline` is NOT a receiver. It is
+/// `last_synced_state` — this device's own snapshot of what it last pushed.
+/// Feeding its horizon to `delta` therefore filters the sender's outgoing
+/// update against the SENDER's own retention window, which is meaningless at
+/// best and lossy at worst:
+///
+/// `message.time` is the browser's wall clock (`get_current_system_time`), so
+/// a device whose clock is behind by more than the room's retention window
+/// composes messages whose `order_key()` sorts at or below its own baseline's
+/// oldest retained key. Those get filtered OUT of the outgoing delta and are
+/// never put on the wire at all. Worse, `compute_update_data` returning `None`
+/// takes the `None` branch in `process_rooms`, which still calls
+/// `sync_info.state_updated(..)` and advances the baseline — so the message is
+/// never retried. It sits in the sender's own UI forever while no other peer
+/// ever sees it.
+///
+/// Before the retention horizon existed, such a message went out and the
+/// contract's own cap-prune decided its fate. Two things changed and both are
+/// regressions: it is now dropped BEFORE the wire, losing the case where
+/// canonical state is below cap and would have KEPT it; and the failure is
+/// silent and purely local.
+///
+/// So the outbound path takes the id-set difference ONLY — exactly the
+/// pre-horizon behaviour — and leaves retention to the contract, which is the
+/// only party that knows the canonical state and the room's real cap. The
+/// horizon still does its job on the RECEIVE path (`merge_incoming_state`),
+/// which is where the summary genuinely belongs to the applying peer.
+///
+/// Pinned by `outbound_update_is_not_filtered_by_the_senders_own_horizon`.
+fn outbound_summary(
+    baseline: &ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+) -> ChatRoomStateV1Summary {
+    // EXHAUSTIVE DESTRUCTURE, deliberately — do not replace this with
+    // `let mut summary = ...; summary.x = ...`.
+    //
+    // This function is a hand-maintained mirror of "which summary fields are
+    // horizon-shaped", and nothing else in the codebase links it to the horizon
+    // definitions. Binding every field by name makes adding a field to
+    // `ChatRoomStateV1Summary` a COMPILE ERROR *at exactly the site that has to
+    // make the keep-or-clear decision*, instead of a silent default-to-keep.
+    //
+    // That is not hypothetical. `MembersV1` (`remove_excess_members`) and
+    // `BansV1` (`max_user_bans`) have the same non-monotonic defect and are
+    // deferred to a follow-up — see "Not fixed here". The moment that follow-up
+    // adds `MembersSummary.horizon`, a struct-update spread here would compile
+    // clean and silently reintroduce this exact bug on a new field: a device
+    // withholding its own member records from every outgoing update, baseline
+    // advancing anyway, never retried.
+    let ChatRoomStateV1Summary {
+        configuration,
+        bans,
+        members,
+        member_info,
+        secrets,
+        mut recent_messages,
+        mut direct_messages,
+        upgrade,
+        version,
+    } = baseline.summarize(baseline, params);
+
+    // The ONLY two horizon-shaped fields today. "Horizon-shaped" means the
+    // field makes the SENDER withhold something it holds and the receiver
+    // lacks; every other field is a pure have-statement (an id set, a version,
+    // a signature map), which is safe — indeed required — to feed from the
+    // sender's own baseline, because that is what makes the delta "what changed
+    // since I last synced".
+    recent_messages.horizon = RetentionHorizon::Open;
+    direct_messages.pair_horizons.clear();
+
+    ChatRoomStateV1Summary {
+        configuration,
+        bans,
+        members,
+        member_info,
+        secrets,
+        recent_messages,
+        direct_messages,
+        upgrade,
+        version,
     }
 }
 
@@ -1130,31 +1257,23 @@ impl RoomSynchronizer {
                 }
 
                 // Update the room state by merging the new state with the
-                // existing one. The `parent_state` arg is dead-code at the
-                // macro/trait level for the `merge` call too — but the proof
-                // shape is slightly different from `apply_delta_inner` and
-                // worth spelling out: the default `ComposableState::merge` in
-                // `freenet-scaffold` calls `self.summarize(parent_state,...)`,
-                // `other.delta(parent_state,...)`, and `self.apply_delta(parent_state,...)`.
-                // The macro-generated `summarize`/`delta` forward `parent_state`
-                // to each field's impl, so safety here ALSO depends on every
-                // field-level `summarize`/`delta` in `common/src/room_state/`
-                // declaring the arg as `_parent_state` (unused) — verified
-                // across all 9 fields. The `apply_delta` leg is protected by
-                // the macro's per-field `self.clone()` as documented on the
-                // `apply_delta_inner` call site above. We pass a cheap default
-                // sentinel rather than cloning the full `room_data.room_state`;
-                // saves one full-state clone per network state-update event.
-                // Together with the equivalent change on the `apply_delta`
-                // path, this chips at the per-event allocation cost that
-                // survived the initial `coalesce_save` fix for
-                // freenet/river#246. The regression test
-                // `merge_with_default_sentinel_parent_matches_merge_with_self_clone_parent`
-                // pins this invariant against future macro / field-impl
-                // refactors that would break the substitution.
-                let parent_sentinel = ChatRoomStateV1::default();
-                match room_data.room_state.merge(
-                    &parent_sentinel,
+                // existing one.
+                //
+                // This used to pass a cheap `ChatRoomStateV1::default()`
+                // sentinel as `parent_state`, on the (then-true) premise that
+                // every field's `summarize`/`delta` declared the arg
+                // `_parent_state`. That premise is DEAD: `MessagesV1::summarize`
+                // now reads `max_recent_messages` from it to size the retention
+                // horizon. Under the sentinel it would read the DEFAULT cap
+                // instead of the room's, understate the horizon, and re-open the
+                // resend loop the horizon exists to close.
+                //
+                // `merge_uses_room_state_as_parent_so_horizon_is_correct` pins
+                // this. The `apply_delta` leg still takes the sentinel — see the
+                // `apply_delta_inner` call site — because the macro ignores its
+                // outer `_parent_state` there and clones `self` per field.
+                match merge_incoming_state(
+                    &mut room_data.room_state,
                     &ChatRoomParametersV1 {
                         owner: room_owner_vk,
                     },
@@ -1522,6 +1641,70 @@ mod tests {
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
     use std::time::SystemTime;
 
+    /// Every `ChatRoomStateV1Delta` field that is `Some`, by name.
+    ///
+    /// The outbound tests build `current` and `baseline` differing in EXACTLY
+    /// one field, so the whole delta must be exactly that one field. Asserting
+    /// per-field instead would miss the failure mode where `outbound_summary`
+    /// over-clears some OTHER field: e.g. adding `summary.bans.clear()` makes
+    /// every outgoing update re-send the full ban list forever, and a test that
+    /// only reads `delta.recent_messages` never notices.
+    fn populated_delta_fields(d: &ChatRoomStateV1Delta) -> Vec<&'static str> {
+        [
+            ("configuration", d.configuration.is_some()),
+            ("bans", d.bans.is_some()),
+            ("members", d.members.is_some()),
+            ("member_info", d.member_info.is_some()),
+            ("secrets", d.secrets.is_some()),
+            ("recent_messages", d.recent_messages.is_some()),
+            ("direct_messages", d.direct_messages.is_some()),
+            ("upgrade", d.upgrade.is_some()),
+            ("version", d.version.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, populated)| *populated)
+        .map(|(name, _)| name)
+        .collect()
+    }
+
+    /// Populate `members` and `bans` so the whole-delta assertion in the
+    /// outbound tests actually has something to bite on.
+    ///
+    /// Without this, `create_test_room()` leaves both empty, so over-clearing
+    /// `summary.bans` in `outbound_summary` produces no ban delta (there are no
+    /// bans to offer) and the assertion passes vacuously — which is exactly what
+    /// happened on the first attempt at that assertion.
+    fn add_members_and_bans(state: &mut ChatRoomStateV1, owner_sk: &SigningKey) {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        use river_core::room_state::member::{AuthorizedMember, Member, MembersV1};
+        use std::time::Duration;
+
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let mut members = Vec::new();
+        for seed in [41u8, 42, 43] {
+            let sk = SigningKey::from_bytes(&[seed; 32]);
+            members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                owner_sk,
+            ));
+        }
+        let banned = MemberId::from(&SigningKey::from_bytes(&[44u8; 32]).verifying_key());
+        state.members = MembersV1 { members };
+        state.bans = BansV1(vec![AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(4_000),
+                banned_user: banned,
+            },
+            owner_id,
+            owner_sk,
+        )]);
+    }
+
     fn create_test_room() -> (ChatRoomStateV1, ChatRoomParametersV1, SigningKey) {
         let owner_sk = SigningKey::generate(&mut rand::thread_rng());
         let owner_vk = owner_sk.verifying_key();
@@ -1786,110 +1969,558 @@ mod tests {
         );
     }
 
-    /// Pin that `merge` with a default-sentinel `parent_state` is
-    /// byte-equivalent to `merge` with `&self.clone()` as `parent_state`,
-    /// for the realistic shapes `update_room_state_inner` actually hands
-    /// to `merge` (existing room state + incoming network state).
+    /// Pin that the incoming-state merge path hands `summarize` the ROOM's
+    /// own state, not a cheap `ChatRoomStateV1::default()` sentinel.
     ///
-    /// This is the regression test for the per-event clone-reduction
-    /// (freenet/river#246 follow-up): we replaced
-    /// `room_state.merge(&room_state.clone(), &params, &incoming)` with
-    /// `room_state.merge(&ChatRoomStateV1::default(), &params, &incoming)`
-    /// on the assumption that `parent_state` is dead-code at the macro
-    /// level. The assumption holds because every field's `summarize` /
-    /// `delta` impl in `common/src/room_state/` takes `_parent_state`
-    /// (unused), and the macro-generated `apply_delta` ignores its outer
-    /// `_parent_state` and uses `self.clone()` per-field instead.
+    /// # History
     ///
-    /// **Discrimination design** (skeptical-review #312 caught the first
-    /// cut of this test was tautological on near-default data): for the
-    /// test to actually catch a future regression where the macro starts
-    /// forwarding the outer `_parent_state` to a field's `apply_delta`,
-    /// the two paths must hand `apply_delta` outer values that DIFFER in
-    /// fields a real-world `apply_delta` impl reads. `MembersV1::apply_delta`
-    /// reads `parent_state.configuration.configuration.max_members` and
-    /// `parent_state.bans`; `MessagesV1::apply_delta` reads
-    /// `max_recent_messages`, `max_message_size`, `privacy_mode`. So
-    /// `state_a` here is set up with a non-default `max_members` AND a
-    /// non-empty `bans` AND an extra non-owner member — any of which is
-    /// enough to make `default()` and `state_a` produce different
-    /// downstream `apply_delta` behavior IF a regression starts plumbing
-    /// the outer arg through.
+    /// `update_room_state_inner` used to call
+    /// `room_state.merge(&ChatRoomStateV1::default(), &params, &incoming)`,
+    /// saving a full-state clone per network event (the freenet/river#246
+    /// follow-up). That was sound only while EVERY field's `summarize`/`delta`
+    /// declared its `parent_state` argument unused — which the predecessor of
+    /// this test asserted.
+    ///
+    /// It is no longer true. `MessagesV1::summarize` reads
+    /// `max_recent_messages` off `parent_state` to size its retention horizon,
+    /// the mechanism that stops a peer being offered messages it would
+    /// immediately prune. Under the sentinel it reads the DEFAULT cap (100)
+    /// instead of the room's, so a room at a smaller cap advertises an OPEN
+    /// horizon, and the sender ships a window of messages the room drops on
+    /// arrival — on every fan-out, forever. That is the loop the horizon
+    /// exists to close.
+    ///
+    /// # Discrimination design
+    ///
+    /// The final STATE is identical either way (the extra messages are pruned
+    /// straight back out), so asserting on post-merge state cannot catch this
+    /// — that is exactly how the regression would slip through. The assertion
+    /// is therefore on the DELTA `merge_incoming_state` returns: with the
+    /// correct parent it must be empty, with the sentinel it is not. Verified
+    /// by mutation: swapping `local.summarize(local, params)` back to
+    /// `local.summarize(&ChatRoomStateV1::default(), params)` fails this test.
     #[test]
-    fn merge_with_default_sentinel_parent_matches_merge_with_self_clone_parent() {
-        use ed25519_dalek::SigningKey;
-        use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+    fn merge_uses_room_state_as_parent_so_horizon_is_correct() {
         use river_core::room_state::configuration::AuthorizedConfigurationV1;
 
-        let (mut state_a, params, owner_sk) = create_test_room();
+        let (mut room_state, params, owner_sk) = create_test_room();
 
-        // Make `state_a` diverge from `ChatRoomStateV1::default()` in
-        // fields that real-world `apply_delta` impls actually read. Any
-        // ONE of these would be enough to discriminate; we use all three
-        // so the test is robust to which field-level impl a future
-        // regression hits.
-        //
-        // 1) Non-default configuration values (`MembersV1` /
-        //    `MemberInfoV1` / `MessagesV1` all read these via parent).
-        let mut new_config = state_a.configuration.configuration.clone();
-        new_config.max_members = 3; // default is 200
-        new_config.max_recent_messages = 5; // default is 100
-        state_a.configuration = AuthorizedConfigurationV1::new(new_config, &owner_sk);
+        // A cap well below the default of 100, so a sentinel parent reads a
+        // materially different value.
+        let mut cfg = room_state.configuration.configuration.clone();
+        cfg.max_recent_messages = 5;
+        room_state.configuration = AuthorizedConfigurationV1::new(cfg, &owner_sk);
 
-        // 2) A non-owner ban — `MembersV1::apply_delta` reads
-        //    `parent_state.bans` to enforce ban-sweep.
-        let banned_member_sk = SigningKey::generate(&mut rand::thread_rng());
-        let banned_member_id = MemberId::from(banned_member_sk.verifying_key());
-        let ban = UserBan {
-            owner_member_id: state_a.configuration.configuration.owner_member_id,
-            banned_at: SystemTime::now(),
-            banned_user: banned_member_id,
+        // Explicit timestamps rather than `add_message`'s `SystemTime::now()`:
+        // the whole point is a strict older/newer split, and two `now()` calls
+        // can land on the same instant, which would make the ordering fall
+        // through to the (random) message-id tiebreak and the test flaky.
+        let at = |state: &mut ChatRoomStateV1, secs: u64, body: &str| {
+            let msg = MessageV1 {
+                room_owner: state.configuration.configuration.owner_member_id,
+                author: MemberId::from(&owner_sk.verifying_key()),
+                content: RoomMessageBody::public(body.to_string()),
+                time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            };
+            state
+                .recent_messages
+                .messages
+                .push(AuthorizedMessageV1::new(msg, &owner_sk));
         };
-        state_a.bans.0.push(AuthorizedUserBan::new(
-            ban,
-            MemberId::from(&owner_sk.verifying_key()),
-            &owner_sk,
-        ));
 
-        // 3) A few owner-authored messages so the merge has real content
-        //    to fold over (Configuration's `owner_member_id` is set on
-        //    new_config above, so messages from the owner key verify).
-        add_message(&mut state_a, &owner_sk, "existing-1");
-        add_message(&mut state_a, &owner_sk, "existing-2");
+        // The peer's window is strictly older: three messages the room has
+        // never seen, every one below anything the room retains.
+        let mut incoming = room_state.clone();
+        for i in 0..3u64 {
+            at(&mut incoming, 1_000 + i, &format!("older-{i}"));
+        }
+        for i in 0..5u64 {
+            at(&mut room_state, 2_000 + i, &format!("newer-{i}"));
+        }
 
-        // `state_b` starts as a byte-equal copy of `state_a` so we can
-        // compare post-merge state across the two `parent_state` shapes.
-        let mut state_b = state_a.clone();
-
-        // Incoming state: same baseline plus one more message. The merge
-        // should fold that one message in.
-        let mut incoming = state_a.clone();
-        add_message(&mut incoming, &owner_sk, "incoming-3");
-
-        // Path A: the old shape — clone self as `parent_state`.
-        let result_a = state_a.merge(&state_a.clone(), &params, &incoming);
-
-        // Path B: the new shape — default sentinel as `parent_state`.
-        let sentinel = ChatRoomStateV1::default();
-        let result_b = state_b.merge(&sentinel, &params, &incoming);
-
+        // Premise: the room is at capacity and the peer really does hold
+        // messages it lacks, or the assertion below is vacuous.
         assert_eq!(
-            result_a.is_ok(),
-            result_b.is_ok(),
-            "merge result-status disagreed between the two parent_state shapes: \
-             self-clone={:?} sentinel={:?}",
-            result_a,
-            result_b
+            room_state.recent_messages.messages.len(),
+            5,
+            "test premise: the room must be exactly at its cap"
+        );
+        let held: Vec<_> = room_state
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| m.id())
+            .collect();
+        assert!(
+            incoming
+                .recent_messages
+                .messages
+                .iter()
+                .any(|m| !held.contains(&m.id())),
+            "test premise: the incoming state must hold messages the room lacks"
+        );
+
+        let before = room_state.recent_messages.messages.clone();
+        let applied =
+            merge_incoming_state(&mut room_state, &params, &incoming).expect("merge must succeed");
+
+        assert!(
+            applied
+                .as_ref()
+                .and_then(|d| d.recent_messages.as_ref())
+                .is_none(),
+            "the merge pulled over messages the room prunes on arrival —              `summarize` was given the wrong parent_state, so the retention              horizon was computed against the DEFAULT max_recent_messages              instead of this room's. See MessagesV1::RetentionHorizon."
         );
         assert_eq!(
-            state_a, state_b,
-            "merge produced different post-merge state with default-sentinel \
-             parent_state vs self-clone parent_state — this means a field's \
-             summarize/delta started reading parent_state, or the \
-             freenet-scaffold macro started forwarding _parent_state down to \
-             a field's apply_delta. The clone-reduction optimization in \
-             apply_delta_inner / update_room_state_inner above is no longer \
-             safe; revert it or update the macro accordingly."
+            room_state.recent_messages.messages, before,
+            "and, consistently, the retained window must be untouched"
+        );
+    }
+
+    /// Pin the OTHER leg: `apply_delta` may still be handed a cheap
+    /// `ChatRoomStateV1::default()` sentinel.
+    ///
+    /// # Why this needs its own test
+    ///
+    /// `merge_uses_room_state_as_parent_so_horizon_is_correct` above pins the
+    /// `summarize` leg. It cannot pin this one: it drives
+    /// `merge_incoming_state` on both sides of its assertion, and
+    /// `merge_incoming_state` ALWAYS passes the sentinel to `apply_delta`, so
+    /// the sentinel becoming unsafe is invisible to it. This test therefore
+    /// calls `apply_delta` directly, once with each parent.
+    ///
+    /// # The invariant, and what breaks if it goes
+    ///
+    /// The `#[composable]` macro's generated `apply_delta` takes
+    /// `_parent_state` and shadows it with a per-field `self.clone()`
+    /// (`freenet-scaffold-macro/src/lib.rs`, whose own comment calls this
+    /// "ugly" — a description, not a stability promise). Two live call sites
+    /// bet on it: `merge_incoming_state` and the `apply_delta_inner` path.
+    ///
+    /// If a freenet-scaffold bump ever forwarded `_parent_state`, both UI
+    /// ingestion paths would apply every delta against a DEFAULT state:
+    /// `members` empty, so `MessagesV1::apply_delta`'s author-must-be-a-member
+    /// retain drops EVERY message; `bans` empty; `max_members` and
+    /// `max_recent_messages` at their defaults rather than the room's. Silent,
+    /// total, local message loss — with no error anywhere.
+    ///
+    /// The room here deliberately carries a non-default `max_members`,
+    /// `max_recent_messages` and a real ban, because those are exactly the
+    /// `parent_state` fields the per-field `apply_delta`s read.
+    #[test]
+    fn apply_delta_ignores_its_outer_parent_state_so_the_sentinel_is_safe() {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use river_core::room_state::member::{AuthorizedMember, Member, MembersV1};
+        use std::time::Duration;
+
+        let owner_sk = SigningKey::generate(&mut rand::thread_rng());
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let member_sks: Vec<SigningKey> = (0..3)
+            .map(|_| SigningKey::generate(&mut rand::thread_rng()))
+            .collect();
+        let authorize = |sk: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                &owner_sk,
+            )
+        };
+
+        // Every one of these is deliberately NOT the default.
+        let cfg = Configuration {
+            owner_member_id: owner_id,
+            max_recent_messages: 4,
+            max_members: 3,
+            max_message_size: 500,
+            max_user_bans: 5,
+            ..Default::default()
+        };
+
+        let banned_id = MemberId::from(&member_sks[2].verifying_key());
+        let ban = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(9_000),
+                banned_user: banned_id,
+            },
+            owner_id,
+            &owner_sk,
+        );
+
+        let msg_at = |sk: &SigningKey, secs: u64, body: &str| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: MemberId::from(&sk.verifying_key()),
+                    content: RoomMessageBody::public(body.to_string()),
+                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                },
+                sk,
+            )
+        };
+
+        let mut local = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(cfg, &owner_sk),
+            members: MembersV1 {
+                members: vec![authorize(&member_sks[0]), authorize(&member_sks[1])],
+            },
+            bans: BansV1(vec![ban]),
+            ..Default::default()
+        };
+        for i in 0..3u64 {
+            local.recent_messages.messages.push(msg_at(
+                &member_sks[0],
+                2_000 + i,
+                &format!("held-{i}"),
+            ));
+        }
+
+        // An incoming peer with more members and more messages, so the delta
+        // is non-trivial across several fields.
+        let mut incoming = local.clone();
+        incoming.members.members.push(authorize(&member_sks[2]));
+        for i in 0..4u64 {
+            incoming.recent_messages.messages.push(msg_at(
+                &member_sks[1],
+                3_000 + i,
+                &format!("new-{i}"),
+            ));
+        }
+
+        let delta = incoming.delta(&incoming, &params, &local.summarize(&local, &params));
+        assert!(
+            delta.is_some(),
+            "test premise: the incoming state must actually produce a delta"
+        );
+
+        // --- the assertion: both parents must give byte-identical results ---
+        let mut via_sentinel = local.clone();
+        via_sentinel
+            .apply_delta(&ChatRoomStateV1::default(), &params, &delta)
+            .expect("sentinel-parent apply");
+
+        let mut via_self = local.clone();
+        let self_parent = via_self.clone();
+        via_self
+            .apply_delta(&self_parent, &params, &delta)
+            .expect("self-parent apply");
+
+        assert_eq!(
+            via_sentinel, via_self,
+            "applying the same delta against the sentinel parent and against the \
+             room's own state produced DIFFERENT states. The #[composable] macro \
+             has stopped ignoring its outer `parent_state`, so `merge_incoming_state` \
+             and `apply_delta_inner` are now merging every room against a DEFAULT \
+             state — empty members, empty bans, default caps. Fix those call sites \
+             to pass the room's own state (a clone) before this ships."
+        );
+
+        // --- proof the assertion above is not vacuous ---
+        //
+        // The two parents are NOT interchangeable to a field that genuinely
+        // reads its `parent_state`. `MessagesV1::apply_delta` does, so calling
+        // it directly shows the divergence the room WOULD get if the macro
+        // forwarded the argument. Without this, the assertion above would still
+        // pass if the two parents happened to be equivalent, and would be
+        // pinning nothing.
+        let msg_delta = delta
+            .as_ref()
+            .and_then(|d| d.recent_messages.clone())
+            .expect("test premise: the delta must carry messages");
+
+        let mut msgs_sentinel = local.recent_messages.clone();
+        msgs_sentinel
+            .apply_delta(
+                &ChatRoomStateV1::default(),
+                &params,
+                &Some(msg_delta.clone()),
+            )
+            .expect("messages under sentinel parent");
+        let mut msgs_real = local.recent_messages.clone();
+        msgs_real
+            .apply_delta(&local, &params, &Some(msg_delta))
+            .expect("messages under the real parent");
+
+        assert!(
+            msgs_sentinel.messages.is_empty(),
+            "premise: under a DEFAULT parent the members list is empty, so the \
+             author-must-be-a-member retain must drop every message — that is \
+             the silent data loss this pin exists to prevent"
+        );
+        assert_ne!(
+            msgs_sentinel.messages, msgs_real.messages,
+            "the two parents must be distinguishable to a field that reads \
+             parent_state, or the equality assertion above pins nothing"
+        );
+    }
+
+    /// A locally-retained message must reach the wire even when its timestamp
+    /// sorts at or below the BASELINE's oldest-retained key.
+    ///
+    /// # The bug this pins
+    ///
+    /// `compute_update_data` used `baseline.summarize(baseline, params)`
+    /// directly. `baseline` is `last_synced_state` — this device's own
+    /// snapshot, NOT a receiver — so the retention horizon inside it filtered
+    /// the device's outgoing update against a STALE view of its own retention
+    /// window. Anything sorting at or below that horizon was dropped from the
+    /// delta and never put on the wire; `compute_update_data` then returned
+    /// `None`, which in `process_rooms` still calls
+    /// `sync_info.state_updated(..)` and advances the baseline, so it was never
+    /// retried either.
+    ///
+    /// # Reachability — narrower than first described, and worth stating
+    ///
+    /// An earlier version of this comment (and of the commit that introduced
+    /// the fix) claimed a clock-skewed device would simply never send anything.
+    /// **That is wrong and is corrected here.** The UI send path applies the
+    /// composed message through `room_data.room_state.apply_delta` before any
+    /// sync tick (`conversation.rs`), and `MessagesV1::apply_delta` sorts by
+    /// `(time, id)` and drains from the FRONT — so on a device already AT
+    /// capacity, a message sorting below the local window is dropped LOCALLY at
+    /// compose time and never reaches `compute_update_data` at all.
+    ///
+    /// The reachable trigger needs `current` to be BELOW cap while `baseline`
+    /// was AT cap publishing a real horizon. Two routes:
+    ///
+    /// * `max_recent_messages` is RAISED, so back-filled older messages are
+    ///   retained locally but still sort below the stale horizon. Modelled
+    ///   here.
+    /// * `post_apply_cleanup`'s ban/member sweep shrinks the local set while
+    ///   `last_synced_state` still holds the pre-sweep snapshot.
+    ///
+    /// This test models the first route rather than an unreachable state: the
+    /// baseline is at its cap of 3 and publishes a real `OldestRetained`, and
+    /// `current` has the cap raised to 10 and holds a back-filled older message
+    /// below that horizon. The configuration bump rides along in the delta,
+    /// which is why the whole-delta assertion expects two fields.
+    #[test]
+    fn outbound_update_is_not_filtered_by_the_senders_own_horizon() {
+        use river_core::room_state::configuration::AuthorizedConfigurationV1;
+        use std::time::Duration;
+
+        let (mut room_state, params, owner_sk) = create_test_room();
+        add_members_and_bans(&mut room_state, &owner_sk);
+
+        let msg_at = |secs: u64, body: &str| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: room_state.configuration.configuration.owner_member_id,
+                    author: MemberId::from(&owner_sk.verifying_key()),
+                    content: RoomMessageBody::public(body.to_string()),
+                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                },
+                &owner_sk,
+            )
+        };
+
+        // BASELINE: cap 3, exactly 3 messages, so it publishes a real horizon.
+        let mut baseline = room_state.clone();
+        let mut cfg = baseline.configuration.configuration.clone();
+        cfg.max_recent_messages = 3;
+        baseline.configuration = AuthorizedConfigurationV1::new(cfg.clone(), &owner_sk);
+        for i in 0..3u64 {
+            baseline
+                .recent_messages
+                .messages
+                .push(msg_at(5_000 + i, &format!("synced-{i}")));
+        }
+        assert!(
+            matches!(
+                baseline
+                    .recent_messages
+                    .retention_horizon(baseline.configuration.configuration.max_recent_messages),
+                river_core::room_state::message::RetentionHorizon::OldestRetained(_)
+            ),
+            "test premise: the baseline must be at capacity and publish a real horizon"
+        );
+
+        // CURRENT: the room raised its cap, so a back-filled older message is
+        // now retained locally even though it sorts below the stale horizon.
+        let mut current = baseline.clone();
+        let mut raised = cfg;
+        raised.max_recent_messages = 10;
+        raised.configuration_version += 1;
+        current.configuration = AuthorizedConfigurationV1::new(raised, &owner_sk);
+        let backfilled = msg_at(1_000, "back-filled-below-the-stale-horizon");
+        let newer_a = msg_at(9_001, "newer-a");
+        let newer_b = msg_at(9_002, "newer-b");
+        current.recent_messages.messages.push(backfilled.clone());
+        current.recent_messages.messages.push(newer_a.clone());
+        current.recent_messages.messages.push(newer_b.clone());
+
+        // Premise: `current` is genuinely BELOW its cap, so this state is
+        // reachable through `apply_delta` — the earlier version of this test
+        // held 6 messages against a cap of 3, which `apply_delta` can never
+        // produce.
+        assert!(
+            current.recent_messages.messages.len()
+                <= current.configuration.configuration.max_recent_messages,
+            "test premise: `current` must be below its own cap, or the state is unreachable"
+        );
+
+        let update = compute_update_data(&current, Some(&baseline), &params)
+            .expect("a locally-retained message must produce an outgoing update");
+
+        let bytes = match update {
+            UpdateData::Delta(d) => d.into_bytes(),
+            other => panic!("expected a delta, got {other:?}"),
+        };
+        let delta: ChatRoomStateV1Delta =
+            ciborium::de::from_reader(bytes.as_slice()).expect("decode outgoing delta");
+
+        let mut sent: Vec<_> = delta
+            .recent_messages
+            .as_ref()
+            .map(|m: &Vec<AuthorizedMessageV1>| m.iter().map(|m| m.id()).collect())
+            .unwrap_or_default();
+        sent.sort();
+        assert!(
+            sent.contains(&backfilled.id()),
+            "the locally-RETAINED message was filtered out of the OUTGOING update by \
+             this device's OWN stale horizon. `compute_update_data` would then return \
+             None, and the `None` branch in process_rooms advances the baseline, so it \
+             is never retried. See `outbound_summary`."
+        );
+
+        // The other direction, which is how this fix would go wrong:
+        // neutralising the horizon must NOT widen the update into a resend of
+        // everything already synced. Exact set equality, not a count.
+        let mut expected = vec![backfilled.id(), newer_a.id(), newer_b.id()];
+        expected.sort();
+        assert_eq!(
+            sent, expected,
+            "the outgoing update must be EXACTLY the messages the baseline lacks. \
+             Anything more means clearing the horizon has widened it into a resend \
+             of already-synced state; anything less means something is still \
+             filtering the send path."
+        );
+
+        // ...and exactly the fields that genuinely differ: the messages, plus
+        // the configuration bump that raised the cap. Any OTHER populated field
+        // means `outbound_summary` over-cleared something and every sync tick
+        // now re-sends it.
+        assert_eq!(
+            populated_delta_fields(&delta),
+            vec!["configuration", "recent_messages"],
+            "the outgoing update touched fields the baseline already has"
+        );
+    }
+
+    /// The DM half of the same fix — `pair_horizons.clear()` in
+    /// `outbound_summary`.
+    ///
+    /// This needs its own test because the messages-side test above asserts
+    /// only on `delta.recent_messages`. Deleting the single line
+    /// `summary.direct_messages.pair_horizons.clear()` leaves that test, and
+    /// every other test in the repo, green — while a clock-skewed device's DM
+    /// to an at-capacity pair is silently dropped before the wire. That is the
+    /// exact failure class the messages side was just fixed for, one line away.
+    ///
+    /// `DmPairHorizon` is published per ordered `(sender, recipient)` pair that
+    /// has reached `MAX_DM_MESSAGES_PER_PAIR`, so it is a receiver-published
+    /// quantity for precisely the same reason and must not survive onto the
+    /// outbound path either.
+    #[test]
+    fn outbound_update_is_not_filtered_by_the_senders_own_dm_pair_horizon() {
+        use river_core::room_state::direct_messages::{
+            sign_direct_message, MAX_DM_MESSAGES_PER_PAIR,
+        };
+
+        let (mut room_state, params, owner_sk) = create_test_room();
+        add_members_and_bans(&mut room_state, &owner_sk);
+
+        let sender_sk = SigningKey::generate(&mut rand::thread_rng());
+        let sender_id = MemberId::from(&sender_sk.verifying_key());
+        let recipient_id = MemberId::from(&owner_sk.verifying_key());
+
+        let dm_at = |ts: u64, tag: u8| {
+            sign_direct_message(
+                &sender_sk,
+                sender_id,
+                recipient_id,
+                &params.owner,
+                ts,
+                vec![tag; 8],
+            )
+            .expect("sign dm")
+        };
+
+        // Fill the ordered pair to capacity so the baseline publishes a real
+        // `DmPairHorizon`. Without this the property is vacuous — a pair below
+        // the cap publishes no entry and nothing could be filtered.
+        for i in 0..MAX_DM_MESSAGES_PER_PAIR {
+            room_state
+                .direct_messages
+                .messages
+                .push(dm_at(5_000 + i as u64, 1));
+        }
+        let baseline = room_state.clone();
+        assert_eq!(
+            baseline.direct_messages.pair_horizons().len(),
+            1,
+            "test premise: the pair must be AT capacity so a horizon is published"
+        );
+
+        // DMs this device just composed. `skewed`'s clock-derived timestamp
+        // lands below everything the baseline's pair retains; the other is an
+        // ordinary newer one, so the assertion below is a real set comparison.
+        let skewed = dm_at(1_000, 2);
+        let newer = dm_at(9_001, 3);
+        let mut current = room_state.clone();
+        current.direct_messages.messages.push(skewed.clone());
+        current.direct_messages.messages.push(newer.clone());
+
+        let update = compute_update_data(&current, Some(&baseline), &params)
+            .expect("a newly composed DM must produce an outgoing update");
+        let bytes = match update {
+            UpdateData::Delta(d) => d.into_bytes(),
+            other => panic!("expected a delta, got {other:?}"),
+        };
+        let delta: ChatRoomStateV1Delta =
+            ciborium::de::from_reader(bytes.as_slice()).expect("decode outgoing delta");
+
+        let sent_dms = delta
+            .direct_messages
+            .as_ref()
+            .map(|d| d.new_messages.clone())
+            .unwrap_or_default();
+        assert!(
+            sent_dms
+                .iter()
+                .any(|m| m.sender_signature == skewed.sender_signature),
+            "the locally-composed DM was filtered out of the OUTGOING update by this \
+             device's OWN pair horizon. `pair_horizons` is receiver-published, exactly \
+             like the messages horizon, so it must be cleared in `outbound_summary` — \
+             otherwise a clock-skewed device silently never delivers a DM to any pair \
+             it holds at capacity."
+        );
+        // Exact set equality, for the same reason as the messages test: this is
+        // the direction the fix would go wrong in. `outbound_summary` clears
+        // only `pair_horizons` and keeps `message_signatures`, so the
+        // signature-set difference still bounds the payload.
+        let mut sent_sigs: Vec<_> = sent_dms.iter().map(|m| m.sender_signature).collect();
+        sent_sigs.sort_by_key(|s| s.to_bytes());
+        let mut expected = vec![skewed.sender_signature, newer.sender_signature];
+        expected.sort_by_key(|s| s.to_bytes());
+        assert_eq!(
+            sent_sigs, expected,
+            "the outgoing update must be EXACTLY the DMs the baseline lacks — not the \
+             whole at-capacity pair, which is what clearing the pair horizon would \
+             widen it to if the signature-set difference stopped applying."
+        );
+
+        assert_eq!(
+            populated_delta_fields(&delta),
+            vec!["direct_messages"],
+            "the outgoing update touched fields the baseline already has"
         );
     }
 }

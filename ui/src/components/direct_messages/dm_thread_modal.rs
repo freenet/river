@@ -23,8 +23,8 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::direct_messages::{
-    advance_recipient_purges, compose_direct_message, open_direct_message, pair_message_count,
-    DirectMessagesDelta, PurgeToken, MAX_DM_CIPHERTEXT_BYTES, MAX_DM_MESSAGES_PER_PAIR,
+    advance_recipient_purges, compose_direct_message, open_direct_message, DirectMessagesDelta,
+    PurgeToken, MAX_DM_CIPHERTEXT_BYTES,
 };
 use river_core::room_state::dm_body::{decode_body, DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
@@ -67,11 +67,6 @@ enum ApplyOutcome {
     Applied,
     /// Room was unloaded between compose and apply.
     RoomGone,
-    /// A concurrent inbound (or re-rendered state) pushed the per-pair
-    /// pair count up to the cap before our delta could land. Better to
-    /// surface this here than to let the contract silently drop the
-    /// message.
-    CapHit,
     DeltaFailed,
     /// `apply_delta` returned Ok but the DM did not actually land in
     /// `direct_messages.messages` — the contract silently dropped it
@@ -468,17 +463,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             return;
         }
 
-        // Per-pair cap: contract `apply_delta` silently drops overflow.
-        // Surface as a user-visible error instead of "successful" sends
-        // that disappear into the void.
-        let existing = pair_message_count(&room_data.room_state.direct_messages, self_id, peer);
-        if existing >= MAX_DM_MESSAGES_PER_PAIR {
-            send_error.set(Some(format!(
-                    "This thread is full ({}/{} messages). Ask them to delete some of the older messages you've sent.",
-                    existing, MAX_DM_MESSAGES_PER_PAIR
-                )));
-            return;
-        }
+        // NO per-pair cap guard, and no "this thread is full" error. The
+        // contract's per-pair cap is newest-N now (`trim_pairs_to_cap`), so a
+        // send at the cap is ADMITTED and the pair's oldest DM is evicted. The
+        // old first-come-wins cap silently discarded the arrival, which is what
+        // this block existed to surface. Blocking here would keep the user
+        // unable to send for a purely client-side reason.
 
         let plaintext = body.clone();
         let body_bytes = body.into_bytes();
@@ -552,15 +542,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                     let Some(rd) = rooms.map.get_mut(&room) else {
                         return ApplyOutcome::RoomGone;
                     };
-                    // Re-check the per-pair cap inside the write-lock:
-                    // an incoming peer-side DM could have arrived
-                    // between the pre-flight check and this defer
-                    // tick. Skeptical-review #3.
-                    if pair_message_count(&rd.room_state.direct_messages, self_id, peer)
-                        >= MAX_DM_MESSAGES_PER_PAIR
-                    {
-                        return ApplyOutcome::CapHit;
-                    }
                     let parent = rd.room_state.clone();
                     if let Err(e) = rd.room_state.apply_delta(&parent, &params, &Some(delta)) {
                         error!("DM apply_delta failed: {:?}", e);
@@ -630,12 +611,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // and idempotent (no-op when no entry exists).
                         unhide_dm_thread(room, peer);
                         draft.set(String::new());
-                    }
-                    ApplyOutcome::CapHit => {
-                        send_error.set(Some(format!(
-                                "This thread is full ({}/{} messages). Ask them to delete some of the older messages you've sent.",
-                                MAX_DM_MESSAGES_PER_PAIR, MAX_DM_MESSAGES_PER_PAIR
-                            )));
                     }
                     ApplyOutcome::RoomGone => {
                         send_error.set(Some("This room is no longer loaded.".into()));
@@ -1426,6 +1401,52 @@ fn merge_invite_into_draft(existing: &str, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The DM send path in this file must NOT carry a client-side per-pair cap
+    /// guard.
+    ///
+    /// It used to block at `MAX_DM_MESSAGES_PER_PAIR` because the contract's
+    /// cap was first-come-wins and silently discarded the arrival. The cap is
+    /// newest-N now, so a send at the cap succeeds (evicting the pair's oldest).
+    /// Re-adding a block here would leave the user unable to send for a purely
+    /// client-side reason and make the contract fix invisible — and this is the
+    /// UI, so that is nearly the whole population.
+    ///
+    /// Source-scrape rather than behavioural: the send path needs a Dioxus
+    /// runtime and a live node. Three deliberate choices:
+    ///
+    /// * **Whole non-test body, not one function.** The CLI's equivalent pin was
+    ///   first written scoped to `execute_send` while the guard actually lived
+    ///   in `deliver_dm`, so it passed while the guard sat untouched. Scope-by-
+    ///   function is how these go vacuous.
+    /// * **Cut at `mod tests`** so this comment and the assertion below cannot
+    ///   satisfy their own check. Verified: this file has exactly ONE
+    ///   `mod tests`, and it is the real module — the cut point resolving
+    ///   correctly is a property of the file, not a guarantee of the technique.
+    /// * **BOTH symbols**, not just `pair_message_count`. Neither has any
+    ///   legitimate non-test use left in this file, so keying on
+    ///   `MAX_DM_MESSAGES_PER_PAIR` too also catches a hand-rolled
+    ///   `.filter(..).count() >= MAX_DM_MESSAGES_PER_PAIR`, which a
+    ///   symbol-only pin would miss. (The CLI pin cannot do this — it uses the
+    ///   constant legitimately for outbound-cache pruning.)
+    ///
+    /// Residual limitation: a guard that inlines the literal 100 and counts by
+    /// hand still slips past. That is tolerated; every realistic re-add goes
+    /// through one of these two symbols.
+    #[test]
+    fn dm_thread_modal_send_has_no_client_side_pair_cap_guard() {
+        let src = include_str!("dm_thread_modal.rs");
+        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        for symbol in ["pair_message_count(", "MAX_DM_MESSAGES_PER_PAIR"] {
+            assert!(
+                !body.contains(symbol),
+                "dm_thread_modal.rs references `{symbol}` outside its test module, which means a \
+                 client-side per-pair DM cap guard has been re-added. The contract \
+                 evicts the pair's oldest DM to admit a newer one now, so blocking \
+                 the send here makes that fix invisible to UI users."
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

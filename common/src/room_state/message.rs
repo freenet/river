@@ -8,7 +8,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::time::SystemTime;
 
@@ -39,9 +39,84 @@ pub struct MessagesV1 {
     pub actions_state: MessageActionsState,
 }
 
+/// The total order [`MessagesV1::apply_delta`] retains by: it sorts ascending
+/// on `(time, id)` and keeps the newest `max_recent_messages`, so this key
+/// alone decides whether a message survives a merge.
+///
+/// `id` breaks ties deterministically; without it two messages sharing a
+/// timestamp would order differently on different peers.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct MessageOrderKey {
+    pub time: SystemTime,
+    pub id: MessageId,
+}
+
+/// How much appetite a peer has for older messages, published in its
+/// [`MessagesSummary`] so a sender never offers a message the receiver would
+/// discard on arrival.
+///
+/// # Why this exists
+///
+/// `apply_delta` DROPS the oldest messages over `max_recent_messages`, which
+/// makes the merge non-monotonic: without a horizon, `delta` is a pure
+/// "everything you don't have" set-difference, so a peer holding an older
+/// window re-offers the same messages on every fan-out, the receiver re-prunes
+/// them, and neither side's summary ever changes. `delta` never returns `None`,
+/// the "empty delta -> skip" path in freenet-core's broadcast never fires, and
+/// the pair loops forever. That loop drove the 2026-07-25 bandwidth incident
+/// (the room contract reached 63.7% of all byte-weighted broadcast work
+/// network-wide).
+///
+/// # Why it terminates
+///
+/// [`RetentionHorizon::OldestRetained`] is the oldest key the peer currently
+/// holds, published only once it is AT capacity. A sender offers only keys
+/// strictly above it. Applying any such message pushes the peer over capacity,
+/// so the prune drops at least the horizon message itself and the horizon
+/// strictly increases. A peer BELOW capacity publishes [`RetentionHorizon::Open`]
+/// and discards nothing, so its id set only grows. Each exchange therefore
+/// either grows a bounded set or strictly advances a bounded key: no cycles.
+///
+/// Deliberately conservative — publishing the oldest HELD key rather than the
+/// exact post-merge cutoff means a peer may occasionally accept a message it
+/// then prunes, costing one extra round. The opposite error (an over-stated
+/// horizon) would silently drop messages the peer would have kept, so the
+/// conservative direction is the safe one.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum RetentionHorizon {
+    /// The peer holds fewer than `max_recent_messages`; it retains anything.
+    Open,
+    /// The peer is at (or over) capacity and holds nothing older than this key.
+    /// Anything ordering strictly before it is discarded on arrival.
+    OldestRetained(MessageOrderKey),
+    /// `max_recent_messages == 0`: the peer retains no messages at all.
+    ///
+    /// `AuthorizedConfigurationV1::apply_delta` rejects a zero cap, but
+    /// `verify` does not, so an owner-signed zero can still arrive on the
+    /// full-state path. Represented explicitly rather than folded into
+    /// `OldestRetained` so the sender suppresses the delta instead of looping
+    /// against a peer that keeps nothing.
+    Closed,
+}
+
+/// Summary of the messages a peer holds, plus the retention horizon a sender
+/// needs in order to avoid offering messages the peer would immediately prune.
+///
+/// `BTreeSet` (not `HashSet`, and not a `Vec` inheriting the state's own
+/// ordering) so the ciborium bytes are canonical for a given logical set:
+/// freenet-core byte-compares `summarize_state` output for staleness, and a
+/// non-canonical order makes two identical peers look perpetually out of sync.
+/// See `.claude/rules/contract-summary-determinism.md` and
+/// freenet/freenet-core#4857.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct MessagesSummary {
+    pub message_ids: BTreeSet<MessageId>,
+    pub horizon: RetentionHorizon,
+}
+
 impl ComposableState for MessagesV1 {
     type ParentState = ChatRoomStateV1;
-    type Summary = Vec<MessageId>;
+    type Summary = MessagesSummary;
     type Delta = Vec<AuthorizedMessageV1>;
     type Parameters = ChatRoomParametersV1;
 
@@ -75,24 +150,50 @@ impl ComposableState for MessagesV1 {
         Ok(())
     }
 
+    /// NOTE: unlike every other field in `ChatRoomStateV1`, this `summarize`
+    /// READS `parent_state` (for `max_recent_messages`, which sizes the
+    /// retention horizon). Callers must pass the SUMMARIZING peer's own state,
+    /// which is what `summarize_state` in the contract and every `merge` call
+    /// site do. Passing a cheap `ChatRoomStateV1::default()` sentinel — as
+    /// `room_synchronizer` used to — reads the DEFAULT cap instead of the
+    /// room's, understating the horizon and re-opening the resend loop.
+    /// Pinned by `merge_uses_room_state_as_parent_so_horizon_is_correct`.
     fn summarize(
         &self,
-        _parent_state: &Self::ParentState,
+        parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.messages.iter().map(|m| m.id()).collect()
+        MessagesSummary {
+            message_ids: self.messages.iter().map(|m| m.id()).collect(),
+            horizon: self
+                .retention_horizon(parent_state.configuration.configuration.max_recent_messages),
+        }
     }
 
+    /// Deliberately does NOT read `parent_state`: the default
+    /// `ComposableState::merge` passes the RECEIVER's state as `parent_state`
+    /// when asking the SENDER for a delta, so anything read from it here would
+    /// be the wrong peer's configuration. Everything this needs about the
+    /// receiver travels in `old_state_summary`.
     fn delta(
         &self,
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
+        // A message the receiver would prune the instant it applied it must
+        // never be offered, or the pair loops forever re-sending it.
+        let retained_by_receiver = |m: &AuthorizedMessageV1| match &old_state_summary.horizon {
+            RetentionHorizon::Open => true,
+            RetentionHorizon::OldestRetained(oldest) => m.order_key() > *oldest,
+            RetentionHorizon::Closed => false,
+        };
+
         let delta: Vec<AuthorizedMessageV1> = self
             .messages
             .iter()
-            .filter(|m| !old_state_summary.contains(&m.id()))
+            .filter(|m| !old_state_summary.message_ids.contains(&m.id()))
+            .filter(|m| retained_by_receiver(m))
             .cloned()
             .collect();
         if delta.is_empty() {
@@ -226,7 +327,13 @@ impl ComposableState for MessagesV1 {
                 .then_with(|| a.id().cmp(&b.id()))
         });
 
-        // Remove oldest messages if there are too many
+        // Remove oldest messages if there are too many.
+        //
+        // This removal is what makes the merge non-monotonic, so it MUST stay
+        // paired with the retention horizon that `summarize` publishes and
+        // `delta` filters on — see [`RetentionHorizon`]. Changing the retention
+        // rule here (a different sort key, a cap on a different axis) without
+        // teaching `retention_horizon` about it re-opens the resend loop.
         if self.messages.len() > max_recent_messages {
             self.messages
                 .drain(0..self.messages.len() - max_recent_messages);
@@ -240,6 +347,35 @@ impl ComposableState for MessagesV1 {
 }
 
 impl MessagesV1 {
+    /// The [`RetentionHorizon`] this peer publishes for the given
+    /// `max_recent_messages`.
+    ///
+    /// Computed as the MINIMUM held key rather than the exact post-prune
+    /// cutoff, and only once the peer is at or over capacity. Two consequences
+    /// worth stating:
+    ///
+    /// * It never over-states, so a sender is never told to withhold a message
+    ///   the peer would in fact have kept. Under-stating merely costs an extra
+    ///   round (the horizon strictly rises each time, so it still terminates).
+    /// * It does not assume `self.messages` is sorted. `apply_delta` keeps it
+    ///   sorted, but `verify` does not enforce that, so a hand-built or hostile
+    ///   full-state PUT could arrive unsorted; taking the min is correct either
+    ///   way and avoids an out-of-bounds index.
+    pub fn retention_horizon(&self, max_recent_messages: usize) -> RetentionHorizon {
+        if max_recent_messages == 0 {
+            return RetentionHorizon::Closed;
+        }
+        if self.messages.len() < max_recent_messages {
+            return RetentionHorizon::Open;
+        }
+        match self.messages.iter().map(|m| m.order_key()).min() {
+            Some(oldest) => RetentionHorizon::OldestRetained(oldest),
+            // Unreachable: len >= max_recent_messages >= 1 means non-empty.
+            // `Open` is the safe fallback (offers more, never drops).
+            None => RetentionHorizon::Open,
+        }
+    }
+
     /// Rebuild the computed actions state by scanning all action messages.
     ///
     /// This method only processes PUBLIC action messages. For private rooms,
@@ -906,6 +1042,16 @@ impl AuthorizedMessageV1 {
     pub fn id(&self) -> MessageId {
         MessageId(fast_hash(&self.signature.to_bytes()))
     }
+
+    /// This message's position in the retention order — the key
+    /// [`MessagesV1::apply_delta`] sorts and prunes by. Must stay in step with
+    /// that sort; see [`RetentionHorizon`].
+    pub fn order_key(&self) -> MessageOrderKey {
+        MessageOrderKey {
+            time: self.message.time,
+            id: self.id(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1212,14 +1358,17 @@ mod tests {
         };
 
         let summary = messages.summarize(&parent_state, &parameters);
-        assert_eq!(summary.len(), 2);
-        assert_eq!(summary[0], authorized_message1.id());
-        assert_eq!(summary[1], authorized_message2.id());
+        assert_eq!(summary.message_ids.len(), 2);
+        assert!(summary.message_ids.contains(&authorized_message1.id()));
+        assert!(summary.message_ids.contains(&authorized_message2.id()));
+        // Two messages against the default cap of 100: plenty of room left.
+        assert_eq!(summary.horizon, RetentionHorizon::Open);
 
         // Test empty messages
         let empty_messages = MessagesV1::default();
         let empty_summary = empty_messages.summarize(&parent_state, &parameters);
-        assert!(empty_summary.is_empty());
+        assert!(empty_summary.message_ids.is_empty());
+        assert_eq!(empty_summary.horizon, RetentionHorizon::Open);
     }
 
     #[test]
@@ -1267,8 +1416,15 @@ mod tests {
             owner: signing_key.verifying_key(),
         };
 
+        // A receiver below its cap accepts anything, so these cases isolate the
+        // id-set half of `delta` from the horizon half.
+        let open_summary = |ids: &[MessageId]| MessagesSummary {
+            message_ids: ids.iter().cloned().collect(),
+            horizon: RetentionHorizon::Open,
+        };
+
         // Test with partial old summary
-        let old_summary = vec![authorized_message1.id(), authorized_message2.id()];
+        let old_summary = open_summary(&[authorized_message1.id(), authorized_message2.id()]);
         let delta = messages
             .delta(&parent_state, &parameters, &old_summary)
             .unwrap();
@@ -1276,7 +1432,7 @@ mod tests {
         assert_eq!(delta[0], authorized_message3);
 
         // Test with empty old summary
-        let empty_summary: Vec<MessageId> = vec![];
+        let empty_summary = open_summary(&[]);
         let full_delta = messages
             .delta(&parent_state, &parameters, &empty_summary)
             .unwrap();
@@ -1284,11 +1440,11 @@ mod tests {
         assert_eq!(full_delta, messages.messages);
 
         // Test with full old summary (no changes)
-        let full_summary = vec![
+        let full_summary = open_summary(&[
             authorized_message1.id(),
             authorized_message2.id(),
             authorized_message3.id(),
-        ];
+        ]);
         let no_delta = messages.delta(&parent_state, &parameters, &full_summary);
         assert!(no_delta.is_none());
     }
@@ -1860,9 +2016,6 @@ mod tests {
 #[cfg(test)]
 mod measure_tests {
     use super::*;
-    use crate::room_state::content::{
-        CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT, REPLY_CONTENT_VERSION, TEXT_CONTENT_VERSION,
-    };
 
     /// Text samples crossing CBOR length-prefix boundaries (23/24, 255/256
     /// bytes) and mixing multi-byte UTF-8 (the HostFat report: chars < limit
@@ -2053,7 +2206,13 @@ mod measure_tests {
     #[cfg(feature = "ecies-randomized")]
     mod private_bodies {
         use super::*;
+        // Only these tests use the content-type constants, so they are imported
+        // here rather than in the parent module — otherwise they are dead
+        // imports whenever `ecies-randomized` is off, which is the default.
         use crate::ecies::encrypt_with_symmetric_key;
+        use crate::room_state::content::{
+            CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT, REPLY_CONTENT_VERSION, TEXT_CONTENT_VERSION,
+        };
 
         const SECRET: [u8; 32] = [7u8; 32];
 
