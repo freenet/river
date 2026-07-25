@@ -4727,9 +4727,15 @@ impl ApiClient {
 
         let banned_member_id = target_member.member_info.member_id;
 
-        // Prevent self-banning
-        if banned_member_id == my_member_id {
-            return Err(anyhow!("Cannot ban yourself"));
+        // Prevent banning yourself out of the room, directly or transitively
+        // (freenet/river#478). ONE rule: refuse when the ban's cascade would
+        // remove US — the target being self, or the target being one of our own
+        // invite ancestors, whose `get_downstream_members` closure contains us.
+        // Both are contract-VALID, so nothing downstream stops them.
+        if let Some(reason) =
+            crate::deputies::self_removing_ban_reason(&room_state, my_member_id, banned_member_id)
+        {
+            return Err(anyhow!(reason));
         }
 
         // Prevent banning the room owner

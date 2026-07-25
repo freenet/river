@@ -9,7 +9,7 @@ use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::deputy_button::DeputyButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
-use crate::components::members::viewer_can_ban;
+use crate::components::members::{ban_gate, BanGate};
 use crate::util::display_name::display_nickname;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
@@ -144,16 +144,22 @@ pub fn MemberInfoModal() -> Element {
             })
             .unwrap_or(false);
 
-        // Ban authority (#410 / #411 round 4 D). The Ban button is gated on REAL
-        // ban authority — owner / invite-ancestor / deputy — via
+        // Ban authority (#410 / #411 round 4 D / #478). The Ban button is gated on
+        // REAL ban authority — owner / invite-ancestor / deputy — via
         // `is_ban_authorized`, NOT bare downstream ancestry (`is_downstream`), so a
         // deputy sees Ban for members in their deputizer's subtree. `is_downstream`
         // is still used above for the "🔑 Invited by You" relationship tag, which
         // is a different meaning and must not change.
-        let can_ban = owner_key_signal
+        //
+        // `ban_gate` folds in the "you may not ban yourself out of the room" rule
+        // and distinguishes its two negative answers, so the ONE case where the
+        // action is taken away from someone who would otherwise have had it —
+        // banning yourself, or banning an ancestor whose cascade sweeps you up —
+        // gets a visible explanation instead of a mysteriously absent button.
+        let gate = owner_key_signal
             .as_ref()
             .map(|owner| {
-                viewer_can_ban(
+                ban_gate(
                     &room_state.room_state.members,
                     &room_state.room_state.member_info,
                     self_member_id,
@@ -161,7 +167,12 @@ pub fn MemberInfoModal() -> Element {
                     MemberId::from(&*owner),
                 )
             })
-            .unwrap_or(false);
+            .unwrap_or(BanGate::NoAuthority);
+        let can_ban = gate == BanGate::Allowed;
+        let ban_refusal = match gate {
+            BanGate::WouldRemoveViewer(reason) => Some(reason),
+            BanGate::Allowed | BanGate::NoAuthority => None,
+        };
 
         info!(
             "Rendering MemberInfoModal for member_id: {:?} is_owner: {:?} is_downstream: {:?} can_ban: {:?}",
@@ -441,26 +452,52 @@ pub fn MemberInfoModal() -> Element {
                             // Ban + Deputize sit in one row (Ban on the left,
                             // Deputize on the right), matching the DM /
                             // Share-invite button row above.
-                            div { class: "mt-4 flex items-start gap-3",
-                                BanButton {
-                                    member_to_ban: member_id,
-                                    can_ban: can_ban,
-                                    // The DECRYPTED, sanitised name — the same
-                                    // value `DeputyButton` gets. This used to
-                                    // pass the raw `SealedBytes`, which Dioxus
-                                    // silently coerced through `Display` (i.e.
-                                    // `to_string_lossy`): the ban dialog showed
-                                    // an unsanitised nickname in the one place
-                                    // a moderator is judging authority, and
-                                    // showed "[Encrypted: N bytes, vN]" instead
-                                    // of a name in private rooms.
-                                    nickname: target_nickname.clone()
-                                }
+                            // BOTH actions are gated on the target not being
+                            // yourself. Ban used to sit OUTSIDE this guard, so a
+                            // deputy opening their own profile saw an enabled
+                            // "Ban User" — and the resulting self-ban is
+                            // contract-VALID and cascades to their whole invite
+                            // subtree (freenet/river#478).
+                            if member_id != self_member_id {
+                                div { class: "mt-4 flex items-start gap-3",
+                                    // #478, transitive case: the Ban action is
+                                    // ALSO withheld when the cascade would sweep
+                                    // the viewer up — i.e. the target is one of
+                                    // the viewer's own invite ancestors. Same
+                                    // damage as a self-ban, different route, so
+                                    // it is the same rule (`ban_gate`), not a
+                                    // second special case. `ban_refusal` is
+                                    // `Some` only when the viewer would OTHERWISE
+                                    // have had the action, which is why it also
+                                    // carries the text: a moderator whose Ban
+                                    // button vanished is owed a reason.
+                                    if ban_refusal.is_none() {
+                                        BanButton {
+                                            member_to_ban: member_id,
+                                            can_ban: can_ban,
+                                            // The DECRYPTED, sanitised name — the same
+                                            // value `DeputyButton` gets. This used to
+                                            // pass the raw `SealedBytes`, which Dioxus
+                                            // silently coerced through `Display` (i.e.
+                                            // `to_string_lossy`): the ban dialog showed
+                                            // an unsanitised nickname in the one place
+                                            // a moderator is judging authority, and
+                                            // showed "[Encrypted: N bytes, vN]" instead
+                                            // of a name in private rooms.
+                                            nickname: target_nickname.clone()
+                                        }
+                                    }
+                                    if let Some(reason) = ban_refusal {
+                                        div {
+                                            "data-testid": "ban-withheld-reason",
+                                            class: "flex-1 px-3 py-2 text-sm text-text-muted bg-surface border border-border rounded-lg",
+                                            "{reason}"
+                                        }
+                                    }
 
-                                // Deputize / revoke-deputy (#410). Any non-owner
-                                // member (except self) may be deputized; the action
-                                // hides itself when the viewer lacks authority.
-                                if member_id != self_member_id {
+                                    // Deputize / revoke-deputy (#410). Any non-owner
+                                    // member (except self) may be deputized; the action
+                                    // hides itself when the viewer lacks authority.
                                     DeputyButton {
                                         target: member_id,
                                         viewer_has_authority: viewer_has_authority,
@@ -490,7 +527,7 @@ pub fn MemberInfoModal() -> Element {
 
 #[cfg(test)]
 mod ban_gate_tests {
-    use super::viewer_can_ban;
+    use crate::components::members::{ban_gate, BanGate};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersV1};
@@ -550,32 +587,26 @@ mod ban_gate_tests {
         };
 
         // Owner can ban anyone.
-        assert!(viewer_can_ban(
-            &members,
-            &member_info,
-            owner_id,
-            v_id,
-            owner_id
-        ));
+        assert_eq!(
+            ban_gate(&members, &member_info, owner_id, v_id, owner_id),
+            BanGate::Allowed
+        );
         // D (owner's deputy) can ban V even though D is NOT an ancestor of V, so
         // the old `is_downstream` gate would have hidden the Ban button.
-        assert!(viewer_can_ban(&members, &member_info, d_id, v_id, owner_id));
+        assert_eq!(
+            ban_gate(&members, &member_info, d_id, v_id, owner_id),
+            BanGate::Allowed
+        );
         // An unrelated member cannot ban V.
-        assert!(!viewer_can_ban(
-            &members,
-            &member_info,
-            u_id,
-            v_id,
-            owner_id
-        ));
+        assert_eq!(
+            ban_gate(&members, &member_info, u_id, v_id, owner_id),
+            BanGate::NoAuthority
+        );
         // Nobody can ban the owner.
-        assert!(!viewer_can_ban(
-            &members,
-            &member_info,
-            d_id,
-            owner_id,
-            owner_id
-        ));
+        assert_eq!(
+            ban_gate(&members, &member_info, d_id, owner_id, owner_id),
+            BanGate::NoAuthority
+        );
     }
 
     /// Source-grep pin for freenet/river#451: the modal's icon legend must

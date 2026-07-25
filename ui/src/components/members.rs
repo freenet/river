@@ -649,20 +649,128 @@ pub(crate) fn relevant_appointers(
     .collect()
 }
 
-/// Whether `viewer` may ban `target` — the Ban-button gate (#410 / #411 round 4
-/// D). Uses [`MembersV1::is_ban_authorized`] (owner / invite-ancestor / deputy),
-/// NOT bare invite-chain ancestry, so a DEPUTY sees the Ban action for members in
-/// their deputizer's subtree. Bare downstream ancestry (`is_downstream`, still
-/// used for the "🔑 Invited by You" relationship tag) would have hidden it.
-pub(crate) fn viewer_can_ban(
+/// Everyone a ban of `target` would remove from the room: `target` themselves
+/// PLUS their entire transitive invite subtree.
+///
+/// This mirrors what the contract actually does. `MembersV1::check_banned_members`
+/// inserts the banned user and then extends with `get_downstream_members`, which
+/// is private to the contract crate, so the walk is recomputed here rather than
+/// approximated. (`cli/src/deputies.rs::invite_subtrees` is riverctl's mirror of
+/// the same thing.)
+///
+/// One deliberate difference from the contract's version: a visited-set guard.
+/// The contract can rely on `verify` having rejected circular invite chains; the
+/// UI walks whatever state it currently holds and must not hang on a malformed
+/// one.
+pub(crate) fn ban_removal_set(members: &MembersV1, target: MemberId) -> HashSet<MemberId> {
+    let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+    for m in &members.members {
+        children
+            .entry(m.member.invited_by)
+            .or_default()
+            .push(m.member.id());
+    }
+
+    let mut removed = HashSet::new();
+    removed.insert(target);
+    let mut stack = vec![target];
+    while let Some(current) = stack.pop() {
+        for child in children.get(&current).into_iter().flatten() {
+            // `insert` gates the push, so a cycle terminates.
+            if removed.insert(*child) {
+                stack.push(*child);
+            }
+        }
+    }
+    removed
+}
+
+/// NOBODY MAY BAN THEMSELVES OUT OF THE ROOM (freenet/river#478).
+///
+/// ONE rule, stated once: compute the set the ban would remove
+/// ([`ban_removal_set`]) and refuse if `banner` is in it. That covers the direct
+/// self-ban (`banner == target`) and the transitive one (`target` is a strict
+/// invite ancestor of `banner`, so the cascade sweeps the banner up with them)
+/// as the single case they are — do NOT split this back into two special cases.
+///
+/// The CONTRACT permits both: `is_ban_authorized` has no self-check, and step 3
+/// (owner-appointed global moderator) fires before anything that would stop it,
+/// so an owner-appointed deputy is authorized to ban themselves AND to ban their
+/// own ancestors. Such a ban is fully valid: `verify` accepts it, and
+/// `check_banned_members` then cascades removal to `get_downstream_members`,
+/// taking the banner's ENTIRE INVITE SUBTREE with them. On the Official room
+/// that is ~105 members for one misclick.
+///
+/// This is therefore a gate at the interaction layer, not a contract fix. Do NOT
+/// "simplify" it away on the assumption that the contract prevents it: it does
+/// not.
+///
+/// Returns the user-visible reason when the ban is refused, `None` when the rule
+/// does not apply. The wording differs between the two routes because they read
+/// very differently to the user, but the DECISION above is one computation.
+pub(crate) fn self_removing_ban_reason(
+    members: &MembersV1,
+    banner: MemberId,
+    target: MemberId,
+) -> Option<&'static str> {
+    if !ban_removal_set(members, target).contains(&banner) {
+        return None;
+    }
+    Some(if banner == target {
+        "You can't ban yourself. The ban would remove you, and everyone you \
+         invited, from the room."
+    } else {
+        "You can't ban a member you joined the room through. A ban also removes \
+         everyone the banned member invited, so this one would remove you, and \
+         everyone you invited, along with them."
+    })
+}
+
+/// Whether the Ban action is offered for one (viewer, target) pair, and if not,
+/// whether the viewer is owed an explanation.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum BanGate {
+    /// The viewer holds ban authority and the ban is safe to offer.
+    Allowed,
+    /// The viewer holds ban authority, but the ban would remove the VIEWER from
+    /// the room ([`self_removing_ban_reason`]). Carries the user-visible reason:
+    /// the action is withheld from someone who would otherwise have had it, so
+    /// silently hiding it would read as a bug.
+    WouldRemoveViewer(&'static str),
+    /// The viewer has no ban authority over this target. Nothing is owed — the
+    /// action has never been offered here, so an explanation would just be noise
+    /// for a capability they never had.
+    NoAuthority,
+}
+
+/// The Ban-button gate (#410 / #411 round 4 D / #478).
+///
+/// Authority first, via [`MembersV1::is_ban_authorized`] (owner /
+/// invite-ancestor / deputy) rather than bare invite-chain ancestry, so a DEPUTY
+/// sees the Ban action for members in their deputizer's subtree — bare downstream
+/// ancestry (`is_downstream`, still used for the "🔑 Invited by You" relationship
+/// tag) would have hidden it.
+///
+/// Then the self-removal rule, applied to the OUTPUT of `is_ban_authorized`
+/// rather than inside it. That placement is load-bearing: `is_ban_authorized`
+/// grants owner-appointed global moderators authority at step 3, ahead of the
+/// step-4 guardrail, so a check wired into the wrong branch of that ladder would
+/// not fire for exactly the deputies who can reach the most members.
+pub(crate) fn ban_gate(
     members: &MembersV1,
     member_info: &river_core::room_state::member_info::MemberInfoV1,
     viewer: MemberId,
     target: MemberId,
     owner_id: MemberId,
-) -> bool {
+) -> BanGate {
     let members_by_id = members.members_by_member_id();
-    MembersV1::is_ban_authorized(viewer, target, &members_by_id, member_info, owner_id)
+    if !MembersV1::is_ban_authorized(viewer, target, &members_by_id, member_info, owner_id) {
+        return BanGate::NoAuthority;
+    }
+    match self_removing_ban_reason(members, viewer, target) {
+        Some(reason) => BanGate::WouldRemoveViewer(reason),
+        None => BanGate::Allowed,
+    }
 }
 
 /// The 🛡 shield one member shows in one viewer's view.
@@ -3320,6 +3428,429 @@ mod tests {
             Some(1),
             "64 repeated grants must collapse to one appointer"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // freenet/river#478: nobody may ban themselves OUT OF THE ROOM.
+    //
+    // One rule, two routes to the same damage: ban yourself, or ban a member
+    // you joined through (the cascade to `get_downstream_members` sweeps you
+    // and your whole subtree up with them). The fixture below is shared by
+    // every case so the ALLOWED cases are proved against the same room as the
+    // REFUSED ones — an over-broad guard cannot hide behind a friendlier
+    // fixture.
+    // ------------------------------------------------------------------
+
+    /// owner → alpha → beta → deputy → child, plus an unrelated `stranger`
+    /// invited by the owner. `deputy` is an OWNER-APPOINTED GLOBAL MODERATOR,
+    /// which is the whole point: that is the only grant in `is_ban_authorized`
+    /// that reaches a member's own ancestors, and it is granted at step 3,
+    /// ahead of the step-4 guardrail. A guard wired into the wrong branch of
+    /// that ladder would not fire for this deputy.
+    struct BanChain {
+        members: MembersV1,
+        member_info: river_core::room_state::member_info::MemberInfoV1,
+        owner_id: MemberId,
+        alpha_id: MemberId,
+        beta_id: MemberId,
+        deputy_id: MemberId,
+        child_id: MemberId,
+        stranger_id: MemberId,
+        /// A deputy of ALPHA rather than of the owner, used to show the
+        /// ancestor cases are not vacuous: this one is refused for lack of
+        /// authority, not by the #478 rule.
+        alphas_deputy_id: MemberId,
+    }
+
+    fn ban_chain() -> BanChain {
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let alpha_sk = SigningKey::generate(&mut rng);
+        let beta_sk = SigningKey::generate(&mut rng);
+        let deputy_sk = SigningKey::generate(&mut rng);
+        let child_sk = SigningKey::generate(&mut rng);
+        let stranger_sk = SigningKey::generate(&mut rng);
+        let alphas_deputy_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let deputy_id = id(&deputy_sk);
+        let alphas_deputy_id = id(&alphas_deputy_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &alpha_sk.verifying_key()),
+                member_invited_by(&alpha_sk, owner_id, &beta_sk.verifying_key()),
+                member_invited_by(&beta_sk, owner_id, &deputy_sk.verifying_key()),
+                member_invited_by(&deputy_sk, owner_id, &child_sk.verifying_key()),
+                authorized_member(&owner_sk, &stranger_sk.verifying_key()),
+                member_invited_by(&alpha_sk, owner_id, &alphas_deputy_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                // The owner deputizes `deputy` — a GLOBAL moderator.
+                signed_member_info(&owner_sk, "Owner", vec![deputy_id]),
+                // Alpha deputizes someone else — a SUBTREE-scoped deputy.
+                signed_member_info(&alpha_sk, "Alpha", vec![alphas_deputy_id]),
+                signed_member_info(&beta_sk, "Beta", vec![]),
+                signed_member_info(&deputy_sk, "Deputy", vec![]),
+                signed_member_info(&child_sk, "Child", vec![]),
+                signed_member_info(&stranger_sk, "Stranger", vec![]),
+                signed_member_info(&alphas_deputy_sk, "AlphasDeputy", vec![]),
+            ],
+        };
+
+        BanChain {
+            members,
+            member_info,
+            owner_id,
+            alpha_id: id(&alpha_sk),
+            beta_id: id(&beta_sk),
+            deputy_id,
+            child_id: id(&child_sk),
+            stranger_id: id(&stranger_sk),
+            alphas_deputy_id,
+        }
+    }
+
+    impl BanChain {
+        fn gate(&self, viewer: MemberId, target: MemberId) -> BanGate {
+            ban_gate(
+                &self.members,
+                &self.member_info,
+                viewer,
+                target,
+                self.owner_id,
+            )
+        }
+
+        /// What the CONTRACT says — asserted as a PRECONDITION everywhere the
+        /// gate refuses, so a refusal can never be credited to the guard when
+        /// the contract would have refused anyway.
+        fn contract_authorizes(&self, banner: MemberId, target: MemberId) -> bool {
+            MembersV1::is_ban_authorized(
+                banner,
+                target,
+                &self.members.members_by_member_id(),
+                &self.member_info,
+                self.owner_id,
+            )
+        }
+    }
+
+    /// The direct route (the original #478): a deputy may not ban themselves.
+    #[test]
+    fn ban_is_refused_for_self() {
+        let c = ban_chain();
+
+        assert!(
+            c.contract_authorizes(c.deputy_id, c.deputy_id),
+            "precondition: the contract permits a deputy to ban THEMSELVES \
+             (step 3 fires before anything that would stop it), which is \
+             exactly why the client must refuse"
+        );
+        assert!(
+            ban_removal_set(&c.members, c.deputy_id).contains(&c.deputy_id),
+            "precondition: the ban's removal set contains the banner"
+        );
+
+        assert!(
+            matches!(
+                c.gate(c.deputy_id, c.deputy_id),
+                BanGate::WouldRemoveViewer(_)
+            ),
+            "a deputy must not be able to ban themselves (#478)"
+        );
+    }
+
+    /// The transitive route: a deputy may not ban anyone ABOVE them in the
+    /// invite chain, at any depth. Same blast radius as a self-ban, because
+    /// `get_downstream_members` is the full transitive closure.
+    #[test]
+    fn ban_is_refused_for_every_strict_ancestor() {
+        let c = ban_chain();
+
+        for (label, ancestor) in [
+            ("direct inviter (parent)", c.beta_id),
+            ("grandparent", c.alpha_id),
+        ] {
+            assert!(
+                c.contract_authorizes(c.deputy_id, ancestor),
+                "precondition ({label}): the contract AUTHORIZES this ban — an \
+                 owner-appointed global moderator is granted authority at step \
+                 3, over their own ancestors included. Without this the test \
+                 would pass for want of authority, not because of the guard"
+            );
+            assert!(
+                ban_removal_set(&c.members, ancestor).contains(&c.deputy_id),
+                "precondition ({label}): the ban's cascade really does remove \
+                 the banner"
+            );
+
+            assert!(
+                matches!(c.gate(c.deputy_id, ancestor), BanGate::WouldRemoveViewer(_)),
+                "banning a {label} removes the banner and their whole subtree, \
+                 so it must be refused (#478)"
+            );
+        }
+    }
+
+    /// The over-broadness case. A guard that also blocks legitimate bans is a
+    /// failure, so these must still be ALLOWED — from the same room, by the
+    /// same deputy, as the refusals above.
+    #[test]
+    fn bans_that_do_not_remove_the_banner_are_still_allowed() {
+        let c = ban_chain();
+
+        for (label, target) in [
+            ("an unrelated member in another subtree", c.stranger_id),
+            ("a member of the deputy's OWN downstream", c.child_id),
+            (
+                "a deputy scoped to an ancestor's subtree",
+                c.alphas_deputy_id,
+            ),
+        ] {
+            assert!(
+                !ban_removal_set(&c.members, target).contains(&c.deputy_id),
+                "precondition ({label}): this ban does not remove the banner"
+            );
+            assert_eq!(
+                c.gate(c.deputy_id, target),
+                BanGate::Allowed,
+                "banning {label} is legitimate and must stay available (#478 \
+                 must not be over-broad)"
+            );
+        }
+
+        // The OWNER is never in anyone's removal set (they are nobody's
+        // invitee), so their authority is untouched — including over the
+        // members at the top of the deputy's own chain.
+        assert_eq!(c.gate(c.owner_id, c.alpha_id), BanGate::Allowed);
+        assert_eq!(c.gate(c.owner_id, c.deputy_id), BanGate::Allowed);
+    }
+
+    /// Proves the ancestor cases above are about the GUARD and not about
+    /// missing authority: a subtree-scoped deputy (deputized by alpha, not by
+    /// the owner) is refused the very same target for a different reason. If a
+    /// future change made `WouldRemoveViewer` the answer here too, the
+    /// distinction the modal renders on would have silently collapsed.
+    #[test]
+    fn a_non_global_deputy_is_refused_an_ancestor_for_lack_of_authority() {
+        let c = ban_chain();
+
+        assert!(
+            !c.contract_authorizes(c.alphas_deputy_id, c.alpha_id),
+            "precondition: deputy authority is scoped to the DEPUTIZER's \
+             subtree, so alpha's deputy has no grant over alpha themselves"
+        );
+        assert_eq!(
+            c.gate(c.alphas_deputy_id, c.alpha_id),
+            BanGate::NoAuthority,
+            "no authority is a different answer from 'would remove you', and \
+             only the latter is explained to the user"
+        );
+    }
+
+    /// The removal set is the target PLUS their whole transitive subtree —
+    /// the same set `check_banned_members` builds. A one-level-only walk (the
+    /// easy mistake) would miss the grandchild and let the grandparent ban
+    /// through.
+    #[test]
+    fn ban_removal_set_is_the_whole_transitive_subtree() {
+        let c = ban_chain();
+
+        let removed = ban_removal_set(&c.members, c.alpha_id);
+        assert!(removed.contains(&c.alpha_id), "the target themselves");
+        assert!(removed.contains(&c.beta_id), "a direct invitee");
+        assert!(removed.contains(&c.deputy_id), "a grandchild");
+        assert!(removed.contains(&c.child_id), "a great-grandchild");
+        assert!(
+            !removed.contains(&c.stranger_id),
+            "a member in a different subtree is NOT removed"
+        );
+
+        // A leaf removes only themselves.
+        assert_eq!(
+            ban_removal_set(&c.members, c.child_id),
+            HashSet::from([c.child_id])
+        );
+    }
+
+    /// The contract's `get_downstream_members` has no visited guard — it can
+    /// rely on `verify` having rejected circular invite chains. This mirror
+    /// walks whatever state the UI currently holds, including a half-applied
+    /// or hostile one, so it must terminate. (Test hangs rather than fails if
+    /// this regresses, which is still a loud CI signal.)
+    #[test]
+    fn ban_removal_set_terminates_on_a_cycle() {
+        let mut c = ban_chain();
+        // Hand-forge a cycle: alpha claims to have been invited by their own
+        // descendant. `AuthorizedMember::new` would not produce this, so patch
+        // the field directly.
+        c.members.members[0].member.invited_by = c.deputy_id;
+
+        let removed = ban_removal_set(&c.members, c.alpha_id);
+        assert!(removed.contains(&c.alpha_id));
+        assert!(removed.contains(&c.beta_id));
+    }
+
+    /// The RENDER layer. The Ban action must not render when the rule refuses
+    /// it, and the modal must derive that from the shared gate rather than
+    /// re-deciding locally. Source-scrape, because the render is a Dioxus
+    /// component tree with no headless harness here.
+    #[test]
+    fn ban_action_is_not_rendered_when_the_rule_refuses() {
+        let prod = prod_source(include_str!("members/member_info_modal.rs"));
+        assert_prod_only(&prod, "member_info_modal.rs");
+
+        // The modal must ask the SHARED gate. A local re-derivation is how the
+        // render and the action boundary drift apart.
+        assert!(
+            prod.contains("ban_gate("),
+            "the modal must gate Ban through `ban_gate` (#478)"
+        );
+        // The reason must be RENDERED, not merely computed. Checking only that
+        // the gate is destructured would let someone delete the explanation
+        // element and keep the pin green — a Ban button that vanishes with no
+        // explanation is exactly the bug report this is here to prevent.
+        let reason_at = prod
+            .find("if let Some(reason) = ban_refusal {")
+            .expect("the modal must render the refusal reason when the rule withholds Ban (#478)");
+        let reason_block = &prod[reason_at..];
+        assert!(
+            reason_block.contains("\"data-testid\": \"ban-withheld-reason\"")
+                && reason_block.contains("\"{reason}\""),
+            "the withheld-Ban explanation must actually display the reason text \
+             (#478)"
+        );
+
+        // EVERY render must be guarded, not just the first. A second,
+        // unguarded `BanButton` added later would otherwise slip past.
+        let sites: Vec<usize> = prod.match_indices("BanButton {").map(|(i, _)| i).collect();
+        assert!(
+            !sites.is_empty(),
+            "the modal must render a BanButton — if it moved to another file, \
+             move this pin with it (#478)"
+        );
+
+        for ban_at in sites {
+            // Both guards must be open where the button renders: the self
+            // check (which also hides Deputize) and the rule's refusal.
+            for guard in [
+                "if member_id != self_member_id {",
+                "if ban_refusal.is_none() {",
+            ] {
+                let guard_at = prod[..ban_at].rfind(guard).unwrap_or_else(|| {
+                    panic!("no `{guard}` guard above a BanButton render (#478)")
+                });
+                assert!(
+                    guard_is_still_open(&prod[guard_at + guard.len()..ban_at]),
+                    "the nearest `{guard}` above a `BanButton` closes before \
+                     the button renders, so the Ban action is still reachable \
+                     where #478 says it must not be"
+                );
+            }
+        }
+    }
+
+    /// The ACTION BOUNDARY. `BanButton::execute_ban` trusts a `member_to_ban`
+    /// PROP and a `can_ban` PROP; any future call site passing `can_ban: true`
+    /// would run the cascading ban if the only guards were render-time. So the
+    /// check must be inside `execute_ban`, must run BEFORE the `UserBan` is
+    /// built, and must NOT consult the caller's flags. Source-scraped because
+    /// the handler is a Dioxus closure needing a runtime.
+    #[test]
+    fn execute_ban_refuses_at_the_action_boundary() {
+        let prod = prod_source(include_str!("members/member_info_modal/ban_button.rs"));
+        assert_prod_only(&prod, "ban_button.rs");
+
+        let handler_at = prod
+            .find("let execute_ban =")
+            .expect("ban_button.rs must define an execute_ban handler");
+        let build_at = prod
+            .find("let ban = UserBan {")
+            .expect("ban_button.rs must build a UserBan");
+        assert!(
+            handler_at < build_at,
+            "the UserBan must be built inside execute_ban"
+        );
+        let guarded_region = &prod[handler_at..build_at];
+
+        assert!(
+            guarded_region.contains("self_removing_ban_reason("),
+            "`execute_ban` must refuse a self-removing ban BEFORE building the \
+             UserBan, using the SAME predicate as the render gate so the two \
+             cannot drift (#478)"
+        );
+        assert!(
+            guarded_region.contains("return;"),
+            "the boundary check must ABORT the ban, not merely log it (#478)"
+        );
+        assert!(
+            !guarded_region.contains("can_ban"),
+            "the boundary check must not be conditioned on the caller's \
+             `can_ban` prop — the whole point is that a caller claiming the \
+             action is permitted cannot make it so (#478)"
+        );
+    }
+
+    /// Production slice of a source file for the pins above: everything before
+    /// the test module (the whole file when it has none), with line comments
+    /// stripped.
+    ///
+    /// Stripping comments matters — a guard that was DELETED but is still
+    /// QUOTED in a comment would otherwise satisfy a `contains`/`rfind`, the
+    /// same reason `util::ecies`'s pin strips them.
+    ///
+    /// Cutting at the FIRST `#[cfg(test)]` is the safe direction here: every
+    /// assertion built on this requires its needle to be PRESENT, so an
+    /// over-short slice panics loudly rather than passing vacuously. The
+    /// dangerous direction is an over-LONG slice, where a needle could match
+    /// inside test code and the pin goes silently vacuous — callers guard
+    /// against that with [`assert_prod_only`].
+    fn prod_source(source: &str) -> String {
+        let end = source.find("#[cfg(test)]").unwrap_or(source.len());
+        source[..end]
+            .lines()
+            .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Fails if a [`prod_source`] slice still contains test code, which would
+    /// let a pin's needles match themselves. Cheap insurance against the
+    /// failure mode where a rebase moves the cut point and every source-scrape
+    /// in the file quietly stops asserting anything.
+    fn assert_prod_only(prod: &str, what: &str) {
+        assert!(
+            !prod.contains("#[test]"),
+            "{what}: the production slice still contains test code, so the \
+             pins below can match their own needles — fix the cut point"
+        );
+    }
+
+    /// Whether a guard block is still OPEN across `between` (the text from the
+    /// end of the guard's `{` to the site it should be protecting).
+    ///
+    /// Tracks the MINIMUM running brace depth, not the final depth: the modal
+    /// has an earlier `if member_id != self_member_id` block (the DM /
+    /// Share-invite row) that closes again, and a final-depth check reads that
+    /// as satisfying the guard because a later block re-opens.
+    fn guard_is_still_open(between: &str) -> bool {
+        let mut depth = 0i32;
+        let mut min_depth = 0i32;
+        for c in between.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            min_depth = min_depth.min(depth);
+        }
+        min_depth >= 0
     }
 
     /// The conversation's 🛡 badge predicate, end to end.

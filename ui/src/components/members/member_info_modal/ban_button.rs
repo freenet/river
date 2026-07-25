@@ -32,6 +32,28 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
             let room_state_clone = room_data.room_state.clone();
             let banned_by = MemberId::from(&self_sk.verifying_key());
 
+            // THE ACTION BOUNDARY for "nobody may ban themselves out of the
+            // room" (freenet/river#478, direct AND transitive).
+            //
+            // `ban_gate` refuses it and the modal renders an explanation in
+            // place of this button, but both of those are render-time: this
+            // function trusts a `member_to_ban` PROP and re-checks nothing, so
+            // any future call site that passes `can_ban: true` would execute
+            // the ban. Such a ban is contract-VALID and cascades to the
+            // banner's whole invite subtree, so the capability has to be
+            // unreachable rather than merely un-rendered.
+            //
+            // Same predicate as the render gate — deliberately not a
+            // re-derivation, so the two cannot drift.
+            if let Some(reason) = crate::components::members::self_removing_ban_reason(
+                &room_data.room_state.members,
+                banned_by,
+                member_to_ban,
+            ) {
+                warn!("Refusing a ban that would remove you from the room (freenet/river#478): {reason}");
+                return;
+            }
+
             let ban = UserBan {
                 owner_member_id: MemberId::from(&current_room),
                 banned_at: get_current_system_time(),
