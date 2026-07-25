@@ -555,7 +555,9 @@ fn asymmetric_caps_terminate_in_both_directions() {
     );
 }
 
-/// KNOWN OPEN BUG — this test pins the loop AS IT CURRENTLY BEHAVES.
+/// KNOWN OPEN BUG (freenet/river#490) — this test pins the loop AS IT
+/// CURRENTLY BEHAVES. Full analysis, including why no horizon can express
+/// this, lives in the issue; do not re-derive it here.
 ///
 /// A peer whose horizon REGRESSES from `OldestRetained` back to `Open` because
 /// a ban sweep emptied part of its window, driven through the FULL
@@ -700,9 +702,10 @@ fn ban_sweep_reopening_the_horizon_still_loops_known_gap() {
             .unwrap_or_else(|| {
                 panic!(
                     "round {round}: S had nothing left to offer. The ban-propagation \
-                     gap this test characterises has been CLOSED — that is good news. \
-                     Rename this test back to `..._does_not_loop` and restore the \
-                     terminating assertion."
+                     gap this test characterises (freenet/river#490) has been \
+                     CLOSED — that is good news. Rename this test back to \
+                     `..._does_not_loop`, restore the terminating assertion, and \
+                     close the issue."
                 )
             });
 
