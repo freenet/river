@@ -739,7 +739,7 @@ pub(crate) enum ReplyContextDisplay {
 /// reply that quoted them becomes the last surviving copy of their text.
 /// Rendering it would keep a banned member's abusive message in circulation —
 /// and `riverctl`'s JSON output feeds bridges, which would republish it. See
-/// `resolve_reply_context` in `ui/src/components/conversation.rs` for why this
+/// `resolve_reply_strip` in `ui/src/components/conversation.rs` for why this
 /// cannot instead be keyed on the room's ban list, and for the deliberate
 /// trade-off that a merely aged-out target is treated the same way.
 pub(crate) fn reply_context_display_with_secrets(
@@ -796,47 +796,69 @@ pub(crate) fn reply_context_display_with_secrets(
         // and `effective_text` consults `edited_content` before any
         // content-type decode, so without it a member could post a join event,
         // edit it to arbitrary text, and quote that. Do NOT drop it. Mirrors
-        // the UI's `resolve_reply_context`.
+        // the UI's `resolve_reply_strip`.
         .filter(|target| {
             !messages.is_deleted(&reply.target_message_id)
                 && !target.message.content.is_action()
                 && !target.message.content.is_event()
-        })
-        .and_then(|target| {
-            // Never fall back to a `<encrypted>` / decode-failure placeholder
-            // here: an undecryptable target has NOT been re-read, so it must be
-            // reported unavailable rather than quoted. Deliberately NOT
-            // `decrypt_private_body_text`, whose catch-all returns the raw
-            // decrypted bytes as lossy UTF-8 for an unrecognised content type —
-            // fine for rendering a BODY, but in a quote it would present raw
-            // bytes as the quoted author's words (and ship them to bridges in
-            // `reply_to.preview`). Mirrors the UI's `target_plaintext`.
-            let text = messages
-                .effective_text(target)
-                .or_else(|| decrypt_private_quote_text(&target.message.content, secrets))?;
-            let author = room_state
-                .member_info
-                .canonical(target.message.author)
-                .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets))
-                .unwrap_or_else(|| "Unknown".to_string());
-            Some((author, text))
         });
+    let Some(target) = resolved else {
+        return ReplyContextDisplay::Unavailable;
+    };
 
-    match resolved {
-        Some((author, text)) => ReplyContextDisplay::Quote {
-            author,
-            preview: truncate_reply_preview(&render_mentions_for_terminal(room_state, &text)),
-        },
-        None => ReplyContextDisplay::Unavailable,
+    // Never fall back to a `<encrypted>` / decode-failure placeholder here: an
+    // undecryptable target has NOT been re-read, so it must be reported
+    // unavailable rather than quoted. Deliberately NOT
+    // `decrypt_private_body_text`, whose catch-all returns the raw decrypted
+    // bytes as lossy UTF-8 for an unrecognised content type — fine for
+    // rendering a BODY, but in a quote it would present raw bytes as the quoted
+    // author's words (and ship them to bridges in `reply_to.preview`). Mirrors
+    // the UI's `target_plaintext`.
+    let Some(text) = messages
+        .effective_text(target)
+        .or_else(|| decrypt_private_quote_text(&target.message.content, secrets))
+    else {
+        // A PUBLIC reply can quote a PRIVATE target — the UI deliberately falls
+        // back to sending a reply publicly when the room secret is missing — so
+        // this arm is reachable with no secrets held even though the reply
+        // itself decoded. Mirrors the UI's second `pending_decryption` check.
+        return if pending_decryption(&target.message.content, secrets) {
+            ReplyContextDisplay::NotAReply
+        } else {
+            ReplyContextDisplay::Unavailable
+        };
+    };
+
+    let author = room_state
+        .member_info
+        .canonical(target.message.author)
+        .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets))
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    ReplyContextDisplay::Quote {
+        author,
+        preview: truncate_reply_preview(&render_mentions_for_terminal(room_state, &text)),
     }
 }
 
-/// Whether an unreadable private body is merely WAITING on the room secrets
-/// rather than genuinely unreadable — riverctl holds no secrets for a room it
-/// has no local storage for. Mirrors the UI's `pending_decryption`
-/// (`ui/src/components/conversation.rs`); the discriminator is "no secrets AT
-/// ALL", not "this version is missing", because a rotated-past version IS
-/// genuinely unavailable.
+/// Whether an unreadable private body is unreadable because we hold NO room
+/// secrets at all, rather than because this particular version is gone.
+///
+/// Mirrors the UI's `pending_decryption` (`ui/src/components/conversation.rs`),
+/// where the state really is transient. In riverctl it is not: a one-shot
+/// invocation either resolves secrets at startup (`room_display_secrets`) or
+/// never will. The behaviour is mirrored anyway, deliberately — the two clients
+/// must agree on which quotes they refuse, and the alternative is riverctl
+/// asserting "unavailable" about every reply in a room it simply cannot read,
+/// where the bodies already render `<encrypted>`.
+///
+/// The discriminator is "no secrets AT ALL", not "this version is missing",
+/// because a rotated-past version IS genuinely unavailable. Note this is a
+/// property of what WE hold, not of the message: in a public room a member can
+/// post a `Private` body (nothing rejects it) and flip this to true for
+/// everyone. The failure mode is benign — both branches render zero
+/// attacker-controlled text, so the only effect is suppressing the
+/// "unavailable" marker.
 fn pending_decryption(
     content: &river_core::room_state::message::RoomMessageBody,
     secrets: &HashMap<u32, [u8; 32]>,
@@ -8545,6 +8567,110 @@ mod mention_cli_tests {
                 "an action/event target must not be quoted"
             );
         }
+    }
+
+    /// riverctl must reach the same verdict as the UI for a PUBLIC reply
+    /// quoting a PRIVATE target — reachable because the composer falls back to
+    /// sending a reply publicly when the room secret is missing. Mirrors the
+    /// UI's `public_reply_to_undecryptable_private_target`.
+    #[test]
+    fn public_reply_to_undecryptable_private_target() {
+        use river_core::room_state::content::{
+            TextContentV1, CONTENT_TYPE_TEXT, TEXT_CONTENT_VERSION,
+        };
+
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let sender = SigningKey::from_bytes(&[200u8; 32]);
+        let mut state =
+            state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
+
+        let secret = [8u8; 32];
+        let (ciphertext, nonce) = river_core::ecies::encrypt_with_symmetric_key(
+            &secret,
+            &TextContentV1::new("sealed target".to_string()).encode(),
+        );
+        let target = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(&sender.verifying_key()),
+                author: member_id(&alice),
+                content: RoomMessageBody::private(
+                    CONTENT_TYPE_TEXT,
+                    TEXT_CONTENT_VERSION,
+                    ciphertext,
+                    nonce,
+                    3,
+                ),
+                time: SystemTime::UNIX_EPOCH,
+            },
+            &alice,
+        );
+        let reply = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(&sender.verifying_key()),
+                author: member_id(&sender),
+                content: RoomMessageBody::reply(
+                    "public reply".to_string(),
+                    target.id(),
+                    "SNAPSHOT AUTHOR MUST NOT RENDER".to_string(),
+                    "SNAPSHOT PREVIEW MUST NOT RENDER".to_string(),
+                ),
+                time: SystemTime::UNIX_EPOCH,
+            },
+            &sender,
+        );
+        state.recent_messages.messages.push(target);
+        state.recent_messages.messages.push(reply.clone());
+
+        assert_eq!(
+            expect_quote(reply_context_display_with_secrets(
+                &state,
+                &reply,
+                &HashMap::from([(3u32, secret)])
+            ))
+            .1,
+            "sealed target"
+        );
+        assert_eq!(
+            reply_context_display_with_secrets(&state, &reply, &HashMap::from([(4u32, [1u8; 32])])),
+            ReplyContextDisplay::Unavailable,
+            "rotated past the target's version is genuinely unavailable"
+        );
+        assert_eq!(
+            reply_context_display(&state, &reply),
+            ReplyContextDisplay::NotAReply,
+            "holding no secrets at all must match the UI, which renders no strip"
+        );
+    }
+
+    /// An undecodable PUBLIC reply body. Any member can post one, and it IS a
+    /// reply, so both clients must report it unavailable rather than dropping
+    /// it silently. Before this it returned `NotAReply` here and `Unavailable`
+    /// in the UI.
+    #[test]
+    fn undecodable_public_reply_reports_unavailable() {
+        use river_core::room_state::content::{CONTENT_TYPE_REPLY, REPLY_CONTENT_VERSION};
+
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
+        let sender = SigningKey::from_bytes(&[200u8; 32]);
+        let reply = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(&sender.verifying_key()),
+                author: member_id(&sender),
+                content: RoomMessageBody::public_raw(
+                    CONTENT_TYPE_REPLY,
+                    REPLY_CONTENT_VERSION,
+                    vec![0xff, 0x00, 0xff],
+                ),
+                time: SystemTime::UNIX_EPOCH,
+            },
+            &sender,
+        );
+
+        assert_eq!(
+            reply_context_display(&state, &reply),
+            ReplyContextDisplay::Unavailable
+        );
     }
 
     /// The two emit sites (the `message list` backfill and the `monitor`

@@ -330,6 +330,11 @@ fn resolve_reply_strip(
 /// `RoomData.secrets` is `#[serde(skip)]`, so every cold start of an
 /// established private room transiently holds NO secrets until
 /// `repopulate_secrets_from_state` rehydrates them from the encrypted blobs.
+/// (Transient is the motivating case, not the only one: a public room always
+/// has no secrets, and any member of one can post a `Private` body — nothing
+/// rejects it — flipping this to true for everyone. The failure mode is benign,
+/// since both branches render zero attacker-supplied text; all it can suppress
+/// is the "unavailable" marker.)
 /// In that window nothing is verifiable and nothing is being hidden (the
 /// snapshot is unreadable too), so the strip must render as if the message
 /// simply were not a reply — flashing "Original message unavailable" over every
@@ -5204,8 +5209,7 @@ mod resolve_reply_strip_tests {
             20,
         );
 
-        // Two records for Alice; the higher version is canonical. Listed with
-        // the STALE one last so a naive `.collect()` into a map would pick it.
+        // Two records for Alice; the higher version is canonical.
         let canonical = AuthorizedMemberInfo::new(
             MemberInfo::new_public(member_id_of(&alice_sk), 2, "Alice v2".to_string()),
             &alice_sk,
@@ -5214,18 +5218,30 @@ mod resolve_reply_strip_tests {
             MemberInfo::new_public(member_id_of(&alice_sk), 1, "Alice v1".to_string()),
             &alice_sk,
         );
-        let member_info = info(vec![canonical, stale]);
 
-        let (author, _) = expect_quote(resolve(
-            &reply,
-            &state(vec![original, reply.clone()]),
-            &member_info,
-        ));
-        assert_eq!(
-            author, "Alice v2",
-            "must match `member_info.canonical()`, which is what the message \
-             header uses"
-        );
+        // BOTH orderings. A single ordering only pins one of the two ways this
+        // regresses, while looking deliberate: `[canonical, stale]` catches a
+        // last-wins `.collect()` into a map but a first-match `.find()` sails
+        // through it, and `[stale, canonical]` catches the reverse. Only
+        // `canonical()`'s rank comparison satisfies both.
+        for (order, member_info) in [
+            (
+                "canonical first",
+                info(vec![canonical.clone(), stale.clone()]),
+            ),
+            ("stale first", info(vec![stale, canonical])),
+        ] {
+            let (author, _) = expect_quote(resolve(
+                &reply,
+                &state(vec![original.clone(), reply.clone()]),
+                &member_info,
+            ));
+            assert_eq!(
+                author, "Alice v2",
+                "must match `member_info.canonical()`, which is what the \
+                 message header uses ({order})"
+            );
+        }
     }
 
     /// Deleting a message removes its text from the room; quotes of it included.
@@ -5539,7 +5555,9 @@ mod resolve_reply_strip_tests {
     /// A private reply whose own secret we lack cannot even be decoded, so we
     /// cannot tell what it quotes. It is still a REPLY (`content_type` is
     /// cleartext on the `Private` variant), so it reports `Unavailable` rather
-    /// than silently dropping the strip — and riverctl reports the same.
+    /// than silently dropping the strip — UNLESS we hold no secrets at all,
+    /// which is the cold-start window and must look like nothing. riverctl
+    /// reports the same for both.
     #[test]
     fn undecodable_private_reply_reports_unavailable() {
         use crate::util::ecies::encrypt_with_symmetric_key;
@@ -5611,6 +5629,107 @@ mod resolve_reply_strip_tests {
             resolve(&reply, &messages, &member_info),
             ReplyStrip::NotAReply,
             "cold start must not flash the placeholder"
+        );
+    }
+
+    /// A PUBLIC reply can quote a PRIVATE target: the composer deliberately
+    /// falls back to sending a reply publicly when the room secret is missing.
+    /// So the target-side cold-start path is reachable even though the reply
+    /// itself decoded fine, and it must behave like the reply-side one.
+    #[test]
+    fn public_reply_to_undecryptable_private_target() {
+        use crate::util::ecies::encrypt_with_symmetric_key;
+        use river_core::room_state::content::TEXT_CONTENT_VERSION;
+
+        let owner_sk = signing_key(1);
+        let alice_sk = signing_key(2);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+        let member_info = info(vec![named(&alice_sk, "Alice")]);
+
+        let secret = [8u8; 32];
+        let (ciphertext, nonce) = encrypt_with_symmetric_key(
+            &secret,
+            &TextContentV1::new("sealed target".to_string()).encode(),
+        );
+        let target = authored(
+            owner,
+            &alice_sk,
+            RoomMessageBody::private(
+                CONTENT_TYPE_TEXT,
+                TEXT_CONTENT_VERSION,
+                ciphertext,
+                nonce,
+                3,
+            ),
+            10,
+        );
+        let reply = authored(
+            owner,
+            &bob_sk,
+            RoomMessageBody::reply(
+                "public reply".to_string(),
+                target.id(),
+                "SNAPSHOT AUTHOR".to_string(),
+                "SNAPSHOT PREVIEW".to_string(),
+            ),
+            20,
+        );
+        let messages = state(vec![target, reply.clone()]);
+
+        let resolve_with = |secrets: HashMap<u32, [u8; 32]>| {
+            resolve_reply_strip(
+                &reply.message.content,
+                &messages,
+                &member_info,
+                &secrets,
+                &HashMap::new(),
+            )
+        };
+
+        assert_eq!(
+            expect_quote(resolve_with(HashMap::from([(3u32, secret)]))).1,
+            "sealed target"
+        );
+        assert_eq!(
+            resolve_with(HashMap::from([(4u32, [1u8; 32])])),
+            ReplyStrip::Unavailable,
+            "rotated past the target's version is genuinely unavailable"
+        );
+        assert_eq!(
+            resolve_with(HashMap::new()),
+            ReplyStrip::NotAReply,
+            "holding no secrets at all is the cold-start window, not a failure"
+        );
+    }
+
+    /// A reply body carrying undecodable payload bytes. Any member can post one
+    /// — the contract treats message content as opaque — and it IS a reply, so
+    /// it must be reported unavailable rather than silently dropped. This also
+    /// pins that `pending_decryption`'s `Private` guard is load-bearing:
+    /// simplifying it to a bare `secrets.is_empty()` would swallow this case.
+    #[test]
+    fn undecodable_public_reply_reports_unavailable() {
+        use river_core::room_state::content::{CONTENT_TYPE_REPLY, REPLY_CONTENT_VERSION};
+
+        let owner_sk = signing_key(1);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+
+        let reply = authored(
+            owner,
+            &bob_sk,
+            RoomMessageBody::public_raw(
+                CONTENT_TYPE_REPLY,
+                REPLY_CONTENT_VERSION,
+                vec![0xff, 0x00, 0xff],
+            ),
+            20,
+        );
+
+        assert_eq!(
+            resolve(&reply, &state(vec![reply.clone()]), &info(vec![])),
+            ReplyStrip::Unavailable
         );
     }
 

@@ -445,7 +445,7 @@ fn add_example_messages(
     // assert on it. In production this is what a reply to a BANNED member's
     // message looks like — banning purges the target, leaving only the
     // replier-authored snapshot, which the UI deliberately refuses to render
-    // (see `resolve_reply_context`). A fabricated target id reproduces that
+    // (see `resolve_reply_strip`). A fabricated target id reproduces that
     // end state without having to simulate a ban, and is deterministic.
     {
         // Authored by the OWNER (i.e. self) so the placeholder's `is_self`
