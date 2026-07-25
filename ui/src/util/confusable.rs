@@ -515,6 +515,22 @@ fn skeleton_with(name: &str, fold: Fold) -> String {
             }
             continue;
         }
+        // 1b. **Joiners, dropped unconditionally** — the OTHER half of #488's
+        //     kept-in-context residual.
+        //
+        //     `is_display_hidden` deliberately does NOT report U+200C/U+200D,
+        //     because they are orthography in Persian, Sinhala and Malayalam and
+        //     blanket-stripping them mangles real names at RENDER time. But this
+        //     is not render, it is comparison, and a joiner never distinguishes
+        //     two people's names to a reader — which is the entire premise of
+        //     the residual `display_name.rs`'s header documents. So dropping
+        //     them here has zero false-positive cost and closes the clone:
+        //     without it `"李\u{200D}小龍"` and `"李小龍"` fold apart and the
+        //     impostor is unflagged, leaving every CJK, Persian, Sinhala and
+        //     Malayalam deputy name cloneable.
+        if c == '\u{200C}' || c == '\u{200D}' {
+            continue;
+        }
         // 2. Fullwidth forms, and the "mathematical alphanumeric" blocks that
         //    every online fancy-text generator emits (`𝐈𝐚𝐧`, `𝗜𝗮𝗻`, `𝙸𝚊𝚗` all
         //    read as "Ian"). NFKC does this in the reference; these are the
@@ -1374,6 +1390,80 @@ mod tests {
              justifies rendering tier 1 only no longer holds — re-examine \
              `members::impersonation_warning_for_display`"
         );
+    }
+
+    /// **SHOULD-FIX D — the joiner half of #488's residual.**
+    ///
+    /// `display_name.rs` keeps TWO characters in context: an IVS after an
+    /// ideograph, and a joiner between two non-ASCII letters. The IVS half was
+    /// already covered (`an_ideographic_variation_selector_clone_is_flagged`);
+    /// this is the other half, which used to EVADE.
+    ///
+    /// A joiner is orthography at render time — Persian `علی‌رضا`, Sinhala
+    /// touching letters, Malayalam chillu — which is why `is_display_hidden`
+    /// does not report it. But it never distinguishes two people's names to a
+    /// READER, so dropping it for comparison has no false-positive cost.
+    #[test]
+    fn a_joiner_clone_is_flagged() {
+        for (real, clone, script) in [
+            (
+                "\u{674E}\u{5C0F}\u{9F8D}",
+                "\u{674E}\u{200D}\u{5C0F}\u{9F8D}",
+                "CJK, ZWJ",
+            ),
+            (
+                "\u{674E}\u{5C0F}\u{9F8D}",
+                "\u{674E}\u{200C}\u{5C0F}\u{9F8D}",
+                "CJK, ZWNJ",
+            ),
+            (
+                "\u{639}\u{644}\u{6CC}\u{631}\u{636}\u{627}",
+                "\u{639}\u{644}\u{6CC}\u{200C}\u{631}\u{636}\u{627}",
+                "Persian",
+            ),
+        ] {
+            // Precondition: sanitisation KEEPS the joiner, so the two members
+            // really do render alike and the existing defence does not catch it.
+            assert_eq!(
+                crate::util::display_name::sanitize_display_name(clone),
+                clone,
+                "{script}: precondition — #488 keeps an interior joiner"
+            );
+            assert_ne!(real, clone, "{script}: different strings");
+
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                real,
+                mid(1),
+            )]);
+            let w = checker
+                .check(mid(2), clone)
+                .unwrap_or_else(|| panic!("{script}: a joiner clone must be flagged"));
+            assert_eq!(w.tier, ConfusableTier::Identical);
+        }
+    }
+
+    /// The joiner drop must not disturb names that legitimately CONTAIN one:
+    /// they still fold to themselves-minus-the-joiner, so two DIFFERENT real
+    /// names remain different.
+    #[test]
+    fn dropping_joiners_does_not_merge_distinct_names() {
+        let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+            ProtectedRole::Deputy,
+            "\u{639}\u{644}\u{6CC}\u{200C}\u{631}\u{636}\u{627}",
+            mid(1),
+        )]);
+        for other in [
+            "\u{645}\u{62D}\u{645}\u{62F}",
+            "\u{62D}\u{633}\u{6CC}\u{646}\u{200C}\u{632}\u{627}\u{62F}\u{647}",
+            "\u{674E}\u{5C0F}\u{9F8D}",
+        ] {
+            assert_eq!(
+                checker.check(mid(2), other),
+                None,
+                "{other:?} is a different name and must not be flagged"
+            );
+        }
     }
 
     /// **Regression: the `nn -> m` fold (removed).** Doubled-n is one of the
