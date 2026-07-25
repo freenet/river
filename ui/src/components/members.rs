@@ -5484,6 +5484,119 @@ mod tests {
             .any(|(g, _)| *g == crate::util::confusable::WARNING_GLYPH));
     }
 
+    /// **The residual #488 knowingly left open, and this warning is its only
+    /// mitigation.**
+    ///
+    /// An Ideographic Variation Selector is legitimate orthography — `辻` has
+    /// the registered variant `辻\u{E0100}` — so #488 deliberately KEEPS one
+    /// after an ideograph rather than stripping it. The cost is that
+    /// `"李\u{E0100}小龍"` and `"李小龍"` render identically on any font without
+    /// an IVD entry for the sequence, which is a clone of another member's
+    /// rendered name that `sanitize_display_name` will not remove.
+    ///
+    /// The layering is what closes it. `is_display_hidden` keeps the selectors
+    /// INSIDE its plane-14 range and the in-context exception is applied ON TOP
+    /// by `sanitize_display_name` / `contains_hidden_chars`, so
+    /// `confusable::skeleton` — which calls `is_display_hidden` DIRECTLY — still
+    /// folds the two names together and this warning fires.
+    ///
+    /// That makes the dependency mutual and easy to break from either side:
+    /// moving the carve-out INTO `is_display_hidden` (punching a hole in the
+    /// range instead of layering over it) would silently switch this warning
+    /// off and leave the residual undetectable. #488 documents that at the call
+    /// site; this test is the CI gate on our side of it.
+    #[test]
+    fn an_ideographic_variation_selector_clone_is_flagged() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        const IVS: char = '\u{E0100}';
+        let real = "李小龍";
+        let clone = format!("李{IVS}小龍");
+
+        // Preconditions, and the reason this test has to exist.
+        //
+        // 1. The IVS SURVIVES sanitisation, so the two members really do render
+        //    a pixel-identical name — the existing invisible-character defence
+        //    does not catch this one, by design.
+        assert_eq!(
+            crate::util::display_name::sanitize_display_name(&clone),
+            clone,
+            "#488 keeps an IVS after an ideograph; if that changed, this \
+             residual is closed elsewhere and this test should be revisited"
+        );
+        assert!(
+            !crate::util::display_name::contains_hidden_chars(&clone),
+            "the nickname input accepts it too — the residual is real"
+        );
+        assert_ne!(clone, real, "different strings, identical rendering");
+
+        // 2. But `skeleton` folds them together, because it consults
+        //    `is_display_hidden` directly and the selectors are still inside
+        //    its plane-14 range.
+        assert_eq!(
+            crate::util::confusable::skeleton(&clone),
+            crate::util::confusable::skeleton(real),
+            "the confusable fold must see through an IVS, or the warning \
+             cannot fire on this residual"
+        );
+
+        // End to end, through the real protected-set derivation.
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let mod_sk = SigningKey::generate(&mut rng);
+        let viewer_sk = SigningKey::generate(&mut rng);
+        let impostor_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &mod_sk.verifying_key()),
+                authorized_member(&owner_sk, &viewer_sk.verifying_key()),
+                authorized_member(&owner_sk, &impostor_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Room Owner", vec![id(&mod_sk)]),
+                signed_member_info(&mod_sk, real, vec![]),
+                signed_member_info(&viewer_sk, "Viewer", vec![]),
+                signed_member_info(&impostor_sk, &clone, vec![]),
+            ],
+        };
+        let badges =
+            deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
+        assert!(
+            badges.contains_key(&id(&mod_sk)),
+            "precondition: the CJK-named moderator carries a shield"
+        );
+        let checker = impersonation_checker_for_viewer(&member_info, &secrets, owner_id, &badges);
+
+        let warning = impersonation_warning_for_display(&checker, id(&impostor_sk), &clone)
+            .expect("an IVS clone of a moderator's name must be flagged");
+        assert_eq!(
+            warning.tier,
+            ConfusableTier::Identical,
+            "an IVS clone renders as the SAME string, so it is a tier-1 match, \
+             not a near-miss (which this UI does not render)"
+        );
+        assert_eq!(warning.impersonated.display_name, real);
+
+        // And the real moderator is untouched, so the fold has not simply made
+        // everything match.
+        assert_eq!(
+            impersonation_warning_for_display(&checker, id(&mod_sk), real),
+            None
+        );
+        assert_eq!(
+            impersonation_warning_for_display(&checker, id(&viewer_sk), "Viewer"),
+            None
+        );
+    }
+
     /// **Wiring pin.** The warning only protects anyone if the surfaces actually
     /// render it. Both go through `impersonation_warning_for_display`, and both
     /// must build the checker OUTSIDE their per-member loop — rebuilding it per
