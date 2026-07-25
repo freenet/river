@@ -4533,9 +4533,41 @@ mod tests {
     // -----------------------------------------------------------------
     // Message-group memoization (over-rendering regression guard)
     // -----------------------------------------------------------------
+    /// The production half of this file, i.e. everything above this test module.
+    ///
+    /// `include_str!("conversation.rs")` pulls in the test module too, so a
+    /// source scrape that searched the whole string would match the literals
+    /// written in the assertions below and pass no matter what the real code
+    /// does. Cutting the file at the test-module header is what makes these
+    /// scrapes able to fail.
+    fn production_src() -> &'static str {
+        let src = include_str!("conversation.rs");
+        let marker = "#[cfg(test)]\nmod tests {";
+        let cut = src
+            .rfind(marker)
+            .expect("conversation.rs must contain the `#[cfg(test)] mod tests {` header");
+        &src[..cut]
+    }
+
+    #[test]
+    fn production_src_excludes_this_test_module() {
+        // Guard for the guard: if the marker ever stops matching (reformat,
+        // renamed module) `production_src` would silently start returning the
+        // whole file and the scrapes below would go back to being self-fulfilling.
+        let prod = production_src();
+        assert!(
+            !prod.contains("fn production_src_excludes_this_test_module"),
+            "production_src() must cut the file before the test module"
+        );
+        assert!(
+            prod.contains("fn MessageGroupComponent"),
+            "production_src() must still contain the production code it scrapes"
+        );
+    }
+
     #[test]
     fn message_group_callbacks_are_stable_handles() {
-        let src = include_str!("conversation.rs");
+        let src = production_src();
 
         // Dioxus decides whether a child component can be skipped by comparing
         // ALL of its props with PartialEq — event handlers included. A closure
@@ -4594,6 +4626,15 @@ mod tests {
             src.contains("_timeFmt") && src.contains("_fullFmt"),
             "format_time_local / format_full_datetime_local must reuse cached \
              Intl.DateTimeFormat instances rather than building one per call."
+        );
+        // A cached formatter pins the timezone it was built with, so the cache
+        // must be invalidated when the device timezone changes mid-session —
+        // otherwise message times drift away from the date separators, which
+        // read the current zone directly.
+        assert!(
+            src.contains("getTimezoneOffset()") && src.contains("_fmtOffset"),
+            "The cached Intl formatters must be rebuilt when the device timezone \
+             changes; otherwise times render in the stale zone until reload."
         );
         assert!(
             !src.contains("date.toLocaleTimeString(") && !src.contains("date.toLocaleString("),

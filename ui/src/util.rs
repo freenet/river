@@ -102,17 +102,35 @@ export function get_current_time() {
 // Intl.DateTimeFormat on every call (~70us each, measured in Chromium). These
 // run once per message group per render, so a 90-message room paid ~12ms of
 // pure date formatting per re-render. Constructing each formatter once and
-// reusing it is ~15x cheaper and produces byte-identical output.
+// reusing it is ~15x cheaper end-to-end and produces byte-identical output
+// (verified over a full year of timestamps in 4 timezones).
 let _timeFmt = null;
 let _fullFmt = null;
-export function format_time_local(timestamp_ms) {
-    if (_timeFmt === null) {
+let _fmtOffset = null;
+function ensureFormatters() {
+    // An Intl.DateTimeFormat resolves its timezone once, when it is constructed.
+    // If the device timezone changes while River is open (travel, a system
+    // setting change), a permanently-cached formatter would keep rendering the
+    // old zone while local_date_key below — which reads the Date's local fields
+    // directly — already reflects the new one, so message times and the date
+    // separators above them would disagree. The uncached form we replaced picked
+    // such a change up immediately, so the cache has to as well.
+    //
+    // The check is the current UTC offset: ~0.16us, against ~1.5us to format.
+    // (Re-resolving the zone NAME via `new Intl.DateTimeFormat().resolvedOptions()`
+    // costs ~84us — worse than not caching at all — and asking the cached
+    // formatter for its own resolvedOptions() only ever reports the zone it was
+    // built with, so neither can do this job.)
+    //
+    // Known limitation: a switch between two zones whose current offset is
+    // identical is not detected. Those zones render identically for the current
+    // period; only a message from a period where their DST rules diverge could
+    // format differently. A DST transition while the app is open changes the
+    // offset and so triggers one rebuild, which is the correct outcome.
+    const offset = new Date().getTimezoneOffset();
+    if (_timeFmt === null || offset !== _fmtOffset) {
+        _fmtOffset = offset;
         _timeFmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
-    }
-    return _timeFmt.format(new Date(timestamp_ms));
-}
-export function format_full_datetime_local(timestamp_ms) {
-    if (_fullFmt === null) {
         _fullFmt = new Intl.DateTimeFormat(undefined, {
             weekday: 'short',
             year: 'numeric',
@@ -124,6 +142,13 @@ export function format_full_datetime_local(timestamp_ms) {
             hour12: false
         });
     }
+}
+export function format_time_local(timestamp_ms) {
+    ensureFormatters();
+    return _timeFmt.format(new Date(timestamp_ms));
+}
+export function format_full_datetime_local(timestamp_ms) {
+    ensureFormatters();
     return _fullFmt.format(new Date(timestamp_ms));
 }
 export function local_date_key(timestamp_ms) {
