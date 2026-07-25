@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod confusable;
 pub mod display_name;
 pub mod ecies;
 
