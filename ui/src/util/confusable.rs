@@ -2047,6 +2047,8 @@ mod tests {
             "ኃይሌ ገብረሥላሴ",
             "Νίκος Παπαδόπουλος",
             "Ольга Иванова",
+            "ᏣᎳᎩ",
+            "ꓡꓲꓢꓴ",
         ] {
             assert_eq!(
                 checker.check_name(name),
@@ -2628,6 +2630,15 @@ mod tests {
             "ⲡⲁⲡⲛⲟⲩⲧⲉ",
             "Ⲡⲉⲧⲣⲟⲥ",
             "ᏣᎳᎩ ᎠᏰᎵ",
+            // Cherokee went from 1-of-35 folded to the whole block and Lisu
+            // from 2-of-26, which is the largest new false-positive surface in
+            // this file — so both need corpus entries that CONTAIN the newly
+            // folded letters, not just the one letter that was there before.
+            // `ᏣᎳᎩ` (Tsalagi, the nation's own name) carries Ꮃ and Ꭹ; `ꓡꓲꓢꓴ`
+            // (Li-Su, the people's own name) carries all four of ꓡ ꓲ ꓢ ꓴ.
+            "ᏣᎳᎩ",
+            "ᎠᏂᏴᏫᏯ",
+            "ꓡꓲꓢꓴ",
             "Γιώργος Παπαδόπουλος",
             "Νίκος Παπαδόπουλος",
             "Иван Петров",
