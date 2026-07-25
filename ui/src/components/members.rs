@@ -651,11 +651,10 @@ pub(crate) fn relevant_deputizer_names(
 /// `banned_by == banned_user` either, and enforcement re-runs the same
 /// predicate, so a self-ban is accepted and then CASCADES:
 /// `MembersV1::banned_member_ids` extends removal to
-/// `get_downstream_members(target)` (`common/src/room_state/member.rs:286-287`),
-/// and `ChatRoomStateV1::post_apply_cleanup` retains that whole set out — taking
-/// the member's entire invite subtree with them. (NOT `check_banned_members`,
-/// which walks invite chains for `has_banned_members` and has no production
-/// caller.)
+/// `get_downstream_members(target)`, and `ChatRoomStateV1::post_apply_cleanup`
+/// retains that whole set out — taking the member's entire invite subtree with
+/// them. (NOT `check_banned_members`, which walks invite chains for
+/// `has_banned_members`, which itself has no production caller.)
 ///
 /// The OWNER was never affected and this guard is not what protects them:
 /// `is_ban_authorized` denies `target == owner_id` outright before any grant, so

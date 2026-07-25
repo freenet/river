@@ -27,9 +27,7 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
             CURRENT_ROOM.read().owner_key,
             current_room_data_signal.read().as_ref(),
         ) {
-            let room_key = room_data.room_key();
             let self_sk = room_data.self_sk.clone();
-            let room_state_clone = room_data.room_state.clone();
             let banned_by = MemberId::from(&self_sk.verifying_key());
 
             // WRITE-PATH refusal of a self-ban (freenet/river#478). The two
@@ -37,10 +35,10 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
             // condition in `member_info_modal.rs` — decide whether the button
             // APPEARS; this one decides whether a `UserBan` is ever built, so it
             // is the check every present and future call site of `BanButton`
-            // inherits. It is also the only one evaluated at CLICK time: the
-            // render-time guards read `MemberInfoModal`'s own `self_member_id`,
-            // while `banned_by` here comes from a separate memo re-read now, so
-            // an identity re-import between render and click cannot slip past.
+            // inherits. Defense in depth: the render guards make it unreachable
+            // today, and it is kept because it is the layer that does not depend
+            // on a caller having asked the right question first. It is also the
+            // only one evaluated at CLICK rather than render time.
             //
             // riverctl refuses the same thing at the same layer
             // (`ApiClient::ban_member`: "Cannot ban yourself"). Nothing below
@@ -48,11 +46,22 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
             // handed, `validate_single_ban` does not refuse
             // `banned_by == banned_user`, and enforcement re-runs
             // `is_ban_authorized`, which GRANTS it for most deputies and then
-            // cascades removal to the member's whole invite subtree.
+            // cascades removal via `banned_member_ids` to the member's whole
+            // invite subtree.
+            //
+            // Close the confirmation dialog on the way out. The success path
+            // never resets `show_confirmation` — it relies on the deferred
+            // `MEMBER_INFO_MODAL.member = None` below unmounting this component
+            // — so returning early without this would leave the user staring at
+            // a "Yes, Ban User" button that silently does nothing.
             if member_to_ban == banned_by {
                 warn!("Refusing to ban self ({banned_by}) — see freenet/river#478");
+                show_confirmation.set(false);
                 return;
             }
+
+            let room_key = room_data.room_key();
+            let room_state_clone = room_data.room_state.clone();
 
             let ban = UserBan {
                 owner_member_id: MemberId::from(&current_room),

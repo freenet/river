@@ -608,47 +608,50 @@ mod ban_gate_tests {
     /// test can detect the loss of just one; that is why the render-site half
     /// needs a source pin.
     ///
-    /// Two things this pin does that the obvious version does not:
-    /// * It strips `//` comments before searching, so a future comment that
-    ///   merely QUOTES the guard cannot satisfy it. That is the exact way a
-    ///   source pin dies silently.
+    /// Three things this pin does that the obvious version does not:
+    /// * It strips comments before searching, so a future comment that merely
+    ///   QUOTES the guard cannot satisfy it. That is the exact way a source pin
+    ///   dies silently.
     /// * It checks EVERY occurrence, so adding a second, unguarded render site
     ///   fails rather than passing on the first one.
+    /// * It requires the guard on the immediately preceding line of CODE rather
+    ///   than somewhere within a character window. A window has to be tuned
+    ///   between two bad ends — wide enough that a `DeputyButton` guard
+    ///   elsewhere in the row could satisfy it, or tight enough that adding a
+    ///   comment breaks the build with a message saying the guard is missing
+    ///   when it is right there. Adjacency needs no tuning.
     #[test]
     fn ban_button_render_site_is_self_guarded() {
         let prod = strip_comments(production_source());
+        let lines: Vec<&str> = prod.lines().collect();
 
-        let sites: Vec<usize> = prod.match_indices("BanButton {").map(|(i, _)| i).collect();
+        let sites: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains("BanButton {"))
+            .map(|(i, _)| i)
+            .collect();
         assert!(
             !sites.is_empty(),
             "the member-info modal must render `BanButton`"
         );
         for site in sites {
-            // Only the text immediately preceding this button counts. With
-            // comments stripped the guard sits ~40 chars back, so 200 is ample
-            // slack while staying far too tight for `DeputyButton`'s own guard
-            // (a separate render site, always AFTER its own `BanButton`) to
-            // satisfy a later occurrence. `char_indices` keeps the slice on a
-            // UTF-8 boundary (this file is full of emoji).
-            let head = &prod[..site];
-            let window_start = head
-                .char_indices()
-                .rev()
-                .nth(200)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+            let guard = site
+                .checked_sub(1)
+                .map(|i| lines[i])
+                .unwrap_or("<start of file>");
             assert!(
-                head[window_start..].contains("if member_id != self_member_id {"),
-                "every `BanButton` render site must be guarded by \
+                guard.contains("if member_id != self_member_id {"),
+                "every `BanButton` render site must sit directly inside \
                  `if member_id != self_member_id {{` (freenet/river#478): a \
                  deputy's self-ban is contract-VALID and cascades to their \
-                 entire invite subtree"
+                 entire invite subtree. Found instead: {guard:?}"
             );
         }
     }
 
     /// freenet/river#478: `BanButton::execute_ban` must refuse a self-ban
-    /// BEFORE it builds the `UserBan`.
+    /// BEFORE it builds the `UserBan`, and must ABORT rather than just log.
     ///
     /// This is the layer every present and future call site inherits, and the
     /// only one evaluated at click rather than render time. Nothing downstream
@@ -657,9 +660,14 @@ mod ban_gate_tests {
     /// enforcement re-runs `is_ban_authorized`, which GRANTS a deputy's
     /// self-ban and then cascades removal to their whole invite subtree.
     ///
-    /// The ordering assertion is the load-bearing half: a guard that runs after
-    /// the `UserBan` is constructed and dispatched would satisfy a naive
-    /// "contains the check" pin while doing nothing.
+    /// Three separate assertions, because each pins a different way the guard
+    /// can rot into decoration:
+    /// * the comparison exists at all;
+    /// * it runs BEFORE every `UserBan` construction (a check placed after one
+    ///   would let the ban be built and dispatched);
+    /// * its body actually `return`s. Dropping the `return;` and keeping the
+    ///   `warn!` compiles without a warning, does nothing, and would satisfy a
+    ///   pin that only checked for the comparison.
     #[test]
     fn execute_ban_refuses_self_before_building_the_ban() {
         let prod = strip_comments(include_str!("member_info_modal/ban_button.rs"));
@@ -668,14 +676,24 @@ mod ban_gate_tests {
             "`execute_ban` must refuse a self-ban: `if member_to_ban == banned_by {` \
              (freenet/river#478)",
         );
-        let construction = prod
-            .find("let ban = UserBan {")
-            .expect("`execute_ban` must build a `UserBan`");
+        let constructions: Vec<usize> = prod.match_indices("UserBan {").map(|(i, _)| i).collect();
         assert!(
-            guard < construction,
-            "the self-ban refusal must run BEFORE the `UserBan` is constructed \
-             (freenet/river#478); a check placed after it would let the ban be \
-             built and dispatched"
+            !constructions.is_empty(),
+            "`execute_ban` must build a `UserBan`"
+        );
+        for construction in &constructions {
+            assert!(
+                guard < *construction,
+                "the self-ban refusal must run BEFORE every `UserBan` is \
+                 constructed (freenet/river#478); a check placed after one would \
+                 let that ban be built and dispatched"
+            );
+        }
+        let first_construction = constructions[0];
+        assert!(
+            prod[guard..first_construction].contains("return;"),
+            "the self-ban refusal must ABORT, not merely log (freenet/river#478); \
+             a guard whose body only warns leaves the ban to proceed"
         );
     }
 
@@ -690,18 +708,42 @@ mod ban_gate_tests {
             .expect("member_info_modal.rs should have a #[cfg(test)] block")]
     }
 
-    /// `source` with `//` comment bodies removed, so a source pin cannot be
-    /// satisfied by a comment that merely quotes the code it is meant to pin.
-    /// Line-oriented and deliberately simple: it does not need to handle `/*
-    /// */` or `//` inside a string literal, because a false NEGATIVE here is a
-    /// loud test failure, never a silent pass.
+    /// `source` with comment bodies removed, so a source pin cannot be
+    /// satisfied by a comment that merely QUOTES the code it is meant to pin.
+    /// That is how a pin dies silently, so both `//` and `/* */` are handled —
+    /// leaving either one out would reopen the hole via the other syntax.
+    ///
+    /// Comment-only lines collapse to nothing rather than to their indentation,
+    /// so a pin's proximity window measures code distance and is not eaten by
+    /// the comments that explain the very guard it pins.
+    ///
+    /// NOT handled, deliberately: `//` or `/*` inside a string literal. Get this
+    /// wrong and the line is truncated early, which can only DROP text from the
+    /// searched source. For a needle that must be PRESENT that is a loud test
+    /// failure. The one silent-pass corner it leaves is a needle that must be
+    /// ABSENT — a second, unguarded render site on a line that also contains a
+    /// `//` inside a string. Accepted: full lexing to close it would be a
+    /// bigger, more fragile thing than the pin it protects.
     fn strip_comments(source: &str) -> String {
-        source
-            .lines()
+        let mut out = String::with_capacity(source.len());
+        let mut rest = source;
+        // Strip `/* */` first, across line boundaries, so a block comment
+        // cannot smuggle a needle past the line-oriented pass below.
+        while let Some(start) = rest.find("/*") {
+            out.push_str(&rest[..start]);
+            rest = match rest[start + 2..].find("*/") {
+                Some(end) => &rest[start + 2 + end + 2..],
+                None => "", // unterminated: drop the remainder
+            };
+        }
+        out.push_str(rest);
+
+        out.lines()
             .map(|line| match line.find("//") {
                 Some(i) => &line[..i],
                 None => line,
             })
+            .filter(|line| !line.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n")
     }
