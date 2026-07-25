@@ -415,18 +415,18 @@ pub fn MemberInfoModal() -> Element {
                             // Share-invite button row above.
                             div { class: "mt-4 flex items-start gap-3",
                                 // Never offer Ban on your OWN row
-                                // (freenet/river#478). This is the second half of
-                                // a deliberate belt-and-braces pair: the other is
-                                // the `viewer == target` refusal inside
-                                // `viewer_can_ban`, which every caller inherits.
-                                // Keep BOTH. `can_ban` arrives here as a plain
-                                // `bool`, so a future call site that computes it
-                                // some other way (the deputy-badge code calls
-                                // `is_ban_authorized` directly, for instance)
-                                // would bypass the predicate guard entirely.
+                                // (freenet/river#478). Redundant TODAY with the
+                                // `viewer == target` refusal in `viewer_can_ban`,
+                                // and kept deliberately: the asymmetry between a
+                                // guarded Deputize and an unguarded Ban is what
+                                // hid this bug, so the two actions in this row
+                                // read the same way. `can_ban` also arrives as a
+                                // plain `bool`, so a future caller computing it
+                                // another way is still gated here.
                                 // The contract PERMITS a self-ban and cascades it
                                 // to the whole invite subtree — see
-                                // `viewer_can_ban`'s docs.
+                                // `viewer_can_ban`'s docs. `execute_ban` refuses
+                                // it a third time, on the WRITE path.
                                 if member_id != self_member_id {
                                     BanButton {
                                         member_to_ban: member_id,
@@ -578,10 +578,7 @@ mod ban_gate_tests {
     /// here.
     #[test]
     fn modal_renders_deputy_shield_via_shared_helper() {
-        let source = include_str!("member_info_modal.rs");
-        let prod = &source[..source
-            .find("#[cfg(test)]")
-            .expect("member_info_modal.rs should have a #[cfg(test)] block")];
+        let prod = production_source();
 
         assert!(
             prod.contains("🛡 Deputy"),
@@ -599,46 +596,113 @@ mod ban_gate_tests {
              so the wording cannot drift between surfaces (#451)"
         );
     }
-    /// freenet/river#478: the `BanButton` render site must be self-guarded, the
-    /// way `DeputyButton` right beside it already is.
+    /// freenet/river#478: EVERY `BanButton` render site must be self-guarded,
+    /// the way `DeputyButton` right beside it already is.
     ///
-    /// This pins the SECOND half of a deliberate belt-and-braces pair. The
-    /// first half — the `viewer == target` refusal inside `viewer_can_ban` — is
-    /// pinned behaviourally by
-    /// `components::members::tests::viewer_can_ban_refuses_self_even_though_the_contract_permits_it`.
-    /// Because EITHER guard alone hides the button, no behavioural test can
-    /// detect the loss of just one of them; this source pin is what fails when
-    /// the render-site half is deleted.
+    /// This pins the render-site half of a three-layer guard. The other two are
+    /// pinned elsewhere: the `viewer == target` refusal inside `viewer_can_ban`
+    /// behaviourally by
+    /// `components::members::tests::viewer_can_ban_refuses_self_even_though_the_contract_permits_it`,
+    /// and the write-path refusal by `execute_ban_refuses_self_before_building_the_ban`
+    /// below. Any ONE of the three hides or blocks the ban, so no behavioural
+    /// test can detect the loss of just one; that is why the render-site half
+    /// needs a source pin.
+    ///
+    /// Two things this pin does that the obvious version does not:
+    /// * It strips `//` comments before searching, so a future comment that
+    ///   merely QUOTES the guard cannot satisfy it. That is the exact way a
+    ///   source pin dies silently.
+    /// * It checks EVERY occurrence, so adding a second, unguarded render site
+    ///   fails rather than passing on the first one.
     #[test]
     fn ban_button_render_site_is_self_guarded() {
-        let source = include_str!("member_info_modal.rs");
-        // Cut at the FIRST `#[cfg(test)]` so the needle below cannot match
-        // itself — the failure mode where a pin quietly stops pinning.
-        let prod = &source[..source
-            .find("#[cfg(test)]")
-            .expect("member_info_modal.rs should have a #[cfg(test)] block")];
+        let prod = strip_comments(production_source());
 
-        let ban_site = prod
-            .find("BanButton {")
-            .expect("the member-info modal must render `BanButton`");
-        // Only the text immediately preceding the button counts. Wide enough to
-        // survive a comment between the guard and the button, narrow enough
-        // that `DeputyButton`'s own guard — which sits well AFTER the ban site —
-        // can never satisfy it. `char_indices` keeps the slice on a UTF-8
-        // boundary (this file is full of emoji).
-        let head = &prod[..ban_site];
-        let window_start = head
-            .char_indices()
-            .rev()
-            .nth(200)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let sites: Vec<usize> = prod.match_indices("BanButton {").map(|(i, _)| i).collect();
         assert!(
-            head[window_start..].contains("member_id != self_member_id"),
-            "the `BanButton` render site must be guarded by \
-             `member_id != self_member_id` (freenet/river#478): a deputy's \
-             self-ban is contract-VALID and cascades to their entire invite \
-             subtree"
+            !sites.is_empty(),
+            "the member-info modal must render `BanButton`"
         );
+        for site in sites {
+            // Only the text immediately preceding this button counts. With
+            // comments stripped the guard sits ~40 chars back, so 200 is ample
+            // slack while staying far too tight for `DeputyButton`'s own guard
+            // (a separate render site, always AFTER its own `BanButton`) to
+            // satisfy a later occurrence. `char_indices` keeps the slice on a
+            // UTF-8 boundary (this file is full of emoji).
+            let head = &prod[..site];
+            let window_start = head
+                .char_indices()
+                .rev()
+                .nth(200)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            assert!(
+                head[window_start..].contains("if member_id != self_member_id {"),
+                "every `BanButton` render site must be guarded by \
+                 `if member_id != self_member_id {{` (freenet/river#478): a \
+                 deputy's self-ban is contract-VALID and cascades to their \
+                 entire invite subtree"
+            );
+        }
+    }
+
+    /// freenet/river#478: `BanButton::execute_ban` must refuse a self-ban
+    /// BEFORE it builds the `UserBan`.
+    ///
+    /// This is the layer every present and future call site inherits, and the
+    /// only one evaluated at click rather than render time. Nothing downstream
+    /// will catch it: the chat delegate signs whatever bytes it is handed,
+    /// `validate_single_ban` does not refuse `banned_by == banned_user`, and
+    /// enforcement re-runs `is_ban_authorized`, which GRANTS a deputy's
+    /// self-ban and then cascades removal to their whole invite subtree.
+    ///
+    /// The ordering assertion is the load-bearing half: a guard that runs after
+    /// the `UserBan` is constructed and dispatched would satisfy a naive
+    /// "contains the check" pin while doing nothing.
+    #[test]
+    fn execute_ban_refuses_self_before_building_the_ban() {
+        let prod = strip_comments(include_str!("member_info_modal/ban_button.rs"));
+
+        let guard = prod.find("if member_to_ban == banned_by {").expect(
+            "`execute_ban` must refuse a self-ban: `if member_to_ban == banned_by {` \
+             (freenet/river#478)",
+        );
+        let construction = prod
+            .find("let ban = UserBan {")
+            .expect("`execute_ban` must build a `UserBan`");
+        assert!(
+            guard < construction,
+            "the self-ban refusal must run BEFORE the `UserBan` is constructed \
+             (freenet/river#478); a check placed after it would let the ban be \
+             built and dispatched"
+        );
+    }
+
+    /// The production half of a source file: everything before the FIRST
+    /// `#[cfg(test)]`, so a pin's needles can never match the test that asserts
+    /// them. Shared by the pins in this module so the cut cannot drift between
+    /// them — moving that cut point is how a pin stops pinning.
+    fn production_source() -> &'static str {
+        let source = include_str!("member_info_modal.rs");
+        &source[..source
+            .find("#[cfg(test)]")
+            .expect("member_info_modal.rs should have a #[cfg(test)] block")]
+    }
+
+    /// `source` with `//` comment bodies removed, so a source pin cannot be
+    /// satisfied by a comment that merely quotes the code it is meant to pin.
+    /// Line-oriented and deliberately simple: it does not need to handle `/*
+    /// */` or `//` inside a string literal, because a false NEGATIVE here is a
+    /// loud test failure, never a silent pass.
+    fn strip_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

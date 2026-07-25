@@ -650,9 +650,16 @@ pub(crate) fn relevant_deputizer_names(
 /// deputize someone you invited) does. `validate_single_ban` does not refuse
 /// `banned_by == banned_user` either, and enforcement re-runs the same
 /// predicate, so a self-ban is accepted and then CASCADES:
-/// `MembersV1::check_banned_members` extends removal to
-/// `get_downstream_members(target)`, taking the member's whole invite subtree
-/// with them.
+/// `MembersV1::banned_member_ids` extends removal to
+/// `get_downstream_members(target)` (`common/src/room_state/member.rs:286-287`),
+/// and `ChatRoomStateV1::post_apply_cleanup` retains that whole set out — taking
+/// the member's entire invite subtree with them. (NOT `check_banned_members`,
+/// which walks invite chains for `has_banned_members` and has no production
+/// caller.)
+///
+/// The OWNER was never affected and this guard is not what protects them:
+/// `is_ban_authorized` denies `target == owner_id` outright before any grant, so
+/// do not later "extend" this refusal to a case that was never broken.
 ///
 /// Refusing at the predicate rather than only at the render site means every
 /// caller inherits the guard, and it makes the UI's read path agree with
@@ -3974,7 +3981,7 @@ mod tests {
     }
     /// freenet/river#478: a deputy must never be offered the Ban action on
     /// THEMSELVES. The contract permits that ban — `is_ban_authorized(P, P)` is
-    /// `true` for most deputies — and `MembersV1::check_banned_members` then
+    /// `true` for most deputies — and `MembersV1::banned_member_ids` then
     /// cascades the removal to `get_downstream_members(P)`, so one misclick
     /// costs the moderator their membership AND their whole invite subtree.
     ///
@@ -3997,6 +4004,7 @@ mod tests {
         let global_mod_sk = SigningKey::generate(&mut rng);
         let parent_sk = SigningKey::generate(&mut rng);
         let subtree_mod_sk = SigningKey::generate(&mut rng);
+        let sibling_sk = SigningKey::generate(&mut rng);
         let bystander_sk = SigningKey::generate(&mut rng);
 
         let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
@@ -4009,6 +4017,7 @@ mod tests {
                 authorized_member(&owner_sk, &parent_sk.verifying_key()),
                 authorized_member(&owner_sk, &bystander_sk.verifying_key()),
                 member_invited_by(&parent_sk, owner_id, &subtree_mod_sk.verifying_key()),
+                member_invited_by(&parent_sk, owner_id, &sibling_sk.verifying_key()),
             ],
         };
         let member_info = MemberInfoV1 {
@@ -4019,6 +4028,7 @@ mod tests {
                 // Parent deputizes someone they invited (step-5 authority).
                 signed_member_info(&parent_sk, "Parent", vec![id(&subtree_mod_sk)]),
                 signed_member_info(&subtree_mod_sk, "SubtreeMod", vec![]),
+                signed_member_info(&sibling_sk, "Sibling", vec![]),
                 signed_member_info(&bystander_sk, "Bystander", vec![]),
             ],
         };
@@ -4046,21 +4056,38 @@ mod tests {
             );
         }
 
-        // The guard must be exactly `viewer == target` and nothing wider — both
-        // deputies keep the authority they genuinely have over other members.
-        assert!(viewer_can_ban(
-            &members,
-            &member_info,
-            id(&global_mod_sk),
-            id(&bystander_sk),
-            owner_id
-        ));
-        assert!(viewer_can_ban(
-            &members,
-            &member_info,
-            id(&parent_sk),
-            id(&subtree_mod_sk),
-            owner_id
-        ));
+        // The guard must be exactly `viewer == target` and nothing wider — every
+        // authority route that reaches a THIRD PARTY must survive it. One case
+        // per route, because a guard widened to something like "the viewer's
+        // relevant-deputizer set contains the target" would leave the step-3 and
+        // step-2 cases passing and only break step 5.
+        for (label, viewer, target) in [
+            // Step 3: owner-appointed global moderator over an unrelated member.
+            (
+                "step 3, global mod -> bystander",
+                id(&global_mod_sk),
+                id(&bystander_sk),
+            ),
+            // Step 2: a genuine strict ancestor over their own invitee.
+            (
+                "step 2, parent -> their invitee",
+                id(&parent_sk),
+                id(&subtree_mod_sk),
+            ),
+            // Step 5: a deputy of a strict non-owner ancestor over another
+            // member of that ancestor's subtree. This is the SAME route the
+            // self-ban case above relies on, so without it the guard could be
+            // widened to swallow step-5 authority entirely and stay green.
+            (
+                "step 5, subtree mod -> sibling in the deputizer's subtree",
+                id(&subtree_mod_sk),
+                id(&sibling_sk),
+            ),
+        ] {
+            assert!(
+                viewer_can_ban(&members, &member_info, viewer, target, owner_id),
+                "the self-ban guard must not block genuine authority ({label})"
+            );
+        }
     }
 }

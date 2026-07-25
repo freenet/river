@@ -32,6 +32,28 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
             let room_state_clone = room_data.room_state.clone();
             let banned_by = MemberId::from(&self_sk.verifying_key());
 
+            // WRITE-PATH refusal of a self-ban (freenet/river#478). The two
+            // guards above this one — `viewer_can_ban` and the render-site
+            // condition in `member_info_modal.rs` — decide whether the button
+            // APPEARS; this one decides whether a `UserBan` is ever built, so it
+            // is the check every present and future call site of `BanButton`
+            // inherits. It is also the only one evaluated at CLICK time: the
+            // render-time guards read `MemberInfoModal`'s own `self_member_id`,
+            // while `banned_by` here comes from a separate memo re-read now, so
+            // an identity re-import between render and click cannot slip past.
+            //
+            // riverctl refuses the same thing at the same layer
+            // (`ApiClient::ban_member`: "Cannot ban yourself"). Nothing below
+            // this point will: the chat delegate signs whatever bytes it is
+            // handed, `validate_single_ban` does not refuse
+            // `banned_by == banned_user`, and enforcement re-runs
+            // `is_ban_authorized`, which GRANTS it for most deputies and then
+            // cascades removal to the member's whole invite subtree.
+            if member_to_ban == banned_by {
+                warn!("Refusing to ban self ({banned_by}) — see freenet/river#478");
+                return;
+            }
+
             let ban = UserBan {
                 owner_member_id: MemberId::from(&current_room),
                 banned_at: get_current_system_time(),
