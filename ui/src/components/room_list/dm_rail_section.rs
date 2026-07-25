@@ -12,12 +12,18 @@
 //!
 //! Each row also carries a rollover **Archive** ✕ button (issue #266 —
 //! the previous "Hide" button in the modal header sat next to the close
-//! ✕ and was repeatedly mistaken for it). On desktop the button is
-//! hidden until the row is hovered/focused; on mobile it's dimmed always-
-//! visible so it's tappable without a hover state. Archived threads stay
-//! out of the rail until either side sends a new DM. The "Archived (N)"
-//! link at the bottom of the section lists currently-archived threads
-//! and offers per-row Un-archive, closing #266.
+//! ✕ and was repeatedly mistaken for it). Reveal is gated on *hover
+//! capability*, not viewport width (issue #462): on a hover-pointer
+//! device the button is `opacity-0` until the row is hovered/focused;
+//! on a touch device (`@media (hover: none)`) `.dm-archive-btn` in
+//! `main.css` forces it fully visible with a 44px tap target, because
+//! the `group-hover` reveal Tailwind emits is itself wrapped in
+//! `@media (hover: hover)` and can never fire there. This mirrors the
+//! `.hover-actions` / `.touch-actions` split #402 introduced for the
+//! message action bar. Archived threads stay out of the rail until
+//! either side sends a new DM. The "Archived (N)" link at the bottom of
+//! the section lists currently-archived threads and offers per-row
+//! Un-archive, closing #266.
 //!
 //! Hidden when empty so the rail doesn't show an empty section on first
 //! load. Sorts unread threads first, then by most-recent message time.
@@ -181,9 +187,12 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
     };
 
     // `group` + `group-hover:opacity-100` keeps the ✕ off-screen at rest
-    // on desktop; on mobile (`<md`) it stays dimmed but visible so the
-    // hover-only affordance doesn't strand touch users. `group-focus-within`
-    // mirrors hover for keyboard users tab-stopping into the row.
+    // on a hover-pointer device. On a touch device the `.dm-archive-btn`
+    // rule in main.css (`@media (hover: none)`) forces it visible with a
+    // real tap target, because Tailwind wraps `group-hover:*` in
+    // `@media (hover: hover)` so it can never fire on touch (#462).
+    // `group-focus-within` mirrors hover for keyboard users tab-stopping
+    // into the row.
     let archive_click = move |evt: Event<MouseData>| {
         // The archive button is a sibling of the row's "open thread"
         // button (not nested inside it), so the row click handler
@@ -203,7 +212,10 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
         li {
             div { class: "group relative w-full",
                 button {
-                    class: "w-full text-left pl-3 pr-9 py-1.5 rounded-lg text-sm transition-colors text-text hover:bg-surface flex items-center gap-2",
+                    // `dm-rail-row-btn`: main.css widens the right padding on
+                    // touch devices so the enlarged always-visible archive ✕
+                    // (below) doesn't overlap the nickname / unread badge (#462).
+                    class: "dm-rail-row-btn w-full text-left pl-3 pr-9 py-1.5 rounded-lg text-sm transition-colors text-text hover:bg-surface flex items-center gap-2",
                     onclick: click,
                     div { class: "flex-1 min-w-0",
                         div { class: "truncate text-sm",
@@ -220,8 +232,12 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
                     }
                 }
                 button {
-                    class: "absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded text-text-muted \
-                            opacity-40 md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 \
+                    // `dm-archive-btn`: opacity-0 at rest so the hover reveal
+                    // stays clean on desktop; main.css forces it visible with a
+                    // 44px tap target under `@media (hover: none)` (#462).
+                    class: "dm-archive-btn absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded text-text-muted \
+                            flex items-center justify-center opacity-0 \
+                            group-hover:opacity-100 group-focus-within:opacity-100 \
                             hover:text-red-400 hover:bg-surface focus:opacity-100 \
                             transition-opacity transition-colors",
                     title: "{archive_title}",
@@ -1779,5 +1795,81 @@ mod tests {
         assert_eq!(last_good_archived_count(), 7);
         set_last_good_archived_count(0);
         assert_eq!(last_good_archived_count(), 0);
+    }
+
+    // ---- #462: archive ✕ must be reachable on touch devices ----
+    //
+    // The archive reveal can't be driven end-to-end in Playwright (the
+    // example-data build ships no DMs, so no rail row renders — see
+    // `ui/tests/dm-archive-ux.spec.ts`), so these pin the fix by
+    // source-scraping the component markup and the static stylesheet.
+    // They fail if a refactor reintroduces the viewport-breakpoint reveal
+    // that stranded touch users, or drops the touch-visibility CSS.
+
+    const DM_RAIL_SRC: &str = include_str!("dm_rail_section.rs");
+    const MAIN_CSS: &str = include_str!("../../../assets/main.css");
+
+    /// The archive ✕ must gate its reveal on hover capability, not the
+    /// viewport breakpoint. Gating on the breakpoint was the #462 bug: a
+    /// tablet clears the breakpoint yet has no hover pointer, so the
+    /// button became invisible-but-tappable there. The reveal is
+    /// hover-capability gated instead (opacity-0 -> `group-hover`, forced
+    /// visible on touch by `.dm-archive-btn` in main.css).
+    #[test]
+    fn archive_button_not_viewport_gated() {
+        assert!(
+            DM_RAIL_SRC.contains("dm-archive-btn"),
+            "the archive ✕ must carry the `dm-archive-btn` hook so main.css \
+             can force it visible on touch (#462)"
+        );
+        assert!(
+            DM_RAIL_SRC.contains("group-hover:opacity-100"),
+            "the archive ✕ must reveal via `group-hover` (hover-capability \
+             gated) rather than a viewport breakpoint (#462)"
+        );
+        // Reconstruct the forbidden token from fragments so this source
+        // file (which include_str! reads back) does not itself contain the
+        // literal and defeat the negative check.
+        let viewport_gate = concat!("md:", "opacity-0");
+        assert!(
+            !DM_RAIL_SRC.contains(viewport_gate),
+            "the archive ✕ must not gate its reveal on the md viewport \
+             breakpoint — a tablet clears the breakpoint but has no hover \
+             pointer, which is exactly the #462 invisible-but-tappable bug"
+        );
+    }
+
+    /// main.css must force `.dm-archive-btn` visible with a real tap
+    /// target under `@media (hover: none)`, and widen the row padding so
+    /// the enlarged ✕ doesn't overlap the nickname / unread badge.
+    /// Position-robust: does not assume how many `@media (hover: none)`
+    /// blocks exist (the #402 message-actions fix adds one too).
+    #[test]
+    fn touch_devices_reveal_archive_button() {
+        assert!(
+            MAIN_CSS.contains("@media (hover: none)"),
+            "main.css must gate touch behaviour on hover capability, not \
+             viewport width (#462)"
+        );
+        let idx = MAIN_CSS
+            .find(".dm-archive-btn")
+            .expect("main.css must style `.dm-archive-btn` (#462)");
+        // The rule that reveals it must live under a hover:none media query,
+        // i.e. one opens somewhere before this selector.
+        assert!(
+            MAIN_CSS[..idx].contains("@media (hover: none)"),
+            "`.dm-archive-btn` must be styled inside an @media (hover: none) \
+             block so it only forces visibility on touch (#462)"
+        );
+        let window = &MAIN_CSS[idx..(idx + 200).min(MAIN_CSS.len())];
+        assert!(
+            window.contains("opacity: 1"),
+            "the touch rule must set the archive ✕ to full opacity (#462)"
+        );
+        assert!(
+            MAIN_CSS.contains(".dm-rail-row-btn"),
+            "the row padding must widen on touch so the enlarged ✕ doesn't \
+             overlap the nickname / unread badge (#462)"
+        );
     }
 }

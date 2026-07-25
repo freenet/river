@@ -144,3 +144,31 @@
         pointer-events: none;
     }
 }
+
+/* DM-rail Archive ✕ — touch reveal (freenet/river#462).
+ *
+ * Same failure mode as #402 above: the archive button in the Direct Messages
+ * rail (`dm_rail_section.rs`) is `opacity-0` and reveals via Tailwind
+ * `group-hover:opacity-100`, which Tailwind v4 wraps in `@media (hover: hover)`.
+ * On a touch device that reveal can never fire, so before this rule the button
+ * was invisible on phones and — because it is `opacity-0` yet still
+ * hit-testable and overlays the row's right edge — an invisible-but-tappable
+ * hazard on tablets (a tap meant to open the thread archived it instead).
+ *
+ * Gate on hover CAPABILITY, not viewport width (the previous `md:opacity-0`
+ * proxy is what broke tablets, which exceed the `md` breakpoint yet have no
+ * hover pointer). On `hover: none` force the button fully visible with a
+ * >=44px tap target (WCAG 2.5.8 / Apple HIG), and widen the row's right
+ * padding to match so the enlarged ✕ never overlaps the nickname or unread
+ * badge. Desktop (`hover: hover`) is untouched: opacity-0 -> group-hover. */
+@media (hover: none) {
+    .dm-archive-btn {
+        opacity: 1;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
+    }
+
+    .dm-rail-row-btn {
+        padding-right: 3.5rem;
+    }
+}
