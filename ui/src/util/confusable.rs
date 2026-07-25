@@ -574,6 +574,47 @@ fn skeleton_with(name: &str, fold: Fold) -> String {
         Fold::CaseInsensitive => fold_bar_class(&out.to_lowercase()),
     };
 
+    // 7a. **Homoglyphs, AGAIN, after the case fold.**
+    //
+    // The pass at step 5 runs before `to_lowercase`, which is correct for the
+    // uppercase entries (`Η` looks like `H` but its lowercase `η` looks like
+    // `n`, so one case-insensitive rule would be wrong for both). But it left a
+    // whole class through: any UPPERCASE codepoint absent from the table whose
+    // Unicode lowercase IS in the table survived as the raw codepoint, because
+    // nothing folded it after the case step. The lowercase forms were caught;
+    // the uppercase ones were not.
+    //
+    //   * `Ӏ` U+04C0 CYRILLIC PALOCHKA — a bare vertical stroke, pixel-identical
+    //     to Latin capital I, and the single most-used I-spoof in IDN attacks.
+    //   * `Ԁ` U+0500 CYRILLIC KOMI DE, `Ѵ` U+0474 CYRILLIC IZHITSA.
+    //
+    // Running the same table a second time closes the class rather than the
+    // three instances: `to_lowercase` has already mapped each of them onto its
+    // lowercase form (`ӏ`, `ԁ`, `ѵ`), all of which the table already carried.
+    //
+    // **A character this pass rewrites must then go through the bar fold too,
+    // and ONLY such a character.** The palochka lowercases to `ӏ`, which this
+    // table maps to `l` — a bar — but the bar fold at step 6/7 has already run,
+    // so without this it stayed a literal `l` and `"Ӏan Clarke"` folded to
+    // `"lan c1arke"` against the real `"1an c1arke"`. It still evaded.
+    //
+    // Re-running the bar fold over the WHOLE string instead would be wrong: in
+    // the visual fold a capital `L` legitimately reaches this point as `l` (it
+    // is not a bar — it has a foot), and folding it here would re-merge
+    // `Lisa`/`Iisa`, undoing the split [`Fold`] exists to make. So the bar fold
+    // is applied per character, conditional on this pass having changed it.
+    let out: String = out
+        .chars()
+        .map(|c| {
+            let folded = fold_homoglyph(c);
+            if folded == c {
+                c
+            } else {
+                fold_bar_char(folded)
+            }
+        })
+        .collect();
+
     // 7b. The remaining ASCII confusables, which are case-agnostic (they all
     //     produce a lowercase letter, which the case step above leaves alone).
     let out: String = out.chars().map(fold_ascii_confusable).collect();
@@ -627,14 +668,17 @@ const MULTI_CONFUSABLES: [(&str, &str); 3] = [("rn", "m"), ("cl", "d"), ("vv", "
 /// See [`Fold`]. Which characters are in the class depends on whether the case
 /// step has already run — the caller decides by choosing the [`Fold`].
 fn fold_bar_class(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            // `I` is here for the pre-case pass; after `to_lowercase` it can no
-            // longer appear, so the same table serves both directions.
-            'l' | 'I' | '1' | '|' | '!' => '1',
-            other => other,
-        })
-        .collect()
+    s.chars().map(fold_bar_char).collect()
+}
+
+/// [`fold_bar_class`] for one character.
+fn fold_bar_char(c: char) -> char {
+    match c {
+        // `I` is here for the pre-case pass; after `to_lowercase` it can no
+        // longer appear, so the same table serves both directions.
+        'l' | 'I' | '1' | '|' | '!' => '1',
+        other => other,
+    }
 }
 
 /// Single-character ASCII lookalikes OTHER than the bar class.
@@ -1389,6 +1433,92 @@ mod tests {
              budget ({a:?} vs {b:?}, budget {budget}); the measurement that \
              justifies rendering tier 1 only no longer holds — re-examine \
              `members::impersonation_warning_for_display`"
+        );
+    }
+
+    /// **BLOCKING B — uppercase homoglyphs whose LOWERCASE is in the table.**
+    ///
+    /// `fold_homoglyph` originally ran only before `to_lowercase`. Any uppercase
+    /// codepoint absent from the table whose Unicode lowercase IS in the table
+    /// therefore survived as the raw codepoint: the lowercase form was caught,
+    /// the uppercase one walked straight through. `Ӏ` U+04C0 CYRILLIC PALOCHKA
+    /// is the single most-used I-spoof in IDN attacks — a bare vertical stroke,
+    /// pixel-identical to Latin capital I.
+    #[test]
+    fn uppercase_cyrillic_homoglyphs_are_flagged() {
+        for (label, attacker, real) in [
+            ("U+04C0 PALOCHKA", "\u{04C0}an Clarke", "Ian Clarke"),
+            ("U+0500 KOMI DE", "\u{0500}eputy Dan", "Deputy Dan"),
+            ("U+0474 IZHITSA", "\u{0474}era Voss", "Vera Voss"),
+            ("U+04CF palochka (lower)", "\u{04CF}an Clarke", "Ian Clarke"),
+        ] {
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                real,
+                mid(1),
+            )]);
+            let w = checker.check(mid(2), attacker).unwrap_or_else(|| {
+                panic!("{label}: {attacker:?} must be flagged against {real:?}")
+            });
+            assert_eq!(w.tier, ConfusableTier::Identical, "{label}");
+        }
+    }
+
+    /// **The class, not the instances.** Every key in the homoglyph table whose
+    /// uppercase differs from itself must fold the same way from EITHER case.
+    /// This is what makes the second pass a class fix rather than three
+    /// hand-patched characters — it fails for any future table entry added in
+    /// lowercase only.
+    #[test]
+    fn every_lowercase_homoglyph_is_also_caught_uppercased() {
+        // Sweep the ranges the table draws from rather than restating it.
+        let mut checked = 0usize;
+        for cp in (0x0370..=0x058Fu32).chain(0x2C80..=0x2CFF) {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            let folded = fold_homoglyph(c);
+            if folded == c {
+                continue; // not a table key
+            }
+            // An uppercase form that lowercases back onto this key must fold to
+            // the same ASCII letter, in both directions — UNLESS the uppercase
+            // is itself a table key, in which case the table has deliberately
+            // given it a different answer and that answer is correct.
+            //
+            // Greek is the reason this carve-out exists and it is not a
+            // loophole: `ν` (nu) looks like Latin `v` while its uppercase `Ν`
+            // looks like Latin `N`. They are different shapes, so they get
+            // different folds. The bug class this test targets is narrower —
+            // an uppercase codepoint the table does NOT mention, whose
+            // lowercase it does.
+            for upper in c.to_uppercase() {
+                if upper == c || fold_homoglyph(upper) != upper {
+                    continue;
+                }
+                checked += 1;
+                let via_upper = skeleton_with(&upper.to_string(), Fold::CaseInsensitive);
+                let via_lower = skeleton_with(&c.to_string(), Fold::CaseInsensitive);
+                assert_eq!(
+                    via_upper,
+                    via_lower,
+                    "U+{cp:04X}: the lowercase form folds to {via_lower:?} but \
+                     its uppercase U+{:04X} folds to {via_upper:?} — an \
+                     uppercase homoglyph is walking through the fold",
+                    u32::from(upper)
+                );
+            }
+        }
+        // The floor is the size of the bug class for the CURRENT table: the
+        // palochka, komi de and izhitsa, whose uppercase forms the table does
+        // not mention. It is a guard against the sweep silently matching
+        // nothing (a wrong range, a `continue` that swallows everything), not a
+        // target — adding table entries only raises it.
+        assert!(
+            checked >= 3,
+            "the sweep found only {checked} uppercase-not-in-table pairs; it \
+             should find at least the palochka, komi de and izhitsa, so the \
+             ranges are wrong and this test is not testing anything"
         );
     }
 
