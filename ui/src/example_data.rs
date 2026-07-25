@@ -116,8 +116,17 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
             MemberInfo {
                 member_id: owner_id,
                 version: 0,
+                // The trailing 🛡👑 is a deliberate BADGE-SPOOF attempt baked
+                // into example data: the owner's stored nickname claims the
+                // deputy shield and the owner crown. `display_nickname` strips
+                // both at render time, so the member list must still show
+                // exactly ONE shield (the real deputy's) and the conversation
+                // must show the owner's name with no glyphs. If the strip ever
+                // regresses, `member-info-deputy-tag.spec.ts`'s
+                // `toHaveCount(1)` and `conversation-deputy-badge.spec.ts`
+                // both fail.
                 preferred_nickname: SealedBytes::public(
-                    (random_full_name() + " (Owner)").into_bytes(),
+                    (random_full_name() + " (Owner) \u{1F6E1}\u{1F451}").into_bytes(),
                 ),
                 deputies: vec![other_member_id],
             },
@@ -203,7 +212,13 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
     member_keys.insert(other_member_id, other_member_sk);
 
     // Add example messages
-    add_example_messages(&mut room_state, &owner_id, owner_sk, &member_keys);
+    add_example_messages(
+        &mut room_state,
+        &owner_id,
+        owner_sk,
+        &member_keys,
+        other_member_id,
+    );
 
     let verification_result = room_state.verify(
         &room_state,
@@ -253,6 +268,10 @@ fn add_example_messages(
     owner_id: &MemberId,
     owner_key: &SigningKey,
     member_keys: &HashMap<MemberId, SigningKey>,
+    // The owner-appointed deputy. Given one guaranteed message below so the
+    // conversation's 🛡 badge is deterministically present for Playwright —
+    // the random author picks alone leave it to chance.
+    deputy_id: MemberId,
 ) {
     // Use a timestamp 24 hours ago as base time for messages
     let now = crate::util::get_current_system_time()
@@ -335,6 +354,25 @@ fn add_example_messages(
         current_time_ms += (rand::random::<u64>() % 870 + 30) * 1000;
     }
 
+    // One guaranteed message from the owner-appointed deputy, so the
+    // conversation always has an author line carrying the 🛡 badge. The random
+    // loop above may or may not pick them.
+    if let Some(deputy_key) = member_keys.get(&deputy_id) {
+        let msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: deputy_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::public(
+                    "Reminder: keep it civil in here, please.".to_string(),
+                ),
+            },
+            deputy_key,
+        );
+        messages.messages.push(msg);
+        current_time_ms += 60_000;
+    }
+
     // A message exercising @mention chips. The snapshot name in the token is
     // intentionally generic ("member") to prove the rendered chip re-resolves
     // to the member's CURRENT nickname from member_info rather than the
@@ -365,7 +403,15 @@ fn add_example_messages(
             .member_info
             .iter()
             .find(|m| m.member_info.member_id == target_author_id)
-            .map(|m| m.member_info.preferred_nickname.to_string_lossy())
+            .map(|m| {
+                // Example rooms are public, so the secret map is empty. Routed
+                // through the shared helper anyway so the render-path pin test
+                // has no exceptions to carve out.
+                crate::util::display_name::display_nickname(
+                    &m.member_info.preferred_nickname,
+                    &HashMap::new(),
+                )
+            })
             .unwrap_or_else(|| "someone".to_string());
         let target_preview = match &target.message.content {
             RoomMessageBody::Public { data, .. } => {
@@ -460,7 +506,15 @@ fn add_example_messages(
             .member_info
             .iter()
             .find(|m| m.member_info.member_id == target_author_id)
-            .map(|m| m.member_info.preferred_nickname.to_string_lossy())
+            .map(|m| {
+                // Example rooms are public, so the secret map is empty. Routed
+                // through the shared helper anyway so the render-path pin test
+                // has no exceptions to carve out.
+                crate::util::display_name::display_nickname(
+                    &m.member_info.preferred_nickname,
+                    &HashMap::new(),
+                )
+            })
             .unwrap_or_else(|| "someone".to_string());
         let target_preview = match &long_url_msg.message.content {
             RoomMessageBody::Public { data, .. } => {

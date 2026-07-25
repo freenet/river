@@ -9,33 +9,12 @@ use crate::components::members::member_info_modal::ban_button::BanButton;
 use crate::components::members::member_info_modal::deputy_button::DeputyButton;
 use crate::components::members::member_info_modal::invited_by_field::InvitedByField;
 use crate::components::members::member_info_modal::nickname_field::NicknameField;
-use crate::util::ecies::unseal_bytes_with_secrets;
+use crate::components::members::viewer_can_ban;
+use crate::util::display_name::display_nickname;
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::ChatRoomParametersV1;
-
-/// Whether `viewer` may ban `target` — the Ban-button gate (#410 / #411 round 4
-/// D). Uses [`MembersV1::is_ban_authorized`] (owner / invite-ancestor / deputy),
-/// NOT bare invite-chain ancestry, so a DEPUTY sees the Ban action for members in
-/// their deputizer's subtree. Bare downstream ancestry (`is_downstream`, still
-/// used for the "🔑 Invited by You" relationship tag) would have hidden it.
-fn viewer_can_ban(
-    members: &river_core::room_state::member::MembersV1,
-    member_info: &river_core::room_state::member_info::MemberInfoV1,
-    viewer: MemberId,
-    target: MemberId,
-    owner_id: MemberId,
-) -> bool {
-    let members_by_id = members.members_by_member_id();
-    river_core::room_state::member::MembersV1::is_ban_authorized(
-        viewer,
-        target,
-        &members_by_id,
-        member_info,
-        owner_id,
-    )
-}
 
 #[component]
 pub fn MemberInfoModal() -> Element {
@@ -197,13 +176,7 @@ pub fn MemberInfoModal() -> Element {
                 let nickname = member_info_v1
                     .canonical(inviter_id)
                     .map(|mi| {
-                        match unseal_bytes_with_secrets(
-                            &mi.member_info.preferred_nickname,
-                            &room_state.secrets,
-                        ) {
-                            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                            Err(_) => mi.member_info.preferred_nickname.to_string_lossy(),
-                        }
+                        display_nickname(&mi.member_info.preferred_nickname, &room_state.secrets)
                     })
                     .unwrap_or_else(|| "Unknown".to_string());
                 (nickname, Some(inviter_id))
@@ -245,42 +218,33 @@ pub fn MemberInfoModal() -> Element {
             .deputies_of(self_member_id)
             .contains(&member_id);
 
-        // Viewer-relevant deputizer names for the target, for the 🛡 legend
-        // chip below (freenet/river#451). Computed with the SAME shared helpers
-        // the member-list row uses, so the modal shows the shield under exactly
-        // the same condition — and with the same "appointed by …" tooltip — as
-        // the row does. Empty ⇒ this member does not show the shield here.
-        let deputizer_names: Vec<String> = owner_key_signal
-            .as_ref()
-            .map(|owner| {
-                let owner_id = MemberId::from(&*owner);
-                let member_info_all = &room_state.room_state.member_info;
-                let deputizers_of = super::build_deputizers_of(member_info_all);
-                let viewer_relevant = super::viewer_relevant_deputizer_set(
+        // The 🛡 legend chip below (freenet/river#451). Computed with the SAME
+        // shared helper the member-list row and the conversation's author line
+        // use, so the modal shows the shield under exactly the same condition,
+        // and with the same tooltip, as they do. `None` means no shield here.
+        //
+        // Single-target variant: this component is not memoised, and the sweep
+        // decrypts every deputy's appointer nicknames.
+        let deputy_badge: Option<super::DeputyBadge> =
+            owner_key_signal.as_ref().and_then(|owner| {
+                super::deputy_badge_for_viewer(
                     &room_state.room_state.members,
-                    owner_id,
-                    self_member_id,
-                );
-                super::relevant_deputizer_names(
-                    member_info_all,
+                    &room_state.room_state.member_info,
                     &room_state.secrets,
-                    &deputizers_of,
-                    &viewer_relevant,
-                    owner_id,
+                    MemberId::from(&*owner),
                     self_member_id,
                     member_id,
                 )
-            })
+            });
+        let deputy_tooltip = deputy_badge
+            .as_ref()
+            .map(super::DeputyBadge::tooltip)
             .unwrap_or_default();
-        let deputy_tooltip = format!("Deputy (appointed by {})", deputizer_names.join(", "));
         // Decrypted display nickname for the target (for the deputy action copy).
-        let target_nickname = match unseal_bytes_with_secrets(
+        let target_nickname = display_nickname(
             &member_info.member_info.preferred_nickname,
             &room_state.secrets,
-        ) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-            Err(_) => member_info.member_info.preferred_nickname.to_string_lossy(),
-        };
+        );
 
         // Get the member ID string to display
         let member_id_str = member_id.to_string();
@@ -352,11 +316,12 @@ pub fn MemberInfoModal() -> Element {
                             // (freenet/river#451). Shown under the same
                             // viewer-relevant condition as the row, with the
                             // appointer names in the tooltip.
-                            if !deputizer_names.is_empty() {
+                            if deputy_badge.is_some() {
                                 span {
                                     "data-testid": "member-info-deputy-tag",
                                     class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-purple-500/20 text-purple-400",
                                     title: "{deputy_tooltip}",
+                                    "aria-label": "{deputy_tooltip}",
                                     "🛡 Deputy"
                                 }
                             }
@@ -452,7 +417,16 @@ pub fn MemberInfoModal() -> Element {
                                 BanButton {
                                     member_to_ban: member_id,
                                     can_ban: can_ban,
-                                    nickname: member_info.member_info.preferred_nickname.clone()
+                                    // The DECRYPTED, sanitised name — the same
+                                    // value `DeputyButton` gets. This used to
+                                    // pass the raw `SealedBytes`, which Dioxus
+                                    // silently coerced through `Display` (i.e.
+                                    // `to_string_lossy`): the ban dialog showed
+                                    // an unsanitised nickname in the one place
+                                    // a moderator is judging authority, and
+                                    // showed "[Encrypted: N bytes, vN]" instead
+                                    // of a name in private rooms.
+                                    nickname: target_nickname.clone()
                                 }
 
                                 // Deputize / revoke-deputy (#410). Any non-owner
@@ -578,10 +552,15 @@ mod ban_gate_tests {
 
     /// Source-grep pin for freenet/river#451: the modal's icon legend must
     /// render the 🛡 deputy chip, driven by the SAME shared helper the
-    /// member-list row uses. The reported bug was that the row showed the
-    /// shield but this modal did not; without this pin a future refactor could
-    /// silently drop the chip again, or reintroduce a private, drifting copy of
-    /// the viewer-relevance logic instead of the shared helper.
+    /// member-list row and the conversation's author line use. The reported bug
+    /// was that the row showed the shield but this modal did not; without this
+    /// pin a future refactor could silently drop the chip again, or reintroduce
+    /// a private, drifting copy of the viewer-relevance logic.
+    ///
+    /// The pin now covers the TOOLTIP as well as visibility: all three surfaces
+    /// must go through `DeputyBadge::tooltip`, so the shield cannot say
+    /// "appointed by X — can ban you" in the conversation and something else
+    /// here.
     #[test]
     fn modal_renders_deputy_shield_via_shared_helper() {
         let source = include_str!("member_info_modal.rs");
@@ -594,9 +573,15 @@ mod ban_gate_tests {
             "the member-info modal must render the 🛡 deputy legend chip (#451)"
         );
         assert!(
-            prod.contains("relevant_deputizer_names"),
-            "the deputy chip must be driven by the shared `relevant_deputizer_names` \
-             helper so it cannot drift from the member-list row (#451)"
+            prod.contains("deputy_badge_for_viewer"),
+            "the deputy chip's visibility must come from the shared \
+             `deputy_badge_for_viewer` helper so it cannot drift from the \
+             member-list row or the conversation author line (#451)"
+        );
+        assert!(
+            prod.contains("DeputyBadge::tooltip"),
+            "the deputy chip's tooltip must come from `DeputyBadge::tooltip` \
+             so the wording cannot drift between surfaces (#451)"
         );
     }
 }

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod display_name;
 pub mod ecies;
 
 use ed25519_dalek::VerifyingKey;

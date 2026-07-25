@@ -545,13 +545,10 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
             .map(|info| {
                 (
                     info.member_info.member_id,
-                    match unseal_bytes_with_secrets(
+                    crate::util::display_name::display_nickname(
                         &info.member_info.preferred_nickname,
                         &room_data.secrets,
-                    ) {
-                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                        Err(_) => info.member_info.preferred_nickname.to_string_lossy(),
-                    },
+                    ),
                 )
             })
             .collect();
@@ -659,13 +656,10 @@ fn build_view() -> Option<Vec<DmRailEntry>> {
             .map(|info| {
                 (
                     info.member_info.member_id,
-                    match unseal_bytes_with_secrets(
+                    crate::util::display_name::display_nickname(
                         &info.member_info.preferred_nickname,
                         &room_data.secrets,
-                    ) {
-                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                        Err(_) => info.member_info.preferred_nickname.to_string_lossy(),
-                    },
+                    ),
                 )
             })
             .collect();

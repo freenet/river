@@ -7,7 +7,9 @@ use crate::components::app::{
     MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
     ROOMS,
 };
+use crate::components::members::{deputy_badges_for_viewer, DeputyBadge};
 use crate::room_data::{NotificationMode, SendMessageError};
+use crate::util::display_name::{display_nickname, sanitize_display_name};
 use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
@@ -78,6 +80,10 @@ struct ReplyContext {
 struct MessageGroup {
     author_id: MemberId,
     author_name: String,
+    /// The 🛡 shield to show next to this author's name, or `None` for none.
+    /// See [`DeputyBadge`] for the predicate and why visibility and the
+    /// "can ban you" wording are separate questions.
+    author_badge: Option<DeputyBadge>,
     is_self: bool,
     first_time: DateTime<Utc>,
     /// True if any message in this group had a future timestamp that was clamped
@@ -388,13 +394,18 @@ fn target_plaintext(
     }
 }
 
-/// A member's current nickname, decrypted when the room is private.
+/// A member's current nickname, decrypted when the room is private and
+/// sanitised for display.
 ///
 /// Routes through [`MemberInfoV1::canonical`] rather than a pre-collected
 /// `member_id -> name` map: River accepts duplicate `member_info` records until
 /// `post_apply_cleanup` dedups them, and a raw `.collect()` keeps whichever
 /// record happens to come last. Every by-id read must agree on the canonical
 /// (highest-rank) record.
+///
+/// The sanitisation is [`crate::util::display_name::display_nickname`], which
+/// strips emoji so a nickname cannot forge the 🛡 deputy badge rendered beside
+/// it. Every nickname that reaches the screen goes through it.
 fn resolve_member_nickname(
     member_info: &MemberInfoV1,
     member_id: MemberId,
@@ -402,12 +413,7 @@ fn resolve_member_nickname(
 ) -> String {
     member_info
         .canonical(member_id)
-        .map(
-            |ami| match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, secrets) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
-            },
-        )
+        .map(|ami| display_nickname(&ami.member_info.preferred_nickname, secrets))
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
@@ -419,6 +425,9 @@ fn group_messages(
     self_member_id: MemberId,
     secrets: &HashMap<u32, [u8; 32]>,
     member_names: &HashMap<MemberId, String>,
+    // Which members show a 🛡 shield in THIS viewer's conversation, built once
+    // per render by `deputy_badges_for_viewer`. Absent ⇒ no shield.
+    deputy_badges: &HashMap<MemberId, DeputyBadge>,
 ) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
@@ -533,6 +542,7 @@ fn group_messages(
             items.push(DisplayItem::Messages(MessageGroup {
                 author_id,
                 author_name,
+                author_badge: deputy_badges.get(&author_id).cloned(),
                 is_self,
                 first_time: message_time,
                 time_clamped,
@@ -663,12 +673,29 @@ pub(crate) fn decrypt_message_content(
 /// the token snapshot as fallback) and strip markdown formatting, so the preview
 /// reads as plain text. Caller truncates the result.
 fn clean_reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> String {
-    let with_mentions = river_core::mention::render_plaintext(text, |r| {
-        member_names
-            .iter()
-            .find(|(id, _)| r.matches(**id))
-            .map(|(_, name)| name.clone())
-    });
+    use river_core::mention::{parse_segments, MentionSegment};
+
+    // Mirrors `river_core::mention::render_plaintext`, except the fallback
+    // display name — the `[name]` snapshot the SENDER embedded in the message
+    // — is sanitised. That snapshot is arbitrary attacker text, so an
+    // unsanitised fallback would let `@[Alice 🛡](rv:…)` paint a shield into a
+    // reply preview for a member id nobody in the room resolves. Names that DO
+    // resolve come from `member_names`, which is already sanitised at source.
+    let mut with_mentions = String::with_capacity(text.len());
+    for seg in parse_segments(text) {
+        match seg {
+            MentionSegment::Text(t) => with_mentions.push_str(&t),
+            MentionSegment::Mention(m) => {
+                let name = member_names
+                    .iter()
+                    .find(|(id, _)| m.member_ref.matches(**id))
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| sanitize_display_name(&m.display_name));
+                with_mentions.push('@');
+                with_mentions.push_str(&name);
+            }
+        }
+    }
     strip_markdown(&with_mentions)
 }
 
@@ -824,9 +851,14 @@ pub(crate) fn message_to_html_with_mentions(
                 // known members so the chip stays clickable and self-highlighted.
                 // An unknown member yields `None` -> non-clickable snapshot chip.
                 let resolved = m.member_ref.resolve(member_names.keys().copied());
+                // The `[name]` snapshot is sender-controlled text, so an
+                // unresolved mention must be sanitised before it becomes a
+                // chip — otherwise `@[Admin 🛡](rv:…)` paints a shield inside
+                // a message. Resolved names come from `member_names`, which is
+                // already sanitised at source.
                 let name = resolved
                     .and_then(|id| member_names.get(&id).cloned())
-                    .unwrap_or(m.display_name);
+                    .unwrap_or_else(|| sanitize_display_name(&m.display_name));
                 chips.push(render_mention_chip_html(
                     resolved,
                     &name,
@@ -1354,22 +1386,32 @@ pub fn Conversation() -> Element {
                         .member_info
                         .iter()
                         .map(|ami| {
-                            let name = match unseal_bytes_with_secrets(
-                                &ami.member_info.preferred_nickname,
-                                &room_data.secrets,
-                            ) {
-                                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                                Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
-                            };
-                            (ami.member_info.member_id, name)
+                            (
+                                ami.member_info.member_id,
+                                display_nickname(
+                                    &ami.member_info.preferred_nickname,
+                                    &room_data.secrets,
+                                ),
+                            )
                         })
                         .collect();
+                    // Which authors show a 🛡 shield in this viewer's view.
+                    // Computed once here, not per message: the maps behind it
+                    // are O(members) to build.
+                    let deputy_badges = deputy_badges_for_viewer(
+                        &room_state.members,
+                        &room_state.member_info,
+                        &room_data.secrets,
+                        MemberId::from(&key),
+                        self_member_id,
+                    );
                     let groups = group_messages(
                         &room_state.recent_messages,
                         &room_state.member_info,
                         self_member_id,
                         &room_data.secrets,
                         &member_names,
+                        &deputy_badges,
                     );
                     return Some((groups, self_member_id, member_names));
                 }
@@ -2610,16 +2652,18 @@ pub fn Conversation() -> Element {
                                     .iter()
                                     .filter(|ami| ami.member_info.member_id != self_id)
                                     .map(|ami| {
-                                        let name = match unseal_bytes_with_secrets(
-                                            &ami.member_info.preferred_nickname,
-                                            &room_data.secrets,
-                                        ) {
-                                            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                                            Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
-                                        };
-                                        (ami.member_info.member_id, name)
+                                        (
+                                            ami.member_info.member_id,
+                                            display_nickname(
+                                                &ami.member_info.preferred_nickname,
+                                                &room_data.secrets,
+                                            ),
+                                        )
                                     })
-                                    .filter(|(_, name)| !name.trim().is_empty())
+                                    // `display_nickname` never returns an empty
+                                    // string, so the old is-empty filter became
+                                    // dead: the placeholder is what to exclude.
+                                    .filter(|(_, name)| name != crate::util::display_name::UNNAMED)
                                     .collect();
                                 mention_members
                                     .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
@@ -2841,7 +2885,9 @@ fn MessageGroupComponent(
         let mut v: Vec<(MemberId, String)> = member_names
             .iter()
             .filter(|(id, _)| **id != self_member_id)
-            .filter(|(_, name)| !name.trim().is_empty())
+            // `display_nickname` never returns an empty string, so the old
+            // is-empty filter became dead: the placeholder is what to exclude.
+            .filter(|(_, name)| *name != crate::util::display_name::UNNAMED)
             .map(|(id, name)| (*id, name.clone()))
             .collect();
         v.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
@@ -2886,6 +2932,25 @@ fn MessageGroupComponent(
                                 });
                             },
                             "{group.author_name}"
+                        }
+                        // Deputy shield. Same glyph, same visibility rule and
+                        // the same tooltip as the member-list row and the
+                        // member-info modal chip, so the three read as one
+                        // badge. The nickname above cannot forge it: nicknames
+                        // are stripped of emoji by `crate::util::display_name`.
+                        if let Some(badge) = group.author_badge.as_ref() {
+                            {
+                                let tooltip = badge.tooltip();
+                                rsx! {
+                                    span {
+                                        "data-testid": "message-author-deputy-badge",
+                                        class: "text-sm cursor-default",
+                                        title: "{tooltip}",
+                                        "aria-label": "{tooltip}",
+                                        "🛡"
+                                    }
+                                }
+                            }
                         }
                         span {
                             class: if time_clamped {
@@ -3758,6 +3823,101 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Source-grep pin, mirroring `member_info_modal`'s: the conversation's
+    /// author line must take BOTH the shield's visibility and its tooltip from
+    /// the shared `DeputyBadge` machinery, never a private copy of the
+    /// viewer-relevance rule. Three surfaces show this shield (author line,
+    /// member-list row, member-info modal); freenet/river#451 is what happens
+    /// when two of them drift.
+    #[test]
+    fn author_deputy_badge_uses_the_shared_helper() {
+        let source = include_str!("conversation.rs");
+        // Cut at THIS test module specifically, by a needle that cannot match
+        // itself (it contains an escaped newline in the source, not a literal
+        // one). Neither `find("#[cfg(test)]")` nor `rfind` works here: the
+        // first lands on the `clear_message_html_cache` helper above and hides
+        // most of the file, and the last lands on whichever test module was
+        // appended most recently — freenet/river#471 added one, which silently
+        // made every assertion below self-satisfying because the needles were
+        // then inside the scanned text.
+        let prod = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
+
+        assert!(
+            prod.contains("message-author-deputy-badge"),
+            "the conversation must render the 🛡 author badge"
+        );
+        assert!(
+            prod.contains("deputy_badges_for_viewer"),
+            "author-badge visibility must come from the shared \
+             `deputy_badges_for_viewer` map"
+        );
+        assert!(
+            prod.contains("badge.tooltip()"),
+            "the author badge's tooltip must come from `DeputyBadge::tooltip` \
+             so the wording cannot drift between surfaces"
+        );
+    }
+
+    /// Nicknames reach the author line through `display_nickname`, so an emoji
+    /// nickname cannot render a second, fake shield beside the real one. The
+    /// crate-wide render-path scan lives in `crate::util::display_name`; this
+    /// is the conversation-local statement of the same requirement.
+    #[test]
+    fn author_names_are_stripped_of_badge_glyphs() {
+        use crate::util::display_name::sanitize_display_name;
+        for spoof in ["Mallory 🛡", "Mallory 👑", "Mallory \u{1F6E1}\u{FE0F}"] {
+            assert_eq!(sanitize_display_name(spoof), "Mallory");
+        }
+    }
+
+    /// A mention token carries a `[name]` SNAPSHOT written by the sender. When
+    /// the member reference doesn't resolve, that snapshot is what renders —
+    /// so `@[Admin 🛡](rv:<nobody>)` would paint a shield inside a message with
+    /// no nickname involved at all. Any member can type this into any message,
+    /// which makes it a broader vector than the nickname one.
+    #[test]
+    fn unresolved_mention_chip_snapshot_is_sanitised() {
+        let unknown = MemberId(freenet_scaffold::util::FastHash(0xDEAD_BEEF));
+        let me = MemberId(freenet_scaffold::util::FastHash(1));
+        let token = river_core::mention::encode_mention(unknown, "Admin 🛡");
+
+        let html = message_to_html_with_mentions(&token, &HashMap::new(), me);
+        assert!(
+            !html.contains('\u{1F6E1}'),
+            "an unresolved mention rendered a badge glyph from its snapshot: {html}"
+        );
+        assert!(
+            html.contains("Admin"),
+            "the name itself must survive: {html}"
+        );
+    }
+
+    /// Same snapshot, the other renderer: the quoted reply preview resolves
+    /// mention tokens to plain `@name` and falls back to the sender-written
+    /// snapshot for an unknown member.
+    #[test]
+    fn reply_preview_sanitises_an_unresolved_mention_snapshot() {
+        let unknown = MemberId(freenet_scaffold::util::FastHash(0xDEAD_BEEF));
+        let token = river_core::mention::encode_mention(unknown, "Admin 🛡");
+
+        let preview = clean_reply_preview(&token, &HashMap::new());
+        assert!(
+            !preview.contains('\u{1F6E1}'),
+            "reply preview rendered a badge glyph from a mention snapshot: {preview}"
+        );
+        assert!(preview.contains("@Admin"), "got: {preview}");
+    }
+
+    // A previous revision of this branch sanitised
+    // `ReplyContentV1.target_author_name` on both decode paths, because the
+    // reply strip rendered that sender-written snapshot. freenet/river#480
+    // removed the field from the decoder's return type entirely, so there is
+    // no longer a value to sanitise: the quote author comes from
+    // `resolve_member_nickname` on live state, covered by
+    // `resolve_reply_strip_tests::quote_author_label_is_sanitised`.
 
     /// Issue #315 — pin that the markdown renderer never passes raw HTML
     /// through to the DOM. `markdown_to_html` feeds attacker-controlled
@@ -4815,6 +4975,49 @@ mod resolve_reply_strip_tests {
             } => (author, preview),
             other => panic!("expected a rendered quote, got {other:?}"),
         }
+    }
+
+    /// The quote's author label is the target author's CURRENT nickname, so it
+    /// goes through the same sanitiser as the message header above it. Without
+    /// this, `Alice 🛡` would paint a shield into the reply strip — one line
+    /// under the real author line and its real badge.
+    ///
+    /// This covers the LIVE path. `extract_reply_context`'s own sanitisation of
+    /// the sender-written snapshot name is defence in depth: both of its
+    /// callers now discard that field.
+    #[test]
+    fn quote_author_label_is_sanitised() {
+        let owner_sk = signing_key(1);
+        let alice_sk = signing_key(2);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+
+        let quoted = authored(
+            owner,
+            &alice_sk,
+            RoomMessageBody::public("morning".to_string()),
+            10,
+        );
+        let reply = authored(
+            owner,
+            &bob_sk,
+            RoomMessageBody::reply(
+                "morning!".to_string(),
+                quoted.id(),
+                "whatever the sender claims".to_string(),
+                "morning".to_string(),
+            ),
+            20,
+        );
+        let member_info = info(vec![named(&alice_sk, "Alice \u{1F6E1}")]);
+
+        let (author, preview) = expect_quote(resolve(
+            &reply,
+            &state(vec![quoted, reply.clone()]),
+            &member_info,
+        ));
+        assert_eq!(author, "Alice", "quote author kept a badge glyph");
+        assert_eq!(preview, "morning");
     }
 
     const ABUSE: &str = "you are all worthless, buy my coin at scam.example";
