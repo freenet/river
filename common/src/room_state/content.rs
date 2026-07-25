@@ -272,15 +272,31 @@ pub struct ReactionPayload {
 
 /// Reply message content (content_type = 3)
 ///
-/// A reply references a target message and includes a snapshot of the target's
-/// author name and content preview so that the reply remains meaningful even if
-/// the target message is later deleted or scrolled out of the recent window.
+/// A reply references a target message by `target_message_id`. It ALSO carries
+/// a snapshot of that message's author name and content — which no client
+/// renders any more, and which should be removed (freenet/river#482).
+///
+/// The snapshot was intended to keep a quote meaningful after its target aged
+/// out of the recent-message window. But it is written and signed by the
+/// REPLIER and validated by nothing here, so a member can name any author and
+/// quote any text: it is a fabricate-a-quote-from-anyone surface, exploited in
+/// production against the Official room. Clients therefore resolve the quote
+/// against live room state and render nothing when the target cannot be re-read
+/// (`resolve_reply_strip` in `ui/src/components/conversation.rs`,
+/// `reply_context_display_with_secrets` in `cli/src/api.rs`) — i.e. they
+/// deliberately do NOT trust the snapshot in the one case it existed for.
+///
+/// Do not add a new consumer of these two fields. Removing them re-keys the
+/// room contract, so it needs `cargo make add-room-contract-migration` before
+/// the WASM changes; see #482 for the full remediation.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct ReplyContentV1 {
     pub text: String,
     pub target_message_id: MessageId,
+    /// Replier-supplied, unvalidated. Not rendered by any client; see #482.
     pub target_author_name: String,
-    /// Snapshot of the target message content (~100 chars)
+    /// Replier-supplied, unvalidated snapshot of the target's content
+    /// (~100 chars). Not rendered by any client; see #482.
     pub target_content_preview: String,
 }
 
