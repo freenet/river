@@ -1364,17 +1364,29 @@ pub fn MemberList() -> Element {
                         // Stable per-member hook for automation (freenet/river#25).
                         // Entity-ID pattern: `member-item-{member_id}`.
                         "data-testid": "member-item-{member_id}",
+                        // `truncate` used to sit on the BUTTON, which clipped
+                        // the badge spans along with the name: a long enough
+                        // nickname pushed the ⚠ (and its `title`/`aria-label`)
+                        // out of view entirely. That is reachable well inside
+                        // the nickname limit, because the sanitiser
+                        // deliberately does NOT normalise `U+3000` IDEOGRAPHIC
+                        // SPACE — `"Ian Clarke" + "\u{3000}".repeat(13) + "."`
+                        // renders as `Ian Clarke…` with the warning clipped off.
+                        //
+                        // Now the row is a flex line: only the NAME truncates,
+                        // and every badge is `flex-shrink-0` so it can never be
+                        // clipped, whatever the name's length.
                         button {
-                            class: "w-full text-left px-3 py-1.5 rounded-lg text-sm text-text hover:bg-surface transition-colors truncate",
+                            class: "w-full text-left px-3 py-1.5 rounded-lg text-sm text-text hover:bg-surface transition-colors flex items-center min-w-0",
                             title: "Member ID: {member_id}",
                             onclick: move |_| handle_member_click(member_id),
                             // Nickname rendered as a plain text node — attacker-controlled
                             // bytes from `MemberInfoV1.preferred_nickname` MUST NOT be
                             // routed through `dangerous_inner_html` (freenet/river#227).
-                            span { "{parts.nickname}" }
+                            span { class: "truncate min-w-0", "{parts.nickname}" }
                             for (icon, tooltip) in parts.tags {
                                 span {
-                                    class: "member-icon",
+                                    class: "member-icon flex-shrink-0",
                                     title: "{tooltip}",
                                     // The glyph alone means nothing to a
                                     // screen reader, and the deputy shield is
@@ -4707,6 +4719,51 @@ mod tests {
         }
     }
 
+    /// **SHOULD-FIX E — the warning must not be clippable.**
+    ///
+    /// `truncate` used to sit on the member-row BUTTON, which clipped the badge
+    /// spans along with the name. Two consequences: a long nickname pushed the
+    /// ⚠ and its `title`/`aria-label` out of view entirely, and because the
+    /// sanitiser deliberately does NOT normalise `U+3000` IDEOGRAPHIC SPACE, a
+    /// nickname like `"Ian Clarke" + "\u{3000}".repeat(13) + "."` rendered as
+    /// `Ian Clarke…` — a visual clone whose warning was clipped off, well
+    /// inside the nickname length limit.
+    ///
+    /// Source-scrape: this is a Dioxus tree with no headless harness here, and
+    /// the property is a class on a specific element.
+    #[test]
+    fn the_warning_badge_cannot_be_clipped_by_a_long_nickname() {
+        let src = include_str!("members.rs");
+        let start = src
+            .find("\"data-testid\": \"member-item-")
+            .expect("the row");
+        let row = &src[start..start + 2600];
+
+        let button = row.find("button {").expect("the row is a button");
+        let button_class_end = row[button..].find('\n').unwrap_or(0) + button;
+        let button_line = &row[button..button_class_end + 200];
+        assert!(
+            !button_line.contains("transition-colors truncate"),
+            "`truncate` must not sit on the row BUTTON — it clips the badges \
+             along with the name, so a long nickname hides the warning"
+        );
+
+        let name = row
+            .find("\"{parts.nickname}\"")
+            .expect("the nickname span exists");
+        assert!(
+            row[name.saturating_sub(120)..name].contains("truncate"),
+            "the NAME span must be the thing that truncates"
+        );
+
+        let tag = row.find("member-icon").expect("the tag span exists");
+        assert!(
+            row[tag..tag + 60].contains("flex-shrink-0"),
+            "every badge span must be `flex-shrink-0` so it can never be \
+             clipped, whatever the nickname's length"
+        );
+    }
+
     /// Source-grep pin: the member-row render MUST keep `parts.nickname`
     /// as a Dioxus text-node interpolation — `span { "{parts.nickname}" }`
     /// — not pass it through any string concatenation or attribute that
@@ -4715,11 +4772,30 @@ mod tests {
     #[test]
     fn member_row_renders_nickname_as_text_node() {
         let prod = production_source();
+        let needle = "\"{parts.nickname}\"";
+        let at = prod
+            .find(needle)
+            .expect("MemberList must still render `parts.nickname`");
+        // Check the interpolation's POSITION, not the whole element literally.
+        // The literal form broke the moment the span gained a `class` — and it
+        // would have passed unchanged for `dangerous_inner_html:
+        // "{parts.nickname}"` had the element otherwise matched. In rsx a text
+        // node follows `{` or `,`; an attribute value follows `:`.
+        let preceding = prod[..at]
+            .trim_end()
+            .chars()
+            .next_back()
+            .expect("something precedes the interpolation");
         assert!(
-            prod.contains("span { \"{parts.nickname}\" }"),
-            "MemberList must render the nickname as a Dioxus text node \
-             (`span {{ \"{{parts.nickname}}\" }}`). Concatenating it into \
-             an HTML string reopens freenet/river#227."
+            preceding == '{' || preceding == ',',
+            "`parts.nickname` must be a Dioxus TEXT NODE (preceded by `{{` or \
+             `,`), but it is preceded by {preceding:?} — an attribute-value \
+             position. If that attribute is `dangerous_inner_html`, this \
+             reopens freenet/river#227."
+        );
+        assert!(
+            prod[at.saturating_sub(200)..at].contains("span {"),
+            "`parts.nickname` is no longer rendered inside a `span`"
         );
     }
 
