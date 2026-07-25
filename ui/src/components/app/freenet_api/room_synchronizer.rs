@@ -30,7 +30,9 @@ use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use river_core::room_state::message::{AuthorizedMessageV1, RetentionHorizon};
 use river_core::room_state::privacy::PrivacyMode;
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use river_core::room_state::{
+    ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -132,11 +134,55 @@ fn compute_update_data(
 fn outbound_summary(
     baseline: &ChatRoomStateV1,
     params: &ChatRoomParametersV1,
-) -> river_core::room_state::ChatRoomStateV1Summary {
-    let mut summary = baseline.summarize(baseline, params);
-    summary.recent_messages.horizon = RetentionHorizon::Open;
-    summary.direct_messages.pair_horizons.clear();
-    summary
+) -> ChatRoomStateV1Summary {
+    // EXHAUSTIVE DESTRUCTURE, deliberately — do not replace this with
+    // `let mut summary = ...; summary.x = ...`.
+    //
+    // This function is a hand-maintained mirror of "which summary fields are
+    // horizon-shaped", and nothing else in the codebase links it to the horizon
+    // definitions. Binding every field by name makes adding a field to
+    // `ChatRoomStateV1Summary` a COMPILE ERROR *at exactly the site that has to
+    // make the keep-or-clear decision*, instead of a silent default-to-keep.
+    //
+    // That is not hypothetical. `MembersV1` (`remove_excess_members`) and
+    // `BansV1` (`max_user_bans`) have the same non-monotonic defect and are
+    // deferred to a follow-up — see "Not fixed here". The moment that follow-up
+    // adds `MembersSummary.horizon`, a struct-update spread here would compile
+    // clean and silently reintroduce this exact bug on a new field: a device
+    // withholding its own member records from every outgoing update, baseline
+    // advancing anyway, never retried.
+    let ChatRoomStateV1Summary {
+        configuration,
+        bans,
+        members,
+        member_info,
+        secrets,
+        mut recent_messages,
+        mut direct_messages,
+        upgrade,
+        version,
+    } = baseline.summarize(baseline, params);
+
+    // The ONLY two horizon-shaped fields today. "Horizon-shaped" means the
+    // field makes the SENDER withhold something it holds and the receiver
+    // lacks; every other field is a pure have-statement (an id set, a version,
+    // a signature map), which is safe — indeed required — to feed from the
+    // sender's own baseline, because that is what makes the delta "what changed
+    // since I last synced".
+    recent_messages.horizon = RetentionHorizon::Open;
+    direct_messages.pair_horizons.clear();
+
+    ChatRoomStateV1Summary {
+        configuration,
+        bans,
+        members,
+        member_info,
+        secrets,
+        recent_messages,
+        direct_messages,
+        upgrade,
+        version,
+    }
 }
 
 /// Send a member-info self-heal as a standalone, member_info-only UPDATE.
@@ -1595,6 +1641,70 @@ mod tests {
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
     use std::time::SystemTime;
 
+    /// Every `ChatRoomStateV1Delta` field that is `Some`, by name.
+    ///
+    /// The outbound tests build `current` and `baseline` differing in EXACTLY
+    /// one field, so the whole delta must be exactly that one field. Asserting
+    /// per-field instead would miss the failure mode where `outbound_summary`
+    /// over-clears some OTHER field: e.g. adding `summary.bans.clear()` makes
+    /// every outgoing update re-send the full ban list forever, and a test that
+    /// only reads `delta.recent_messages` never notices.
+    fn populated_delta_fields(d: &ChatRoomStateV1Delta) -> Vec<&'static str> {
+        [
+            ("configuration", d.configuration.is_some()),
+            ("bans", d.bans.is_some()),
+            ("members", d.members.is_some()),
+            ("member_info", d.member_info.is_some()),
+            ("secrets", d.secrets.is_some()),
+            ("recent_messages", d.recent_messages.is_some()),
+            ("direct_messages", d.direct_messages.is_some()),
+            ("upgrade", d.upgrade.is_some()),
+            ("version", d.version.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, populated)| *populated)
+        .map(|(name, _)| name)
+        .collect()
+    }
+
+    /// Populate `members` and `bans` so the whole-delta assertion in the
+    /// outbound tests actually has something to bite on.
+    ///
+    /// Without this, `create_test_room()` leaves both empty, so over-clearing
+    /// `summary.bans` in `outbound_summary` produces no ban delta (there are no
+    /// bans to offer) and the assertion passes vacuously — which is exactly what
+    /// happened on the first attempt at that assertion.
+    fn add_members_and_bans(state: &mut ChatRoomStateV1, owner_sk: &SigningKey) {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        use river_core::room_state::member::{AuthorizedMember, Member, MembersV1};
+        use std::time::Duration;
+
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let mut members = Vec::new();
+        for seed in [41u8, 42, 43] {
+            let sk = SigningKey::from_bytes(&[seed; 32]);
+            members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: sk.verifying_key(),
+                },
+                owner_sk,
+            ));
+        }
+        let banned = MemberId::from(&SigningKey::from_bytes(&[44u8; 32]).verifying_key());
+        state.members = MembersV1 { members };
+        state.bans = BansV1(vec![AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(4_000),
+                banned_user: banned,
+            },
+            owner_id,
+            owner_sk,
+        )]);
+    }
+
     fn create_test_room() -> (ChatRoomStateV1, ChatRoomParametersV1, SigningKey) {
         let owner_sk = SigningKey::generate(&mut rand::thread_rng());
         let owner_vk = owner_sk.verifying_key();
@@ -2179,6 +2289,7 @@ mod tests {
         use std::time::Duration;
 
         let (mut room_state, params, owner_sk) = create_test_room();
+        add_members_and_bans(&mut room_state, &owner_sk);
 
         let mut cfg = room_state.configuration.configuration.clone();
         cfg.max_recent_messages = 3;
@@ -2271,6 +2382,16 @@ mod tests {
              of already-synced state; anything less means something is still \
              filtering the send path."
         );
+
+        // ...and EXACTLY that field. `current` and `baseline` differ only in
+        // `recent_messages`, so any other populated field means
+        // `outbound_summary` over-cleared something and every sync tick now
+        // re-sends it.
+        assert_eq!(
+            populated_delta_fields(&delta),
+            vec!["recent_messages"],
+            "the outgoing update touched fields the baseline already has"
+        );
     }
 
     /// The DM half of the same fix — `pair_horizons.clear()` in
@@ -2294,6 +2415,7 @@ mod tests {
         };
 
         let (mut room_state, params, owner_sk) = create_test_room();
+        add_members_and_bans(&mut room_state, &owner_sk);
 
         let sender_sk = SigningKey::generate(&mut rand::thread_rng());
         let sender_id = MemberId::from(&sender_sk.verifying_key());
@@ -2373,6 +2495,12 @@ mod tests {
             "the outgoing update must be EXACTLY the DMs the baseline lacks — not the \
              whole at-capacity pair, which is what clearing the pair horizon would \
              widen it to if the signature-set difference stopped applying."
+        );
+
+        assert_eq!(
+            populated_delta_fields(&delta),
+            vec!["direct_messages"],
+            "the outgoing update touched fields the baseline already has"
         );
     }
 }
