@@ -661,6 +661,23 @@ pub(crate) fn viewer_can_ban(
     target: MemberId,
     owner_id: MemberId,
 ) -> bool {
+    // NOBODY MAY BAN THEMSELVES (freenet/river#478).
+    //
+    // The CONTRACT permits it: `is_ban_authorized` has no self-check, and step
+    // 3 (owner-appointed global moderator) fires before anything that would
+    // stop it, so `is_ban_authorized(d, d)` is `true` for every deputy. Such a
+    // ban is fully valid: `verify` accepts it, and `check_banned_members` then
+    // cascades removal to `get_downstream_members`, taking the deputy's ENTIRE
+    // INVITE SUBTREE with them. On the Official room that is ~105 members for
+    // one misclick on your own profile.
+    //
+    // This is therefore a gate at the interaction layer, not a contract fix.
+    // Do NOT "simplify" it away on the assumption that the contract prevents
+    // self-bans: it does not. Removing it re-arms the misclick, which is why
+    // `viewer_can_ban_refuses_self` pins it.
+    if viewer == target {
+        return false;
+    }
     let members_by_id = members.members_by_member_id();
     MembersV1::is_ban_authorized(viewer, target, &members_by_id, member_info, owner_id)
 }
@@ -3319,6 +3336,113 @@ mod tests {
             deputizers.get(&deputy_id).map(Vec::len),
             Some(1),
             "64 repeated grants must collapse to one appointer"
+        );
+    }
+
+    /// freenet/river#478: nobody may ban themselves.
+    ///
+    /// The precondition assertion is the point. The CONTRACT says yes —
+    /// `is_ban_authorized(deputy, deputy)` returns `true`, because step 3
+    /// (owner-appointed global moderator) fires before anything that would
+    /// stop it — and such a ban cascades to the deputy's whole invite subtree.
+    /// Asserting the contract's answer FIRST proves the guard, and not the
+    /// contract, is what produces `false`.
+    #[test]
+    fn viewer_can_ban_refuses_self() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let deputy_sk = SigningKey::generate(&mut rng);
+        let plain_sk = SigningKey::generate(&mut rng);
+
+        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+        let owner_id = id(&owner_sk);
+        let deputy_id = id(&deputy_sk);
+
+        let members = MembersV1 {
+            members: vec![
+                authorized_member(&owner_sk, &deputy_sk.verifying_key()),
+                authorized_member(&owner_sk, &plain_sk.verifying_key()),
+            ],
+        };
+        let member_info = MemberInfoV1 {
+            member_info: vec![
+                signed_member_info(&owner_sk, "Owner", vec![deputy_id]),
+                signed_member_info(&deputy_sk, "Deputy", vec![]),
+                signed_member_info(&plain_sk, "Plain", vec![]),
+            ],
+        };
+
+        // Precondition: the contract really does authorise a self-ban.
+        assert!(
+            MembersV1::is_ban_authorized(
+                deputy_id,
+                deputy_id,
+                &members.members_by_member_id(),
+                &member_info,
+                owner_id
+            ),
+            "precondition: the contract permits a deputy to ban themselves, \
+             which is exactly why the UI must refuse"
+        );
+
+        // The UI gate refuses it.
+        assert!(
+            !viewer_can_ban(&members, &member_info, deputy_id, deputy_id, owner_id),
+            "a deputy must not be able to ban themselves"
+        );
+        // ...without disturbing the ban authority they legitimately hold.
+        assert!(viewer_can_ban(
+            &members,
+            &member_info,
+            deputy_id,
+            id(&plain_sk),
+            owner_id
+        ));
+    }
+
+    /// The second layer of the #478 guard: the Ban action must not even RENDER
+    /// on your own profile. Source-scrape, because the render is a Dioxus
+    /// component tree with no headless harness here — but it fails loudly if
+    /// someone moves `BanButton` back outside the self-check.
+    #[test]
+    fn ban_action_is_not_rendered_for_self() {
+        let source = include_str!("members/member_info_modal.rs");
+        let prod = &source[..source
+            .find("#[cfg(test)]")
+            .expect("member_info_modal.rs should have a #[cfg(test)] block")];
+
+        let ban_at = prod
+            .find("BanButton {")
+            .expect("the modal must render a BanButton");
+        let guard = "if member_id != self_member_id {";
+        let guard_at = prod[..ban_at]
+            .rfind(guard)
+            .unwrap_or_else(|| panic!("no `{guard}` guard above the BanButton render (#478)"));
+
+        // The guard must still be OPEN where the button renders. Track the
+        // MINIMUM running brace depth, not the final depth: the modal has an
+        // earlier `if member_id != self_member_id` block (the DM / Share-invite
+        // row) that closes again, and a final-depth check reads that as
+        // satisfying the guard because a later block re-opens.
+        let between = &prod[guard_at + guard.len()..ban_at];
+        let mut depth = 0i32;
+        let mut min_depth = 0i32;
+        for c in between.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            min_depth = min_depth.min(depth);
+        }
+        assert!(
+            min_depth >= 0,
+            "the nearest `{guard}` above `BanButton` closes before the button \
+             renders, so a deputy can still ban themselves from their own \
+             profile (#478)"
         );
     }
 

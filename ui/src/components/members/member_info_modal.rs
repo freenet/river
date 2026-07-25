@@ -441,6 +441,14 @@ pub fn MemberInfoModal() -> Element {
                             // Ban + Deputize sit in one row (Ban on the left,
                             // Deputize on the right), matching the DM /
                             // Share-invite button row above.
+                            // BOTH actions are gated on the target not being
+                            // yourself. Ban used to sit OUTSIDE this guard, so a
+                            // deputy opening their own profile saw an enabled
+                            // "Ban User" — and the resulting self-ban is
+                            // contract-VALID and cascades to their whole invite
+                            // subtree (freenet/river#478). `viewer_can_ban`
+                            // refuses self as well; this is the second layer.
+                            if member_id != self_member_id {
                             div { class: "mt-4 flex items-start gap-3",
                                 BanButton {
                                     member_to_ban: member_id,
@@ -460,14 +468,13 @@ pub fn MemberInfoModal() -> Element {
                                 // Deputize / revoke-deputy (#410). Any non-owner
                                 // member (except self) may be deputized; the action
                                 // hides itself when the viewer lacks authority.
-                                if member_id != self_member_id {
-                                    DeputyButton {
-                                        target: member_id,
-                                        viewer_has_authority: viewer_has_authority,
-                                        target_is_my_deputy: target_is_my_deputy,
-                                        nickname: target_nickname.clone(),
-                                    }
+                                DeputyButton {
+                                    target: member_id,
+                                    viewer_has_authority: viewer_has_authority,
+                                    target_is_my_deputy: target_is_my_deputy,
+                                    nickname: target_nickname.clone(),
                                 }
+                            }
                             }
                         }
                     }
