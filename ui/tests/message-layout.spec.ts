@@ -230,7 +230,10 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    const replyStrip = page.locator(".reply-strip").first();
+    // Scope to the testid, not `.reply-strip`: the unavailable-quote
+    // placeholder is a sibling strip that is deliberately inert, and this test
+    // asserts the interactive quote's ARIA contract.
+    const replyStrip = page.locator('[data-testid="reply-strip"]').first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
 
     // ARIA contract
@@ -274,7 +277,10 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
           if (
             rule instanceof CSSStyleRule &&
             rule.selectorText &&
-            rule.selectorText.includes(".reply-strip") &&
+            // Boundary-aware: `.reply-strip-unavailable` (the inert
+            // placeholder, which is deliberately not focusable) must not
+            // satisfy this assertion about the interactive strip.
+            /\.reply-strip(?![\w-])/.test(rule.selectorText) &&
             rule.selectorText.includes(":focus-visible")
           ) {
             return true;
@@ -556,5 +562,62 @@ test.describe("Self message bubble mobile overflow", () => {
         overflow.bad
       )}`
     ).toEqual([]);
+  });
+});
+
+// A reply whose quoted message can no longer be read from room state must show
+// a neutral placeholder instead of the replier-authored snapshot. This is what
+// a reply to a BANNED member's message renders as: banning purges the target,
+// so the snapshot is the only surviving copy of their text and the UI refuses
+// to render it. Example data carries a reply with a fabricated target id
+// (ui/src/example_data.rs) to reproduce that end state.
+test.describe("Unavailable reply quote", () => {
+  test("renders a neutral placeholder and never the snapshot", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const placeholder = page
+      .locator('[data-testid="reply-strip-unavailable"]')
+      .first();
+    await expect(placeholder).toBeVisible({ timeout: 10_000 });
+    await expect(placeholder).toContainText("Original message unavailable");
+
+    // The whole point: neither half of the replier's snapshot reaches the DOM.
+    const body = page.locator("body");
+    await expect(body).not.toContainText(
+      "snapshot text that must never be rendered"
+    );
+    await expect(body).not.toContainText("BannedUser");
+
+    // Inert — there is no original message to scroll to.
+    await expect(placeholder).not.toHaveAttribute("role", "button");
+    await expect(placeholder).not.toHaveAttribute("tabindex", "0");
+    // Count on the UNFILTERED locator — `placeholder` is `.first()`, which
+    // resolves to at most one element, so counting it proves nothing.
+    await expect(
+      page.locator('[data-testid="reply-strip-unavailable"]')
+    ).toHaveCount(1);
+
+    // Resolvable quotes must STILL render — otherwise "no snapshot in the DOM"
+    // above would be satisfied by a build that dropped every reply strip.
+    await expect(
+      page.locator('[data-testid="reply-strip"]')
+    ).not.toHaveCount(0);
+
+    // Mutually exclusive with the quote strip: no bubble carries both.
+    const bubbles = page.locator(".max-w-prose");
+    expect(await bubbles.count()).toBeGreaterThan(0);
+    const bothInOneBubble = await bubbles.evaluateAll(
+      (els) =>
+        els.filter(
+          (b) =>
+            b.querySelector('[data-testid="reply-strip"]') &&
+            b.querySelector('[data-testid="reply-strip-unavailable"]')
+        ).length
+    );
+    expect(bothInOneBubble).toBe(0);
   });
 });

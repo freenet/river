@@ -263,13 +263,13 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // stream via crate::api::reply_context_display so the
                             // two renderings can't drift, including the truncation
                             // marker appended by truncate_reply_preview).
-                            let reply_prefix = crate::api::reply_context_display_with_secrets(
-                                &room_state,
-                                msg,
-                                &secrets,
-                            )
-                            .map(|(author, preview)| format!("[reply to {}: {}] ", author, preview))
-                            .unwrap_or_default();
+                            let reply_prefix = crate::api::reply_prefix_display(
+                                &crate::api::reply_context_display_with_secrets(
+                                    &room_state,
+                                    msg,
+                                    &secrets,
+                                ),
+                            );
 
                             // Get reactions
                             let reactions_str = room_state
@@ -349,13 +349,13 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // Reply context (null for non-replies) — same shape
                             // as the monitor stream's JSON, so a bridge sees
                             // reply_to on both the backfill and the live feed.
-                            let reply_to = crate::api::reply_context_display_with_secrets(
-                                &room_state,
-                                msg,
-                                &secrets,
-                            )
-                            .map(
-                                |(author, preview)| json!({ "author": author, "preview": preview }),
+                            // Shared helper so the two cannot drift.
+                            let reply_to = crate::api::reply_to_json(
+                                &crate::api::reply_context_display_with_secrets(
+                                    &room_state,
+                                    msg,
+                                    &secrets,
+                                ),
                             );
 
                             json!({
