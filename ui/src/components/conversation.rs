@@ -100,16 +100,9 @@ struct GroupedMessage {
     message_id: MessageId,
     edited: bool,
     reactions: HashMap<String, Vec<MemberId>>,
-    reply_to_author: Option<String>,
-    reply_to_preview: Option<String>,
-    reply_to_message_id: Option<MessageId>,
-    /// True when this message IS a reply but the quoted message is no longer
-    /// readable from room state — its author was banned (which purges their
-    /// messages), it was deleted, it aged out of the bounded `recent_messages`
-    /// window, or the replier's `target_message_id` never referred to a real
-    /// message. The replier-authored snapshot is unverifiable in all four cases,
-    /// so a neutral placeholder is rendered in place of the quote.
-    reply_target_unavailable: bool,
+    /// What the reply-quote strip should render, already resolved against live
+    /// room state — see [`ReplyStrip`] and [`resolve_reply_context`].
+    reply_strip: ReplyStrip,
     /// Propagation delay in seconds (send → receive), if known and significant
     #[allow(dead_code)]
     receive_delay_secs: Option<i64>,
@@ -169,24 +162,34 @@ enum DisplayRow {
     Item(DisplayItem),
 }
 
-/// The reply-quote strip's content, resolved against live room state by
-/// [`resolve_reply_context`]. Either `author` + `preview` are both set (a quote
-/// that was verified against the message it quotes), or `unavailable` is set (a
-/// reply whose quoted message could not be read back), or the message is not a
-/// reply at all and every field is empty.
+/// What the reply-quote strip should render, resolved against live room state
+/// by [`resolve_reply_context`].
+///
+/// An enum rather than co-varying `Option` fields plus a flag: the renderer has
+/// two mutually exclusive arms, and the freenet "paired `Option` fields that
+/// must co-occur" bug pattern is exactly the shape where a later edit sets one
+/// half and silently renders both strips at once. Matching on this makes that
+/// unrepresentable.
 ///
 /// Distinct from [`ReplyContext`], which is the reply-in-progress the composer
 /// holds while the user is writing a reply.
-#[derive(Debug, Default, PartialEq)]
-struct ResolvedReply {
-    /// Current nickname of the quoted message's ACTUAL author.
-    author: Option<String>,
-    /// Current text of the quoted message, mention-resolved and truncated.
-    preview: Option<String>,
-    /// Quoted message id, used to scroll to the original.
-    target_id: Option<MessageId>,
-    /// True when this IS a reply but the quoted message could not be read.
-    unavailable: bool,
+#[derive(Clone, Debug, Default, PartialEq)]
+enum ReplyStrip {
+    /// Not a reply — no strip at all.
+    #[default]
+    None,
+    /// A reply whose quoted message could not be read back from room state.
+    Unavailable,
+    /// A quote verified against the message it quotes. Every field is re-read
+    /// from that message; nothing here comes from the replier's snapshot.
+    Quote {
+        /// Current nickname of the quoted message's ACTUAL author.
+        author: String,
+        /// Current text of the quoted message, mention-resolved and truncated.
+        preview: String,
+        /// Quoted message id, used to scroll to the original.
+        target_id: MessageId,
+    },
 }
 
 /// Resolve a message's reply quote against LIVE room state, showing it only
@@ -198,15 +201,17 @@ struct ResolvedReply {
 /// from room state. Rendering it unconditionally lets the quoted text outlive
 /// the message it quotes:
 ///
-///   * BANNED author — the motivating case (freenet/river). `post_apply_cleanup`
-///     purges a banned member's messages (step 4b) AND their `member_info`
-///     record, so their abusive text would otherwise survive verbatim in every
-///     reply that quoted it. This CANNOT be keyed on looking the quoted author
-///     up in `bans`: the snapshot carries no `MemberId` (only a name string),
-///     `MessageId` is `fast_hash(signature)` and so is not invertible, and a
-///     banned member has no nickname left anywhere in state to match the name
-///     against. Absence of the quoted message is the only observable, so that
-///     is what this keys on.
+///   * BANNED author — the motivating case. An ENFORCED ban removes the member,
+///     which makes `post_apply_cleanup` purge their messages (step 4b) AND
+///     their `member_info` record, so their abusive text would otherwise
+///     survive verbatim in every reply that quoted it. This CANNOT be keyed on
+///     looking the quoted author up in `bans`: the snapshot carries no
+///     `MemberId` (only a name string), `MessageId` is `fast_hash(signature)`
+///     and so is not invertible, and a banned member has no nickname left
+///     anywhere in state to match the name against. Absence of the quoted
+///     message is the only observable, so that is what this keys on. (The same
+///     purge applies to any member removed from the room, e.g. by
+///     inactivity-prune — the ban is just the case that matters.)
 ///   * DELETED target — deleting a message should remove its text from the
 ///     room, quotes of it included.
 ///   * FORGED snapshot — any member can post a reply naming an arbitrary author
@@ -214,73 +219,147 @@ struct ResolvedReply {
 ///     nothing, or at a message somebody else wrote.
 ///
 /// The cost is that a target which merely aged out of the bounded
-/// `recent_messages` window also loses its preview. That is deliberate and is
-/// why the placeholder wording is neutral: absence cannot distinguish a ban
-/// from an ordinary aged-out message, so the UI must not claim "banned".
+/// `recent_messages` window (`max_recent_messages`, default 100 and
+/// owner-configurable) also loses its preview. That is deliberate and is why
+/// the placeholder wording is neutral: absence cannot distinguish a ban from an
+/// ordinary aged-out message, so the UI must not claim "banned".
+///
+/// A tempting discriminator is the timestamp — if the oldest retained message
+/// is NEWER than the reply, the target provably fell out of the window rather
+/// than being purged. Do NOT use it: `MessageV1::time` is self-signed and
+/// unvalidated, so an ally of a banned member could backdate a reply to force
+/// that branch and resurrect the text.
 ///
 /// The strip therefore renders ENTIRELY from live state or not at all — when
-/// the target is present both its text and its attribution are re-read from it,
-/// so edits and renames propagate and neither half of the replier-supplied
+/// the target is readable, both its text and its attribution are re-read from
+/// it, so edits and renames propagate and neither half of the replier-supplied
 /// snapshot is ever displayed.
 fn resolve_reply_context(
     content: &RoomMessageBody,
     messages_state: &MessagesV1,
+    member_info: &MemberInfoV1,
     secrets: &HashMap<u32, [u8; 32]>,
     member_names: &HashMap<MemberId, String>,
-) -> ResolvedReply {
+) -> ReplyStrip {
     let (_snapshot_author, _snapshot_preview, target_id) = extract_reply_context(content, secrets);
-
-    let live_reply = target_id.as_ref().and_then(|target_id| {
-        messages_state
-            .messages
-            .iter()
-            .find(|m| &m.id() == target_id)
-            // `messages` retains soft-deleted messages; `display_messages`
-            // filters them out. A deleted target counts as unavailable.
-            .filter(|_| !messages_state.is_deleted(target_id))
-            .map(|target_msg| {
-                let text = messages_state
-                    .effective_text(target_msg)
-                    .unwrap_or_else(|| {
-                        decrypt_message_content(&target_msg.message.content, secrets)
-                    });
-                // Attribute to the CURRENT nickname of the message's ACTUAL
-                // author rather than the snapshot's `target_author_name`, which
-                // can name anyone and does not track renames. Matches how the
-                // message body header resolves its author.
-                let author = member_names
-                    .get(&target_msg.message.author)
-                    .cloned()
-                    .unwrap_or_else(|| "Unknown".to_string());
-                (author, text)
-            })
-    });
-
-    let unavailable = target_id.is_some() && live_reply.is_none();
-    // The author name is dropped along with the text: "Alice: [removed]" still
-    // attributes the quoted content to Alice, and the name is exactly as
-    // unverifiable as the text it labels.
-    let (author, preview) = match live_reply {
-        Some((author, text)) => {
-            // Clean the preview for display: resolve @mention tokens to plain
-            // `@name` (current nickname) and strip markdown, so the quote reads
-            // as plain text rather than showing raw `@[name](rv:id)` / `**` /
-            // `[text](url)` syntax. Truncate after cleaning.
-            let preview = clean_reply_preview(&text, member_names)
-                .chars()
-                .take(100)
-                .collect::<String>();
-            (Some(author), Some(preview))
-        }
-        None => (None, None),
+    let Some(target_id) = target_id else {
+        return ReplyStrip::None;
     };
 
-    ResolvedReply {
-        author,
-        preview,
-        target_id,
-        unavailable,
+    let quote = messages_state
+        .messages
+        .iter()
+        .find(|m| m.id() == target_id)
+        // Mirror `display_messages()` and then some: `messages` retains
+        // soft-deleted messages and action messages, and events render as a
+        // merged summary rather than a `msg-{id}` row. None of those is a
+        // quotable message — resolving one would render machine copy
+        // ("[Reaction 👍 to …]") as if it were the author's words and leave the
+        // scroll-to-original handler pointing at an element that never exists.
+        .filter(|target_msg| {
+            !messages_state.is_deleted(&target_id)
+                && !target_msg.message.content.is_action()
+                && !target_msg.message.content.is_event()
+        })
+        .and_then(|target_msg| {
+            let text = target_plaintext(messages_state, target_msg, secrets)?;
+            // Attribute to the CURRENT nickname of the message's ACTUAL author
+            // rather than the snapshot's `target_author_name`, which can name
+            // anyone and does not track renames. Routed through the same
+            // `canonical()` lookup the message header uses, so a member with
+            // duplicate `member_info` records cannot be labelled one way in the
+            // quote and another way on their own message.
+            let author = resolve_member_nickname(member_info, target_msg.message.author, secrets);
+            Some((author, text))
+        });
+
+    match quote {
+        // Clean the preview for display: resolve @mention tokens to plain
+        // `@name` (current nickname) and strip markdown, so the quote reads as
+        // plain text rather than showing raw `@[name](rv:id)` / `**` /
+        // `[text](url)` syntax. Truncate after cleaning.
+        Some((author, text)) => ReplyStrip::Quote {
+            author,
+            preview: clean_reply_preview(&text, member_names)
+                .chars()
+                .take(100)
+                .collect::<String>(),
+            target_id,
+        },
+        // The author name is dropped along with the text: "Alice: [removed]"
+        // still attributes the quoted content to Alice, and the name is exactly
+        // as unverifiable as the text it labels.
+        None => ReplyStrip::Unavailable,
     }
+}
+
+/// The quoted message's plaintext, or `None` when it genuinely cannot be read.
+///
+/// Deliberately NOT `decrypt_message_content`: that returns user-facing
+/// diagnostics on a missing secret or a failed decrypt ("[Encrypted message -
+/// secret v2 unavailable]", "Decrypting messages — this should only take a
+/// moment..."), and quoting one of those would render machine copy as if it
+/// were the quoted author's words — while reporting the quote as verified. A
+/// private target we cannot decrypt has not been re-read, so it must fall
+/// through to the neutral placeholder like any other unreadable target.
+fn target_plaintext(
+    messages_state: &MessagesV1,
+    target: &AuthorizedMessageV1,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> Option<String> {
+    use river_core::room_state::content::{
+        ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
+    };
+
+    // An edit supersedes the body, and reaches `actions_state` already
+    // decrypted (`RoomData::rebuild_private_actions_state`). Falls back to the
+    // public body text, which is `None` for a private message.
+    if let Some(text) = messages_state.effective_text(target) {
+        return Some(text);
+    }
+
+    let RoomMessageBody::Private {
+        content_type,
+        ciphertext,
+        nonce,
+        secret_version,
+        ..
+    } = &target.message.content
+    else {
+        return None;
+    };
+    let secret = secrets.get(secret_version)?;
+    let plaintext =
+        crate::util::ecies::decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
+            .ok()?;
+    match *content_type {
+        CONTENT_TYPE_TEXT => TextContentV1::decode(&plaintext).ok().map(|c| c.text),
+        CONTENT_TYPE_REPLY => ReplyContentV1::decode(&plaintext).ok().map(|r| r.text),
+        _ => None,
+    }
+}
+
+/// A member's current nickname, decrypted when the room is private.
+///
+/// Routes through [`MemberInfoV1::canonical`] rather than a pre-collected
+/// `member_id -> name` map: River accepts duplicate `member_info` records until
+/// `post_apply_cleanup` dedups them, and a raw `.collect()` keeps whichever
+/// record happens to come last. Every by-id read must agree on the canonical
+/// (highest-rank) record.
+fn resolve_member_nickname(
+    member_info: &MemberInfoV1,
+    member_id: MemberId,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> String {
+    member_info
+        .canonical(member_id)
+        .map(
+            |ami| match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, secrets) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
+            },
+        )
+        .unwrap_or_else(|| "Unknown".to_string())
 }
 
 /// Group consecutive messages from the same sender within 5 minutes,
@@ -310,16 +389,7 @@ fn group_messages(
         let message_time = if time_clamped { now } else { raw_time };
         let message_id = message.id();
 
-        let author_name = member_info
-            .canonical(author_id)
-            .map(|ami| {
-                // Decrypt nickname using version-aware decryption
-                match unseal_bytes_with_secrets(&ami.member_info.preferred_nickname, secrets) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                    Err(_) => ami.member_info.preferred_nickname.to_string_lossy(),
-                }
-            })
-            .unwrap_or_else(|| "Unknown".to_string());
+        let author_name = resolve_member_nickname(member_info, author_id, secrets);
 
         // Handle event messages (join, etc.) — summarize consecutive events within 1 hour
         if message.message.content.is_event() {
@@ -366,14 +436,10 @@ fn group_messages(
             .unwrap_or_default();
 
         // Resolve the reply quote (if any) against live room state.
-        let ResolvedReply {
-            author: reply_to_author,
-            preview: reply_to_preview,
-            target_id: reply_to_message_id,
-            unavailable: reply_target_unavailable,
-        } = resolve_reply_context(
+        let reply_strip = resolve_reply_context(
             &message.message.content,
             messages_state,
+            member_info,
             secrets,
             member_names,
         );
@@ -391,10 +457,7 @@ fn group_messages(
             message_id,
             edited,
             reactions,
-            reply_to_author,
-            reply_to_preview,
-            reply_to_message_id,
-            reply_target_unavailable,
+            reply_strip,
             receive_delay_secs,
         };
 
@@ -1476,7 +1539,6 @@ pub fn Conversation() -> Element {
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
-
                     // Build list of actions:
                     // - If clicking same emoji: just remove it
                     // - If clicking different emoji: remove old (if any) + add new
@@ -2807,10 +2869,7 @@ fn MessageGroupComponent(
                         let is_last = idx == messages_len - 1;
                         let is_first = idx == 0;
                         let has_reactions = !msg.reactions.is_empty();
-                        let reply_author_val = msg.reply_to_author.clone();
-                        let reply_preview_val = msg.reply_to_preview.clone();
-                        let reply_target_id_val = msg.reply_to_message_id.clone();
-                        let reply_unavailable_val = msg.reply_target_unavailable;
+                        let reply_strip_val = msg.reply_strip.clone();
 
                         rsx! {
                             // `min-w-0 max-w-full` clamps this per-message wrapper to
@@ -3033,10 +3092,7 @@ fn MessageGroupComponent(
                                                 }
                                             }
                                         } else {
-                                            let reply_author_inner = reply_author_val.clone();
-                                            let reply_preview_inner = reply_preview_val.clone();
-                                            let reply_target_inner = reply_target_id_val.clone();
-                                            let reply_unavailable_inner = reply_unavailable_val;
+                                            let reply_strip_inner = reply_strip_val.clone();
                                             rsx! {
                                                 // Message bubble. The reply strip (if any) is rendered as
                                                 // the first child INSIDE the bubble so it shares the
@@ -3082,81 +3138,89 @@ fn MessageGroupComponent(
                                                             }
                                                         }
                                                     },
-                                                    // Placeholder strip for a reply whose quoted message is
-                                                    // no longer readable from room state (banned author,
-                                                    // deletion, aged out of the window, or a snapshot that
-                                                    // never pointed at a real message). Rendered instead of
-                                                    // the quote, never alongside it: `group_messages` clears
-                                                    // both `reply_to_author` and `reply_to_preview` whenever
-                                                    // it sets this flag, so the two arms are exclusive.
+                                                    // Reply-quote strip (inside bubble, first child).
+                                                    // Exactly one arm renders, enforced by the type: an
+                                                    // unverifiable quote is `Unavailable`, which carries no
+                                                    // author or preview to render.
                                                     //
-                                                    // Deliberately inert — no `role`/`tabindex`/`onclick` —
-                                                    // because there is no original message to scroll to.
-                                                    // The wording stays neutral: absence cannot distinguish
-                                                    // a ban from an ordinary aged-out message, so claiming
-                                                    // "banned" here would mislabel the common case.
-                                                    if reply_unavailable_inner {
-                                                        div {
-                                                            "data-testid": "reply-strip-unavailable",
-                                                            class: format!(
-                                                                "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 italic {}",
-                                                                if is_self { "bg-white/25 text-white/70" } else { "bg-black/[0.12] text-text-muted" }
-                                                            ),
-                                                            "\u{21a9} Original message unavailable"
-                                                        }
-                                                    }
-                                                    // Reply context strip (inside bubble, first child).
                                                     // Self bubbles use a white-tinted overlay so the strip
                                                     // stays legible against the accent background; other
                                                     // bubbles use a dark-tinted overlay against the surface
                                                     // background. The previous `bg-accent/40 text-accent`
                                                     // was invisible on self bubbles because the strip
                                                     // composited to the same colour as the bubble.
-                                                    if let (Some(author), Some(preview)) = (reply_author_inner, reply_preview_inner) {
-                                                        {
-                                                            let target_id_str = reply_target_inner.map(|id| format!("{:?}", id.0)).unwrap_or_default();
-                                                            // Clone the target id so we can own one copy in the
-                                                            // onclick handler and one in the onkeydown handler.
-                                                            let target_id_for_key = target_id_str.clone();
-                                                            rsx! {
+                                                    {
+                                                        match reply_strip_inner {
+                                                            ReplyStrip::None => rsx! {},
+                                                            // Deliberately inert — no `role`/`tabindex`/
+                                                            // `onclick` — because there is no original
+                                                            // message to scroll to. It therefore carries
+                                                            // its own class rather than `reply-strip`,
+                                                            // whose hover/focus-expand rules assume a
+                                                            // focusable element with ellipsized text.
+                                                            //
+                                                            // The wording stays neutral: absence cannot
+                                                            // distinguish a ban from an ordinary aged-out
+                                                            // message, so claiming "banned" here would
+                                                            // mislabel the common case.
+                                                            ReplyStrip::Unavailable => rsx! {
                                                                 div {
-                                                                    "data-testid": "reply-strip",
+                                                                    "data-testid": "reply-strip-unavailable",
                                                                     class: format!(
-                                                                        "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
+                                                                        "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 italic {}",
                                                                         if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
                                                                     ),
-                                                                    title: "Scroll to original message (Enter or Space to activate)",
-                                                                    role: "button",
-                                                                    tabindex: "0",
-                                                                    "aria-label": "Scroll to the message this is a reply to",
-                                                                    onclick: move |_| {
-                                                                        if let Some(window) = web_sys::window() {
-                                                                            if let Some(doc) = window.document() {
-                                                                                if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
-                                                                                    el.scroll_into_view();
-                                                                                    let _ = el.class_list().add_1("reply-highlight");
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    },
-                                                                    onkeydown: move |e: KeyboardEvent| {
-                                                                        // Activate the same scroll-to-original
-                                                                        // behaviour via Enter or Space so keyboard
-                                                                        // users can reach it without a mouse.
-                                                                        if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
-                                                                            e.prevent_default();
+                                                                    // The arrow is decorative; the sentence
+                                                                    // after it is what a screen reader needs.
+                                                                    span { "aria-hidden": "true", "\u{21a9} " }
+                                                                    "Original message unavailable"
+                                                                }
+                                                            },
+                                                            ReplyStrip::Quote { author, preview, target_id } => {
+                                                                let target_id_str = format!("{:?}", target_id.0);
+                                                                // Clone the target id so we can own one copy in the
+                                                                // onclick handler and one in the onkeydown handler.
+                                                                let target_id_for_key = target_id_str.clone();
+                                                                rsx! {
+                                                                    div {
+                                                                        "data-testid": "reply-strip",
+                                                                        class: format!(
+                                                                            "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
+                                                                            if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
+                                                                        ),
+                                                                        title: "Scroll to original message (Enter or Space to activate)",
+                                                                        role: "button",
+                                                                        tabindex: "0",
+                                                                        "aria-label": "Scroll to the message this is a reply to",
+                                                                        onclick: move |_| {
                                                                             if let Some(window) = web_sys::window() {
                                                                                 if let Some(doc) = window.document() {
-                                                                                    if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_for_key)) {
+                                                                                    if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
                                                                                         el.scroll_into_view();
                                                                                         let _ = el.class_list().add_1("reply-highlight");
                                                                                     }
                                                                                 }
                                                                             }
-                                                                        }
-                                                                    },
-                                                                    span { class: "font-medium", "\u{21a9} @{author}: " }
-                                                                    span { "{preview}" }
+                                                                        },
+                                                                        onkeydown: move |e: KeyboardEvent| {
+                                                                            // Activate the same scroll-to-original
+                                                                            // behaviour via Enter or Space so keyboard
+                                                                            // users can reach it without a mouse.
+                                                                            if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
+                                                                                e.prevent_default();
+                                                                                if let Some(window) = web_sys::window() {
+                                                                                    if let Some(doc) = window.document() {
+                                                                                        if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_for_key)) {
+                                                                                            el.scroll_into_view();
+                                                                                            let _ = el.class_list().add_1("reply-highlight");
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        },
+                                                                        span { class: "font-medium", "\u{21a9} @{author}: " }
+                                                                        span { "{preview}" }
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -4631,11 +4695,14 @@ mod tests {
 ///
 /// These target the helper rather than `group_messages` because the latter
 /// reads the `RECEIVE_TIMES` `GlobalSignal`, which panics outside a Dioxus
-/// runtime.
+/// runtime. The render side (which arm of [`ReplyStrip`] produces what markup)
+/// is covered by `ui/tests/message-layout.spec.ts`.
 #[cfg(test)]
 mod resolve_reply_context_tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use river_core::room_state::content::{TextContentV1, CONTENT_TYPE_TEXT, TEXT_CONTENT_VERSION};
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
     use std::time::{Duration, SystemTime};
 
     fn signing_key(seed: u8) -> SigningKey {
@@ -4670,12 +4737,42 @@ mod resolve_reply_context_tests {
         }
     }
 
+    /// Public `member_info` naming `sk`'s member, as an unencrypted room has.
+    fn named(sk: &SigningKey, nickname: &str) -> AuthorizedMemberInfo {
+        AuthorizedMemberInfo::new(
+            MemberInfo::new_public(member_id_of(sk), 1, nickname.to_string()),
+            sk,
+        )
+    }
+
+    fn info(entries: Vec<AuthorizedMemberInfo>) -> MemberInfoV1 {
+        MemberInfoV1 {
+            member_info: entries,
+        }
+    }
+
     fn resolve(
         reply: &AuthorizedMessageV1,
         messages: &MessagesV1,
-        names: &HashMap<MemberId, String>,
-    ) -> ResolvedReply {
-        resolve_reply_context(&reply.message.content, messages, &HashMap::new(), names)
+        member_info: &MemberInfoV1,
+    ) -> ReplyStrip {
+        resolve_reply_context(
+            &reply.message.content,
+            messages,
+            member_info,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+    }
+
+    /// Destructure a `Quote`, failing loudly with the actual variant otherwise.
+    fn expect_quote(strip: ReplyStrip) -> (String, String) {
+        match strip {
+            ReplyStrip::Quote {
+                author, preview, ..
+            } => (author, preview),
+            other => panic!("expected a rendered quote, got {other:?}"),
+        }
     }
 
     const ABUSE: &str = "you are all worthless, buy my coin at scam.example";
@@ -4717,28 +4814,22 @@ mod resolve_reply_context_tests {
         let replier_sk = signing_key(3);
         let owner = member_id_of(&owner_sk);
         let (abusive, reply) = abuse_and_reply(owner, &abuser_sk, &replier_sk);
-        let names = HashMap::from([(member_id_of(&abuser_sk), "Abuser".to_string())]);
+        let member_info = info(vec![named(&abuser_sk, "Abuser")]);
 
         // Before the ban the abusive message is present, so the quote renders.
         // Pins that the assertion below is about the purge, not a dead fixture.
-        let before = resolve(&reply, &state(vec![abusive, reply.clone()]), &names);
-        assert_eq!(before.preview.as_deref(), Some(ABUSE));
-        assert!(!before.unavailable);
+        let before = resolve(&reply, &state(vec![abusive, reply.clone()]), &member_info);
+        assert_eq!(expect_quote(before).1, ABUSE);
 
-        // After the ban the contract has purged the abuser's message.
-        let after = resolve(&reply, &state(vec![reply.clone()]), &names);
-        assert!(
-            after.unavailable,
-            "a reply whose quoted message was purged must be flagged unavailable"
-        );
+        // After the ban the contract has purged the abuser's message — and
+        // their `member_info` record with it.
+        let after = resolve(&reply, &state(vec![reply.clone()]), &info(vec![]));
         assert_eq!(
-            after.preview, None,
-            "banned member's text must not survive in the quote"
-        );
-        assert_eq!(
-            after.author, None,
-            "attribution is dropped too — 'Abuser: [removed]' still attributes \
-             the quoted content to them"
+            after,
+            ReplyStrip::Unavailable,
+            "a banned member's text must not survive in the quote, and the \
+             attribution must be dropped with it — 'Abuser: [removed]' still \
+             attributes the quoted content to them"
         );
     }
 
@@ -4774,23 +4865,26 @@ mod resolve_reply_context_tests {
             2,
         );
         // `old` has since scrolled out of the window; other, newer messages
-        // remain, so this is a window effect rather than an empty room.
+        // remain, so this is a window effect rather than an empty room. Alice
+        // is still very much a member.
         let survivor = authored(
             owner,
             &alice_sk,
             RoomMessageBody::public("something newer".to_string()),
             3,
         );
-        let names = HashMap::from([(member_id_of(&alice_sk), "Alice".to_string())]);
 
-        let ctx = resolve(&reply, &state(vec![reply.clone(), survivor]), &names);
-        assert!(ctx.unavailable);
-        assert_eq!(ctx.preview, None);
-        assert_eq!(ctx.author, None);
+        let ctx = resolve(
+            &reply,
+            &state(vec![reply.clone(), survivor]),
+            &info(vec![named(&alice_sk, "Alice")]),
+        );
+        assert_eq!(ctx, ReplyStrip::Unavailable);
     }
 
     /// An ordinary reply to a message that is still present renders the quote,
-    /// reading the CURRENT text so edits to the quoted message propagate.
+    /// reading the CURRENT text and the CURRENT nickname so edits and renames
+    /// both propagate.
     #[test]
     fn quote_shows_current_text_and_current_nickname_of_present_target() {
         let owner_sk = signing_key(1);
@@ -4822,22 +4916,71 @@ mod resolve_reply_context_tests {
             .actions_state
             .edited_content
             .insert(original.id(), "edited wording".to_string());
-        // Alice has since renamed herself.
-        let names = HashMap::from([(member_id_of(&alice_sk), "Alice".to_string())]);
 
-        let ctx = resolve(&reply, &messages, &names);
-        assert!(!ctx.unavailable);
+        // Alice has since renamed herself.
+        let ctx = resolve(&reply, &messages, &info(vec![named(&alice_sk, "Alice")]));
         assert_eq!(
-            ctx.preview.as_deref(),
-            Some("edited wording"),
-            "quote must track edits to the quoted message"
+            ctx,
+            ReplyStrip::Quote {
+                author: "Alice".to_string(),
+                preview: "edited wording".to_string(),
+                target_id: original.id(),
+            },
+            "the quote must track edits and renames, and keep the target id so \
+             scroll-to-original still works"
         );
+    }
+
+    /// Duplicate `member_info` records are legal until `post_apply_cleanup`
+    /// dedups them. The quote must pick the same CANONICAL record the message
+    /// header picks, or one member is labelled two different ways on screen.
+    #[test]
+    fn quote_author_uses_the_canonical_member_info_record() {
+        let owner_sk = signing_key(1);
+        let alice_sk = signing_key(2);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+
+        let original = authored(
+            owner,
+            &alice_sk,
+            RoomMessageBody::public("hello".to_string()),
+            10,
+        );
+        let reply = authored(
+            owner,
+            &bob_sk,
+            RoomMessageBody::reply(
+                "hi".to_string(),
+                original.id(),
+                "Alice".to_string(),
+                "hello".to_string(),
+            ),
+            20,
+        );
+
+        // Two records for Alice; the higher version is canonical. Listed with
+        // the STALE one last so a naive `.collect()` into a map would pick it.
+        let canonical = AuthorizedMemberInfo::new(
+            MemberInfo::new_public(member_id_of(&alice_sk), 2, "Alice v2".to_string()),
+            &alice_sk,
+        );
+        let stale = AuthorizedMemberInfo::new(
+            MemberInfo::new_public(member_id_of(&alice_sk), 1, "Alice v1".to_string()),
+            &alice_sk,
+        );
+        let member_info = info(vec![canonical, stale]);
+
+        let (author, _) = expect_quote(resolve(
+            &reply,
+            &state(vec![original, reply.clone()]),
+            &member_info,
+        ));
         assert_eq!(
-            ctx.author.as_deref(),
-            Some("Alice"),
-            "quote must use the author's current nickname, not the snapshot"
+            author, "Alice v2",
+            "must match `member_info.canonical()`, which is what the message \
+             header uses"
         );
-        assert_eq!(ctx.target_id, Some(original.id()));
     }
 
     /// Deleting a message removes its text from the room; quotes of it included.
@@ -4869,12 +5012,9 @@ mod resolve_reply_context_tests {
         // A soft delete leaves the message in `messages` but marks it deleted.
         let mut messages = state(vec![original.clone(), reply.clone()]);
         messages.actions_state.deleted.insert(original.id());
-        let names = HashMap::from([(member_id_of(&alice_sk), "Alice".to_string())]);
 
-        let ctx = resolve(&reply, &messages, &names);
-        assert!(ctx.unavailable);
-        assert_eq!(ctx.preview, None);
-        assert_eq!(ctx.author, None);
+        let ctx = resolve(&reply, &messages, &info(vec![named(&alice_sk, "Alice")]));
+        assert_eq!(ctx, ReplyStrip::Unavailable);
     }
 
     /// The snapshot is written and signed by the REPLIER and validated by
@@ -4904,11 +5044,15 @@ mod resolve_reply_context_tests {
             ),
             20,
         );
-        let names = HashMap::from([(member_id_of(&carol_sk), "Carol".to_string())]);
+        let member_info = info(vec![named(&carol_sk, "Carol")]);
 
-        let ctx = resolve(&forged, &state(vec![real, forged.clone()]), &names);
-        assert_eq!(ctx.author.as_deref(), Some("Carol"));
-        assert_eq!(ctx.preview.as_deref(), Some("what Carol actually said"));
+        let (author, preview) = expect_quote(resolve(
+            &forged,
+            &state(vec![real, forged.clone()]),
+            &member_info,
+        ));
+        assert_eq!(author, "Carol");
+        assert_eq!(preview, "what Carol actually said");
 
         // A snapshot pointing at a message that never existed renders nothing.
         let fabricated = authored(
@@ -4922,10 +5066,208 @@ mod resolve_reply_context_tests {
             ),
             30,
         );
-        let ctx = resolve(&fabricated, &state(vec![fabricated.clone()]), &names);
-        assert!(ctx.unavailable);
-        assert_eq!(ctx.preview, None);
-        assert_eq!(ctx.author, None);
+        let ctx = resolve(&fabricated, &state(vec![fabricated.clone()]), &member_info);
+        assert_eq!(ctx, ReplyStrip::Unavailable);
+    }
+
+    /// Action and event messages live in `messages` but are never rendered as
+    /// rows. Quoting one would put machine copy ("[Reaction 👍 to …]", "joined
+    /// the room") on screen as if it were the author's words, and point
+    /// scroll-to-original at a `msg-{id}` element that does not exist.
+    #[test]
+    fn quote_of_an_action_or_event_message_is_hidden() {
+        use river_core::room_state::content::ActionContentV1;
+
+        let owner_sk = signing_key(1);
+        let alice_sk = signing_key(2);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+        let member_info = info(vec![named(&alice_sk, "Alice")]);
+
+        let anchor = authored(
+            owner,
+            &alice_sk,
+            RoomMessageBody::public("anchor".to_string()),
+            5,
+        );
+        let action = authored(
+            owner,
+            &alice_sk,
+            RoomMessageBody::reaction(anchor.id(), "\u{1f44d}".to_string()),
+            10,
+        );
+        let event = authored(owner, &alice_sk, RoomMessageBody::join_event(), 11);
+
+        for target in [&action, &event] {
+            let reply = authored(
+                owner,
+                &bob_sk,
+                RoomMessageBody::reply(
+                    "quoting a non-message".to_string(),
+                    target.id(),
+                    "Alice".to_string(),
+                    "something plausible".to_string(),
+                ),
+                20,
+            );
+            let messages = state(vec![
+                anchor.clone(),
+                action.clone(),
+                event.clone(),
+                reply.clone(),
+            ]);
+            assert_eq!(
+                resolve(&reply, &messages, &member_info),
+                ReplyStrip::Unavailable,
+                "a reply targeting {:?} must not render a quote",
+                target.message.content.content_type()
+            );
+        }
+    }
+
+    /// A private target we cannot decrypt has NOT been re-read, so it must fall
+    /// through to the placeholder. Quoting `decrypt_message_content`'s output
+    /// would put a diagnostic string ("[Encrypted message - secret v1
+    /// unavailable]") on screen as if it were the quoted author's words, while
+    /// reporting the quote as verified.
+    #[test]
+    fn private_target_is_quoted_only_when_its_secret_is_available() {
+        use crate::util::ecies::encrypt_with_symmetric_key;
+
+        let owner_sk = signing_key(1);
+        let alice_sk = signing_key(2);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+        let member_info = info(vec![named(&alice_sk, "Alice")]);
+
+        let secret_v1 = [7u8; 32];
+        let (ciphertext, nonce) = encrypt_with_symmetric_key(
+            &secret_v1,
+            &TextContentV1::new("private words".to_string()).encode(),
+        );
+        let target = authored(
+            owner,
+            &alice_sk,
+            RoomMessageBody::private(
+                CONTENT_TYPE_TEXT,
+                TEXT_CONTENT_VERSION,
+                ciphertext,
+                nonce,
+                1,
+            ),
+            10,
+        );
+        // The reply itself is public so the test isolates the TARGET's
+        // decryptability, which is the thing under test.
+        let reply = authored(
+            owner,
+            &bob_sk,
+            RoomMessageBody::reply(
+                "responding".to_string(),
+                target.id(),
+                "Alice".to_string(),
+                "private words".to_string(),
+            ),
+            20,
+        );
+        let messages = state(vec![target, reply.clone()]);
+
+        // Holding v1: the target is genuinely re-read.
+        let with_secret = resolve_reply_context(
+            &reply.message.content,
+            &messages,
+            &member_info,
+            &HashMap::from([(1u32, secret_v1)]),
+            &HashMap::new(),
+        );
+        assert_eq!(expect_quote(with_secret).1, "private words");
+
+        // Rotated past v1 (holding only v2), and the cold-start case of holding
+        // nothing yet. Both must be `Unavailable`, NOT a quote of the
+        // "[Encrypted message - secret vN unavailable]" / "Decrypting
+        // messages..." diagnostics.
+        for secrets in [HashMap::from([(2u32, [9u8; 32])]), HashMap::new()] {
+            let ctx = resolve_reply_context(
+                &reply.message.content,
+                &messages,
+                &member_info,
+                &secrets,
+                &HashMap::new(),
+            );
+            assert_eq!(
+                ctx,
+                ReplyStrip::Unavailable,
+                "an undecryptable target must not be quoted (secrets held: {:?})",
+                secrets.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A target whose author has no `member_info` record yet (sync lag) still
+    /// renders its text, attributed to the same "Unknown" the message header
+    /// uses rather than to the replier's snapshot name.
+    #[test]
+    fn quote_of_target_with_unsynced_author_is_attributed_unknown() {
+        let owner_sk = signing_key(1);
+        let alice_sk = signing_key(2);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+
+        let original = authored(
+            owner,
+            &alice_sk,
+            RoomMessageBody::public("hello".to_string()),
+            10,
+        );
+        let reply = authored(
+            owner,
+            &bob_sk,
+            RoomMessageBody::reply(
+                "hi".to_string(),
+                original.id(),
+                "Alice".to_string(),
+                "hello".to_string(),
+            ),
+            20,
+        );
+
+        let (author, _) = expect_quote(resolve(
+            &reply,
+            &state(vec![original, reply.clone()]),
+            &info(vec![]),
+        ));
+        assert_eq!(author, "Unknown");
+    }
+
+    /// The preview is truncated so a long quoted message cannot dominate the
+    /// bubble. Truncation happens after mention/markdown cleaning.
+    #[test]
+    fn quote_preview_is_truncated() {
+        let owner_sk = signing_key(1);
+        let alice_sk = signing_key(2);
+        let bob_sk = signing_key(3);
+        let owner = member_id_of(&owner_sk);
+
+        let long = "x".repeat(500);
+        let original = authored(owner, &alice_sk, RoomMessageBody::public(long.clone()), 10);
+        let reply = authored(
+            owner,
+            &bob_sk,
+            RoomMessageBody::reply(
+                "short".to_string(),
+                original.id(),
+                "Alice".to_string(),
+                long,
+            ),
+            20,
+        );
+
+        let (_, preview) = expect_quote(resolve(
+            &reply,
+            &state(vec![original, reply.clone()]),
+            &info(vec![named(&alice_sk, "Alice")]),
+        ));
+        assert_eq!(preview.chars().count(), 100);
     }
 
     /// A plain message is not a reply, so it gets no strip of either kind.
@@ -4942,8 +5284,7 @@ mod resolve_reply_context_tests {
             10,
         );
 
-        let ctx = resolve(&plain, &state(vec![plain.clone()]), &HashMap::new());
-        assert_eq!(ctx, ResolvedReply::default());
-        assert!(!ctx.unavailable);
+        let ctx = resolve(&plain, &state(vec![plain.clone()]), &info(vec![]));
+        assert_eq!(ctx, ReplyStrip::None);
     }
 }

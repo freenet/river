@@ -5,6 +5,7 @@ use crate::{
     util::to_cbor_vec,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use freenet_scaffold::util::fast_hash;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use lipsum::lipsum;
@@ -391,6 +392,35 @@ fn add_example_messages(
             reply_signing_key,
         );
         messages.messages.push(reply_msg);
+    }
+
+    // A reply whose quoted message CANNOT be resolved, so the example build
+    // renders the "Original message unavailable" placeholder and Playwright can
+    // assert on it. In production this is what a reply to a BANNED member's
+    // message looks like — banning purges the target, leaving only the
+    // replier-authored snapshot, which the UI deliberately refuses to render
+    // (see `resolve_reply_context`). A fabricated target id reproduces that
+    // end state without having to simulate a ban, and is deterministic.
+    {
+        let (author_id, author_signing_key) = authors[0];
+        current_time_ms += 30_000;
+        let orphan_reply = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: author_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::reply(
+                    "That was out of line.".to_string(),
+                    MessageId(fast_hash(b"river example: purged message")),
+                    // Snapshot fields a banned member's reply would carry. The
+                    // UI must render NEITHER of them.
+                    "BannedUser".to_string(),
+                    "snapshot text that must never be rendered".to_string(),
+                ),
+            },
+            author_signing_key,
+        );
+        messages.messages.push(orphan_reply);
     }
 
     // Add a message containing an unbreakable long URL so the bubble width

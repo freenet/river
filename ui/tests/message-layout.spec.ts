@@ -230,7 +230,10 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    const replyStrip = page.locator(".reply-strip").first();
+    // Scope to the testid, not `.reply-strip`: the unavailable-quote
+    // placeholder is a sibling strip that is deliberately inert, and this test
+    // asserts the interactive quote's ARIA contract.
+    const replyStrip = page.locator('[data-testid="reply-strip"]').first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
 
     // ARIA contract
@@ -556,5 +559,51 @@ test.describe("Self message bubble mobile overflow", () => {
         overflow.bad
       )}`
     ).toEqual([]);
+  });
+});
+
+// A reply whose quoted message can no longer be read from room state must show
+// a neutral placeholder instead of the replier-authored snapshot. This is what
+// a reply to a BANNED member's message renders as: banning purges the target,
+// so the snapshot is the only surviving copy of their text and the UI refuses
+// to render it. Example data carries a reply with a fabricated target id
+// (ui/src/example_data.rs) to reproduce that end state.
+test.describe("Unavailable reply quote", () => {
+  test("renders a neutral placeholder and never the snapshot", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const placeholder = page
+      .locator('[data-testid="reply-strip-unavailable"]')
+      .first();
+    await expect(placeholder).toBeVisible({ timeout: 10_000 });
+    await expect(placeholder).toContainText("Original message unavailable");
+
+    // The whole point: neither half of the replier's snapshot reaches the DOM.
+    const body = page.locator("body");
+    await expect(body).not.toContainText(
+      "snapshot text that must never be rendered"
+    );
+    await expect(body).not.toContainText("BannedUser");
+
+    // Inert — there is no original message to scroll to.
+    await expect(placeholder).not.toHaveAttribute("role", "button");
+    await expect(placeholder).not.toHaveAttribute("tabindex", "0");
+    await expect(placeholder).toHaveCount(1);
+
+    // Mutually exclusive with the quote strip: no bubble carries both.
+    const bothInOneBubble = await page
+      .locator(".max-w-prose")
+      .evaluateAll((bubbles) =>
+        bubbles.filter(
+          (b) =>
+            b.querySelector('[data-testid="reply-strip"]') &&
+            b.querySelector('[data-testid="reply-strip-unavailable"]')
+        ).length
+      );
+    expect(bothInOneBubble).toBe(0);
   });
 });
