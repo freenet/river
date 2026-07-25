@@ -26,7 +26,7 @@
 //! state.
 
 use ed25519_dalek::VerifyingKey;
-use river_core::room_state::member::MemberId;
+use river_core::room_state::member::{AuthorizedMember, MemberId, MembersV1};
 use river_core::room_state::member_info::MemberInfoV1;
 use river_core::room_state::ChatRoomStateV1;
 use serde::Serialize;
@@ -129,6 +129,8 @@ pub struct RoomDeputies<'a> {
     /// `member -> the members they invited, directly or indirectly`, for every
     /// member with a non-empty subtree.
     subtrees: HashMap<MemberId, HashSet<MemberId>>,
+    /// Index required by `MembersV1::is_ban_authorized`, built once.
+    members_by_id: HashMap<MemberId, &'a AuthorizedMember>,
 }
 
 impl<'a> RoomDeputies<'a> {
@@ -182,6 +184,7 @@ impl<'a> RoomDeputies<'a> {
         }
 
         let subtrees = invite_subtrees(state);
+        let members_by_id = state.members.members_by_member_id();
 
         Self {
             state,
@@ -191,6 +194,7 @@ impl<'a> RoomDeputies<'a> {
             deputies_by_deputizer,
             known_ids,
             subtrees,
+            members_by_id,
         }
     }
 
@@ -267,30 +271,38 @@ impl<'a> RoomDeputies<'a> {
         }
     }
 
-    /// How many members a `deputizer -> deputy` grant can actually be used
-    /// against, per `MembersV1::is_ban_authorized`.
+    /// How many members within a grant's scope the deputy can actually ban.
     ///
-    /// The owner's grant is absolute (step 3, checked BEFORE the guardrail), so
-    /// it reaches every member. A non-owner's grant reaches only that member's
-    /// invite subtree (step 5), minus any subtree member who has themselves
-    /// deputized this deputy: step 4 denies a ban whose TARGET lists the banner
-    /// in their own `deputies`, so those members are not reachable.
+    /// Delegates the per-target decision to `MembersV1::is_ban_authorized`, the
+    /// contract's OWN public predicate, rather than re-deriving its rules here.
+    /// That matters: the rules do not compose the way a summary would suggest.
+    /// The "you cannot ban the member who deputized you" guardrail is step 4,
+    /// checked AFTER the absolute grants, so a target who deputized this deputy
+    /// is still bannable when the deputy is that target's own invite ancestor,
+    /// or is an owner-appointed global moderator. An earlier version of this
+    /// function approximated the guardrail by hand and undercounted both cases.
+    ///
+    /// Scope is the grant's: every member for an owner grant (whose subtree is
+    /// the room), otherwise the deputizer's invite subtree.
     fn reach_of(&self, deputizer: MemberId, deputy: MemberId) -> usize {
-        if deputizer == self.owner_id {
-            // The owner is never in `members.members`, and `is_ban_authorized`
-            // refuses `target == owner` outright, so the member list is already
-            // exactly the set of valid targets.
-            return self.current_members.len();
-        }
-        self.subtrees
-            .get(&deputizer)
-            .map(|subtree| {
-                subtree
-                    .iter()
-                    .filter(|target| !self.deputies_of(**target).contains(&deputy))
-                    .count()
+        let empty = HashSet::new();
+        let targets = if deputizer == self.owner_id {
+            &self.current_members
+        } else {
+            self.subtrees.get(&deputizer).unwrap_or(&empty)
+        };
+        targets
+            .iter()
+            .filter(|target| {
+                MembersV1::is_ban_authorized(
+                    deputy,
+                    **target,
+                    &self.members_by_id,
+                    self.member_info(),
+                    self.owner_id,
+                )
             })
-            .unwrap_or(0)
+            .count()
     }
 
     /// Build the resolved view of a single `deputizer -> deputy` grant.
@@ -381,8 +393,9 @@ impl<'a> RoomDeputies<'a> {
 /// `verify` having rejected circular invite chains, whereas this reads a fetched
 /// state directly and must not hang on a malformed one.
 ///
-/// The owner is excluded: they are never in `members.members`, and their reach
-/// is the whole room, handled separately.
+/// The owner gets an entry like anyone else (they are the `invited_by` of the
+/// members they invited), but [`RoomDeputies::reach_of`] does not consult it:
+/// an owner grant is scoped to the whole member list, not to a subtree.
 fn invite_subtrees(state: &ChatRoomStateV1) -> HashMap<MemberId, HashSet<MemberId>> {
     let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
     for member in &state.members.members {
@@ -487,6 +500,10 @@ pub fn grant_status_line(grant: &DeputyGrant) -> String {
     match grant.scope {
         // `is_ban_authorized` refuses `target == owner` outright, so even an
         // owner-appointed deputy cannot ban the owner.
+        DeputyScope::RoomWide if grant.reaches_members == 1 => {
+            "active: may ban the only other member in the room (granted by the room owner)"
+                .to_string()
+        }
         DeputyScope::RoomWide => format!(
             "active: may ban any of the {} in the room (granted by the room owner)",
             members(grant.reaches_members)
@@ -1063,8 +1080,16 @@ mod tests {
         let bidi = "Eve\u{202e} rewonR mooR :fo ytuped";
         // 4. Zero-width characters can hide text inside an apparent name.
         let zero_width = "Ev\u{200b}e\u{feff}";
+        // 5. A carriage return rewrites the line in place; a tab fakes columns.
+        let carriage = "Eve\r  Admin (AAAAAAAA)";
+        let tabbed = "Eve\tAdmin";
+        // 6. The Zl/Zp separators are neither Cc nor Cf, and a terminal or log
+        //    viewer may still break a line on them.
+        let separators = "Eve\u{2028}Admin\u{2029}Mod";
 
-        for hostile in [newline, ansi, bidi, zero_width] {
+        for hostile in [
+            newline, ansi, bidi, zero_width, carriage, tabbed, separators,
+        ] {
             let mut state = room(&owner, &[&evil]);
             push_info(&mut state, &owner, 0, "Room Owner", vec![]);
             push_info(&mut state, &evil, 0, hostile, vec![]);
@@ -1074,7 +1099,8 @@ mod tests {
             let label = party_label(&d.party(id(&evil)));
 
             for forbidden in [
-                '\n', '\r', '\t', '\u{1b}', '\u{202e}', '\u{200b}', '\u{feff}',
+                '\n', '\r', '\t', '\u{1b}', '\u{202e}', '\u{200b}', '\u{feff}', '\u{2028}',
+                '\u{2029}',
             ] {
                 assert!(
                     !label.contains(forbidden),
@@ -1150,11 +1176,71 @@ mod tests {
             "Alice's subtree is {{target, other}}, but target deputized this \
              deputy so only `other` is reachable"
         );
+    }
 
-        // The owner's grant is absolute (step 3 precedes the guardrail), so the
-        // same guardrail must NOT reduce it.
+    #[test]
+    fn the_guardrail_does_not_apply_where_an_absolute_grant_already_does() {
+        // The guardrail is `is_ban_authorized` step 4, checked AFTER the
+        // absolute grants, so it must NOT be applied as a blanket exclusion.
+        // Two cases where a target who deputized the deputy is STILL bannable:
+        //
+        //   (a) the deputy is that target's own invite ancestor (step 2)
+        //   (b) the owner has appointed the deputy globally (step 3)
+        //
+        // Approximating step 4 by hand undercounted both. The reach now routes
+        // through the contract's own predicate, so it cannot drift from it.
+        let owner = key(1);
+        let alice = key(2);
+        let deputy = key(3);
+        let target = key(4);
+
+        // (a) owner -> alice -> deputy -> target, and alice deputizes deputy.
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &alice, &deputy);
+        push_member(&mut state, &owner, &deputy, &target);
+        push_info(&mut state, &owner, 0, "Room Owner", vec![]);
+        push_info(&mut state, &alice, 0, "Alice", vec![id(&deputy)]);
+        push_info(&mut state, &deputy, 0, "Deputy", vec![]);
+        // The target deputized the deputy, which would trip a naive guardrail.
+        push_info(&mut state, &target, 0, "Target", vec![id(&deputy)]);
+
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        assert_eq!(
+            d.grant(id(&alice), id(&deputy)).reaches_members,
+            2,
+            "Alice's subtree is {{deputy, target}}; the deputy is the target's \
+             own invite ancestor, so step 2 authorizes the ban despite the \
+             target having deputized them"
+        );
+
+        // (b) the same shape, but authority comes from the owner appointing the
+        //     deputy as a global moderator.
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &alice, &target);
+        push_member(&mut state, &owner, &owner, &deputy);
+        push_info(&mut state, &owner, 0, "Room Owner", vec![id(&deputy)]);
+        push_info(&mut state, &alice, 0, "Alice", vec![id(&deputy)]);
+        push_info(&mut state, &deputy, 0, "Deputy", vec![]);
+        push_info(&mut state, &target, 0, "Target", vec![id(&deputy)]);
+
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        assert_eq!(
+            d.grant(id(&alice), id(&deputy)).reaches_members,
+            1,
+            "Alice's subtree is {{target}}; the owner's global appointment is \
+             absolute (step 3), so the target's own grant cannot block it"
+        );
+
+        // The owner's own grant reaches every member.
         let owner_grant = d.grant(id(&owner), id(&deputy));
-        assert_eq!(owner_grant.reaches_members, 4, "every member is a target");
+        assert_eq!(owner_grant.scope, DeputyScope::RoomWide);
+        assert_eq!(
+            owner_grant.reaches_members, 3,
+            "alice + target + deputy; the owner is never a valid ban target"
+        );
     }
 
     #[test]
@@ -1230,6 +1316,59 @@ mod tests {
         let line = grant_status_line(&d.grant(id(&alice), id(&deputy)));
         assert!(line.contains("1 member in"), "{line}");
         assert!(!line.contains("member(s)"), "{line}");
+    }
+
+    #[test]
+    fn dedup_survives_two_distinct_ids_that_print_identically() {
+        // A `MemberId` prints as 8 base32 characters, which is only the first 5
+        // of its 8 underlying bytes, so distinct ids CAN print the same. Sorting
+        // by the printed form alone would not necessarily put equal ids
+        // adjacent, and `dedup` would then leave a duplicate behind. Constructed
+        // directly here because grinding a real 40-bit collision is not viable
+        // in a unit test.
+        use freenet_scaffold::util::FastHash;
+
+        // Little-endian: the low 5 bytes drive the printed form, so these two
+        // differ only in bytes the printed id never sees.
+        let twin_a = MemberId(FastHash(0x0000_0000_0000_0001));
+        let twin_b = MemberId(FastHash(0x0100_0000_0000_0001));
+        assert_ne!(twin_a, twin_b, "the two ids must be genuinely distinct");
+        assert_eq!(
+            twin_a.to_string(),
+            twin_b.to_string(),
+            "...but must print identically, or this test proves nothing"
+        );
+
+        // A third entry equal to the first: the duplicate `dedup` has to remove.
+        let mut ids = vec![twin_a, twin_b, twin_a];
+        ids.sort_by_key(|id| (id.to_string(), *id));
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            2,
+            "the genuine duplicate must collapse while the twin survives"
+        );
+        assert!(ids.contains(&twin_a) && ids.contains(&twin_b));
+    }
+
+    #[test]
+    fn room_wide_status_reads_correctly_for_a_single_other_member() {
+        // The room-wide branch needed its own singular form: "may ban any of
+        // the 1 member in the room" is not English.
+        let owner = key(1);
+        let deputy = key(2);
+        let mut state = room(&owner, &[&deputy]);
+        push_info(&mut state, &owner, 0, "Room Owner", vec![id(&deputy)]);
+        push_info(&mut state, &deputy, 0, "Deputy", vec![]);
+
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+
+        let grant = d.grant(id(&owner), id(&deputy));
+        assert_eq!(grant.reaches_members, 1);
+        let line = grant_status_line(&grant);
+        assert!(line.contains("the only other member"), "{line}");
+        assert!(!line.contains("1 member in the room"), "{line}");
     }
 
     #[test]
