@@ -28,7 +28,12 @@
 //!   name. Confusable-script detection is a different problem with a different
 //!   (much worse) false-positive profile.
 //! * Combining marks are preserved, so a "Zalgo" nickname can still be ugly.
-//!   It cannot forge a badge, which is what this module is for.
+//!   It cannot forge a badge, which is what this module is for. The one
+//!   exception is general category **Me** (Enclosing_Mark), all thirteen of
+//!   which are stripped: an Mn mark decorates the preceding character, but an
+//!   Me mark draws a shape *around* it, so `A\u{20DD}` and `A\u{A670}` both
+//!   render a circled A and rebuild by composition the enclosed-alphanumeric
+//!   glyphs this module strips.
 //! * Sanitising can CREATE a collision: `"B⭐ob"` and `"Bob"` render alike, as
 //!   do two nicknames that differ only in stripped characters. Nicknames were
 //!   never unique in River, so this grants no new capability, but identical
@@ -39,6 +44,26 @@
 //!   clones it, and homoglyphs always will. Note that
 //!   `conversation::mention::duplicate_candidate_names` compares name STRINGS,
 //!   so it does not flag a pair that differs only in kept characters.
+//!
+//!   The two characters kept in context — a joiner between non-ASCII letters,
+//!   and an Ideographic Variation Selector after an ideograph — are the whole
+//!   of that residual. `"李\u{E0100}小龍"` and `"李小龍"` render alike on a font
+//!   with no IVD entry for the sequence, exactly as `"李\u{200D}小龍"` does. It
+//!   is bounded: neither survives after an ASCII, Cyrillic or Hangul letter, so
+//!   a Latin name cannot be cloned this way, and a font that DOES carry the IVD
+//!   entry renders the two differently.
+//!
+//!   **This residual is mitigated, and the mitigation is load-bearing on the
+//!   layering below.** `confusable.rs::skeleton` folds a name for
+//!   impersonation detection by dropping every character [`is_display_hidden`]
+//!   reports, and it consults that function DIRECTLY. Because the variation
+//!   selectors stay inside `is_display_hidden`'s plane-14 range and their
+//!   exception is applied on top, `skeleton` still folds `"李\u{E0100}小龍"` and
+//!   `"李小龍"` to the same value, so the confusable warning fires on exactly
+//!   this residual. Anyone tempted to "simplify" by moving the carve-out INTO
+//!   [`is_display_hidden`] — punching a hole in the range rather than layering
+//!   over it — would silently switch that warning off and make the residual
+//!   undetectable. Do not.
 //!
 //! ## What gets removed
 //!
@@ -60,6 +85,14 @@
 //!   covers both the orphans the emoji strip leaves behind and the
 //!   `"Bo\u{200D}b"` clone of `"Bob"`. Keeping them is safe because every
 //!   emoji a joiner could assemble is itself removed.
+//!
+//!   The **Ideographic Variation Selectors** (`U+E0100..U+E01EF`) are the same
+//!   kind of special case, from the other direction: they are
+//!   Default_Ignorable by property, but they SELECT A GLYPH rather than
+//!   rendering as nothing, and a Japanese family name routinely needs one
+//!   (`辻󠄀` is `U+8FBB U+E0100`). Blanket-stripping them rewrote real names and
+//!   locked those users out of saving a nickname at all, so they are judged in
+//!   context too: kept directly after an ideograph, dropped everywhere else.
 //! * **Private-use area** codepoints. Fonts are free to map these to any glyph
 //!   at all (Nerd Fonts map a large PUA range to icons, including shields), so
 //!   a PUA nickname renders as a badge on any machine with such a font
@@ -142,8 +175,25 @@ pub fn is_display_hidden(c: char) -> bool {
         | 0x2900..=0x297F
         // Miscellaneous Symbols and Arrows (⬛ ⭐ …).
         | 0x2B00..=0x2BFF
-        // Combining enclosing keycap (the `1️⃣` assembler).
-        | 0x20E3
+        // Combining Diacritical Marks for Symbols. Includes the keycap
+        // assembler (`1️⃣`) but also the ENCLOSING marks — U+20DD circle,
+        // U+20DE square, U+20E0 circle-backslash, U+20E4 triangle — which
+        // rebuild by composition the very glyphs `0x2460..=0x24FF` is stripped
+        // for: `A\u{20DD}` is Ⓐ, `!\u{20E4}` reads as ⚠. The block has no
+        // letter content.
+        | 0x20D0..=0x20F0
+        // The rest of Unicode general category Me (Enclosing_Mark). Me draws a
+        // shape AROUND the preceding character, so every one of them composes
+        // a badge the same way U+20DD does: `A\u{A670}` renders a circled A,
+        // which is byte-for-byte the `A\u{20DD}` attack above. Me has thirteen
+        // members; the block above covers seven and these are the other six.
+        // U+0488/U+0489 are the Cyrillic hundred-thousands and millions signs,
+        // U+A670..U+A672 the ten-millions family, U+1ABE the parentheses
+        // overlay. Stripping a whole general category is the exception to the
+        // "combining marks are preserved" rule in the module header: Mn marks
+        // decorate a letter, Me marks enclose it, and only the latter can draw
+        // a badge.
+        | 0x0488..=0x0489 | 0x1ABE | 0xA670..=0xA672
         // 〰 〽 and the two emoji-presented enclosed ideographs ㊗ ㊙. The
         // rest of the CJK punctuation and Enclosed CJK blocks is untouched.
         | 0x3030 | 0x303D | 0x3297 | 0x3299
@@ -158,7 +208,7 @@ pub fn is_display_hidden(c: char) -> bool {
         // U+00AD SOFT HYPHEN and U+180E MONGOLIAN VOWEL SEPARATOR render as
         // nothing; U+FFF9..U+FFFB are interlinear annotation anchors that hide
         // the text between them.
-        | 0x00AD | 0x061C | 0x180E | 0xFFF9..=0xFFFB
+        | 0x00AD | 0x061C | 0x180E | 0xFFF0..=0xFFFB
         // Blank glyphs that are not whitespace, so the space collapse below
         // would not remove them: they let two members share a pixel-identical
         // rendered name (`Alice` vs `Alice\u{3164}`), which undermines the
@@ -175,13 +225,20 @@ pub fn is_display_hidden(c: char) -> bool {
         // Selectors Supplement (U+FE00..FE0F's big brother), and the
         // shorthand-format and musical beam/slur/phrase controls.
         | 0x034F | 0x180B..=0x180D | 0x180F | 0x17B4..=0x17B5 | 0x2065
-        | 0xE0100..=0xE01EF | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
         // Text-presentation symbols that read as a badge in the fonts that
         // carry them: ۞ (ornate star, present wherever Arabic renders), ٭,
         // ꙳, and the Phaistos shield. Plus Symbols for Legacy Computing and
         // its supplement, which contain an inverse check mark and stick
         // figures.
-        | 0x066D | 0x06DE | 0xA673 | 0x101DB
+        | 0x066D | 0x06DE | 0xA673
+        // Aegean/Phaistos: picking out only the shield (U+101DB) left the
+        // helmet, tiara, rosette and — the one that matters — U+10102 AEGEAN
+        // CHECK MARK, which renders as ✓ wherever Noto Sans Symbols is
+        // installed (stock Ubuntu/Fedora).
+        | 0x10100..=0x101FC
+        // Halfwidth clones of the geometric shapes stripped above.
+        | 0xFFED..=0xFFEE
         | 0x1FB00..=0x1FBFF | 0x1CC00..=0x1CEBF
         // Private Use Area (BMP). Font-defined glyphs, and River's own
         // mention sentinels live at U+E000/U+E001.
@@ -191,12 +248,78 @@ pub fn is_display_hidden(c: char) -> bool {
         // Pictographs, Emoticons, Transport, Supplemental Symbols and
         // Pictographs, Symbols and Pictographs Extended-A. 🛡 is U+1F6E1.
         | 0x1F000..=0x1FAFF
-        // Tags — the flag-sequence assembler (🏴󠁧󠁢󠁳󠁣󠁴󠁿).
-        | 0xE0000..=0xE007F
+        // Plane 14's Default_Ignorable range. `E0000..E0FFF` is the whole set
+        // Unicode marks ignorable in that plane, and the rest of plane 14
+        // (`E1000..EFFFF`) is not ignorable and is left alone. Naming only the
+        // tag block (`E0000..E007F`, the flag-sequence assembler 🏴󠁧󠁢󠁳󠁣󠁴󠁿) left
+        // ~3,700 invisible characters through, each of which clones another
+        // member's rendered name.
+        //
+        // The Ideographic Variation Selectors (`E0100..E01EF`) are INSIDE this
+        // range on purpose, even though they are the one part of it that is
+        // legitimate in a name. Their exception is applied ON TOP, in context,
+        // by [`sanitize_display_name`] and [`contains_hidden_chars`] — NOT by
+        // punching a hole here. TWO separate things depend on that.
+        //
+        // First, `confusable.rs::skeleton` folds names for impersonation
+        // detection by calling THIS function directly. Keeping the selectors
+        // inside the range is what lets it fold `"李\u{E0100}小龍"` and
+        // `"李小龍"` together, so the confusable warning covers the residual
+        // the in-context exception deliberately leaves open (module header).
+        // Punching a hole here would switch that warning off silently.
+        //
+        // Second, two complementary hand-written ranges drift:
+        // narrowing the carve-out by one codepoint leaves a character that is
+        // neither stripped nor judged, so it survives verbatim in every name
+        // while rendering as nothing. Layering makes that gap impossible, and
+        // `no_plane_14_codepoint_escapes_both_the_strip_and_the_carve_out`
+        // fails if anyone splits it again.
+        | 0xE0000..=0xE0FFF
         // Supplementary Private Use Areas A and B.
         | 0xF0000..=0xFFFFD
         | 0x100000..=0x10FFFD
     )
+}
+
+/// Whether `c` is an Ideographic Variation Selector (VS17..VS256).
+///
+/// These sit inside plane 14's Default_Ignorable range but are the one part of
+/// it that is NOT invisible: they SELECT A GLYPH. Japanese family names are
+/// routinely spelled with one — `辻` has the variant `辻󠄀` (U+8FBB U+E0100), and
+/// `邊`/`邉`, `﨑`, `髙` work the same way — and any font with an IVS table
+/// (Source Han, Noto CJK) renders the selected form. Stripping them blanket-
+/// wise rewrote real names, and because [`contains_hidden_chars`] gates the
+/// nickname `<input>`, it also told those users their own name "can't contain
+/// emoji" and refused to save it.
+///
+/// So they are judged in context instead, exactly like `U+200C`/`U+200D`: kept
+/// where they can be doing the work they exist for, dropped everywhere else.
+fn is_variation_selector_supplement(c: char) -> bool {
+    matches!(u32::from(c), 0xE0100..=0xE01EF)
+}
+
+/// The ideographs a variation selector may legitimately follow. These are the
+/// blocks the Ideographic Variation Database actually registers sequences for;
+/// after anything else a selector is invisible filler.
+fn is_ideograph(c: char) -> bool {
+    matches!(u32::from(c),
+        // CJK Unified Ideographs Extension A, and the main block.
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF
+        // CJK Compatibility Ideographs (where `﨑` lives).
+        | 0xF900..=0xFAFF
+        // Extensions B onwards, plus the compatibility supplement.
+        | 0x20000..=0x323AF
+    )
+}
+
+/// Whether the variation selector at `chars[i]` can be selecting a glyph, i.e.
+/// it directly follows an ideograph.
+///
+/// Anywhere else it renders as nothing and clones the surrounding name, so it
+/// is dropped for the same reason an orphaned joiner is. `"Ian\u{E0100}"` is a
+/// clone of `"Ian"`; `"辻\u{E0100}"` is a person's name.
+fn selects_an_ideograph_variant(chars: &[char], i: usize) -> bool {
+    i > 0 && chars.get(i - 1).copied().is_some_and(is_ideograph)
 }
 
 /// Whether `s` contains anything [`sanitize_display_name`] would remove.
@@ -204,8 +327,19 @@ pub fn is_display_hidden(c: char) -> bool {
 /// Drives the nickname `<input>`'s "Nicknames can't contain emoji" message —
 /// UX only. Never rely on this for safety: the render-time strip is the
 /// boundary, because `riverctl` never runs this code.
+///
+/// Position-sensitive for the same characters [`sanitize_display_name`] judges
+/// in context, so it cannot reject a name the sanitiser would have kept: a
+/// variation selector after an ideograph is a legitimate Japanese name and is
+/// NOT flagged, while the same selector after `n` is invisible filler and is.
 pub fn contains_hidden_chars(s: &str) -> bool {
-    s.chars().any(is_display_hidden)
+    let chars: Vec<char> = s.chars().collect();
+    chars.iter().enumerate().any(|(i, c)| {
+        if is_variation_selector_supplement(*c) {
+            return !selects_an_ideograph_variant(&chars, i);
+        }
+        is_display_hidden(*c)
+    })
 }
 
 /// Strip everything [`is_display_hidden`] rejects and tidy the result.
@@ -227,12 +361,25 @@ pub fn contains_hidden_chars(s: &str) -> bool {
 pub fn sanitize_display_name(raw: &str) -> String {
     // 1. Remove the hidden characters. A hidden character that was itself
     //    whitespace becomes a space so words don't run together.
-    let stripped: Vec<char> = raw
-        .chars()
-        .filter_map(|c| match (is_display_hidden(c), c.is_whitespace()) {
-            (true, true) => Some(' '),
-            (true, false) => None,
-            (false, _) => Some(c),
+    //
+    //    A variation selector is judged here rather than by the blanket strip,
+    //    because whether it is a Japanese name or invisible filler depends on
+    //    what precedes it. Same decision, same inputs as
+    //    [`contains_hidden_chars`], so the input check and the render strip
+    //    cannot disagree about a given name.
+    let raw_chars: Vec<char> = raw.chars().collect();
+    let stripped: Vec<char> = raw_chars
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &c)| {
+            if is_variation_selector_supplement(c) {
+                return selects_an_ideograph_variant(&raw_chars, i).then_some(c);
+            }
+            match (is_display_hidden(c), c.is_whitespace()) {
+                (true, true) => Some(' '),
+                (true, false) => None,
+                (false, _) => Some(c),
+            }
         })
         .collect();
 
@@ -260,10 +407,24 @@ pub fn sanitize_display_name(raw: &str) -> String {
             !is_joiner(**c)
                 || (*i > 0
                     && joins_letters(stripped.get(i - 1))
-                    // A trailing joiner is legitimate (Malayalam chillu), so
-                    // "no next character" is allowed; a next character that is
-                    // present must itself be a non-ASCII letter.
-                    && stripped.get(i + 1).is_none_or(|n| joins_letters(Some(n))))
+                    // A joiner is legitimate at the end of a WORD, not just at
+                    // the end of the string: Malayalam legacy chillu is
+                    // consonant + virama + ZWJ, so `"മോഹന\u{0D4D}\u{200D} കുമാർ"`
+                    // (Mohan Kumar) carries one mid-name, and word-final ZWNJ
+                    // does the same in Persian and Kurdish. Requiring
+                    // end-of-string dropped it and degraded the chillu `ൻ` to
+                    // `ന്`, showing a chandrakkala that is not part of the name.
+                    // So: no next character, a non-ASCII letter, or whitespace.
+                    //
+                    // This does not widen the Latin clone surface — the
+                    // PRECEDING character must still be a non-ASCII letter, so
+                    // `"Bo\u{200D}b"` stays closed. It does add word-final
+                    // positions to the non-ASCII residual already documented in
+                    // the module header (an interior joiner in a CJK name), so
+                    // no new capability, just more places for the same one.
+                    && stripped
+                        .get(i + 1)
+                        .is_none_or(|n| joins_letters(Some(n)) || n.is_whitespace()))
         })
         .map(|(_, c)| *c)
         .collect();
@@ -704,6 +865,362 @@ mod tests {
              nickname can forge a 🛡 deputy badge there:\n  {}",
             offenders.join("\n  ")
         );
+    }
+
+    /// Every Default_Ignorable character renders as nothing, so any one of
+    /// them clones another member's rendered name — the exact capability an
+    /// impersonation campaign wants. The first pass named only the ranges it
+    /// happened to think of and left ~3,700 through, including all of plane 14
+    /// and `U+FFF0..U+FFF8`. These are NOT riverctl-only: `contains_hidden_chars`
+    /// gates the nickname input, so a miss means the UI accepts them too.
+    #[test]
+    fn default_ignorable_characters_cannot_clone_a_name() {
+        for c in [
+            '\u{FFF0}',
+            '\u{FFF4}',
+            '\u{FFF8}', // the FFFx reserved-DI gap
+            '\u{E0001}',
+            '\u{E0080}',
+            '\u{E00FF}', // plane 14 outside the tag block
+            '\u{E01F0}',
+            '\u{E0FFF}', // plane 14 above the variation selectors
+            '\u{E0100}', // variation selectors supplement
+        ] {
+            let cloned = format!("Ian{c} Clarke");
+            assert_eq!(
+                sanitize_display_name(&cloned),
+                "Ian Clarke",
+                "U+{:04X} survived and clones another member's name",
+                u32::from(c)
+            );
+            assert!(
+                contains_hidden_chars(&cloned),
+                "U+{:04X} is not rejected at the nickname input",
+                u32::from(c)
+            );
+            // Alone, it must not pass as a name at all.
+            assert_eq!(sanitize_display_name(&c.to_string()), UNNAMED);
+        }
+    }
+
+    /// Enclosing combining marks rebuild by composition the badge-shaped
+    /// glyphs the enclosed-alphanumeric block is stripped for, and the Aegean
+    /// check mark renders as ✓ on a stock Linux desktop.
+    #[test]
+    fn composed_and_stray_badge_glyphs_are_stripped() {
+        for (label, name, want) in [
+            ("enclosing circle (Ⓐ)", "Mod A\u{20DD}", "Mod A"),
+            ("enclosing square", "Mod A\u{20DE}", "Mod A"),
+            ("enclosing triangle (⚠-ish)", "Mod !\u{20E4}", "Mod !"),
+            ("Aegean check mark", "Mod \u{10102}", "Mod"),
+            ("halfwidth black square", "Mod \u{FFED}", "Mod"),
+        ] {
+            let out = sanitize_display_name(name);
+            assert_eq!(out, want, "{label}: got {out:?}");
+        }
+    }
+
+    /// Both ends of every range widened here, plus the two codepoints the
+    /// widening comments name by hand (`U+20E0`, `U+20E3`).
+    ///
+    /// The tests above sample INTERIOR points, which catches a deleted range
+    /// but not a range narrowed by one, and off-by-one is the likelier edit.
+    /// Every entry below is a codepoint whose loss reopens a real vector: a
+    /// combining mark that rebuilds a badge by composition, an interlinear
+    /// annotation anchor that hides the text between two of them, or an
+    /// invisible plane-14 codepoint that clones another member's name.
+    #[test]
+    fn widened_range_endpoints_are_hidden() {
+        for (label, c) in [
+            // Combining Diacritical Marks for Symbols, 0x20D0..=0x20F0.
+            ("U+20D0 combining left harpoon above", '\u{20D0}'),
+            ("U+20E0 combining enclosing circle backslash", '\u{20E0}'),
+            ("U+20E3 combining enclosing keycap", '\u{20E3}'),
+            ("U+20F0 combining asterisk above", '\u{20F0}'),
+            // Halfwidth geometric shapes, 0xFFED..=0xFFEE.
+            ("U+FFED halfwidth black square", '\u{FFED}'),
+            ("U+FFEE halfwidth white circle", '\u{FFEE}'),
+            // Reserved Default_Ignorables + interlinear annotation,
+            // 0xFFF0..=0xFFFB.
+            ("U+FFF0 reserved Default_Ignorable", '\u{FFF0}'),
+            ("U+FFFB interlinear annotation terminator", '\u{FFFB}'),
+            // Aegean Numbers + Phaistos Disc, 0x10100..=0x101FC.
+            ("U+10100 aegean word separator line", '\u{10100}'),
+            ("U+101FC phaistos disc sign wavy band", '\u{101FC}'),
+            // Plane 14's Default_Ignorable range, 0xE0000..=0xE0FFF, plus
+            // 0xE01F0..=0xE0FFF, the two codepoints flanking the
+            // variation-selector carve-out layered on top of it.
+            ("U+E0000 reserved tag codepoint", '\u{E0000}'),
+            (
+                "U+E00FF reserved, just below the IVS carve-out",
+                '\u{E00FF}',
+            ),
+            (
+                "U+E01F0 reserved, just above the IVS carve-out",
+                '\u{E01F0}',
+            ),
+            ("U+E0FFF reserved Default_Ignorable", '\u{E0FFF}'),
+        ] {
+            assert!(
+                is_display_hidden(c),
+                "{label} is not stripped, so it can forge a badge or clone a name"
+            );
+            let cloned = format!("Ian{c} Clarke");
+            assert_eq!(
+                sanitize_display_name(&cloned),
+                "Ian Clarke",
+                "{label} survived sanitisation"
+            );
+            assert!(
+                contains_hidden_chars(&cloned),
+                "{label} is not rejected at the nickname input"
+            );
+        }
+    }
+
+    /// The upper constraint on every range widened here.
+    ///
+    /// Endpoint and interior assertions only pin a range from BELOW: they all
+    /// still pass if a future edit widens it further, which is how a strip rule
+    /// starts mangling real names. Widening `0xFFF0..=0xFFFB` to swallow
+    /// U+FFFD REPLACEMENT CHARACTER, or plane 14 to `0xEFFFF`, passes every
+    /// other test in this module.
+    #[test]
+    fn characters_just_outside_the_widened_ranges_stay_visible() {
+        for (label, c) in [
+            // Either side of 0x20D0..=0x20F0. Reserved codepoints render as a
+            // tofu box, so they are visible and cannot clone a name.
+            (
+                "U+20CF reserved, below the symbol combining marks",
+                '\u{20CF}',
+            ),
+            (
+                "U+20F1 reserved, above the symbol combining marks",
+                '\u{20F1}',
+            ),
+            // Below 0xFFED..=0xFFEE.
+            ("U+FFEC halfwidth downwards arrow", '\u{FFEC}'),
+            // The one-codepoint gap between 0xFFED..=0xFFEE and 0xFFF0..=0xFFFB,
+            // so this pins the top of one range and the bottom of the other.
+            ("U+FFEF reserved", '\u{FFEF}'),
+            // Above 0xFFF0..=0xFFFB. U+FFFD is what `String::from_utf8_lossy`
+            // emits, and `display_nickname`'s undecryptable fallback goes
+            // through it, so stripping it would blank a whole nickname.
+            ("U+FFFC object replacement character", '\u{FFFC}'),
+            ("U+FFFD replacement character", '\u{FFFD}'),
+            // Either side of 0x10100..=0x101FC.
+            ("U+100FF reserved, below Aegean Numbers", '\u{100FF}'),
+            (
+                "U+101FD phaistos disc combining oblique stroke",
+                '\u{101FD}',
+            ),
+            // Either side of 0xE0000..=0xE0FFF. Unicode's Default_Ignorable set
+            // for plane 14 ends at E0FFF; E1000 and up are ordinary reserved
+            // codepoints, and plane 13 below it is unassigned throughout.
+            ("U+DFFFF reserved, below plane 14", '\u{DFFFF}'),
+            ("U+E1000 reserved, above plane 14's ignorables", '\u{E1000}'),
+            ("U+EFFFF reserved, top of plane 14", '\u{EFFFF}'),
+        ] {
+            assert!(
+                !is_display_hidden(c),
+                "{label} is treated as hidden, so a widened range is now \
+                 stripping characters that are not invisible"
+            );
+            let name = format!("Ian{c} Clarke");
+            assert_eq!(
+                sanitize_display_name(&name),
+                name,
+                "{label} was stripped out of a name"
+            );
+        }
+    }
+
+    /// Unicode general category Me (Enclosing_Mark) in FULL.
+    ///
+    /// Every Me character draws a shape around the character before it, so
+    /// each one composes a badge exactly the way `U+20DD` does. Adding the
+    /// `0x20D0..=0x20F0` block caught seven of the thirteen and left six —
+    /// including `U+A670`, which sits immediately before the `U+A673` this
+    /// module already stripped, and which renders `"Mod A\u{A670}"` as a
+    /// circled A: byte-for-byte the attack the block was added to stop.
+    #[test]
+    fn every_enclosing_mark_is_stripped() {
+        // The complete Me category, verified against the Unicode 15.0
+        // character database rather than assembled from memory: these thirteen
+        // are every codepoint with `category == "Me"`. If a later revision adds
+        // a fourteenth, this list is the thing to update.
+        const ENCLOSING_MARKS: &[(char, &str)] = &[
+            ('\u{0488}', "COMBINING CYRILLIC HUNDRED THOUSANDS SIGN"),
+            ('\u{0489}', "COMBINING CYRILLIC MILLIONS SIGN"),
+            ('\u{1ABE}', "COMBINING PARENTHESES OVERLAY"),
+            ('\u{20DD}', "COMBINING ENCLOSING CIRCLE"),
+            ('\u{20DE}', "COMBINING ENCLOSING SQUARE"),
+            ('\u{20DF}', "COMBINING ENCLOSING DIAMOND"),
+            ('\u{20E0}', "COMBINING ENCLOSING CIRCLE BACKSLASH"),
+            ('\u{20E2}', "COMBINING ENCLOSING SCREEN"),
+            ('\u{20E3}', "COMBINING ENCLOSING KEYCAP"),
+            ('\u{20E4}', "COMBINING ENCLOSING UPWARD POINTING TRIANGLE"),
+            ('\u{A670}', "COMBINING CYRILLIC TEN MILLIONS SIGN"),
+            ('\u{A671}', "COMBINING CYRILLIC HUNDRED MILLIONS SIGN"),
+            ('\u{A672}', "COMBINING CYRILLIC THOUSAND MILLIONS SIGN"),
+        ];
+        for (mark, name) in ENCLOSING_MARKS {
+            assert!(
+                is_display_hidden(*mark),
+                "U+{:04X} {name} is not stripped, so `A{mark}` composes a badge",
+                u32::from(*mark)
+            );
+            // The concrete attack: a circled/enclosed capital, rebuilt from a
+            // letter the strip cannot remove plus a mark it must.
+            assert_eq!(
+                sanitize_display_name(&format!("Mod A{mark}")),
+                "Mod A",
+                "U+{:04X} {name} survived and encloses the letter before it",
+                u32::from(*mark)
+            );
+            assert!(
+                contains_hidden_chars(&format!("Mod A{mark}")),
+                "U+{:04X} {name} is not rejected at the nickname input",
+                u32::from(*mark)
+            );
+        }
+    }
+
+    /// Malayalam legacy chillu is `consonant + virama + ZWJ` and ends a WORD,
+    /// not only a string. Permitting the trailing joiner solely at
+    /// end-of-string kept the single-token name working (which is all the
+    /// original test covered) while silently breaking the ordinary two-word
+    /// form: the ZWJ was dropped, degrading the chillu `ൻ` to `ന്` and showing
+    /// a chandrakkala that is not part of the name.
+    #[test]
+    fn word_final_joiners_survive_in_multi_word_names() {
+        for (label, name) in [
+            (
+                "Malayalam chillu before a space",
+                "മോഹന\u{0D4D}\u{200D} കുമാർ",
+            ),
+            ("Malayalam chillu at end of string", "മോഹന\u{0D4D}\u{200D}"),
+            ("Persian word-final ZWNJ", "علی\u{200C} رضا"),
+            (
+                "two chillus, two words",
+                "മോഹന\u{0D4D}\u{200D} കുമാരന\u{0D4D}\u{200D}",
+            ),
+        ] {
+            assert_eq!(
+                sanitize_display_name(name),
+                name,
+                "{label}: sanitisation dropped a joiner that is part of the name"
+            );
+            assert!(
+                !contains_hidden_chars(name),
+                "{label}: the nickname input rejected a legitimate name"
+            );
+        }
+
+        // The Latin clone surface must stay closed: the PRECEDING character is
+        // still required to be a non-ASCII letter, so a joiner next to ASCII
+        // is dropped no matter what follows it.
+        assert_eq!(sanitize_display_name("Bo\u{200D}b"), "Bob");
+        assert_eq!(sanitize_display_name("Bob\u{200D} Smith"), "Bob Smith");
+        assert_eq!(sanitize_display_name("Alice \u{200D} Bob"), "Alice Bob");
+    }
+
+    /// The Ideographic Variation Selectors are Default_Ignorable by property
+    /// but DO select a glyph, and Japanese family names need them. Blanket-
+    /// stripping them rewrote real names, and because `contains_hidden_chars`
+    /// gates the nickname `<input>`, it also told those users their own name
+    /// "can't contain emoji" and refused to save it.
+    #[test]
+    fn ideographic_variation_sequences_are_preserved() {
+        for (label, name) in [
+            ("辻 with VS17 (the canonical IVS example)", "辻\u{E0100}"),
+            ("邊 variant", "邊\u{E0101}"),
+            ("﨑 (compatibility ideograph) variant", "﨑\u{E0100}"),
+            ("髙 variant in a full name", "髙\u{E0100}橋 太郎"),
+            ("VS256, the top of the range", "辻\u{E01EF}"),
+        ] {
+            assert_eq!(
+                sanitize_display_name(name),
+                name,
+                "{label}: sanitisation rewrote an ideographic variation sequence"
+            );
+            assert!(
+                !contains_hidden_chars(name),
+                "{label}: the nickname input refused a legitimate Japanese name"
+            );
+        }
+    }
+
+    /// No codepoint in plane 14's Default_Ignorable range may fall through BOTH
+    /// the blanket strip and the context-judged variation-selector carve-out.
+    ///
+    /// The two used to be complementary hand-written ranges
+    /// (`E0000..E00FF | E01F0..E0FFF` in [`is_display_hidden`], `E0100..E01EF`
+    /// in [`is_variation_selector_supplement`]). Mutation testing showed that
+    /// narrowing the carve-out by ONE codepoint left `U+E01EF` in neither: not
+    /// stripped, not judged, kept verbatim in every name while rendering as
+    /// nothing — a free clone vector, and every other test still passed. The
+    /// ranges are now layered rather than complementary, so the gap is
+    /// structurally impossible; this sweep is what fails if anyone splits them
+    /// again.
+    #[test]
+    fn no_plane_14_codepoint_escapes_both_the_strip_and_the_carve_out() {
+        for cp in 0xE0000u32..=0xE0FFF {
+            let c = char::from_u32(cp).expect("all of plane 14 is valid scalars");
+            assert!(
+                is_display_hidden(c) || is_variation_selector_supplement(c),
+                "U+{cp:04X} is neither stripped nor context-judged, so it \
+                 survives verbatim while rendering as nothing"
+            );
+            // The decision that matters: after a non-ideograph, every one of
+            // them must go, whichever of the two paths handles it.
+            let cloned = format!("Ian{c} Clarke");
+            assert_eq!(
+                sanitize_display_name(&cloned),
+                "Ian Clarke",
+                "U+{cp:04X} survived after an ASCII letter and clones a name"
+            );
+            assert!(
+                contains_hidden_chars(&cloned),
+                "U+{cp:04X} is not rejected at the nickname input"
+            );
+        }
+    }
+
+    /// The other half of the IVS carve-out. A selector that is NOT after an
+    /// ideograph selects nothing, renders as nothing, and clones the name it
+    /// sits in — so it must still be dropped AND still be rejected at the
+    /// input. Without this the carve-out would just be a hole.
+    #[test]
+    fn variation_selectors_not_after_an_ideograph_are_still_dropped() {
+        for (label, raw, want) in [
+            ("after an ASCII letter", "Ian\u{E0100} Clarke", "Ian Clarke"),
+            ("after a space", "Ian \u{E0100}Clarke", "Ian Clarke"),
+            ("after Cyrillic (not an ideograph)", "Иван\u{E0100}", "Иван"),
+            (
+                "after Hangul (not an ideograph)",
+                "김민준\u{E0100}",
+                "김민준",
+            ),
+            ("at the very start", "\u{E0100}Ian", "Ian"),
+            (
+                "doubled after an ideograph",
+                "辻\u{E0100}\u{E0100}",
+                "辻\u{E0100}",
+            ),
+        ] {
+            assert_eq!(
+                sanitize_display_name(raw),
+                want,
+                "{label}: a non-selecting variation selector survived and clones a name"
+            );
+            assert!(
+                contains_hidden_chars(raw),
+                "{label}: a non-selecting variation selector is not rejected at the input"
+            );
+        }
+        // Alone it is not a name at all.
+        assert_eq!(sanitize_display_name("\u{E0100}"), UNNAMED);
     }
 
     #[test]

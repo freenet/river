@@ -315,7 +315,9 @@ pub fn MemberInfoModal() -> Element {
                             // Deputy shield — mirrors the member-list 🛡 badge
                             // (freenet/river#451). Shown under the same
                             // viewer-relevant condition as the row, with the
-                            // appointer names in the tooltip.
+                            // same tooltip. The tooltip counts the appointers
+                            // rather than naming them; the names themselves are
+                            // listed below.
                             if deputy_badge.is_some() {
                                 span {
                                     "data-testid": "member-info-deputy-tag",
@@ -323,6 +325,32 @@ pub fn MemberInfoModal() -> Element {
                                     title: "{deputy_tooltip}",
                                     "aria-label": "{deputy_tooltip}",
                                     "🛡 Deputy"
+                                }
+                            }
+                        }
+
+                        // The appointers, by name. This is the ONE surface that
+                        // shows them, and it renders each as its own element on
+                        // purpose: a `title=` attribute is a flat string, so a
+                        // nickname of `Bob, the room owner, Carol` inside one
+                        // reads as three appointers including a role label
+                        // River never granted. One node per appointer makes the
+                        // boundaries real rather than punctuation, so a comma
+                        // inside a name cannot span two of them.
+                        //
+                        // Do NOT collapse this into a joined string, and do NOT
+                        // move these names into the tooltip above. See
+                        // `DeputyBadge::appointer_phrase`.
+                        if let Some(badge) = deputy_badge.as_ref() {
+                            div {
+                                "data-testid": "member-info-deputy-appointers",
+                                class: "mb-4 text-sm text-text-muted",
+                                span { class: "mr-1", "Deputized by:" }
+                                for name in badge.appointer_names() {
+                                    span {
+                                        class: "inline-block px-2 py-0.5 mr-1 mb-1 rounded bg-surface border border-border text-text",
+                                        "{name}"
+                                    }
                                 }
                             }
                         }
@@ -583,5 +611,38 @@ mod ban_gate_tests {
             "the deputy chip's tooltip must come from `DeputyBadge::tooltip` \
              so the wording cannot drift between surfaces (#451)"
         );
+    }
+
+    /// This modal is the only surface that shows appointer NAMES, and it must
+    /// render each as its own element.
+    ///
+    /// The tooltip deliberately names nobody, because a `title=` attribute is a
+    /// flat string in which a nickname of `Bob, the room owner, Carol` reads as
+    /// three appointers including a role label River never granted. Joining
+    /// these names — here or anywhere — rebuilds that exact hole with different
+    /// punctuation, so the shape is pinned rather than left to a comment.
+    #[test]
+    fn modal_lists_appointer_names_as_separate_elements() {
+        let source = include_str!("member_info_modal.rs");
+        let prod = &source[..source
+            .find("#[cfg(test)]")
+            .expect("member_info_modal.rs should have a #[cfg(test)] block")];
+
+        assert!(
+            prod.contains("for name in badge.appointer_names()"),
+            "the appointer names must be iterated into one element each; a \
+             single interpolated string reintroduces the role-label forgery"
+        );
+        for joiner in [
+            "appointer_names().join",
+            "appointer_names().concat",
+            "deputized_by.join",
+        ] {
+            assert!(
+                !prod.contains(joiner),
+                "`{joiner}` flattens attacker-controlled nicknames into one \
+                 string, which is the forgery this shape exists to prevent"
+            );
+        }
     }
 }

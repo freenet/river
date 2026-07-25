@@ -533,7 +533,13 @@ pub(crate) fn build_deputizers_of(
             if *deputy == appointer {
                 continue;
             }
-            deputizers_of.entry(*deputy).or_default().push(appointer);
+            // `MAX_DEPUTIES` bounds the LENGTH but nothing rejects repeats, so
+            // `deputies: [sockpuppet; 64]` would otherwise name the same
+            // appointer 64 times in the tooltip and bury the real content.
+            let entry = deputizers_of.entry(*deputy).or_default();
+            if !entry.contains(&appointer) {
+                entry.push(appointer);
+            }
         }
     }
     deputizers_of
@@ -579,16 +585,35 @@ pub(crate) fn viewer_relevant_deputizer_set(
     set
 }
 
-/// Display names of `target`'s deputizers that are RELEVANT to the viewer,
-/// resolved to `"room owner"` / `"you"` / the appointer's decrypted nickname —
-/// exactly what the member-list 🛡 badge shows. An empty result means the
-/// shield does not show for this viewer.
+/// One appointer behind a 🛡 shield, kept as a TYPE rather than a string so a
+/// surface cannot accidentally treat a nickname as a role label.
+///
+/// `Owner` and `You` are trusted: River decides them, and their wording is a
+/// literal in this file. `Member` carries an attacker-chosen nickname and is
+/// the reason this enum exists — see [`DeputyBadge::tooltip`] for what may and
+/// may not be done with it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Appointer {
+    /// The room owner. Rendered as the trusted label `"the room owner"`.
+    Owner,
+    /// The viewer themselves. Rendered as the trusted label `"you"`.
+    You,
+    /// Any other member, named by their decrypted `preferred_nickname`.
+    ///
+    /// **Attacker-controlled.** Never interpolate this into a flat sentence
+    /// alongside a role label.
+    Member(String),
+}
+
+/// `target`'s deputizers that are RELEVANT to the viewer, in the order the
+/// member-list 🛡 badge shows them. An empty result means the shield does not
+/// show for this viewer.
 ///
 /// This is the single definition shared by the member-list row and the
 /// member-info modal legend, so the shield's visibility and its
 /// `Deputy (appointed by …)` tooltip cannot drift between the two
 /// (freenet/river#451).
-pub(crate) fn relevant_deputizer_names(
+pub(crate) fn relevant_appointers(
     member_info: &river_core::room_state::member_info::MemberInfoV1,
     room_secrets: &HashMap<u32, [u8; 32]>,
     deputizers_of: &HashMap<MemberId, Vec<MemberId>>,
@@ -596,41 +621,31 @@ pub(crate) fn relevant_deputizer_names(
     owner_id: MemberId,
     self_member_id: MemberId,
     target: MemberId,
-) -> Vec<String> {
-    // Resolve an appointer's id to a display name (owner -> "the room owner",
-    // self -> "you", else the appointer's decrypted preferred nickname).
-    //
-    // A real nickname is QUOTED and the two role labels are not, because they
-    // share one flat, comma-joined list and a nickname is attacker-chosen.
-    // Without the quotes a member who is a strict ancestor of the viewer can
-    // set their nickname to `room owner`, deputize anyone, and make that
-    // member's shield read `Deputy (appointed by room owner). Can ban you.` —
-    // a forged global-moderator appointment, in the one place the badge
-    // communicates the SCOPE of someone's authority. Sanitising cannot help:
-    // `room owner` is plain ASCII.
-    let name_of = |id: MemberId| -> String {
+) -> Vec<Appointer> {
+    // Classify rather than format. Resolving straight to a display string here
+    // is what made the forgery possible: once an appointer is a `String`, the
+    // difference between "River said this" and "a member typed this" is gone,
+    // and every downstream surface has to remember a rule it cannot see.
+    let appointer_of = |id: MemberId| -> Appointer {
         if id == owner_id {
-            return "the room owner".to_string();
+            return Appointer::Owner;
         }
         if id == self_member_id {
-            return "you".to_string();
+            return Appointer::You;
         }
-        member_info
-            .canonical(id)
-            .map(|mi| {
-                format!(
-                    "\u{201c}{}\u{201d}",
-                    display_nickname(&mi.member_info.preferred_nickname, room_secrets)
-                )
-            })
-            .unwrap_or_else(|| "an unknown member".to_string())
+        Appointer::Member(
+            member_info
+                .canonical(id)
+                .map(|mi| display_nickname(&mi.member_info.preferred_nickname, room_secrets))
+                .unwrap_or_else(|| "an unknown member".to_string()),
+        )
     };
     relevant_deputizers(
         deputizers_of.get(&target).map(Vec::as_slice).unwrap_or(&[]),
         viewer_relevant,
     )
     .into_iter()
-    .map(name_of)
+    .map(appointer_of)
     .collect()
 }
 
@@ -662,7 +677,7 @@ pub(crate) fn viewer_can_ban(
 ///
 /// * `deputized_by` decides **visibility** — non-empty means show the shield.
 ///   It is the pre-existing viewer-relative predicate the member list and the
-///   member-info modal already use ([`relevant_deputizer_names`]), which never
+///   member-info modal already use ([`relevant_appointers`]), which never
 ///   consults the viewer's own deputy status, so the "still shows when I'm
 ///   immune" half holds by construction.
 /// * `can_ban_viewer` decides only the **tooltip wording**, and is the real
@@ -673,10 +688,9 @@ pub(crate) fn viewer_can_ban(
 ///   `is_ban_authorized` step 4).
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct DeputyBadge {
-    /// Viewer-relevant appointer display names — `"room owner"`, `"you"`, or a
-    /// nickname. Never empty: an empty result means no badge at all, which is
-    /// represented by the member being absent from the map.
-    pub deputized_by: Vec<String>,
+    /// Viewer-relevant appointers. Never empty: an empty result means no badge
+    /// at all, which is represented by the member being absent from the map.
+    pub deputized_by: Vec<Appointer>,
     /// Whether this member can currently get the viewer removed from the room,
     /// directly or by a cascading ban of one of the viewer's ancestors. `None`
     /// when the badge is on the VIEWER'S OWN row: "can they ban you" is not a
@@ -686,6 +700,60 @@ pub(crate) struct DeputyBadge {
 }
 
 impl DeputyBadge {
+    /// Who appointed them, as a phrase built ONLY from trusted literals plus a
+    /// count. No nickname reaches this string.
+    ///
+    /// **A `title=` attribute is a flat string, so quoting a nickname inside it
+    /// is not a defense and must not be re-attempted.** The appointers used to
+    /// be joined with `", "`, with the role labels left unquoted so a nickname
+    /// could not pass as one. The forging primitive is the COMMA, not the
+    /// quote: a plain-ASCII nickname of `Bob, the room owner, Carol` produced
+    ///
+    /// ```text
+    /// Deputy (appointed by "Bob, the room owner, Carol"). Can ban you.
+    /// ```
+    ///
+    /// against the legitimate `appointed by "Bob", the room owner, "Carol"`.
+    /// Two quote glyphs shift position; nobody reads that at tooltip size. Any
+    /// quote character works for the decorated variant (`U+201C`, `U+2033`,
+    /// `U+FF02`, `U+00AB`…), and the payload above needs no quote at all, so
+    /// denylisting characters cannot close it. Sanitising cannot either: every
+    /// byte of the payload is a legitimate name character.
+    ///
+    /// So the tooltip names no member. The actual names are surfaced by the
+    /// member-info modal, which renders them as SEPARATE elements where a
+    /// comma inside one of them cannot span two of them.
+    fn appointer_phrase(&self) -> String {
+        let has = |want: &Appointer| self.deputized_by.contains(want);
+        let others = self
+            .deputized_by
+            .iter()
+            .filter(|a| matches!(a, Appointer::Member(_)))
+            .count();
+
+        let mut parts: Vec<String> = Vec::new();
+        if has(&Appointer::Owner) {
+            parts.push("the room owner".to_string());
+        }
+        if has(&Appointer::You) {
+            parts.push("you".to_string());
+        }
+        match others {
+            0 => {}
+            1 => parts.push("another member".to_string()),
+            n => parts.push(format!("{n} other members")),
+        }
+
+        // At most three parts (owner, you, the count), so this covers every
+        // case without a general list-joiner.
+        match parts.len() {
+            0 => "nobody".to_string(),
+            1 => parts.remove(0),
+            2 => format!("{} and {}", parts[0], parts[1]),
+            _ => format!("{}, {} and {}", parts[0], parts[1], parts[2]),
+        }
+    }
+
     /// The `title=` text: who appointed them, and what that means for you.
     ///
     /// One definition for all three surfaces (message author line, member-list
@@ -693,12 +761,29 @@ impl DeputyBadge {
     /// in different places. That is the drift freenet/river#451 fixed for
     /// visibility, applied to the wording too.
     pub fn tooltip(&self) -> String {
-        let appointers = self.deputized_by.join(", ");
+        let appointers = self.appointer_phrase();
         match self.can_ban_viewer {
             Some(true) => format!("Deputy (appointed by {appointers}). Can ban you."),
             Some(false) => format!("Deputy (appointed by {appointers}). Cannot ban you."),
             None => format!("Deputy (appointed by {appointers})"),
         }
+    }
+
+    /// The appointers as individual display strings, for a surface that can
+    /// render them as SEPARATE elements.
+    ///
+    /// Do NOT join these into one string — that reintroduces exactly the
+    /// forgery [`Self::appointer_phrase`] exists to prevent. The only caller is
+    /// the member-info modal, which emits one node per entry.
+    pub fn appointer_names(&self) -> Vec<String> {
+        self.deputized_by
+            .iter()
+            .map(|a| match a {
+                Appointer::Owner => "the room owner".to_string(),
+                Appointer::You => "you".to_string(),
+                Appointer::Member(name) => name.clone(),
+            })
+            .collect()
     }
 }
 
@@ -794,7 +879,7 @@ fn badge_for_target(
     if target == owner_id {
         return None;
     }
-    let deputized_by = relevant_deputizer_names(
+    let deputized_by = relevant_appointers(
         member_info,
         room_secrets,
         deputizers_of,
@@ -2941,7 +3026,7 @@ mod tests {
     /// The 🛡 deputy shield renders exactly when `deputized_by` is non-empty,
     /// and its tooltip names the appointer(s). The member-info modal legend
     /// mirrors this (freenet/river#451) via the shared
-    /// `relevant_deputizer_names` helper, so this pins the row half of the
+    /// `relevant_appointers` helper, so this pins the row half of the
     /// "same shield in both places" contract.
     #[test]
     fn member_display_parts_shows_deputy_shield_with_appointer_tooltip() {
@@ -2955,7 +3040,7 @@ mod tests {
         );
 
         display.deputy_badge = Some(DeputyBadge {
-            deputized_by: vec!["the room owner".to_string()],
+            deputized_by: vec![Appointer::Owner],
             can_ban_viewer: Some(true),
         });
         let parts = member_display_parts(&display);
@@ -2974,7 +3059,7 @@ mod tests {
         // On the viewer's OWN row the ban clause is dropped: "can they ban
         // you" is meaningless about yourself.
         display.deputy_badge = Some(DeputyBadge {
-            deputized_by: vec!["the room owner".to_string()],
+            deputized_by: vec![Appointer::Owner],
             can_ban_viewer: None,
         });
         let parts = member_display_parts(&display);
@@ -2987,7 +3072,7 @@ mod tests {
     /// End-to-end pin of the shared deputy helpers the member row AND the
     /// member-info modal legend both depend on (freenet/river#451): build a
     /// room where the OWNER deputizes `mod_member`, and assert that from an
-    /// unrelated viewer's perspective `relevant_deputizer_names` reports the
+    /// unrelated viewer's perspective `relevant_appointers` reports the
     /// shield named "room owner" (a global moderator is relevant to everyone),
     /// while a member nobody deputized reports no shield.
     #[test]
@@ -3038,7 +3123,7 @@ mod tests {
         // The moderator (a deputy of the owner) shows the shield, named "room
         // owner", even to an unrelated viewer.
         assert_eq!(
-            relevant_deputizer_names(
+            relevant_appointers(
                 &member_info,
                 &secrets,
                 &deputizers_of,
@@ -3047,10 +3132,10 @@ mod tests {
                 viewer_id,
                 mod_id,
             ),
-            vec!["the room owner".to_string()],
+            vec![Appointer::Owner],
         );
         // A member nobody deputized shows no shield.
-        assert!(relevant_deputizer_names(
+        assert!(relevant_appointers(
             &member_info,
             &secrets,
             &deputizers_of,
@@ -3060,6 +3145,181 @@ mod tests {
             viewer_id,
         )
         .is_empty());
+    }
+
+    /// **No nickname content reaches the shield tooltip, at all.**
+    ///
+    /// The tooltip is a `title=` attribute, i.e. one flat string, and the
+    /// forging primitive there is the COMMA, not the quote. A plain-ASCII
+    /// nickname of `Bob, the room owner, Carol` used to render
+    ///
+    /// ```text
+    /// Deputy (appointed by "Bob, the room owner, Carol"). Can ban you.
+    /// ```
+    ///
+    /// against the legitimate `appointed by "Bob", the room owner, "Carol"` —
+    /// two quote glyphs apart, and nobody reads that at tooltip size. Since the
+    /// payload carries no quote character of its own, no denylist of quote
+    /// characters closes it, and sanitising cannot either: every byte is a
+    /// legitimate name character.
+    ///
+    /// So this asserts the only property that actually holds: the tooltip
+    /// contains no attacker-supplied substring. It is checked with a payload
+    /// that has NO Unicode trickery, because that is the case a
+    /// character-denylist fix would silently fail.
+    #[test]
+    fn no_nickname_content_reaches_the_shield_tooltip() {
+        use river_core::room_state::member::MembersV1;
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        // Each of these is a nickname a member can simply type. The first is
+        // the one that defeats every quote-stripping fix.
+        for payload in [
+            "Bob, the room owner, Carol",
+            "Bob\u{201d}, the room owner, \u{201c}Carol",
+            "Bob\", the room owner, \"Carol",
+            "Bob\u{00BB}, the room owner, \u{00AB}Carol",
+            "Bob\u{FF02}, the room owner, \u{FF02}Carol",
+            "Bob and you and the room owner",
+            ") . Can ban you. Deputy (appointed by the room owner",
+        ] {
+            let mut rng = rand::thread_rng();
+            let owner_sk = SigningKey::generate(&mut rng);
+            let liar_sk = SigningKey::generate(&mut rng);
+            let puppet_sk = SigningKey::generate(&mut rng);
+            let viewer_sk = SigningKey::generate(&mut rng);
+
+            let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+            let owner_id = id(&owner_sk);
+
+            // The liar invited the viewer, so the liar is a viewer-relevant
+            // appointer and their puppet carries a shield in the viewer's view.
+            let members = MembersV1 {
+                members: vec![
+                    authorized_member(&owner_sk, &liar_sk.verifying_key()),
+                    authorized_member(&owner_sk, &puppet_sk.verifying_key()),
+                    member_invited_by(&liar_sk, owner_id, &viewer_sk.verifying_key()),
+                ],
+            };
+            let member_info = MemberInfoV1 {
+                member_info: vec![
+                    signed_member_info(&owner_sk, "Owner", vec![]),
+                    signed_member_info(&liar_sk, payload, vec![id(&puppet_sk)]),
+                    signed_member_info(&puppet_sk, "Puppet", vec![]),
+                    signed_member_info(&viewer_sk, "Viewer", vec![]),
+                ],
+            };
+            let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+            let badges = deputy_badges_for_viewer(
+                &members,
+                &member_info,
+                &secrets,
+                owner_id,
+                id(&viewer_sk),
+            );
+            let badge = badges
+                .get(&id(&puppet_sk))
+                .expect("the puppet carries a shield in this view");
+            let tooltip = badge.tooltip();
+
+            // The payload is the liar's nickname. The liar is ONE appointer, so
+            // the only truthful thing the tooltip can say is "another member".
+            assert_eq!(
+                tooltip, "Deputy (appointed by another member). Can ban you.",
+                "tooltip is not the trusted-literal form for payload {payload:?}"
+            );
+
+            // Belt and braces: no run of the payload long enough to read as a
+            // phrase survives anywhere in the tooltip. A future rewrite that
+            // reintroduces names in some other shape fails here even if it
+            // changes the exact wording asserted above.
+            for window in payload.split(',').map(str::trim).filter(|w| w.len() > 3) {
+                assert!(
+                    !tooltip.contains(window),
+                    "tooltip leaked the nickname fragment {window:?}: {tooltip}"
+                );
+            }
+
+            // The names are still available — as SEPARATE elements, where a
+            // comma inside one cannot span two of them.
+            assert_eq!(
+                badge.appointer_names(),
+                vec![payload.to_string()],
+                "the modal must still be able to show who appointed them"
+            );
+        }
+    }
+
+    /// The trusted-literal wording, across every combination of appointers.
+    /// The counts are the only thing a nickname can influence, and only by
+    /// existing.
+    #[test]
+    fn appointer_phrase_is_built_from_trusted_literals_only() {
+        let phrase = |appointers: Vec<Appointer>| {
+            DeputyBadge {
+                deputized_by: appointers,
+                can_ban_viewer: None,
+            }
+            .tooltip()
+        };
+        let member = |n: &str| Appointer::Member(n.to_string());
+
+        assert_eq!(
+            phrase(vec![Appointer::Owner]),
+            "Deputy (appointed by the room owner)"
+        );
+        assert_eq!(phrase(vec![Appointer::You]), "Deputy (appointed by you)");
+        assert_eq!(
+            phrase(vec![member("Eve")]),
+            "Deputy (appointed by another member)"
+        );
+        assert_eq!(
+            phrase(vec![member("Eve"), member("Mallory")]),
+            "Deputy (appointed by 2 other members)"
+        );
+        assert_eq!(
+            phrase(vec![Appointer::Owner, member("Eve")]),
+            "Deputy (appointed by the room owner and another member)"
+        );
+        assert_eq!(
+            phrase(vec![Appointer::Owner, Appointer::You]),
+            "Deputy (appointed by the room owner and you)"
+        );
+        assert_eq!(
+            phrase(vec![
+                Appointer::Owner,
+                Appointer::You,
+                member("Eve"),
+                member("Mallory"),
+            ]),
+            "Deputy (appointed by the room owner, you and 2 other members)"
+        );
+    }
+
+    /// A repeated deputy entry must not repeat the appointer in the tooltip.
+    #[test]
+    fn duplicate_deputy_entries_are_collapsed() {
+        use river_core::room_state::member_info::MemberInfoV1;
+
+        let mut rng = rand::thread_rng();
+        let appointer_sk = SigningKey::generate(&mut rng);
+        let deputy_sk = SigningKey::generate(&mut rng);
+        let deputy_id = MemberId::from(&deputy_sk.verifying_key());
+
+        let member_info = MemberInfoV1 {
+            member_info: vec![signed_member_info(
+                &appointer_sk,
+                "Spammer",
+                vec![deputy_id; 64],
+            )],
+        };
+        let deputizers = build_deputizers_of(&member_info);
+        assert_eq!(
+            deputizers.get(&deputy_id).map(Vec::len),
+            Some(1),
+            "64 repeated grants must collapse to one appointer"
+        );
     }
 
     /// The conversation's 🛡 badge predicate, end to end.
@@ -3136,7 +3396,7 @@ mod tests {
         let global = badges
             .get(&id(&global_mod_sk))
             .expect("a deputy of the owner must show the shield to every viewer");
-        assert_eq!(global.deputized_by, vec!["the room owner".to_string()]);
+        assert_eq!(global.deputized_by, vec![Appointer::Owner]);
         assert_eq!(global.can_ban_viewer, Some(true));
         assert_eq!(
             global.tooltip(),
@@ -3148,11 +3408,11 @@ mod tests {
         let by_alpha = badges
             .get(&id(&deputy_alpha_sk))
             .expect("a deputy of the viewer's inviter must show the shield");
-        // A real nickname is quoted so it cannot masquerade as the unquoted
-        // `the room owner` / `you` role labels in the same comma-joined list.
+        // A real nickname is classified as `Member`, never as one of the two
+        // trusted role labels, so it cannot masquerade as either.
         assert_eq!(
             by_alpha.deputized_by,
-            vec!["\u{201c}Alpha\u{201d}".to_string()]
+            vec![Appointer::Member("Alpha".to_string())]
         );
         assert_eq!(by_alpha.can_ban_viewer, Some(true));
 
@@ -3173,7 +3433,7 @@ mod tests {
         let mine = badges
             .get(&id(&my_deputy_sk))
             .expect("a deputy the viewer appointed must still show the shield");
-        assert_eq!(mine.deputized_by, vec!["you".to_string()]);
+        assert_eq!(mine.deputized_by, vec![Appointer::You]);
         assert_eq!(
             mine.can_ban_viewer,
             Some(false),
@@ -3237,7 +3497,7 @@ mod tests {
         let other = badges
             .get(&id(&other_mod_sk))
             .expect("a fellow deputy must still show the shield to a deputy viewer");
-        assert_eq!(other.deputized_by, vec!["the room owner".to_string()]);
+        assert_eq!(other.deputized_by, vec![Appointer::Owner]);
         assert_eq!(
             other.can_ban_viewer,
             Some(true),
@@ -3294,11 +3554,11 @@ mod tests {
         let m = badges
             .get(&id(&mod_sk))
             .expect("the owner must see the shield on their own appointee");
-        // `relevant_deputizer_names` resolves the owner id BEFORE the self id,
+        // `relevant_appointers` resolves the owner id BEFORE the self id,
         // so an owner viewing their own appointee reads "room owner", not
         // "you". Pinned rather than "fixed": the label describes the role that
         // granted the authority, and every other viewer sees the same word.
-        assert_eq!(m.deputized_by, vec!["the room owner".to_string()]);
+        assert_eq!(m.deputized_by, vec![Appointer::Owner]);
         assert_eq!(
             m.can_ban_viewer,
             Some(false),
@@ -3568,7 +3828,10 @@ mod tests {
         let badges =
             deputy_badges_for_viewer(&members, &member_info, &secrets, owner_id, id(&viewer_sk));
         let badge = badges.get(&id(&deputy_sk)).expect("shield expected");
-        assert_eq!(badge.deputized_by, vec!["\u{201c}Eve\u{201d}".to_string()]);
+        assert_eq!(
+            badge.deputized_by,
+            vec![Appointer::Member("Eve".to_string())]
+        );
         assert!(!badge.tooltip().contains('🛡'));
 
         // The role labels are unquoted, so a nickname of `room owner` reads as
@@ -3587,12 +3850,20 @@ mod tests {
             owner_id,
             id(&viewer_sk),
         );
+        let badge = liar.get(&id(&deputy_sk)).expect("shield expected");
         assert_eq!(
-            liar.get(&id(&deputy_sk))
-                .expect("shield expected")
-                .deputized_by,
-            vec!["\u{201c}room owner\u{201d}".to_string()],
-            "a nickname of `room owner` must not forge an owner appointment"
+            badge.deputized_by,
+            vec![Appointer::Member("room owner".to_string())],
+            "a nickname of `room owner` must classify as a MEMBER, never as the \
+             trusted `Appointer::Owner` label"
+        );
+        // And the tooltip, which is the flat surface a reader actually sees,
+        // names no member at all.
+        assert!(
+            !badge.tooltip().contains("the room owner"),
+            "a nickname of `room owner` forged an owner appointment in the \
+             tooltip: {}",
+            badge.tooltip()
         );
     }
 
