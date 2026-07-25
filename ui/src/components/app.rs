@@ -15,6 +15,7 @@ use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
+use crate::components::room_list::notification_modal::NotificationModal;
 use crate::components::room_list::receive_invitation_modal::{
     accept_invitation, clear_invitation_from_storage, decide_recovered_invitation,
     is_invitation_processed, load_invitation_from_storage, load_invitation_nickname_from_storage,
@@ -47,6 +48,8 @@ pub static MEMBER_INFO_MODAL: GlobalSignal<MemberInfoModalSignal> =
     Global::new(|| MemberInfoModalSignal { member: None });
 pub static EDIT_ROOM_MODAL: GlobalSignal<EditRoomModalSignal> =
     Global::new(|| EditRoomModalSignal { room: None });
+pub static NOTIFICATION_MODAL: GlobalSignal<NotificationModalSignal> =
+    Global::new(|| NotificationModalSignal { room: None });
 pub static CREATE_ROOM_MODAL: GlobalSignal<CreateRoomModalSignal> =
     Global::new(|| CreateRoomModalSignal { show: false });
 pub static PENDING_INVITES: GlobalSignal<PendingInvites> = Global::new(PendingInvites::new);
@@ -489,6 +492,7 @@ pub fn App() -> Element {
             }
         }
         EditRoomModal {}
+        NotificationModal {}
         MemberInfoModal {}
         CreateRoomModal {}
         DmThreadModal {}
@@ -518,6 +522,10 @@ fn initial_rooms() -> Rooms {
 }
 
 pub struct EditRoomModalSignal {
+    pub room: Option<VerifyingKey>,
+}
+
+pub struct NotificationModalSignal {
     pub room: Option<VerifyingKey>,
 }
 
