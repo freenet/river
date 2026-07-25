@@ -3409,40 +3409,95 @@ mod tests {
     /// someone moves `BanButton` back outside the self-check.
     #[test]
     fn ban_action_is_not_rendered_for_self() {
-        let source = include_str!("members/member_info_modal.rs");
-        let prod = &source[..source
-            .find("#[cfg(test)]")
-            .expect("member_info_modal.rs should have a #[cfg(test)] block")];
-
-        let ban_at = prod
-            .find("BanButton {")
-            .expect("the modal must render a BanButton");
-        let guard = "if member_id != self_member_id {";
-        let guard_at = prod[..ban_at]
-            .rfind(guard)
-            .unwrap_or_else(|| panic!("no `{guard}` guard above the BanButton render (#478)"));
-
-        // The guard must still be OPEN where the button renders. Track the
-        // MINIMUM running brace depth, not the final depth: the modal has an
-        // earlier `if member_id != self_member_id` block (the DM / Share-invite
-        // row) that closes again, and a final-depth check reads that as
-        // satisfying the guard because a later block re-opens.
-        let between = &prod[guard_at + guard.len()..ban_at];
-        let mut depth = 0i32;
-        let mut min_depth = 0i32;
-        for c in between.chars() {
-            match c {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            min_depth = min_depth.min(depth);
+        // Comments are stripped first. `rfind` matching the guard's text
+        // inside a comment would let a DELETED guard satisfy this test — the
+        // same reason `util::ecies`'s pin strips them.
+        fn strip_line_comments(src: &str) -> String {
+            src.lines()
+                .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
         }
+
+        let source = include_str!("members/member_info_modal.rs");
+        // Cutting at the FIRST `#[cfg(test)]` is the safe direction here: this
+        // assertion requires the button to be PRESENT, so an over-short slice
+        // makes the `expect` below panic loudly rather than pass vacuously.
+        let prod = strip_line_comments(
+            &source[..source
+                .find("#[cfg(test)]")
+                .expect("member_info_modal.rs should have a #[cfg(test)] block")],
+        );
+
+        let guard = "if member_id != self_member_id {";
+        // EVERY render must be guarded, not just the first. A second,
+        // unguarded `BanButton` added later would otherwise slip past.
+        let sites: Vec<usize> = prod.match_indices("BanButton {").map(|(i, _)| i).collect();
         assert!(
-            min_depth >= 0,
-            "the nearest `{guard}` above `BanButton` closes before the button \
-             renders, so a deputy can still ban themselves from their own \
-             profile (#478)"
+            !sites.is_empty(),
+            "the modal must render a BanButton — if it moved to another file, \
+             move this pin with it (#478)"
+        );
+
+        for ban_at in sites {
+            let guard_at = prod[..ban_at]
+                .rfind(guard)
+                .unwrap_or_else(|| panic!("no `{guard}` guard above a BanButton render (#478)"));
+
+            // The guard must still be OPEN where the button renders. Track the
+            // MINIMUM running brace depth, not the final depth: the modal has
+            // an earlier `if member_id != self_member_id` block (the DM /
+            // Share-invite row) that closes again, and a final-depth check
+            // reads that as satisfying the guard because a later block
+            // re-opens.
+            let between = &prod[guard_at + guard.len()..ban_at];
+            let mut depth = 0i32;
+            let mut min_depth = 0i32;
+            for c in between.chars() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                min_depth = min_depth.min(depth);
+            }
+            assert!(
+                min_depth >= 0,
+                "the nearest `{guard}` above a `BanButton` closes before the \
+                 button renders, so a deputy can still ban themselves from \
+                 their own profile (#478)"
+            );
+        }
+    }
+
+    /// The THIRD layer of the #478 guard: `execute_ban` must refuse a self-ban
+    /// at the action boundary, not only at render time.
+    ///
+    /// `BanButton::execute_ban` trusts a `member_to_ban` PROP and re-checks
+    /// nothing else, so any future call site passing `can_ban: true` would run
+    /// the cascading ban. Source-scraped because the handler is a Dioxus
+    /// closure needing a runtime; the check is three lines and this pin is
+    /// what stops them being "simplified" away.
+    #[test]
+    fn execute_ban_refuses_self_at_the_action_boundary() {
+        fn strip_line_comments(src: &str) -> String {
+            src.lines()
+                .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let source = include_str!("members/member_info_modal/ban_button.rs");
+        let prod =
+            strip_line_comments(&source[..source.find("#[cfg(test)]").unwrap_or(source.len())]);
+
+        let build_at = prod
+            .find("let ban = UserBan {")
+            .expect("ban_button.rs must build a UserBan");
+        assert!(
+            prod[..build_at].contains("if member_to_ban == banned_by {"),
+            "`execute_ban` must refuse a self-ban BEFORE building the UserBan \
+             — a self-ban is contract-valid and cascades to the banner's whole \
+             invite subtree (#478)"
         );
     }
 

@@ -449,32 +449,32 @@ pub fn MemberInfoModal() -> Element {
                             // subtree (freenet/river#478). `viewer_can_ban`
                             // refuses self as well; this is the second layer.
                             if member_id != self_member_id {
-                            div { class: "mt-4 flex items-start gap-3",
-                                BanButton {
-                                    member_to_ban: member_id,
-                                    can_ban: can_ban,
-                                    // The DECRYPTED, sanitised name — the same
-                                    // value `DeputyButton` gets. This used to
-                                    // pass the raw `SealedBytes`, which Dioxus
-                                    // silently coerced through `Display` (i.e.
-                                    // `to_string_lossy`): the ban dialog showed
-                                    // an unsanitised nickname in the one place
-                                    // a moderator is judging authority, and
-                                    // showed "[Encrypted: N bytes, vN]" instead
-                                    // of a name in private rooms.
-                                    nickname: target_nickname.clone()
-                                }
+                                div { class: "mt-4 flex items-start gap-3",
+                                    BanButton {
+                                        member_to_ban: member_id,
+                                        can_ban: can_ban,
+                                        // The DECRYPTED, sanitised name — the same
+                                        // value `DeputyButton` gets. This used to
+                                        // pass the raw `SealedBytes`, which Dioxus
+                                        // silently coerced through `Display` (i.e.
+                                        // `to_string_lossy`): the ban dialog showed
+                                        // an unsanitised nickname in the one place
+                                        // a moderator is judging authority, and
+                                        // showed "[Encrypted: N bytes, vN]" instead
+                                        // of a name in private rooms.
+                                        nickname: target_nickname.clone()
+                                    }
 
-                                // Deputize / revoke-deputy (#410). Any non-owner
-                                // member (except self) may be deputized; the action
-                                // hides itself when the viewer lacks authority.
-                                DeputyButton {
-                                    target: member_id,
-                                    viewer_has_authority: viewer_has_authority,
-                                    target_is_my_deputy: target_is_my_deputy,
-                                    nickname: target_nickname.clone(),
+                                    // Deputize / revoke-deputy (#410). Any non-owner
+                                    // member (except self) may be deputized; the action
+                                    // hides itself when the viewer lacks authority.
+                                    DeputyButton {
+                                        target: member_id,
+                                        viewer_has_authority: viewer_has_authority,
+                                        target_is_my_deputy: target_is_my_deputy,
+                                        nickname: target_nickname.clone(),
+                                    }
                                 }
-                            }
                             }
                         }
                     }

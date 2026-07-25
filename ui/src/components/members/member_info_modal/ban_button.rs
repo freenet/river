@@ -32,6 +32,20 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
             let room_state_clone = room_data.room_state.clone();
             let banned_by = MemberId::from(&self_sk.verifying_key());
 
+            // THIRD layer of the #478 guard, at the ACTION boundary.
+            //
+            // `viewer_can_ban` refuses self and the modal does not render this
+            // button for self, but both are render-time: this function trusts
+            // a `member_to_ban` PROP and re-checks nothing, so any future call
+            // site that passes `can_ban: true` would execute the ban. A
+            // self-ban is contract-valid and cascades to the banner's whole
+            // invite subtree, so the capability should be unreachable rather
+            // than merely un-rendered.
+            if member_to_ban == banned_by {
+                warn!("Refusing to ban yourself (freenet/river#478)");
+                return;
+            }
+
             let ban = UserBan {
                 owner_member_id: MemberId::from(&current_room),
                 banned_at: get_current_system_time(),
