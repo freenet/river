@@ -115,6 +115,15 @@
 //!   meaning-bearing than the Latin ones, and widening the strip is exactly the
 //!   kind of change that starts flagging real people in scripts this codebase
 //!   has no test corpus for. Revisit only with a corpus.
+//! * **The shape-homoglyph blocks (Lisu, Cherokee, Coptic) are taken from
+//!   UTR39 `confusables.txt`, not eyeballed.** That is deliberate: several
+//!   Lisu letters are ROTATED or mirrored Latin capitals rather than upright
+//!   ones, and reading them off a chart gets it wrong in both directions. The
+//!   letters those blocks contain that UTR39 does not list stay unfolded.
+//!   Cherokee is the widest false-positive surface in the file — it is a
+//!   living script — but its letters are SYLLABLES, so what a Cherokee name
+//!   folds to is not a word in any language and cannot land on a moderator by
+//!   accident.
 //! * This module compares names. It does not, and cannot, tell you whether the
 //!   person behind an unflagged name is who they say they are.
 
@@ -888,22 +897,45 @@ fn fold_homoglyph(c: char) -> char {
         '\u{03F9}' => 'C',
         '\u{03F2}' => 'c',
         // Coptic. These capitals are drawn as their Latin lookalikes in every
-        // Coptic font; the lowercase forms sit at +1.
+        // Coptic font, and the lowercase form sits at +1 — so the two are
+        // folded as PAIRS. Four lowercase letters were missing while their
+        // capitals were folded (`\u{2C89}`, `\u{2C93}`, `\u{2C95}`,
+        // `\u{2C9B}`), which is a half-closed block rather than a decision.
+        // The entries UTR39 lists and this table did not are here too.
         '\u{2C80}' => 'A',
         '\u{2C81}' => 'a',
+        '\u{2C82}' => 'B',
+        '\u{2C83}' => 'b',
+        '\u{2C85}' => 'r', // small gamma; the CAPITAL is Γ-shaped and is not here
         '\u{2C88}' => 'E',
+        '\u{2C89}' => 'e',
         '\u{2C8E}' => 'H',
+        '\u{2C8F}' => 'h',
         '\u{2C92}' => 'I',
+        '\u{2C93}' => 'i',
         '\u{2C94}' => 'K',
+        '\u{2C95}' => 'k',
         '\u{2C98}' => 'M',
+        '\u{2C99}' => 'm',
         '\u{2C9A}' => 'N',
+        '\u{2C9B}' => 'n',
         '\u{2C9E}' => 'O',
         '\u{2C9F}' => 'o',
         '\u{2CA2}' => 'P',
+        '\u{2CA3}' => 'p',
         '\u{2CA4}' => 'C',
         '\u{2CA5}' => 'c',
         '\u{2CA6}' => 'T',
+        '\u{2CA7}' => 't',
+        '\u{2CA8}' => 'Y',
+        '\u{2CA9}' => 'y',
         '\u{2CAC}' => 'X',
+        '\u{2CAD}' => 'x',
+        '\u{2CBD}' => 'w',
+        '\u{2CCE}' => 'P',
+        '\u{2CCF}' => 'p',
+        '\u{2CD0}' => 'L',
+        '\u{2CD1}' => 'l',
         // Armenian. ONLY these two: `\u{0585}` and `\u{0578}` are drawn as
         // Latin `o`/`n`, and BOTH occur in real Armenian names
         // (`\u{0540}\u{578}\u{57E}\u{570}\u{561}\u{576}\u{576}\u{565}\u{57D}`,
@@ -913,11 +945,89 @@ fn fold_homoglyph(c: char) -> char {
         // corpus sweep, not by assertion.
         '\u{0585}' => 'o',
         '\u{0578}' => 'n',
-        // Cherokee, and Lisu — which was designed FROM Latin capitals, so its
-        // letters are Latin letterforms outright.
-        '\u{13DF}' => 'C',
-        '\u{A4F2}' => 'I',
+        // ---- Lisu (the Fraser alphabet) ----
+        //
+        // Designed FROM Latin capitals, so its letters are Latin letterforms
+        // outright — which is why folding two of them (`I` and `W`) and
+        // leaving the other 24 made no sense: the justification applied to the
+        // whole block, and `ꓲꓮꓠ ꓚꓡꓮꓣꓗꓰ` spelled the moderator's name in
+        // characters nothing folded.
+        //
+        // **Every mapping below is UTR39 `confusables.txt` (17.0), not a
+        // guess.** That matters here: several Fraser letters are ROTATED or
+        // MIRRORED Latin capitals rather than upright ones, and eyeballing the
+        // chart gets those wrong in both directions. UTR39 lists the upright
+        // ones; the rotated forms (`ꓒ ꓕ ꓘ ꓛ ꓞ ꓤ ꓥ ꓨ ꓩ ꓭ ꓯ ꓱ ꓵ ꓶ ꓷ`) are
+        // absent from it and stay unfolded here.
+        '\u{A4D0}' => 'B',
+        '\u{A4D1}' => 'P',
+        '\u{A4D2}' => 'd',
+        '\u{A4D3}' => 'D',
+        '\u{A4D4}' => 'T',
+        '\u{A4D6}' => 'G',
+        '\u{A4D7}' => 'K',
+        '\u{A4D9}' => 'J',
+        '\u{A4DA}' => 'C',
+        '\u{A4DC}' => 'Z',
+        '\u{A4DD}' => 'F',
+        '\u{A4DF}' => 'M',
+        '\u{A4E0}' => 'N',
+        '\u{A4E1}' => 'L',
+        '\u{A4E2}' => 'S',
+        '\u{A4E3}' => 'R',
+        '\u{A4E6}' => 'V',
+        '\u{A4E7}' => 'H',
         '\u{A4EA}' => 'W',
+        '\u{A4EB}' => 'X',
+        '\u{A4EC}' => 'Y',
+        '\u{A4EE}' => 'A',
+        '\u{A4F0}' => 'E',
+        '\u{A4F2}' => 'I',
+        '\u{A4F3}' => 'O',
+        '\u{A4F4}' => 'U',
+        // ---- Cherokee ----
+        //
+        // Same story: one letter was folded and the other 34 were not. The
+        // syllabary is a living script, so this is the widest false-positive
+        // surface added here — but a Cherokee name is written in SYLLABLES, so
+        // the Latin string it folds to is not a name in any language, and a
+        // badge needs the whole thing to land on a protected name. Sourced
+        // from UTR39; the letters absent from that file stay unfolded.
+        '\u{13A0}' => 'D',
+        '\u{13A1}' => 'R',
+        '\u{13A2}' => 'T',
+        '\u{13A5}' => 'i',
+        '\u{13A9}' => 'Y',
+        '\u{13AA}' => 'A',
+        '\u{13AB}' => 'J',
+        '\u{13AC}' => 'E',
+        '\u{13B3}' => 'W',
+        '\u{13B7}' => 'M',
+        '\u{13BB}' => 'H',
+        '\u{13BD}' => 'Y',
+        '\u{13C0}' => 'G',
+        '\u{13C2}' => 'h',
+        '\u{13C3}' => 'Z',
+        '\u{13CF}' => 'b',
+        '\u{13D2}' => 'R',
+        '\u{13D4}' => 'W',
+        '\u{13D5}' => 'S',
+        '\u{13D9}' => 'V',
+        '\u{13DA}' => 'S',
+        '\u{13DE}' => 'L',
+        '\u{13DF}' => 'C',
+        '\u{13E2}' => 'P',
+        '\u{13E6}' => 'K',
+        '\u{13E7}' => 'd',
+        '\u{13F3}' => 'G',
+        '\u{13F4}' => 'B',
+        '\u{AB75}' => 'i',
+        '\u{AB81}' => 'r',
+        '\u{AB83}' => 'w',
+        '\u{AB93}' => 'z',
+        '\u{ABA9}' => 'v',
+        '\u{ABAA}' => 's',
+        '\u{ABAF}' => 'c',
         // Latin-block letters that are not the ASCII letter they resemble:
         // `\u{01C0}` is a click consonant, `\u{0251}` the IPA script-a, and
         // `\u{0131}` is Turkish dotless i — a REAL letter in Turkish names,
@@ -940,17 +1050,27 @@ fn fold_homoglyph(c: char) -> char {
 /// Combining marks, dropped so `"I" + U+0300` folds like `"Ì"`.
 fn is_combining_mark(c: char) -> bool {
     matches!(u32::from(c),
-        // Cyrillic combining marks (titlo, palatalisation, psili...). Added
-        // because `"Ian Cla\u{0483}rke"` otherwise EVADED while `U+0300` was
-        // caught — a mark a reader barely registers must not defeat the fold.
-        // These are historic/liturgical ornaments, not part of how any modern
-        // Cyrillic name is spelled, so folding them is safe.
+        // **The Cyrillic combining marks, ALL of them.** U+0483..U+0489 was
+        // added because `"Ian Cla\u{0483}rke"` EVADED while `U+0300` was
+        // caught, and the rest of the same family was left behind — so
+        // `"Ian Cla\u{A66F}rke"` (VZMET, which sits immediately before the
+        // U+A670 range `is_display_hidden` already strips) evaded in exactly
+        // the same way. Closing a family one codepoint at a time is how the
+        // hole reopens; these are now the complete Mn/Me Cyrillic set:
+        // U+0483..U+0489, the Combining Cyrillic Letters block
+        // (U+2DE0..U+2DFF), and U+A66F plus U+A674..U+A67D.
+        //
+        // They are historic and liturgical ornaments and superscript letters,
+        // not part of how any modern Cyrillic name is spelled, so folding them
+        // is safe.
         //
         // Hebrew niqqud, Arabic harakat and Indic/Thai vowel signs are still
         // NOT here, deliberately: in those scripts marks are far more often
         // meaning-bearing, and widening the strip would start flagging real
         // people in scripts this repo has no corpus for. See the module header.
         0x0483..=0x0489
+        | 0x2DE0..=0x2DFF // Combining Cyrillic Letters
+        | 0xA66F | 0xA674..=0xA67D // vzmet, combining Cyrillic letters, kavyka, payerok
         | 0x0300..=0x036F   // Combining Diacritical Marks
         | 0x1AB0..=0x1AFF // Combining Diacritical Marks Extended
         | 0x1DC0..=0x1DFF // Combining Diacritical Marks Supplement
@@ -2350,6 +2470,94 @@ mod tests {
                 strip_latin_accent(own_letter),
                 None,
                 "{own_letter:?} is a letter in its own right"
+            );
+        }
+    }
+
+    /// **Whole-block coverage where the file previously folded one or two
+    /// letters out of a block.** Lisu had 2 of 26, Cherokee 1 of 35, and four
+    /// Coptic lowercase letters were missing while their capitals folded.
+    ///
+    /// Partial coverage reads like a judgement and is not one: the comment
+    /// justifying the two Lisu entries ("designed FROM Latin capitals, so its
+    /// letters are Latin letterforms outright") applies to the whole block, so
+    /// the other 24 were an oversight that spelled a moderator's name in
+    /// characters nothing folded.
+    #[test]
+    fn partially_covered_blocks_are_now_complete() {
+        for (label, attacker, real) in [
+            (
+                "Lisu, whole name",
+                "\u{A4F2}\u{A4EE}\u{A4E0} \u{A4DA}\u{A4E1}\u{A4EE}\u{A4E3}\u{A4D7}\u{A4F0}",
+                "Ian Clarke",
+            ),
+            ("Lisu R", "Ian Cla\u{A4E3}ke", "Ian Clarke"),
+            ("Lisu N", "Ia\u{A4E0} Clarke", "Ian Clarke"),
+            (
+                "Cherokee, whole name",
+                "\u{13A2}\u{13AA}\u{13C0} \u{13DF}\u{13DE}\u{13AA}\u{13D2}\u{13E6}\u{13AC}",
+                "Tag Clarke",
+            ),
+            ("Cherokee R", "Ian Cla\u{13D2}ke", "Ian Clarke"),
+            ("Cherokee W", "\u{13B3}illiam", "William"),
+            ("Coptic small eie", "Ian Clark\u{2C89}", "Ian Clarke"),
+            ("Coptic small kapa", "Ian Clar\u{2C95}e", "Ian Clarke"),
+            ("Coptic small ni", "Ia\u{2C9B} Clarke", "Ian Clarke"),
+            ("Coptic small iauda", "\u{2C93}nvite Bot", "invite Bot"),
+        ] {
+            let checker = ImpersonationChecker::new(vec![ProtectedName::new(
+                ProtectedRole::Deputy,
+                real,
+                mid(1),
+            )]);
+            let w = checker
+                .check(mid(2), attacker)
+                .unwrap_or_else(|| panic!("{label}: {attacker:?} vs {real:?}"));
+            assert_eq!(w.tier, ConfusableTier::Identical, "{label}");
+        }
+
+        // The Lisu letters UTR39 does NOT list are ROTATED or MIRRORED Latin
+        // capitals, not upright ones. They stay unfolded — folding them would
+        // be inventing a confusable from a chart glance.
+        for rotated in [
+            '\u{A4D5}', // THA
+            '\u{A4D8}', // KHA
+            '\u{A4DB}', // CHA
+            '\u{A4E5}', // NGA
+            '\u{A4EF}', // AE
+            '\u{A4F1}', // EU
+        ] {
+            assert_eq!(
+                fold_homoglyph(rotated),
+                rotated,
+                "{rotated:?} is a rotated Latin form and is absent from UTR39"
+            );
+        }
+    }
+
+    /// **The Cyrillic combining family, closed.** `0x0483..=0x0489` was added
+    /// when `"Ian Cla\u{0483}rke"` evaded; the rest of the same family was
+    /// left, so `"Ian Cla\u{A66F}rke"` evaded in exactly the same way —
+    /// U+A66F sits immediately before the U+A670..A672 range
+    /// `is_display_hidden` already strips.
+    #[test]
+    fn the_whole_cyrillic_combining_family_is_stripped() {
+        for mark in [
+            '\u{0483}', // titlo
+            '\u{0487}', // pokrytie
+            '\u{A66F}', // vzmet
+            '\u{A674}', // combining Ukrainian ie
+            '\u{A67C}', // kavyka
+            '\u{A67D}', // payerok
+            '\u{2DE0}', // combining Cyrillic be
+            '\u{2DFF}', // combining iotified big yus
+        ] {
+            let spoofed = format!("Ian Cla{mark}rke");
+            assert_eq!(
+                skeleton(&spoofed),
+                skeleton("Ian Clarke"),
+                "a combining mark a reader barely registers defeated the fold: \
+                 {mark:?}"
             );
         }
     }

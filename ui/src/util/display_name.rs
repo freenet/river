@@ -133,6 +133,68 @@ pub const UNKNOWN_MEMBER: &str = "Unknown";
 /// user gets the same explanation wherever they hit it.
 pub const EMOJI_REJECTION_MESSAGE: &str = "Nicknames can't contain emoji";
 
+/// Unicode general category `Cf` (Format): every character whose whole job is
+/// to be invisible and change how neighbouring text is laid out.
+///
+/// **Generated from Unicode 15.0 data, not hand-listed.** The list above grew
+/// one codepoint at a time as each was noticed, and the result had the exact
+/// signature of that process: U+06DE was in it but U+06DD was not; U+0488/U+0489
+/// were covered but U+0890/U+0891 were not. Thirteen `Cf` codepoints survived
+/// BOTH the sanitiser and the confusable fold — U+0600..U+0605, U+06DD, U+070F,
+/// U+0890, U+0891, U+08E2, U+110BD, U+110CD and U+13430..U+1343F — and because
+/// `is_display_hidden` also gates [`sanitize_display_name`], they survived into
+/// the RENDERED nickname. `Ian\u{070F} Clarke` is not merely a fold miss; it is
+/// a pixel-identical clone of another member's displayed name.
+///
+/// Regenerate by sweeping `0..0x110000` for `unicodedata.category(chr(cp)) ==
+/// 'Cf'` and collapsing to ranges; 170 codepoints in 21 ranges as of Unicode
+/// 15.0. `every_format_character_is_hidden` pins a representative of each range.
+///
+/// ## The other invisible categories
+///
+/// * `Cs` (surrogates) cannot exist in a Rust `char`, so there is nothing to do.
+/// * `Co` (private use) is covered by the PUA ranges in [`is_display_hidden`].
+/// * `Cn` (unassigned) is deliberately NOT covered. An unassigned codepoint
+///   renders as a visible replacement box, not as nothing, so it does not clone
+///   anyone's name — and the set SHRINKS with every Unicode release, so a frozen
+///   `Cn` table would start stripping newly-assigned letters out of real names.
+///   That is the one direction of error this module must not have.
+///
+/// ## The two exceptions, which are the same ones as everywhere else
+///
+/// U+200C ZWNJ and U+200D ZWJ are `Cf` and are deliberately NOT reported. They
+/// are orthography in Persian, Sinhala and Malayalam, and stripping them at
+/// RENDER time mangles real names — the reasoning is on the `0x200B` entry
+/// below. `crate::util::confusable::skeleton` drops them anyway, because
+/// comparison is not rendering.
+fn is_format_control(c: char) -> bool {
+    if c == '\u{200C}' || c == '\u{200D}' {
+        return false;
+    }
+    matches!(u32::from(c),
+        0x00AD                  // SOFT HYPHEN
+        | 0x0600..=0x0605       // ARABIC NUMBER SIGN..ARABIC NUMBER MARK ABOVE
+        | 0x061C                // ARABIC LETTER MARK
+        | 0x06DD                // ARABIC END OF AYAH
+        | 0x070F                // SYRIAC ABBREVIATION MARK
+        | 0x0890..=0x0891       // ARABIC POUND/PIASTRE MARK ABOVE
+        | 0x08E2                // ARABIC DISPUTED END OF AYAH
+        | 0x180E                // MONGOLIAN VOWEL SEPARATOR
+        | 0x200B..=0x200F       // ZWSP, ZWNJ, ZWJ, LRM, RLM (joiners excepted above)
+        | 0x202A..=0x202E       // bidi embedding / override
+        | 0x2060..=0x2064       // word joiner, invisible operators
+        | 0x2066..=0x206F       // bidi isolates, deprecated formatting
+        | 0xFEFF                // ZERO WIDTH NO-BREAK SPACE / BOM
+        | 0xFFF9..=0xFFFB       // interlinear annotation anchors
+        | 0x110BD | 0x110CD     // KAITHI NUMBER SIGN, ...ABOVE
+        | 0x13430..=0x1343F     // Egyptian hieroglyph format controls
+        | 0x1BCA0..=0x1BCA3     // shorthand format controls
+        | 0x1D173..=0x1D17A     // musical beam/slur/phrase controls
+        | 0xE0001               // LANGUAGE TAG
+        | 0xE0020..=0xE007F     // TAG SPACE..CANCEL TAG
+    )
+}
+
 /// Whether `c` must never appear in rendered display text.
 ///
 /// Ranges are Unicode *blocks* rather than the `Emoji` character property:
@@ -145,6 +207,11 @@ pub fn is_display_hidden(c: char) -> bool {
     // Control characters (C0/C1). A newline or NUL in a nickname is never
     // legitimate and breaks layout.
     if c.is_control() {
+        return true;
+    }
+    // Every Unicode FORMAT character, by category rather than by whichever ones
+    // someone happened to hit. See [`is_format_control`].
+    if is_format_control(c) {
         return true;
     }
 
@@ -495,6 +562,53 @@ mod tests {
     /// The badge glyphs River itself renders. A nickname able to display any
     /// of these can impersonate a moderator, the room owner, or "you".
     const BADGE_GLYPHS: &[&str] = &["🛡", "👑", "⭐", "🔑", "🎪", "✅", "⚠", "🔰", "⚔"];
+
+    /// Every Unicode `Cf` FORMAT character must be hidden, because
+    /// `is_display_hidden` gates the sanitiser: one that survives is not merely
+    /// a fold miss, it renders as nothing inside the nickname and clones
+    /// another member's displayed name exactly.
+    ///
+    /// One representative from each of the 21 ranges (the whole range where it
+    /// is short), so a range dropped from [`is_format_control`] fails here.
+    /// The specific codepoints called out below are the ones that survived
+    /// BOTH this sanitiser and the confusable fold before the list was
+    /// generated rather than hand-extended.
+    #[test]
+    fn every_format_character_is_hidden() {
+        for cp in [
+            0x00ADu32, 0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605, 0x061C, 0x06DD, 0x070F,
+            0x0890, 0x0891, 0x08E2, 0x180E, 0x200B, 0x200E, 0x200F, 0x202A, 0x202E, 0x2060, 0x2064,
+            0x2066, 0x206F, 0xFEFF, 0xFFF9, 0xFFFB, 0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0,
+            0x1BCA3, 0x1D173, 0x1D17A, 0xE0001, 0xE0020, 0xE007F,
+        ] {
+            let c = char::from_u32(cp).expect("a valid codepoint");
+            assert!(
+                is_display_hidden(c),
+                "U+{cp:04X} is a Cf format character and renders as nothing, so \
+                 it must never survive into a displayed nickname"
+            );
+        }
+
+        // The two deliberate exceptions survive, exactly as before: they are
+        // orthography in Persian, Sinhala and Malayalam.
+        assert!(!is_display_hidden('\u{200C}'));
+        assert!(!is_display_hidden('\u{200D}'));
+
+        // The end-to-end property: a name carrying one of these must not
+        // render identically to the plain one. Both of these used to.
+        for hidden in ['\u{070F}', '\u{13437}', '\u{06DD}', '\u{0890}', '\u{110BD}'] {
+            let spoofed = format!("Ian{hidden} Clarke");
+            assert!(
+                contains_hidden_chars(&spoofed),
+                "{spoofed:?} must be reported as containing hidden characters"
+            );
+            assert_eq!(
+                sanitize_display_name(&spoofed),
+                "Ian Clarke",
+                "{spoofed:?} rendered as a pixel-identical clone of `Ian Clarke`"
+            );
+        }
+    }
 
     #[test]
     fn badge_glyphs_cannot_survive_a_nickname() {
