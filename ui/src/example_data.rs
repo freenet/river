@@ -48,12 +48,26 @@ const DEEP_HISTORY_FILLER_MESSAGES: usize = 188;
 /// has its own dedicated fixture room below).
 const DEEP_ROOM_MAX_RECENT_MESSAGES: usize = 300;
 
-/// Fillers for the AT-CAP fixture room: 88 + the 12 standard messages lands
-/// exactly on the default `max_recent_messages` (100), so every delivered
-/// arrival drains the oldest message — the steady state of every busy
-/// production room, and the index-shift regression surface of #505 blocker 1.
-/// `at_cap_room_is_exactly_at_its_message_cap` pins the arithmetic.
-const AT_CAP_FILLER_MESSAGES: usize = 88;
+/// Fillers for the AT-CAP fixture room: 148 + the 12 standard messages lands
+/// exactly on that room's `max_recent_messages`
+/// ([`AT_CAP_MAX_RECENT_MESSAGES`]), so every delivered arrival drains the
+/// oldest message — the steady state of every busy production room, and the
+/// index-shift regression surface of #505 blocker 1.
+///
+/// These fillers come in same-author PAIRS (AABB…), NOT alternating: paired
+/// consecutive messages fold into MULTI-message display groups, which is the
+/// dominant production message shape and the one the #505 re-review blocker
+/// lives in — draining the first message of a multi-message head group
+/// RE-KEYS the group (a group's key is its first message's id). A strictly
+/// alternating fixture is blind to that by construction. 148 paired fillers =
+/// 74 display items, still comfortably past the 60-item window;
+/// `at_cap_room_is_exactly_at_its_message_cap` pins all of it.
+const AT_CAP_FILLER_MESSAGES: usize = 148;
+
+/// `max_recent_messages` for the at-cap room. Raised from the default 100 so
+/// the room can hold enough PAIRED fillers to exceed the render window in
+/// display items (pairs halve the item count) while sitting exactly at cap.
+const AT_CAP_MAX_RECENT_MESSAGES: usize = 160;
 
 /// How deep a fixture room's message history is seeded.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -192,12 +206,16 @@ fn create_room(
         description: description.map(|d| SealedBytes::public(d.as_bytes().to_vec())),
     };
     config.owner_member_id = owner_id;
-    if history_depth == HistoryDepth::Deep {
+    match history_depth {
+        HistoryDepth::Standard => {}
         // Headroom over the 200 seeded messages so the specs can deliver
         // arrival batches without the at-cap prune shifting the fixture out
-        // from under them. The AT-CAP room keeps the default (100) — landing
-        // exactly on it is its entire purpose.
-        config.max_recent_messages = DEEP_ROOM_MAX_RECENT_MESSAGES;
+        // from under them.
+        HistoryDepth::Deep => config.max_recent_messages = DEEP_ROOM_MAX_RECENT_MESSAGES,
+        // Landing EXACTLY on the cap is this room's entire purpose; the cap
+        // is raised so paired fillers still exceed the render window in
+        // display items.
+        HistoryDepth::AtCap => config.max_recent_messages = AT_CAP_MAX_RECENT_MESSAGES,
     }
     room_state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
 
@@ -438,17 +456,25 @@ fn add_example_messages(
 
     // Deep-history fixtures: filler messages AHEAD of the standard fixture so
     // the room's display-item count comfortably exceeds the render window.
-    // Authors strictly alternate — consecutive same-author messages within
-    // five minutes fold into one display item, so alternation is what makes
-    // "N messages" mean "N display items". Deterministic content and fixed
-    // 60s gaps: nothing here should vary run to run.
+    // Deep-room authors strictly ALTERNATE — consecutive same-author messages
+    // within five minutes fold into one display item, so alternation makes
+    // "N messages" mean "N display items". The AT-CAP room's authors come in
+    // PAIRS (AABB…) instead: two-message display groups are the dominant
+    // production shape, and a drained first message RE-KEYING its group is
+    // the #505 re-review blocker an alternating fixture cannot see.
+    // Deterministic content and fixed 60s gaps: nothing here varies run to
+    // run.
     let filler_count = match history_depth {
         HistoryDepth::Standard => 0,
         HistoryDepth::Deep => DEEP_HISTORY_FILLER_MESSAGES,
         HistoryDepth::AtCap => AT_CAP_FILLER_MESSAGES,
     };
     for i in 0..filler_count {
-        let (author_id, signing_key) = authors[i % 2.min(authors.len())];
+        let author_slot = match history_depth {
+            HistoryDepth::AtCap => (i / 2) % 2,
+            _ => i % 2,
+        };
+        let (author_id, signing_key) = authors[author_slot.min(authors.len() - 1)];
         let msg = AuthorizedMessageV1::new(
             MessageV1 {
                 room_owner: *owner_id,
@@ -785,7 +811,11 @@ mod tests {
     /// The at-cap fixture must land EXACTLY on its message cap: one message
     /// under and arrivals do not prune (blocker-1's index shift never
     /// happens); one over and `create_room`'s verify sees a state
-    /// `apply_delta` would never produce.
+    /// `apply_delta` would never produce. Its fillers must come in
+    /// same-author PAIRS — multi-message display groups are what makes an
+    /// at-cap drain RE-KEY the head group (#505 re-review blocker) — while
+    /// still exceeding the render window in display ITEMS (pairs halve the
+    /// item count).
     #[test]
     fn at_cap_room_is_exactly_at_its_message_cap() {
         let room = create_room(
@@ -801,16 +831,32 @@ mod tests {
             "the capped room must sit exactly at max_recent_messages so every \
              delivered arrival drains the oldest message (#505 blocker 1)"
         );
-        // And it is still deeper than the render window, so the windowed
-        // premise assertions hold for this room too.
-        assert!(state.recent_messages.messages.len() > 60);
-        for pair in state.recent_messages.messages[..AT_CAP_FILLER_MESSAGES].windows(2) {
-            assert_ne!(
+        // Paired fillers: within a pair the author repeats (the messages fold
+        // into ONE multi-message display group); across pairs it changes (the
+        // groups stay distinct).
+        let fillers = &state.recent_messages.messages[..AT_CAP_FILLER_MESSAGES];
+        for pair in fillers.chunks(2) {
+            assert_eq!(
                 pair[0].message.author, pair[1].message.author,
-                "adjacent fillers share an author and would merge into one \
-                 display item"
+                "a filler pair must share its author, or no display group has \
+                 more than one message and the re-key path is untestable"
             );
         }
+        for boundary in fillers.chunks(2).collect::<Vec<_>>().windows(2) {
+            assert_ne!(
+                boundary[0][0].message.author, boundary[1][0].message.author,
+                "adjacent pairs must differ in author, or they merge into one \
+                 display item and the item count collapses"
+            );
+        }
+        // Still deeper than the render window in display ITEMS, so the
+        // windowed premise assertions hold for this room too.
+        assert!(
+            AT_CAP_FILLER_MESSAGES / 2 > 60,
+            "paired fillers must still exceed INITIAL_WINDOW_ITEMS display \
+             items or the windowing specs quietly degrade to the small-room \
+             path"
+        );
     }
 
     #[test]

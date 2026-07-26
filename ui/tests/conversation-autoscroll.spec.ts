@@ -654,6 +654,64 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     ).toBeLessThanOrEqual(2);
   });
 
+  test("a batched at-cap drain does not crawl a parked reader (re-keyed head group)", async ({
+    page,
+  }) => {
+    // The capped room's fillers come in same-author PAIRS, so its display
+    // groups hold two messages — the dominant production shape. A batch of
+    // 61 arrivals drains 61 messages: ~30 whole pairs past the window head,
+    // plus one half-pair that RE-KEYS the group at the drain boundary (a
+    // group's key is its first message's id — the new key exists in no
+    // pre-patch row). The window must re-anchor on the surviving neighbors
+    // (spare keys) and the reposition must measure through a surviving row
+    // (probe walk), or the parked reader's view is torn away (#505
+    // re-review blocker).
+    //
+    // No scrollTop-stability assertion here, deliberately: the compensation
+    // MOVES scrollTop to hold the CONTENT still. The probed row's rect is
+    // the thing that must not move.
+    await openRoomAtBottom(page, CAPPED_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    const mid = Math.floor((await historyHeight(page)) / 2);
+    await readerScrollsTo(page, mid);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    const probe = await tagVisibleRow(page, "__riverProbeBatch");
+    expect(
+      probe,
+      "premise: a rendered row should be visible mid-history"
+    ).not.toBeNull();
+
+    const beforeBatch = await renderedRowCount(page);
+    await page.evaluate(() => (window as any).__riverTest.appendMessages(61));
+    // The batch landed and the SURVIVING remainder of the old window is still
+    // rendered (the arrivals alone add 61 rows; losing the survivors would
+    // shrink the count back toward the window size).
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message:
+          "premise: the batch should land with the surviving window rows kept",
+      })
+      .toBeGreaterThan(beforeBatch + 30);
+    // Let scroll events from the reposition settle before measuring.
+    await page.waitForTimeout(300);
+
+    const after = await taggedRowTop(page, "__riverProbeBatch");
+    expect(
+      after,
+      "the probed row left the DOM — the window lost the surviving rows " +
+        "under a parked reader"
+    ).not.toBeNull();
+    expect(
+      Math.abs(after! - probe!),
+      "content moved under a parked reader across a batched at-cap drain"
+    ).toBeLessThanOrEqual(3);
+  });
+
   test("backfill paging reveals older history and keeps the reader's place", async ({
     page,
   }) => {
