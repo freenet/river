@@ -154,10 +154,15 @@ fn get_current_room_name() -> Option<String> {
 
 /// Count unread messages in a single room's [`RoomData`].
 ///
-/// Counts display messages (non-action, non-deleted) authored by other
-/// users that fall after `last_read_message_id`. Pure — takes a borrowed
-/// `RoomData` so callers that already hold a `ROOMS` read guard (the
-/// room-list badge memo, the title's cross-room sum) don't re-lock.
+/// Counts display messages (non-action, non-deleted, non-event) authored
+/// by other users that fall after `last_read_message_id`. Pure — takes a
+/// borrowed `RoomData` so callers that already hold a `ROOMS` read guard
+/// (the room-list badge memo, the title's cross-room sum) don't re-lock.
+///
+/// Room-event messages (`CONTENT_TYPE_EVENT`, e.g. "X joined the room")
+/// are shown by `display_messages()` but deliberately excluded here
+/// (freenet/river#500): they are ambient activity, not something waiting
+/// to be read, so they must not inflate the badge or title counts.
 ///
 /// The marker is located in the full ordered message list, not the
 /// display-filtered view: a last-read message that was later *deleted* is
@@ -185,9 +190,12 @@ pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usiz
 
     recent.messages[start..]
         .iter()
-        // Mirror `MessagesV1::display_messages`: skip action and deleted msgs.
+        // Mirror `MessagesV1::display_messages` (skip action and deleted
+        // msgs), plus skip room events — see the doc comment above.
         .filter(|m| {
-            !m.message.content.is_action() && !recent.actions_state.deleted.contains(&m.id())
+            !m.message.content.is_action()
+                && !m.message.content.is_event()
+                && !recent.actions_state.deleted.contains(&m.id())
         })
         .filter(|m| m.message.author != self_member_id)
         .count()
@@ -582,16 +590,32 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};
 
-    /// Build a signed display message from `author_sk`, distinct per `n`.
-    fn msg(author_sk: &SigningKey, owner_vk: &VerifyingKey, n: u64) -> AuthorizedMessageV1 {
+    /// Build a signed message from `author_sk` with an arbitrary body,
+    /// distinct per `n` (the timestamp orders the buffer).
+    fn msg_with_body(
+        author_sk: &SigningKey,
+        owner_vk: &VerifyingKey,
+        n: u64,
+        content: RoomMessageBody,
+    ) -> AuthorizedMessageV1 {
         AuthorizedMessageV1::new(
             MessageV1 {
                 room_owner: MemberId::from(owner_vk),
                 author: MemberId::from(&author_sk.verifying_key()),
-                content: RoomMessageBody::public(format!("message {n}")),
+                content,
                 time: UNIX_EPOCH + Duration::from_secs(n),
             },
             author_sk,
+        )
+    }
+
+    /// Build a signed display (text) message from `author_sk`, distinct per `n`.
+    fn msg(author_sk: &SigningKey, owner_vk: &VerifyingKey, n: u64) -> AuthorizedMessageV1 {
+        msg_with_body(
+            author_sk,
+            owner_vk,
+            n,
+            RoomMessageBody::public(format!("message {n}")),
         )
     }
 
@@ -704,6 +728,24 @@ mod tests {
     }
 
     #[test]
+    fn event_messages_are_not_counted() {
+        // freenet/river#500: room-event messages ("X joined the room",
+        // CONTENT_TYPE_EVENT) are ambient activity, not something to read —
+        // they must not inflate the unread badge. A "3" badge that is 2
+        // messages plus a join overstates what's waiting for the user.
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            msg_with_body(&owner_sk, &owner_vk, 2, RoomMessageBody::join_event()),
+            msg(&owner_sk, &owner_vk, 3),
+        ];
+        let rd = room(self_sk, owner_vk, messages, None);
+        // 3 other-authored messages, 1 is a join event → 2 unread.
+        assert_eq!(count_unread_in_room_data(&rd), 2);
+    }
+
+    #[test]
     fn deleted_messages_are_not_counted() {
         // `display_messages` filters deleted messages; the helper must too.
         let (self_sk, _) = keypair();
@@ -765,8 +807,11 @@ mod tests {
     fn helper_agrees_with_display_messages_filter() {
         // Drift guard: the helper hand-mirrors `MessagesV1::display_messages`'s
         // action/deleted filter. With no marker, the count must equal
-        // `display_messages()` filtered to other authors — if the two
-        // predicates ever diverge, this fails.
+        // `display_messages()` filtered to other authors AND to non-event
+        // messages — the ONE deliberate divergence from `display_messages()`
+        // is that room events render in the conversation but never count as
+        // unread (freenet/river#500). If the predicates drift further, this
+        // fails.
         let (self_sk, self_vk) = keypair();
         let (owner_sk, owner_vk) = keypair();
         let self_id: MemberId = (&self_vk).into();
@@ -774,6 +819,7 @@ mod tests {
             msg(&owner_sk, &owner_vk, 1),
             msg(&owner_sk, &owner_vk, 2),
             msg(&self_sk, &owner_vk, 3),
+            msg_with_body(&owner_sk, &owner_vk, 4, RoomMessageBody::join_event()),
         ];
         let deleted = messages[1].id();
         let mut rd = room(self_sk, owner_vk, messages, None);
@@ -786,7 +832,7 @@ mod tests {
             .room_state
             .recent_messages
             .display_messages()
-            .filter(|m| m.message.author != self_id)
+            .filter(|m| m.message.author != self_id && !m.message.content.is_event())
             .count();
         assert_eq!(count_unread_in_room_data(&rd), expected);
     }
