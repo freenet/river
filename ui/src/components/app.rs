@@ -99,6 +99,13 @@ pub fn App() -> Element {
     // Must be called from within a Dioxus component where the runtime is active.
     crate::util::capture_runtime();
 
+    // Playwright's inbound-message hooks. `example-data` builds that also have
+    // sync switched off, and nothing else — the hooks mint messages signed by a
+    // non-member key, so they must never reach a real node. See
+    // `example_data::install_test_hooks`.
+    #[cfg(all(feature = "example-data", feature = "no-sync"))]
+    crate::example_data::install_test_hooks();
+
     // In the gateway iframe, notifications are shown by the shell page; listen
     // for its `notification_click` replies to route to the clicked room
     // (freenet/river#408). No-op when served as a top-level page. Installs once.

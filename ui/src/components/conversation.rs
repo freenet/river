@@ -1,7 +1,9 @@
 use crate::components::app::document_title::count_unread_behind_rooms_panel;
 #[cfg(target_arch = "wasm32")]
 use crate::components::app::notifications::request_permission_on_first_message;
-use crate::components::app::receive_times::{format_delay, get_delay_secs};
+use crate::components::app::receive_times::{
+    first_seen_ms, format_delay, get_delay_secs_from, ReceiveTimes,
+};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{
     MobileView, CURRENT_ROOM, EDIT_ROOM_MODAL, MEMBER_INFO_MODAL, MOBILE_VIEW, NOTIFICATION_MODAL,
@@ -104,7 +106,9 @@ struct MessageGroup {
     author_impersonation: Option<ImpersonationWarning>,
     is_self: bool,
     first_time: DateTime<Utc>,
-    /// True if any message in this group had a future timestamp that was clamped
+    /// True if any message in this group carried a sender timestamp later than
+    /// when we received it, by more than [`CLOCK_SKEW_TOLERANCE_SECS`], and was
+    /// therefore clamped back to its arrival time.
     time_clamped: bool,
     /// Propagation delay for the first message in the group (shown in header)
     first_delay_secs: Option<i64>,
@@ -117,7 +121,10 @@ struct GroupedMessage {
     content_html: String,
     #[allow(dead_code)]
     time: DateTime<Utc>,
-    /// True if the original timestamp was in the future and was clamped to now
+    /// True if the sender's timestamp ran ahead of when we received this
+    /// message and was clamped back to that arrival time. (It is clamped to
+    /// ARRIVAL, not to "now": see [`MessageClock`] for why the render's wall
+    /// clock cannot be the target.)
     #[allow(dead_code)]
     time_clamped: bool,
     id: String,
@@ -440,8 +447,55 @@ fn resolve_member_nickname(
         .unwrap_or_else(|| crate::util::display_name::UNKNOWN_MEMBER.to_string())
 }
 
+/// How far a sender's timestamp may run ahead of when we received the message
+/// before we stop believing it.
+///
+/// Not zero. The clamp target used to be `Utc::now()` at render time, which
+/// carried the whole propagation delay as implicit slack; the target is now
+/// arrival time, which has none, so a bare `>` would flag EVERY message from
+/// any peer whose clock is a few seconds fast — and a few seconds of skew
+/// between two ordinary machines is normal. A minute is roughly where the
+/// rendered `HH:MM` would start disagreeing with reality, which is the point at
+/// which telling the reader the timestamp is untrustworthy earns its keep.
+const CLOCK_SKEW_TOLERANCE_SECS: i64 = 60;
+
+/// What a grouping pass knows about time.
+///
+/// Both fields are read once for the whole pass. That is the point: reading
+/// the clock per message made the grouping of a clock-skewed message depend on
+/// exactly when the render happened, so it changed under the reader.
+#[derive(Clone, Copy)]
+struct MessageClock<'a> {
+    /// When this client first saw each message — see [`ReceiveTimes`].
+    receive_times: &'a ReceiveTimes,
+    /// Clamp target for a message with no recorded arrival time.
+    fallback_now: DateTime<Utc>,
+}
+
+impl MessageClock<'_> {
+    /// The latest time `message_id` is allowed to claim.
+    fn clamp_target(&self, message_id: &MessageId) -> DateTime<Utc> {
+        first_seen_ms(self.receive_times, message_id)
+            .and_then(|ms| DateTime::<Utc>::from_timestamp_millis(ms as i64))
+            .unwrap_or(self.fallback_now)
+    }
+}
+
 /// Group consecutive messages from the same sender within 5 minutes,
 /// and summarize consecutive event messages (e.g. joins).
+///
+/// A message whose sender-supplied timestamp runs ahead of when we received it
+/// (a skewed remote clock) is clamped, because an hour-ahead timestamp would
+/// otherwise group and date-separate as if it were an hour in the future — and
+/// would then move again on every single render, since the old clamp target was
+/// `Utc::now()` read fresh inside this loop. (Nothing here sorts: the display
+/// order is the stored order, via `display_messages`.) Clamping to when THIS
+/// client first saw the message
+/// (`RECEIVE_TIMES`, first-seen-wins and persisted in localStorage) makes the
+/// result idempotent: the same input produces the same grouping on every
+/// render, which is what `2cb49ec11` set out to do. `fallback_now` covers a
+/// message with no recorded arrival — the same behaviour as before, but read
+/// once for the whole pass rather than once per message.
 fn group_messages(
     messages_state: &MessagesV1,
     member_info: &MemberInfoV1,
@@ -458,6 +512,7 @@ fn group_messages(
     // The room owner, so an author line can tell whether the member it is
     // flagging holds privilege themselves — see `privilege_in_view`.
     owner_id: MemberId,
+    clock: MessageClock<'_>,
 ) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
@@ -471,11 +526,16 @@ fn group_messages(
     // Only iterate over displayable messages (non-deleted, non-action)
     for message in messages_state.display_messages() {
         let author_id = message.message.author;
-        let now = Utc::now();
-        let raw_time = DateTime::<Utc>::from(message.message.time);
-        let time_clamped = raw_time > now;
-        let message_time = if time_clamped { now } else { raw_time };
         let message_id = message.id();
+        let raw_time = DateTime::<Utc>::from(message.message.time);
+        // Clamp target: when we first saw it, else the pass-wide "now".
+        let clamp_to = clock.clamp_target(&message_id);
+        // `checked_add_signed` rather than `+`: `clamp_to` can come from
+        // persisted storage, and chrono's `Add` panics at the end of its range.
+        let time_clamped = clamp_to
+            .checked_add_signed(chrono::Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS))
+            .is_some_and(|limit| raw_time > limit);
+        let message_time = if time_clamped { clamp_to } else { raw_time };
 
         let author_name = resolve_member_nickname(member_info, author_id, secrets);
 
@@ -534,7 +594,8 @@ fn group_messages(
 
         // Look up propagation delay (send time → receive time)
         let send_time_ms = raw_time.timestamp_millis();
-        let receive_delay_secs = get_delay_secs(&message_id, send_time_ms);
+        let receive_delay_secs =
+            get_delay_secs_from(clock.receive_times, &message_id, send_time_ms);
 
         let grouped_message = GroupedMessage {
             content_text: content_text.clone(),
@@ -1300,6 +1361,234 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
     Some(format!("freenet:{id_prefix}{suffix}"))
 }
 
+/// How close to the end of the history (in px) still counts as "at the bottom".
+///
+/// Shared by the scroll-to-latest button's IntersectionObserver `rootMargin`
+/// and by the pin flag, so the two agree about where the bottom is.
+#[cfg(target_arch = "wasm32")]
+const BOTTOM_THRESHOLD_PX: f64 = 100.0;
+
+/// Trailing delay used to spot a scroll settling on browsers with no
+/// `scrollend` event (Safari before 17.4).
+#[cfg(target_arch = "wasm32")]
+const SCROLL_SETTLE_DEBOUNCE_MS: i32 = 120;
+
+/// Read the chat history's scroll container, if it is currently in the DOM.
+#[cfg(target_arch = "wasm32")]
+fn chat_scroll_container() -> Option<web_sys::Element> {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("chat-scroll-container"))
+}
+
+/// Read the wrapper the history's rows are laid out in.
+#[cfg(target_arch = "wasm32")]
+fn chat_content_wrapper() -> Option<web_sys::Element> {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("chat-content"))
+}
+
+/// The furthest down `container` can be scrolled, in px.
+#[cfg(target_arch = "wasm32")]
+fn max_scroll_top(container: &web_sys::Element) -> i32 {
+    (container.scroll_height() - container.client_height()).max(0)
+}
+
+/// Slack for comparing one scroll offset against another.
+///
+/// `scrollTop` is fractional in every engine while `Element::scroll_top`
+/// rounds, so an exact comparison would report a 1px difference on a view that
+/// never moved. `conversation-autoscroll.spec.ts` is what catches this being
+/// too tight.
+#[cfg(target_arch = "wasm32")]
+const SCROLL_TOP_SLACK_PX: i32 = 2;
+
+/// Has the view moved ABOVE the offset `last_top` records?
+///
+/// `pinned_to_bottom` is only re-measured when a scroll SETTLES, so between the
+/// reader moving the view and their `scrollend` arriving it is stale by design.
+/// Everything that scrolls on the strength of that flag has to consult this
+/// too, or it drags the reader back down inside that window. The interleaving
+/// is ordinary rather than contrived — a message arriving, or a layout settling,
+/// while the reader is scrolling up — and it reproduced on Firefox, WebKit and
+/// mobile Safari, where the reader reached the top of the history and the view
+/// snapped back within a few milliseconds.
+///
+/// This is deliberately NOT a re-measurement of "is the end on screen": that
+/// question is what latched in the first place (#486). It only ever answers
+/// "has the position moved since we last knew what it was", which cannot latch,
+/// because every settle refreshes `last_top`.
+///
+/// Known limit: `last_top` records the offset a scroll ASKED for, so while the
+/// scroll-to-latest button's smooth scroll is animating this reports true and
+/// stands both follow paths down. A message arriving inside that ~300ms window
+/// therefore lands short until the next content change, which corrects it. Only
+/// the button animates; every automatic scroll is instant and lands within the
+/// same task.
+#[cfg(target_arch = "wasm32")]
+fn reader_moved_up_since(last_top: &Rc<std::cell::Cell<i32>>) -> bool {
+    let Some(container) = chat_scroll_container() else {
+        return false;
+    };
+    // Never judge against an offset the container can no longer reach: if the
+    // history shrank, the browser clamped the position down on its own and that
+    // is not the reader moving.
+    let reference = last_top.get().min(max_scroll_top(&container));
+    container.scroll_top() + SCROLL_TOP_SLACK_PX < reference
+}
+
+/// Snap the history to its newest message.
+///
+/// Every programmatic scroll goes through here so two things always happen
+/// together: the pin is re-armed (we are taking the reader to the bottom, so
+/// that is where they now are), and the offset we asked for is recorded. That
+/// offset is what the settle handler compares against to tell OUR scroll's
+/// settle from the reader's, and what a later resize compares against to tell
+/// "content grew underneath us" from "the reader has moved since".
+/// See [`install_scroll_pin_listeners`].
+#[cfg(target_arch = "wasm32")]
+fn scroll_history_to_bottom(
+    pinned: &Rc<std::cell::Cell<bool>>,
+    last_top: &Rc<std::cell::Cell<i32>>,
+    behavior: web_sys::ScrollBehavior,
+) {
+    let Some(container) = chat_scroll_container() else {
+        warn!("chat-scroll-container missing; skipping scroll-to-bottom");
+        return;
+    };
+    pinned.set(true);
+    last_top.set(max_scroll_top(&container));
+    let opts = web_sys::ScrollToOptions::new();
+    opts.set_top(container.scroll_height() as f64);
+    opts.set_behavior(behavior);
+    container.scroll_to_with_scroll_to_options(&opts);
+}
+
+/// Wire up the "the reader is pinned to the newest message" flag.
+///
+/// This flag exists because the scroll-to-latest button's IntersectionObserver
+/// answers a different question: *is the end of the history on screen right
+/// now?* Gating auto-scroll on that answer is freenet/river#486 — anything that
+/// grew the gap past the observer's margin (a burst of arrivals, or merely
+/// growing the composer, which shrinks the container by more than the margin)
+/// switched auto-scroll off, and nothing turned it back on short of a manual
+/// scroll to the bottom or a room switch. The recorded failure ran 54 arrivals
+/// with the view frozen while the gap ratcheted out to roughly three screens.
+///
+/// `pinned` therefore tracks *intent*, and only a settle the reader caused can
+/// clear it. A settle WE caused must not: a smooth auto-scroll that lands short
+/// because more content arrived mid-flight would otherwise read as "the reader
+/// moved away".
+///
+/// Whose settle it is, is decided by POSITION, not by a flag. `last_top` holds
+/// the offset our last scroll asked for; a settle that lands there is ours, and
+/// a settle that lands anywhere else is the reader's. An earlier version raised
+/// a boolean instead, and it could not survive two settles being in flight at
+/// once: clearing a long draft grows the container, the browser clamps
+/// `scrollTop` down on its own, and that clamp's settle was consumed by the
+/// flag our previous scroll had raised. `last_top` then kept pointing at an
+/// offset the view had already left, `reader_moved_up_since` read that as the
+/// reader having scrolled up, and BOTH follow paths stood down — the view sat
+/// 62px short of the newest message and stayed there (observed on mobile
+/// Safari, 12s and counting). A position cannot go stale the way a flag can,
+/// because every settle rewrites it, and it needs no `wheel`/`pointerdown`
+/// listeners to guess at reader intent — which also removes the hole where
+/// Firefox dispatches no pointer event for a native scrollbar drag.
+///
+/// Returns whether the listener was installed; `false` means the container was
+/// not in the DOM yet and the caller should try again.
+#[cfg(target_arch = "wasm32")]
+#[must_use]
+fn install_scroll_pin_listeners(
+    pinned: Rc<std::cell::Cell<bool>>,
+    last_top: Rc<std::cell::Cell<i32>>,
+) -> bool {
+    use wasm_bindgen::prelude::*;
+
+    let Some(container) = chat_scroll_container() else {
+        return false;
+    };
+
+    // Passive throughout: none of these handlers call `preventDefault`, and the
+    // jank this replaces (#151) came from doing work on the scroll path.
+    let passive = web_sys::AddEventListenerOptions::new();
+    passive.set_passive(true);
+
+    // One DOM measurement per settle, not per scroll event.
+    let settle = {
+        let pinned = pinned.clone();
+        let last_top = last_top.clone();
+        Closure::wrap(Box::new(move || {
+            let Some(container) = chat_scroll_container() else {
+                return;
+            };
+            let settled_at = container.scroll_top();
+            let ours = (settled_at - last_top.get()).abs() <= SCROLL_TOP_SLACK_PX;
+            // Where the view ended up is a fact whoever caused it, and it is
+            // what everything else compares against. Recorded before the
+            // `ours` early-out on purpose: the version that only recorded it
+            // for reader settles is what let a stale offset suppress the
+            // follow indefinitely.
+            last_top.set(settled_at);
+            if ours {
+                return;
+            }
+            let distance = container.scroll_height() as f64
+                - settled_at as f64
+                - container.client_height() as f64;
+            pinned.set(distance <= BOTTOM_THRESHOLD_PX);
+        }) as Box<dyn FnMut()>)
+    };
+    let settle_fn: js_sys::Function = settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
+    // Leaked deliberately, on the same reasoning as the IntersectionObserver
+    // below: `Conversation` mounts once for the app's lifetime (rooms are
+    // swapped by CSS, not by unmount) and `use_effect` has no cleanup hook, so
+    // there is nothing to disconnect these from.
+    settle.forget();
+
+    // `scrollend` fires once, when the position has settled. Where it is
+    // missing, a trailing debounce on `scroll` stands in; that listener still
+    // measures nothing per event, it only resets a timer.
+    let has_scrollend =
+        js_sys::Reflect::has(&container, &JsValue::from_str("onscrollend")).unwrap_or(false);
+    if has_scrollend {
+        let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
+            let _ = settle_fn.call0(&JsValue::NULL);
+        }) as Box<dyn FnMut(web_sys::Event)>);
+        let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
+            "scrollend",
+            cb.as_ref().unchecked_ref(),
+            &passive,
+        );
+        cb.forget();
+    } else {
+        let pending: Rc<std::cell::Cell<Option<i32>>> = Rc::new(std::cell::Cell::new(None));
+        let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            if let Some(handle) = pending.take() {
+                window.clear_timeout_with_handle(handle);
+            }
+            if let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                &settle_fn,
+                SCROLL_SETTLE_DEBOUNCE_MS,
+            ) {
+                pending.set(Some(handle));
+            }
+        }) as Box<dyn FnMut(web_sys::Event)>);
+        let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
+            "scroll",
+            cb.as_ref().unchecked_ref(),
+            &passive,
+        );
+        cb.forget();
+    }
+
+    true
+}
+
 #[component]
 pub fn Conversation() -> Element {
     let current_room_data = {
@@ -1316,8 +1605,26 @@ pub fn Conversation() -> Element {
             None
         }
     };
-    let last_chat_element = use_signal(|| None as Option<Rc<MountedData>>);
+    // Drives the scroll-to-latest button only: "is the end of the history on
+    // screen right now?". Auto-scroll is gated on `pinned_to_bottom` below,
+    // which answers the different question this one cannot (#486).
     let mut is_at_bottom = use_signal(|| true);
+    // "The reader wants to stay with the newest message." Plain `Cell`s, not
+    // signals: they are written from raw JS event callbacks that run with no
+    // Dioxus scope on the stack, and nothing renders from them, so there is no
+    // subscriber to notify and no reason to risk the Firefox-mobile panic that
+    // forced the IntersectionObserver's write through `defer` (#402).
+    let pinned_to_bottom = use_hook(|| Rc::new(std::cell::Cell::new(true)));
+    // Where the scroll position was last accounted for: our own scrolls write
+    // the offset they asked for, and every settle overwrites it with where the
+    // view actually came to rest. Two readers depend on it — the settle handler
+    // uses it to tell our own scroll's settle from the reader's, and the
+    // ResizeObserver uses it to tell "content grew underneath us" from "the
+    // reader has moved since", which `pinned_to_bottom` alone cannot answer
+    // until the settle lands. Only the browser has scroll positions, hence the
+    // gate. See `install_scroll_pin_listeners`.
+    #[cfg(target_arch = "wasm32")]
+    let last_scroll_top = use_hook(|| Rc::new(std::cell::Cell::new(0i32)));
     // Which message's touch action menu (kebab) is open, by message ID string.
     // Owned by Conversation (not per message group) so only ONE menu is open at
     // a time across the whole history — opening one closes any other (#402).
@@ -1460,6 +1767,14 @@ pub fn Conversation() -> Element {
                         MemberId::from(&key),
                         &deputy_badges,
                     );
+                    // Borrowed once per pass, not once per message. The old
+                    // per-message `get_delay_secs` read the same global from
+                    // inside the loop, so for any room with messages this is
+                    // the same subscription taken once instead of N times. (A
+                    // room with no displayable messages never reached that read
+                    // and so did not subscribe; now it does. Harmless, and
+                    // noted so the claim is not overstated.)
+                    let receive_times = crate::components::app::receive_times::RECEIVE_TIMES.read();
                     let groups = group_messages(
                         &room_state.recent_messages,
                         &room_state.member_info,
@@ -1469,6 +1784,12 @@ pub fn Conversation() -> Element {
                         &deputy_badges,
                         &impersonation,
                         MemberId::from(&key),
+                        MessageClock {
+                            receive_times: &receive_times,
+                            // One "now" for the whole pass. Only reached by
+                            // messages with no recorded arrival time.
+                            fallback_now: Utc::now(),
+                        },
                     );
                     return Some((groups, self_member_id, member_names));
                 }
@@ -1522,9 +1843,12 @@ pub fn Conversation() -> Element {
 
         let options = web_sys::IntersectionObserverInit::new();
         options.set_root(Some(&root));
-        // Expand detection zone 100px below the viewport edge so the user is
-        // considered "at bottom" when within 100px of the sentinel.
-        options.set_root_margin("0px 0px 100px 0px");
+        // Expand the detection zone below the viewport edge so the user counts
+        // as "at bottom" when within `BOTTOM_THRESHOLD_PX` of the sentinel.
+        // Built from the constant rather than written out, so the button and
+        // the pin cannot drift apart: the doc on `BOTTOM_THRESHOLD_PX` claims
+        // they agree, and this is what makes that true.
+        options.set_root_margin(&format!("0px 0px {BOTTOM_THRESHOLD_PX}px 0px"));
         options.set_threshold(&JsValue::from_f64(0.0));
 
         if let Ok(observer) =
@@ -1539,65 +1863,179 @@ pub fn Conversation() -> Element {
         }
     });
 
-    // Trigger scroll to bottom when recent messages change (only if user is near bottom).
-    // Scroll the chat-scroll-container itself, not the last bubble: scrollIntoView aligns
-    // the bubble's top to the container's top, which can leave the actual bottom (reactions,
-    // sentinel, padding) off-screen. On page refresh this surfaced as scrolling only ~70%
-    // of the way down.
+    // The pin that actually gates auto-scroll. Installed once, in its own
+    // effect, because the listeners must outlive every re-render of the
+    // history. Reading `message_groups` only makes the effect re-runnable, so
+    // a first attempt that found no container yet (nothing rendered) gets
+    // another chance; `installed` is set only on success, so a successful
+    // install is never repeated.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pinned_to_bottom = pinned_to_bottom.clone();
+        let last_scroll_top = last_scroll_top.clone();
+        let installed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+        use_effect(move || {
+            let _retry_on_content_change = message_groups.read().is_some();
+            if installed.get() {
+                return;
+            }
+            if install_scroll_pin_listeners(pinned_to_bottom.clone(), last_scroll_top.clone()) {
+                installed.set(true);
+            }
+        });
+    }
+
+    // Keep the newest message in view when the history grows.
     //
-    // First scroll uses Instant so a page refresh snaps to the bottom rather than animating
-    // a ~500ms scroll from top. Subsequent scrolls (new messages while at bottom) use Smooth.
-    let first_scroll = use_hook(|| Rc::new(std::cell::Cell::new(true)));
-    // Set by the room-change effect below to force the next mount-triggered
-    // scroll regardless of `is_at_bottom` (#402). This decouples the room-switch
-    // snap from `is_at_bottom`, so the IntersectionObserver flipping the signal
-    // to `false` (new room's persisted scroll position) between the room-change
-    // effect and this one can't suppress the snap. A plain `Cell`, not a signal,
+    // Scroll the chat-scroll-container itself, not the last bubble:
+    // scrollIntoView aligns the bubble's top to the container's top, which can
+    // leave the actual bottom (reactions, sentinel, padding) off-screen. On
+    // page refresh this surfaced as scrolling only ~70% of the way down.
+    //
+    // Set by the room-change effect and the send path to force the next scroll
+    // regardless of the pin (#402), so a room switch or your own outgoing
+    // message always lands at the newest message. A plain `Cell`, not a signal,
     // so reading it here does not subscribe.
     let force_scroll = use_hook(|| Rc::new(std::cell::Cell::new(false)));
     use_effect({
-        let first_scroll = first_scroll.clone();
         let force_scroll = force_scroll.clone();
+        let pinned_to_bottom = pinned_to_bottom.clone();
+        // Only the wasm arm below scrolls anything, so on native this clone is
+        // genuinely unused rather than accidentally so.
+        #[cfg(target_arch = "wasm32")]
+        let last_scroll_top = last_scroll_top.clone();
         move || {
-            // Re-run when the last bubble mounts (new messages or initial load).
-            let trigger = last_chat_element();
+            // Re-run on ANY change to the rendered history, not just a remount
+            // of the last bubble. The old trigger was an `onmounted` on the
+            // last message group, which is silent for every content change
+            // that leaves that row in place: a mid-list insert, a reaction, an
+            // edit, or another join folding into an existing "N people joined"
+            // summary (that summary is keyed on its FIRST event, so absorbing
+            // a new one grows it without remounting anything). Subscribing to
+            // the memo is what makes those cases reach this effect at all.
+            let has_content = message_groups.read().is_some();
             let forced = force_scroll.get();
-            let should_scroll = forced || *is_at_bottom.peek();
-            if should_scroll && trigger.is_some() {
-                force_scroll.set(false);
-                let is_first = first_scroll.replace(false);
-                // `behavior` is only used inside the wasm32 block below; on
-                // native it would warn as unused. Gate the binding too so
-                // clippy stays clean across both targets.
-                #[cfg(target_arch = "wasm32")]
-                let behavior = if is_first {
-                    web_sys::ScrollBehavior::Instant
-                } else {
-                    web_sys::ScrollBehavior::Smooth
-                };
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = is_first;
-                #[cfg(target_arch = "wasm32")]
+            if !has_content || !(forced || pinned_to_bottom.get()) {
+                return;
+            }
+            force_scroll.set(false);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let pinned_to_bottom = pinned_to_bottom.clone();
+                let last_scroll_top = last_scroll_top.clone();
+                // Deferred so the scroll measures a container Dioxus has
+                // finished patching, and (per `safe_spawn_local`) so no signal
+                // borrow is live when it runs.
                 crate::util::safe_spawn_local(async move {
-                    let Some(window) = web_sys::window() else {
+                    // A forced scroll — a room switch, or your own outgoing
+                    // message — is an explicit instruction, and nothing below
+                    // may cancel it. Everything else has to survive two
+                    // separate ways of being out of date by the time this
+                    // deferred task actually runs:
+                    //
+                    // 1. the gate above ran BEFORE this task was queued, and a
+                    //    reader `scrollend` can resolve the pin to false in
+                    //    between (measured on Firefox: the gate saw
+                    //    `pinned = true` at 4791ms, the reader's settle cleared
+                    //    it at 4854ms, and this task ran at 4974ms), so the pin
+                    //    is re-read here rather than trusted from then;
+                    // 2. the reader may have moved with their `scrollend` still
+                    //    in flight, so the pin has not caught up at all yet —
+                    //    which is what `reader_moved_up_since` answers.
+                    //
+                    // Neither check subsumes the other, and dropping either one
+                    // reproduces the yank-back on Firefox, WebKit or mobile
+                    // Safari while Chromium stays green.
+                    if !forced
+                        && (!pinned_to_bottom.get() || reader_moved_up_since(&last_scroll_top))
+                    {
                         return;
-                    };
-                    let Some(document) = window.document() else {
-                        return;
-                    };
-                    let Some(container) = document.get_element_by_id("chat-scroll-container")
-                    else {
-                        warn!("chat-scroll-container missing; skipping scroll-to-bottom");
-                        return;
-                    };
-                    let opts = web_sys::ScrollToOptions::new();
-                    opts.set_top(container.scroll_height() as f64);
-                    opts.set_behavior(behavior);
-                    container.scroll_to_with_scroll_to_options(&opts);
+                    }
+                    scroll_history_to_bottom(
+                        &pinned_to_bottom,
+                        &last_scroll_top,
+                        // Instant, not Smooth. The ResizeObserver below reaches
+                        // the same target as soon as layout settles, so an
+                        // animation here would only ever be overtaken by it —
+                        // and a smooth scroll that lands short because more
+                        // content arrived mid-flight is exactly the race the
+                        // pin has to be defended against. Deliberate scrolls
+                        // the reader asks for (the scroll-to-latest button)
+                        // still animate.
+                        web_sys::ScrollBehavior::Instant,
+                    );
                 });
             }
         }
     });
+
+    // Size changes that no re-render can see still have to keep the newest
+    // message in view. `message_groups` covers state changes; this covers
+    // layout ones, and there are two independent kinds:
+    //
+    // * the CONTENT grows or reflows under a fixed window — a late-loading
+    //   image, a web font swapping in, a markdown block rewrapping on a
+    //   narrower screen;
+    // * the WINDOW shrinks over fixed content — which is what growing the
+    //   composer does. That is freenet/river#486's third cause: the composer
+    //   reaching its 168px maximum takes more than the observer's 100px margin
+    //   off the history in one step, with no network activity at all.
+    //   De-latching the gate stops that freezing auto-scroll for good, but on
+    //   its own it still leaves the newest message below the fold until
+    //   something else happens, so the container has to be watched too.
+    //
+    // Watching only the content wrapper misses the second kind entirely: the
+    // container's `clientHeight` changes while the wrapper's box does not.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pinned_to_bottom = pinned_to_bottom.clone();
+        let last_scroll_top = last_scroll_top.clone();
+        let observed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+        use_effect(move || {
+            use wasm_bindgen::prelude::*;
+
+            let _retry_on_content_change = message_groups.read().is_some();
+            if observed.get() {
+                return;
+            }
+            let (Some(content), Some(container)) =
+                (chat_content_wrapper(), chat_scroll_container())
+            else {
+                return;
+            };
+
+            let pinned_to_bottom = pinned_to_bottom.clone();
+            let last_scroll_top = last_scroll_top.clone();
+            let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
+                if !pinned_to_bottom.get() {
+                    return;
+                }
+                // Stand down if the reader has moved since we last knew where
+                // the view was; the settle on its way is what decides. Without
+                // this, a resize landing in that window undoes their scroll —
+                // measured on Firefox: reader reaches scrollTop 0, a resize
+                // fires 2ms later, the view snaps back.
+                if reader_moved_up_since(&last_scroll_top) {
+                    return;
+                }
+                // Instant: this fires DURING layout settling, so animating
+                // would chase a target that is still moving.
+                scroll_history_to_bottom(
+                    &pinned_to_bottom,
+                    &last_scroll_top,
+                    web_sys::ScrollBehavior::Instant,
+                );
+            }) as Box<dyn FnMut(js_sys::Array)>);
+
+            if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+                observer.observe(&content);
+                observer.observe(&container);
+                // Leaked for the same reason as the observers above.
+                cb.forget();
+                observed.set(true);
+            }
+        });
+    }
 
     // Snap to the newest message whenever the selected room changes (#402). The
     // Conversation component is mounted once and reused across rooms (hidden or
@@ -1607,23 +2045,24 @@ pub fn Conversation() -> Element {
     // makes this effect re-run on every room change and nothing else.
     //
     // This effect only raises `force_scroll`; the actual scroll runs in the
-    // mount-triggered effect above once the new room's last bubble mounts (its
-    // trigger, `last_chat_element`, necessarily changes AFTER this room change,
-    // so the ordering is causal — not dependent on effect scheduling). Using a
-    // persistent `force_scroll` flag instead of `is_at_bottom` means the
-    // observer can't cancel the snap in the gap between the two effects.
-    // `first_scroll` = true makes that snap instant rather than animated from an
-    // arbitrary position. `is_at_bottom` = true hides the scroll-to-latest
-    // button immediately on switch (the observer reconfirms after the snap).
+    // content-triggered effect above once the new room's groups are rendered
+    // (its trigger, `message_groups`, necessarily changes AFTER this room
+    // change, so the ordering is causal — not dependent on effect scheduling).
+    // Using a persistent `force_scroll` flag means nothing can cancel the snap
+    // in the gap between the two effects.
+    // `is_at_bottom` = true hides the scroll-to-latest button immediately on
+    // switch (the observer reconfirms after the snap).
     //
     // Guarded on an ACTUAL key change: Dioxus re-runs the effect on any write
     // to `CURRENT_ROOM`, and re-selecting the already-open room in the sidebar
     // rewrites it with the same key. Without the guard that would arm
-    // `force_scroll` with no new bubble to consume it, so a later message would
-    // snap the reader to the bottom (#402 review).
+    // `force_scroll` with no new content to consume it, so a later message
+    // would snap the reader to the bottom (#402 review).
     {
-        let first_scroll = first_scroll.clone();
         let force_scroll = force_scroll.clone();
+        let pinned_to_bottom = pinned_to_bottom.clone();
+        #[cfg(target_arch = "wasm32")]
+        let last_scroll_top = last_scroll_top.clone();
         let prev_room =
             use_hook(|| Rc::new(std::cell::Cell::new(None::<ed25519_dalek::VerifyingKey>)));
         use_effect(move || {
@@ -1631,8 +2070,18 @@ pub fn Conversation() -> Element {
             if prev_room.get() != room {
                 prev_room.set(room);
                 force_scroll.set(true);
-                first_scroll.set(true);
                 is_at_bottom.set(true);
+                // Opening a room starts you at its newest message, so the pin
+                // starts armed. Set here rather than left to the snap below,
+                // because a room with no messages produces no scroll at all
+                // and would otherwise inherit the previous room's pin state.
+                pinned_to_bottom.set(true);
+                // Same reason: an offset measured in the room we just left says
+                // nothing about this one, and `reader_moved_up_since` would
+                // read it as "the reader has scrolled up" and stand the follow
+                // down. Zero is the "no constraint yet" value it starts at.
+                #[cfg(target_arch = "wasm32")]
+                last_scroll_top.set(0);
             }
         });
     }
@@ -2432,7 +2881,7 @@ pub fn Conversation() -> Element {
                     // than show a horizontal scrollbar in the history. #402.
                     class: "h-full overflow-y-auto overflow-x-hidden",
                     id: "chat-scroll-container",
-                    div { class: "max-w-4xl mx-auto px-4 py-4",
+                    div { class: "max-w-4xl mx-auto px-4 py-4", id: "chat-content",
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
@@ -2485,14 +2934,12 @@ pub fn Conversation() -> Element {
                                         }
                                         rows
                                     };
-                                    let rows_len = rows.len();
                                     Some(rsx! {
                                         div { class: "space-y-4",
-                                            {rows.into_iter().enumerate().map({
+                                            {rows.into_iter().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
-                                                move |(row_idx, row)| {
-                                                let is_last_group = row_idx == rows_len - 1;
+                                                move |row| {
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let handle_edit_message = handle_edit_message.clone();
                                                 let member_names = member_names.clone();
@@ -2510,7 +2957,6 @@ pub fn Conversation() -> Element {
                                                     DisplayRow::Item(DisplayItem::Event(summary)) => {
                                                         let text = format_event_summary(&summary.names);
                                                         let key = summary.id.clone();
-                                                        let mut last_el = last_chat_element;
                                                         rsx! {
                                                             div {
                                                                 key: "{key}",
@@ -2518,13 +2964,6 @@ pub fn Conversation() -> Element {
                                                                 span {
                                                                     class: "text-xs text-text-muted italic",
                                                                     "{text}"
-                                                                }
-                                                                if is_last_group {
-                                                                    div {
-                                                                        onmounted: move |data| {
-                                                                            last_el.set(Some(data.data()));
-                                                                        }
-                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -2539,7 +2978,6 @@ pub fn Conversation() -> Element {
                                                                 member_names: member_names,
                                                                 max_message_size: edit_max_size,
                                                                 is_private: edit_is_private,
-                                                                last_chat_element: if is_last_group { Some(last_chat_element) } else { None },
                                                                 edit_trigger: edit_trigger,
                                                                 on_react: move |(msg_id, emoji)| {
                                                                     handle_toggle_reaction(msg_id, emoji);
@@ -2610,19 +3048,23 @@ pub fn Conversation() -> Element {
                         // the smooth scroll before reaching the bottom (the
                         // observer emits no new change and stays quiet). #402.
                         onclick: move |_| {
+                            // Asking for the newest message is the clearest
+                            // possible statement of intent, so this re-arms the
+                            // pin (inside `scroll_history_to_bottom`) even
+                            // though the button itself renders off the
+                            // IntersectionObserver.
                             #[cfg(target_arch = "wasm32")]
-                            crate::util::safe_spawn_local(async move {
-                                let Some(container) = web_sys::window()
-                                    .and_then(|w| w.document())
-                                    .and_then(|d| d.get_element_by_id("chat-scroll-container"))
-                                else {
-                                    return;
-                                };
-                                let opts = web_sys::ScrollToOptions::new();
-                                opts.set_top(container.scroll_height() as f64);
-                                opts.set_behavior(web_sys::ScrollBehavior::Smooth);
-                                container.scroll_to_with_scroll_to_options(&opts);
-                            });
+                            {
+                                let pinned_to_bottom = pinned_to_bottom.clone();
+                                let last_scroll_top = last_scroll_top.clone();
+                                crate::util::safe_spawn_local(async move {
+                                    scroll_history_to_bottom(
+                                        &pinned_to_bottom,
+                                        &last_scroll_top,
+                                        web_sys::ScrollBehavior::Smooth,
+                                    );
+                                });
+                            }
                         },
                         Icon { icon: FaChevronDown, width: 18, height: 18 }
                     }
@@ -2870,7 +3312,6 @@ fn MessageGroupComponent(
     max_message_size: usize,
     /// Whether the room is private (encrypted edits carry the AES-GCM tag).
     is_private: bool,
-    last_chat_element: Option<Signal<Option<Rc<MountedData>>>>,
     edit_trigger: Signal<Option<(String, String)>>,
     on_react: EventHandler<(MessageId, String)>,
     on_request_delete: EventHandler<MessageId>,
@@ -2893,7 +3334,9 @@ fn MessageGroupComponent(
         .map(|s| format!(" (received after {} delay)", format_delay(s)));
     let full_time_str = if group.time_clamped {
         format!(
-            "{} (sender's clock may be incorrect — original timestamp was in the future)",
+            "{} (sender's clock may be ahead of yours — their timestamp was later \
+             than when this message reached you, so the time shown is when it \
+             arrived)",
             format_utc_as_full_datetime(timestamp_ms)
         )
     } else if let Some(ref suffix) = delay_suffix {
@@ -3326,13 +3769,6 @@ fn MessageGroupComponent(
                                                         // the nowrap strip from widening the bubble.
                                                         "max-w-prose"
                                                     ),
-                                                    onmounted: move |cx| {
-                                                        if is_last {
-                                                            if let Some(mut last_el) = last_chat_element {
-                                                                last_el.set(Some(cx.data()));
-                                                            }
-                                                        }
-                                                    },
                                                     // Reply-quote strip (inside bubble, first child).
                                                     // Exactly one arm renders, enforced by the type: an
                                                     // unverifiable quote is `Unavailable`, which carries no
@@ -4983,10 +5419,11 @@ mod tests {
 /// Tests for [`resolve_reply_strip`] — the rule that a reply's quoted
 /// snapshot is rendered only when it can be re-read from live room state.
 ///
-/// These target the helper rather than `group_messages` because the latter
-/// reads the `RECEIVE_TIMES` `GlobalSignal`, which panics outside a Dioxus
-/// runtime. The render side (which arm of [`ReplyStrip`] produces what markup)
-/// is covered by `ui/tests/message-layout.spec.ts`.
+/// These target the helper rather than `group_messages` because it is the unit
+/// under test; `group_messages` itself is now callable outside a Dioxus runtime
+/// and is covered by `group_messages_clock_tests`. The render side (which arm
+/// of [`ReplyStrip`] produces what markup) is covered by
+/// `ui/tests/message-layout.spec.ts`.
 #[cfg(test)]
 mod resolve_reply_strip_tests {
     use super::*;
@@ -5832,5 +6269,485 @@ mod resolve_reply_strip_tests {
 
         let ctx = resolve(&plain, &state(vec![plain.clone()]), &info(vec![]));
         assert_eq!(ctx, ReplyStrip::NotAReply);
+    }
+}
+
+/// Tests for [`group_messages`]' clock handling.
+///
+/// These are possible at all because the receive-time snapshot is now a
+/// parameter: the function used to read the `RECEIVE_TIMES` `GlobalSignal`
+/// per message, which panics outside a Dioxus runtime.
+#[cfg(test)]
+mod group_messages_clock_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use std::time::{Duration as StdDuration, UNIX_EPOCH};
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn member_id_of(sk: &SigningKey) -> MemberId {
+        MemberId::from(&sk.verifying_key())
+    }
+
+    /// A public text message from `sk`, stamped with the sender's clock.
+    fn message_at(owner: MemberId, sk: &SigningKey, sent: DateTime<Utc>) -> AuthorizedMessageV1 {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner,
+                author: member_id_of(sk),
+                time: UNIX_EPOCH + StdDuration::from_millis(sent.timestamp_millis().max(0) as u64),
+                content: RoomMessageBody::public("hello".to_string()),
+            },
+            sk,
+        )
+    }
+
+    fn state(messages: Vec<AuthorizedMessageV1>) -> MessagesV1 {
+        MessagesV1 {
+            messages,
+            actions_state: Default::default(),
+        }
+    }
+
+    fn info(sk: &SigningKey, nickname: &str) -> MemberInfoV1 {
+        MemberInfoV1 {
+            member_info: vec![AuthorizedMemberInfo::new(
+                MemberInfo::new_public(member_id_of(sk), 1, nickname.to_string()),
+                sk,
+            )],
+        }
+    }
+
+    fn group(
+        messages: &MessagesV1,
+        member_info: &MemberInfoV1,
+        me: MemberId,
+        receive_times: &ReceiveTimes,
+        fallback_now: DateTime<Utc>,
+    ) -> Vec<DisplayItem> {
+        group_messages(
+            messages,
+            member_info,
+            me,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            // No protected names, so no ⚠ warning can fire — these tests are
+            // about the clock, and an empty checker keeps them about only that.
+            &ImpersonationChecker::default(),
+            me,
+            MessageClock {
+                receive_times,
+                fallback_now,
+            },
+        )
+    }
+
+    fn only_group(items: &[DisplayItem]) -> &MessageGroup {
+        match items {
+            [DisplayItem::Messages(g)] => g,
+            other => panic!(
+                "expected exactly one message group, got {} items",
+                other.len()
+            ),
+        }
+    }
+
+    fn at(ms: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp_millis(ms).expect("valid timestamp")
+    }
+
+    /// A message from a clock that runs an hour fast is pinned to when THIS
+    /// client first saw it — not to "now", which moves on every render.
+    ///
+    /// This is the assertion that fails if the clamp target goes back to
+    /// `Utc::now()`: `now` and `first_seen` are deliberately far apart.
+    #[test]
+    fn future_timestamp_is_clamped_to_first_seen_not_to_now() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+
+        let now = at(1_700_000_000_000);
+        let first_seen = now - chrono::Duration::minutes(10);
+        let sent = now + chrono::Duration::hours(1);
+
+        let msg = message_at(owner_id, &alice, sent);
+        let mut receive_times = ReceiveTimes::new();
+        receive_times.insert(msg.id().0 .0, first_seen.timestamp_millis() as f64);
+
+        let items = group(
+            &state(vec![msg]),
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            now,
+        );
+        let g = only_group(&items);
+
+        assert!(g.time_clamped, "a future timestamp must be flagged clamped");
+        assert_eq!(
+            g.messages[0].time, first_seen,
+            "the clamp target must be when we first saw the message, not the \
+             render's wall clock"
+        );
+    }
+
+    /// Same input, two renders a minute apart: identical grouping, and both
+    /// pinned to the arrival time. The old code read `Utc::now()` inside the
+    /// loop, so a clock-skewed message re-timed itself on every render.
+    ///
+    /// The send time is deliberately far in the future in ABSOLUTE terms, not
+    /// merely relative to the fixture's `now`: a fixture-relative future is
+    /// already in the past by the time the suite runs, so the clamp branch
+    /// would never be taken and the test could not fail. The explicit
+    /// `first_seen` assertions are what make it fail rather than a
+    /// `first == later` comparison, which would otherwise pass on two
+    /// `Utc::now()` reads that happen to land in the same instant.
+    #[test]
+    fn grouping_is_idempotent_across_renders() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+
+        let now = at(1_700_000_000_000);
+        let first_seen = now - chrono::Duration::minutes(10);
+        // Year 4000-ish: later than any clock this test could run against.
+        let msg = message_at(owner_id, &alice, at(64_060_588_800_000));
+        let mut receive_times = ReceiveTimes::new();
+        receive_times.insert(msg.id().0 .0, first_seen.timestamp_millis() as f64);
+
+        let messages = state(vec![msg]);
+        let member_info = info(&alice, "Alice");
+
+        let first = group(&messages, &member_info, owner_id, &receive_times, now);
+        let later = group(
+            &messages,
+            &member_info,
+            owner_id,
+            &receive_times,
+            now + chrono::Duration::minutes(1),
+        );
+
+        assert_eq!(only_group(&first).messages[0].time, first_seen);
+        assert_eq!(only_group(&later).messages[0].time, first_seen);
+        assert!(
+            first == later,
+            "a clock-skewed message must group identically on a later render"
+        );
+    }
+
+    /// No recorded arrival (an older message restored from contract state, or
+    /// one whose entry aged out of the 24h window): fall back to the pass-wide
+    /// "now", which is the pre-existing behaviour.
+    #[test]
+    fn unknown_first_seen_falls_back_to_the_pass_wide_now() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+
+        let now = at(1_700_000_000_000);
+        let msg = message_at(owner_id, &alice, now + chrono::Duration::hours(1));
+
+        let items = group(
+            &state(vec![msg]),
+            &info(&alice, "Alice"),
+            owner_id,
+            &ReceiveTimes::new(),
+            now,
+        );
+        let g = only_group(&items);
+
+        assert!(g.time_clamped);
+        assert_eq!(g.messages[0].time, now);
+    }
+
+    /// The case the clamp-target change actually creates: a timestamp in the
+    /// PAST relative to the render, but later than when we received the
+    /// message. The old code compared against `Utc::now()`, so it left this
+    /// alone; the new code clamps it, because a send time after the arrival
+    /// time is not something an accurate clock produces.
+    ///
+    /// This is the assertion that would have caught the change slipping in
+    /// unnoticed — `past_timestamps_are_never_rewritten` below passes either
+    /// way, so on its own it pins nothing about this fix.
+    #[test]
+    fn a_timestamp_later_than_arrival_is_clamped_even_though_it_is_in_the_past() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+
+        let now = at(1_700_000_000_000);
+        let first_seen = now - chrono::Duration::hours(2);
+        let sent = now - chrono::Duration::hours(1);
+
+        let msg = message_at(owner_id, &alice, sent);
+        let mut receive_times = ReceiveTimes::new();
+        receive_times.insert(msg.id().0 .0, first_seen.timestamp_millis() as f64);
+
+        let items = group(
+            &state(vec![msg]),
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            now,
+        );
+        let g = only_group(&items);
+
+        assert!(
+            g.time_clamped,
+            "a send time an hour after arrival is skew, even though it is in \
+             the past relative to this render"
+        );
+        assert_eq!(g.messages[0].time, first_seen);
+    }
+
+    /// Skew inside the tolerance is left alone and NOT flagged.
+    ///
+    /// Without the tolerance the clamp target's move from "now at render" to
+    /// "arrival" would silently widen the flag: the old comparison carried the
+    /// whole propagation delay as slack, the new one carries none, so every
+    /// message from any peer whose clock is a few seconds fast would render
+    /// with the "clock may be wrong" marker.
+    #[test]
+    fn skew_within_the_tolerance_is_left_alone() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+
+        let now = at(1_700_000_000_000);
+        let first_seen = now - chrono::Duration::minutes(10);
+        // Ahead of arrival, but by less than CLOCK_SKEW_TOLERANCE_SECS.
+        let sent = first_seen + chrono::Duration::seconds(CLOCK_SKEW_TOLERANCE_SECS - 1);
+
+        let msg = message_at(owner_id, &alice, sent);
+        let mut receive_times = ReceiveTimes::new();
+        receive_times.insert(msg.id().0 .0, first_seen.timestamp_millis() as f64);
+
+        let items = group(
+            &state(vec![msg]),
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            now,
+        );
+        let g = only_group(&items);
+
+        assert!(
+            !g.time_clamped,
+            "a few seconds of clock skew is normal and must not put a \
+             \"sender's clock may be wrong\" marker on the message"
+        );
+        assert_eq!(
+            g.messages[0].time, sent,
+            "and the time must be left as sent"
+        );
+    }
+
+    /// A timestamp that is merely in the past is left exactly as the sender
+    /// wrote it, whether or not we have an arrival time for it.
+    ///
+    /// Passes against the pre-fix code too — it is here to pin the unchanged
+    /// half, not the change. See
+    /// `a_timestamp_later_than_arrival_is_clamped_even_though_it_is_in_the_past`
+    /// for the assertion that depends on the fix.
+    #[test]
+    fn past_timestamps_are_never_rewritten() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+
+        let now = at(1_700_000_000_000);
+        let sent = now - chrono::Duration::hours(2);
+        let msg = message_at(owner_id, &alice, sent);
+        let mut receive_times = ReceiveTimes::new();
+        receive_times.insert(
+            msg.id().0 .0,
+            (now - chrono::Duration::hours(1)).timestamp_millis() as f64,
+        );
+
+        let items = group(
+            &state(vec![msg]),
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            now,
+        );
+        let g = only_group(&items);
+
+        assert!(!g.time_clamped);
+        assert_eq!(g.messages[0].time, sent);
+    }
+}
+
+/// Source-grep pins for the auto-scroll wiring in [`Conversation`].
+///
+/// The behaviour these guard is only observable in a browser (it is measured
+/// by `ui/tests/conversation-autoscroll.spec.ts`), so these exist to make a
+/// silent revert in a refactor fail at `cargo test` rather than in the field.
+/// freenet/river#486 is what a silent revert costs: the view stopped following
+/// the conversation for 54 consecutive arrivals.
+#[cfg(test)]
+mod autoscroll_wiring_pins {
+    /// The production half of this file, cut at the first test module.
+    ///
+    /// Cut by a needle that cannot match itself — it contains an escaped
+    /// newline in the source, not a literal one. `rfind` would land on
+    /// whichever test module was appended most recently and quietly put these
+    /// needles inside the scanned text, making every assertion below
+    /// self-satisfying (freenet/river#471).
+    fn production_source() -> &'static str {
+        let source = include_str!("conversation.rs");
+        &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")]
+    }
+
+    /// `is_at_bottom` answers "is the end of the history on screen right now?".
+    /// Gating auto-scroll on it is the #486 latch: once the gap exceeded the
+    /// observer's margin the gate read false and nothing re-armed it. The
+    /// signal may still drive the scroll-to-latest button, so this pins the
+    /// narrow thing — it must not appear in the auto-scroll effect's condition.
+    #[test]
+    fn autoscroll_is_not_gated_on_the_intersection_observer() {
+        let prod = production_source();
+        for forbidden in [
+            "forced || *is_at_bottom.peek()",
+            "*is_at_bottom.peek() || forced",
+            "forced || is_at_bottom()",
+        ] {
+            assert!(
+                !prod.contains(forbidden),
+                "auto-scroll must be gated on the user-intent pin, not on the \
+                 scroll-to-latest button's IntersectionObserver: found `{forbidden}`"
+            );
+        }
+        assert!(
+            prod.contains("forced || pinned_to_bottom.get()"),
+            "the auto-scroll gate must read the user-intent pin"
+        );
+    }
+
+    /// The pin is only meaningful if something maintains it. Removing the
+    /// listener install would freeze it at its initial `true`, which looks
+    /// fine until the reader scrolls up to read history and gets yanked back.
+    #[test]
+    fn the_pin_is_maintained_by_scroll_listeners() {
+        let prod = production_source();
+        assert!(
+            prod.contains("fn install_scroll_pin_listeners"),
+            "the user-intent pin needs a listener that maintains it"
+        );
+        assert!(
+            prod.contains("if install_scroll_pin_listeners("),
+            "`install_scroll_pin_listeners` must actually be called from `Conversation`"
+        );
+        assert!(
+            prod.contains("\"scrollend\""),
+            "the pin is re-evaluated once per settle, via `scrollend`"
+        );
+        // Safari before 17.4 has no `scrollend`, so the settle is spotted by a
+        // trailing debounce on `scroll` instead. Every engine Playwright drives
+        // exposes `scrollend`, so that branch NEVER executes in CI and could be
+        // deleted or broken without a single test going red.
+        assert!(
+            prod.contains("SCROLL_SETTLE_DEBOUNCE_MS") && prod.contains("\"scroll\""),
+            "browsers without `scrollend` need the debounced `scroll` fallback; \
+             nothing in the browser suite covers it, so it is pinned here"
+        );
+        // Whose settle it is, is decided by comparing where it landed against
+        // the offset our last scroll asked for — and `last_top` is refreshed
+        // for EVERY settle, including our own, BEFORE the early-out. Recording
+        // it only for the reader's settles is what let a stale offset suppress
+        // the follow indefinitely, so the ORDER of these three is the thing
+        // being pinned, not merely their presence.
+        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        let at = |needle: &str| {
+            dense
+                .find(needle)
+                .unwrap_or_else(|| panic!("the settle handler must contain `{needle}`"))
+        };
+        let decide = at("letours=(settled_at-last_top.get()).abs()<=SCROLL_TOP_SLACK_PX;");
+        let record = at("last_top.set(settled_at);");
+        let early_out = at("ifours{return;}");
+        assert!(
+            decide < record && record < early_out,
+            "the settle handler must decide whose settle it is by POSITION, then \
+             record that position, and only THEN skip the pin update for our own \
+             scroll"
+        );
+    }
+
+    /// The pin is resolved by a `scrollend`, which arrives milliseconds after
+    /// the reader actually moves. Both things that scroll on the strength of
+    /// the pin must therefore also check that the reader has not moved since —
+    /// otherwise a message (or a resize) landing inside that window drags them
+    /// back down. Dropping either call site is silent: the suite still passes
+    /// on Chromium, where the `scrollend` happens to win the race, and fails
+    /// only on Firefox, WebKit and mobile Safari.
+    #[test]
+    fn both_scroll_paths_defer_to_a_reader_scroll_the_pin_has_not_seen_yet() {
+        let prod = production_source();
+        assert!(
+            prod.contains("fn reader_moved_up_since"),
+            "the stale-pin window needs an explicit guard"
+        );
+        assert_eq!(
+            prod.matches("reader_moved_up_since(&last_scroll_top)")
+                .count(),
+            2,
+            "BOTH the content-change effect and the ResizeObserver must consult \
+             the guard; found a different number of call sites"
+        );
+        // Whitespace-insensitive: `cargo fmt` decides how this condition wraps,
+        // and a pin that a reformat can break is a pin that gets deleted.
+        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            dense.contains(
+                "if!forced&&(!pinned_to_bottom.get()||reader_moved_up_since(&last_scroll_top))"
+            ),
+            "the deferred scroll must RE-READ the pin (a reader settle can clear \
+             it between the gate and the scroll) as well as consult the guard, \
+             and a forced scroll must override both"
+        );
+    }
+
+    /// The trigger, not just the gate. An `onmounted` on the last bubble is
+    /// silent for every content change that leaves that row in place, so the
+    /// effect has to subscribe to the grouped-message memo instead.
+    #[test]
+    fn autoscroll_is_triggered_by_content_change_not_by_a_remount() {
+        let prod = production_source();
+        assert!(
+            !prod.contains("last_chat_element"),
+            "the last-bubble mount handle is not a content-change trigger; it \
+             misses mid-list inserts, merged join summaries, reactions and edits"
+        );
+        // Whitespace-insensitive, like the sibling pin below: `cargo fmt`
+        // decides how this wraps, and a pin a reformat can break gets deleted.
+        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            dense.contains("lethas_content=message_groups.read().is_some();"),
+            "the auto-scroll effect must subscribe to `message_groups` so any \
+             content change re-runs it"
+        );
+        assert!(
+            prod.contains("ResizeObserver::new"),
+            "content-height changes with no re-render (late-loading images, \
+             font swaps) must also reach the scroll"
+        );
+        // Two observations, not one. The content wrapper sees the history
+        // growing or reflowing; only the container sees the WINDOW shrinking,
+        // which is what growing the composer does — #486's third cause.
+        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            dense.contains("observer.observe(&content);observer.observe(&container);"),
+            "the resize follow must watch BOTH the content wrapper and the \
+             scroll container; watching only the wrapper misses the composer \
+             taking height away from the history"
+        );
     }
 }
