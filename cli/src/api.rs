@@ -46,6 +46,15 @@ const UPGRADE_HOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// cyclic or runaway chain.
 const MAX_UPGRADE_HOPS: usize = 32;
 
+/// Optional fail-closed checks for non-interactive moderation callers. All
+/// predicates are evaluated against the fresh state fetched by the ban path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BanSafety {
+    pub require_exact_member_id: bool,
+    pub require_no_descendants: bool,
+    pub require_not_deputy: bool,
+}
+
 /// Decide the next contract to follow from `state`'s upgrade pointer.
 ///
 /// Returns `Some(next)` when `state` carries an `OptionalUpgradeV1` pointer to
@@ -4706,6 +4715,18 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         member_id_short: &str,
     ) -> Result<()> {
+        self.ban_member_with_safety(room_owner_key, member_id_short, BanSafety::default())
+            .await
+    }
+
+    /// Ban with fail-closed safety predicates evaluated against the same fresh
+    /// room state used to construct the signed ban delta.
+    pub async fn ban_member_with_safety(
+        &self,
+        room_owner_key: &VerifyingKey,
+        member_id_short: &str,
+        safety: BanSafety,
+    ) -> Result<()> {
         info!(
             "Banning member '{}' from room owned by: {}",
             member_id_short,
@@ -4743,6 +4764,40 @@ impl ApiClient {
             })?;
 
         let banned_member_id = target_member.member_info.member_id;
+
+        if safety.require_exact_member_id && banned_member_id.to_string() != member_id_short {
+            return Err(anyhow!(
+                "Safety preflight refused: '{}' is not the exact current member ID '{}'.",
+                member_id_short,
+                banned_member_id
+            ));
+        }
+
+        if safety.require_no_descendants {
+            let removal = crate::deputies::ban_removal_set(&room_state, banned_member_id);
+            if removal.len() != 1 {
+                return Err(anyhow!(
+                    "Safety preflight refused: banning '{}' would remove {} descendants.",
+                    banned_member_id,
+                    removal.len().saturating_sub(1)
+                ));
+            }
+        }
+
+        if safety.require_not_deputy {
+            let is_deputy = room_state.member_info.member_info.iter().any(|record| {
+                room_state
+                    .member_info
+                    .deputies_of(record.member_info.member_id)
+                    .contains(&banned_member_id)
+            });
+            if is_deputy {
+                return Err(anyhow!(
+                    "Safety preflight refused: member '{}' is a deputy.",
+                    banned_member_id
+                ));
+            }
+        }
 
         // Prevent banning yourself out of the room, directly or transitively
         // (freenet/river#478). ONE rule: refuse when the ban's cascade would

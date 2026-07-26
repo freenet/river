@@ -65,6 +65,7 @@ pub enum MessageCommands {
         /// Room ID
         room_id: String,
         /// Message ID (from 'message list --json', use the signature field)
+        #[arg(allow_hyphen_values = true)]
         message_id: String,
         /// New message content
         new_content: String,
@@ -74,6 +75,7 @@ pub enum MessageCommands {
         /// Room ID
         room_id: String,
         /// Message ID (from 'message list --json', use the signature field)
+        #[arg(allow_hyphen_values = true)]
         message_id: String,
     },
     /// Add a reaction to a message
@@ -81,6 +83,7 @@ pub enum MessageCommands {
         /// Room ID
         room_id: String,
         /// Message ID (from 'message list --json', use the signature field)
+        #[arg(allow_hyphen_values = true)]
         message_id: String,
         /// Emoji to react with (e.g., "👍", "❤️", "😂")
         emoji: String,
@@ -90,6 +93,7 @@ pub enum MessageCommands {
         /// Room ID
         room_id: String,
         /// Message ID (from 'message list --json', use the signature field)
+        #[arg(allow_hyphen_values = true)]
         message_id: String,
         /// Emoji to remove
         emoji: String,
@@ -101,6 +105,7 @@ pub enum MessageCommands {
         /// Room ID
         room_id: String,
         /// Message ID of the message to reply to
+        #[arg(allow_hyphen_values = true)]
         message_id: String,
         /// Reply text. Write `@nickname` to mention a member.
         message: String,
