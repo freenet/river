@@ -31,7 +31,7 @@
 use crate::components::app::chat_delegate::{hide_dm_thread, unhide_dm_thread};
 use crate::components::app::ROOMS;
 use crate::components::direct_messages::{
-    is_thread_hidden_for, open_dm_thread, DM_LAST_SEEN, HIDDEN_DM_THREADS, OPEN_DM_THREAD,
+    is_thread_hidden_for, open_dm_thread, DM_LAST_SEEN, HIDDEN_DM_THREADS,
 };
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
@@ -42,7 +42,7 @@ use dioxus_free_icons::{
 use ed25519_dalek::VerifyingKey;
 use river_core::chat_delegate::HiddenDmThreadEntry;
 use river_core::room_state::member::MemberId;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -116,10 +116,11 @@ pub fn DmRailSection() -> Element {
     //
     // `current_archived_count` walks ROOMS to compute the per-pair
     // `last_any_ts` and runs `count_currently_archived`. On contention
-    // (any `try_read` failing) we fall back to 0 so the link disappears
-    // for THIS render — a brief mid-write flicker is preferable to
-    // showing a stale count.
-    let archived_count = use_memo(move || current_archived_count().unwrap_or(0));
+    // (any `try_read` failing) it serves the last clean count and
+    // schedules a self-nudge — a transient 0 here could combine with an
+    // empty thread list to satisfy the empty-state early return below
+    // and unmount the whole DIRECT MESSAGES section for a pass.
+    let archived_count = use_memo(current_archived_count);
     let archived_count = *archived_count.read();
 
     let mut archived_panel_open: Signal<bool> = use_signal(|| false);
@@ -441,12 +442,15 @@ pub(crate) fn filter_rail_entries(
 ///   failed OPEN (skipped the filter), flashing every archived thread
 ///   into the active rail for a render. Failing closed to an EMPTY list
 ///   instead would blink the whole rail (the other #499 symptom), so we
-///   return `last_good`: the most recent successfully-filtered rail. It
-///   is at worst one render stale and by construction contains no
-///   thread that was archived as of the last clean pass (a thread whose
-///   archive click is the very write we're contending with may persist
-///   for that single render — matching what was on screen the instant
-///   before the click, never resurrecting older archived threads).
+///   return `last_good`: the most recent successfully-filtered rail. By
+///   construction it contains no thread that was archived as of the
+///   last clean pass (a thread whose archive click is the very write
+///   we're contending with may persist briefly — matching what was on
+///   screen the instant before the click, never resurrecting older
+///   archived threads). Staleness is bounded: every degraded pass
+///   schedules a rail nudge (`schedule_rail_nudge`), so the memo
+///   re-polls one macrotask later in a clean context rather than
+///   waiting for an unrelated signal write.
 ///
 /// Invariants, in priority order: (1) archived threads never appear in
 /// the active rail; (2) the rail collapses as rarely as possible.
@@ -494,9 +498,12 @@ pub(crate) struct PeerDmActivity {
 /// contended read must degrade to "no unread info for this pass" —
 /// entries are still produced, with `unread = 0` and correct recency —
 /// instead of aborting the whole rail build (which blanked the entire
-/// active list while "Archived (N)" stayed put). A peer merely ABSENT
-/// from a `Some` map still means cutoff 0 (thread never read). Pinned
-/// by the `accumulate_peer_activity_*` tests.
+/// active list while "Archived (N)" stayed put). `build_view` then
+/// backfills the zeroed unread counts from the last good rail (see
+/// [`backfill_unread_from_last_good`]) so the degrade doesn't reorder
+/// the unread-first sort. A peer merely ABSENT from a `Some` map still
+/// means cutoff 0 (thread never read). Pinned by the
+/// `accumulate_peer_activity_*` tests.
 pub(crate) fn accumulate_peer_activity(
     room: &VerifyingKey,
     self_id: MemberId,
@@ -530,6 +537,31 @@ pub(crate) fn accumulate_peer_activity(
     per_peer
 }
 
+/// Pure helper: carry per-pair unread counts forward from the last good
+/// rail when the CURRENT pass had no readable `DM_LAST_SEEN` (issue
+/// #499 review follow-up). Zeroing unread on a contended pass is not
+/// merely cosmetic: unread is the PRIMARY sort key, so a transient 0
+/// reorders the rail (unread rows drop from the top) for that pass and
+/// snaps back a moment later — the same visual flap #499 is about.
+/// Pairs absent from `last_good` keep `unread = 0`: we have no better
+/// information for them. Recency (`last_any_ts`) is deliberately NOT
+/// backfilled — the current pass computed it from live room state.
+/// Pinned by the `backfill_unread_from_last_good_*` tests.
+pub(crate) fn backfill_unread_from_last_good(
+    entries: &mut [DmRailEntry],
+    last_good: &[DmRailEntry],
+) {
+    let prev: HashMap<(VerifyingKey, MemberId), usize> = last_good
+        .iter()
+        .map(|e| ((e.room, e.peer), e.unread))
+        .collect();
+    for e in entries.iter_mut() {
+        if let Some(unread) = prev.get(&(e.room, e.peer)) {
+            e.unread = *unread;
+        }
+    }
+}
+
 /// Project a room's authorized DM list into the `(sender, recipient,
 /// timestamp)` triples [`accumulate_peer_activity`] consumes. Shared by
 /// all three builders so their per-pair `last_any_ts` scans can't
@@ -552,16 +584,34 @@ fn dm_message_triples(
 }
 
 thread_local! {
-    /// Last successfully filtered + sorted rail, kept by `build_view`.
-    /// Serves as the degrade value when a signal read is contended:
-    /// showing the one-render-old rail is strictly better than blanking
-    /// it (issue #499's headline symptom), and — unlike the old skip-
-    /// the-filter fallback — can never flash archived threads into the
-    /// active list, because every cached list already went through
-    /// `filter_rail_entries`. Plain `thread_local` (not a signal): the
-    /// UI is single-threaded WASM and writing a signal from inside a
-    /// memo would re-trigger reactivity.
+    /// Last rail built by a FULLY-clean `build_view` pass (hide-list
+    /// AND unread cutoffs both read cleanly — see the gated write at
+    /// the end of `build_view`; a pass with degraded unread would
+    /// poison the unread backfill that reads from here). Serves as the
+    /// degrade value when a signal read is contended: showing the
+    /// last-good rail is strictly better than blanking it (issue #499's
+    /// headline symptom), and — unlike the old skip-the-filter
+    /// fallback — can never flash archived threads into the active
+    /// list, because every cached list already went through
+    /// `filter_rail_entries`. Staleness is bounded by the rail nudge
+    /// (every degraded pass schedules one, so the memo re-polls a
+    /// macrotask later). Plain `thread_local` (not a signal): the UI is
+    /// single-threaded WASM and writing a signal from inside a memo
+    /// would re-trigger reactivity.
     static LAST_GOOD_RAIL: RefCell<Vec<DmRailEntry>> = const { RefCell::new(Vec::new()) };
+
+    /// Last archived count computed by a clean `current_archived_count`
+    /// pass. Served on contended passes: a transient 0 there could
+    /// combine with an empty thread list to satisfy `DmRailSection`'s
+    /// empty-state early return and unmount the whole DIRECT MESSAGES
+    /// section for a pass. Same clean-pass-only write discipline as
+    /// `LAST_GOOD_RAIL`.
+    static LAST_GOOD_ARCHIVED_COUNT: Cell<usize> = const { Cell::new(0) };
+
+    /// "A rail nudge is already queued" latch, so N degraded builder
+    /// passes in one render schedule exactly ONE deferred tick bump
+    /// (storm-proof). Cleared when the deferred bump runs.
+    static RAIL_NUDGE_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
 fn last_good_rail() -> Vec<DmRailEntry> {
@@ -570,6 +620,45 @@ fn last_good_rail() -> Vec<DmRailEntry> {
 
 fn set_last_good_rail(entries: &[DmRailEntry]) {
     LAST_GOOD_RAIL.with(|c| *c.borrow_mut() = entries.to_vec());
+}
+
+fn last_good_archived_count() -> usize {
+    LAST_GOOD_ARCHIVED_COUNT.with(|c| c.get())
+}
+
+fn set_last_good_archived_count(count: usize) {
+    LAST_GOOD_ARCHIVED_COUNT.with(|c| c.set(count));
+}
+
+/// Rebuild-nudge channel for the rail's three builder memos (issue #499
+/// review follow-up). Each builder anchors its subscription set with an
+/// infallible read of this tick BEFORE any fallible `try_read`, so a
+/// contended poll can never leave a memo with zero subscriptions — and,
+/// because every degraded pass schedules a deferred bump via
+/// [`schedule_rail_nudge`], the tick is also the RECOVERY channel: the
+/// memo re-polls one macrotask later instead of serving last-good data
+/// until some unrelated user action happens to write a signal it reads.
+static RAIL_REBUILD_TICK: GlobalSignal<u64> = Global::new(|| 0);
+
+/// Schedule a one-shot deferred bump of [`RAIL_REBUILD_TICK`]. Called
+/// from every degraded (contended-read) builder pass.
+///
+/// Self-terminating: the bump runs through `crate::util::defer` (the
+/// clean execution context the dioxus-signal-safety rules require for
+/// signal mutations), and the re-poll it triggers happens in a later,
+/// borrow-free context — so the retried pass reads cleanly and
+/// schedules no further nudge. If contention somehow persists, the
+/// retried pass schedules exactly one more; the loop converges the
+/// moment a pass reads cleanly. Storm-proof via `RAIL_NUDGE_PENDING`:
+/// however many degrade paths fire in one render, only one bump queues.
+fn schedule_rail_nudge() {
+    if RAIL_NUDGE_PENDING.with(|c| c.replace(true)) {
+        return; // a bump is already queued
+    }
+    crate::util::defer(|| {
+        RAIL_NUDGE_PENDING.with(|c| c.set(false));
+        RAIL_REBUILD_TICK.with_mut(|t| *t = t.wrapping_add(1));
+    });
 }
 
 /// Pure helper: project the archived viewer's rows from the in-memory
@@ -653,18 +742,28 @@ struct ArchivedRoomMeta {
 }
 
 fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
-    // OPEN_DM_THREAD is read (infallibly) BEFORE the fallible reads:
+    // RAIL_REBUILD_TICK is read (infallibly) BEFORE the fallible reads:
     // `try_read() -> Err` registers no subscription (dioxus-signal-safety
     // rules) and each memo run clears the previous subscription set, so
-    // without this guard one contended poll would leave the memo with
+    // without this anchor one contended poll would leave the memo with
     // ZERO subscriptions — permanently frozen (issue #499 mechanism 3;
-    // mirrors the CURRENT_ROOM guard in room_list.rs). OPEN_DM_THREAD is
-    // the DM surface's own view-state signal and is only written through
-    // `defer` from clean contexts, so the infallible read cannot hit a
-    // live write borrow.
-    let _ = OPEN_DM_THREAD.read();
-    let rooms = ROOMS.try_read().ok()?;
-    let hidden = HIDDEN_DM_THREADS.try_read().ok()?.clone();
+    // mirrors the CURRENT_ROOM guard in room_list.rs). The tick is only
+    // written through `defer` from clean contexts, so the infallible
+    // read cannot hit a live write borrow — and each degraded pass
+    // below bumps it (via `schedule_rail_nudge`) so the retry is one
+    // macrotask away.
+    let _ = RAIL_REBUILD_TICK.read();
+    let Ok(rooms) = ROOMS.try_read() else {
+        schedule_rail_nudge();
+        return None;
+    };
+    let hidden = match HIDDEN_DM_THREADS.try_read() {
+        Ok(h) => h.clone(),
+        Err(_) => {
+            schedule_rail_nudge();
+            return None;
+        }
+    };
 
     // Materialise per-room display data once and compute the per-pair
     // max DM timestamp at the same time. Both decryption and the
@@ -730,15 +829,27 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
 /// the same scan as `build_archived_view` but without materialising
 /// the per-pair display metadata — saves a HashMap of decrypted
 /// nicknames per render when the viewer is closed (the common case).
-fn current_archived_count() -> Option<usize> {
-    // Same subscription guard as `build_view` / `build_archived_view`:
+fn current_archived_count() -> usize {
+    // Same subscription anchor as `build_view` / `build_archived_view`:
     // an infallible read must precede the first fallible `try_read`,
     // otherwise one contended poll leaves this memo with zero
     // subscriptions and the count freezes for the session (issue #499
     // mechanism 3; mirrors the CURRENT_ROOM guard in room_list.rs).
-    let _ = OPEN_DM_THREAD.read();
-    let rooms = ROOMS.try_read().ok()?;
-    let hidden = HIDDEN_DM_THREADS.try_read().ok()?;
+    //
+    // Contended passes serve the last CLEAN count instead of 0: a
+    // transient 0 could combine with an empty thread list to satisfy
+    // the component's empty-state early return and unmount the whole
+    // DIRECT MESSAGES section for a pass. The nudge re-polls one
+    // macrotask later.
+    let _ = RAIL_REBUILD_TICK.read();
+    let Ok(rooms) = ROOMS.try_read() else {
+        schedule_rail_nudge();
+        return last_good_archived_count();
+    };
+    let Ok(hidden) = HIDDEN_DM_THREADS.try_read() else {
+        schedule_rail_nudge();
+        return last_good_archived_count();
+    };
     let mut last_any_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
     for (owner_vk, room_data) in &rooms.map {
         let self_id: MemberId = room_data.self_sk.verifying_key().into();
@@ -748,27 +859,31 @@ fn current_archived_count() -> Option<usize> {
             last_any_ts.insert((*owner_vk, peer), activity.last_any_ts);
         }
     }
-    Some(count_currently_archived(&hidden, &last_any_ts))
+    let count = count_currently_archived(&hidden, &last_any_ts);
+    set_last_good_archived_count(count);
+    count
 }
 
 fn build_view() -> Vec<DmRailEntry> {
-    // OPEN_DM_THREAD is read (infallibly) BEFORE the fallible reads:
+    // RAIL_REBUILD_TICK is read (infallibly) BEFORE the fallible reads:
     // `try_read() -> Err` registers no subscription (dioxus-signal-safety
     // rules) and each memo run clears the previous subscription set, so
-    // without this guard a single contended `ROOMS` poll would leave the
+    // without this anchor a single contended `ROOMS` poll would leave the
     // memo with ZERO subscriptions — a permanently empty rail, since
     // `DmRailSection` never unmounts (issue #499 mechanism 3; mirrors
-    // the CURRENT_ROOM guard in room_list.rs). OPEN_DM_THREAD is the DM
-    // surface's own view-state signal and is only written through
-    // `defer` from clean contexts, so the infallible read cannot hit a
-    // live write borrow.
-    let _ = OPEN_DM_THREAD.read();
+    // the CURRENT_ROOM guard in room_list.rs). The tick is only written
+    // through `defer` from clean contexts, so the infallible read cannot
+    // hit a live write borrow — and every degraded pass below bumps it
+    // (via `schedule_rail_nudge`) so the retry is one macrotask away,
+    // not parked until some unrelated signal write.
+    let _ = RAIL_REBUILD_TICK.read();
 
     let Ok(rooms) = ROOMS.try_read() else {
         // ROOMS is mid-write: reuse the last successfully-built rail
         // rather than blanking the whole list for this pass (issue #499
-        // mechanism 1's symptom shape). The guard read above keeps the
-        // memo subscribed, so a later signal write re-runs this build.
+        // mechanism 1's symptom shape). The scheduled nudge re-polls
+        // this memo one macrotask later, when the write has finished.
+        schedule_rail_nudge();
         return last_good_rail();
     };
     if rooms.map.is_empty() {
@@ -780,8 +895,15 @@ fn build_view() -> Vec<DmRailEntry> {
     // mechanism 1 — the old `?` blanked the entire active list while
     // "Archived (N)" stayed put): degrade to `None`, which
     // `accumulate_peer_activity` renders as "unread = 0 for this pass";
-    // badges reappear on the next clean pass.
-    let last_seen = DM_LAST_SEEN.try_read().ok().map(|s| s.clone());
+    // the backfill below then restores the last-known unread per pair
+    // so the unread-first sort doesn't transiently reorder.
+    let last_seen = match DM_LAST_SEEN.try_read() {
+        Ok(s) => Some(s.clone()),
+        Err(_) => {
+            schedule_rail_nudge();
+            None
+        }
+    };
 
     // Snapshot the hide-list (#261). `try_read` keeps us cooperative
     // with any in-flight `defer`-scheduled mutation. On contention
@@ -790,7 +912,13 @@ fn build_view() -> Vec<DmRailEntry> {
     // archived thread into the active rail for a render (#499
     // mechanism 2). Successful `try_read` registers the memo's
     // subscription so subsequent hide/unhide writes re-run this build.
-    let hidden = HIDDEN_DM_THREADS.try_read().ok().map(|h| h.clone());
+    let hidden = match HIDDEN_DM_THREADS.try_read() {
+        Ok(h) => Some(h.clone()),
+        Err(_) => {
+            schedule_rail_nudge();
+            None
+        }
+    };
 
     let mut entries: Vec<DmRailEntry> = Vec::new();
     for (owner_vk, room_data) in &rooms.map {
@@ -862,17 +990,26 @@ fn build_view() -> Vec<DmRailEntry> {
     let mut entries = LAST_GOOD_RAIL
         .with(|cache| resolve_active_entries(entries, hidden.as_ref(), &cache.borrow()));
 
+    // Contended DM_LAST_SEEN: the pass computed every entry with
+    // unread = 0, and unread is the PRIMARY sort key — carry each
+    // pair's last-known unread forward from the last good rail so rows
+    // don't transiently drop from the top and snap back. (When `hidden`
+    // was ALSO contended, `entries` IS the last good rail and the
+    // backfill is a no-op.)
+    if last_seen.is_none() {
+        LAST_GOOD_RAIL.with(|cache| backfill_unread_from_last_good(&mut entries, &cache.borrow()));
+    }
+
     // Unread threads first, then most-recent, then a deterministic
     // tiebreak (#499 mechanism 4). Re-sorting the cached list on the
     // contended path is a no-op because the order is total.
     sort_rail_entries(&mut entries);
 
-    // Cache the result for the contended-read degrade paths above —
-    // only from a pass whose hide-list read was clean, so the cache can
-    // never contain an unfiltered list. (A pass with degraded unread
-    // info is still cache-worthy: hidden-safety is the invariant,
-    // badge staleness is cosmetic and heals on the next clean pass.)
-    if hidden.is_some() {
+    // Cache only a FULLY-clean pass — hide-list AND unread cutoffs both
+    // read cleanly. A hidden-contended pass would cache the cache (no
+    // information), and a last_seen-contended pass would poison the
+    // unread counts the backfill above reads from.
+    if hidden.is_some() && last_seen.is_some() {
         set_last_good_rail(&entries);
     }
 
@@ -1435,7 +1572,11 @@ mod tests {
     /// whose FIRST read is fallible can come out of one contended poll
     /// with zero subscriptions — permanently frozen (`DmRailSection`
     /// never unmounts). Mirrors the `CURRENT_ROOM.read()` guard in
-    /// `room_list.rs`.
+    /// `room_list.rs`. The anchor is `RAIL_REBUILD_TICK`, which doubles
+    /// as the recovery channel: every degraded pass must ALSO schedule
+    /// a rail nudge (a deferred tick bump), so recovery is one
+    /// macrotask away rather than parked until unrelated user action —
+    /// each segment is checked for at least one nudge call too.
     ///
     /// Source-scrape because the builders need a Dioxus runtime to run.
     /// Conventions: match WHITESPACE-STRIPPED source so rustfmt
@@ -1444,10 +1585,10 @@ mod tests {
     /// bound each builder's segment by the NEXT function head so a
     /// guard in one builder can't vacuously cover another. The
     /// non-test comments deliberately avoid the literal guard/fallible
-    /// needles (`OPEN_DM_THREAD` + `.read()` adjacent, or a dotted
-    /// `try_read` call) so a comment can't satisfy the pin either.
-    /// Reordering these functions breaks the segment lookups loudly
-    /// (expect-panic), not silently.
+    /// needles (the tick static's name + `.read()` adjacent, or a
+    /// dotted `try_read` call) so a comment can't satisfy the pin
+    /// either. Reordering these functions breaks the segment lookups
+    /// loudly (expect-panic), not silently.
     #[test]
     fn rail_builders_read_infallible_guard_before_first_fallible_read() {
         let src = include_str!("dm_rail_section.rs");
@@ -1472,18 +1613,159 @@ mod tests {
                 });
             let seg = &stripped[start..end];
 
-            let guard = seg.find("OPEN_DM_THREAD.read()").unwrap_or_else(|| {
-                panic!("{head} lost its infallible OPEN_DM_THREAD.read() subscription guard")
+            let guard = seg.find("RAIL_REBUILD_TICK.read()").unwrap_or_else(|| {
+                panic!("{head} lost its infallible RAIL_REBUILD_TICK.read() subscription anchor")
             });
             let fallible = seg.find(".try_read(").unwrap_or_else(|| {
                 panic!("{head} has no fallible read — pin needs updating if that's intended")
             });
             assert!(
                 guard < fallible,
-                "{head}: the infallible OPEN_DM_THREAD.read() guard (at {guard}) must \
+                "{head}: the infallible RAIL_REBUILD_TICK.read() anchor (at {guard}) must \
                  come BEFORE the first fallible try_read (at {fallible}) — otherwise a \
                  contended poll leaves the memo with zero subscriptions (issue #499)"
             );
+            assert!(
+                seg.contains("schedule_rail_nudge()"),
+                "{head} has no schedule_rail_nudge() call — a degraded pass must \
+                 queue a deferred tick bump so the memo re-polls one macrotask \
+                 later instead of serving stale data until unrelated user action"
+            );
         }
+    }
+
+    /// Review follow-up wiring pins for the last-good degrade caches
+    /// (same source-scrape conventions as the pin above):
+    ///
+    /// 1. `build_view` may write `LAST_GOOD_RAIL` only from a FULLY-
+    ///    clean pass (`hidden` AND `last_seen` both read cleanly). An
+    ///    ungated write from a `last_seen`-contended pass would cache
+    ///    unread = 0 for every pair, poisoning the very backfill that
+    ///    reads from the cache.
+    /// 2. `build_view` must backfill unread from the last good rail on
+    ///    a `last_seen`-contended pass — unread is the PRIMARY sort
+    ///    key, so a transient 0 reorders the rail (the reviewers
+    ///    overturned the earlier "cosmetic" claim).
+    /// 3. `current_archived_count` must serve the last clean count on
+    ///    contention (never a transient 0, which can unmount the whole
+    ///    section via the empty-state early return) and record the
+    ///    count on a clean pass.
+    #[test]
+    fn rail_last_good_caches_have_clean_pass_write_discipline() {
+        let src = include_str!("dm_rail_section.rs");
+        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+        let view_start = stripped
+            .find("fnbuild_view()")
+            .expect("build_view not found");
+        let view_end = stripped[view_start..]
+            .find("fnshort_member_id(")
+            .map(|i| view_start + i)
+            .expect("short_member_id must follow build_view");
+        let view_seg = &stripped[view_start..view_end];
+        assert!(
+            view_seg
+                .contains("ifhidden.is_some()&&last_seen.is_some(){set_last_good_rail(&entries);}"),
+            "build_view's LAST_GOOD_RAIL write must be gated on BOTH hidden and \
+             last_seen reading cleanly — an ungated (or half-gated) write lets a \
+             degraded pass poison the cache the degrade paths serve from"
+        );
+        assert!(
+            view_seg.contains(
+                "iflast_seen.is_none(){LAST_GOOD_RAIL.with(|cache|backfill_unread_from_last_good("
+            ),
+            "build_view must backfill unread from LAST_GOOD_RAIL when last_seen \
+             was contended — without it the unread-first sort transiently \
+             reorders (unread is the primary sort key, not a cosmetic badge)"
+        );
+
+        let count_start = stripped
+            .find("fncurrent_archived_count()")
+            .expect("current_archived_count not found");
+        let count_end = stripped[count_start..]
+            .find("fnbuild_view()")
+            .map(|i| count_start + i)
+            .expect("build_view must follow current_archived_count");
+        let count_seg = &stripped[count_start..count_end];
+        assert!(
+            count_seg.contains("schedule_rail_nudge();returnlast_good_archived_count();"),
+            "current_archived_count's contended arms must nudge and serve the \
+             last clean count — a transient 0 can combine with an empty thread \
+             list to unmount the whole DIRECT MESSAGES section"
+        );
+        assert!(
+            count_seg.contains("set_last_good_archived_count(count);"),
+            "current_archived_count must record the count from a clean pass — \
+             otherwise the contended arms serve a stale default forever"
+        );
+    }
+
+    /// Review follow-up (issue #499): a `last_seen`-contended pass
+    /// computes unread = 0 for every entry, and unread is the PRIMARY
+    /// sort key — the backfill must restore each pair's last-known
+    /// unread so rows keep their order across the degraded pass.
+    #[test]
+    fn backfill_unread_from_last_good_preserves_unread_and_order() {
+        let room = sk(1).verifying_key();
+        // Last good rail (fully-clean pass): peer 11 has 3 unread and
+        // sorts first; peer 22 read, more recent.
+        let mut last_good = vec![entry(room, 11, 1_000, 3), entry(room, 22, 2_000, 0)];
+        sort_rail_entries(&mut last_good);
+        assert_eq!(
+            last_good[0].peer,
+            MemberId(FastHash(11)),
+            "precondition: unread row sorts first on the clean pass"
+        );
+
+        // Degraded pass: same pairs, unread zeroed by the contended
+        // DM_LAST_SEEN read. Without the backfill, peer 22 (more
+        // recent) would sort first — a visible transient reorder.
+        let mut degraded = vec![entry(room, 11, 1_000, 0), entry(room, 22, 2_000, 0)];
+        backfill_unread_from_last_good(&mut degraded, &last_good);
+        sort_rail_entries(&mut degraded);
+        assert_eq!(
+            degraded[0].peer,
+            MemberId(FastHash(11)),
+            "backfill must restore unread so the degraded pass keeps the \
+             clean pass's order"
+        );
+        assert_eq!(
+            degraded[0].unread, 3,
+            "cached unread must be carried forward"
+        );
+        assert_eq!(degraded[1].unread, 0);
+    }
+
+    /// Pairs absent from the last good rail keep unread = 0 — the
+    /// backfill has no better information for them (e.g. a thread whose
+    /// first message arrived during the contended pass).
+    #[test]
+    fn backfill_unread_from_last_good_leaves_uncached_pairs_at_zero() {
+        let room = sk(1).verifying_key();
+        let last_good = vec![entry(room, 11, 1_000, 3)];
+        let mut degraded = vec![entry(room, 11, 1_000, 0), entry(room, 22, 2_000, 0)];
+        backfill_unread_from_last_good(&mut degraded, &last_good);
+        assert_eq!(degraded[0].unread, 3);
+        assert_eq!(
+            degraded[1].unread, 0,
+            "a pair the cache has never seen must stay at unread = 0"
+        );
+        // Recency is never backfilled — the current pass computed it
+        // from live room state.
+        assert_eq!(degraded[1].last_any_ts, 2_000);
+    }
+
+    /// The archived-count last-good cell round-trips (thread_local, so
+    /// each test thread starts at the default 0). Wiring — clean-pass
+    /// writes, contended-pass serves — is pinned by
+    /// `rail_last_good_caches_have_clean_pass_write_discipline`.
+    #[test]
+    fn last_good_archived_count_round_trip() {
+        assert_eq!(last_good_archived_count(), 0, "default is 0");
+        set_last_good_archived_count(7);
+        assert_eq!(last_good_archived_count(), 7);
+        set_last_good_archived_count(0);
+        assert_eq!(last_good_archived_count(), 0);
     }
 }

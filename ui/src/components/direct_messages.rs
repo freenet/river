@@ -67,15 +67,21 @@ pub fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
         // Skip the write when the stored cutoff would not advance —
         // `with_mut` notifies subscribers even for a no-op mutation and
         // this runs on every render of an open thread (issue #499
-        // write-pulse). `try_peek` registers no subscription and takes
-        // no write borrow; if it is somehow contended (it shouldn't be
-        // — we're in a `defer`'d clean context) we conservatively
-        // attempt the write rather than risk losing a genuine
-        // mark-read.
+        // write-pulse). `try_peek` registers no subscription; it fails
+        // ONLY while a live WRITE borrow exists on `DM_LAST_SEEN` — and
+        // on that same synchronous stack `with_mut` (which is
+        // `f(&mut *self.write())`, a panicking borrow) would be a
+        // GUARANTEED panic. So a contended peek must SKIP, never fall
+        // through to the write. Skipping is harmless: this function
+        // re-fires on every render of the open thread and again on the
+        // next inbound message, so a skipped advance self-heals on the
+        // next clean pass. The `false` fallback below is load-bearing —
+        // a `true` fallback is the panic path. Pinned by
+        // `mark_thread_read_write_is_gated_pinned`.
         let needs_write = DM_LAST_SEEN
             .try_peek()
             .map(|seen| thread_read_needs_write(seen.get(&(room, peer)).copied(), up_to_ts))
-            .unwrap_or(true);
+            .unwrap_or(false);
         if !needs_write {
             return;
         }
@@ -775,6 +781,31 @@ mod tests {
              (decide at {decide}, gate at {gate}, write at {write}) — an ungated \
              with_mut notifies DM rail subscribers on every render of an open \
              thread (issue #499 write-pulse)"
+        );
+
+        // The contended-peek fallback must be FALSE (skip the write).
+        // `try_peek` fails only while a live WRITE borrow exists on
+        // DM_LAST_SEEN, and on that same synchronous stack `with_mut`
+        // is a panicking borrow — so a `true` fallback converts every
+        // contended peek into a guaranteed RefCell panic. `false` is
+        // safe: mark_thread_read re-fires on every render of the open
+        // thread, so a skipped advance self-heals on the next clean
+        // pass. (Needles built with concat! so this comment and the
+        // assertion literals cannot drift into matching themselves —
+        // they sit inside the cut anyway, belt and braces.)
+        let fallback_false = concat!(".unwrap_or(", "false)");
+        let fallback_true = concat!(".unwrap_or(", "true)");
+        assert!(
+            seg.contains(fallback_false),
+            "mark_thread_read's try_peek fallback must be `false` (skip on \
+             contention) — a contended peek means a live write borrow, and \
+             falling through to with_mut on that stack panics"
+        );
+        assert!(
+            !seg.contains(fallback_true),
+            "mark_thread_read must NOT fall back to `true` on a contended \
+             try_peek — that is the guaranteed-panic path (with_mut on a \
+             signal whose write borrow is live)"
         );
     }
 
