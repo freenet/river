@@ -92,10 +92,22 @@ fn current_room_data_snapshot() -> Option<crate::room_data::RoomData> {
     // Scoped so the CURRENT_ROOM guard is dropped before ROOMS is read — the
     // same re-entrancy hazard the render-side lookup documents.
     let key = { CURRENT_ROOM.read().owner_key }?;
-    ROOMS
-        .try_read()
-        .ok()
-        .and_then(|rooms| rooms.map.get(&key).cloned())
+    // `try_read`, not `read`, for the reason the render-side lookup documents:
+    // a Dioxus write guard's Drop notifies subscribers synchronously on Firefox
+    // and can re-enter while ROOMS is still borrowed.
+    //
+    // A miss here means the action the reader just took is dropped, which the
+    // old render-time capture could not do — so say so rather than failing
+    // silently. It should not happen from a click handler (the event starts a
+    // fresh task, with no ROOMS write guard on the stack); a warning in the
+    // wild means that assumption is wrong somewhere.
+    match ROOMS.try_read() {
+        Ok(rooms) => rooms.map.get(&key).cloned(),
+        Err(_) => {
+            warn!("ROOMS signal busy while resolving the open room; action dropped");
+            None
+        }
+    }
 }
 
 /// Context for a reply-in-progress (held in a signal)
@@ -1414,6 +1426,25 @@ const INITIAL_WINDOW_ITEMS: usize = 60;
 /// back through history grows the window at the rate they consume it.
 const WINDOW_GROWTH_ITEMS: usize = 60;
 
+/// How far into the rendered history the backfill trigger REACHES, in px.
+///
+/// The sentinel is a strip spanning `[0, BACKFILL_LEAD_PX]` from the top of the
+/// history, not a marker at a point. Both halves of that matter:
+///
+/// * Not a 1px marker at the very top: it would only intersect at
+///   `scrollTop == 0`, so the reader hits the end of the rendered history and
+///   *then* watches it grow. Reaching a screenful in means the next page is
+///   already there by the time they get to it — what `BOTTOM_THRESHOLD_PX`
+///   does for the other end via an IntersectionObserver `rootMargin`.
+/// * Not a 1px marker at `top: BACKFILL_LEAD_PX` either. That was the first
+///   attempt and it is worse than doing nothing: on any viewport SHORTER than
+///   the lead, scrolling to the very top puts the marker BELOW the viewport, so
+///   the reader who scrolls straight to the top — the exact case this exists
+///   for — never triggers a backfill and the history dead-ends. A strip is
+///   intersecting for every scroll position in the band, including 0, on every
+///   viewport size.
+const BACKFILL_LEAD_PX: i32 = 800;
+
 /// Where the history's tail window starts, and whether anything is behind it.
 ///
 /// Split out from the render so the arithmetic is testable: getting it wrong
@@ -1693,45 +1724,6 @@ pub fn Conversation() -> Element {
     // inside it are wasm-only.
     let backfill_anchor = use_hook(|| Rc::new(std::cell::Cell::new(None::<(i32, i32)>)));
 
-    // Re-window when the reader opens a different room. The window means "how
-    // far back have I looked in THIS room", so carrying it across rooms would
-    // render a freshly-opened room to the depth of the last one. Subscribes to
-    // the room IDENTITY, not its contents: a message arriving must not collapse
-    // a window the reader has grown.
-    use_effect(move || {
-        let _room = CURRENT_ROOM.read().owner_key;
-        window_items.set(INITIAL_WINDOW_ITEMS);
-    });
-
-    // Put the view back where the reader was after a backfill. The revealed
-    // items land ABOVE the current offset, so without this the history jumps by
-    // their full height. Restoring the offset is also what stops the backfill
-    // cascading: the sentinel ends up above the viewport again, so it stops
-    // intersecting until the reader scrolls back up to it.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let backfill_anchor = backfill_anchor.clone();
-        use_effect(move || {
-            // Subscribe, so this runs after the render that added the items.
-            let _ = window_items();
-            let Some((prev_height, prev_top)) = backfill_anchor.get() else {
-                return;
-            };
-            let backfill_anchor = backfill_anchor.clone();
-            // Deferred so the browser has laid the new rows out and
-            // `scroll_height` reflects them.
-            crate::util::defer(move || {
-                backfill_anchor.set(None);
-                let Some(container) = chat_scroll_container() else {
-                    return;
-                };
-                let grew_by = container.scroll_height() - prev_height;
-                if grew_by > 0 {
-                    container.set_scroll_top(prev_top + grew_by);
-                }
-            });
-        });
-    }
     // "The reader wants to stay with the newest message." Plain `Cell`s, not
     // signals: they are written from raw JS event callbacks that run with no
     // Dioxus scope on the stack, and nothing renders from them, so there is no
@@ -1748,6 +1740,69 @@ pub fn Conversation() -> Element {
     // gate. See `install_scroll_pin_listeners`.
     #[cfg(target_arch = "wasm32")]
     let last_scroll_top = use_hook(|| Rc::new(std::cell::Cell::new(0i32)));
+
+    // Re-window when the reader opens a DIFFERENT room. The window means "how
+    // far back have I looked in THIS room", so carrying it across rooms would
+    // render a freshly-opened room to the depth of the last one.
+    //
+    // Guarded on an ACTUAL key change for the same reason the force-scroll
+    // effect below is: Dioxus re-runs the effect on any write to
+    // `CURRENT_ROOM`, and re-selecting the already-open room in the sidebar
+    // rewrites it with the same key. Without the guard, that would collapse a
+    // window the reader had scrolled back through — dropping them to the newest
+    // 60 items mid-read.
+    {
+        let prev_windowed_room =
+            use_hook(|| Rc::new(std::cell::Cell::new(None::<ed25519_dalek::VerifyingKey>)));
+        use_effect(move || {
+            let room = CURRENT_ROOM.read().owner_key;
+            if prev_windowed_room.get() != room {
+                prev_windowed_room.set(room);
+                window_items.set(INITIAL_WINDOW_ITEMS);
+            }
+        });
+    }
+
+    // Put the view back where the reader was after a backfill. The revealed
+    // items land ABOVE the current offset, so without this the history jumps by
+    // their full height. Restoring the offset is also what stops the backfill
+    // cascading: the sentinel ends up above the viewport again, so it stops
+    // intersecting until the reader scrolls back up to it.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let backfill_anchor = backfill_anchor.clone();
+        let last_scroll_top = last_scroll_top.clone();
+        use_effect(move || {
+            // Subscribe, so this runs after the render that added the items.
+            let _ = window_items();
+            let Some((prev_height, prev_top)) = backfill_anchor.get() else {
+                return;
+            };
+            let backfill_anchor = backfill_anchor.clone();
+            let last_scroll_top = last_scroll_top.clone();
+            // Deferred so the browser has laid the new rows out and
+            // `scroll_height` reflects them.
+            crate::util::defer(move || {
+                backfill_anchor.set(None);
+                let Some(container) = chat_scroll_container() else {
+                    return;
+                };
+                let grew_by = container.scroll_height() - prev_height;
+                if grew_by > 0 {
+                    let target = prev_top + grew_by;
+                    // Record the offset we asked for BEFORE asking for it, the
+                    // same contract `scroll_history_to_bottom` keeps: the
+                    // settle handler decides whose scroll a settle was by
+                    // POSITION, so a programmatic scroll that does not write
+                    // `last_scroll_top` is later mistaken for the reader
+                    // moving, and the ResizeObserver stands down on the
+                    // strength of it. See `install_scroll_pin_listeners`.
+                    last_scroll_top.set(target);
+                    container.set_scroll_top(target);
+                }
+            });
+        });
+    }
     // Which message's touch action menu (kebab) is open, by message ID string.
     // Owned by Conversation (not per message group) so only ONE menu is open at
     // a time across the whole history — opening one closes any other (#402).
@@ -3072,17 +3127,46 @@ pub fn Conversation() -> Element {
                                         rows
                                     };
                                     Some(rsx! {
-                                        div { class: "space-y-4",
-                                            // Backfill trigger, rendered only
-                                            // while older items are held back.
-                                            // Once the whole room is on screen
-                                            // it leaves the DOM, and with it
-                                            // the observer — so a fully-read
-                                            // room behaves exactly as before.
-                                            if history_window.has_older {
+                                        // Backfill trigger, rendered only while
+                                        // older items are held back. Once the
+                                        // whole room is on screen it leaves the
+                                        // DOM, and with it the observer — so a
+                                        // fully-read room behaves exactly as
+                                        // before.
+                                        //
+                                        // Deliberately OUTSIDE the `space-y-4`
+                                        // list: as a child it would take the
+                                        // first row's place, pushing that row
+                                        // down by the 1rem gap and shifting the
+                                        // history by that much every time the
+                                        // sentinel appeared or (on the last
+                                        // backfill) disappeared.
+                                        if history_window.has_older {
+                                            // Zero-height anchor; the sentinel
+                                            // inside it is absolutely
+                                            // positioned, so it contributes no
+                                            // layout at all.
+                                            div { style: "position:relative;height:0;",
                                                 div {
                                                     id: "top-backfill-sentinel",
-                                                    class: "h-px pointer-events-none",
+                                                    // A STRIP spanning the top
+                                                    // BACKFILL_LEAD_PX of the
+                                                    // history, so the backfill
+                                                    // fires as the reader
+                                                    // approaches the end of what
+                                                    // is rendered rather than
+                                                    // when they hit it — and
+                                                    // still fires at scrollTop 0
+                                                    // on a viewport shorter than
+                                                    // the lead. See
+                                                    // `BACKFILL_LEAD_PX` for why
+                                                    // a point marker fails.
+                                                    // Inline style, not a
+                                                    // Tailwind arbitrary value:
+                                                    // the class scanner does not
+                                                    // see class names built
+                                                    // inside rsx.
+                                                    style: "position:absolute;top:0;height:{BACKFILL_LEAD_PX}px;width:1px;",
                                                     onvisible: move |evt| {
                                                         if evt.data().is_intersecting().unwrap_or(false) {
                                                             // Capture the geometry BEFORE the
@@ -3102,6 +3186,8 @@ pub fn Conversation() -> Element {
                                                     },
                                                 }
                                             }
+                                        }
+                                        div { class: "space-y-4",
                                             {rows.into_iter().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
