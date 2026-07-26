@@ -850,12 +850,21 @@ mod tests {
             );
         }
         // Still deeper than the render window in display ITEMS, so the
-        // windowed premise assertions hold for this room too.
+        // windowed premise assertions hold for this room too. Counted from
+        // the seeded DATA (runs of same-author adjacent messages collapse,
+        // exactly as `group_messages` groups them) rather than from the
+        // constant, so a fixture change that alters the authoring pattern —
+        // not just the count — fails here.
+        let display_items = fillers
+            .windows(2)
+            .filter(|w| w[0].message.author != w[1].message.author)
+            .count()
+            + 1;
         assert!(
-            AT_CAP_FILLER_MESSAGES / 2 > 60,
+            display_items > 60,
             "paired fillers must still exceed INITIAL_WINDOW_ITEMS display \
              items or the windowing specs quietly degrade to the small-room \
-             path"
+             path; got {display_items}"
         );
     }
 

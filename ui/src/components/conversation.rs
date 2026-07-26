@@ -1543,15 +1543,24 @@ fn relocate_anchor(total: usize, hint: usize, is_anchor: impl Fn(usize) -> bool)
 }
 
 /// Re-locate the anchored window: the head by its own key, else by the first
-/// surviving spare, else index 0 (a front-contiguous drain consumed the head
-/// and every spare, so the oldest remaining item IS the nearest survivor).
+/// surviving spare, else index 0.
+///
+/// The index-0 fallback is exact for a front-contiguous drain that consumed
+/// the head and every spare — the oldest remaining item IS then the nearest
+/// survivor. It is a DEGRADED answer for the other way to lose that many
+/// contiguous leading items (a ban purge or bulk delete of >=
+/// [`WINDOW_ANCHOR_KEYS`] display items above the reader): the window jumps
+/// to the front of the room, bounded only by the ceiling, and the reposition
+/// probe finds nothing to measure against. Rare, and it fails toward
+/// rendering MORE history rather than losing the reader's place entirely.
 ///
 /// The `head_reposition` effect measures and compensates a parked reader for
-/// the FRONT-CONTIGUOUS removals this relocation deals in (at-cap drains,
-/// batched or not, including a re-keyed multi-message head group). It does
-/// NOT make every removal invisible: a bulk MID-window removal (a ban purge)
-/// or late-loading media above the viewport still shifts a parked reader —
-/// tracked as follow-up work, not covered here.
+/// the TOP-CONTIGUOUS removals this relocation deals in (at-cap drains,
+/// batched or not, including a re-keyed multi-message head group, and small
+/// leading deletes the spares still cover). It does NOT make every removal
+/// invisible: a bulk MID-window removal (a ban purge) or late-loading media
+/// above the viewport still shifts a parked reader — tracked as follow-up
+/// work, not covered here.
 fn relocate_window(
     total: usize,
     anchor: &WindowAnchor,
@@ -1575,21 +1584,30 @@ fn relocate_window(
 /// How many rows past the window head the reposition capture will probe for a
 /// row that exists in the PRE-patch DOM.
 ///
-/// The new head itself may have no pre-patch row to measure: a multi-message
-/// head group whose first message was drained RE-KEYS (a group's key is its
-/// first message's id), so its new key is in no pre-patch row and a
-/// head-only probe dead-fires — the parked reader then crawls one intra-group
-/// line per arrival (#505 re-review blocker). For a front-contiguous removal
-/// every surviving row at or below the head shifts by the same amount, so ANY
-/// nearby surviving row measures the shift exactly; a handful of candidates
-/// is plenty (one re-keyed head plus a couple of simultaneously-drained
-/// neighbors).
+/// The new head itself may have no pre-patch row to measure, for two reasons:
+///
+/// * a multi-message head group whose first message was drained RE-KEYS (a
+///   group's key is its first message's id), so its new key is in no
+///   pre-patch row (#505 re-review blocker);
+/// * relocation landing via SPARE `k` sets `start = i - k`, widening the
+///   window backward by `k` items that were not rendered pre-patch at all, so
+///   the first `k` candidates cannot have pre-patch rows either.
+///
+/// A head-only — or too-short — probe dead-fires, and the parked reader is
+/// left uncompensated. Sized to [`WINDOW_ANCHOR_KEYS`] so the walk always
+/// outlasts the deepest spare the anchor can relocate through (`k <=
+/// WINDOW_ANCHOR_KEYS - 1`, needing `k + 1` candidates). For a
+/// top-contiguous removal every surviving row at or below the head shifts by
+/// the same amount, so whichever candidate lands measures the shift exactly.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-const REPOSITION_PROBE_ROWS: usize = 4;
+const REPOSITION_PROBE_ROWS: usize = WINDOW_ANCHOR_KEYS;
 
 /// Pick the row the reposition will measure: the first of the leading
-/// `REPOSITION_PROBE_ROWS` post-patch keys that has a PRE-patch row (i.e.
-/// `pre_patch_offset_of` returns its current `offsetTop`).
+/// `REPOSITION_PROBE_ROWS` post-patch keys that has a PRE-patch row.
+///
+/// `pre_patch_offsets` is handed the whole candidate list at once so the DOM
+/// is scanned a single time (see `first_history_row_offset`) rather than once
+/// per candidate inside the render body.
 ///
 /// Only the wasm render path calls this at runtime; natively it is exercised
 /// by the unit tests, hence the targeted allow rather than a cfg that would
@@ -1597,11 +1615,10 @@ const REPOSITION_PROBE_ROWS: usize = 4;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn select_reposition_probe(
     keys_from_head: impl Iterator<Item = String>,
-    pre_patch_offset_of: impl Fn(&str) -> Option<i32>,
+    pre_patch_offsets: impl Fn(&[String]) -> Option<(String, i32)>,
 ) -> Option<(String, i32)> {
-    keys_from_head
-        .take(REPOSITION_PROBE_ROWS)
-        .find_map(|key| pre_patch_offset_of(&key).map(|top| (key, top)))
+    let candidates: Vec<String> = keys_from_head.take(REPOSITION_PROBE_ROWS).collect();
+    pre_patch_offsets(&candidates)
 }
 
 /// Does `key` identify `item`, without allocating a key `String`?
@@ -1618,6 +1635,11 @@ fn display_item_key_matches(item: &DisplayItem, key: &str) -> bool {
 
 /// What the backfill sentinel captures just before growing the window, so the
 /// restore can put the reader back on the row they were looking at.
+///
+/// Only ever constructed on wasm (the capture reads the DOM), hence the
+/// native allow rather than a cfg that would also hide the type from the
+/// component's non-wasm compile.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, PartialEq, Debug)]
 struct BackfillAnchor {
     /// `data-item-key` of the head row at capture time. It survives the
@@ -1777,19 +1799,34 @@ fn max_scroll_top(container: &web_sys::Element) -> i32 {
 /// few hundred rows) and only runs on the rare head-swap paths.
 #[cfg(target_arch = "wasm32")]
 fn history_row_offset_top(key: &str) -> Option<i32> {
+    first_history_row_offset(&[key.to_string()]).map(|(_, top)| top)
+}
+
+/// The first of `keys` (in order) that has a row in the CURRENT DOM, as
+/// `(key, offsetTop)`.
+///
+/// One DOM pass for the whole candidate list rather than one per candidate:
+/// the reposition capture runs inside the render body, where each
+/// `query_selector_all` + `offsetTop` pair forces a reflow, and the walk can
+/// legitimately need to try [`REPOSITION_PROBE_ROWS`] of them.
+#[cfg(target_arch = "wasm32")]
+fn first_history_row_offset(keys: &[String]) -> Option<(String, i32)> {
     use wasm_bindgen::JsCast;
     let container = chat_scroll_container()?;
     let rows = container.query_selector_all("[data-item-key]").ok()?;
+    // Rendered key -> offsetTop, built in one pass.
+    let mut present: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
     for i in 0..rows.length() {
         let Some(node) = rows.item(i) else { continue };
         let Some(el) = node.dyn_ref::<web_sys::HtmlElement>() else {
             continue;
         };
-        if el.get_attribute("data-item-key").as_deref() == Some(key) {
-            return Some(el.offset_top());
+        if let Some(k) = el.get_attribute("data-item-key") {
+            present.entry(k).or_insert_with(|| el.offset_top());
         }
     }
-    None
+    keys.iter()
+        .find_map(|k| present.get(k).map(|top| (k.clone(), *top)))
 }
 
 /// The first history row carrying a `data-item-key` — the current window head
@@ -2246,14 +2283,16 @@ pub fn Conversation() -> Element {
             };
             if shift > 0 {
                 let target = anchor.scroll_top + shift;
-                // Record the offset we asked for BEFORE asking for it, the
-                // same contract `scroll_history_to_bottom` keeps: the
-                // settle handler decides whose scroll a settle was by
-                // POSITION, so a programmatic scroll that does not write
-                // `last_scroll_top` is later mistaken for the reader
-                // moving, and the ResizeObserver stands down on the
-                // strength of it. See `install_scroll_pin_listeners`.
-                last_scroll_top.set(target);
+                // Move the reference BY THE SHIFT, for the same reason the
+                // head reposition below does: `last_scroll_top` is what
+                // `reader_moved_up_since` measures against, and writing the
+                // reader's new absolute offset into it erases the fact that
+                // they are up in the history whenever their `scrollend` has
+                // not landed yet — after which the stale-true pin lets both
+                // follow paths drag them to the bottom (#505 delta review).
+                // Relative keeps the gap, and keeps this settle readable as
+                // the reader's so the pin resolves honestly.
+                last_scroll_top.set(last_scroll_top.get() + shift);
                 container.set_scroll_top(target);
             }
         });
@@ -2578,13 +2617,14 @@ pub fn Conversation() -> Element {
             // scroll in the app, and while it is in flight the state reads
             // exactly like a parked reader (pinned, position above the
             // recorded target). Its recorded target is the bottom — so when
-            // `last_scroll_top` already points at the maximum, a scrollTop
-            // write here would cancel that animation mid-flight for a reader
-            // who is headed to the bottom anyway (#505 re-review). Trade-off,
-            // documented: a parked reader whose content SHRANK enough to pull
-            // `max_scroll_top` under their recorded offset skips one
-            // compensation; the next settle re-records and re-arms.
-            if last_scroll_top.get() >= max_scroll_top(&container) {
+            // the view is PINNED and `last_scroll_top` already points at the
+            // maximum, a scrollTop write here would cancel that animation
+            // mid-flight for a reader who is headed to the bottom anyway
+            // (#505 re-review). Gated on the pin as well as the offset: with
+            // `pinned == false` no animation can be in flight, so an unpinned
+            // reader whose patch pulled `max_scroll_top` under their recorded
+            // offset still gets compensated.
+            if pinned_to_bottom.get() && last_scroll_top.get() >= max_scroll_top(&container) {
                 return;
             }
             let Some(post_top) = history_row_offset_top(&key) else {
@@ -2593,10 +2633,20 @@ pub fn Conversation() -> Element {
             let shift = post_top - pre_top;
             if shift != 0 {
                 let target = (container.scroll_top() + shift).max(0);
-                // Same contract as every programmatic scroll: record the
-                // offset so the settle reads as ours. See
-                // `install_scroll_pin_listeners`.
-                last_scroll_top.set(target);
+                // Move the reference BY THE SHIFT, not to the new absolute
+                // offset. `last_scroll_top` is what `reader_moved_up_since`
+                // measures against, and it is only meaningful in the window
+                // between the reader moving and their `scrollend` landing —
+                // writing their freshly-compensated position into it collapses
+                // that signal to "has not moved", and with `pinned_to_bottom`
+                // still stale-true BOTH follow paths then yank them to the
+                // bottom (#505 delta review). A relative update preserves
+                // their gap to the reference in both directions, so the guard
+                // keeps answering truthfully. It also resolves the pin
+                // correctly: this settle now reads as the READER's, so the
+                // handler re-measures and clears the stale pin — right, since
+                // this effect only runs for a genuinely parked reader.
+                last_scroll_top.set(last_scroll_top.get() + shift);
                 container.set_scroll_top(target);
             }
         });
@@ -3701,7 +3751,7 @@ pub fn Conversation() -> Element {
                                             groups[history_window.start..]
                                                 .iter()
                                                 .map(display_item_key),
-                                            history_row_offset_top,
+                                            first_history_row_offset,
                                         ) {
                                             *reposition_pending.borrow_mut() = Some(probe);
                                         }
@@ -5479,10 +5529,6 @@ mod tests {
         );
     }
 
-    /// #505 blocker 1: the anchor is re-located by IDENTITY. An at-cap room
-    /// prunes its oldest message per arrival, shifting every index down — the
-    /// walk below is that steady state, and the head must stay the same ITEM
-    /// (its index marching toward 0), not the same index.
     /// Anchor carrying the head + spare keys the way the render does.
     fn anchor_of(keys: &[String], start: usize) -> WindowAnchor {
         WindowAnchor {
@@ -5495,6 +5541,10 @@ mod tests {
         }
     }
 
+    /// #505 blocker 1: the anchor is re-located by IDENTITY. An at-cap room
+    /// prunes its oldest message per arrival, shifting every index down — the
+    /// walk below is that steady state, and the head must stay the same ITEM
+    /// (its index marching toward 0), not the same index.
     #[test]
     fn the_anchor_follows_the_item_through_at_cap_pruning() {
         // A 100-item room at cap: items are identified by these keys.
@@ -5570,18 +5620,83 @@ mod tests {
         // The measured probe: the new head key "m1" has NO pre-patch row —
         // a head-only probe dead-fires and the parked reader crawls one
         // intra-group line per arrival. The walk lands on "b", which does.
-        let pre_patch_dom = |key: &str| match key {
-            "m0" => Some(100),
-            "b" => Some(160),
-            "c" => Some(220),
-            _ => None,
-        };
-        let probe = select_reposition_probe(post_keys.iter().map(|k| k.to_string()), pre_patch_dom);
+        let probe = select_reposition_probe(
+            post_keys.iter().map(|k| k.to_string()),
+            pre_patch_dom(&[("m0", 100), ("b", 160), ("c", 220)]),
+        );
         assert_eq!(
             probe,
             Some(("b".to_string(), 160)),
             "the probe must walk past the un-measurable re-keyed head to the \
              first row that existed pre-patch"
+        );
+    }
+
+    /// A pre-patch DOM as a `first_history_row_offset`-shaped lookup: the
+    /// first candidate key that has a row, with its offset.
+    fn pre_patch_dom(rows: &[(&'static str, i32)]) -> impl Fn(&[String]) -> Option<(String, i32)> {
+        let rows = rows.to_vec();
+        move |keys: &[String]| {
+            keys.iter().find_map(|k| {
+                rows.iter()
+                    .find(|(rk, _)| rk == k)
+                    .map(|(_, top)| (k.clone(), *top))
+            })
+        }
+    }
+
+    /// The probe walk must outlast the DEEPEST spare the anchor can relocate
+    /// through. Landing via spare `k` sets `start = i - k`, widening the
+    /// window backward by `k` items that were never rendered pre-patch, so
+    /// the first `k` candidates cannot have pre-patch rows. A walk shorter
+    /// than `WINDOW_ANCHOR_KEYS` dead-fires exactly when the removal is
+    /// biggest — a bulk delete of several contiguous leading items above a
+    /// parked reader (#505 delta review).
+    #[test]
+    fn the_probe_walk_outlasts_the_deepest_spare() {
+        assert!(
+            REPOSITION_PROBE_ROWS >= WINDOW_ANCHOR_KEYS,
+            "the probe walk must cover every spare the anchor can land on"
+        );
+
+        // Anchor: head + 7 spares. A bulk delete removes the head and the
+        // first 6 spares; relocation lands on spare 7 ("s7"), so the window
+        // widens back by 7 items that have no pre-patch rows.
+        let anchor = WindowAnchor {
+            keys: (0..WINDOW_ANCHOR_KEYS)
+                .map(|i| {
+                    if i == 0 {
+                        "head".to_string()
+                    } else {
+                        format!("s{i}")
+                    }
+                })
+                .collect(),
+            index: 20,
+        };
+        let post_keys: Vec<String> = (0..7)
+            .map(|i| format!("older{i}"))
+            .chain(std::iter::once("s7".to_string()))
+            .chain((0..10).map(|i| format!("rest{i}")))
+            .collect();
+        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
+        assert!(!relocated.head_survived);
+        assert_eq!(
+            relocated.start, 0,
+            "spare 7 found at index 7, offset 7 in the anchor → start 0"
+        );
+
+        // Only the 8th candidate ("s7") has a pre-patch row; the seven
+        // widened-in rows above it do not. A 4-row walk finds nothing.
+        let probe = select_reposition_probe(
+            post_keys.iter().map(|k| k.to_string()),
+            pre_patch_dom(&[("s7", 480), ("rest0", 540)]),
+        );
+        assert_eq!(
+            probe,
+            Some(("s7".to_string(), 480)),
+            "the walk must reach the deepest spare's row, or the compensation \
+             silently dead-fires on the largest removals"
         );
     }
 
@@ -5679,7 +5794,7 @@ mod tests {
         assert_eq!(find("c", 0), Some(2));
         // Hint out of range entirely: still found.
         assert_eq!(find("e", 400), Some(4));
-        // Gone: None, and the caller falls back to the position.
+        // Gone: None, and `relocate_window` moves on to the next spare.
         assert_eq!(find("zz", 2), None);
         assert_eq!(relocate_anchor(0, 0, |_| true), None, "empty list");
     }
@@ -8303,6 +8418,20 @@ mod autoscroll_wiring_pins {
             dense.contains("letshift=post_top-pre_top;"),
             "the reposition must be BY MEASUREMENT (post-patch minus pre-patch \
              offset of a surviving row), not a guess"
+        );
+        // The reference moves BY THE SHIFT. Writing the reader's new absolute
+        // offset instead collapses `reader_moved_up_since` to false while the
+        // pin is still stale-true, and both follow paths then yank a parked
+        // reader to the bottom (#505 delta review). Two call sites: the head
+        // reposition and the backfill restore.
+        assert_eq!(
+            dense
+                .matches("last_scroll_top.set(last_scroll_top.get()+shift);")
+                .count(),
+            2,
+            "both the head reposition and the backfill restore must update \
+             `last_scroll_top` RELATIVELY — an absolute write erases the \
+             reader's movement and the follow paths drag them to the bottom"
         );
         assert!(
             dense.contains("select_reposition_probe("),
