@@ -661,13 +661,17 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     await expectWindowedRenderActive(page);
     const initialRows = await renderedRowCount(page);
 
-    // Scroll to the very top and tag the current head row IN THE SAME
+    // Scroll to the very top and tag the current head ITEM row IN THE SAME
     // browser task — the sentinel's IntersectionObserver fires in a later
-    // task, so the tag always lands before the backfill.
+    // task, so the tag always lands before the backfill. The head's date
+    // SEPARATOR is not a valid probe: when older rows land above it, the day
+    // no longer starts at the old head, so that row legitimately leaves the
+    // DOM. The item row itself survives — item identity is exactly what the
+    // window anchors on.
     const probeTop = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       c.scrollTop = 0;
-      const row = c.querySelector(".space-y-4 > *") as HTMLElement;
+      const row = c.querySelector(".space-y-4 > [data-item-key]") as HTMLElement;
       (row as any).__riverPagingProbe = true;
       return row.getBoundingClientRect().top;
     });
