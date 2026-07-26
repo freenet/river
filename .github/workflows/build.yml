@@ -188,6 +188,17 @@ jobs:
       # `cargo test -p river-ui`. This step gates them on every push.
       run: cargo test -p river-ui --bins
 
+    - name: Test river-ui (example-data fixture tests)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # The example_data module (and its tests — the deep/at-cap windowing
+      # fixture pins for freenet/river#501/#505) only compiles behind the
+      # example-data feature, so the featureless run above never executes
+      # them. Without this step a fixture regression that vacuates the
+      # windowing Playwright specs would pass CI silently.
+      run: cargo test -p river-ui --bins --features example-data,no-sync
+
   ui-playwright-tests:
     runs-on: freenet-default-runner
 

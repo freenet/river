@@ -33,9 +33,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// shipped with a green suite. Strictly ALTERNATING authors, because
 /// consecutive same-author messages within five minutes fold into one display
 /// item: alternation makes messages == items, so the count is a guarantee
-/// rather than a hope. 80 fillers + the ~12 standard fixture messages stays
-/// under the default `max_recent_messages` (100).
-const DEEP_HISTORY_FILLER_MESSAGES: usize = 80;
+/// rather than a hope.
+///
+/// Sized to more than THREE windows (188 + the 12 standard messages = 200), so
+/// the backfill-paging spec takes several growth steps to exhaust the room and
+/// the #505 blocker-2 scenario (arrivals widening the rendered window past one
+/// whole growth step) is reachable with a single batched delivery. The room's
+/// `max_recent_messages` is raised to [`DEEP_ROOM_MAX_RECENT_MESSAGES`] so
+/// those deliveries do not prune the fillers out from under the test.
+const DEEP_HISTORY_FILLER_MESSAGES: usize = 188;
+
+/// `max_recent_messages` for the deep fixture room: 200 seeded + headroom for
+/// the specs' delivered arrivals without hitting the at-cap prune path (which
+/// has its own dedicated fixture room below).
+const DEEP_ROOM_MAX_RECENT_MESSAGES: usize = 300;
+
+/// Fillers for the AT-CAP fixture room: 88 + the 12 standard messages lands
+/// exactly on the default `max_recent_messages` (100), so every delivered
+/// arrival drains the oldest message — the steady state of every busy
+/// production room, and the index-shift regression surface of #505 blocker 1.
+/// `at_cap_room_is_exactly_at_its_message_cap` pins the arithmetic.
+const AT_CAP_FILLER_MESSAGES: usize = 88;
 
 /// How deep a fixture room's message history is seeded.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,8 +63,11 @@ enum HistoryDepth {
     Standard,
     /// [`DEEP_HISTORY_FILLER_MESSAGES`] alternating-author fillers ahead of the
     /// standard fixture, so the room renders a windowed tail with a live
-    /// backfill sentinel.
+    /// backfill sentinel, with prune headroom for delivered arrivals.
     Deep,
+    /// [`AT_CAP_FILLER_MESSAGES`] fillers, landing the room EXACTLY on its
+    /// `max_recent_messages` cap so arrivals prune.
+    AtCap,
 }
 
 /// Whether the page was loaded with `?deep-history-room=1`, asking for the
@@ -95,7 +116,9 @@ pub fn create_example_rooms() -> Rooms {
     );
     map.insert(room3.owner_vk, room3.room_data);
 
-    // A room deeper than the render window, for the windowing specs (#501).
+    // Rooms deeper than the render window, for the windowing specs (#501):
+    // one with prune headroom, one exactly at its message cap so delivered
+    // arrivals exercise the at-cap index-shift path (#505 blocker 1).
     if deep_history_room_requested() {
         let room4 = create_room(
             &"Deep History Room".to_string(),
@@ -104,6 +127,14 @@ pub fn create_example_rooms() -> Rooms {
             HistoryDepth::Deep,
         );
         map.insert(room4.owner_vk, room4.room_data);
+
+        let room5 = create_room(
+            &"Capped History Room".to_string(),
+            SelfIs::Member,
+            None,
+            HistoryDepth::AtCap,
+        );
+        map.insert(room5.owner_vk, room5.room_data);
     }
 
     Rooms {
@@ -161,6 +192,13 @@ fn create_room(
         description: description.map(|d| SealedBytes::public(d.as_bytes().to_vec())),
     };
     config.owner_member_id = owner_id;
+    if history_depth == HistoryDepth::Deep {
+        // Headroom over the 200 seeded messages so the specs can deliver
+        // arrival batches without the at-cap prune shifting the fixture out
+        // from under them. The AT-CAP room keeps the default (100) — landing
+        // exactly on it is its entire purpose.
+        config.max_recent_messages = DEEP_ROOM_MAX_RECENT_MESSAGES;
+    }
     room_state.configuration = AuthorizedConfigurationV1::new(config, owner_sk);
 
     // Initialize member lists
@@ -398,29 +436,32 @@ fn add_example_messages(
         .chain(std::iter::once((*owner_id, owner_key)))
         .collect();
 
-    // Deep-history fixture: filler messages AHEAD of the standard fixture so
+    // Deep-history fixtures: filler messages AHEAD of the standard fixture so
     // the room's display-item count comfortably exceeds the render window.
     // Authors strictly alternate — consecutive same-author messages within
     // five minutes fold into one display item, so alternation is what makes
     // "N messages" mean "N display items". Deterministic content and fixed
     // 60s gaps: nothing here should vary run to run.
-    if history_depth == HistoryDepth::Deep {
-        for i in 0..DEEP_HISTORY_FILLER_MESSAGES {
-            let (author_id, signing_key) = authors[i % 2.min(authors.len())];
-            let msg = AuthorizedMessageV1::new(
-                MessageV1 {
-                    room_owner: *owner_id,
-                    author: author_id,
-                    time: get_time_from_millis(current_time_ms),
-                    content: RoomMessageBody::public(format!(
-                        "history filler {i:02}: the window only renders a tail"
-                    )),
-                },
-                signing_key,
-            );
-            messages.messages.push(msg);
-            current_time_ms += 60_000;
-        }
+    let filler_count = match history_depth {
+        HistoryDepth::Standard => 0,
+        HistoryDepth::Deep => DEEP_HISTORY_FILLER_MESSAGES,
+        HistoryDepth::AtCap => AT_CAP_FILLER_MESSAGES,
+    };
+    for i in 0..filler_count {
+        let (author_id, signing_key) = authors[i % 2.min(authors.len())];
+        let msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: author_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::public(format!(
+                    "history filler {i:02}: the window only renders a tail"
+                )),
+            },
+            signing_key,
+        );
+        messages.messages.push(msg);
+        current_time_ms += 60_000;
     }
 
     let message_count = 6;
@@ -721,8 +762,55 @@ mod tests {
             "the fixture must exceed INITIAL_WINDOW_ITEMS or the windowing \
              specs test nothing"
         );
+        // Prune headroom: the specs deliver arrival batches into this room;
+        // if the total creeps up to the cap, those deliveries silently start
+        // pruning fillers and every count-based premise drifts.
+        let max = room
+            .room_data
+            .room_state
+            .configuration
+            .configuration
+            .max_recent_messages;
+        assert_eq!(max, DEEP_ROOM_MAX_RECENT_MESSAGES);
+        assert!(
+            msgs.len() + 80 <= max,
+            "the deep room needs at least ~80 messages of prune headroom for \
+             delivered arrivals; seeded {} of max {max}",
+            msgs.len()
+        );
         // create_room verifies the state internally (it panics on failure),
         // so reaching this point means the deep room is contract-valid.
+    }
+
+    /// The at-cap fixture must land EXACTLY on its message cap: one message
+    /// under and arrivals do not prune (blocker-1's index shift never
+    /// happens); one over and `create_room`'s verify sees a state
+    /// `apply_delta` would never produce.
+    #[test]
+    fn at_cap_room_is_exactly_at_its_message_cap() {
+        let room = create_room(
+            &"Capped History Room".to_string(),
+            SelfIs::Member,
+            None,
+            HistoryDepth::AtCap,
+        );
+        let state = &room.room_data.room_state;
+        assert_eq!(
+            state.recent_messages.messages.len(),
+            state.configuration.configuration.max_recent_messages,
+            "the capped room must sit exactly at max_recent_messages so every \
+             delivered arrival drains the oldest message (#505 blocker 1)"
+        );
+        // And it is still deeper than the render window, so the windowed
+        // premise assertions hold for this room too.
+        assert!(state.recent_messages.messages.len() > 60);
+        for pair in state.recent_messages.messages[..AT_CAP_FILLER_MESSAGES].windows(2) {
+            assert_ne!(
+                pair[0].message.author, pair[1].message.author,
+                "adjacent fillers share an author and would merge into one \
+                 display item"
+            );
+        }
     }
 
     #[test]
@@ -813,6 +901,20 @@ pub fn install_test_hooks() {
     );
     insert.forget();
 
+    // A burst in ONE state mutation — one delta application, one re-render —
+    // as a network delta carrying many messages produces. The windowing specs
+    // use it to grow an anchored window well past one backfill step without
+    // paying per-delivery render round-trips (#505 blocker 2).
+    let append_many = Closure::wrap(Box::new(move |count: u32| {
+        crate::util::defer(move || deliver_batch(count as usize));
+    }) as Box<dyn FnMut(u32)>);
+    let _ = js_sys::Reflect::set(
+        &hooks,
+        &JsValue::from_str("appendMessages"),
+        append_many.as_ref(),
+    );
+    append_many.forget();
+
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 
@@ -831,15 +933,101 @@ enum Delivery {
     BeforeLast,
 }
 
-/// Two fixed identities, so a delivered message never merges into the group
-/// above it by accident: grouping needs the same author within 5 minutes, and
+/// Fixed identities, so a delivered message never merges into the group above
+/// it by accident: grouping needs the same author within 5 minutes, and
 /// `BeforeLast` in particular has to leave the last group's key (its first
 /// message's id) untouched or the row remounts and the test proves nothing.
+///
+/// APPENDED arrivals ALTERNATE between two identities per message, so a burst
+/// of N arrivals is N display items rather than folding into one group — a
+/// six-arrival follow loop that renders as a single item exercises the
+/// windowing's grow/trim interleave zero times (#505 review).
 #[cfg(all(target_arch = "wasm32", feature = "no-sync"))]
-fn test_author(delivery: Delivery) -> SigningKey {
+fn test_author(delivery: Delivery, seq: u64) -> (SigningKey, &'static str) {
     match delivery {
-        Delivery::Append => SigningKey::from_bytes(&[0x5A; 32]),
-        Delivery::BeforeLast => SigningKey::from_bytes(&[0x7B; 32]),
+        Delivery::Append if seq % 2 == 0 => (SigningKey::from_bytes(&[0x5A; 32]), "Test Sender A"),
+        Delivery::Append => (SigningKey::from_bytes(&[0x6A; 32]), "Test Sender B"),
+        Delivery::BeforeLast => (SigningKey::from_bytes(&[0x7B; 32]), "Test Sender Insert"),
+    }
+}
+
+// Monotone counter driving the append-author alternation. Shared by single
+// and batched deliveries so alternation continues across calls. WASM is
+// single-threaded; the thread_local is just the idiomatic mutable static.
+#[cfg(all(target_arch = "wasm32", feature = "no-sync"))]
+thread_local! {
+    static APPEND_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Append `message` to `room` as the given test identity, registering the
+/// identity's nickname the first time it speaks so the bubble renders like
+/// any other member's rather than as "Unknown".
+#[cfg(all(target_arch = "wasm32", feature = "no-sync"))]
+fn push_test_message(
+    room: &mut RoomData,
+    room_key: &VerifyingKey,
+    text: String,
+    sk: &SigningKey,
+    nickname: &str,
+    at_end: bool,
+) {
+    let author = MemberId::from(&sk.verifying_key());
+    if !room
+        .room_state
+        .member_info
+        .member_info
+        .iter()
+        .any(|entry| entry.member_info.member_id == author)
+    {
+        room.room_state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo {
+                    member_id: author,
+                    version: 0,
+                    preferred_nickname: SealedBytes::public(nickname.as_bytes().to_vec()),
+                    deputies: Vec::new(),
+                },
+                sk,
+            ));
+    }
+
+    let message = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: MemberId::from(room_key),
+            author,
+            content: RoomMessageBody::public(text),
+            time: crate::util::get_current_system_time(),
+        },
+        sk,
+    );
+
+    let messages = &mut room.room_state.recent_messages.messages;
+    let at = if at_end {
+        messages.len()
+    } else {
+        messages.len().saturating_sub(1)
+    };
+    messages.insert(at, message);
+}
+
+/// What a real arrival does once the room is at `max_recent_messages`: drain
+/// the oldest. Mirrors `MessagesV1::apply_delta`
+/// (common/src/room_state/message.rs) — without this, the hooks grow the
+/// message list unboundedly and the at-cap index-shift path (#505 blocker 1)
+/// is unreachable from the browser suite.
+#[cfg(all(target_arch = "wasm32", feature = "no-sync"))]
+fn prune_to_cap(room: &mut RoomData) {
+    let max = room
+        .room_state
+        .configuration
+        .configuration
+        .max_recent_messages;
+    let messages = &mut room.room_state.recent_messages.messages;
+    if messages.len() > max {
+        let excess = messages.len() - max;
+        messages.drain(0..excess);
     }
 }
 
@@ -851,54 +1039,62 @@ fn deliver_message(text: String, delivery: Delivery) {
     let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
         return;
     };
-    let sk = test_author(delivery);
-    let author = MemberId::from(&sk.verifying_key());
+    let seq = match delivery {
+        Delivery::Append => APPEND_SEQ.with(|s| {
+            let v = s.get();
+            s.set(v + 1);
+            v
+        }),
+        Delivery::BeforeLast => 0,
+    };
+    let (sk, nickname) = test_author(delivery, seq);
 
     ROOMS.with_mut(|rooms| {
         let Some(room) = rooms.map.get_mut(&room_key) else {
             return;
         };
+        push_test_message(
+            room,
+            &room_key,
+            text,
+            &sk,
+            nickname,
+            delivery == Delivery::Append,
+        );
+        prune_to_cap(room);
+    });
+}
 
-        // Give the sender a name the first time it speaks, so the bubble
-        // renders like any other member's rather than as "Unknown".
-        if !room
-            .room_state
-            .member_info
-            .member_info
-            .iter()
-            .any(|entry| entry.member_info.member_id == author)
-        {
-            room.room_state.member_info.member_info.push(
-                AuthorizedMemberInfo::new_with_member_key(
-                    MemberInfo {
-                        member_id: author,
-                        version: 0,
-                        preferred_nickname: SealedBytes::public(
-                            format!("Test Sender {}", u8::from(delivery == Delivery::BeforeLast))
-                                .into_bytes(),
-                        ),
-                        deputies: Vec::new(),
-                    },
-                    &sk,
-                ),
+/// Deliver `count` appended arrivals in ONE `ROOMS` mutation (one re-render),
+/// alternating authors like single deliveries do.
+#[cfg(all(target_arch = "wasm32", feature = "no-sync"))]
+fn deliver_batch(count: usize) {
+    use crate::components::app::{CURRENT_ROOM, ROOMS};
+    use dioxus::prelude::*;
+
+    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+        return;
+    };
+    ROOMS.with_mut(|rooms| {
+        let Some(room) = rooms.map.get_mut(&room_key) else {
+            return;
+        };
+        for i in 0..count {
+            let seq = APPEND_SEQ.with(|s| {
+                let v = s.get();
+                s.set(v + 1);
+                v
+            });
+            let (sk, nickname) = test_author(Delivery::Append, seq);
+            push_test_message(
+                room,
+                &room_key,
+                format!("batched arrival {i:02}"),
+                &sk,
+                nickname,
+                true,
             );
         }
-
-        let message = AuthorizedMessageV1::new(
-            MessageV1 {
-                room_owner: MemberId::from(&room_key),
-                author,
-                content: RoomMessageBody::public(text),
-                time: crate::util::get_current_system_time(),
-            },
-            &sk,
-        );
-
-        let messages = &mut room.room_state.recent_messages.messages;
-        let at = match delivery {
-            Delivery::Append => messages.len(),
-            Delivery::BeforeLast => messages.len().saturating_sub(1),
-        };
-        messages.insert(at, message);
+        prune_to_cap(room);
     });
 }

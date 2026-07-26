@@ -459,6 +459,9 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
   const DEEP_ROOM = "Deep History Room";
+  /// Seeded exactly at its max_recent_messages cap: every delivered arrival
+  /// drains the oldest message, shifting every item index (#505 blocker 1).
+  const CAPPED_ROOM = "Capped History Room";
   const DEEP_ROOM_PATH = "/?deep-history-room=1";
 
   /// Rendered history rows: display items plus date separators. A windowed
@@ -494,6 +497,44 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     ).toBeGreaterThan(40);
   }
 
+  /// Tag the first history row fully inside the container's viewport and
+  /// return its viewport-relative top. scrollTop alone cannot see a window
+  /// slide: with scroll anchoring disabled, dropping rows above the viewport
+  /// leaves scrollTop untouched and shifts the CONTENT under it — the reader
+  /// watches their message jump away while every offset reads steady. The
+  /// probed row's rect is what catches that.
+  async function tagVisibleRow(page: Page, flag: string): Promise<number | null> {
+    return page.evaluate((f) => {
+      const container = document.getElementById("chat-scroll-container")!;
+      const cRect = container.getBoundingClientRect();
+      const rows = container.querySelectorAll(".space-y-4 > *");
+      for (const row of rows) {
+        const r = row.getBoundingClientRect();
+        if (r.top >= cRect.top && r.bottom <= cRect.bottom) {
+          (row as any)[f] = true;
+          return r.top;
+        }
+      }
+      return null;
+    }, flag);
+  }
+
+  /// The tagged row's current viewport-relative top, or null if it left the
+  /// DOM (i.e. the window slid out from under it).
+  async function taggedRowTop(page: Page, flag: string): Promise<number | null> {
+    return page.evaluate((f) => {
+      const rows = document.querySelectorAll(
+        "#chat-scroll-container .space-y-4 > *"
+      );
+      for (const row of rows) {
+        if ((row as any)[f]) {
+          return row.getBoundingClientRect().top;
+        }
+      }
+      return null;
+    }, flag);
+  }
+
   test("keeps following a burst of arrivals in a windowed room", async ({
     page,
   }) => {
@@ -503,7 +544,11 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // The recorded #501 failure mode: with the reader pinned to the bottom,
     // each arrival slid the window, the shifted scrollTop read as reader
     // movement, and the view never followed again. The loop is what catches a
-    // fix that survives one arrival and then latches.
+    // fix that survives one arrival and then latches. Delivered arrivals
+    // alternate authors (see `test_author` in example_data.rs), so each one
+    // is its own display item and the loop interleaves window GROWTH with the
+    // settle-at-bottom TRIM — six arrivals folding into one group would
+    // exercise the windowing arithmetic zero times.
     for (let i = 1; i <= 6; i++) {
       await deliver(page, `windowed arrival ${i}`);
       await expectSettledAtBottom(
@@ -512,13 +557,18 @@ test.describe("Windowed history follows arrivals (#501)", () => {
       );
     }
 
-    // Following six arrivals must not have cost the window its bound: the
-    // trim machinery (settle-at-bottom, ceiling) exists so a long pinned
-    // session cannot re-accumulate the unbounded render #498 removed.
-    expect(
-      await renderedRowCount(page),
-      "following arrivals should grow the window modestly, not unboundedly"
-    ).toBeLessThan(90);
+    // Following six arrivals must not have cost the window its bound: each
+    // follow snap settles at the bottom, and that settle trims the window
+    // back toward its initial size. Polled because the last settle's trim
+    // lands asynchronously.
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message:
+          "the settle-at-bottom trim should return the window to ~initial size " +
+          "after a followed burst",
+      })
+      .toBeLessThan(67);
   });
 
   test("arrivals do not move a reader parked in a windowed room's history", async ({
@@ -535,24 +585,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
 
-    // Tag a row that is visible in the viewport and record where it sits.
-    // scrollTop alone cannot see this regression: with scroll anchoring
-    // disabled, a sliding window leaves scrollTop untouched and shifts the
-    // CONTENT under it — the reader watches their message jump away while
-    // every offset reads steady.
-    const probe = await page.evaluate(() => {
-      const container = document.getElementById("chat-scroll-container")!;
-      const cRect = container.getBoundingClientRect();
-      const rows = container.querySelectorAll(".space-y-4 > *");
-      for (const row of rows) {
-        const r = row.getBoundingClientRect();
-        if (r.top >= cRect.top && r.bottom <= cRect.bottom) {
-          (row as any).__riverProbe501 = true;
-          return r.top;
-        }
-      }
-      return null;
-    });
+    const probe = await tagVisibleRow(page, "__riverProbe501");
     expect(
       probe,
       "premise: a rendered row should be visible mid-history"
@@ -566,25 +599,166 @@ test.describe("Windowed history follows arrivals (#501)", () => {
       "arrivals in a windowed room moved a parked reader's scroll offset"
     );
 
-    const probedRowTop = await page.evaluate(() => {
-      const rows = document.querySelectorAll(
-        "#chat-scroll-container .space-y-4 > *"
-      );
-      for (const row of rows) {
-        if ((row as any).__riverProbe501) {
-          return row.getBoundingClientRect().top;
-        }
-      }
-      return null;
-    });
+    const after = await taggedRowTop(page, "__riverProbe501");
     expect(
-      probedRowTop,
+      after,
       "the probed row left the DOM — the window slid out from under a parked reader"
     ).not.toBeNull();
     expect(
-      Math.abs(probedRowTop! - probe!),
+      Math.abs(after! - probe!),
       "content shifted under a parked reader when arrivals landed"
     ).toBeLessThanOrEqual(2);
+  });
+
+  test("arrivals do not crawl a parked reader in an at-cap room", async ({
+    page,
+  }) => {
+    // The at-cap room sits EXACTLY at max_recent_messages, so every arrival
+    // drains the oldest message and shifts every item index down — the
+    // steady state of every busy production room. A positional window anchor
+    // then swaps the head's IDENTITY one item per arrival: the top rendered
+    // row is removed in the same patch that appends the new one, and the
+    // parked reader crawls upward one row height each time (#505 blocker 1).
+    // The identity anchor must hold the head fixed instead.
+    await openRoomAtBottom(page, CAPPED_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    const mid = Math.floor((await historyHeight(page)) / 2);
+    await readerScrollsTo(page, mid);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    const probe = await tagVisibleRow(page, "__riverProbeAtCap");
+    expect(
+      probe,
+      "premise: a rendered row should be visible mid-history"
+    ).not.toBeNull();
+
+    for (let i = 1; i <= 4; i++) {
+      await deliver(page, `at-cap arrival ${i}`);
+    }
+    await expectStaysPut(
+      page,
+      "at-cap arrivals moved a parked reader's scroll offset"
+    );
+
+    const after = await taggedRowTop(page, "__riverProbeAtCap");
+    expect(
+      after,
+      "the probed row left the DOM — the at-cap window slid in content space"
+    ).not.toBeNull();
+    expect(
+      Math.abs(after! - probe!),
+      "content crawled under a parked reader as at-cap arrivals pruned the history"
+    ).toBeLessThanOrEqual(2);
+  });
+
+  test("backfill paging reveals older history and keeps the reader's place", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+    const initialRows = await renderedRowCount(page);
+
+    // Scroll to the very top and tag the current head row IN THE SAME
+    // browser task — the sentinel's IntersectionObserver fires in a later
+    // task, so the tag always lands before the backfill.
+    const probeTop = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.scrollTop = 0;
+      const row = c.querySelector(".space-y-4 > *") as HTMLElement;
+      (row as any).__riverPagingProbe = true;
+      return row.getBoundingClientRect().top;
+    });
+
+    // The first growth step reveals a full page of older rows...
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message: "reaching the top should backfill a page of older rows",
+      })
+      .toBeGreaterThan(initialRows + 40);
+
+    // ...and the restore keeps the row the reader was looking at where it
+    // was: the revealed rows land ABOVE, the offset is re-anchored by the
+    // container's measured growth.
+    const probeAfter = await taggedRowTop(page, "__riverPagingProbe");
+    expect(
+      probeAfter,
+      "the pre-backfill head row must survive a backfill"
+    ).not.toBeNull();
+    expect(
+      Math.abs(probeAfter! - probeTop),
+      "a backfill must not move the reader's view"
+    ).toBeLessThanOrEqual(3);
+
+    // Repeated paging must reach the very oldest history — a growth step
+    // that reveals nothing dead-ends here and the loop times out.
+    const oldestFiller = page.getByText("history filler 00", { exact: false });
+    for (let i = 0; i < 6 && (await oldestFiller.count()) === 0; i++) {
+      const before = await renderedRowCount(page);
+      await page.evaluate(() => {
+        document.getElementById("chat-scroll-container")!.scrollTop = 0;
+      });
+      await expect
+        .poll(() => renderedRowCount(page), {
+          timeout: 5_000,
+          message: `paging step ${i} revealed no further rows`,
+        })
+        .toBeGreaterThan(before);
+    }
+    expect(
+      await oldestFiller.count(),
+      "paging back through the whole room must reach the oldest filler"
+    ).toBe(1);
+  });
+
+  test("backfill still reveals older rows after arrivals grew the window", async ({
+    page,
+  }) => {
+    // #505 blocker 2: arrivals grow an anchored window past its REQUESTED
+    // size. A growth step computed from the stale request then resolves to a
+    // start the window already renders — zero new rows, no DOM change, the
+    // sentinel's IntersectionObserver never re-fires, and paging dead-ends.
+    // The growth step must come from the RENDERED size.
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // Park mid-history so the batch below grows the window (a pinned reader's
+    // follow-snap settle would trim the divergence away before paging).
+    const mid = Math.floor((await historyHeight(page)) / 2);
+    await readerScrollsTo(page, mid);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    const beforeBatch = await renderedRowCount(page);
+    // One batched delivery of more than a whole growth step, in a single
+    // state mutation — as a network delta carrying many messages does.
+    await page.evaluate(() => (window as any).__riverTest.appendMessages(61));
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message:
+          "premise: the batch should grow the anchored window past one whole " +
+          "growth step — without that divergence this test exercises nothing",
+      })
+      .toBeGreaterThan(beforeBatch + 55);
+
+    // Now page up. The FIRST sentinel fire must reveal older rows.
+    const beforePaging = await renderedRowCount(page);
+    await page.evaluate(() => {
+      document.getElementById("chat-scroll-container")!.scrollTop = 0;
+    });
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message:
+          "the first backfill after an arrival burst revealed no older rows — " +
+          "the growth step dead-ended (#505 blocker 2)",
+      })
+      .toBeGreaterThan(beforePaging + 40);
   });
 
   test("opening a deep room lands settled at the bottom with the initial window", async ({
@@ -593,7 +767,10 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // `openRoomAtBottom` itself asserts the settle; the premise check is what
     // rules out the H2 failure shape, where the backfill sentinel fires from
     // scrollTop 0 before the opening snap and cascades the window over the
-    // whole room (the row count would be ~92, not ~62).
+    // whole room (the row count would be ~200, not ~62). Note the H2 race is
+    // timing-dependent in a live browser — this test catches it when it
+    // fires, but the deterministic guard is the source pin on the sentinel's
+    // `opening_snap_done` mount gate in conversation.rs.
     await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
     await expectWindowedRenderActive(page);
 
