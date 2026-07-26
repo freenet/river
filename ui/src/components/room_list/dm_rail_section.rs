@@ -31,7 +31,7 @@
 use crate::components::app::chat_delegate::{hide_dm_thread, unhide_dm_thread};
 use crate::components::app::ROOMS;
 use crate::components::direct_messages::{
-    is_thread_hidden_for, open_dm_thread, DM_LAST_SEEN, HIDDEN_DM_THREADS,
+    is_thread_hidden_for, open_dm_thread, DM_LAST_SEEN, HIDDEN_DM_THREADS, OPEN_DM_THREAD,
 };
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
@@ -42,6 +42,7 @@ use dioxus_free_icons::{
 use ed25519_dalek::VerifyingKey;
 use river_core::chat_delegate::HiddenDmThreadEntry;
 use river_core::room_state::member::MemberId;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,7 +86,7 @@ const ARCHIVE_TOAST_DURATION_MS: u64 = 5_000;
 
 #[component]
 pub fn DmRailSection() -> Element {
-    let threads = use_memo(move || build_view().unwrap_or_default());
+    let threads = use_memo(build_view);
     let threads_value = threads.read().clone();
 
     // Reading the toast signal here subscribes the rail to its writes so
@@ -432,6 +433,145 @@ pub(crate) fn filter_rail_entries(
         .collect()
 }
 
+/// Pure helper deciding what the ACTIVE rail may show given the outcome
+/// of the `HIDDEN_DM_THREADS` read (issue #499 mechanism 2).
+///
+/// * `hidden = Some(map)` — clean read: apply the #261 archive filter.
+/// * `hidden = None` — the signal was contended. The old behaviour
+///   failed OPEN (skipped the filter), flashing every archived thread
+///   into the active rail for a render. Failing closed to an EMPTY list
+///   instead would blink the whole rail (the other #499 symptom), so we
+///   return `last_good`: the most recent successfully-filtered rail. It
+///   is at worst one render stale and by construction contains no
+///   thread that was archived as of the last clean pass (a thread whose
+///   archive click is the very write we're contending with may persist
+///   for that single render — matching what was on screen the instant
+///   before the click, never resurrecting older archived threads).
+///
+/// Invariants, in priority order: (1) archived threads never appear in
+/// the active rail; (2) the rail collapses as rarely as possible.
+/// Pinned by the `resolve_active_entries_*` tests.
+pub(crate) fn resolve_active_entries(
+    entries: Vec<DmRailEntry>,
+    hidden: Option<&HashMap<(VerifyingKey, MemberId), HiddenDmThreadEntry>>,
+    last_good: &[DmRailEntry],
+) -> Vec<DmRailEntry> {
+    match hidden {
+        Some(h) => filter_rail_entries(entries, h),
+        None => last_good.to_vec(),
+    }
+}
+
+/// Total-order sort for the rail: unread desc, most-recent activity
+/// desc, then `(room key bytes, peer id)` as a deterministic tiebreak.
+/// Entries accumulate through a fresh `HashMap` each pass, so without
+/// the tiebreak threads tied on `(unread, last_any_ts)` shuffled
+/// position between renders (issue #499 mechanism 4). Pinned by the
+/// `sort_rail_entries_*` tests.
+pub(crate) fn sort_rail_entries(entries: &mut [DmRailEntry]) {
+    entries.sort_by(|a, b| {
+        b.unread
+            .cmp(&a.unread)
+            .then_with(|| b.last_any_ts.cmp(&a.last_any_ts))
+            .then_with(|| a.room.as_bytes().cmp(b.room.as_bytes()))
+            .then_with(|| a.peer.cmp(&b.peer))
+    });
+}
+
+/// Per-peer DM activity accumulated from one room's message list.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct PeerDmActivity {
+    pub(crate) last_any_ts: u64,
+    pub(crate) unread: usize,
+}
+
+/// Pure helper: fold one room's DM stream into per-peer activity.
+/// `messages` yields `(sender, recipient, timestamp)` triples; anything
+/// not involving `self_id` is skipped.
+///
+/// `last_seen` is `Some(map)` when `DM_LAST_SEEN` read cleanly and
+/// `None` when the signal was contended. Issue #499 mechanism 1: a
+/// contended read must degrade to "no unread info for this pass" —
+/// entries are still produced, with `unread = 0` and correct recency —
+/// instead of aborting the whole rail build (which blanked the entire
+/// active list while "Archived (N)" stayed put). A peer merely ABSENT
+/// from a `Some` map still means cutoff 0 (thread never read). Pinned
+/// by the `accumulate_peer_activity_*` tests.
+pub(crate) fn accumulate_peer_activity(
+    room: &VerifyingKey,
+    self_id: MemberId,
+    messages: impl IntoIterator<Item = (MemberId, MemberId, u64)>,
+    last_seen: Option<&HashMap<(VerifyingKey, MemberId), u64>>,
+) -> HashMap<MemberId, PeerDmActivity> {
+    let mut per_peer: HashMap<MemberId, PeerDmActivity> = HashMap::new();
+    for (sender, recipient, timestamp) in messages {
+        let is_self_sender = sender == self_id;
+        let is_self_recipient = recipient == self_id;
+        if !is_self_sender && !is_self_recipient {
+            continue;
+        }
+        let peer = if is_self_sender { recipient } else { sender };
+        let acc = per_peer.entry(peer).or_insert(PeerDmActivity {
+            last_any_ts: 0,
+            unread: 0,
+        });
+        if timestamp > acc.last_any_ts {
+            acc.last_any_ts = timestamp;
+        }
+        if is_self_recipient {
+            if let Some(seen) = last_seen {
+                let cutoff = seen.get(&(*room, peer)).copied().unwrap_or(0);
+                if timestamp > cutoff {
+                    acc.unread += 1;
+                }
+            }
+        }
+    }
+    per_peer
+}
+
+/// Project a room's authorized DM list into the `(sender, recipient,
+/// timestamp)` triples [`accumulate_peer_activity`] consumes. Shared by
+/// all three builders so their per-pair `last_any_ts` scans can't
+/// drift apart.
+fn dm_message_triples(
+    room_data: &crate::room_data::RoomData,
+) -> impl Iterator<Item = (MemberId, MemberId, u64)> + '_ {
+    room_data
+        .room_state
+        .direct_messages
+        .messages
+        .iter()
+        .map(|msg| {
+            (
+                msg.message.sender,
+                msg.message.recipient,
+                msg.message.timestamp,
+            )
+        })
+}
+
+thread_local! {
+    /// Last successfully filtered + sorted rail, kept by `build_view`.
+    /// Serves as the degrade value when a signal read is contended:
+    /// showing the one-render-old rail is strictly better than blanking
+    /// it (issue #499's headline symptom), and — unlike the old skip-
+    /// the-filter fallback — can never flash archived threads into the
+    /// active list, because every cached list already went through
+    /// `filter_rail_entries`. Plain `thread_local` (not a signal): the
+    /// UI is single-threaded WASM and writing a signal from inside a
+    /// memo would re-trigger reactivity.
+    static LAST_GOOD_RAIL: RefCell<Vec<DmRailEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+fn last_good_rail() -> Vec<DmRailEntry> {
+    LAST_GOOD_RAIL.with(|c| c.borrow().clone())
+}
+
+fn set_last_good_rail(entries: &[DmRailEntry]) {
+    LAST_GOOD_RAIL.with(|c| *c.borrow_mut() = entries.to_vec());
+}
+
 /// Pure helper: project the archived viewer's rows from the in-memory
 /// hide map plus the per-room display data and a per-pair
 /// `last_any_ts` map (the max DM timestamp for each `(room, peer)` in
@@ -513,6 +653,16 @@ struct ArchivedRoomMeta {
 }
 
 fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
+    // OPEN_DM_THREAD is read (infallibly) BEFORE the fallible reads:
+    // `try_read() -> Err` registers no subscription (dioxus-signal-safety
+    // rules) and each memo run clears the previous subscription set, so
+    // without this guard one contended poll would leave the memo with
+    // ZERO subscriptions — permanently frozen (issue #499 mechanism 3;
+    // mirrors the CURRENT_ROOM guard in room_list.rs). OPEN_DM_THREAD is
+    // the DM surface's own view-state signal and is only written through
+    // `defer` from clean contexts, so the infallible read cannot hit a
+    // live write borrow.
+    let _ = OPEN_DM_THREAD.read();
     let rooms = ROOMS.try_read().ok()?;
     let hidden = HIDDEN_DM_THREADS.try_read().ok()?.clone();
 
@@ -561,24 +711,14 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
         );
 
         // Max DM timestamp per (this room, peer) across both inbound and
-        // outbound DMs — same accumulator shape as `build_view`. We do
-        // NOT pre-filter by `hidden` here; the strict-`<=` revival rule
-        // is applied inside `build_archived_rows`.
-        for msg in &room_data.room_state.direct_messages.messages {
-            let is_self_sender = msg.message.sender == self_id;
-            let is_self_recipient = msg.message.recipient == self_id;
-            if !is_self_sender && !is_self_recipient {
-                continue;
-            }
-            let peer = if is_self_sender {
-                msg.message.recipient
-            } else {
-                msg.message.sender
-            };
-            let entry = last_any_ts.entry((*owner_vk, peer)).or_insert(0);
-            if msg.message.timestamp > *entry {
-                *entry = msg.message.timestamp;
-            }
+        // outbound DMs — the same accumulator `build_view` uses (unread
+        // info irrelevant here, so `last_seen = None`). We do NOT
+        // pre-filter by `hidden`; the strict-`<=` revival rule is
+        // applied inside `build_archived_rows`.
+        for (peer, activity) in
+            accumulate_peer_activity(owner_vk, self_id, dm_message_triples(room_data), None)
+        {
+            last_any_ts.insert((*owner_vk, peer), activity.last_any_ts);
         }
     }
 
@@ -591,44 +731,65 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
 /// the per-pair display metadata — saves a HashMap of decrypted
 /// nicknames per render when the viewer is closed (the common case).
 fn current_archived_count() -> Option<usize> {
+    // Same subscription guard as `build_view` / `build_archived_view`:
+    // an infallible read must precede the first fallible `try_read`,
+    // otherwise one contended poll leaves this memo with zero
+    // subscriptions and the count freezes for the session (issue #499
+    // mechanism 3; mirrors the CURRENT_ROOM guard in room_list.rs).
+    let _ = OPEN_DM_THREAD.read();
     let rooms = ROOMS.try_read().ok()?;
     let hidden = HIDDEN_DM_THREADS.try_read().ok()?;
     let mut last_any_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
     for (owner_vk, room_data) in &rooms.map {
         let self_id: MemberId = room_data.self_sk.verifying_key().into();
-        for msg in &room_data.room_state.direct_messages.messages {
-            let is_self_sender = msg.message.sender == self_id;
-            let is_self_recipient = msg.message.recipient == self_id;
-            if !is_self_sender && !is_self_recipient {
-                continue;
-            }
-            let peer = if is_self_sender {
-                msg.message.recipient
-            } else {
-                msg.message.sender
-            };
-            let entry = last_any_ts.entry((*owner_vk, peer)).or_insert(0);
-            if msg.message.timestamp > *entry {
-                *entry = msg.message.timestamp;
-            }
+        for (peer, activity) in
+            accumulate_peer_activity(owner_vk, self_id, dm_message_triples(room_data), None)
+        {
+            last_any_ts.insert((*owner_vk, peer), activity.last_any_ts);
         }
     }
     Some(count_currently_archived(&hidden, &last_any_ts))
 }
 
-fn build_view() -> Option<Vec<DmRailEntry>> {
-    let rooms = ROOMS.try_read().ok()?;
+fn build_view() -> Vec<DmRailEntry> {
+    // OPEN_DM_THREAD is read (infallibly) BEFORE the fallible reads:
+    // `try_read() -> Err` registers no subscription (dioxus-signal-safety
+    // rules) and each memo run clears the previous subscription set, so
+    // without this guard a single contended `ROOMS` poll would leave the
+    // memo with ZERO subscriptions — a permanently empty rail, since
+    // `DmRailSection` never unmounts (issue #499 mechanism 3; mirrors
+    // the CURRENT_ROOM guard in room_list.rs). OPEN_DM_THREAD is the DM
+    // surface's own view-state signal and is only written through
+    // `defer` from clean contexts, so the infallible read cannot hit a
+    // live write borrow.
+    let _ = OPEN_DM_THREAD.read();
+
+    let Ok(rooms) = ROOMS.try_read() else {
+        // ROOMS is mid-write: reuse the last successfully-built rail
+        // rather than blanking the whole list for this pass (issue #499
+        // mechanism 1's symptom shape). The guard read above keeps the
+        // memo subscribed, so a later signal write re-runs this build.
+        return last_good_rail();
+    };
     if rooms.map.is_empty() {
-        return Some(Vec::new());
+        set_last_good_rail(&[]);
+        return Vec::new();
     }
-    let last_seen = DM_LAST_SEEN.try_read().ok()?.clone();
+
+    // Unread cutoffs. Contention here must NOT abort the rail (#499
+    // mechanism 1 — the old `?` blanked the entire active list while
+    // "Archived (N)" stayed put): degrade to `None`, which
+    // `accumulate_peer_activity` renders as "unread = 0 for this pass";
+    // badges reappear on the next clean pass.
+    let last_seen = DM_LAST_SEEN.try_read().ok().map(|s| s.clone());
+
     // Snapshot the hide-list (#261). `try_read` keeps us cooperative
-    // with any in-flight `defer`-scheduled mutation. On contention we
-    // silently treat the list as empty for THIS render — a hidden
-    // thread briefly re-appearing during a write storm is preferable
-    // to dropping the entire rail. Successful `try_read` registers
-    // the memo's subscription so subsequent hide/unhide writes
-    // re-run this build (Dioxus signal-safety semantics).
+    // with any in-flight `defer`-scheduled mutation. On contention
+    // (`None`) the archive filter must fail CLOSED — see
+    // `resolve_active_entries`: the old fail-open path flashed every
+    // archived thread into the active rail for a render (#499
+    // mechanism 2). Successful `try_read` registers the memo's
+    // subscription so subsequent hide/unhide writes re-run this build.
     let hidden = HIDDEN_DM_THREADS.try_read().ok().map(|h| h.clone());
 
     let mut entries: Vec<DmRailEntry> = Vec::new();
@@ -664,37 +825,15 @@ fn build_view() -> Option<Vec<DmRailEntry>> {
             })
             .collect();
 
-        // Per-peer accumulator.
-        struct Acc {
-            last_any_ts: u64,
-            unread: usize,
-        }
-        let mut per_peer: HashMap<MemberId, Acc> = HashMap::new();
-        for msg in &room_data.room_state.direct_messages.messages {
-            let is_self_sender = msg.message.sender == self_id;
-            let is_self_recipient = msg.message.recipient == self_id;
-            if !is_self_sender && !is_self_recipient {
-                continue;
-            }
-            let peer = if is_self_sender {
-                msg.message.recipient
-            } else {
-                msg.message.sender
-            };
-            let acc = per_peer.entry(peer).or_insert(Acc {
-                last_any_ts: 0,
-                unread: 0,
-            });
-            if msg.message.timestamp > acc.last_any_ts {
-                acc.last_any_ts = msg.message.timestamp;
-            }
-            if is_self_recipient {
-                let cutoff = last_seen.get(&(*owner_vk, peer)).copied().unwrap_or(0);
-                if msg.message.timestamp > cutoff {
-                    acc.unread += 1;
-                }
-            }
-        }
+        // Per-peer accumulator — shared with the archived builders via
+        // `accumulate_peer_activity` (a contended `last_seen` degrades
+        // unread to 0 there, issue #499 mechanism 1).
+        let per_peer = accumulate_peer_activity(
+            owner_vk,
+            self_id,
+            dm_message_triples(room_data),
+            last_seen.as_ref(),
+        );
 
         // Build the candidate entries for this room. The hide-filter
         // step runs once at the end (over all rooms' candidates) so it
@@ -702,7 +841,7 @@ fn build_view() -> Option<Vec<DmRailEntry>> {
         // that helper's doc-comment for the #261 strict-`<=` semantics
         // and the `filter_rail_entries_newer_outbound_revives_hidden`
         // test for the "outbound revives" invariant.
-        for (peer, acc) in per_peer {
+        for (peer, activity) in per_peer {
             entries.push(DmRailEntry {
                 room: *owner_vk,
                 peer,
@@ -711,30 +850,33 @@ fn build_view() -> Option<Vec<DmRailEntry>> {
                     .cloned()
                     .unwrap_or_else(|| short_member_id(&peer)),
                 room_name: room_name.clone(),
-                last_any_ts: acc.last_any_ts,
-                unread: acc.unread,
+                last_any_ts: activity.last_any_ts,
+                unread: activity.unread,
             });
         }
     }
 
-    // Issue freenet/river#261: drop hidden entries. When the signal
-    // read was contended we silently treat the list as empty for THIS
-    // render — a hidden thread briefly re-appearing during a write
-    // storm is preferable to dropping the entire rail.
-    let filtered = match hidden {
-        Some(ref h) => filter_rail_entries(entries, h),
-        None => entries,
-    };
-    let mut entries = filtered;
+    // Issue freenet/river#261: drop hidden entries — failing CLOSED to
+    // the last good rail when the hide-list read was contended (#499
+    // mechanism 2; see `resolve_active_entries` for the full decision).
+    let mut entries = LAST_GOOD_RAIL
+        .with(|cache| resolve_active_entries(entries, hidden.as_ref(), &cache.borrow()));
 
-    // Unread threads first, then most-recent.
-    entries.sort_by(|a, b| {
-        b.unread
-            .cmp(&a.unread)
-            .then_with(|| b.last_any_ts.cmp(&a.last_any_ts))
-    });
+    // Unread threads first, then most-recent, then a deterministic
+    // tiebreak (#499 mechanism 4). Re-sorting the cached list on the
+    // contended path is a no-op because the order is total.
+    sort_rail_entries(&mut entries);
 
-    Some(entries)
+    // Cache the result for the contended-read degrade paths above —
+    // only from a pass whose hide-list read was clean, so the cache can
+    // never contain an unfiltered list. (A pass with degraded unread
+    // info is still cache-worthy: hidden-safety is the invariant,
+    // badge staleness is cosmetic and heals on the next clean pass.)
+    if hidden.is_some() {
+        set_last_good_rail(&entries);
+    }
+
+    entries
 }
 
 fn short_member_id(id: &MemberId) -> String {
@@ -1115,5 +1257,233 @@ mod tests {
              distinct identity tokens — the auto-dismiss timeout's \
              'is it still mine?' check compares tokens, not expiries"
         );
+    }
+
+    /// Issue #499 mechanism 1: a contended `DM_LAST_SEEN` read
+    /// (`last_seen = None`) must degrade to "unread = 0 for this pass"
+    /// — the entries are still produced with correct recency — instead
+    /// of aborting the whole rail build (the old `?` blanked the entire
+    /// active list while "Archived (N)" stayed put).
+    #[test]
+    fn accumulate_peer_activity_contended_last_seen_degrades_unread_to_zero() {
+        let room = sk(1).verifying_key();
+        let self_id = MemberId(FastHash(1));
+        let peer = MemberId(FastHash(2));
+        // Two inbound DMs, never read (no cutoff recorded anywhere).
+        let msgs = vec![(peer, self_id, 100u64), (peer, self_id, 200u64)];
+
+        // Clean pass: both count as unread.
+        let clean = accumulate_peer_activity(&room, self_id, msgs.clone(), Some(&HashMap::new()));
+        assert_eq!(
+            clean[&peer].unread, 2,
+            "precondition: clean pass counts unread"
+        );
+        assert_eq!(clean[&peer].last_any_ts, 200);
+
+        // Contended pass: entry still produced, unread degraded to 0.
+        let degraded = accumulate_peer_activity(&room, self_id, msgs, None);
+        assert_eq!(
+            degraded[&peer].unread, 0,
+            "contended DM_LAST_SEEN must degrade unread to 0, not drop the entry"
+        );
+        assert_eq!(
+            degraded[&peer].last_any_ts, 200,
+            "recency must be unaffected by the unread degrade"
+        );
+    }
+
+    /// Baseline semantics of the shared accumulator: outbound messages
+    /// bump recency but never unread; inbound messages at or below the
+    /// per-pair cutoff are read; third-party traffic is skipped
+    /// entirely. (Behaviour lifted verbatim from the old inline loop in
+    /// `build_view` — this pins the extraction.)
+    #[test]
+    fn accumulate_peer_activity_applies_cutoffs_and_direction() {
+        let room = sk(1).verifying_key();
+        let self_id = MemberId(FastHash(1));
+        let peer = MemberId(FastHash(2));
+        let third_a = MemberId(FastHash(3));
+        let third_b = MemberId(FastHash(4));
+        let msgs = vec![
+            (self_id, peer, 100u64),    // outbound: recency only
+            (peer, self_id, 150u64),    // inbound, <= cutoff: read
+            (peer, self_id, 250u64),    // inbound, > cutoff: unread
+            (third_a, third_b, 999u64), // not ours: skipped
+        ];
+        let mut last_seen = HashMap::new();
+        last_seen.insert((room, peer), 200u64);
+
+        let result = accumulate_peer_activity(&room, self_id, msgs, Some(&last_seen));
+        assert_eq!(
+            result.len(),
+            1,
+            "third-party traffic must not create entries"
+        );
+        assert_eq!(result[&peer].unread, 1);
+        assert_eq!(result[&peer].last_any_ts, 250);
+    }
+
+    /// Clean hide-list read: `resolve_active_entries` applies the #261
+    /// archive filter exactly like `filter_rail_entries`.
+    #[test]
+    fn resolve_active_entries_clean_read_applies_archive_filter() {
+        let room = sk(1).verifying_key();
+        let live = entry(room, 11, 2_000, 1);
+        let archived = entry(room, 22, 1_000, 0);
+        let hidden = HashMap::from([hidden_at(room, 22, 1_000)]);
+
+        let out = resolve_active_entries(vec![live.clone(), archived], Some(&hidden), &[]);
+        assert_eq!(out, vec![live]);
+    }
+
+    /// Issue #499 mechanism 2: a contended `HIDDEN_DM_THREADS` read
+    /// must fail CLOSED. The old behaviour skipped the filter and
+    /// flashed every archived thread into the active rail for a
+    /// render; the fix returns the last successfully-filtered rail —
+    /// so the archived thread never appears AND the rail doesn't
+    /// collapse to empty.
+    #[test]
+    fn resolve_active_entries_contended_hidden_never_yields_archived() {
+        let room = sk(1).verifying_key();
+        let live = entry(room, 11, 2_000, 1);
+        let archived = entry(room, 22, 1_000, 0);
+        let hidden = HashMap::from([hidden_at(room, 22, 1_000)]);
+
+        // A previous CLEAN pass produced the last-good rail.
+        let last_good =
+            resolve_active_entries(vec![live.clone(), archived.clone()], Some(&hidden), &[]);
+        assert_eq!(
+            last_good,
+            vec![live.clone()],
+            "precondition: clean pass filters"
+        );
+
+        // Contended pass over the same candidates.
+        let out = resolve_active_entries(vec![live.clone(), archived.clone()], None, &last_good);
+        assert!(
+            !out.contains(&archived),
+            "an archived thread must NEVER appear in the active rail, \
+             even while the hide-list signal is contended"
+        );
+        assert_eq!(
+            out,
+            vec![live],
+            "the rail must keep the last good list rather than collapse to empty"
+        );
+    }
+
+    /// Cold-start corner of the same degrade: contended hide-list with
+    /// no previous clean pass shows nothing — briefly showing an empty
+    /// rail is preferable to flashing archived threads into it.
+    #[test]
+    fn resolve_active_entries_contended_hidden_with_no_history_shows_nothing() {
+        let room = sk(1).verifying_key();
+        let archived = entry(room, 22, 1_000, 0);
+        let out = resolve_active_entries(vec![archived], None, &[]);
+        assert!(
+            out.is_empty(),
+            "with no last-good rail, the contended-hidden pass must show \
+             nothing rather than unfiltered (possibly archived) entries"
+        );
+    }
+
+    /// Primary sort keys are unchanged: unread desc, then recency desc.
+    #[test]
+    fn sort_rail_entries_orders_unread_then_recency() {
+        let room = sk(1).verifying_key();
+        let mut entries = vec![
+            entry(room, 11, 3_000, 0), // read, most recent
+            entry(room, 22, 1_000, 2), // unread, older
+            entry(room, 33, 2_000, 0), // read, mid
+        ];
+        sort_rail_entries(&mut entries);
+        assert_eq!(entries[0].peer, MemberId(FastHash(22)), "unread first");
+        assert_eq!(entries[1].peer, MemberId(FastHash(11)), "then recency desc");
+        assert_eq!(entries[2].peer, MemberId(FastHash(33)));
+    }
+
+    /// Issue #499 mechanism 4: entries tied on `(unread, last_any_ts)`
+    /// must sort identically regardless of input order. They accumulate
+    /// through a fresh `HashMap` each pass, so without the total-order
+    /// tiebreak tied threads shuffled position between renders.
+    #[test]
+    fn sort_rail_entries_ties_are_deterministic_across_input_orders() {
+        let room_a = sk(1).verifying_key();
+        let room_b = sk(2).verifying_key();
+        // Four entries fully tied on both primary sort keys.
+        let e1 = entry(room_a, 11, 1_000, 0);
+        let e2 = entry(room_a, 22, 1_000, 0);
+        let e3 = entry(room_b, 11, 1_000, 0);
+        let e4 = entry(room_b, 22, 1_000, 0);
+
+        let mut fwd = vec![e1.clone(), e2.clone(), e3.clone(), e4.clone()];
+        let mut rev = vec![e4, e3, e2, e1];
+        sort_rail_entries(&mut fwd);
+        sort_rail_entries(&mut rev);
+        assert_eq!(
+            fwd, rev,
+            "ties must sort identically regardless of the (HashMap-derived) \
+             input order — `sort_by` is stable, so without a total order the \
+             output inherits the per-pass-random input order"
+        );
+    }
+
+    /// Issue #499 mechanism 3: each fallible builder must register an
+    /// INFALLIBLE signal read before its first fallible `try_read`. In
+    /// Dioxus 0.7 an Err `try_read` registers no subscription and each
+    /// memo run clears the previous subscription set, so a builder
+    /// whose FIRST read is fallible can come out of one contended poll
+    /// with zero subscriptions — permanently frozen (`DmRailSection`
+    /// never unmounts). Mirrors the `CURRENT_ROOM.read()` guard in
+    /// `room_list.rs`.
+    ///
+    /// Source-scrape because the builders need a Dioxus runtime to run.
+    /// Conventions: match WHITESPACE-STRIPPED source so rustfmt
+    /// reflowing can't fake a result; cut at `mod tests` (this file has
+    /// exactly one) so these needles can't satisfy their own check;
+    /// bound each builder's segment by the NEXT function head so a
+    /// guard in one builder can't vacuously cover another. The
+    /// non-test comments deliberately avoid the literal guard/fallible
+    /// needles (`OPEN_DM_THREAD` + `.read()` adjacent, or a dotted
+    /// `try_read` call) so a comment can't satisfy the pin either.
+    /// Reordering these functions breaks the segment lookups loudly
+    /// (expect-panic), not silently.
+    #[test]
+    fn rail_builders_read_infallible_guard_before_first_fallible_read() {
+        let src = include_str!("dm_rail_section.rs");
+        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // (builder head, next-function head bounding the segment)
+        let cases = [
+            ("fnbuild_archived_view()", "fncurrent_archived_count()"),
+            ("fncurrent_archived_count()", "fnbuild_view()"),
+            ("fnbuild_view()", "fnshort_member_id("),
+        ];
+        for (head, next_head) in cases {
+            let start = stripped
+                .find(head)
+                .unwrap_or_else(|| panic!("{head} not found — function renamed/removed?"));
+            let end = stripped[start..]
+                .find(next_head)
+                .map(|i| start + i)
+                .unwrap_or_else(|| {
+                    panic!("{next_head} not found after {head} — functions reordered?")
+                });
+            let seg = &stripped[start..end];
+
+            let guard = seg.find("OPEN_DM_THREAD.read()").unwrap_or_else(|| {
+                panic!("{head} lost its infallible OPEN_DM_THREAD.read() subscription guard")
+            });
+            let fallible = seg.find(".try_read(").unwrap_or_else(|| {
+                panic!("{head} has no fallible read — pin needs updating if that's intended")
+            });
+            assert!(
+                guard < fallible,
+                "{head}: the infallible OPEN_DM_THREAD.read() guard (at {guard}) must \
+                 come BEFORE the first fallible try_read (at {fallible}) — otherwise a \
+                 contended poll leaves the memo with zero subscriptions (issue #499)"
+            );
+        }
     }
 }

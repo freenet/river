@@ -42,10 +42,43 @@ pub static OPEN_DM_THREAD: GlobalSignal<Option<(VerifyingKey, MemberId)>> = Glob
 pub static DM_LAST_SEEN: GlobalSignal<HashMap<(VerifyingKey, MemberId), u64>> =
     Global::new(HashMap::new);
 
+/// Pure decision for [`mark_thread_read`]: would recording `up_to_ts`
+/// actually advance the stored cutoff? `current` is the existing
+/// `DM_LAST_SEEN` entry for the `(room, peer)` pair (`None` = no entry
+/// yet, which reads as cutoff 0 everywhere else).
+///
+/// Split out because the answer gates whether `mark_thread_read`
+/// touches the signal at all: `DmThreadModalBody` calls
+/// `mark_thread_read` from its render body on every render while a
+/// thread is open, and `with_mut` notifies subscribers even when the
+/// mutation changed nothing — so an unconditional write turned an open
+/// DM thread into a continuous write pulse on `DM_LAST_SEEN`, widening
+/// the contention window that blanked the DM rail (issue #499).
+/// Pinned by the `thread_read_needs_write_*` tests plus the wiring pin
+/// `mark_thread_read_write_is_gated_pinned`.
+pub(crate) fn thread_read_needs_write(current: Option<u64>, up_to_ts: u64) -> bool {
+    up_to_ts > current.unwrap_or(0)
+}
+
 /// Mark every DM from `peer` in `room` as seen up to (and including) the
 /// most recent inbound message timestamp known to the synchronizer.
 pub fn mark_thread_read(room: VerifyingKey, peer: MemberId, up_to_ts: u64) {
     crate::util::defer(move || {
+        // Skip the write when the stored cutoff would not advance —
+        // `with_mut` notifies subscribers even for a no-op mutation and
+        // this runs on every render of an open thread (issue #499
+        // write-pulse). `try_peek` registers no subscription and takes
+        // no write borrow; if it is somehow contended (it shouldn't be
+        // — we're in a `defer`'d clean context) we conservatively
+        // attempt the write rather than risk losing a genuine
+        // mark-read.
+        let needs_write = DM_LAST_SEEN
+            .try_peek()
+            .map(|seen| thread_read_needs_write(seen.get(&(room, peer)).copied(), up_to_ts))
+            .unwrap_or(true);
+        if !needs_write {
+            return;
+        }
         DM_LAST_SEEN.with_mut(|seen| {
             let entry = seen.entry((room, peer)).or_insert(0);
             if up_to_ts > *entry {
@@ -700,6 +733,65 @@ mod tests {
                  the send here makes that fix invisible to UI users."
             );
         }
+    }
+
+    /// Issue #499 write-pulse: `mark_thread_read` is called from
+    /// `DmThreadModalBody`'s render body on every render while a thread
+    /// is open, and `with_mut` notifies subscribers even when the
+    /// mutation is a no-op — so the `with_mut` MUST stay gated on
+    /// `thread_read_needs_write`. Source-scrape (the function needs a
+    /// Dioxus runtime to exercise): match whitespace-stripped source so
+    /// rustfmt reflowing can't fake a failure; cut at `mod tests` (this
+    /// file has exactly one) so these needles can't satisfy their own
+    /// check; bound the segment by the NEXT function head so a gate
+    /// elsewhere in the file can't vacuously pass.
+    #[test]
+    fn mark_thread_read_write_is_gated_pinned() {
+        let src = include_str!("direct_messages.rs");
+        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+        let start = stripped
+            .find("pubfnmark_thread_read")
+            .expect("mark_thread_read not found");
+        let end = stripped[start..]
+            .find("pubfnopen_dm_thread")
+            .map(|i| start + i)
+            .expect("open_dm_thread must follow mark_thread_read");
+        let seg = &stripped[start..end];
+
+        let gate = seg
+            .find("if!needs_write{return;}")
+            .expect("mark_thread_read must early-return when the cutoff would not advance");
+        let decide = seg
+            .find("thread_read_needs_write(")
+            .expect("mark_thread_read must decide via thread_read_needs_write");
+        let write = seg
+            .find(".with_mut(")
+            .expect("mark_thread_read must still perform the gated write");
+        assert!(
+            decide < gate && gate < write,
+            "mark_thread_read's with_mut must come AFTER the needs-write gate \
+             (decide at {decide}, gate at {gate}, write at {write}) — an ungated \
+             with_mut notifies DM rail subscribers on every render of an open \
+             thread (issue #499 write-pulse)"
+        );
+    }
+
+    /// Decision table for the issue #499 write-pulse gate.
+    #[test]
+    fn thread_read_needs_write_only_when_cutoff_advances() {
+        // No stored entry: any positive timestamp advances the cutoff…
+        assert!(thread_read_needs_write(None, 1));
+        // …but a zero timestamp does not (absent reads as 0 everywhere).
+        assert!(!thread_read_needs_write(None, 0));
+        // Equal to the stored cutoff: no-op — this is the exact case the
+        // render body hits on every re-render while a thread is open.
+        assert!(!thread_read_needs_write(Some(100), 100));
+        // Older than the stored cutoff: no-op.
+        assert!(!thread_read_needs_write(Some(100), 99));
+        // Strictly newer: write.
+        assert!(thread_read_needs_write(Some(100), 101));
     }
 
     use super::*;
