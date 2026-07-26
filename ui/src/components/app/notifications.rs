@@ -504,7 +504,12 @@ fn create_notification_internal(
 /// that message's author to self. If the target has scrolled out of `recent` we
 /// cannot confirm authorship, so we conservatively return `false` (miss rather
 /// than spuriously notify).
-fn mentions_or_replies_to_self(
+///
+/// `pub(crate)`: besides gating browser notifications here, this is the same
+/// predicate the unread counters use for rooms in MentionsAndReplies mode
+/// (`document_title::count_unread_in_room_data_with_mode`, freenet/river#500),
+/// so the badge and the notification can't disagree about what "qualifies".
+pub(crate) fn mentions_or_replies_to_self(
     msg: &AuthorizedMessageV1,
     self_member_id: MemberId,
     room_secrets: &std::collections::HashMap<u32, [u8; 32]>,

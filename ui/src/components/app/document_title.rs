@@ -175,6 +175,18 @@ fn get_current_room_name() -> Option<String> {
 /// invariant `MessagesV1::apply_delta` maintains — so the slice after the
 /// marker's index is exactly the set of messages newer than the marker.
 pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usize {
+    unread_candidate_messages(room_data).count()
+}
+
+/// The unread tail of `room_data` as an iterator: display messages
+/// (non-action, non-deleted, non-event) authored by other users after
+/// `last_read_message_id`. Shared core of both counting modes
+/// ([`count_unread_in_room_data`] and the MentionsAndReplies arm of
+/// [`count_unread_in_room_data_with_mode`]) so the tail-slicing and
+/// exclusion rules can't drift between them.
+fn unread_candidate_messages(
+    room_data: &crate::room_data::RoomData,
+) -> impl Iterator<Item = &river_core::room_state::message::AuthorizedMessageV1> {
     let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
     let recent = &room_data.room_state.recent_messages;
 
@@ -197,8 +209,52 @@ pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usiz
                 && !m.message.content.is_event()
                 && !recent.actions_state.deleted.contains(&m.id())
         })
-        .filter(|m| m.message.author != self_member_id)
-        .count()
+        .filter(move |m| m.message.author != self_member_id)
+}
+
+/// Count the unread messages in `room_data` that its
+/// [`NotificationMode`](crate::room_data::NotificationMode) surfaces
+/// (freenet/river#500). This is THE per-room badge value: the room-list
+/// badge, the document-title `(N)` total, and the mobile hamburger badge
+/// all sum these same per-room values, so every surface agrees.
+///
+/// * `All` — every unread other-authored display message
+///   ([`count_unread_in_room_data`]).
+/// * `MentionsAndReplies` — only unread messages that @mention the user or
+///   reply to one of their messages (the same
+///   [`mentions_or_replies_to_self`] predicate that gates browser
+///   notifications). Zero qualifying messages means no badge even when
+///   other unreads exist.
+/// * `Muted` — always 0; a muted room never badges and never inflates the
+///   totals, matching the modal's "Never notify for this room" wording.
+///
+/// Performance: the mention scan decrypts message content, so it runs only
+/// over the unread tail (the `start..` slice inside
+/// [`unread_candidate_messages`], typically small) and only for rooms in
+/// MentionsAndReplies mode — All and Muted rooms never decrypt anything.
+pub fn count_unread_in_room_data_with_mode(
+    room_data: &crate::room_data::RoomData,
+    mode: crate::room_data::NotificationMode,
+) -> usize {
+    use crate::room_data::NotificationMode;
+    match mode {
+        NotificationMode::All => count_unread_in_room_data(room_data),
+        NotificationMode::Muted => 0,
+        NotificationMode::MentionsAndReplies => {
+            let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
+            let recent = &room_data.room_state.recent_messages.messages;
+            unread_candidate_messages(room_data)
+                .filter(|m| {
+                    crate::components::app::notifications::mentions_or_replies_to_self(
+                        m,
+                        self_member_id,
+                        &room_data.secrets,
+                        recent,
+                    )
+                })
+                .count()
+        }
+    }
 }
 
 /// Count total unread messages across all rooms — room messages plus
@@ -209,11 +265,19 @@ pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usiz
 /// DM unread is tab-title-relevant because the issue lists "incoming DM
 /// notifications + unread tracking" as a single line item — without this
 /// the inbox badge would update but the document title wouldn't.
+///
+/// Room totals go through the same mode-aware per-room values as the
+/// room-list badge ([`count_unread_in_room_data_with_mode`], via the
+/// shared [`count_unread_excluding_room`] sum with no exclusion), so a
+/// Muted room never inflates the tab title and a MentionsAndReplies room
+/// contributes only its qualifying messages (freenet/river#500). DM
+/// counts are unaffected — DMs have no per-thread mode.
 pub fn count_total_unread_messages() -> usize {
     let Ok(rooms) = ROOMS.try_read() else {
         return 0;
     };
-    let room_unread: usize = rooms.map.values().map(count_unread_in_room_data).sum();
+    let room_unread: usize =
+        count_unread_excluding_room(&rooms.map, &rooms.notification_modes, None);
     let dm_unread: usize = count_unread_dms(&rooms);
     room_unread + dm_unread
 }
@@ -304,17 +368,31 @@ fn count_unread_dms_with(
     total
 }
 
-/// Sum unread messages across every room in `map` except `exclude`.
+/// Sum mode-aware unread messages across every room in `map` except
+/// `exclude` (`None` excludes nothing — the document-title total).
 ///
-/// Pure (no signal reads) so the exclusion logic is unit-testable; the
-/// signal-reading wrapper is [`count_unread_behind_rooms_panel`].
+/// Each room contributes [`count_unread_in_room_data_with_mode`] under its
+/// entry in `modes` (absent = `All`, the same default the notification
+/// gate uses), so every unread surface sums identical per-room values
+/// (freenet/river#500).
+///
+/// Pure (no signal reads) so the exclusion + mode logic is unit-testable;
+/// the signal-reading wrappers are [`count_total_unread_messages`] and
+/// [`count_unread_behind_rooms_panel`].
 pub fn count_unread_excluding_room(
     map: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
+    modes: &std::collections::HashMap<
+        ed25519_dalek::VerifyingKey,
+        crate::room_data::NotificationMode,
+    >,
     exclude: Option<&ed25519_dalek::VerifyingKey>,
 ) -> usize {
     map.iter()
         .filter(|(owner_key, _)| Some(*owner_key) != exclude)
-        .map(|(_, room_data)| count_unread_in_room_data(room_data))
+        .map(|(owner_key, room_data)| {
+            let mode = modes.get(owner_key).copied().unwrap_or_default();
+            count_unread_in_room_data_with_mode(room_data, mode)
+        })
         .sum()
 }
 
@@ -339,7 +417,8 @@ pub fn count_unread_behind_rooms_panel() -> usize {
     let Ok(rooms) = ROOMS.try_read() else {
         return 0;
     };
-    count_unread_excluding_room(&rooms.map, current.as_ref()) + count_unread_dms(&rooms)
+    count_unread_excluding_room(&rooms.map, &rooms.notification_modes, current.as_ref())
+        + count_unread_dms(&rooms)
 }
 
 /// Update the document title based on current state
@@ -580,7 +659,7 @@ pub fn DocumentTitleUpdater() -> Element {
 mod tests {
     use super::*;
     use crate::constants::ROOM_CONTRACT_WASM;
-    use crate::room_data::RoomData;
+    use crate::room_data::{NotificationMode, RoomData};
     use crate::util::to_cbor_vec;
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
@@ -863,14 +942,234 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(owner_a_vk, room_a);
         map.insert(owner_b_vk, room_b);
+        let modes = HashMap::new();
 
         // Excluding room A (2 unread) leaves only room B's single unread.
-        assert_eq!(count_unread_excluding_room(&map, Some(&owner_a_vk)), 1);
+        assert_eq!(
+            count_unread_excluding_room(&map, &modes, Some(&owner_a_vk)),
+            1
+        );
         // No current room (welcome screen): every room counts.
-        assert_eq!(count_unread_excluding_room(&map, None), 3);
+        assert_eq!(count_unread_excluding_room(&map, &modes, None), 3);
         // Excluding a key not in the map changes nothing.
         let (_, other_vk) = keypair();
-        assert_eq!(count_unread_excluding_room(&map, Some(&other_vk)), 3);
+        assert_eq!(
+            count_unread_excluding_room(&map, &modes, Some(&other_vk)),
+            3
+        );
+    }
+
+    /// Build a message from `author_sk` that @mentions `mention_of`.
+    fn mention_msg(
+        author_sk: &SigningKey,
+        owner_vk: &VerifyingKey,
+        n: u64,
+        mention_of: MemberId,
+    ) -> AuthorizedMessageV1 {
+        let text = format!(
+            "hey {}!",
+            river_core::mention::encode_mention(mention_of, "Someone")
+        );
+        msg_with_body(author_sk, owner_vk, n, RoomMessageBody::public(text))
+    }
+
+    #[test]
+    fn muted_room_counts_zero_despite_unreads() {
+        // freenet/river#500: a Muted room must never badge and never feed
+        // the title/hamburger totals, however many unreads it holds.
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            msg(&owner_sk, &owner_vk, 2),
+            msg(&owner_sk, &owner_vk, 3),
+        ];
+        let rd = room(self_sk, owner_vk, messages, None);
+        // The messages ARE unread under All…
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::All),
+            3
+        );
+        // …but Muted always counts zero.
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::Muted),
+            0
+        );
+    }
+
+    #[test]
+    fn all_mode_matches_the_plain_count() {
+        // `All` (the default) must be exactly the historical behaviour —
+        // the same value `count_unread_in_room_data` returns.
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            msg(&owner_sk, &owner_vk, 2),
+            msg(&owner_sk, &owner_vk, 3),
+        ];
+        let marker = messages[0].id();
+        let rd = room(self_sk, owner_vk, messages, Some(marker));
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::All),
+            count_unread_in_room_data(&rd)
+        );
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::All),
+            2
+        );
+    }
+
+    #[test]
+    fn mentions_mode_counts_only_qualifying_messages() {
+        // freenet/river#500: a MentionsAndReplies room badges the count of
+        // unread messages that @mention the user or reply to one of their
+        // messages — the same predicate that gates browser notifications.
+        let (self_sk, self_vk) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+
+        // Self-authored target for the reply (never unread itself).
+        let target = msg_with_body(
+            &self_sk,
+            &owner_vk,
+            1,
+            RoomMessageBody::public("my message".to_string()),
+        );
+        let messages = vec![
+            target.clone(),
+            // Plain other-authored message: unread under All, but not a
+            // mention/reply.
+            msg(&owner_sk, &owner_vk, 2),
+            // @mention of self.
+            mention_msg(&owner_sk, &owner_vk, 3, self_id),
+            // Reply to self's message.
+            msg_with_body(
+                &owner_sk,
+                &owner_vk,
+                4,
+                RoomMessageBody::reply(
+                    "agreed".to_string(),
+                    target.id(),
+                    "Me".to_string(),
+                    "my message".to_string(),
+                ),
+            ),
+        ];
+        let rd = room(self_sk, owner_vk, messages, None);
+        // All mode sees 3 unread (plain + mention + reply)…
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::All),
+            3
+        );
+        // …MentionsAndReplies counts only the mention and the reply.
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+            2
+        );
+    }
+
+    #[test]
+    fn mentions_mode_with_no_qualifying_messages_counts_zero() {
+        // Zero qualifying messages means NO badge — even when other unread
+        // messages exist (they'd notify nobody, so they don't badge).
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let (_, third_vk) = keypair();
+        let messages = vec![
+            msg(&owner_sk, &owner_vk, 1),
+            // A mention of someone ELSE doesn't qualify.
+            mention_msg(&owner_sk, &owner_vk, 2, (&third_vk).into()),
+        ];
+        let rd = room(self_sk, owner_vk, messages, None);
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::All),
+            2
+        );
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+            0
+        );
+    }
+
+    #[test]
+    fn mentions_mode_scans_only_the_unread_tail() {
+        // Performance + correctness guard: the mention scan runs over the
+        // unread tail only. A mention BEFORE the last-read marker is read —
+        // it must not count (and must not be scanned at all).
+        let (self_sk, self_vk) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let messages = vec![
+            mention_msg(&owner_sk, &owner_vk, 1, self_id), // read mention
+            msg(&owner_sk, &owner_vk, 2),                  // unread, plain
+        ];
+        let marker = messages[0].id();
+        let rd = room(self_sk, owner_vk, messages, Some(marker));
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+            0
+        );
+    }
+
+    #[test]
+    fn totals_sum_the_same_per_mode_values() {
+        // freenet/river#500: the document-title total and the mobile
+        // hamburger total must sum the SAME mode-aware per-room values the
+        // room-list badge shows, so every surface agrees.
+        let (self_sk, self_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let (owner_a_sk, owner_a_vk) = keypair(); // All (default): 2 unread
+        let (owner_b_sk, owner_b_vk) = keypair(); // MentionsAndReplies: 1 of 3 qualifies
+        let (owner_c_sk, owner_c_vk) = keypair(); // Muted: 5 unread, counts 0
+
+        let room_a = room(
+            self_sk.clone(),
+            owner_a_vk,
+            vec![
+                msg(&owner_a_sk, &owner_a_vk, 1),
+                msg(&owner_a_sk, &owner_a_vk, 2),
+            ],
+            None,
+        );
+        let room_b = room(
+            self_sk.clone(),
+            owner_b_vk,
+            vec![
+                msg(&owner_b_sk, &owner_b_vk, 1),
+                mention_msg(&owner_b_sk, &owner_b_vk, 2, self_id),
+                msg(&owner_b_sk, &owner_b_vk, 3),
+            ],
+            None,
+        );
+        let room_c = room(
+            self_sk,
+            owner_c_vk,
+            (1..=5).map(|n| msg(&owner_c_sk, &owner_c_vk, n)).collect(),
+            None,
+        );
+        let mut map = HashMap::new();
+        map.insert(owner_a_vk, room_a);
+        map.insert(owner_b_vk, room_b);
+        map.insert(owner_c_vk, room_c);
+
+        let mut modes = HashMap::new();
+        // Room A has no entry → defaults to All, like the notification gate.
+        modes.insert(owner_b_vk, NotificationMode::MentionsAndReplies);
+        modes.insert(owner_c_vk, NotificationMode::Muted);
+
+        // Title total (no exclusion): 2 (All) + 1 (mention) + 0 (muted).
+        assert_eq!(count_unread_excluding_room(&map, &modes, None), 3);
+        // Hamburger total with room A open: 1 + 0.
+        assert_eq!(
+            count_unread_excluding_room(&map, &modes, Some(&owner_a_vk)),
+            1
+        );
+        // Hamburger total with the mentions room open: 2 + 0.
+        assert_eq!(
+            count_unread_excluding_room(&map, &modes, Some(&owner_b_vk)),
+            2
+        );
     }
 
     /// Build a direct message. The counters never verify signatures, so
