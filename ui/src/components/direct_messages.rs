@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(updates.get(&(owner_vk, bob_id)), Some(&200));
         // Outbound DM: must NOT seed against my own self_id.
         let me_id: MemberId = (&me.verifying_key()).into();
-        assert!(updates.get(&(owner_vk, me_id)).is_none());
+        assert!(!updates.contains_key(&(owner_vk, me_id)));
     }
 
     #[test]
