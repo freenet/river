@@ -24,6 +24,46 @@ use river_core::{
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// How many alternating-author filler messages the deep-history fixture seeds.
+///
+/// The point is to comfortably exceed `INITIAL_WINDOW_ITEMS` (60) in DISPLAY
+/// ITEMS so the windowed-tail rendering (freenet/river#498) is actually active
+/// under Playwright — the standard fixture's ~15-20 items leave the window, the
+/// backfill sentinel and the restore path all unreachable, which is how #501
+/// shipped with a green suite. Strictly ALTERNATING authors, because
+/// consecutive same-author messages within five minutes fold into one display
+/// item: alternation makes messages == items, so the count is a guarantee
+/// rather than a hope. 80 fillers + the ~12 standard fixture messages stays
+/// under the default `max_recent_messages` (100).
+const DEEP_HISTORY_FILLER_MESSAGES: usize = 80;
+
+/// How deep a fixture room's message history is seeded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HistoryDepth {
+    /// The standard ~12-message fixture. Fits inside the render window, so
+    /// these rooms exercise the pre-window code path exactly as before.
+    Standard,
+    /// [`DEEP_HISTORY_FILLER_MESSAGES`] alternating-author fillers ahead of the
+    /// standard fixture, so the room renders a windowed tail with a live
+    /// backfill sentinel.
+    Deep,
+}
+
+/// Whether the page was loaded with `?deep-history-room=1`, asking for the
+/// extra >window fixture room. Query-gated so the default fixture (and every
+/// existing spec's timing) is untouched; only the windowing specs opt in.
+#[cfg(target_arch = "wasm32")]
+fn deep_history_room_requested() -> bool {
+    web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .is_some_and(|search| search.contains("deep-history-room"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn deep_history_room_requested() -> bool {
+    false
+}
+
 pub fn create_example_rooms() -> Rooms {
     let mut map = HashMap::new();
 
@@ -33,16 +73,38 @@ pub fn create_example_rooms() -> Rooms {
         &"Public Discussion Room".to_string(),
         SelfIs::Observer,
         Some("Welcome | [Website](https://freenet.org/) · [Docs](https://docs.freenet.org/)"),
+        HistoryDepth::Standard,
     );
     map.insert(room1.owner_vk, room1.room_data);
 
     // Room where you're a member
-    let room2 = create_room(&"Team Chat Room".to_string(), SelfIs::Member, None);
+    let room2 = create_room(
+        &"Team Chat Room".to_string(),
+        SelfIs::Member,
+        None,
+        HistoryDepth::Standard,
+    );
     map.insert(room2.owner_vk, room2.room_data);
 
     // Room where you're the owner
-    let room3 = create_room(&"Your Private Room".to_string(), SelfIs::Owner, None);
+    let room3 = create_room(
+        &"Your Private Room".to_string(),
+        SelfIs::Owner,
+        None,
+        HistoryDepth::Standard,
+    );
     map.insert(room3.owner_vk, room3.room_data);
+
+    // A room deeper than the render window, for the windowing specs (#501).
+    if deep_history_room_requested() {
+        let room4 = create_room(
+            &"Deep History Room".to_string(),
+            SelfIs::Member,
+            None,
+            HistoryDepth::Deep,
+        );
+        map.insert(room4.owner_vk, room4.room_data);
+    }
 
     Rooms {
         map,
@@ -68,7 +130,12 @@ enum SelfIs {
 
 // Function to create a room with an owner and members, self_is determines whether
 // the user of the UI is the owner, a member, or an observer (not an owner or member)
-fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -> CreatedRoom {
+fn create_room(
+    room_name: &String,
+    self_is: SelfIs,
+    description: Option<&str>,
+    history_depth: HistoryDepth,
+) -> CreatedRoom {
     let mut csprng = OsRng;
 
     // Create self - the user actually using the app
@@ -218,6 +285,7 @@ fn create_room(room_name: &String, self_is: SelfIs, description: Option<&str>) -
         owner_sk,
         &member_keys,
         other_member_id,
+        history_depth,
     );
 
     let verification_result = room_state.verify(
@@ -272,6 +340,7 @@ fn add_example_messages(
     // conversation's 🛡 badge is deterministically present for Playwright —
     // the random author picks alone leave it to chance.
     deputy_id: MemberId,
+    history_depth: HistoryDepth,
 ) {
     // Use a timestamp 24 hours ago as base time for messages
     let now = crate::util::get_current_system_time()
@@ -328,6 +397,31 @@ fn add_example_messages(
         .map(|(id, key)| (*id, key))
         .chain(std::iter::once((*owner_id, owner_key)))
         .collect();
+
+    // Deep-history fixture: filler messages AHEAD of the standard fixture so
+    // the room's display-item count comfortably exceeds the render window.
+    // Authors strictly alternate — consecutive same-author messages within
+    // five minutes fold into one display item, so alternation is what makes
+    // "N messages" mean "N display items". Deterministic content and fixed
+    // 60s gaps: nothing here should vary run to run.
+    if history_depth == HistoryDepth::Deep {
+        for i in 0..DEEP_HISTORY_FILLER_MESSAGES {
+            let (author_id, signing_key) = authors[i % 2.min(authors.len())];
+            let msg = AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: *owner_id,
+                    author: author_id,
+                    time: get_time_from_millis(current_time_ms),
+                    content: RoomMessageBody::public(format!(
+                        "history filler {i:02}: the window only renders a tail"
+                    )),
+                },
+                signing_key,
+            );
+            messages.messages.push(msg);
+            current_time_ms += 60_000;
+        }
+    }
 
     let message_count = 6;
 
@@ -591,6 +685,45 @@ fn get_time_from_millis(ms: u64) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deep-history fixture must actually put the windowed render path in
+    /// play: more display items than `INITIAL_WINDOW_ITEMS` (60), guaranteed
+    /// by strict author alternation (messages == display items), and a state
+    /// that still verifies. If this shrinks below the window, every #501
+    /// Playwright test silently degrades to the small-room path — the exact
+    /// coverage gap that let #501 ship.
+    #[test]
+    fn deep_history_room_exceeds_the_render_window() {
+        let room = create_room(
+            &"Deep History Room".to_string(),
+            SelfIs::Member,
+            None,
+            HistoryDepth::Deep,
+        );
+
+        let msgs = &room.room_data.room_state.recent_messages.messages;
+        assert!(
+            msgs.len() >= DEEP_HISTORY_FILLER_MESSAGES,
+            "expected at least the filler messages, got {}",
+            msgs.len()
+        );
+        // The fillers are the oldest messages; adjacent authors must differ so
+        // no two fold into one display item.
+        for pair in msgs[..DEEP_HISTORY_FILLER_MESSAGES].windows(2) {
+            assert_ne!(
+                pair[0].message.author, pair[1].message.author,
+                "adjacent fillers share an author and would merge into one \
+                 display item"
+            );
+        }
+        assert!(
+            DEEP_HISTORY_FILLER_MESSAGES > 60,
+            "the fixture must exceed INITIAL_WINDOW_ITEMS or the windowing \
+             specs test nothing"
+        );
+        // create_room verifies the state internally (it panics on failure),
+        // so reaching this point means the deep room is contract-valid.
+    }
 
     #[test]
     fn test_create_example_rooms() {
