@@ -631,3 +631,141 @@ mod tests {
         }
     }
 }
+
+/// Browser hooks the Playwright specs use to deliver INBOUND messages.
+///
+/// The composer is not a substitute: `handle_send_message` raises
+/// `force_scroll`, which deliberately bypasses the pin that the scroll specs
+/// exist to test, so a message sent through the UI proves nothing about how an
+/// arriving one behaves. These write straight into `ROOMS`, as an arriving
+/// network update does.
+///
+/// They skip `apply_delta`'s verification on purpose, so they must never be
+/// reachable anywhere the result could be pushed to the network. Two gates,
+/// both required:
+///
+/// * `example-data`, which is off for the published webapp (`UI_FEATURES` is
+///   empty for `build-webapp`) and for every non-example build;
+/// * `no-sync`, because `cargo make dev-example` turns `example-data` on
+///   WITHOUT it. A message minted here is signed by a key that is not a room
+///   member, so a developer pointing that build at a live node would otherwise
+///   have the synchronizer try to push contract-invalid state.
+#[cfg(all(target_arch = "wasm32", feature = "no-sync"))]
+pub fn install_test_hooks() {
+    use wasm_bindgen::prelude::*;
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    // Idempotent: `App` may re-render, and re-installing would leak closures.
+    if js_sys::Reflect::has(&window, &JsValue::from_str("__riverTest")).unwrap_or(false) {
+        return;
+    }
+
+    let hooks = js_sys::Object::new();
+
+    let append = Closure::wrap(Box::new(move |text: String| {
+        crate::util::defer(move || deliver_message(text, Delivery::Append));
+    }) as Box<dyn FnMut(String)>);
+    let _ = js_sys::Reflect::set(&hooks, &JsValue::from_str("appendMessage"), append.as_ref());
+    append.forget();
+
+    let insert = Closure::wrap(Box::new(move |text: String| {
+        crate::util::defer(move || deliver_message(text, Delivery::BeforeLast));
+    }) as Box<dyn FnMut(String)>);
+    let _ = js_sys::Reflect::set(
+        &hooks,
+        &JsValue::from_str("insertMessageBeforeLast"),
+        insert.as_ref(),
+    );
+    insert.forget();
+
+    let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "no-sync"))]
+pub fn install_test_hooks() {}
+
+/// Where a delivered message lands in the room's message list.
+#[cfg(all(target_arch = "wasm32", feature = "no-sync"))]
+#[derive(Clone, Copy, PartialEq)]
+enum Delivery {
+    /// At the end, as an ordinary arrival does.
+    Append,
+    /// One position from the end — the mid-list insert that grows the history
+    /// WITHOUT remounting its last row, which is the case the old
+    /// `onmounted`-on-the-last-bubble scroll trigger could not see.
+    BeforeLast,
+}
+
+/// Two fixed identities, so a delivered message never merges into the group
+/// above it by accident: grouping needs the same author within 5 minutes, and
+/// `BeforeLast` in particular has to leave the last group's key (its first
+/// message's id) untouched or the row remounts and the test proves nothing.
+#[cfg(all(target_arch = "wasm32", feature = "no-sync"))]
+fn test_author(delivery: Delivery) -> SigningKey {
+    match delivery {
+        Delivery::Append => SigningKey::from_bytes(&[0x5A; 32]),
+        Delivery::BeforeLast => SigningKey::from_bytes(&[0x7B; 32]),
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "no-sync"))]
+fn deliver_message(text: String, delivery: Delivery) {
+    use crate::components::app::{CURRENT_ROOM, ROOMS};
+    use dioxus::prelude::*;
+
+    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+        return;
+    };
+    let sk = test_author(delivery);
+    let author = MemberId::from(&sk.verifying_key());
+
+    ROOMS.with_mut(|rooms| {
+        let Some(room) = rooms.map.get_mut(&room_key) else {
+            return;
+        };
+
+        // Give the sender a name the first time it speaks, so the bubble
+        // renders like any other member's rather than as "Unknown".
+        if !room
+            .room_state
+            .member_info
+            .member_info
+            .iter()
+            .any(|entry| entry.member_info.member_id == author)
+        {
+            room.room_state.member_info.member_info.push(
+                AuthorizedMemberInfo::new_with_member_key(
+                    MemberInfo {
+                        member_id: author,
+                        version: 0,
+                        preferred_nickname: SealedBytes::public(
+                            format!("Test Sender {}", u8::from(delivery == Delivery::BeforeLast))
+                                .into_bytes(),
+                        ),
+                        deputies: Vec::new(),
+                    },
+                    &sk,
+                ),
+            );
+        }
+
+        let message = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(&room_key),
+                author,
+                content: RoomMessageBody::public(text),
+                time: crate::util::get_current_system_time(),
+            },
+            &sk,
+        );
+
+        let messages = &mut room.room_state.recent_messages.messages;
+        let at = match delivery {
+            Delivery::Append => messages.len(),
+            Delivery::BeforeLast => messages.len().saturating_sub(1),
+        };
+        messages.insert(at, message);
+    });
+}
