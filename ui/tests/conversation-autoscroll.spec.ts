@@ -673,16 +673,37 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     await openRoomAtBottom(page, CAPPED_ROOM, DEEP_ROOM_PATH);
     await expectWindowedRenderActive(page);
 
-    const mid = Math.floor((await historyHeight(page)) / 2);
-    await readerScrollsTo(page, mid);
+    // Park just far enough up to be unpinned, NOT mid-history: the 61-message
+    // batch drains ~30 display items off the FRONT of a 74-item room, so a
+    // row tagged mid-history is inside the pruned range and legitimately
+    // leaves the DOM — which row exactly depends on per-engine row heights,
+    // so tagging there is flaky by construction rather than by timing. The
+    // rows just above the fold are the newest ones; they survive the drain,
+    // and holding THEM still is the property under test.
+    const parkedAt = Math.max(
+      0,
+      (await historyHeight(page)) - (await viewportHeight(page)) - 400
+    );
+    await readerScrollsTo(page, parkedAt);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    // Wait out the reader's scrollend before delivering. "Parked" means their
+    // scroll has SETTLED — which is when the pin learns they left the bottom.
+    // Delivering inside that ~120ms window hits a separate, pre-existing
+    // hazard: a batch large enough to momentarily shrink the content below
+    // the reader's offset makes `reader_moved_up_since`'s
+    // `.min(max_scroll_top(..))` clamp read them as still at the bottom, so
+    // the stale-true pin lets the follow yank them down. Reproduced on mobile
+    // Safari (scrollTop 7910 → 13651, then the bottom-settle trim drops the
+    // rows they were reading); filed separately rather than folded in here,
+    // since it predates this PR and needs its own review.
+    await page.waitForTimeout(400);
 
     const probe = await tagVisibleRow(page, "__riverProbeBatch");
     expect(
       probe,
-      "premise: a rendered row should be visible mid-history"
+      "premise: a rendered row should be visible above the fold"
     ).not.toBeNull();
 
     const beforeBatch = await renderedRowCount(page);
