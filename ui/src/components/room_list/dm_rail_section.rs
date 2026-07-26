@@ -1573,10 +1573,15 @@ mod tests {
     /// with zero subscriptions — permanently frozen (`DmRailSection`
     /// never unmounts). Mirrors the `CURRENT_ROOM.read()` guard in
     /// `room_list.rs`. The anchor is `RAIL_REBUILD_TICK`, which doubles
-    /// as the recovery channel: every degraded pass must ALSO schedule
+    /// as the recovery channel: EVERY degraded pass must ALSO schedule
     /// a rail nudge (a deferred tick bump), so recovery is one
     /// macrotask away rather than parked until unrelated user action —
-    /// each segment is checked for at least one nudge call too.
+    /// each segment is checked for its full PER-DEGRADE-ARM count of
+    /// nudge calls (3 in `build_view`: ROOMS / DM_LAST_SEEN / HIDDEN;
+    /// 2 in each archived builder: ROOMS / HIDDEN). A bare "at least
+    /// one" check would let a refactor drop the nudge from the ROOMS
+    /// arm alone — the most critical arm, since that pass leaves the
+    /// memo subscribed ONLY to the tick — while the pin stayed green.
     ///
     /// Source-scrape because the builders need a Dioxus runtime to run.
     /// Conventions: match WHITESPACE-STRIPPED source so rustfmt
@@ -1595,13 +1600,14 @@ mod tests {
         let body = &src[..src.find("mod tests").unwrap_or(src.len())];
         let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
 
-        // (builder head, next-function head bounding the segment)
+        // (builder head, next-function head bounding the segment,
+        //  expected schedule_rail_nudge() call count = degrade-arm count)
         let cases = [
-            ("fnbuild_archived_view()", "fncurrent_archived_count()"),
-            ("fncurrent_archived_count()", "fnbuild_view()"),
-            ("fnbuild_view()", "fnshort_member_id("),
+            ("fnbuild_archived_view()", "fncurrent_archived_count()", 2),
+            ("fncurrent_archived_count()", "fnbuild_view()", 2),
+            ("fnbuild_view()", "fnshort_member_id(", 3),
         ];
-        for (head, next_head) in cases {
+        for (head, next_head, expected_nudges) in cases {
             let start = stripped
                 .find(head)
                 .unwrap_or_else(|| panic!("{head} not found — function renamed/removed?"));
@@ -1625,11 +1631,17 @@ mod tests {
                  come BEFORE the first fallible try_read (at {fallible}) — otherwise a \
                  contended poll leaves the memo with zero subscriptions (issue #499)"
             );
+            let nudges = seg.matches("schedule_rail_nudge()").count();
             assert!(
-                seg.contains("schedule_rail_nudge()"),
-                "{head} has no schedule_rail_nudge() call — a degraded pass must \
-                 queue a deferred tick bump so the memo re-polls one macrotask \
-                 later instead of serving stale data until unrelated user action"
+                nudges >= expected_nudges,
+                "{head} has {nudges} schedule_rail_nudge() call(s), expected at \
+                 least {expected_nudges} (one per degrade arm) — EVERY contended-read \
+                 arm must queue a deferred tick bump so the memo re-polls one \
+                 macrotask later instead of serving stale data until unrelated \
+                 user action. Dropping the nudge from even one arm (e.g. the \
+                 ROOMS arm, whose pass leaves the memo subscribed only to the \
+                 tick) reopens the parked-stale window. If a degrade arm was \
+                 deliberately removed, update this count alongside it."
             );
         }
     }
