@@ -121,11 +121,16 @@ fn build_room(members: usize, messages: usize, msg_len: usize) -> ChatRoomStateV
 }
 
 fn main() {
-    // Shape taken from the live "Off Topic" room profiled on 2026-07-26:
-    // ~1133 rendered messages, ~136 members.
-    let members = 136;
-    let messages = 1133;
-    let msg_len = 80;
+    // Defaults are the live "Off Topic" room profiled on 2026-07-26: ~1133
+    // rendered messages, ~136 members. Override to price another room's shape:
+    //   cargo run --release --example room_state_clone_cost -- <members> <messages> <body_len>
+    let a: Vec<String> = std::env::args().skip(1).collect();
+    let arg = |i: usize, default: usize| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(default);
+    // At least one member: messages are authored round-robin across them, and
+    // a room with no members has nobody to sign one.
+    let members = arg(0, 136).max(1);
+    let messages = arg(1, 1133);
+    let msg_len = arg(2, 80);
 
     let state = build_room(members, messages, msg_len);
     println!(
