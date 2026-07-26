@@ -1393,6 +1393,53 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
 #[cfg(target_arch = "wasm32")]
 const BOTTOM_THRESHOLD_PX: f64 = 100.0;
 
+/// How many display items (message groups and event summaries) the conversation
+/// renders when a room is opened.
+///
+/// Rendering an entire room at once is what makes a busy room unusable.
+/// Profiling the live "Off Topic" room on 2026-07-26 (1133 messages, 136
+/// members) measured 24,305 DOM nodes and a 1.65 GB WASM heap — and WASM never
+/// returns linear memory to the OS, so that peak is permanent for the tab.
+/// Rendering the tail the reader actually lands on, and backfilling only when
+/// they scroll off the top of it, keeps both bounded by what has been looked at.
+///
+/// Counted in ITEMS, not messages: consecutive messages from one author share a
+/// group, so this is a floor on messages shown, never a cap. A room with fewer
+/// items than this renders exactly as it always did — no sentinel, no
+/// backfill — so the common case carries none of the windowing's behaviour.
+const INITIAL_WINDOW_ITEMS: usize = 60;
+
+/// How many more items each backfill reveals when the reader reaches the top of
+/// the current window. Matching [`INITIAL_WINDOW_ITEMS`] means a reader paging
+/// back through history grows the window at the rate they consume it.
+const WINDOW_GROWTH_ITEMS: usize = 60;
+
+/// Where the history's tail window starts, and whether anything is behind it.
+///
+/// Split out from the render so the arithmetic is testable: getting it wrong
+/// either renders an empty history (start past the end) or silently renders
+/// everything (the blow-up the window exists to prevent), and neither is
+/// visible in a unit test of the component.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct HistoryWindow {
+    /// Index of the first display item to render.
+    start: usize,
+    /// Whether older items are held back — drives the backfill sentinel.
+    has_older: bool,
+}
+
+impl HistoryWindow {
+    fn resolve(total_items: usize, window: usize) -> Self {
+        // `max(1)` so the newest item is always on screen: a zero window would
+        // render an empty history that the reader has no way to scroll into.
+        let start = total_items.saturating_sub(window.max(1));
+        Self {
+            start,
+            has_older: start > 0,
+        }
+    }
+}
+
 /// Trailing delay used to spot a scroll settling on browsers with no
 /// `scrollend` event (Safari before 17.4).
 #[cfg(target_arch = "wasm32")]
@@ -1634,6 +1681,57 @@ pub fn Conversation() -> Element {
     // screen right now?". Auto-scroll is gated on `pinned_to_bottom` below,
     // which answers the different question this one cannot (#486).
     let mut is_at_bottom = use_signal(|| true);
+    // How many trailing display items the history renders. Grows only when the
+    // reader reaches the top of what is rendered — see `INITIAL_WINDOW_ITEMS`.
+    let mut window_items = use_signal(|| INITIAL_WINDOW_ITEMS);
+    // Scroll geometry captured just before a backfill, so the view can be put
+    // back on the message the reader was looking at once the older items land
+    // above it. `(scroll_height, scroll_top)` at capture time; `None` when no
+    // backfill is in flight. A plain `Cell` for the same reason
+    // `pinned_to_bottom` is one: nothing renders from it. Not `cfg`-gated —
+    // the sentinel's handler is compiled on every target, only the DOM reads
+    // inside it are wasm-only.
+    let backfill_anchor = use_hook(|| Rc::new(std::cell::Cell::new(None::<(i32, i32)>)));
+
+    // Re-window when the reader opens a different room. The window means "how
+    // far back have I looked in THIS room", so carrying it across rooms would
+    // render a freshly-opened room to the depth of the last one. Subscribes to
+    // the room IDENTITY, not its contents: a message arriving must not collapse
+    // a window the reader has grown.
+    use_effect(move || {
+        let _room = CURRENT_ROOM.read().owner_key;
+        window_items.set(INITIAL_WINDOW_ITEMS);
+    });
+
+    // Put the view back where the reader was after a backfill. The revealed
+    // items land ABOVE the current offset, so without this the history jumps by
+    // their full height. Restoring the offset is also what stops the backfill
+    // cascading: the sentinel ends up above the viewport again, so it stops
+    // intersecting until the reader scrolls back up to it.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let backfill_anchor = backfill_anchor.clone();
+        use_effect(move || {
+            // Subscribe, so this runs after the render that added the items.
+            let _ = window_items();
+            let Some((prev_height, prev_top)) = backfill_anchor.get() else {
+                return;
+            };
+            let backfill_anchor = backfill_anchor.clone();
+            // Deferred so the browser has laid the new rows out and
+            // `scroll_height` reflects them.
+            crate::util::defer(move || {
+                backfill_anchor.set(None);
+                let Some(container) = chat_scroll_container() else {
+                    return;
+                };
+                let grew_by = container.scroll_height() - prev_height;
+                if grew_by > 0 {
+                    container.set_scroll_top(prev_top + grew_by);
+                }
+            });
+        });
+    }
     // "The reader wants to stay with the newest message." Plain `Cell`s, not
     // signals: they are written from raw JS event callbacks that run with no
     // Dioxus scope on the stack, and nothing renders from them, so there is no
@@ -2917,7 +3015,16 @@ pub fn Conversation() -> Element {
                         if current_room_data.is_some() {
                             match message_groups.read().as_ref() {
                                 Some((groups, self_member_id, member_names)) => {
-                                    let groups = groups.clone();
+                                    // Render only the tail the reader has asked
+                                    // for. Slicing BEFORE the clone is the
+                                    // point: `GroupedMessage` carries the
+                                    // rendered HTML of every message it holds,
+                                    // so cloning the whole history here — on
+                                    // every re-render — would pay most of the
+                                    // cost the window exists to avoid.
+                                    let history_window =
+                                        HistoryWindow::resolve(groups.len(), window_items());
+                                    let groups = groups[history_window.start..].to_vec();
                                     let self_member_id = *self_member_id;
                                     let member_names = member_names.clone();
                                     // Room limits for the in-place edit form's
@@ -2966,6 +3073,35 @@ pub fn Conversation() -> Element {
                                     };
                                     Some(rsx! {
                                         div { class: "space-y-4",
+                                            // Backfill trigger, rendered only
+                                            // while older items are held back.
+                                            // Once the whole room is on screen
+                                            // it leaves the DOM, and with it
+                                            // the observer — so a fully-read
+                                            // room behaves exactly as before.
+                                            if history_window.has_older {
+                                                div {
+                                                    id: "top-backfill-sentinel",
+                                                    class: "h-px pointer-events-none",
+                                                    onvisible: move |evt| {
+                                                        if evt.data().is_intersecting().unwrap_or(false) {
+                                                            // Capture the geometry BEFORE the
+                                                            // re-render so the restore effect can
+                                                            // put the reader back on the message
+                                                            // they were looking at.
+                                                            #[cfg(target_arch = "wasm32")]
+                                                            if let Some(container) = chat_scroll_container() {
+                                                                backfill_anchor.set(Some((
+                                                                    container.scroll_height(),
+                                                                    container.scroll_top(),
+                                                                )));
+                                                            }
+                                                            window_items
+                                                                .with_mut(|n| *n += WINDOW_GROWTH_ITEMS);
+                                                        }
+                                                    },
+                                                }
+                                            }
                                             {rows.into_iter().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
@@ -4418,6 +4554,87 @@ mod tests {
             squashed.matches("current_room_data_snapshot()").count() >= 4,
             "the react/delete/edit handlers must each resolve the open room \
              through `current_room_data_snapshot()` at interaction time"
+        );
+    }
+
+    /// The newest item is on screen for ANY window size — including the
+    /// degenerate zero, which would otherwise render a history the reader
+    /// cannot scroll into (the window only ever grows upward from the bottom).
+    #[test]
+    fn the_window_always_renders_the_newest_item() {
+        for total in 1..200usize {
+            for window in [0, 1, 2, 59, 60, 61, 199, 200, 5000] {
+                let w = HistoryWindow::resolve(total, window);
+                assert!(
+                    w.start < total,
+                    "total {total}, window {window}: start {} skips every item",
+                    w.start
+                );
+            }
+        }
+    }
+
+    /// A room that fits in the window renders exactly as it did before the
+    /// window existed: every item, and no backfill sentinel to observe.
+    #[test]
+    fn a_room_inside_the_window_is_rendered_whole() {
+        for total in 0..=INITIAL_WINDOW_ITEMS {
+            let w = HistoryWindow::resolve(total, INITIAL_WINDOW_ITEMS);
+            assert_eq!(
+                w.start, 0,
+                "total {total} should render from the first item"
+            );
+            assert!(!w.has_older, "total {total} has nothing to backfill");
+        }
+    }
+
+    /// Past the window, only the tail renders and the sentinel appears. The
+    /// counts here are the live "Off Topic" room's shape.
+    #[test]
+    fn a_room_past_the_window_renders_only_its_tail() {
+        let w = HistoryWindow::resolve(1133, INITIAL_WINDOW_ITEMS);
+        assert_eq!(w.start, 1133 - INITIAL_WINDOW_ITEMS);
+        assert!(w.has_older, "1133 items must offer a backfill");
+
+        // Each backfill reveals exactly one growth step more...
+        let grown = HistoryWindow::resolve(1133, INITIAL_WINDOW_ITEMS + WINDOW_GROWTH_ITEMS);
+        assert_eq!(w.start - grown.start, WINDOW_GROWTH_ITEMS);
+
+        // ...until the window covers the room, at which point the sentinel goes.
+        let all = HistoryWindow::resolve(1133, 1133);
+        assert_eq!(all.start, 0);
+        assert!(!all.has_older);
+    }
+
+    /// Source-grep pin: the history must render through the window. Rendering
+    /// `groups` directly is the regression this guards — it is a one-token edit
+    /// away, it looks harmless, and it costs nothing measurable until someone
+    /// opens a room with a thousand messages in it.
+    #[test]
+    fn the_history_renders_through_the_window() {
+        let source = include_str!("conversation.rs");
+        let prod = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
+        let squashed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            squashed.contains("HistoryWindow::resolve(groups.len(),window_items())"),
+            "the history must slice its display items through `HistoryWindow`"
+        );
+        assert!(
+            squashed.contains("groups[history_window.start..].to_vec()"),
+            "the render must clone only the windowed tail — cloning all groups \
+             re-introduces the per-render cost the window exists to avoid"
+        );
+        assert!(
+            squashed.contains(concat!("id:\"top-backfill", "-sentinel\"")),
+            "the backfill sentinel must be rendered, or a reader can never see \
+             messages older than the initial window"
+        );
+        assert!(
+            squashed.contains("window_items.set(INITIAL_WINDOW_ITEMS)"),
+            "the window must reset when the reader opens another room"
         );
     }
 
