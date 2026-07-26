@@ -35,10 +35,12 @@ dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-solid"] }
 
 # Web-related
 web-sys = { workspace = true, features = [
+    "AddEventListenerOptions",
     "Clipboard",
     "Document",
     "DomTokenList",
     "Element",
+    "Event",
     "EventTarget",
     "CssStyleDeclaration",
     "HtmlAnchorElement",
@@ -53,6 +55,9 @@ web-sys = { workspace = true, features = [
     "Notification",
     "NotificationOptions",
     "NotificationPermission",
+    "ResizeObserver",
+    "ScrollBehavior",
+    "ScrollToOptions",
     "Storage",
     "VisibilityState",
     "Window",

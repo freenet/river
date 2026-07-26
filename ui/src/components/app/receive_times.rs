@@ -38,11 +38,32 @@ fn parse_map(s: &str) -> HashMap<i64, f64> {
         let mut parts = pair.splitn(2, ':');
         if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
             if let (Ok(key), Ok(val)) = (k.parse::<i64>(), v.parse::<f64>()) {
-                map.insert(key, val);
+                if is_plausible_arrival_ms(val) {
+                    map.insert(key, val);
+                }
             }
         }
     }
     map
+}
+
+/// Is `ms` a time this client could plausibly have received a message at?
+///
+/// These values come back out of `localStorage`, which anything running in the
+/// origin can write, and they are no longer only a diagnostic: `group_messages`
+/// clamps a future-dated sender timestamp to the arrival time, so a garbage
+/// entry would move that message's rendered time, its 5-minute grouping and its
+/// day separator. A NaN, a negative, or a value from before this project
+/// existed is not an arrival time; neither is one in the future, since we
+/// record arrivals as they happen. Rejecting them here means every reader gets
+/// a sane map rather than each one re-checking.
+#[cfg(target_arch = "wasm32")]
+fn is_plausible_arrival_ms(ms: f64) -> bool {
+    /// 2020-01-01, comfortably before any River build existed.
+    const EARLIEST_PLAUSIBLE_MS: f64 = 1_577_836_800_000.0;
+    // A little slack for a clock that ticks between the write and the read.
+    const FUTURE_SLACK_MS: f64 = 60.0 * 1000.0;
+    ms.is_finite() && ms >= EARLIEST_PLAUSIBLE_MS && ms <= now_ms() + FUTURE_SLACK_MS
 }
 
 /// Serialize to "key:value,key:value,..." format
@@ -121,10 +142,30 @@ pub fn record_receive_times(message_ids: &[MessageId]) {
     });
 }
 
+/// A snapshot of the first-seen times, taken once per grouping pass.
+///
+/// `group_messages` needs the same map for every message it walks, and reading
+/// the `RECEIVE_TIMES` `GlobalSignal` per message both costs a borrow each time
+/// and makes the function unusable outside a Dioxus runtime (so untestable).
+/// Taking the reference once and threading it through fixes both.
+pub type ReceiveTimes = HashMap<i64, f64>;
+
+/// When this client FIRST saw a message, in ms since the epoch.
+///
+/// This is local wall-clock at arrival, so unlike the sender-supplied
+/// timestamp it cannot be in the future and cannot be moved by a remote clock.
+pub fn first_seen_ms(times: &ReceiveTimes, message_id: &MessageId) -> Option<f64> {
+    times.get(&message_id.0 .0).copied()
+}
+
 /// Get the propagation delay for a message, if known.
 /// Returns delay in seconds, or None if unknown or negative (clock skew).
-pub fn get_delay_secs(message_id: &MessageId, send_time_ms: i64) -> Option<i64> {
-    let recv_ms = *RECEIVE_TIMES.read().get(&message_id.0 .0)?;
+pub fn get_delay_secs_from(
+    times: &ReceiveTimes,
+    message_id: &MessageId,
+    send_time_ms: i64,
+) -> Option<i64> {
+    let recv_ms = first_seen_ms(times, message_id)?;
     let delay_ms = recv_ms as i64 - send_time_ms;
     let delay_secs = delay_ms / 1000;
     if delay_secs >= 0 {
