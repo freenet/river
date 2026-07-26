@@ -73,6 +73,31 @@ fn try_rejoin_delta(
     }
 }
 
+/// Snapshot the currently-open room's data, cloning it out of [`ROOMS`].
+///
+/// Called at INTERACTION time by the message-action handlers rather than
+/// captured into them. A captured `RoomData` is a DEEP clone of the whole room
+/// state — every retained message, member and signature — and Dioxus clones an
+/// event-handler closure once per rendered row, so capturing made the
+/// conversation's resident memory O(messages × state_size): measured at ~343 KB
+/// per clone × 2 handlers × 1133 rows ≈ 0.8 GB in the "Off Topic" room, on top
+/// of a WASM heap that never returns linear memory to the OS. Looking the room
+/// up when the user actually clicks costs one clone per interaction instead of
+/// two per row, and reads fresher state than a render-time snapshot would.
+///
+/// Keep this cheap to call and keep callers from capturing its result: the
+/// per-row cost is the whole point. Pinned by
+/// `message_action_handlers_do_not_capture_room_data`.
+fn current_room_data_snapshot() -> Option<crate::room_data::RoomData> {
+    // Scoped so the CURRENT_ROOM guard is dropped before ROOMS is read — the
+    // same re-entrancy hazard the render-side lookup documents.
+    let key = { CURRENT_ROOM.read().owner_key }?;
+    ROOMS
+        .try_read()
+        .ok()
+        .and_then(|rooms| rooms.map.get(&key).cloned())
+}
+
 /// Context for a reply-in-progress (held in a signal)
 #[derive(Clone, PartialEq, Debug)]
 struct ReplyContext {
@@ -2088,10 +2113,13 @@ pub fn Conversation() -> Element {
 
     // Handler for toggling a reaction on a message (add or remove)
     let handle_toggle_reaction = {
-        let current_room_data = current_room_data.clone();
+        // Captures NOTHING: this closure is cloned once per rendered row, so a
+        // captured RoomData would be a full room-state copy per message. See
+        // `current_room_data_snapshot`.
         move |target_message_id: MessageId, emoji: String| {
+            let open_room = { CURRENT_ROOM.read().owner_key };
             if let (Some(current_room), Some(current_room_data)) =
-                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+                (open_room, current_room_data_snapshot())
             {
                 let room_key = current_room_data.room_key();
                 let self_sk = current_room_data.self_sk.clone();
@@ -2280,10 +2308,11 @@ pub fn Conversation() -> Element {
 
     // Handler for deleting a message
     let handle_delete_message = {
-        let current_room_data = current_room_data.clone();
+        // Captures NOTHING — see `current_room_data_snapshot`.
         move |target_message_id: MessageId| {
+            let open_room = { CURRENT_ROOM.read().owner_key };
             if let (Some(current_room), Some(current_room_data)) =
-                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+                (open_room, current_room_data_snapshot())
             {
                 let room_key = current_room_data.room_key();
                 let self_sk = current_room_data.self_sk.clone();
@@ -2383,14 +2412,15 @@ pub fn Conversation() -> Element {
 
     // Handler for editing a message
     let handle_edit_message = {
-        let current_room_data = current_room_data.clone();
+        // Captures NOTHING — see `current_room_data_snapshot`.
         move |target_message_id: MessageId, new_text: String| {
             if new_text.is_empty() {
                 warn!("Edit text is empty");
                 return;
             }
+            let open_room = { CURRENT_ROOM.read().owner_key };
             if let (Some(current_room), Some(current_room_data)) =
-                (CURRENT_ROOM.read().owner_key, current_room_data.clone())
+                (open_room, current_room_data_snapshot())
             {
                 let room_key = current_room_data.room_key();
                 let self_sk = current_room_data.self_sk.clone();
@@ -4347,6 +4377,49 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Source-grep pin: the message-action handlers must LOOK UP the open
+    /// room's data when they run, never CAPTURE it.
+    ///
+    /// Dioxus clones an event-handler closure once per rendered row, and
+    /// `RoomData` owns `ChatRoomStateV1` by value — no `Rc` — so a captured
+    /// snapshot is a deep copy of every retained message, member and signature.
+    /// Capturing it in two handlers made the conversation's resident memory
+    /// O(messages × state_size): profiling the live "Off Topic" room
+    /// (1133 messages, 136 members) on 2026-07-26 measured 343 KB per room-state
+    /// clone and a 1.65 GB WASM heap, which the WASM allocator never returns to
+    /// the OS. The capture is a one-line change to re-introduce and costs
+    /// nothing observable on a small room, which is exactly why it needs a pin.
+    #[test]
+    fn message_action_handlers_do_not_capture_room_data() {
+        let source = include_str!("conversation.rs");
+        // Same cut as the pins below — see `author_deputy_badge_uses_the_shared_helper`
+        // for why it must be this needle and not a bare `#[cfg(test)]`.
+        let prod = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
+        // Compare whitespace-stripped so a future rustfmt run that re-wraps the
+        // capture across lines cannot silently disarm the pin.
+        let squashed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Split so the needle cannot match its own text via `include_str!`.
+        let capture = concat!("letcurrent_room_data=", "current_room_data.clone();");
+        assert!(
+            !squashed.contains(capture),
+            "a handler closure captures `current_room_data` by value. Dioxus \
+             clones these closures once per rendered message row, so this deep- \
+             copies the entire room state per message (~343 KB × rows). Look the \
+             room up at interaction time with `current_room_data_snapshot()` \
+             instead."
+        );
+
+        // The definition plus one call per handler (react / delete / edit).
+        assert!(
+            squashed.matches("current_room_data_snapshot()").count() >= 4,
+            "the react/delete/edit handlers must each resolve the open room \
+             through `current_room_data_snapshot()` at interaction time"
+        );
+    }
 
     /// Source-grep pin, mirroring `member_info_modal`'s: the conversation's
     /// author line must take BOTH the shield's visibility and its tooltip from
