@@ -5618,6 +5618,32 @@ mod tests {
         assert_eq!(relocated.start, 0);
     }
 
+    /// The case where the spares are load-bearing and no fallback can stand
+    /// in for them: the head alone vanishes MID-window (its whole group
+    /// deleted), the neighbors survive in place. The first spare pins the
+    /// window one slot back from where it sits — a head-only relocation
+    /// would fall back to index 0 and blow the window open across the whole
+    /// room (ceiling-bounded, but a ~180-item over-render and a torn view).
+    #[test]
+    fn a_mid_window_head_deletion_reanchors_on_the_next_survivor() {
+        let keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
+        let anchor = anchor_of(&keys, 40);
+        // The head item "m40" is deleted outright; everything else survives,
+        // shifted down by one from index 41 on.
+        let post_keys: Vec<String> = keys
+            .iter()
+            .filter(|k| k.as_str() != "m40")
+            .cloned()
+            .collect();
+        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
+        assert!(!relocated.head_survived);
+        assert_eq!(
+            relocated.start, 39,
+            "spare m41 (offset 1) found at index 40 → start 39: the window \
+             re-anchors one slot back, not at the front of the room"
+        );
+    }
+
     /// The trim guard: skip the bottom-settle trim when the retained tail
     /// would leave the backfill sentinel strip inside the bottom viewport —
     /// trimming then re-fires the backfill and the two oscillate at render
