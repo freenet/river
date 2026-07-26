@@ -690,14 +690,18 @@ test.describe("Windowed history follows arrivals (#501)", () => {
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
     // Wait out the reader's scrollend before delivering. "Parked" means their
     // scroll has SETTLED — which is when the pin learns they left the bottom.
-    // Delivering inside that ~120ms window hits a separate, pre-existing
-    // hazard: a batch large enough to momentarily shrink the content below
-    // the reader's offset makes `reader_moved_up_since`'s
-    // `.min(max_scroll_top(..))` clamp read them as still at the bottom, so
-    // the stale-true pin lets the follow yank them down. Reproduced on mobile
-    // Safari (scrollTop 7910 → 13651, then the bottom-settle trim drops the
-    // rows they were reading); filed separately rather than folded in here,
-    // since it predates this PR and needs its own review.
+    //
+    // Delivering INSIDE that ~120ms window hits #508, which is pre-existing
+    // and NOT what this test is about: while the pin is still stale-true, the
+    // patch momentarily shrinks the content below the reader's own offset, so
+    // `reader_moved_up_since`'s `.min(max_scroll_top(..))` clamp reads them as
+    // at the bottom and the FOLLOW path scrolls them there. Verified by
+    // removing this wait and re-running: 2/4 red on mobile Safari (chromium
+    // and firefox clean), and in the red runs `scrollTop` lands on exactly
+    // `max_scroll_top` — `scroll_history_to_bottom`'s signature, not this
+    // PR's compensation, which writes `scroll_top + shift` and is observed
+    // working in the green runs (7965 -> 7272, probed row held). The
+    // bottom-settle trim that follows the yank is what removes the row.
     await page.waitForTimeout(400);
 
     const probe = await tagVisibleRow(page, "__riverProbeBatch");
