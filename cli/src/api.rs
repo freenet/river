@@ -716,9 +716,14 @@ pub(crate) enum ReplyContextDisplay {
     NotAReply,
     /// A reply whose quoted message could not be read back from room state.
     Unavailable,
-    /// A quote verified against the message it quotes. Both fields are re-read
-    /// from that message; neither comes from the replier's snapshot.
-    Quote { author: String, preview: String },
+    /// A quote verified against the message it quotes. Every field is re-read
+    /// from that message; none comes from the replier's snapshot.
+    Quote {
+        author: String,
+        author_id: String,
+        message_id: String,
+        preview: String,
+    },
 }
 
 /// Like [`reply_context_display`], but able to decrypt the reply context of a
@@ -837,6 +842,8 @@ pub(crate) fn reply_context_display_with_secrets(
 
     ReplyContextDisplay::Quote {
         author,
+        author_id: target.message.author.to_string(),
+        message_id: target.id().0 .0.to_string(),
         preview: truncate_reply_preview(&render_mentions_for_terminal(room_state, &text)),
     }
 }
@@ -914,7 +921,9 @@ fn decrypt_private_quote_text(
 /// explicitly required to match.
 pub(crate) fn reply_prefix_display(ctx: &ReplyContextDisplay) -> String {
     match ctx {
-        ReplyContextDisplay::Quote { author, preview } => {
+        ReplyContextDisplay::Quote {
+            author, preview, ..
+        } => {
             format!("[reply to {}: {}] ", author, preview)
         }
         // The quoted message could not be read back — its author was banned and
@@ -935,9 +944,17 @@ pub(crate) fn reply_prefix_display(ctx: &ReplyContextDisplay) -> String {
 /// human-readable stream does distinguish them.
 pub(crate) fn reply_to_json(ctx: &ReplyContextDisplay) -> Option<serde_json::Value> {
     match ctx {
-        ReplyContextDisplay::Quote { author, preview } => {
-            Some(json!({ "author": author, "preview": preview }))
-        }
+        ReplyContextDisplay::Quote {
+            author,
+            author_id,
+            message_id,
+            preview,
+        } => Some(json!({
+            "author": author,
+            "author_id": author_id,
+            "message_id": message_id,
+            "preview": preview,
+        })),
         ReplyContextDisplay::Unavailable | ReplyContextDisplay::NotAReply => None,
     }
 }
@@ -7320,8 +7337,9 @@ mod display_text_tests {
 
         // Author + quoted text decrypt with the secret.
         let secrets = HashMap::from([(0u32, secret)]);
-        let ReplyContextDisplay::Quote { author, preview } =
-            reply_context_display_with_secrets(&state, &msg, &secrets)
+        let ReplyContextDisplay::Quote {
+            author, preview, ..
+        } = reply_context_display_with_secrets(&state, &msg, &secrets)
         else {
             panic!("private reply context should resolve to a quote");
         };
@@ -8294,7 +8312,9 @@ mod mention_cli_tests {
     /// Destructure a resolved quote, failing loudly with the actual variant.
     fn expect_quote(ctx: ReplyContextDisplay) -> (String, String) {
         match ctx {
-            ReplyContextDisplay::Quote { author, preview } => (author, preview),
+            ReplyContextDisplay::Quote {
+                author, preview, ..
+            } => (author, preview),
             other => panic!("expected a resolved quote, got {other:?}"),
         }
     }
@@ -8413,6 +8433,28 @@ mod mention_cli_tests {
             "mention rendered in preview: {rendered}"
         );
         assert!(!rendered.contains("rv:"), "no raw token syntax: {rendered}");
+    }
+
+    #[test]
+    fn reply_json_includes_verified_target_identity() {
+        let alice = SigningKey::from_bytes(&[1u8; 32]);
+        let mut state =
+            state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
+        let reply = reply_quoting(&mut state, &alice, "the verified target");
+        let target = state
+            .recent_messages
+            .messages
+            .last()
+            .expect("reply_quoting inserts the target");
+        let expected_message_id = target.id().0 .0.to_string();
+        let expected_author_id = target.message.author.to_string();
+
+        let json = reply_to_json(&reply_context_display(&state, &reply))
+            .expect("resolved reply should have JSON context");
+        assert_eq!(json["message_id"], expected_message_id);
+        assert_eq!(json["author_id"], expected_author_id);
+        assert_eq!(json["author"], "Alice");
+        assert_eq!(json["preview"], "the verified target");
     }
 
     #[test]
@@ -8686,12 +8728,19 @@ mod mention_cli_tests {
     fn unverifiable_quotes_are_omitted_from_json_and_neutral_in_text() {
         let quote = ReplyContextDisplay::Quote {
             author: "Alice".to_string(),
+            author_id: "ALICE123".to_string(),
+            message_id: "42".to_string(),
             preview: "hello".to_string(),
         };
         assert_eq!(reply_prefix_display(&quote), "[reply to Alice: hello] ");
         assert_eq!(
             reply_to_json(&quote),
-            Some(json!({ "author": "Alice", "preview": "hello" }))
+            Some(json!({
+                "author": "Alice",
+                "author_id": "ALICE123",
+                "message_id": "42",
+                "preview": "hello",
+            }))
         );
 
         // Never a snapshot, and never a shape a bridge has not seen before.
