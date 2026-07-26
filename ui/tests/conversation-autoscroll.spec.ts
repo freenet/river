@@ -132,8 +132,12 @@ async function insertBeforeLast(page: Page, text: string) {
 }
 
 /// Open a room and wait until the history has settled at its newest message.
-async function openRoomAtBottom(page: Page, roomName: string) {
-  await page.goto("/");
+///
+/// `path` lets a test opt into fixture variants the default build hides —
+/// the windowed-history tests load `/?deep-history-room=1` to get a room
+/// deeper than the render window without changing what every other spec sees.
+async function openRoomAtBottom(page: Page, roomName: string, path = "/") {
+  await page.goto(path);
   await waitForApp(page);
   await selectRoom(page, roomName);
   await expectSettledAtBottom(page, "opening a room should land on its newest message");
@@ -430,5 +434,175 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+  });
+});
+
+// Regression tests for freenet/river#501: the #498 windowed tail slid its
+// start index forward on every arrival, removing the oldest rendered rows in
+// the same patch that appended the new message. Browser scroll anchoring
+// rewrote scrollTop to hold the visible content still, `reader_moved_up_since`
+// attributed the browser's adjustment to the reader, and both follow paths
+// stood down — so a room deeper than the render window stopped following
+// arrivals entirely, while every room the old suite seeded (~15-20 items vs a
+// 60-item window) kept passing on the pre-window code path.
+//
+// Every test here therefore asserts its PREMISE first — the backfill sentinel
+// is attached and the rendered row count is a windowed tail, not the whole
+// fixture — so a fixture change that shrinks the room below the window makes
+// these fail loudly instead of quietly regressing into small-room tests.
+//
+// The fixture: `?deep-history-room=1` adds a room of 80 alternating-author
+// messages (alternation makes messages == display items, so >60 items is a
+// guarantee) plus the ~12 standard fixture messages. The default fixture is
+// untouched; the describes above still exercise the small-room path.
+test.describe("Windowed history follows arrivals (#501)", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  const DEEP_ROOM = "Deep History Room";
+  const DEEP_ROOM_PATH = "/?deep-history-room=1";
+
+  /// Rendered history rows: display items plus date separators. A windowed
+  /// tail is ~60 items + a separator or two; the whole fixture is ~92 items.
+  function renderedRowCount(page: Page): Promise<number> {
+    return page.evaluate(
+      () =>
+        document.querySelectorAll("#chat-scroll-container .space-y-4 > *")
+          .length
+    );
+  }
+
+  /// The premise all three tests stand on: the windowed render path is
+  /// actually active. Without this, a fixture or window-size change could
+  /// turn every test below into a duplicate of the small-room suite — the
+  /// exact coverage gap that let #501 ship green.
+  async function expectWindowedRenderActive(page: Page) {
+    await expect(
+      page.locator("#top-backfill-sentinel"),
+      "premise: the backfill sentinel must be attached — if the room fits in " +
+        "the window, nothing here exercises #501's code path"
+    ).toHaveCount(1);
+    const rows = await renderedRowCount(page);
+    expect(
+      rows,
+      "premise: the deep room must render a windowed TAIL (~60 items plus " +
+        "separators), not the whole fixture — a full render means the window " +
+        "backfilled behind the reader's back or the fixture shrank"
+    ).toBeLessThan(75);
+    expect(
+      rows,
+      "premise: the windowed tail itself should be on the page"
+    ).toBeGreaterThan(40);
+  }
+
+  test("keeps following a burst of arrivals in a windowed room", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // The recorded #501 failure mode: with the reader pinned to the bottom,
+    // each arrival slid the window, the shifted scrollTop read as reader
+    // movement, and the view never followed again. The loop is what catches a
+    // fix that survives one arrival and then latches.
+    for (let i = 1; i <= 6; i++) {
+      await deliver(page, `windowed arrival ${i}`);
+      await expectSettledAtBottom(
+        page,
+        `arrival ${i} in a windowed room was not followed`
+      );
+    }
+
+    // Following six arrivals must not have cost the window its bound: the
+    // trim machinery (settle-at-bottom, ceiling) exists so a long pinned
+    // session cannot re-accumulate the unbounded render #498 removed.
+    expect(
+      await renderedRowCount(page),
+      "following arrivals should grow the window modestly, not unboundedly"
+    ).toBeLessThan(90);
+  });
+
+  test("arrivals do not move a reader parked in a windowed room's history", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // Park mid-history: far enough from the bottom to unpin, far enough from
+    // the top not to trigger a backfill.
+    const mid = Math.floor((await historyHeight(page)) / 2);
+    await readerScrollsTo(page, mid);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    // Tag a row that is visible in the viewport and record where it sits.
+    // scrollTop alone cannot see this regression: with scroll anchoring
+    // disabled, a sliding window leaves scrollTop untouched and shifts the
+    // CONTENT under it — the reader watches their message jump away while
+    // every offset reads steady.
+    const probe = await page.evaluate(() => {
+      const container = document.getElementById("chat-scroll-container")!;
+      const cRect = container.getBoundingClientRect();
+      const rows = container.querySelectorAll(".space-y-4 > *");
+      for (const row of rows) {
+        const r = row.getBoundingClientRect();
+        if (r.top >= cRect.top && r.bottom <= cRect.bottom) {
+          (row as any).__riverProbe501 = true;
+          return r.top;
+        }
+      }
+      return null;
+    });
+    expect(
+      probe,
+      "premise: a rendered row should be visible mid-history"
+    ).not.toBeNull();
+
+    for (let i = 1; i <= 3; i++) {
+      await deliver(page, `parked windowed arrival ${i}`);
+    }
+    await expectStaysPut(
+      page,
+      "arrivals in a windowed room moved a parked reader's scroll offset"
+    );
+
+    const probedRowTop = await page.evaluate(() => {
+      const rows = document.querySelectorAll(
+        "#chat-scroll-container .space-y-4 > *"
+      );
+      for (const row of rows) {
+        if ((row as any).__riverProbe501) {
+          return row.getBoundingClientRect().top;
+        }
+      }
+      return null;
+    });
+    expect(
+      probedRowTop,
+      "the probed row left the DOM — the window slid out from under a parked reader"
+    ).not.toBeNull();
+    expect(
+      Math.abs(probedRowTop! - probe!),
+      "content shifted under a parked reader when arrivals landed"
+    ).toBeLessThanOrEqual(2);
+  });
+
+  test("opening a deep room lands settled at the bottom with the initial window", async ({
+    page,
+  }) => {
+    // `openRoomAtBottom` itself asserts the settle; the premise check is what
+    // rules out the H2 failure shape, where the backfill sentinel fires from
+    // scrollTop 0 before the opening snap and cascades the window over the
+    // whole room (the row count would be ~92, not ~62).
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // And it STAYS settled: a late backfill restore racing the opening snap
+    // (H3) would park the view at the restore anchor moments later.
+    await expectStaysPut(page, "the view moved after the room-open snap settled");
+    await expectSettledAtBottom(
+      page,
+      "the room should still be at its newest message after settling"
+    );
   });
 });
