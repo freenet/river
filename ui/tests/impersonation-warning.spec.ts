@@ -109,6 +109,17 @@ test.describe("Impersonation warning (#489)", () => {
 
   test("the impostor's modal EXPLAINS the warning in visible text", async ({ page }) => {
     await openTeamChat(page);
+
+    // Read the DEPUTY's name first, so the imitated-name chip can be compared
+    // to it rather than merely checked for being non-empty. Rendering the
+    // FLAGGED member's own name there would pass a non-empty check, and under
+    // the two bar-class branches of `confusable_variant` the two names differ
+    // by a single character — so it would also survive inspection by eye.
+    const deputyName = ((await rowsWithShield(page).first().textContent()) || "")
+      .replace(/[\u{1F6E1}\u{FE0F}\u{26A0}]/gu, "")
+      .trim();
+    expect(deputyName, "could not read the deputy's name").not.toBe("");
+
     await rowsWithWarning(page).first().click();
     await expect(page.locator(MODAL)).toBeVisible({ timeout: 5_000 });
 
@@ -120,9 +131,10 @@ test.describe("Impersonation warning (#489)", () => {
     await expect(explanation).toContainText(/is NOT a moderator/i);
 
     // The imitated name is shown as its own element, never folded into the
-    // sentence above it.
+    // sentence above it — and it is the DEPUTY's name, not the flagged
+    // member's own.
     await expect(page.locator(MODAL_IMITATED_NAME)).toBeVisible();
-    await expect(page.locator(MODAL_IMITATED_NAME)).not.toHaveText("");
+    await expect(page.locator(MODAL_IMITATED_NAME)).toHaveText(deputyName);
   });
 
   // Again: fixture-scoped, not a general rule. See the note in the row test —

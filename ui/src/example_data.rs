@@ -820,21 +820,55 @@ fn add_example_messages(
 ///   (`I`, `l`, `1`, `|`, `!` all fold to the same sentinel), so the VISUAL
 ///   skeleton is unchanged. This is the live 2026-07-25 attack, and the branch
 ///   the demo wants: the two names are near-indistinguishable on screen.
+/// * A letter-for-digit swap from [`crate::util::confusable`]'s ASCII table
+///   (`o`->`0`, `e`->`3`, `s`->`5`, `a`->`4`, `t`->`7`), which that table folds
+///   straight back, so the skeleton is unchanged.
 /// * Uppercasing changes only case, so the CASE-INSENSITIVE skeleton is
 ///   unchanged.
+///
+/// **The branch ORDER is a demo decision, not an arbitrary one.** Measured
+/// exhaustively over the real pools (46 x 23 = 1,058 handles): `I`->`l` covers
+/// 6.5%, `l`->`I` covers 42.1%, and the remaining 51.4% used to fall through to
+/// uppercasing. That meant more than half of `cargo make dev-example` runs
+/// showed `BOB SMITH (MEMBER)` flagged as impersonating `Bob Smith (Member)` —
+/// a correct tier-1 match (the case-insensitive fold is exactly that), but one
+/// a developer reasonably reads as a FALSE POSITIVE. A fixture that teaches the
+/// reader to distrust the badge inverts its own purpose, and is the same
+/// "trains people to ignore the warning" harm the tier-1-only decision exists
+/// to avoid. The digit swap is checked first for that reason: all 544 of those
+/// handles contain at least one of `o/e/s/a/t`, so it covers the remainder
+/// completely and `B0b Smith (Member)` is what the demo shows.
+///
+/// Uppercasing stays as a last resort for inputs outside the generator's pools.
 ///
 /// `the_example_impostor_always_collides_with_the_deputy` pins the property
 /// against the real generator rather than against one hand-picked name.
 fn confusable_variant(real: &str) -> String {
+    // Letters the ASCII confusable table folds a digit back onto. Kept in the
+    // fold's own order so the correspondence is checkable by eye against
+    // `fold_ascii_confusable`.
+    const DIGIT_FOR: [(char, char); 5] =
+        [('o', '0'), ('e', '3'), ('s', '5'), ('a', '4'), ('t', '7')];
+
     // `I` and `l` are ASCII, so a `find` hit is always a char boundary and
     // `i + 1` is the next one.
     if let Some(i) = real.find('I') {
-        format!("{}l{}", &real[..i], &real[i + 1..])
-    } else if let Some(i) = real.find('l') {
-        format!("{}I{}", &real[..i], &real[i + 1..])
-    } else {
-        real.to_uppercase()
+        return format!("{}l{}", &real[..i], &real[i + 1..]);
     }
+    if let Some(i) = real.find('l') {
+        return format!("{}I{}", &real[..i], &real[i + 1..]);
+    }
+    // Both cases: the visual fold lowercases, so `O` and `o` both end up at
+    // `o`, which is where the table sends `0`.
+    for (i, c) in real.char_indices() {
+        if let Some((_, digit)) = DIGIT_FOR
+            .iter()
+            .find(|(letter, _)| c.eq_ignore_ascii_case(letter))
+        {
+            return format!("{}{}{}", &real[..i], digit, &real[i + c.len_utf8()..]);
+        }
+    }
+    real.to_uppercase()
 }
 
 fn get_time_from_millis(ms: u64) -> SystemTime {
@@ -987,7 +1021,8 @@ mod tests {
         for (real, why) in [
             ("Ian Clarke (Member)", "capital I -> lowercase l"),
             ("Alice Golden (Member)", "no capital I; lowercase l -> I"),
-            ("Bob Smith (Member)", "neither I nor l; uppercased"),
+            ("Bob Smith (Member)", "neither I nor l; letter -> digit"),
+            ("Zyx Wvu", "no I, no l, no o/e/s/a/t; uppercased"),
         ] {
             let variant = confusable_variant(real);
             assert_ne!(
@@ -997,6 +1032,22 @@ mod tests {
             assert!(
                 folds_together(&variant, real),
                 "{why}: {variant:?} must fold onto {real:?} or the ⚠ never fires"
+            );
+        }
+
+        // The demo-QUALITY property, pinned rather than left to a comment: the
+        // uppercase fallback must be unreachable for every handle the generator
+        // can actually produce. It used to catch 51.4% of them, and
+        // `BOB SMITH (MEMBER)` beside `Bob Smith (Member)` reads as a false
+        // positive to anyone looking at the dev build — which teaches exactly
+        // the distrust of the badge this feature cannot afford.
+        for _ in 0..500 {
+            let real = random_full_name() + " (Member)";
+            assert_ne!(
+                confusable_variant(&real),
+                real.to_uppercase(),
+                "{real:?} fell through to the uppercase fallback; the demo now \
+                 shows a shouted name, which reads as a false positive"
             );
         }
 

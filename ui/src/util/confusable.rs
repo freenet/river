@@ -367,8 +367,18 @@ impl ImpersonationWarning {
     ///   `flagged_privilege`, so a collision can appear in only one of them and
     ///   look intermittent.
     ///
-    /// If you reword this, grep the Playwright specs for `getByRole` name
-    /// locators and check each against the NEW text.
+    /// Since freenet/river#494 the member-info modal also renders this sentence
+    /// as VISIBLE TEXT, so the collision surface is wider than accessible
+    /// names: `getByText`, `filter({ hasText })` and `toContainText` can now
+    /// match it too, which they could not when it lived only in `title` and
+    /// `aria-label`. The deputy wording contains 🛡, and
+    /// `member-info-deputy-tag.spec.ts` filters rows on `hasText: "🛡"` — safe
+    /// today only because that locator is scoped to `button[title^="Member
+    /// ID"]`, not because the glyph is unique on the page.
+    ///
+    /// If you reword this, grep the Playwright specs for `getByRole`,
+    /// `getByText`, `hasText` and `toContainText` and check each against the
+    /// NEW text.
     ///
     /// Pinned by `tooltip_contains_no_nickname_content`.
     pub fn tooltip(&self) -> String {

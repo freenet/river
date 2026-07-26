@@ -1177,16 +1177,21 @@ pub(crate) fn impersonation_checker_for_viewer(
 ///
 /// This used to claim "every render surface must go through this", which was
 /// false and is the class of stale comment this file's credibility depends on
-/// not having. The warning is rendered on **two** surfaces today:
+/// not having. The warning is rendered on **three** surfaces today:
 ///
-/// * the member-list row ([`MemberList`]), and
-/// * the conversation's message author line.
+/// * the member-list row ([`MemberList`]),
+/// * the conversation's message author line, and
+/// * the member-info modal, which is the only one that renders the warning's
+///   sentence as VISIBLE TEXT rather than a `title=` tooltip. That matters
+///   because `title=` never fires on touch: on a phone the other two can show
+///   the glyph and nothing else, so the modal is where a reader who taps the
+///   name finds out what it means (freenet/river#494).
 ///
-/// It is NOT rendered on the member-info modal, the DM thread and DM rail,
-/// @mention chips and autocomplete, notifications, or reaction tooltips. Those
-/// show a nickname with no warning beside it. The DM thread is the most
-/// consequential of the gaps: it is a 1:1 surface, which is where a victim is
-/// most likely to act on perceived authority.
+/// It is NOT rendered on the DM thread and DM rail, @mention chips and
+/// autocomplete, notifications, or reaction tooltips. Those show a nickname
+/// with no warning beside it. The DM thread is the most consequential of the
+/// gaps: it is a 1:1 surface, which is where a victim is most likely to act on
+/// perceived authority.
 ///
 /// Adding a surface is a one-line call to this function plus the glyph; the
 /// reason not to do it blindly is that each surface needs its own
@@ -1423,7 +1428,7 @@ pub fn MemberList() -> Element {
             // `self_member_id` here compiles, passes every behavioural test, and
             // puts ⚠ on the genuine owner and every genuine moderator — the
             // argument is pinned by
-            // `impersonation_warning_is_wired_into_both_render_surfaces`.
+            // `impersonation_warning_is_wired_into_every_render_surface`.
             let impersonation_warning = impersonation_warning_for_display(
                 &impersonation,
                 member_id,
@@ -6894,7 +6899,7 @@ mod tests {
     /// `display_name::nickname_render_paths_go_through_display_nickname`
     /// documents).
     #[test]
-    fn impersonation_warning_is_wired_into_both_render_surfaces() {
+    fn impersonation_warning_is_wired_into_every_render_surface() {
         let members_src = include_str!("members.rs");
         let conversation = include_str!("conversation.rs");
 
@@ -7055,6 +7060,27 @@ mod tests {
             )
             .contains("WARNING_GLYPH"),
             "the author-line warning element no longer renders the warning glyph"
+        );
+
+        // --- Member-info modal -------------------------------------------
+        //
+        // The THIRD surface (freenet/river#494), and the only one that renders
+        // the sentence as visible text — which is the whole reason it exists,
+        // since `title=` does not fire on touch. Its own file pins the
+        // ARGUMENTS and the visible-text shape; what belongs here is the
+        // cross-surface claim this test is named for, so that dropping the
+        // modal fails the same test that would catch dropping either of the
+        // other two.
+        let modal = include_str!("members/member_info_modal.rs");
+        assert!(
+            modal.contains("impersonation_warning_for_display("),
+            "the member-info modal no longer computes an impersonation \
+             warning, so a phone user has no surface that explains the ⚠"
+        );
+        assert!(
+            modal.contains("\"data-testid\": \"member-info-impersonation-explanation\""),
+            "the member-info modal no longer renders the warning's explanation \
+             element"
         );
     }
 }
