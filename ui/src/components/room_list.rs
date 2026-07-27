@@ -10,7 +10,7 @@ use crate::components::app::chat_delegate::{
     retry_rooms_load, save_rooms_to_delegate, RoomsLoadState, ROOMS_LOAD_STATE,
 };
 use crate::components::app::document_title::{
-    count_unread_in_room_data, mark_current_room_as_read,
+    count_unread_in_room_data_with_mode, mark_current_room_as_read,
 };
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
@@ -85,6 +85,23 @@ pub(crate) fn room_list_display_state(
             RoomsLoadState::Loaded => RoomListDisplay::Empty,
             RoomsLoadState::LoadFailed => RoomListDisplay::LoadFailed,
         }
+    }
+}
+
+/// Tooltip / accessible name for a room row's unread badge.
+///
+/// `is_mentions` is true for a room in
+/// [`NotificationMode::MentionsAndReplies`](crate::room_data::NotificationMode),
+/// where the badge counts only messages that @mention the user or reply to
+/// one of their messages — so the copy must not claim "messages", and must
+/// name replies as well as mentions (freenet/river#500). Both variants are
+/// singular-aware so a count of 1 never reads "1 unread messages".
+fn unread_badge_label(unread: usize, is_mentions: bool) -> String {
+    match (is_mentions, unread) {
+        (true, 1) => "1 unread mention or reply".to_string(),
+        (true, n) => format!("{n} unread mentions or replies"),
+        (false, 1) => "1 unread message".to_string(),
+        (false, n) => format!("{n} unread messages"),
     }
 }
 
@@ -207,11 +224,32 @@ pub fn RoomList() -> Element {
                     .configuration
                     .privacy_mode
                     == PrivacyMode::Private;
-                // Unread badge: same per-room count the document title uses,
-                // surfaced in the rail so users who don't get browser
-                // notifications (e.g. not on a localhost node) can still see
-                // which rooms have new messages.
-                let unread = count_unread_in_room_data(room_data);
+                // Unread badge: same mode-aware per-room count the document
+                // title uses (freenet/river#500), surfaced in the rail so
+                // users who don't get browser notifications (e.g. not on a
+                // localhost node) can still see which rooms have new
+                // messages. A Muted room counts 0 (no badge, ever); a
+                // MentionsAndReplies room counts only unread messages that
+                // mention or reply to the user.
+                //
+                // That mode's scan decrypts message bodies and is NOT cheap:
+                // its unread tail is the whole message buffer whenever the
+                // room has never been opened or the last-read marker aged
+                // out. It is memoized per room inside
+                // `count_unread_in_room_data_with_mode`, which is what keeps
+                // this memo affordable on every ROOMS write — see that
+                // function's docs before removing the memo.
+                let mode = rooms
+                    .notification_modes
+                    .get(&room_key)
+                    .copied()
+                    .unwrap_or_default();
+                let unread = count_unread_in_room_data_with_mode(room_data, mode);
+                // Badge label matches what is being counted: qualifying
+                // mentions/replies for MentionsAndReplies rooms, all unread
+                // messages otherwise. (Muted rooms never render the badge.)
+                let unread_is_mentions =
+                    mode == crate::room_data::NotificationMode::MentionsAndReplies;
                 Some((
                     room_key,
                     room_name,
@@ -219,6 +257,7 @@ pub fn RoomList() -> Element {
                     awaiting_sync,
                     is_private,
                     unread,
+                    unread_is_mentions,
                     sync_error_msg,
                 ))
             })
@@ -388,14 +427,22 @@ pub fn RoomList() -> Element {
                     RoomListDisplay::List => rsx! {},
                 }
 
-                {room_items.read().iter().enumerate().map(|(idx, (room_key, room_name, is_current, awaiting_sync, is_private, unread, sync_error_msg))| {
+                {room_items.read().iter().enumerate().map(|(idx, (room_key, room_name, is_current, awaiting_sync, is_private, unread, unread_is_mentions, sync_error_msg))| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
                     let is_current = *is_current;
                     let awaiting_sync = *awaiting_sync;
                     let is_private = *is_private;
                     let unread = *unread;
+                    let unread_is_mentions = *unread_is_mentions;
                     let sync_error_msg = sync_error_msg.clone();
+                    // Badge tooltip/accessible name — says what the number
+                    // means under the room's notification mode. The
+                    // mentions-mode count includes REPLIES as well as
+                    // @mentions, so the copy names both; both variants are
+                    // singular-aware ("1 unread mention or reply").
+                    let badge_title = unread_badge_label(unread, unread_is_mentions);
+                    let badge_aria = badge_title.clone();
                     // Row position, for disabling the up control on the first
                     // row and the down control on the last (reorder mode).
                     let is_first = idx == 0;
@@ -516,15 +563,19 @@ pub fn RoomList() -> Element {
                                     // Unread badge — hidden for the current
                                     // room (its messages are marked read on
                                     // open, so a badge there would only
-                                    // flicker). Styling mirrors the DM rail
-                                    // badge plus `flex-shrink-0` so a long
-                                    // truncated room name can't squash it.
+                                    // flicker) and for Muted rooms (their
+                                    // count is always 0, freenet/river#500).
+                                    // Styling mirrors the DM rail badge plus
+                                    // `flex-shrink-0` so a long truncated
+                                    // room name can't squash it; the accent
+                                    // styling applies to any nonzero count,
+                                    // whichever mode produced it.
                                     if unread > 0 && !is_current {
                                         span {
                                             class: "ml-2 flex-shrink-0 inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-medium bg-accent text-white",
                                             "data-testid": "room-unread-badge",
-                                            title: "{unread} unread",
-                                            "aria-label": "{unread} unread messages",
+                                            title: "{badge_title}",
+                                            "aria-label": "{badge_aria}",
                                             "{unread}"
                                         }
                                     }
@@ -715,6 +766,21 @@ pub fn RoomList() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// freenet/river#500: the badge copy must say what the number counts.
+    /// A mentions-mode badge counts @mentions AND replies, so naming only
+    /// mentions understates it; and neither variant may read "1 unread
+    /// messages".
+    #[test]
+    fn unread_badge_label_names_what_it_counts() {
+        assert_eq!(unread_badge_label(1, false), "1 unread message");
+        assert_eq!(unread_badge_label(4, false), "4 unread messages");
+        assert_eq!(unread_badge_label(1, true), "1 unread mention or reply");
+        assert_eq!(unread_badge_label(3, true), "3 unread mentions or replies");
+        // The mentions variant must never claim plain "messages" — the count
+        // deliberately excludes unread messages that don't mention the user.
+        assert!(!unread_badge_label(3, true).contains("messages"));
+    }
 
     /// freenet/river#397: the initial load hasn't resolved and there are no
     /// rooms yet → show the loading spinner, NOT a blank list or a premature
