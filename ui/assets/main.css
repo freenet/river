@@ -155,13 +155,28 @@
  * hit-testable and overlays the row's right edge — an invisible-but-tappable
  * hazard on tablets (a tap meant to open the thread archived it instead).
  *
- * Gate on hover CAPABILITY, not viewport width (the previous `md:opacity-0`
+ * Gate on pointer CAPABILITY, not viewport width (the previous `md:opacity-0`
  * proxy is what broke tablets, which exceed the `md` breakpoint yet have no
- * hover pointer). On `hover: none` force the button fully visible with a
- * >=44px tap target (WCAG 2.5.8 / Apple HIG), and widen the row's right
- * padding to match so the enlarged ✕ never overlaps the nickname or unread
- * badge. Desktop (`hover: hover`) is untouched: opacity-0 -> group-hover. */
-@media (hover: none) {
+ * hover pointer). Force the button fully visible with a >=44px tap target
+ * (WCAG 2.5.8 / Apple HIG), and widen the row's right padding to match so the
+ * enlarged ✕ never overlaps the nickname or unread badge.
+ *
+ * The query is `(hover: none), (any-pointer: coarse)`, NOT `(hover: none)`
+ * alone. `hover` reports the PRIMARY input, so a touchscreen laptop or a touch
+ * Chromebook answers `hover: hover` while the user's finger is on the glass —
+ * they would keep an `opacity-0` button that is still hit-testable over the
+ * row's right edge, which is the invisible-but-tappable hazard this fix exists
+ * to remove, just moved to a different device class. `any-pointer: coarse` is
+ * true whenever ANY available pointer is a finger, so it catches them.
+ *
+ * The cost is that a hybrid device shows the ✕ always-visible rather than on
+ * hover. That is the right way round: a mouse user on such a device sees a
+ * button that is merely always present, while a finger user on the alternative
+ * sees nothing and archives threads by accident.
+ *
+ * A mouse-only desktop matches neither term and is untouched:
+ * opacity-0 -> group-hover. */
+@media (hover: none), (any-pointer: coarse) {
     .dm-archive-btn {
         opacity: 1;
         min-width: 2.75rem;
