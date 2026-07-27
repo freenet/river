@@ -2991,7 +2991,6 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                let room_key = current_room_data.room_key();
                 let self_sk = current_room_data.self_sk.clone();
                 let room_state_clone = current_room_data.room_state.clone();
                 let is_private = current_room_data
@@ -3024,6 +3023,12 @@ pub fn Conversation() -> Element {
                 let clicked_same = existing_reaction.as_ref() == Some(&emoji);
                 let has_existing = existing_reaction.is_some();
 
+                // Retained even though this block no longer awaits anything:
+                // it keeps the body off the event handler's stack. The guard
+                // that actually protects the ROOMS write is the
+                // `crate::util::defer` below (a real setTimeout) — inlining
+                // this block would put everything up to it back on the
+                // handler's stack (freenet/river#512 review).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -3118,12 +3123,8 @@ pub fn Conversation() -> Element {
                             return;
                         }
 
-                        let signature = crate::signing::sign_message_with_fallback(
-                            room_key,
-                            message_bytes.clone(),
-                            &self_sk,
-                        )
-                        .await;
+                        let signature =
+                            crate::signing::sign_message_locally(&message_bytes, &self_sk);
 
                         auth_messages.push(AuthorizedMessageV1::with_signature(message, signature));
                     }
@@ -3184,7 +3185,6 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                let room_key = current_room_data.room_key();
                 let self_sk = current_room_data.self_sk.clone();
                 let room_state_clone = current_room_data.room_state.clone();
                 let is_private = current_room_data
@@ -3197,6 +3197,12 @@ pub fn Conversation() -> Element {
                     .get_secret()
                     .map(|(secret, version)| (*secret, version));
 
+                // Retained even though this block no longer awaits anything:
+                // it keeps the body off the event handler's stack. The guard
+                // that actually protects the ROOMS write is the
+                // `crate::util::defer` below (a real setTimeout) — inlining
+                // this block would put everything up to it back on the
+                // handler's stack (freenet/river#512 review).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -3230,12 +3236,7 @@ pub fn Conversation() -> Element {
                         return;
                     }
 
-                    let signature = crate::signing::sign_message_with_fallback(
-                        room_key,
-                        message_bytes,
-                        &self_sk,
-                    )
-                    .await;
+                    let signature = crate::signing::sign_message_locally(&message_bytes, &self_sk);
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
                     let (members_delta, member_info_delta) =
@@ -3292,7 +3293,6 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                let room_key = current_room_data.room_key();
                 let self_sk = current_room_data.self_sk.clone();
                 let room_state_clone = current_room_data.room_state.clone();
                 let is_private = current_room_data
@@ -3324,6 +3324,12 @@ pub fn Conversation() -> Element {
                     return;
                 }
 
+                // Retained even though this block no longer awaits anything:
+                // it keeps the body off the event handler's stack. The guard
+                // that actually protects the ROOMS write is the
+                // `crate::util::defer` below (a real setTimeout) — inlining
+                // this block would put everything up to it back on the
+                // handler's stack (freenet/river#512 review).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -3359,12 +3365,7 @@ pub fn Conversation() -> Element {
                         return;
                     }
 
-                    let signature = crate::signing::sign_message_with_fallback(
-                        room_key,
-                        message_bytes,
-                        &self_sk,
-                    )
-                    .await;
+                    let signature = crate::signing::sign_message_locally(&message_bytes, &self_sk);
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
                     let (members_delta, member_info_delta) =
@@ -3438,7 +3439,6 @@ pub fn Conversation() -> Element {
                 (current_room_opt, fresh_room_data)
             {
                 // Clone what we need for the async block
-                let room_key = current_room_data.room_key();
                 let self_sk = current_room_data.self_sk.clone();
                 let room_state_clone = current_room_data.room_state.clone();
                 let is_private = current_room_data.is_private();
@@ -3455,6 +3455,12 @@ pub fn Conversation() -> Element {
                 // rather than snapping a later unrelated message to the bottom
                 // (#402 review).
                 let force_scroll = force_scroll.clone();
+                // Retained even though this block no longer awaits anything:
+                // it keeps the body off the event handler's stack. The guard
+                // that actually protects the ROOMS write is the
+                // `crate::util::defer` below (a real setTimeout) — inlining
+                // this block would put everything up to it back on the
+                // handler's stack (freenet/river#512 review).
                 spawn_local(async move {
                     use river_core::room_state::content::{
                         ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
@@ -3558,14 +3564,13 @@ pub fn Conversation() -> Element {
                         return;
                     }
 
-                    // Sign using delegate with fallback to local signing
+                    // Sign locally and synchronously. Do NOT reinstate a
+                    // delegate round-trip here — see `sign_message_locally`
+                    // (freenet/river#512): it cannot change these bytes, and
+                    // awaiting it is what made a sent message take seconds to
+                    // appear.
                     crate::util::debug_log("[send] signing message...");
-                    let signature = crate::signing::sign_message_with_fallback(
-                        room_key,
-                        message_bytes,
-                        &self_sk,
-                    )
-                    .await;
+                    let signature = crate::signing::sign_message_locally(&message_bytes, &self_sk);
                     crate::util::debug_log("[send] signed OK");
 
                     let auth_message = AuthorizedMessageV1::with_signature(message, signature);
@@ -3626,10 +3631,14 @@ pub fn Conversation() -> Element {
                         if delta_applied {
                             // Local apply succeeded and a message will mount:
                             // scroll it into view — but only if the user is still
-                            // viewing the room this send targeted. Signing is
-                            // async, so they may have switched rooms; arming the
-                            // conversation-wide flag then would snap the NEW room
-                            // to the bottom on its next message (#402 review).
+                            // viewing the room this send targeted. This runs two
+                            // task hops after the keypress (`spawn_local`, then
+                            // `defer`'s setTimeout), so they may have switched
+                            // rooms; arming the conversation-wide flag then would
+                            // snap the NEW room to the bottom on its next message
+                            // (#402 review). Still required now that signing is
+                            // synchronous — the hops, not the signature, are what
+                            // let a room switch interleave.
                             if CURRENT_ROOM.peek().owner_key == Some(current_room) {
                                 force_scroll.set(true);
                             }
@@ -5527,6 +5536,112 @@ mod tests {
             squashed.matches("current_room_data_snapshot()").count() >= 4,
             "the react/delete/edit handlers must each resolve the open room \
              through `current_room_data_snapshot()` at interaction time"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#512): nothing may be awaited between the
+    /// user acting on a message and that message reaching `ROOMS`.
+    ///
+    /// All four handlers — send, reaction, delete, edit — render optimistically:
+    /// the composer (or the reaction pill) updates the instant the delta is
+    /// applied to `ROOMS`, and nothing waits for the network echo. So every
+    /// suspension point before that write is dead air, with the composer
+    /// already cleared and no message in its place.
+    ///
+    /// The one that shipped was a delegate signing round-trip. On a hosted node
+    /// that is a WAN hop queued behind contract merges on a serial WASM
+    /// executor, with a 10s timeout before the local fallback. It cost seconds
+    /// and could not change the produced bytes — see
+    /// `signing::a_delegate_signature_can_never_differ_from_the_local_one`.
+    ///
+    /// It is also invisible in development: with `--features no-sync` the
+    /// delegate request fails instantly, so `dev-example` and every Playwright
+    /// spec only ever exercise the fast path. Nothing but this pin stands
+    /// between a future `.await` here and another silent multi-second
+    /// regression.
+    #[test]
+    fn nothing_is_awaited_between_acting_on_a_message_and_it_appearing() {
+        let source = include_str!("conversation.rs");
+        // Same cut as the pins around it — see
+        // `author_deputy_badge_uses_the_shared_helper` for why it must be this
+        // needle and not a bare `#[cfg(test)]`.
+        let prod = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
+        // Drop whole-line comments, so prose about awaiting (this file has
+        // plenty) cannot satisfy the search. Deliberately NOT `split_once`,
+        // which would also truncate a line at a `//` inside a string literal
+        // (`"https://…"`) and could hide a real trailing `.await`. A trailing
+        // comment that happens to contain the needle now fails the test
+        // instead, which is the safe direction: loud, not silent.
+        let code: String = prod
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Whitespace-stripped so a rustfmt re-wrap cannot silently disarm it.
+        let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Every optimistic-render handler, not just the one #512 was reported
+        // against: they are the same shape, and all four carried the same await.
+        // Each ends at the `defer` that performs its `ROOMS` write.
+        for handler in [
+            "lethandle_send_message={",
+            "lethandle_toggle_reaction={",
+            "lethandle_delete_message={",
+            "lethandle_edit_message={",
+        ] {
+            let start = squashed.find(handler).unwrap_or_else(|| {
+                panic!(
+                    "conversation.rs no longer defines `{handler}` — re-anchor \
+                     this pin on whatever replaced it, do not delete it"
+                )
+            });
+            // Anchored on the ROOMS write itself, not on the `defer` that
+            // wraps it: a future edit adding an EARLIER defer to a handler (a
+            // scroll defer, a focus defer) would otherwise shrink the region
+            // and quietly let an await through behind it.
+            let end = squashed[start..]
+                .find("ROOMS.with_mut(")
+                .map(|i| start + i)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{handler}` no longer applies its result to ROOMS \
+                         optimistically — re-anchor this pin, do not delete it"
+                    )
+                });
+            let region = &squashed[start..end];
+
+            assert!(
+                !region.contains(".await"),
+                "`{handler}` awaits something before its optimistic ROOMS \
+                 write. The UI is already committed to the action by then, so \
+                 the user waits with nothing on screen for as long as that \
+                 future takes — which is what freenet/river#512 was. Do the \
+                 work after the local apply, or off this path entirely."
+            );
+            // Per-region, so it also fails if signing moves INTO the deferred
+            // closure (outside the scanned region) or switches to another key.
+            assert!(
+                region.contains("sign_message_locally(&message_bytes,&self_sk)"),
+                "`{handler}` must sign with the room's own key, synchronously, \
+                 before the message reaches ROOMS"
+            );
+            // The write must still be deferred to a clean execution context —
+            // that `setTimeout`, not `spawn_local`, is what keeps the Dioxus
+            // signal write off the event handler's stack.
+            assert!(
+                region.contains("crate::util::defer(move||{"),
+                "`{handler}`'s ROOMS write must stay inside `crate::util::defer`"
+            );
+        }
+
+        // No path may fall back to asking the delegate. Split so the needle
+        // cannot match its own text via `include_str!`.
+        assert!(
+            !squashed.contains(concat!("sign_message_", "with_fallback")),
+            "message signing must not go through the delegate on any path \
+             (freenet/river#512)"
         );
     }
 
