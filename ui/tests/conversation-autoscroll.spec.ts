@@ -453,7 +453,7 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
 //
 // The fixture: `?deep-history-room=1` adds a room of 80 alternating-author
 // messages (alternation makes messages == display items, so >60 items is a
-// guarantee) plus the ~12 standard fixture messages. The default fixture is
+// guarantee) plus the ~13 standard fixture messages. The default fixture is
 // untouched; the describes above still exercise the small-room path.
 test.describe("Windowed history follows arrivals (#501)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });

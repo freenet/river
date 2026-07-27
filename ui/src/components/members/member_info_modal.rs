@@ -257,6 +257,79 @@ pub fn MemberInfoModal() -> Element {
             &room_state.secrets,
         );
 
+        // The ⚠ impersonation warning (freenet/river#489), through the SAME
+        // entry point the member-list row and the conversation's author line
+        // use, so this surface cannot show a badge the others do not — the
+        // cross-surface drift #451 fixed for the shield.
+        //
+        // Fed `target_nickname`, which is the text this modal actually renders.
+        // Checking the raw sealed nickname would compare a string nobody sees.
+        //
+        // ## Why this pays for the whole badge map
+        //
+        // `impersonation_checker_for_viewer` takes the badge map, so this builds
+        // the map `deputy_badge_for_viewer` above deliberately avoids: in a
+        // private room that is an ECIES unseal per appointer. It is worth it
+        // here, because the alternative is not "a cheaper warning" but "no
+        // explanation at all on a phone". A `title=` tooltip NEVER FIRES ON
+        // TOUCH, so on mobile the ⚠ beside a name is a bare glyph, and the
+        // reader's natural next move — tapping the name, which opens THIS modal
+        // — used to explain nothing. This modal is opened by a deliberate click
+        // and renders one member; it is not a per-keystroke path.
+        //
+        // The shield above still uses the single-target helper: it is pinned by
+        // `modal_renders_deputy_shield_via_shared_helper` and by two Playwright
+        // specs, and re-deriving it from this map would put that behaviour on a
+        // different code path for no gain.
+        let impersonation = owner_key_signal.as_ref().and_then(|owner| {
+            let owner_id = MemberId::from(&*owner);
+            let deputy_badges = super::deputy_badges_for_viewer(
+                &room_state.room_state.members,
+                &room_state.room_state.member_info,
+                &room_state.secrets,
+                owner_id,
+                self_member_id,
+            );
+            let checker = super::impersonation_checker_for_viewer(
+                &room_state.room_state.member_info,
+                &room_state.secrets,
+                owner_id,
+                &deputy_badges,
+            );
+            // BOTH ids below are `member_id`, the member whose modal this is —
+            // never `self_member_id`. The 4th argument never suppresses the
+            // badge; it picks which of the two true sentences the tooltip
+            // states (see `ImpersonationWarning`), so passing the VIEWER's
+            // privilege there would tell a moderator looking at an impostor
+            // "Name conflict … Both are real", exonerating the impostor to
+            // exactly the people who would act on it. The argument list is
+            // kept contiguous, with no comment inside it, so the pin in
+            // `modal_passes_the_target_id_and_the_targets_own_privilege` can
+            // match it whitespace-insensitively.
+            super::impersonation_warning_for_display(
+                &checker,
+                member_id,
+                &target_nickname,
+                super::privilege_in_view(member_id, owner_id, &deputy_badges),
+            )
+        });
+        let impersonation_tooltip = impersonation
+            .as_ref()
+            .map(crate::util::confusable::ImpersonationWarning::tooltip)
+            .unwrap_or_default();
+        // The chip's label is the tooltip's OWN leading clause (everything
+        // before the first colon: "Impersonation warning" or "Name conflict").
+        // Deriving it means this surface cannot invent wording that drifts from
+        // the single definition in `ImpersonationWarning::tooltip`, and it
+        // follows the tooltip's privileged/unprivileged branch for free. Safe to
+        // split on: `tooltip_contains_no_nickname_content` pins that no nickname
+        // reaches this string, so the colon is always ours.
+        let impersonation_label = impersonation_tooltip
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+
         // Get the member ID string to display
         let member_id_str = member_id.to_string();
 
@@ -336,6 +409,60 @@ pub fn MemberInfoModal() -> Element {
                                     title: "{deputy_tooltip}",
                                     "aria-label": "{deputy_tooltip}",
                                     "🛡 Deputy"
+                                }
+                            }
+                            // The ⚠ impersonation warning (#489). Deliberately
+                            // NOT mutually exclusive with the 🛡 above: two
+                            // deputies whose names collide each carry a real
+                            // shield AND a real warning, and suppressing the
+                            // warning for a badged member would hand a
+                            // deputised sockpuppet exactly the immunity the
+                            // per-name exemption exists to deny. The tooltip,
+                            // not the badge, is what changes in that case.
+                            if impersonation.is_some() {
+                                span {
+                                    "data-testid": "member-info-impersonation-tag",
+                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-amber-500/20 text-amber-400",
+                                    title: "{impersonation_tooltip}",
+                                    "aria-label": "{impersonation_tooltip}",
+                                    "{crate::util::confusable::WARNING_GLYPH} {impersonation_label}"
+                                }
+                            }
+                        }
+
+                        // The warning, SPELLED OUT. This is the reason the modal
+                        // was wired up at all: `title=` never fires on touch, so
+                        // on a phone every other surface can only show the bare
+                        // ⚠ glyph. Rendering the same sentence as visible text
+                        // makes this the one place a phone user can find out
+                        // what the badge means.
+                        //
+                        // The imitated NAME is shown here and nowhere else, as
+                        // its own element. That is safe for the same reason
+                        // `appointer_names` is: a nickname is attacker-chosen
+                        // and a comma inside it (`Bob, the room owner, Carol`)
+                        // forges structure in a flat string, but cannot span two
+                        // DOM nodes. Do NOT join it into the sentence above, and
+                        // do NOT move it into the tooltip — see
+                        // `ImpersonationWarning::tooltip`.
+                        if let Some(warning) = impersonation.as_ref() {
+                            div {
+                                "data-testid": "member-info-impersonation-explanation",
+                                class: "mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-sm text-amber-200",
+                                p { class: "mb-1", "{impersonation_tooltip}" }
+                                div {
+                                    span { class: "mr-1 text-text-muted", "Resembles:" }
+                                    // `max-w-full break-words`: this is an
+                                    // attacker-chosen nickname, so it can be
+                                    // long and contain no spaces at all.
+                                    // Without them it overflows the modal's
+                                    // `max-w-md` at 320px and pushes the panel
+                                    // wider than the viewport.
+                                    span {
+                                        "data-testid": "member-info-impersonated-name",
+                                        class: "inline-block max-w-full break-words px-2 py-0.5 rounded bg-surface border border-border text-text",
+                                        "{warning.impersonated.display_name}"
+                                    }
                                 }
                             }
                         }
@@ -675,5 +802,133 @@ mod ban_gate_tests {
                  string, which is the forgery this shape exists to prevent"
             );
         }
+    }
+
+    /// freenet/river#489: this modal must render the ⚠ warning, and must render
+    /// its sentence as VISIBLE TEXT.
+    ///
+    /// The visible-text half is the entire reason the modal was wired up, and a
+    /// future refactor that "tidied" the explanation into the `title=` alone
+    /// would silently undo it while still looking correct on a desktop. A
+    /// `title=` tooltip NEVER FIRES ON TOUCH, so on a phone every other surface
+    /// can show only a bare glyph, and the reader's natural next move — tapping
+    /// the name, which opens this modal — has to be what explains it.
+    #[test]
+    fn modal_renders_the_impersonation_warning_as_visible_text() {
+        let source = include_str!("member_info_modal.rs");
+        let prod = &source[..source
+            .find("#[cfg(test)]")
+            .expect("member_info_modal.rs should have a #[cfg(test)] block")];
+
+        assert!(
+            prod.contains("impersonation_warning_for_display"),
+            "the ⚠ must come from the shared `impersonation_warning_for_display` \
+             entry point, which carries the tier decision — a surface that \
+             called the checker directly would render a badge the member list \
+             and the conversation do not (#451's cross-surface drift)"
+        );
+        for bypass in ["check_identical(", "ImpersonationChecker::check"] {
+            assert!(
+                !prod.contains(bypass),
+                "`{bypass}` skips the tier decision in \
+                 `impersonation_warning_for_display`"
+            );
+        }
+
+        // Scoped between anchors rather than by a byte count: the first version
+        // took a fixed 900-character window, and adding a comment inside the
+        // block silently pushed the element it checks out of range. A pin whose
+        // reach depends on how much prose sits above it is not a pin.
+        let explanation = {
+            let start = prod
+                .find("member-info-impersonation-explanation")
+                .expect("the modal must render an explanation block for the ⚠");
+            let end = prod[start..]
+                .find("NicknameField")
+                .expect("the explanation block is followed by the nickname field")
+                + start;
+            &prod[start..end]
+        };
+        assert!(
+            explanation.contains("{impersonation_tooltip}"),
+            "the warning's SENTENCE must be rendered as visible text, not only \
+             as a `title=` attribute: `title=` does not fire on touch, so a \
+             phone user would get a bare glyph and no way to find out what it \
+             means"
+        );
+        assert!(
+            explanation.contains("member-info-impersonated-name"),
+            "the imitated name must be its own element, so a comma inside an \
+             attacker-chosen nickname cannot forge structure the way it did in \
+             #488's tooltip"
+        );
+
+        // The name must never be folded INTO the sentence — the same rule
+        // `ImpersonationWarning::tooltip` states and `appointer_names` follows.
+        for joiner in [
+            "impersonated.display_name.join",
+            "{impersonation_tooltip} {warning.impersonated.display_name}",
+        ] {
+            assert!(
+                !prod.contains(joiner),
+                "`{joiner}` joins an attacker-chosen nickname into our sentence"
+            );
+        }
+    }
+
+    /// **The ARGUMENTS, not just the call.** The member list and the
+    /// conversation author line each pin theirs; this is the third surface and
+    /// was pinned by nothing.
+    ///
+    /// Two swaps compile, pass every other test in this file, and are invisible
+    /// in the example-data fixture — where the impostor and the viewer both
+    /// have `privilege_in_view` of `None`, so nothing observable changes:
+    ///
+    /// * `member_id` -> `self_member_id` at the 2nd argument puts the ⚠ on the
+    ///   genuine owner and every genuine moderator.
+    /// * `member_id` -> `self_member_id` INSIDE `privilege_in_view` at the 4th
+    ///   is the subtler one and matters most in the room this feature exists
+    ///   for. A viewer who is themselves badged — every moderator in Freenet
+    ///   Official — would open an impostor's modal and be shown the
+    ///   PRIVILEGED-clash sentence: "Name conflict … Both are real; check the
+    ///   member ID". That is the wording for a legitimate collision, displayed
+    ///   for a genuine impersonation, exonerating the impostor to precisely the
+    ///   people who would otherwise ban them.
+    ///
+    /// Whitespace-insensitive so `cargo fmt` may rewrap the call, but still
+    /// failing if an ARGUMENT changes.
+    #[test]
+    fn modal_passes_the_target_id_and_the_targets_own_privilege() {
+        let source = include_str!("member_info_modal.rs");
+        let prod = &source[..source
+            .find("#[cfg(test)]")
+            .expect("member_info_modal.rs should have a #[cfg(test)] block")];
+
+        // Scope to the one computation, not the whole file: this file also
+        // contains the comment describing the call, and a whole-file scrape
+        // would match that instead.
+        let start = prod
+            .find("let impersonation = owner_key_signal")
+            .expect("the modal must compute an impersonation warning");
+        let end = prod[start..]
+            .find("let impersonation_tooltip")
+            .expect("the warning computation is followed by its tooltip")
+            + start;
+        let call = &prod[start..end];
+
+        let squashed = call.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            squashed.contains(
+                "impersonation_warning_for_display( &checker, member_id, &target_nickname, \
+                 super::privilege_in_view(member_id, owner_id, &deputy_badges), )"
+            ),
+            "the member-info modal no longer passes `member_id` — the member \
+             whose modal this is — as BOTH the flagged id and the subject of \
+             `privilege_in_view`. Passing `self_member_id` at the 2nd argument \
+             brands the genuine owner and every genuine moderator; passing it \
+             at the 4th shows a badged viewer the \"Name conflict … Both are \
+             real\" sentence for a real impostor. Neither is visible in the \
+             example-data fixture, which is why this pin exists.\ngot: {squashed}"
+        );
     }
 }

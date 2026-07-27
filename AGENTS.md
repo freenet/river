@@ -81,6 +81,26 @@ npx playwright test --project=webkit --grep "iframe"
 npx playwright test --project=mobile-safari --grep "Mobile"
 ```
 
+**Verify what you are actually testing.** Three ways a run silently measures
+the wrong thing, all hit in one session (2026-07-25):
+
+- **`dx serve` can serve a stale build.** The warning above is not theoretical.
+  A mutation check — reintroduce a bug and expect the test to go red — "passed"
+  only because the watcher never rebuilt and the browser was still running the
+  previous binary. That inverts the result of the one technique that proves a
+  test is not vacuous. Prefer the static-server flow above; if you must use
+  `dx serve`, read a marker out of the DOM (a row's `class` attribute is
+  enough) to confirm which build is loaded before believing a pass OR a fail.
+- **A stale `dx` earlier on PATH.** `/opt/rust/bin/dx` was 0.7.3 against the
+  crate's dioxus 0.7.9. It refuses to build and serves a 404 "dx is not serving
+  a web app" page that reads exactly like a broken change; `~/.cargo/bin/dx`
+  was correct. Check `dx --version` against the RESOLVED dioxus version —
+  `cargo tree -p dioxus` or `Cargo.lock`, NOT `ui/Cargo.toml`, which declares
+  `0.7.3` and would have confirmed the stale binary as correct.
+- **Port 8082 is shared.** It is the suite's default `baseURL`, so if another
+  worktree already has a server on it, `npx playwright test` silently tests
+  THAT build. Use a free port and set `PLAYWRIGHT_BASE_URL`.
+
 **Test coverage:**
 - Desktop 1280px: 3-column layout, no overflow
 - Tablet 768px: narrower sidebars via CSS clamp

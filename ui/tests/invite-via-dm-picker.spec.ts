@@ -302,9 +302,11 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     // member's own title. These assertions pin each title to the member
     // it was opened for — with the bug, titleB held member A's name and
     // `memberB.text.startsWith(titleB)` was false. (A row text can't
-    // start with a *different* member's nickname unless the two members
-    // share a nickname, which example data's owner/member suffixes rule
-    // out — so this also implicitly proves titleA ≠ titleB.)
+    // start with a *different* member's nickname unless one nickname is a
+    // PREFIX of another. Since #494 the fixture deliberately contains two
+    // confusable names, but `confusable_variant` substitutes a character
+    // rather than appending, so they are the same length and neither is a
+    // prefix of the other — this still implicitly proves titleA ≠ titleB.)
     expect(titleA.length).toBeGreaterThan(0);
     expect(memberA.text.startsWith(titleA)).toBeTruthy();
     expect(memberB.text.startsWith(titleB!)).toBeTruthy();

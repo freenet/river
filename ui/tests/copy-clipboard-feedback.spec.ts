@@ -22,17 +22,13 @@ async function selectRoom(page: Page) {
   const roomBtn = page.getByRole("button", { name: ROOM_NAME });
   await expect(roomBtn).toBeVisible({ timeout: 5_000 });
   await roomBtn.click();
-  await expect(
-    page.getByRole("heading", { name: ROOM_NAME })
-  ).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByRole("heading", { name: ROOM_NAME })).toBeVisible({ timeout: 5_000 });
 }
 
 test.describe("Export Identity copy feedback", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("clicking Copy to Clipboard updates the button to 'Copied!'", async ({
-    page,
-  }) => {
+  test("clicking Copy to Clipboard updates the button to 'Copied!'", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page);
@@ -46,14 +42,10 @@ test.describe("Export Identity copy feedback", () => {
 
     await copyButton.click();
 
-    await expect(
-      page.getByRole("button", { name: "Copied!" })
-    ).toBeVisible({ timeout: 2_000 });
+    await expect(page.getByRole("button", { name: "Copied!" })).toBeVisible({ timeout: 2_000 });
   });
 
-  test("dismissing via the backdrop also resets the button text", async ({
-    page,
-  }) => {
+  test("dismissing via the backdrop also resets the button text", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page);
@@ -64,24 +56,18 @@ test.describe("Export Identity copy feedback", () => {
     const copyButton = page.getByRole("button", { name: "Copy to Clipboard" });
     await expect(copyButton).toBeVisible({ timeout: 5_000 });
     await copyButton.click();
-    await expect(
-      page.getByRole("button", { name: "Copied!" })
-    ).toBeVisible({ timeout: 2_000 });
+    await expect(page.getByRole("button", { name: "Copied!" })).toBeVisible({ timeout: 2_000 });
 
     // Click the backdrop (anywhere outside the inner panel). The modal panel
     // calls stop_propagation, so a click in the corner reaches the backdrop.
     await page.mouse.click(5, 5);
-    await expect(
-      page.getByRole("button", { name: "Copied!" })
-    ).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Copied!" })).toHaveCount(0);
 
     await exportButton.click();
-    await expect(
-      page.getByRole("button", { name: "Copy to Clipboard" })
-    ).toBeVisible({ timeout: 5_000 });
-    await expect(
-      page.getByRole("button", { name: "Copied!" })
-    ).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Copy to Clipboard" })).toBeVisible({
+      timeout: 5_000,
+    });
+    await expect(page.getByRole("button", { name: "Copied!" })).toHaveCount(0);
   });
 
   test("reopening the modal resets the button text", async ({ page }) => {
@@ -95,23 +81,24 @@ test.describe("Export Identity copy feedback", () => {
     const copyButton = page.getByRole("button", { name: "Copy to Clipboard" });
     await expect(copyButton).toBeVisible({ timeout: 5_000 });
     await copyButton.click();
-    await expect(
-      page.getByRole("button", { name: "Copied!" })
-    ).toBeVisible({ timeout: 2_000 });
+    await expect(page.getByRole("button", { name: "Copied!" })).toBeVisible({ timeout: 2_000 });
 
     // Close via the explicit Close button.
-    await page.getByRole("button", { name: "Close" }).click();
-    await expect(
-      page.getByRole("button", { name: "Copied!" })
-    ).toHaveCount(0);
+    //
+    // `exact: true` is load-bearing. `getByRole` matches the accessible name by
+    // case-insensitive SUBSTRING, and a member row's accessible name includes
+    // its badges' `aria-label`s — the ⚠ impersonation warning's begins
+    // "…their name CLOSEly resembles…" (freenet/river#489). So a room
+    // containing a flagged member gives this locator a second match and the
+    // click fails on strict mode, with no obvious connection to the cause.
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Copied!" })).toHaveCount(0);
 
     // Reopen — the button must say "Copy to Clipboard" again, not stay stuck on "Copied!".
     await exportButton.click();
-    await expect(
-      page.getByRole("button", { name: "Copy to Clipboard" })
-    ).toBeVisible({ timeout: 5_000 });
-    await expect(
-      page.getByRole("button", { name: "Copied!" })
-    ).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Copy to Clipboard" })).toBeVisible({
+      timeout: 5_000,
+    });
+    await expect(page.getByRole("button", { name: "Copied!" })).toHaveCount(0);
   });
 });

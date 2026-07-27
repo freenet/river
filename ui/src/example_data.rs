@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// item: alternation makes messages == items, so the count is a guarantee
 /// rather than a hope.
 ///
-/// Sized to more than THREE windows (188 + the 12 standard messages = 200), so
+/// Sized to more than THREE windows (188 + the 13 standard messages = 201), so
 /// the backfill-paging spec takes several growth steps to exhaust the room and
 /// the #505 blocker-2 scenario (arrivals widening the rendered window past one
 /// whole growth step) is reachable with a single batched delivery. The room's
@@ -48,7 +48,7 @@ const DEEP_HISTORY_FILLER_MESSAGES: usize = 188;
 /// has its own dedicated fixture room below).
 const DEEP_ROOM_MAX_RECENT_MESSAGES: usize = 300;
 
-/// Fillers for the AT-CAP fixture room: 148 + the 12 standard messages lands
+/// Fillers for the AT-CAP fixture room: 148 + the 13 standard messages lands
 /// exactly on that room's `max_recent_messages`
 /// ([`AT_CAP_MAX_RECENT_MESSAGES`]), so every delivered arrival drains the
 /// oldest message — the steady state of every busy production room, and the
@@ -67,12 +67,18 @@ const AT_CAP_FILLER_MESSAGES: usize = 148;
 /// `max_recent_messages` for the at-cap room. Raised from the default 100 so
 /// the room can hold enough PAIRED fillers to exceed the render window in
 /// display items (pairs halve the item count) while sitting exactly at cap.
-const AT_CAP_MAX_RECENT_MESSAGES: usize = 160;
+///
+/// Tracks the seeded total exactly: [`AT_CAP_FILLER_MESSAGES`] plus the
+/// standard block. It went 160 -> 161 when #489's guaranteed impostor message
+/// was added to that block — `at_cap_room_is_exactly_at_its_message_cap` is
+/// what catches the drift, so bump this rather than shrinking the fillers
+/// (they must stay an EVEN count to keep the same-author pairing).
+const AT_CAP_MAX_RECENT_MESSAGES: usize = 161;
 
 /// How deep a fixture room's message history is seeded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HistoryDepth {
-    /// The standard ~12-message fixture. Fits inside the render window, so
+    /// The standard ~13-message fixture. Fits inside the render window, so
     /// these rooms exercise the pre-window code path exactly as before.
     Standard,
     /// [`DEEP_HISTORY_FILLER_MESSAGES`] alternating-author fillers ahead of the
@@ -309,18 +315,55 @@ fn create_room(
         inviter_sk,
     ));
 
+    // The deputy's nickname, captured rather than inlined: the impostor added
+    // below is DERIVED from it (see `confusable_variant`), because these names
+    // are re-rolled on every run.
+    let deputy_nickname = random_full_name() + " (Member)";
+
     member_info
         .member_info
         .push(AuthorizedMemberInfo::new_with_member_key(
             MemberInfo {
                 member_id: other_member_id,
                 version: 0,
-                preferred_nickname: SealedBytes::public(
-                    (random_full_name() + " (Member)").into_bytes(),
-                ),
+                preferred_nickname: SealedBytes::public(deputy_nickname.clone().into_bytes()),
                 deputies: Vec::new(),
             },
             &other_member_sk,
+        ));
+
+    // The IMPOSTOR (freenet/river#489), so the ⚠ impersonation warning is
+    // visible in `cargo make dev-example` and reachable from Playwright. Before
+    // this, the badge had never been seen in a browser: nothing in example data
+    // produced two members whose names fold together.
+    //
+    // They are a plain member, NOT a deputy. Adding a second deputy would break
+    // `member-info-deputy-tag.spec.ts`, which asserts exactly ONE member row
+    // carries a 🛡 — and it would be the wrong shape anyway, since the point is
+    // a member with no authority wearing a moderator's name.
+    let impostor_sk = SigningKey::generate(&mut csprng);
+    let impostor_vk = impostor_sk.verifying_key();
+    let impostor_id = MemberId::from(&impostor_vk);
+    members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: inviter_id,
+            member_vk: impostor_vk,
+        },
+        inviter_sk,
+    ));
+    member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: impostor_id,
+                version: 0,
+                preferred_nickname: SealedBytes::public(
+                    confusable_variant(&deputy_nickname).into_bytes(),
+                ),
+                deputies: Vec::new(),
+            },
+            &impostor_sk,
         ));
 
     // Add members to the room
@@ -333,6 +376,7 @@ fn create_room(
         member_keys.insert(self_id, self_sk.clone());
     }
     member_keys.insert(other_member_id, other_member_sk);
+    member_keys.insert(impostor_id, impostor_sk);
 
     // Add example messages
     add_example_messages(
@@ -341,6 +385,7 @@ fn create_room(
         owner_sk,
         &member_keys,
         other_member_id,
+        impostor_id,
         history_depth,
     );
 
@@ -396,6 +441,10 @@ fn add_example_messages(
     // conversation's 🛡 badge is deterministically present for Playwright —
     // the random author picks alone leave it to chance.
     deputy_id: MemberId,
+    // The member whose nickname is confusable with the deputy's (#489). Given a
+    // guaranteed message for the same reason: the ⚠ on an author line must not
+    // depend on the random author picks above.
+    impostor_id: MemberId,
     history_depth: HistoryDepth,
 ) {
     // Use a timestamp 24 hours ago as base time for messages
@@ -529,6 +578,26 @@ fn add_example_messages(
                 ),
             },
             deputy_key,
+        );
+        messages.messages.push(msg);
+        current_time_ms += 60_000;
+    }
+
+    // One guaranteed message from the IMPOSTOR, so the conversation always has
+    // an author line carrying the ⚠ warning (#489) just below the deputy's 🛡
+    // line above — which is exactly the comparison the badge exists to let a
+    // reader make.
+    if let Some(impostor_key) = member_keys.get(&impostor_id) {
+        let msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author: impostor_id,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::public(
+                    "Hi all, DM me your invite code and I'll sort it out.".to_string(),
+                ),
+            },
+            impostor_key,
         );
         messages.messages.push(msg);
         current_time_ms += 60_000;
@@ -736,6 +805,91 @@ fn add_example_messages(
     room_state.recent_messages = messages;
 }
 
+/// A nickname visually confusable with `real` — the impostor half of the #489
+/// ⚠ fixture.
+///
+/// **Derived, not hardcoded, and that is the whole point.** Example nicknames
+/// come from [`random_full_name`] and are re-rolled on every run, so a literal
+/// `"lan Clarke"` would collide with the deputy only on the runs where the
+/// generator happened to pick `Ian Clarke` — a fixture that reaches its own
+/// premise about 1 time in 1,000.
+///
+/// The first three branches are a TIER-1 collision by construction for any
+/// ASCII input:
+///
+/// * `I` -> `l` and `l` -> `I` swap one member of the fold's *bar class*
+///   (`I`, `l`, `1`, `|`, `!` all fold to the same sentinel), so the VISUAL
+///   skeleton is unchanged. This is the live 2026-07-25 attack, and the branch
+///   the demo wants: the two names are near-indistinguishable on screen.
+/// * A letter-for-digit swap from [`crate::util::confusable`]'s ASCII table
+///   (`o`->`0`, `e`->`3`, `s`->`5`, `a`->`4`, `t`->`7`), which that table folds
+///   straight back, so the skeleton is unchanged.
+/// * Uppercasing, for ASCII, changes only case, so the CASE-INSENSITIVE
+///   skeleton is unchanged. This one is NOT universal — `str::to_uppercase`
+///   is not case-only for every input (`ß` -> `SS`, `ﬁ` -> `FI` change
+///   length) — which is fine, because it is the fallback for inputs outside
+///   the generator's ASCII pools and the tests pin that it never fires for
+///   inputs inside them.
+///
+/// **The branch ORDER is a demo decision, not an arbitrary one.** Measured
+/// exhaustively over the real pools (46 x 23 = 1,058 handles): `I`->`l` covers
+/// 6.5%, `l`->`I` covers 42.1%, and the remaining 51.4% used to fall through to
+/// uppercasing. That meant more than half of `cargo make dev-example` runs
+/// showed `BOB SMITH (MEMBER)` flagged as impersonating `Bob Smith (Member)` —
+/// a correct tier-1 match (the case-insensitive fold is exactly that), but one
+/// a developer reasonably reads as a FALSE POSITIVE. A fixture that teaches the
+/// reader to distrust the badge inverts its own purpose, and is the same
+/// "trains people to ignore the warning" harm the tier-1-only decision exists
+/// to avoid. The digit swap is tried BEFORE the uppercase fallback for that
+/// reason: all 544 of those handles contain at least one of `o/e/s/a/t`, so it
+/// covers the remainder completely and `B0b Smith (Member)` is what the demo
+/// shows.
+///
+/// The digit swap searches only the NAME, never the `" (Member)"` / `" (Owner)"`
+/// role suffix. The suffix contains an `e`, so an unconstrained search would
+/// always find a target there and quietly hide a name the pools cannot spoof —
+/// producing `Quinn Zhu (M3mber)`, which reads as a broken label rather than a
+/// spoofed name. `the_example_impostor_always_collides_with_the_deputy` pins
+/// that the swap lands inside the name for every handle the generator can
+/// produce.
+///
+/// Uppercasing stays as a last resort for inputs outside the generator's pools.
+///
+/// `the_example_impostor_always_collides_with_the_deputy` pins the property
+/// against the real generator rather than against one hand-picked name.
+fn confusable_variant(real: &str) -> String {
+    // Letters the ASCII confusable table folds a digit back onto. Kept in the
+    // fold's own order so the correspondence is checkable by eye against
+    // `fold_ascii_confusable`.
+    const DIGIT_FOR: [(char, char); 5] =
+        [('o', '0'), ('e', '3'), ('s', '5'), ('a', '4'), ('t', '7')];
+
+    // `I` and `l` are ASCII, so a `find` hit is always a char boundary and
+    // `i + 1` is the next one.
+    if let Some(i) = real.find('I') {
+        return format!("{}l{}", &real[..i], &real[i + 1..]);
+    }
+    if let Some(i) = real.find('l') {
+        return format!("{}I{}", &real[..i], &real[i + 1..]);
+    }
+    // Both cases: the visual fold lowercases, so `O` and `o` both end up at
+    // `o`, which is where the table sends `0`.
+    //
+    // Searched over the NAME only — everything before the role suffix — so a
+    // name with none of `o/e/s/a/t` falls through to the fallback instead of
+    // silently mangling `" (Member)"` into `" (M3mber)"`.
+    let name_len = real.find(" (").unwrap_or(real.len());
+    for (i, c) in real[..name_len].char_indices() {
+        if let Some((_, digit)) = DIGIT_FOR
+            .iter()
+            .find(|(letter, _)| c.eq_ignore_ascii_case(letter))
+        {
+            return format!("{}{}{}", &real[..i], digit, &real[i + c.len_utf8()..]);
+        }
+    }
+    real.to_uppercase()
+}
+
 fn get_time_from_millis(ms: u64) -> SystemTime {
     // Use WASM-compatible time function
     crate::util::get_current_system_time()
@@ -867,6 +1021,167 @@ mod tests {
              items or the windowing specs quietly degrade to the small-room \
              path; got {display_items}"
         );
+    }
+
+    /// The impostor's name must ACTUALLY collide with the deputy's, for every
+    /// name the generator can produce — not just for the one a developer had in
+    /// mind when they wrote the fixture.
+    ///
+    /// This is the fixture-reaches-its-premise check. A fixture that silently
+    /// fails to set up the state it claims is this repo's signature failure
+    /// mode: the Playwright spec would still pass its "no ⚠ on the deputy" half
+    /// while the ⚠ it is supposed to find never rendered at all.
+    #[test]
+    fn the_example_impostor_always_collides_with_the_deputy() {
+        use crate::util::confusable::folds_together;
+
+        // One name per branch of `confusable_variant`, so a future edit that
+        // breaks a branch fails here rather than in a browser.
+        for (real, why) in [
+            ("Ian Clarke (Member)", "capital I -> lowercase l"),
+            ("Alice Golden (Member)", "no capital I; lowercase l -> I"),
+            ("Bob Smith (Member)", "neither I nor l; letter -> digit"),
+            ("Zyx Wvu", "no I, no l, no o/e/s/a/t; uppercased"),
+        ] {
+            let variant = confusable_variant(real);
+            assert_ne!(
+                variant, real,
+                "{why}: the impostor must differ from {real:?}"
+            );
+            assert!(
+                folds_together(&variant, real),
+                "{why}: {variant:?} must fold onto {real:?} or the ⚠ never fires"
+            );
+        }
+
+        // Now against the real generator, EXHAUSTIVELY — all 1,058 handles, not
+        // a sample. Sampling ~40% of the product per run would turn a pool
+        // regression into an intermittent failure, and the doc above claims
+        // these numbers were measured over the whole pool, so the test should
+        // measure the whole pool too.
+        let mut checked = 0usize;
+        for name in crate::util::all_full_names() {
+            let real = name + " (Member)";
+            let variant = confusable_variant(&real);
+
+            assert_ne!(variant, real, "{real:?} produced no variant at all");
+            assert!(
+                folds_together(&variant, &real),
+                "{variant:?} does not fold onto {real:?}"
+            );
+
+            // The demo-QUALITY property, pinned rather than left to a comment:
+            // the uppercase fallback must be unreachable for every handle the
+            // generator can actually produce. It used to catch 51.4% of them,
+            // and `BOB SMITH (MEMBER)` beside `Bob Smith (Member)` reads as a
+            // false positive to anyone looking at the dev build — which teaches
+            // exactly the distrust of the badge this feature cannot afford.
+            assert_ne!(
+                variant,
+                real.to_uppercase(),
+                "{real:?} fell through to the uppercase fallback; the demo now \
+                 shows a shouted name, which reads as a false positive"
+            );
+
+            // …and the substitution must land in the NAME, never in the
+            // `" (Member)"` role suffix. `Quinn Zhu (M3mber)` would satisfy
+            // every assertion above while showing the reader a broken label
+            // rather than a spoofed name.
+            let suffix_at = real.find(" (").expect("the fixture appends a role");
+            assert_eq!(
+                &variant[suffix_at..],
+                &real[suffix_at..],
+                "{variant:?} mangled the role suffix instead of the name"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 1_000,
+            "premise: the enumeration must cover the whole pool product; only \
+             {checked} names were checked"
+        );
+    }
+
+    /// The end-to-end fixture precondition: in EVERY example room the viewer's
+    /// own checker is non-empty, the deputy is badged, and the impostor is the
+    /// member it flags.
+    ///
+    /// Asserted through the same entry points the UI renders from, so it cannot
+    /// pass while the browser shows nothing.
+    #[test]
+    fn every_example_room_shows_the_impersonation_warning() {
+        use crate::components::members::{
+            deputy_badges_for_viewer, impersonation_checker_for_viewer,
+            impersonation_warning_for_display, privilege_in_view,
+        };
+        use crate::util::display_name::display_nickname;
+
+        for (owner_vk, room_data) in create_example_rooms().map.iter() {
+            let owner_id = MemberId::from(owner_vk);
+            let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
+            let state = &room_data.room_state;
+
+            let deputy_badges = deputy_badges_for_viewer(
+                &state.members,
+                &state.member_info,
+                &room_data.secrets,
+                owner_id,
+                self_member_id,
+            );
+            assert!(
+                !deputy_badges.is_empty(),
+                "the owner-appointed deputy must be badged, or there is no \
+                 protected name for the impostor to collide with"
+            );
+
+            let checker = impersonation_checker_for_viewer(
+                &state.member_info,
+                &room_data.secrets,
+                owner_id,
+                &deputy_badges,
+            );
+            assert!(
+                !checker.is_empty(),
+                "the protected set is empty, so no ⚠ can ever render in this room"
+            );
+
+            let flagged: Vec<MemberId> = state
+                .members
+                .members
+                .iter()
+                .map(|m| m.member.id())
+                .filter(|&id| {
+                    let Some(mi) = state.member_info.canonical(id) else {
+                        return false;
+                    };
+                    let name =
+                        display_nickname(&mi.member_info.preferred_nickname, &room_data.secrets);
+                    impersonation_warning_for_display(
+                        &checker,
+                        id,
+                        &name,
+                        privilege_in_view(id, owner_id, &deputy_badges),
+                    )
+                    .is_some()
+                })
+                .collect();
+
+            assert_eq!(
+                flagged.len(),
+                1,
+                "exactly one MEMBER (the impostor) must be flagged; the deputy \
+                 is exempt from their OWN name and nobody else should collide. \
+                 Note this sweeps `members.members`, which deliberately \
+                 excludes the owner — a warning wrongly painted on the OWNER is \
+                 caught by impersonation-warning.spec.ts, which renders the \
+                 owner as a row, not here"
+            );
+            assert!(
+                !deputy_badges.contains_key(&flagged[0]),
+                "the flagged member must be the plain-member impostor, not a \
+                 badged deputy"
+            );
+        }
     }
 
     #[test]

@@ -675,7 +675,7 @@ fn group_messages(
             // Passing `self_member_id` compiles and passes every behavioural
             // test while putting ⚠ on the genuine owner and every genuine
             // moderator; the argument is pinned by
-            // `impersonation_warning_is_wired_into_both_render_surfaces`.
+            // `impersonation_warning_is_wired_into_every_render_surface`.
             let author_impersonation = impersonation_warning_for_display(
                 impersonation,
                 author_id,
