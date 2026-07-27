@@ -211,3 +211,9 @@ version = "V29"
 description = "Before retention-horizon summaries for capped collections (messages prune/resend loop, freenet/river#485): last generation whose MessagesV1/DirectMessagesV1 delta re-offered messages the receiver would immediately discard"
 date = "2026-07-25"
 code_hash = "5ae5930adf5f8749019d359e5863fae0d24ba11208f20f45e220150f2a05b113"
+
+[[entry]]
+version = "V30"
+description = "Before the global direct-message retention cap (freenet/river#519): last generation whose DirectMessagesV1 had no whole-set bound, so every DM participant was pinned as a room member forever"
+date = "2026-07-27"
+code_hash = "f8cca7600a63dac16de1974e08211e3eb6e530713a8cfe78caed3a66372a3e50"
