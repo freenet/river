@@ -1426,6 +1426,23 @@ const INITIAL_WINDOW_ITEMS: usize = 60;
 /// back through history grows the window at the rate they consume it.
 const WINDOW_GROWTH_ITEMS: usize = 60;
 
+/// Hard ceiling on how many display items arrival-growth can accumulate.
+///
+/// While the reader is pinned to the bottom (or parked mid-history), arrivals
+/// GROW the rendered window instead of sliding it — see
+/// [`HistoryWindow::resolve`] — so a long session in a busy room would
+/// otherwise re-accumulate exactly the unbounded render the window exists to
+/// prevent (freenet/river#498). Four initial windows is the chosen bound:
+/// deep enough that trims are rare (240 items is hours of a busy room, and the
+/// bottom-settle trim usually fires long before), shallow enough that the
+/// worst-case DOM stays ~4x the room-open cost rather than unbounded.
+///
+/// The ceiling caps ARRIVAL growth only. A reader paging back through history
+/// raises `window_items` explicitly, and that requested size always wins over
+/// the ceiling — capping it would make the backfill sentinel a no-op past 240
+/// items and dead-end the history (see the cap in [`HistoryWindow::resolve`]).
+const WINDOW_ITEMS_CEILING: usize = INITIAL_WINDOW_ITEMS * 4;
+
 /// How far into the rendered history the backfill trigger REACHES, in px.
 ///
 /// The sentinel is a strip spanning `[0, BACKFILL_LEAD_PX]` from the top of the
@@ -1459,11 +1476,291 @@ struct HistoryWindow {
     has_older: bool,
 }
 
+/// The identity of the window's head: which display item the last render
+/// started at, remembered by KEY, with the index it held as a relocation hint.
+///
+/// The anchor is by IDENTITY, not position, because positions are not stable:
+/// `MessagesV1::apply_delta` drains the oldest message once a room exceeds
+/// `max_recent_messages` (the steady state of every busy room), so an arrival
+/// shifts every index down by one. A positional anchor then renders a head one
+/// item LATER in identity — the top rendered row is removed in the same patch
+/// that appends the arrival, which is the #501 slide reproduced in content
+/// space, and with scroll anchoring disabled it crawls a parked reader upward
+/// one row per arrival. Anchoring on the head item's key holds the rendered
+/// set fixed in identity no matter how the indices shift underneath it.
+#[derive(Clone, PartialEq, Debug)]
+struct WindowAnchor {
+    /// `display_item_key` of the first [`WINDOW_ANCHOR_KEYS`] rendered items,
+    /// head first. The spares exist because the head key alone can vanish
+    /// while its NEIGHBORS survive: an at-cap drain that consumes the head
+    /// (or only its first message — a multi-message head group RE-KEYS, since
+    /// a group's key is its first message's id), or a batched delta draining
+    /// many items at once. The first spare still present tells us exactly
+    /// where the surviving remainder of the old window now sits.
+    keys: Vec<String>,
+    /// The index the head held last render — a hint so relocation is
+    /// O(shift), not O(total), in the common case.
+    index: usize,
+}
+
+/// How many leading item keys the anchor remembers (head + spares).
+///
+/// Bounds how large a head-consuming removal can be precisely relocated: a
+/// front drain that consumes the head and ALL spares falls back to index 0,
+/// which for a front-contiguous drain — the only mechanism that can remove
+/// this many contiguous leading items — is exactly the nearest surviving
+/// item anyway.
+const WINDOW_ANCHOR_KEYS: usize = 8;
+
+/// Where the anchored window starts after the item list changed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RelocatedWindow {
+    /// Start index for the resolve: the head's new position when it survived,
+    /// otherwise derived from the first surviving spare (its position minus
+    /// its offset in the anchor), otherwise 0.
+    start: usize,
+    /// Whether the HEAD itself survived under its own key. False means the
+    /// pre-patch head row is gone or re-keyed, so rendered content above (or
+    /// at) the new head changed and a parked reader needs the measured
+    /// reposition.
+    head_survived: bool,
+}
+
+/// Search for one anchored key after the item list changed.
+///
+/// Front prunes shift every surviving index DOWN, so the hint is checked
+/// first, then the indices below it, then (for completeness — a merge can
+/// insert older history above the head) the indices above. `None` means this
+/// key is gone entirely.
+fn relocate_anchor(total: usize, hint: usize, is_anchor: impl Fn(usize) -> bool) -> Option<usize> {
+    if hint < total && is_anchor(hint) {
+        return Some(hint);
+    }
+    if let Some(i) = (0..hint.min(total)).rev().find(|&i| is_anchor(i)) {
+        return Some(i);
+    }
+    (hint.saturating_add(1)..total).find(|&i| is_anchor(i))
+}
+
+/// Re-locate the anchored window: the head by its own key, else by the first
+/// surviving spare, else index 0.
+///
+/// The index-0 fallback is exact for a front-contiguous drain that consumed
+/// the head and every spare — the oldest remaining item IS then the nearest
+/// survivor. It is a DEGRADED answer for the other way to lose that many
+/// contiguous leading items (a ban purge or bulk delete of >=
+/// [`WINDOW_ANCHOR_KEYS`] display items above the reader): the window jumps
+/// to the front of the room, bounded only by the ceiling, and the reposition
+/// probe finds nothing to measure against. Rare, and it fails toward
+/// rendering MORE history rather than losing the reader's place entirely.
+///
+/// The `head_reposition` effect measures and compensates a parked reader for
+/// the TOP-CONTIGUOUS removals this relocation deals in (at-cap drains,
+/// batched or not, including a re-keyed multi-message head group, and small
+/// leading deletes the spares still cover). It does NOT make every removal
+/// invisible: a bulk MID-window removal (a ban purge) or late-loading media
+/// above the viewport still shifts a parked reader — tracked as follow-up
+/// work, not covered here.
+fn relocate_window(
+    total: usize,
+    anchor: &WindowAnchor,
+    key_at: impl Fn(usize, &str) -> bool,
+) -> RelocatedWindow {
+    for (spare, key) in anchor.keys.iter().enumerate() {
+        let located = relocate_anchor(total, anchor.index + spare, |i| key_at(i, key));
+        if let Some(i) = located {
+            return RelocatedWindow {
+                start: i.saturating_sub(spare),
+                head_survived: spare == 0,
+            };
+        }
+    }
+    RelocatedWindow {
+        start: 0,
+        head_survived: false,
+    }
+}
+
+/// How many rows past the window head the reposition capture will probe for a
+/// row that exists in the PRE-patch DOM.
+///
+/// The new head itself may have no pre-patch row to measure, for two reasons:
+///
+/// * a multi-message head group whose first message was drained RE-KEYS (a
+///   group's key is its first message's id), so its new key is in no
+///   pre-patch row (#505 re-review blocker);
+/// * relocation landing via SPARE `k` sets `start = i - k`, widening the
+///   window backward by `k` items that were not rendered pre-patch at all, so
+///   the first `k` candidates cannot have pre-patch rows either.
+///
+/// A head-only — or too-short — probe dead-fires, and the parked reader is
+/// left uncompensated. Sized to [`WINDOW_ANCHOR_KEYS`] so the walk covers the
+/// SPARE term exactly (`k <= WINDOW_ANCHOR_KEYS - 1`, needing `k + 1`
+/// candidates). The full count of leading candidates without pre-patch rows is
+/// `k + (relocated.start - history_window.start)`, and that second term is
+/// non-zero only when `resolve` pulls the start back below the relocated head
+/// — the bulk mid-window removal `relocate_window` already declares
+/// out of scope. For a top-contiguous removal every surviving row at or below
+/// the head shifts by the same amount, so whichever candidate lands measures
+/// the shift exactly.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const REPOSITION_PROBE_ROWS: usize = WINDOW_ANCHOR_KEYS;
+
+/// Pick the row the reposition will measure: the first of the leading
+/// `REPOSITION_PROBE_ROWS` post-patch keys that has a PRE-patch row.
+///
+/// `pre_patch_offsets` is handed the whole candidate list at once so the DOM
+/// is scanned a single time (see `first_history_row_offset`) rather than once
+/// per candidate inside the render body.
+///
+/// Only the wasm render path calls this at runtime; natively it is exercised
+/// by the unit tests, hence the targeted allow rather than a cfg that would
+/// hide it from them.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn select_reposition_probe(
+    keys_from_head: impl Iterator<Item = String>,
+    pre_patch_offsets: impl Fn(&[String]) -> Option<(String, i32)>,
+) -> Option<(String, i32)> {
+    let candidates: Vec<String> = keys_from_head.take(REPOSITION_PROBE_ROWS).collect();
+    pre_patch_offsets(&candidates)
+}
+
+/// Does `key` identify `item`, without allocating a key `String`?
+///
+/// The relocation walk compares keys against up to every item on a miss;
+/// building a `String` per probe made that O(total) allocations per render at
+/// the at-cap steady state (#505 re-review).
+fn display_item_key_matches(item: &DisplayItem, key: &str) -> bool {
+    match item {
+        DisplayItem::Messages(group) => group.messages[0].id == key,
+        DisplayItem::Event(summary) => summary.id == key,
+    }
+}
+
+/// What the backfill sentinel captures just before growing the window, so the
+/// restore can put the reader back on the row they were looking at.
+///
+/// Only ever constructed on wasm (the capture reads the DOM), hence the
+/// native allow rather than a cfg that would also hide the type from the
+/// component's non-wasm compile.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Clone, PartialEq, Debug)]
+struct BackfillAnchor {
+    /// `data-item-key` of the head row at capture time. It survives the
+    /// backfill (revealed rows land ABOVE it), and its `offsetTop` shift
+    /// measures EXACTLY the height prepended above the viewport — unlike the
+    /// raw `scrollHeight` delta, which also counts content appended BELOW the
+    /// viewport when an arrival batches into the same patch, over-shifting
+    /// the reader by that content's height (#505 re-review).
+    probe_key: String,
+    /// The probe row's `offsetTop` at capture time.
+    probe_top: i32,
+    /// `scrollTop` at capture time.
+    scroll_top: i32,
+    /// `scrollHeight` at capture time — the fallback delta if the probe row
+    /// vanishes in the same patch (an at-cap drain re-keying it; rare).
+    scroll_height: i32,
+}
+
+/// Extra estimated px the retained tail must clear beyond "sentinel exactly
+/// out of range" before a bottom-settle trim is allowed. Absorbs the error in
+/// estimating the trimmed height from the average row height.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const TRIM_HEADROOM_PX: f64 = 200.0;
+
+/// Would trimming the rendered window down to `target` items leave the
+/// backfill sentinel strip inside the bottom viewport?
+///
+/// At the bottom, the sentinel strip `[0, BACKFILL_LEAD_PX]` intersects the
+/// viewport iff `content_height < client_height + BACKFILL_LEAD_PX`. A tail
+/// short enough for that (browser zoom-out, a tall portrait monitor over a
+/// modest window) would re-fire the backfill the moment the trim lands:
+/// grow → snap → settle → trim → grow, a silent render loop at full speed
+/// (#505 re-review). The settle handler skips the trim when the retained
+/// tail's ESTIMATED height (current height scaled by the retained fraction)
+/// would sit within the strip's reach; the window then simply stays grown,
+/// bounded by the ceiling as ever.
+/// Only the wasm settle handler calls this at runtime; natively it is
+/// exercised by the unit tests, hence the targeted allow.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn trim_would_rearm_backfill(
+    scroll_height: i32,
+    client_height: i32,
+    rendered: usize,
+    target: usize,
+) -> bool {
+    if rendered == 0 || target >= rendered {
+        return false;
+    }
+    let estimated_tail = scroll_height as f64 * target as f64 / rendered as f64;
+    estimated_tail < client_height as f64 + BACKFILL_LEAD_PX as f64 + TRIM_HEADROOM_PX
+}
+
+/// The requested window size after one backfill growth step.
+///
+/// Grows from the RENDERED size, not the requested size. Arrivals grow an
+/// anchored window past what was requested (`rendered = total - start` exceeds
+/// `requested` by the number of arrivals), and a growth step computed from the
+/// stale requested size can resolve to a start the anchor already renders —
+/// zero new rows, no DOM change, so the sentinel's IntersectionObserver never
+/// re-fires and paging dead-ends (#505 review, blocker 2). Growing from the
+/// rendered size guarantees every step reveals `WINDOW_GROWTH_ITEMS` more
+/// items than are currently on screen.
+fn grown_window(requested: usize, rendered: usize) -> usize {
+    rendered.max(requested) + WINDOW_GROWTH_ITEMS
+}
+
 impl HistoryWindow {
-    fn resolve(total_items: usize, window: usize) -> Self {
+    /// Resolve where the rendered tail starts.
+    ///
+    /// `anchor` is the start index the PREVIOUS render used (`None` when the
+    /// room was just opened, or after a trim). It is what keeps the window
+    /// from SLIDING on arrival: without it, every new message advanced `start`
+    /// by one, dropping the oldest rendered row in the same patch that
+    /// appended the new one at the bottom. Removing content above the viewport
+    /// while adding below it is what broke arrival auto-scroll in
+    /// freenet/river#501 — browser scroll anchoring rewrote `scrollTop`, and
+    /// `reader_moved_up_since` attributed the shift to the reader — and it
+    /// visibly shifts a reader parked mid-history now that scroll anchoring is
+    /// disabled on the container. So:
+    ///
+    /// * `start` NEVER moves forward from the anchor on an ordinary render:
+    ///   arrivals grow the rendered count instead (start fixed, new items
+    ///   appended below).
+    /// * `start` moves BACK (upward, revealing older items) when the reader
+    ///   backfills — `window` grew, so the plain tail start is earlier than
+    ///   the anchor.
+    /// * The one exception is [`WINDOW_ITEMS_CEILING`]: past it, `start` is
+    ///   dragged forward to cap arrival growth. `max(window, ...)` keeps the
+    ///   ceiling from ever capping a reader-requested backfill.
+    ///
+    /// Trimming back toward [`INITIAL_WINDOW_ITEMS`] is NOT done here — it is
+    /// an explicit event (the reader's own settle landing at the bottom, or a
+    /// room switch) that clears the anchor and resets `window`, because a trim
+    /// is only invisible when the view is at the bottom, where the browser's
+    /// scrollTop clamp keeps the tail glued in place.
+    fn resolve(total_items: usize, window: usize, anchor: Option<usize>) -> Self {
         // `max(1)` so the newest item is always on screen: a zero window would
         // render an empty history that the reader has no way to scroll into.
-        let start = total_items.saturating_sub(window.max(1));
+        let base = total_items.saturating_sub(window.max(1));
+        // Grow, never slide: keep the anchored start unless a backfill asked
+        // for an even earlier one. `min` also repairs an anchor past the end
+        // (messages pruned out from under it).
+        let mut start = match anchor {
+            None => base,
+            Some(prev) => prev.min(base),
+        };
+        // The ceiling on arrival growth; never on reader-requested backfill.
+        // One growth step of grace above the requested size, so a reader who
+        // parked right after backfilling to the ceiling is not hit with a
+        // ceiling slide on the first arrival — belt-and-braces on top of the
+        // `head_reposition` compensation (#505 review).
+        let cap = (window + WINDOW_GROWTH_ITEMS)
+            .max(WINDOW_ITEMS_CEILING)
+            .max(1);
+        if total_items - start > cap {
+            start = total_items - cap;
+        }
         Self {
             start,
             has_older: start > 0,
@@ -1496,6 +1793,72 @@ fn chat_content_wrapper() -> Option<web_sys::Element> {
 #[cfg(target_arch = "wasm32")]
 fn max_scroll_top(container: &web_sys::Element) -> i32 {
     (container.scroll_height() - container.client_height()).max(0)
+}
+
+/// The `offsetTop` of the history row carrying `data-item-key == key`, if it
+/// is currently in the DOM.
+///
+/// Matched by comparing attributes rather than an attribute SELECTOR, so a key
+/// never needs CSS escaping. The scan is bounded by the rendered window (≤ a
+/// few hundred rows) and only runs on the rare head-swap paths.
+#[cfg(target_arch = "wasm32")]
+fn history_row_offset_top(key: &str) -> Option<i32> {
+    first_history_row_offset(&[key.to_string()]).map(|(_, top)| top)
+}
+
+/// The first of `keys` (in order) that has a row in the CURRENT DOM, as
+/// `(key, offsetTop)`.
+///
+/// One DOM pass for the whole candidate list rather than one pass per
+/// candidate: the walk can legitimately need to try [`REPOSITION_PROBE_ROWS`]
+/// of them, and the old shape re-ran `querySelectorAll` plus an attribute read
+/// per row for each — `candidates x rows` FFI calls. (Not repeated reflows:
+/// the DOM does not change between scans, so layout stayed cached after the
+/// first `offsetTop`.) Only CANDIDATE rows are measured, so a match on the
+/// first row costs a handful of string compares and a single `offsetTop`.
+#[cfg(target_arch = "wasm32")]
+fn first_history_row_offset(keys: &[String]) -> Option<(String, i32)> {
+    use wasm_bindgen::JsCast;
+    if keys.is_empty() {
+        return None;
+    }
+    let container = chat_scroll_container()?;
+    let rows = container.query_selector_all("[data-item-key]").ok()?;
+    // Candidate key -> offsetTop. Bounded by `keys.len()`, not by the rendered
+    // window: measuring every row cost an `offsetTop` and a map insert per row
+    // (up to the ceiling, 240) on a path that runs per arrival in an at-cap
+    // room. The `String` per row is NOT saved — `get_attribute` allocates one
+    // either way; what this avoids is the layout read and the insert.
+    let mut present: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    for i in 0..rows.length() {
+        if present.len() == keys.len() {
+            break;
+        }
+        let Some(node) = rows.item(i) else { continue };
+        let Some(el) = node.dyn_ref::<web_sys::HtmlElement>() else {
+            continue;
+        };
+        if let Some(k) = el.get_attribute("data-item-key") {
+            if keys.iter().any(|c| c == &k) {
+                present.entry(k).or_insert_with(|| el.offset_top());
+            }
+        }
+    }
+    // Priority is the CANDIDATE order (nearest the head first), not DOM order.
+    keys.iter()
+        .find_map(|k| present.get(k).map(|top| (k.clone(), *top)))
+}
+
+/// The first history row carrying a `data-item-key` — the current window head
+/// item's row — as `(key, offsetTop)`. The backfill capture probes it.
+#[cfg(target_arch = "wasm32")]
+fn first_history_row_identity() -> Option<(String, i32)> {
+    use wasm_bindgen::JsCast;
+    let container = chat_scroll_container()?;
+    let el = container.query_selector("[data-item-key]").ok()??;
+    let key = el.get_attribute("data-item-key")?;
+    let html = el.dyn_ref::<web_sys::HtmlElement>()?;
+    Some((key, html.offset_top()))
 }
 
 /// Slack for comparing one scroll offset against another.
@@ -1606,6 +1969,11 @@ fn scroll_history_to_bottom(
 fn install_scroll_pin_listeners(
     pinned: Rc<std::cell::Cell<bool>>,
     last_top: Rc<std::cell::Cell<i32>>,
+    window_items: Signal<usize>,
+    window_anchor: Rc<std::cell::RefCell<Option<WindowAnchor>>>,
+    window_overgrown: Rc<std::cell::Cell<bool>>,
+    window_rendered: Rc<std::cell::Cell<usize>>,
+    trim_landed: Rc<std::cell::Cell<bool>>,
 ) -> bool {
     use wasm_bindgen::prelude::*;
 
@@ -1622,6 +1990,9 @@ fn install_scroll_pin_listeners(
     let settle = {
         let pinned = pinned.clone();
         let last_top = last_top.clone();
+        let window_anchor = window_anchor.clone();
+        let window_overgrown = window_overgrown.clone();
+        let trim_landed = trim_landed.clone();
         Closure::wrap(Box::new(move || {
             let Some(container) = chat_scroll_container() else {
                 return;
@@ -1634,12 +2005,69 @@ fn install_scroll_pin_listeners(
             // for reader settles is what let a stale offset suppress the
             // follow indefinitely.
             last_top.set(settled_at);
-            if ours {
-                return;
-            }
             let distance = container.scroll_height() as f64
                 - settled_at as f64
                 - container.client_height() as f64;
+            // A settle landing AT the bottom is the ONE moment a window trim
+            // is provably invisible: removing rows above the viewport shrinks
+            // `scrollHeight` and the browser clamps `scrollTop` down with it,
+            // so the same tail stays glued to the bottom edge
+            // (`reader_moved_up_since`'s `.min(max_scroll_top(..))` already
+            // treats that clamp as not the reader). Trimming anywhere else
+            // shifts content under the reader now that scroll anchoring is
+            // off, so growth accumulated while parked is bounded by
+            // `WINDOW_ITEMS_CEILING` instead of trimmed.
+            //
+            // Checked BEFORE the `ours` early-out, deliberately: every
+            // followed arrival's snap settles as ours, and so does the
+            // scroll-to-latest button — a touch reader who only ever returns
+            // to the bottom through the button would otherwise never trim
+            // (#505 review). Gated at SCROLL_TOP_SLACK_PX, not
+            // BOTTOM_THRESHOLD_PX: a reader parked up to 100px above the
+            // bottom still counts as pinned, and a trim from there would
+            // clamp their offset to the exact bottom — a visible yank. And
+            // skipped entirely when the trimmed tail would leave the backfill
+            // sentinel in range of the bottom viewport — trimming then
+            // re-fires the backfill and the two oscillate at render speed
+            // (#505 re-review; see `trim_would_rearm_backfill`).
+            //
+            // Deferred: this runs from a raw JS callback with no Dioxus scope,
+            // and `window_items` is a signal the render subscribes to. See
+            // .claude/rules/dioxus-signal-safety.md.
+            if distance <= SCROLL_TOP_SLACK_PX as f64
+                && window_overgrown.get()
+                && !trim_would_rearm_backfill(
+                    container.scroll_height(),
+                    container.client_height(),
+                    window_rendered.get(),
+                    INITIAL_WINDOW_ITEMS,
+                )
+            {
+                window_overgrown.set(false);
+                let window_anchor = window_anchor.clone();
+                let mut window_items = window_items;
+                // The trim removes rows ABOVE a view that is at the bottom, so
+                // the browser clamps `scrollTop` down by their height. That
+                // clamp is OURS, but `last_scroll_top` still holds the
+                // pre-trim bottom, so an arrival that grows the content back
+                // before the clamp's settle lands makes
+                // `reader_moved_up_since` read the clamp as the reader
+                // scrolling up — and the follow stands down, leaving them a
+                // row short of the newest message. Flagged here and repaired
+                // by the effect that watches `window_items`.
+                let trim_landed = trim_landed.clone();
+                crate::util::defer(move || {
+                    *window_anchor.borrow_mut() = None;
+                    // Raised in the SAME task as the write it describes, so
+                    // no other `window_items` writer can run between the two
+                    // and consume a flag meant for this trim.
+                    trim_landed.set(true);
+                    window_items.set(INITIAL_WINDOW_ITEMS);
+                });
+            }
+            if ours {
+                return;
+            }
             pinned.set(distance <= BOTTOM_THRESHOLD_PX);
         }) as Box<dyn FnMut()>)
     };
@@ -1715,14 +2143,98 @@ pub fn Conversation() -> Element {
     // How many trailing display items the history renders. Grows only when the
     // reader reaches the top of what is rendered — see `INITIAL_WINDOW_ITEMS`.
     let mut window_items = use_signal(|| INITIAL_WINDOW_ITEMS);
-    // Scroll geometry captured just before a backfill, so the view can be put
-    // back on the message the reader was looking at once the older items land
-    // above it. `(scroll_height, scroll_top)` at capture time; `None` when no
-    // backfill is in flight. A plain `Cell` for the same reason
-    // `pinned_to_bottom` is one: nothing renders from it. Not `cfg`-gated —
-    // the sentinel's handler is compiled on every target, only the DOM reads
-    // inside it are wasm-only.
-    let backfill_anchor = use_hook(|| Rc::new(std::cell::Cell::new(None::<(i32, i32)>)));
+    // The IDENTITY of the item the last render's window started at, so
+    // arrivals GROW the window instead of sliding it (#501), and so index
+    // shifts from at-cap message pruning cannot move the head in content
+    // space (#505 review, blocker 1) — see `WindowAnchor`. Inter-render
+    // memory written back during render; nothing renders FROM it, so there is
+    // no subscriber to notify.
+    let window_anchor = use_hook(|| Rc::new(std::cell::RefCell::new(None::<WindowAnchor>)));
+    // How many display items the last render actually put on screen. The
+    // backfill growth step reads this instead of the requested size: after
+    // arrivals grow an anchored window, growing from the stale requested size
+    // can reveal zero new rows and dead-end paging (#505 review, blocker 2).
+    let window_rendered = use_hook(|| Rc::new(std::cell::Cell::new(0usize)));
+    // Whether the rendered window currently holds more than a fresh room-open
+    // would render — i.e. whether the bottom-settle trim in
+    // `install_scroll_pin_listeners` has anything to do. Maintained by render,
+    // read from the raw settle callback (which cannot touch signals).
+    let window_overgrown = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+    // Set when the settle handler schedules a trim, cleared once the view has
+    // been re-anchored to the bottom afterwards. See the trim site in
+    // `install_scroll_pin_listeners` for why the re-anchor is required.
+    let trim_landed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+    // A pending "keep the parked reader's view still" adjustment: when a
+    // render swaps the window head for a LATER item (the head was pruned out
+    // from under the anchor, or a ceiling trim dropped it), the rows above
+    // the viewport shrink, and with scroll anchoring disabled nothing
+    // compensates. The render captures a surviving row's pre-patch
+    // `offsetTop` here (see `select_reposition_probe`); the `head_reposition`
+    // effect below re-measures it after the patch and shifts `scrollTop` by
+    // the difference. `(key, pre_patch_offset_top)`.
+    // `(probe key, its pre-patch offsetTop, the container's pre-patch
+    // scrollTop)`. The scroll offset is captured too because the browser
+    // clamps `scrollTop` down on its own when a patch shortens the content,
+    // and it does so BEFORE the effect runs: computing the target from the
+    // post-clamp offset would apply the shift on top of the clamp and
+    // over-shift the reader (#505 delta review). This is a TRADE, not a
+    // strict improvement — a live read is immune to the reader scrolling
+    // between render and effect, a captured one is immune to the browser's
+    // clamp. The clamp is the far more frequent hazard here (every
+    // head-removing patch that shortens the content), and `BackfillAnchor`
+    // already captures its offset even earlier for the same reason.
+    let reposition_pending =
+        use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, i32, i32)>)));
+    // The backfill sentinel's capture, consumed by the restore effect. See
+    // `BackfillAnchor`. Not `cfg`-gated — the sentinel's handler is compiled
+    // on every target, only the DOM reads inside it are wasm-only.
+    let backfill_anchor = use_hook(|| Rc::new(std::cell::RefCell::new(None::<BackfillAnchor>)));
+    // Whether the opening snap for the CURRENT room has landed. The backfill
+    // sentinel only mounts once this is true: a freshly-opened >window room
+    // renders at `scrollTop = 0` for a beat before the snap runs, and a
+    // sentinel mounted during that beat is intersecting, fires, and cascades
+    // the backfill until the whole room is rendered (#501 H2). A signal, not a
+    // `Cell`, because the sentinel's `if` in rsx renders from it.
+    let mut opening_snap_done = use_signal(|| false);
+    // Set by the room-change effect and the send path to force the next scroll
+    // regardless of the pin (#402), so a room switch or your own outgoing
+    // message always lands at the newest message. A plain `Cell`, not a
+    // signal, so reading it does not subscribe. Declared here (not next to the
+    // scroll effect that consumes it) because the backfill-restore effect
+    // below also has to stand down while a forced snap is in flight.
+    let force_scroll = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+
+    // Reset the windowing Cells the moment THIS render is for a different
+    // room — not only in the effect below, which runs AFTER the first render
+    // of the new room has already resolved against the OLD room's anchor and
+    // requested size (cloning and patching up to a fully-backfilled room's
+    // depth for one wasted frame; #505 review). Cells are safe to write
+    // during render; the signals (`window_items`, `opening_snap_done`) still
+    // reset in the effect, so this render substitutes `INITIAL_WINDOW_ITEMS`
+    // below and keeps the sentinel unmounted until they catch up.
+    let room_changed_this_render = {
+        // `Option<Option<..>>` so the very first render (no room recorded yet)
+        // also counts as a change and starts from a clean window.
+        let prev_render_room = use_hook(|| {
+            Rc::new(std::cell::Cell::new(
+                None::<Option<ed25519_dalek::VerifyingKey>>,
+            ))
+        });
+        let room = CURRENT_ROOM.read().owner_key;
+        let changed = prev_render_room.get() != Some(room);
+        if changed {
+            prev_render_room.set(Some(room));
+            *window_anchor.borrow_mut() = None;
+            window_rendered.set(0);
+            window_overgrown.set(false);
+            trim_landed.set(false);
+            *reposition_pending.borrow_mut() = None;
+            // A capture from the OLD room's geometry must not restore into
+            // the new room (#505 re-review).
+            *backfill_anchor.borrow_mut() = None;
+        }
+        changed
+    };
 
     // "The reader wants to stay with the newest message." Plain `Cell`s, not
     // signals: they are written from raw JS event callbacks that run with no
@@ -1756,10 +2268,65 @@ pub fn Conversation() -> Element {
             use_hook(|| Rc::new(std::cell::Cell::new(None::<ed25519_dalek::VerifyingKey>)));
         use_effect(move || {
             let room = CURRENT_ROOM.read().owner_key;
+            // The Cells (anchor, rendered, overgrown) were already reset by
+            // the render-side check above; only the SIGNALS reset here,
+            // because writing them from render would re-enter the render.
             if prev_windowed_room.get() != room {
                 prev_windowed_room.set(room);
                 window_items.set(INITIAL_WINDOW_ITEMS);
+                // Re-gate the backfill sentinel until the new room's opening
+                // snap has landed (#501 H2).
+                opening_snap_done.set(false);
             }
+        });
+    }
+
+    // Re-anchor to the bottom after a TRIM. The trim only ever runs from a
+    // settle that landed at the bottom, so "at the bottom" is where the view
+    // belongs afterwards — but the rows it removes are ABOVE the viewport, so
+    // the browser clamps `scrollTop` down by their height while
+    // `last_scroll_top` still holds the pre-trim bottom. Left alone, that gap
+    // reads as the reader having scrolled up (`reader_moved_up_since`), and
+    // an arrival landing before the clamp's settle is NOT followed — the
+    // reader sits a row short of the newest message, and a taller row would
+    // push them past `BOTTOM_THRESHOLD_PX` and clear the pin for good.
+    // Routing through `scroll_history_to_bottom` fixes both halves: it puts
+    // the view on the bottom and records that offset as ours.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let trim_landed = trim_landed.clone();
+        let pinned_to_bottom = pinned_to_bottom.clone();
+        let last_scroll_top = last_scroll_top.clone();
+        use_effect(move || {
+            // Subscribe, so this runs after the render the trim caused.
+            let _ = window_items();
+            if !trim_landed.get() {
+                return;
+            }
+            trim_landed.set(false);
+            let Some(container) = chat_scroll_container() else {
+                return;
+            };
+            // The trim fired from a settle AT the bottom, but this effect runs
+            // a task later — long enough on a mid-range phone for the reader
+            // to have started swiping up. Re-anchoring then yanks them back,
+            // re-arms the pin, and records their position as ours, so their
+            // own `scrollend` is discarded and nothing self-corrects inside
+            // the gesture. Both halves are needed and neither subsumes the
+            // other: the pin catches a reader whose settle beat this effect,
+            // the distance catches one still inside the pre-settle window.
+            // Same shape as the arrival snap's gate.
+            if !pinned_to_bottom.get()
+                || (max_scroll_top(&container) - container.scroll_top()) as f64
+                    > BOTTOM_THRESHOLD_PX
+            {
+                return;
+            }
+            scroll_history_to_bottom(
+                &pinned_to_bottom,
+                &last_scroll_top,
+                web_sys::ScrollBehavior::Instant,
+            );
         });
     }
 
@@ -1772,35 +2339,64 @@ pub fn Conversation() -> Element {
     {
         let backfill_anchor = backfill_anchor.clone();
         let last_scroll_top = last_scroll_top.clone();
+        let pinned_to_bottom = pinned_to_bottom.clone();
+        let force_scroll = force_scroll.clone();
         use_effect(move || {
             // Subscribe, so this runs after the render that added the items.
             let _ = window_items();
-            let Some((prev_height, prev_top)) = backfill_anchor.get() else {
+            let Some(anchor) = backfill_anchor.borrow_mut().take() else {
                 return;
             };
-            let backfill_anchor = backfill_anchor.clone();
-            let last_scroll_top = last_scroll_top.clone();
-            // Deferred so the browser has laid the new rows out and
-            // `scroll_height` reflects them.
-            crate::util::defer(move || {
-                backfill_anchor.set(None);
-                let Some(container) = chat_scroll_container() else {
-                    return;
-                };
-                let grew_by = container.scroll_height() - prev_height;
-                if grew_by > 0 {
-                    let target = prev_top + grew_by;
-                    // Record the offset we asked for BEFORE asking for it, the
-                    // same contract `scroll_history_to_bottom` keeps: the
-                    // settle handler decides whose scroll a settle was by
-                    // POSITION, so a programmatic scroll that does not write
-                    // `last_scroll_top` is later mistaken for the reader
-                    // moving, and the ResizeObserver stands down on the
-                    // strength of it. See `install_scroll_pin_listeners`.
-                    last_scroll_top.set(target);
-                    container.set_scroll_top(target);
-                }
-            });
+            // The restore serves a reader who is up in the history holding
+            // their place. It must never fight the bottom pin or a forced
+            // snap (#501 H3): unconditionally it could park the view at
+            // the anchor over a concurrent arrival — and because it writes
+            // `last_scroll_top`, the settle would read as OURS and the pin
+            // would quietly survive pointing somewhere the reader never
+            // asked to be. The pin alone is not enough, though: a continuous
+            // fling from the bottom into the sentinel band produces no settle
+            // mid-gesture, so `pinned_to_bottom` can still read a stale true —
+            // a reader AT the sentinel has definitionally moved up, which is
+            // exactly what `reader_moved_up_since` detects (#505 review).
+            if (pinned_to_bottom.get() && !reader_moved_up_since(&last_scroll_top))
+                || force_scroll.get()
+            {
+                return;
+            }
+            let Some(container) = chat_scroll_container() else {
+                return;
+            };
+            // Synchronous, not deferred: Dioxus has already patched the DOM
+            // when effects run, and reading layout here forces the reflow the
+            // restore needs. A macrotask hop let the browser paint one frame
+            // of the prepended rows at the wrong offset before the
+            // reposition landed — a flicker native scroll anchoring used to
+            // mask (#505 review).
+            //
+            // MEASURED, not height-delta'd: the probed head row's `offsetTop`
+            // shift is exactly the height prepended ABOVE the viewport. The
+            // raw `scrollHeight` delta also counts an arrival batched into
+            // the same patch BELOW the viewport, and over-shifts the reader
+            // by its height (#505 re-review). The delta method survives only
+            // as the fallback for a probe row pruned in the same patch.
+            let shift = match history_row_offset_top(&anchor.probe_key) {
+                Some(post_top) => post_top - anchor.probe_top,
+                None => container.scroll_height() - anchor.scroll_height,
+            };
+            if shift > 0 {
+                let target = anchor.scroll_top + shift;
+                // Move the reference BY THE SHIFT, for the same reason the
+                // head reposition below does: `last_scroll_top` is what
+                // `reader_moved_up_since` measures against, and writing the
+                // reader's new absolute offset into it erases the fact that
+                // they are up in the history whenever their `scrollend` has
+                // not landed yet — after which the stale-true pin lets both
+                // follow paths drag them to the bottom (#505 delta review).
+                // Relative keeps the gap, and keeps this settle readable as
+                // the reader's so the pin resolves honestly.
+                last_scroll_top.set(last_scroll_top.get() + shift);
+                container.set_scroll_top(target);
+            }
         });
     }
     // Which message's touch action menu (kebab) is open, by message ID string.
@@ -2051,14 +2647,120 @@ pub fn Conversation() -> Element {
     {
         let pinned_to_bottom = pinned_to_bottom.clone();
         let last_scroll_top = last_scroll_top.clone();
+        let window_anchor = window_anchor.clone();
+        let window_overgrown = window_overgrown.clone();
+        let window_rendered = window_rendered.clone();
+        let trim_landed = trim_landed.clone();
         let installed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
         use_effect(move || {
             let _retry_on_content_change = message_groups.read().is_some();
             if installed.get() {
                 return;
             }
-            if install_scroll_pin_listeners(pinned_to_bottom.clone(), last_scroll_top.clone()) {
+            if install_scroll_pin_listeners(
+                pinned_to_bottom.clone(),
+                last_scroll_top.clone(),
+                window_items,
+                window_anchor.clone(),
+                window_overgrown.clone(),
+                window_rendered.clone(),
+                trim_landed.clone(),
+            ) {
                 installed.set(true);
+            }
+        });
+    }
+
+    // Keep a PARKED reader's view still when the window head is swapped for a
+    // later item — the head was pruned out from under the anchor (an at-cap
+    // room drains its oldest message on every arrival), or a ceiling trim
+    // dropped it (#505 review, blocker 1). Rows above the viewport shrink,
+    // and with `overflow-anchor: none` the browser no longer compensates, so
+    // this effect is the one piece of scroll anchoring reimplemented under
+    // our own control: the render captured a SURVIVING row's `offsetTop`
+    // BEFORE the patch (into `reposition_pending` — the new head row when it
+    // already existed, else the first row after it that did, since a
+    // re-keyed multi-message head group has no pre-patch row under its new
+    // key; see `select_reposition_probe`). Re-measuring it after the patch
+    // gives exactly how far the content above the viewport shifted,
+    // date-separator churn included — top-contiguous removals shift every
+    // surviving row identically. Synchronous — post-patch, pre-paint — for
+    // the same no-flicker reason as the backfill restore above.
+    //
+    // Known limitation, deliberately accepted: a mid-window removal (a
+    // deletion, a ban purge) or late-loading media above the viewport still
+    // shifts a parked reader — rare events, versus the every-arrival churn
+    // this compensates. Full generality is what browser scroll anchoring
+    // does, and fighting the pin machinery is why it is switched off.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let reposition_pending = reposition_pending.clone();
+        let last_scroll_top = last_scroll_top.clone();
+        let pinned_to_bottom = pinned_to_bottom.clone();
+        let force_scroll = force_scroll.clone();
+        use_effect(move || {
+            // Subscribe: head swaps only happen on content changes.
+            let _ = message_groups.read().is_some();
+            let Some((key, pre_top, pre_scroll_top)) = reposition_pending.borrow_mut().take()
+            else {
+                return;
+            };
+            // A pinned reader needs no compensation — the arrival effect
+            // snaps to the bottom — and a forced snap owns the view outright.
+            // The pin is distrusted mid-gesture exactly as in the restore
+            // above: a reader flinging upward has moved even if their settle
+            // has not landed yet.
+            if force_scroll.get()
+                || (pinned_to_bottom.get() && !reader_moved_up_since(&last_scroll_top))
+            {
+                return;
+            }
+            let Some(container) = chat_scroll_container() else {
+                return;
+            };
+            // The scroll-to-latest button's SMOOTH scroll is the one animated
+            // scroll in the app, and while it is in flight the state reads
+            // exactly like a parked reader (pinned, position above the
+            // recorded target). Its recorded target is the bottom — so when
+            // the view is PINNED and `last_scroll_top` already points at the
+            // maximum, a scrollTop write here would cancel that animation
+            // mid-flight for a reader who is headed to the bottom anyway
+            // (#505 re-review). Gated on the pin as well as the offset: with
+            // `pinned == false` no animation can be in flight, so an unpinned
+            // reader whose patch pulled `max_scroll_top` under their recorded
+            // offset still gets compensated.
+            if pinned_to_bottom.get() && last_scroll_top.get() >= max_scroll_top(&container) {
+                return;
+            }
+            let Some(post_top) = history_row_offset_top(&key) else {
+                return;
+            };
+            let shift = post_top - pre_top;
+            if shift != 0 {
+                // From the PRE-patch offset, not the live one: when the patch
+                // shortens the content the browser has already clamped
+                // `scrollTop` down by the time this runs, and shifting from
+                // the clamped value applies the clamp twice (#505 delta
+                // review). Clamping the result is left to the browser.
+                let target = (pre_scroll_top + shift).max(0);
+                // Move the reference BY THE SHIFT, not to the new absolute
+                // offset. `last_scroll_top` is what `reader_moved_up_since`
+                // measures against, and it is only meaningful in the window
+                // between the reader moving and their `scrollend` landing —
+                // writing their freshly-compensated position into it collapses
+                // that signal to "has not moved", and with `pinned_to_bottom`
+                // still stale-true BOTH follow paths then yank them to the
+                // bottom (#505 delta review). A relative update preserves
+                // their gap to the reference in both directions, so the guard
+                // keeps answering truthfully. The pin resolves correctly
+                // either way: in the pre-settle window the reference and the
+                // view differ, so this settle reads as the READER's and the
+                // handler re-measures and clears the stale pin; for a reader
+                // whose settle already landed the two move together, so it
+                // reads as ours and leaves their (already correct) pin
+                // alone.
+                last_scroll_top.set(last_scroll_top.get() + shift);
+                container.set_scroll_top(target);
             }
         });
     }
@@ -2070,11 +2772,8 @@ pub fn Conversation() -> Element {
     // leave the actual bottom (reactions, sentinel, padding) off-screen. On
     // page refresh this surfaced as scrolling only ~70% of the way down.
     //
-    // Set by the room-change effect and the send path to force the next scroll
-    // regardless of the pin (#402), so a room switch or your own outgoing
-    // message always lands at the newest message. A plain `Cell`, not a signal,
-    // so reading it here does not subscribe.
-    let force_scroll = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+    // `force_scroll` (declared with the pin cells above) is what makes a room
+    // switch or your own outgoing message snap regardless of the pin (#402).
     use_effect({
         let force_scroll = force_scroll.clone();
         let pinned_to_bottom = pinned_to_bottom.clone();
@@ -2101,6 +2800,10 @@ pub fn Conversation() -> Element {
             {
                 let pinned_to_bottom = pinned_to_bottom.clone();
                 let last_scroll_top = last_scroll_top.clone();
+                // Which room this snap belongs to. A rapid room switch can
+                // leave the previous room's snap task queued; it must not
+                // un-gate the NEW room's backfill sentinel (#505 review).
+                let room_at_snap = CURRENT_ROOM.peek().owner_key;
                 // Deferred so the scroll measures a container Dioxus has
                 // finished patching, and (per `safe_spawn_local`) so no signal
                 // borrow is live when it runs.
@@ -2142,6 +2845,20 @@ pub fn Conversation() -> Element {
                         // still animate.
                         web_sys::ScrollBehavior::Instant,
                     );
+                    // The opening snap for this room has landed, so the
+                    // backfill sentinel may mount (#501 H2). Deferred, and the
+                    // signal is only written on the transition, so steady-state
+                    // arrivals do not re-notify the render for nothing. The
+                    // room is re-checked because this task can outlive a rapid
+                    // room switch, and a stale set here would un-gate the new
+                    // room's sentinel before ITS snap (#505 review).
+                    crate::util::defer(move || {
+                        if CURRENT_ROOM.peek().owner_key == room_at_snap
+                            && !*opening_snap_done.peek()
+                        {
+                            opening_snap_done.set(true);
+                        }
+                    });
                 });
             }
         }
@@ -3063,6 +3780,19 @@ pub fn Conversation() -> Element {
                     // menu content is left-aligned and stays visible) rather
                     // than show a horizontal scrollbar in the history. #402.
                     class: "h-full overflow-y-auto overflow-x-hidden",
+                    // `overflow-anchor: none`: the pin machinery owns this
+                    // container's `scrollTop`. Browser scroll anchoring rewrites
+                    // it whenever rendered rows change above the viewport (a
+                    // window trim, date-separator churn at the window head), and
+                    // `reader_moved_up_since` then attributes the browser's
+                    // adjustment to the reader and stands the follow down —
+                    // freenet/river#501. With anchoring off, `scrollTop` only
+                    // changes through our own scrolls, the reader's, or the
+                    // browser's shrink clamp, which the guard's
+                    // `.min(max_scroll_top(..))` already accounts for. Inline
+                    // style, not a Tailwind arbitrary class, so it cannot depend
+                    // on the class scanner seeing it.
+                    style: "overflow-anchor:none;",
                     id: "chat-scroll-container",
                     div { class: "max-w-4xl mx-auto px-4 py-4", id: "chat-content",
                     {
@@ -3077,8 +3807,103 @@ pub fn Conversation() -> Element {
                                     // so cloning the whole history here — on
                                     // every re-render — would pay most of the
                                     // cost the window exists to avoid.
-                                    let history_window =
-                                        HistoryWindow::resolve(groups.len(), window_items());
+                                    // Subscribe every render; the value is
+                                    // substituted on a room switch because the
+                                    // signal's own reset only lands in the
+                                    // NEXT render's effect pass.
+                                    let subscribed_window = window_items();
+                                    let requested_window = if room_changed_this_render {
+                                        INITIAL_WINDOW_ITEMS
+                                    } else {
+                                        subscribed_window
+                                    };
+                                    // Re-locate the anchored window by
+                                    // IDENTITY: at-cap pruning shifts every
+                                    // index, so the stored index is only a
+                                    // hint, and the head key alone can vanish
+                                    // while its neighbors survive (#505
+                                    // blockers; see `WindowAnchor` and
+                                    // `relocate_window`).
+                                    let prev_anchor = window_anchor.borrow().clone();
+                                    let relocated = prev_anchor.as_ref().map(|a| {
+                                        relocate_window(groups.len(), a, |i, key| {
+                                            display_item_key_matches(&groups[i], key)
+                                        })
+                                    });
+                                    let history_window = HistoryWindow::resolve(
+                                        groups.len(),
+                                        requested_window,
+                                        relocated.as_ref().map(|r| r.start),
+                                    );
+                                    // Was rendered content at or above the new
+                                    // head removed in this very patch? True
+                                    // when the old head is gone (pruned,
+                                    // deleted, or re-keyed by a drained first
+                                    // message) or now sits BEFORE the window
+                                    // (ceiling trim). A parked reader needs
+                                    // their offset compensated for it — the
+                                    // `head_reposition` effect's job.
+                                    let head_removed = match &relocated {
+                                        None => false,
+                                        Some(r) => {
+                                            !r.head_survived
+                                                || history_window.start > r.start
+                                        }
+                                    };
+                                    if head_removed {
+                                        // Capture a surviving row's PRE-patch
+                                        // offset, AND the container's
+                                        // pre-patch scrollTop; the DOM still
+                                        // shows the previous render here. The
+                                        // probe row is not necessarily the
+                                        // head itself: a re-keyed head group
+                                        // has no pre-patch row under its new
+                                        // key (#505 re-review blocker; see
+                                        // `select_reposition_probe`). The
+                                        // scroll offset is captured because
+                                        // the browser clamps it down before
+                                        // the effect can read it when the
+                                        // patch shortens the content (#505
+                                        // delta review).
+                                        #[cfg(target_arch = "wasm32")]
+                                        if let (Some((key, pre_top)), Some(container)) = (
+                                            select_reposition_probe(
+                                                groups[history_window.start..]
+                                                    .iter()
+                                                    .map(display_item_key),
+                                                first_history_row_offset,
+                                            ),
+                                            chat_scroll_container(),
+                                        ) {
+                                            *reposition_pending.borrow_mut() =
+                                                Some((key, pre_top, container.scroll_top()));
+                                        }
+                                    }
+                                    // Remember where this render started so the
+                                    // NEXT one grows instead of sliding (#501).
+                                    // Cell/RefCell writes during render are
+                                    // fine: inter-render memory, nothing
+                                    // renders from them, and re-resolving with
+                                    // the values just written is a fixed point.
+                                    *window_anchor.borrow_mut() = Some(WindowAnchor {
+                                        keys: groups[history_window.start..]
+                                            .iter()
+                                            .take(WINDOW_ANCHOR_KEYS)
+                                            .map(display_item_key)
+                                            .collect(),
+                                        index: history_window.start,
+                                    });
+                                    // What the backfill growth step grows FROM
+                                    // (#505 blocker 2; see `grown_window`).
+                                    window_rendered
+                                        .set(groups.len() - history_window.start);
+                                    // Tell the settle handler whether a
+                                    // bottom-settle trim would shrink anything.
+                                    window_overgrown.set(
+                                        requested_window > INITIAL_WINDOW_ITEMS
+                                            || groups.len() - history_window.start
+                                                > INITIAL_WINDOW_ITEMS,
+                                    );
                                     let groups = groups[history_window.start..].to_vec();
                                     let self_member_id = *self_member_id;
                                     let member_names = member_names.clone();
@@ -3141,7 +3966,25 @@ pub fn Conversation() -> Element {
                                         // history by that much every time the
                                         // sentinel appeared or (on the last
                                         // backfill) disappeared.
-                                        if history_window.has_older {
+                                        // Gated on the opening snap having
+                                        // landed as well: a >window room's
+                                        // first render sits at `scrollTop = 0`
+                                        // until the snap runs, and a sentinel
+                                        // mounted during that beat fires from
+                                        // the top of the history and cascades
+                                        // the backfill (#501 H2). Mounting it
+                                        // after the snap means its first
+                                        // observation sees the view at the
+                                        // bottom, far below the strip. The
+                                        // room-change check covers the one
+                                        // render where `opening_snap_done` is
+                                        // still the PREVIOUS room's true —
+                                        // its reset only lands in the effect
+                                        // pass after this render.
+                                        if history_window.has_older
+                                            && opening_snap_done()
+                                            && !room_changed_this_render
+                                        {
                                             // Zero-height anchor; the sentinel
                                             // inside it is absolutely
                                             // positioned, so it contributes no
@@ -3169,25 +4012,53 @@ pub fn Conversation() -> Element {
                                                     style: "position:absolute;top:0;height:{BACKFILL_LEAD_PX}px;width:1px;",
                                                     onvisible: move |evt| {
                                                         if evt.data().is_intersecting().unwrap_or(false) {
-                                                            // Capture the geometry BEFORE the
-                                                            // re-render so the restore effect can
-                                                            // put the reader back on the message
-                                                            // they were looking at.
+                                                            // Capture BEFORE the re-render so the
+                                                            // restore effect can put the reader back
+                                                            // on the row they were looking at: the
+                                                            // current head row's identity + offset
+                                                            // (the measured probe), plus scroll
+                                                            // geometry (offset to restore from, and
+                                                            // the height-delta fallback). See
+                                                            // `BackfillAnchor`.
                                                             #[cfg(target_arch = "wasm32")]
-                                                            if let Some(container) = chat_scroll_container() {
-                                                                backfill_anchor.set(Some((
-                                                                    container.scroll_height(),
-                                                                    container.scroll_top(),
-                                                                )));
+                                                            if let (
+                                                                Some(container),
+                                                                Some((probe_key, probe_top)),
+                                                            ) = (
+                                                                chat_scroll_container(),
+                                                                first_history_row_identity(),
+                                                            ) {
+                                                                *backfill_anchor.borrow_mut() =
+                                                                    Some(BackfillAnchor {
+                                                                        probe_key,
+                                                                        probe_top,
+                                                                        scroll_top: container
+                                                                            .scroll_top(),
+                                                                        scroll_height: container
+                                                                            .scroll_height(),
+                                                                    });
                                                             }
-                                                            window_items
-                                                                .with_mut(|n| *n += WINDOW_GROWTH_ITEMS);
+                                                            // Grow from the RENDERED size, not the
+                                                            // requested one: arrivals grow an anchored
+                                                            // window past the request, and growing from
+                                                            // the stale request can reveal zero new rows
+                                                            // — the sentinel then never re-fires and
+                                                            // paging dead-ends (#505 blocker 2; see
+                                                            // `grown_window`).
+                                                            window_items.with_mut(|n| {
+                                                                *n = grown_window(*n, window_rendered.get())
+                                                            });
                                                         }
                                                     },
                                                 }
                                             }
                                         }
-                                        div { class: "space-y-4",
+                                        div {
+                                            class: "space-y-4",
+                                            // Stable automation hook for the
+                                            // history rows (AGENTS.md test-id
+                                            // rule); additive markup only.
+                                            "data-testid": "conversation-history",
                                             {rows.into_iter().map({
                                                 let handle_toggle_reaction = handle_toggle_reaction.clone();
                                                 let member_names = member_names.clone();
@@ -3212,6 +4083,10 @@ pub fn Conversation() -> Element {
                                                         rsx! {
                                                             div {
                                                                 key: "{key}",
+                                                                // Identity tag for the
+                                                                // head-reposition machinery
+                                                                // (`history_row_offset_top`).
+                                                                "data-item-key": "{key}",
                                                                 class: "flex justify-center py-1",
                                                                 span {
                                                                     class: "text-xs text-text-muted italic",
@@ -3223,8 +4098,19 @@ pub fn Conversation() -> Element {
                                                     DisplayRow::Item(DisplayItem::Messages(group)) => {
                                                         let key = group.messages[0].id.clone();
                                                         rsx! {
-                                                            MessageGroupComponent {
+                                                            // The wrapper exists to carry
+                                                            // `data-item-key` — the identity
+                                                            // the head-reposition machinery
+                                                            // locates rows by — since a
+                                                            // component cannot carry a DOM
+                                                            // attribute directly. It is the
+                                                            // keyed list child, so diffing
+                                                            // and `space-y-4` spacing are
+                                                            // unchanged.
+                                                            div {
                                                                 key: "{key}",
+                                                                "data-item-key": "{key}",
+                                                                MessageGroupComponent {
                                                                 group: group,
                                                                 self_member_id: self_member_id,
                                                                 member_names: member_names,
@@ -3253,6 +4139,7 @@ pub fn Conversation() -> Element {
                                                                     }
                                                                 },
                                                                 open_action_menu: open_action_menu,
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -4650,12 +5537,15 @@ mod tests {
     fn the_window_always_renders_the_newest_item() {
         for total in 1..200usize {
             for window in [0, 1, 2, 59, 60, 61, 199, 200, 5000] {
-                let w = HistoryWindow::resolve(total, window);
-                assert!(
-                    w.start < total,
-                    "total {total}, window {window}: start {} skips every item",
-                    w.start
-                );
+                for anchor in [None, Some(0), Some(30), Some(total)] {
+                    let w = HistoryWindow::resolve(total, window, anchor);
+                    assert!(
+                        w.start < total,
+                        "total {total}, window {window}, anchor {anchor:?}: \
+                         start {} skips every item",
+                        w.start
+                    );
+                }
             }
         }
     }
@@ -4665,7 +5555,7 @@ mod tests {
     #[test]
     fn a_room_inside_the_window_is_rendered_whole() {
         for total in 0..=INITIAL_WINDOW_ITEMS {
-            let w = HistoryWindow::resolve(total, INITIAL_WINDOW_ITEMS);
+            let w = HistoryWindow::resolve(total, INITIAL_WINDOW_ITEMS, None);
             assert_eq!(
                 w.start, 0,
                 "total {total} should render from the first item"
@@ -4678,18 +5568,401 @@ mod tests {
     /// counts here are the live "Off Topic" room's shape.
     #[test]
     fn a_room_past_the_window_renders_only_its_tail() {
-        let w = HistoryWindow::resolve(1133, INITIAL_WINDOW_ITEMS);
+        let w = HistoryWindow::resolve(1133, INITIAL_WINDOW_ITEMS, None);
         assert_eq!(w.start, 1133 - INITIAL_WINDOW_ITEMS);
         assert!(w.has_older, "1133 items must offer a backfill");
 
-        // Each backfill reveals exactly one growth step more...
-        let grown = HistoryWindow::resolve(1133, INITIAL_WINDOW_ITEMS + WINDOW_GROWTH_ITEMS);
+        // Each backfill reveals exactly one growth step more... (the anchor is
+        // carried the way the render carries it, and moving it BACK for a
+        // backfill is allowed — only forward movement is the #501 slide)
+        let grown = HistoryWindow::resolve(
+            1133,
+            INITIAL_WINDOW_ITEMS + WINDOW_GROWTH_ITEMS,
+            Some(w.start),
+        );
         assert_eq!(w.start - grown.start, WINDOW_GROWTH_ITEMS);
 
         // ...until the window covers the room, at which point the sentinel goes.
-        let all = HistoryWindow::resolve(1133, 1133);
+        let all = HistoryWindow::resolve(1133, 1133, Some(grown.start));
         assert_eq!(all.start, 0);
         assert!(!all.has_older);
+    }
+
+    /// Arrivals GROW an anchored window instead of sliding it (#501): with the
+    /// reader pinned to the bottom, the start index stays put as the total
+    /// climbs, so nothing is removed above the viewport in the same patch that
+    /// appends below it.
+    #[test]
+    fn arrivals_grow_an_anchored_window_instead_of_sliding_it() {
+        let opened = HistoryWindow::resolve(100, INITIAL_WINDOW_ITEMS, None);
+        assert_eq!(opened.start, 40);
+
+        let mut anchor = Some(opened.start);
+        for arrivals in 1..=50usize {
+            let w = HistoryWindow::resolve(100 + arrivals, INITIAL_WINDOW_ITEMS, anchor);
+            assert_eq!(
+                w.start, opened.start,
+                "arrival {arrivals} slid the window instead of growing it"
+            );
+            anchor = Some(w.start);
+        }
+    }
+
+    /// The trim — the settle handler clearing the anchor and resetting the
+    /// requested window once the reader's own settle lands at the bottom —
+    /// resolves back to the plain tail.
+    #[test]
+    fn a_trim_resolves_back_to_the_plain_tail() {
+        // 40 arrivals grew the anchored window to 100 rendered items...
+        let grown = HistoryWindow::resolve(140, INITIAL_WINDOW_ITEMS, Some(40));
+        assert_eq!(grown.start, 40);
+        // ...and the trim (anchor cleared, window back to INITIAL) collapses
+        // it to the newest INITIAL_WINDOW_ITEMS.
+        let trimmed = HistoryWindow::resolve(140, INITIAL_WINDOW_ITEMS, None);
+        assert_eq!(trimmed.start, 140 - INITIAL_WINDOW_ITEMS);
+        assert!(trimmed.has_older);
+    }
+
+    /// The ceiling bounds what arrival growth can accumulate — a reader pinned
+    /// through a very long burst must not re-accumulate the unbounded render
+    /// the window exists to prevent — but it NEVER caps a reader-requested
+    /// backfill, which would dead-end paging through history.
+    #[test]
+    fn the_ceiling_caps_arrival_growth_but_never_reader_backfill() {
+        // Anchored at 100 while the room ran away to 1000 items: capped.
+        let w = HistoryWindow::resolve(1000, INITIAL_WINDOW_ITEMS, Some(100));
+        assert_eq!(w.start, 1000 - WINDOW_ITEMS_CEILING);
+        assert!(w.has_older);
+
+        // A reader who backfilled PAST the ceiling keeps everything they asked
+        // for: the requested window wins over the ceiling.
+        let requested = WINDOW_ITEMS_CEILING + WINDOW_GROWTH_ITEMS;
+        let w = HistoryWindow::resolve(1000, requested, Some(1000 - requested));
+        assert_eq!(w.start, 1000 - requested);
+
+        // Arrival-grace headroom: a reader who backfilled TO the ceiling and
+        // parked is not hit with a ceiling slide by the next few arrivals —
+        // the cap sits one growth step above the request (#505 review).
+        let at_ceiling = WINDOW_ITEMS_CEILING;
+        let anchor = 1000 - at_ceiling;
+        let w = HistoryWindow::resolve(1010, at_ceiling, Some(anchor));
+        assert_eq!(
+            w.start, anchor,
+            "10 arrivals within the grace must not slide a ceiling-deep window"
+        );
+    }
+
+    /// Anchor carrying the head + spare keys the way the render does.
+    fn anchor_of(keys: &[String], start: usize) -> WindowAnchor {
+        WindowAnchor {
+            keys: keys[start..]
+                .iter()
+                .take(WINDOW_ANCHOR_KEYS)
+                .cloned()
+                .collect(),
+            index: start,
+        }
+    }
+
+    /// #505 blocker 1: the anchor is re-located by IDENTITY. An at-cap room
+    /// prunes its oldest message per arrival, shifting every index down — the
+    /// walk below is that steady state, and the head must stay the same ITEM
+    /// (its index marching toward 0), not the same index.
+    #[test]
+    fn the_anchor_follows_the_item_through_at_cap_pruning() {
+        // A 100-item room at cap: items are identified by these keys.
+        let mut keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
+        let opened = HistoryWindow::resolve(keys.len(), INITIAL_WINDOW_ITEMS, None);
+        assert_eq!(opened.start, 40);
+        let head_key = keys[opened.start].clone();
+        let mut anchor = anchor_of(&keys, opened.start);
+
+        for arrival in 0..40usize {
+            // apply_delta at cap: drain the oldest, append the new.
+            keys.remove(0);
+            keys.push(format!("new{arrival}"));
+            let relocated = relocate_window(keys.len(), &anchor, |i, key| keys[i] == key);
+            assert!(relocated.head_survived, "arrival {arrival}: head survives");
+            let start =
+                HistoryWindow::resolve(keys.len(), INITIAL_WINDOW_ITEMS, Some(relocated.start))
+                    .start;
+            assert_eq!(
+                keys[start], head_key,
+                "arrival {arrival}: the window head changed identity — the \
+                 #501 slide reproduced in content space"
+            );
+            assert_eq!(start, opened.start - (arrival + 1), "start marches down");
+            anchor = anchor_of(&keys, start);
+        }
+
+        // One more prune consumes the head itself: the head key is gone, but
+        // the FIRST SPARE (the item right after the old head) survives at
+        // index 0, so the relocation lands on the nearest surviving item and
+        // reports the head as removed — which is what arms the measured
+        // reposition for a parked reader.
+        keys.remove(0);
+        keys.push("new40".into());
+        let relocated = relocate_window(keys.len(), &anchor, |i, key| keys[i] == key);
+        assert!(!relocated.head_survived, "the head itself was pruned");
+        assert_eq!(
+            relocated.start, 0,
+            "the first surviving spare pins the window to the nearest \
+             surviving item"
+        );
+    }
+
+    /// #505 re-review blocker: a MULTI-message head group RE-KEYS when an
+    /// at-cap drain consumes its first message (a group's key is its first
+    /// message's id). The old key is gone while the group itself survives —
+    /// the spares must still pin the window to the survivors, and the
+    /// reposition probe must skip the un-measurable new head key and land on
+    /// a row that existed pre-patch.
+    #[test]
+    fn a_rekeyed_multi_message_head_group_is_still_anchored_and_measurable() {
+        // Window head at index 0: a group keyed by its first message "m0",
+        // followed by neighbors. The at-cap drain consumes "m0"; the group
+        // survives RE-KEYED as "m1". (Modelled at the key level — exactly
+        // what `display_item_key` exposes to this machinery.)
+        let anchor = WindowAnchor {
+            keys: vec!["m0".into(), "b".into(), "c".into(), "d".into()],
+            index: 0,
+        };
+        let post_keys = ["m1", "b", "c", "d", "e"];
+        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
+        assert!(
+            !relocated.head_survived,
+            "the re-keyed head must count as removed — its row is replaced \
+             and its height changed"
+        );
+        assert_eq!(
+            relocated.start, 0,
+            "the first spare (\"b\", found at index 1, offset 1 in the \
+             anchor) pins the window back to the re-keyed group"
+        );
+
+        // The measured probe: the new head key "m1" has NO pre-patch row —
+        // a head-only probe dead-fires and the parked reader crawls one
+        // intra-group line per arrival. The walk lands on "b", which does.
+        let probe = select_reposition_probe(
+            post_keys.iter().map(|k| k.to_string()),
+            pre_patch_dom(&[("m0", 100), ("b", 160), ("c", 220)]),
+        );
+        assert_eq!(
+            probe,
+            Some(("b".to_string(), 160)),
+            "the probe must walk past the un-measurable re-keyed head to the \
+             first row that existed pre-patch"
+        );
+    }
+
+    /// A pre-patch DOM as a `first_history_row_offset`-shaped lookup: the
+    /// first candidate key that has a row, with its offset.
+    fn pre_patch_dom(rows: &[(&'static str, i32)]) -> impl Fn(&[String]) -> Option<(String, i32)> {
+        let rows = rows.to_vec();
+        move |keys: &[String]| {
+            keys.iter().find_map(|k| {
+                rows.iter()
+                    .find(|(rk, _)| rk == k)
+                    .map(|(_, top)| (k.clone(), *top))
+            })
+        }
+    }
+
+    /// The probe walk must outlast the DEEPEST spare the anchor can relocate
+    /// through. Landing via spare `k` sets `start = i - k`, widening the
+    /// window backward by `k` items that were never rendered pre-patch, so
+    /// the first `k` candidates cannot have pre-patch rows. A walk shorter
+    /// than `WINDOW_ANCHOR_KEYS` dead-fires exactly when the removal is
+    /// biggest — a bulk delete of several contiguous leading items above a
+    /// parked reader (#505 delta review).
+    #[test]
+    fn the_probe_walk_outlasts_the_deepest_spare() {
+        assert!(
+            REPOSITION_PROBE_ROWS >= WINDOW_ANCHOR_KEYS,
+            "the probe walk must cover every spare the anchor can land on"
+        );
+
+        // Anchor: head + 7 spares. A bulk delete removes the head and the
+        // first 6 spares; relocation lands on spare 7 ("s7"), so the window
+        // widens back by 7 items that have no pre-patch rows.
+        let anchor = WindowAnchor {
+            keys: (0..WINDOW_ANCHOR_KEYS)
+                .map(|i| {
+                    if i == 0 {
+                        "head".to_string()
+                    } else {
+                        format!("s{i}")
+                    }
+                })
+                .collect(),
+            index: 20,
+        };
+        let post_keys: Vec<String> = (0..7)
+            .map(|i| format!("older{i}"))
+            .chain(std::iter::once("s7".to_string()))
+            .chain((0..10).map(|i| format!("rest{i}")))
+            .collect();
+        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
+        assert!(!relocated.head_survived);
+        assert_eq!(
+            relocated.start, 0,
+            "spare 7 found at index 7, offset 7 in the anchor → start 0"
+        );
+
+        // Only the 8th candidate ("s7") has a pre-patch row; the seven
+        // widened-in rows above it do not. A 4-row walk finds nothing.
+        let probe = select_reposition_probe(
+            post_keys.iter().map(|k| k.to_string()),
+            pre_patch_dom(&[("s7", 480), ("rest0", 540)]),
+        );
+        assert_eq!(
+            probe,
+            Some(("s7".to_string(), 480)),
+            "the walk must reach the deepest spare's row, or the compensation \
+             silently dead-fires on the largest removals"
+        );
+    }
+
+    /// A batched drain that consumes the head AND several spares (the
+    /// `appendMessages` burst crossing the anchor) still lands on the first
+    /// surviving spare, offset back to where the head would have been.
+    #[test]
+    fn a_batched_drain_past_the_head_lands_on_the_first_surviving_spare() {
+        // 100 items, window head at 25 with spares 25..33.
+        let keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
+        let anchor = anchor_of(&keys, 25);
+        // A 30-item drain + 30 arrivals: items 0..30 gone, head (25) and
+        // spares 25..29 with it; spare "m30" (offset 5) survives at index 0.
+        let post_keys: Vec<String> = (30..100)
+            .map(|i| format!("m{i}"))
+            .chain((0..30).map(|i| format!("new{i}")))
+            .collect();
+        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
+        assert!(!relocated.head_survived);
+        assert_eq!(
+            relocated.start, 0,
+            "spare m30 found at index 0, offset 5 in the anchor → start 0: \
+             the whole surviving remainder of the old window stays rendered"
+        );
+
+        // And when the drain consumes every spare too, the only safe answer
+        // for a front-contiguous drain is index 0 — the oldest survivor.
+        let post_keys: Vec<String> = (40..100)
+            .map(|i| format!("m{i}"))
+            .chain((0..40).map(|i| format!("new{i}")))
+            .collect();
+        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
+        assert!(!relocated.head_survived);
+        assert_eq!(relocated.start, 0);
+    }
+
+    /// The case where the spares are load-bearing and no fallback can stand
+    /// in for them: the head alone vanishes MID-window (its whole group
+    /// deleted), the neighbors survive in place. The first spare pins the
+    /// window one slot back from where it sits — a head-only relocation
+    /// would fall back to index 0 and blow the window open across the whole
+    /// room (ceiling-bounded, but a ~180-item over-render and a torn view).
+    #[test]
+    fn a_mid_window_head_deletion_reanchors_on_the_next_survivor() {
+        let keys: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
+        let anchor = anchor_of(&keys, 40);
+        // The head item "m40" is deleted outright; everything else survives,
+        // shifted down by one from index 41 on.
+        let post_keys: Vec<String> = keys
+            .iter()
+            .filter(|k| k.as_str() != "m40")
+            .cloned()
+            .collect();
+        let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
+        assert!(!relocated.head_survived);
+        assert_eq!(
+            relocated.start, 39,
+            "spare m41 (offset 1) found at index 40 → start 39: the window \
+             re-anchors one slot back, not at the front of the room"
+        );
+    }
+
+    /// The trim guard: skip the bottom-settle trim when the retained tail
+    /// would leave the backfill sentinel strip inside the bottom viewport —
+    /// trimming then re-fires the backfill and the two oscillate at render
+    /// speed (#505 re-review).
+    #[test]
+    fn the_trim_skips_when_the_tail_would_rearm_the_sentinel() {
+        // Ordinary desktop shape: 120 rendered items ~8000px tall, 900px
+        // viewport. Trimming to 60 retains ~4000px >> 900 + 800 + slack.
+        assert!(!trim_would_rearm_backfill(8000, 900, 120, 60));
+
+        // Tall portrait monitor / zoomed out: the same 120 items are only
+        // ~2600px tall over a 2000px viewport. The retained ~1300px tail sits
+        // entirely within client + BACKFILL_LEAD reach — trimming would
+        // re-fire the sentinel immediately.
+        assert!(trim_would_rearm_backfill(2600, 2000, 120, 60));
+
+        // Degenerate inputs never divide by zero or "trim" upward.
+        assert!(!trim_would_rearm_backfill(8000, 900, 0, 60));
+        assert!(!trim_would_rearm_backfill(8000, 900, 50, 60));
+    }
+
+    /// `relocate_anchor` search order and fallbacks.
+    #[test]
+    fn relocate_anchor_finds_shifted_heads_and_reports_lost_ones() {
+        let keys = ["a", "b", "c", "d", "e"];
+        let find =
+            |key: &'static str, hint: usize| relocate_anchor(keys.len(), hint, |i| keys[i] == key);
+        // Unshifted: found at the hint.
+        assert_eq!(find("c", 2), Some(2));
+        // Front prune shifted it down: found below the hint.
+        assert_eq!(find("c", 3), Some(2));
+        // Older history merged in above: found above the hint.
+        assert_eq!(find("c", 0), Some(2));
+        // Hint out of range entirely: still found.
+        assert_eq!(find("e", 400), Some(4));
+        // Gone: None, and `relocate_window` moves on to the next spare.
+        assert_eq!(find("zz", 2), None);
+        assert_eq!(relocate_anchor(0, 0, |_| true), None, "empty list");
+    }
+
+    /// #505 blocker 2: one backfill growth step must always reveal more than
+    /// what is RENDERED — growing from the stale requested size can resolve to
+    /// a start the anchor already renders (zero new rows, sentinel never
+    /// re-fires, paging dead-ends). The trace is the review's: open at 1000
+    /// items, 61 arrivals, page up.
+    #[test]
+    fn a_growth_step_reveals_rows_even_after_arrivals_grew_the_window() {
+        let opened = HistoryWindow::resolve(1000, INITIAL_WINDOW_ITEMS, None);
+        assert_eq!(opened.start, 940);
+        // 61 arrivals: the anchored start holds, rendered = 121.
+        let grown = HistoryWindow::resolve(1061, INITIAL_WINDOW_ITEMS, Some(opened.start));
+        assert_eq!(grown.start, opened.start);
+        let rendered = 1061 - grown.start;
+        assert_eq!(rendered, 121);
+
+        // The regression this pins: growing from the REQUESTED size reveals
+        // nothing (min(anchor, 1061-120) = anchor).
+        let dead = HistoryWindow::resolve(
+            1061,
+            INITIAL_WINDOW_ITEMS + WINDOW_GROWTH_ITEMS,
+            Some(grown.start),
+        );
+        assert_eq!(
+            dead.start, grown.start,
+            "premise: the naive growth really does dead-end — if this stops \
+             holding, the whole scenario needs rebuilding"
+        );
+
+        // The fix: grow from the rendered size.
+        let requested = grown_window(INITIAL_WINDOW_ITEMS, rendered);
+        assert_eq!(requested, rendered + WINDOW_GROWTH_ITEMS);
+        let paged = HistoryWindow::resolve(1061, requested, Some(grown.start));
+        assert!(
+            paged.start < grown.start,
+            "a growth step must strictly decrease start"
+        );
+        assert_eq!(
+            grown.start - paged.start,
+            WINDOW_GROWTH_ITEMS,
+            "and by exactly one growth step"
+        );
     }
 
     /// Source-grep pin: the history must render through the window. Rendering
@@ -4705,8 +5978,31 @@ mod tests {
         let squashed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
 
         assert!(
-            squashed.contains("HistoryWindow::resolve(groups.len(),window_items())"),
+            squashed.contains("HistoryWindow::resolve(groups.len(),requested_window,"),
             "the history must slice its display items through `HistoryWindow`"
+        );
+        assert!(
+            squashed.contains("relocate_window(groups.len(),a,"),
+            "the anchor must be re-located by IDENTITY (head key, then spare \
+             keys) before resolving — a positional anchor slides the head in \
+             content space whenever an at-cap room prunes a message (#505 \
+             blocker 1)"
+        );
+        assert!(
+            squashed.contains("*window_anchor.borrow_mut()=Some(WindowAnchor{"),
+            "the render must write the resolved head's identity back so the \
+             NEXT render grows instead of sliding (#501)"
+        );
+        assert!(
+            squashed.contains("window_rendered.set(groups.len()-history_window.start);"),
+            "the render must record the RENDERED size — the backfill growth \
+             step grows from it, or paging dead-ends after arrivals (#505 \
+             blocker 2)"
+        );
+        assert!(
+            squashed.contains("*n=grown_window(*n,window_rendered.get())"),
+            "the backfill sentinel must grow through `grown_window`, from the \
+             rendered size (#505 blocker 2)"
         );
         assert!(
             squashed.contains("groups[history_window.start..].to_vec()"),
@@ -4718,9 +6014,21 @@ mod tests {
             "the backfill sentinel must be rendered, or a reader can never see \
              messages older than the initial window"
         );
+        // Anchored on needles unique to the ROOM-SWITCH reset. The obvious
+        // needle — `window_items.set(INITIAL_WINDOW_ITEMS)` — also matches
+        // the bottom-settle trim, so deleting the room reset would have
+        // false-passed against it (#505 review).
         assert!(
-            squashed.contains("window_items.set(INITIAL_WINDOW_ITEMS)"),
-            "the window must reset when the reader opens another room"
+            squashed.contains("prev_render_room.set(Some(room));*window_anchor.borrow_mut()=None;"),
+            "the windowing Cells must reset inline in the render on a room \
+             switch — the effect-based reset runs one render too late, so \
+             the new room's first frame would render at the old room's depth"
+        );
+        assert!(
+            squashed
+                .contains("prev_windowed_room.set(room);window_items.set(INITIAL_WINDOW_ITEMS);"),
+            "the requested window signal must reset when the reader opens \
+             another room"
         );
     }
 
@@ -7074,9 +8382,12 @@ mod autoscroll_wiring_pins {
         assert_eq!(
             prod.matches("reader_moved_up_since(&last_scroll_top)")
                 .count(),
-            2,
-            "BOTH the content-change effect and the ResizeObserver must consult \
-             the guard; found a different number of call sites"
+            4,
+            "the guard has exactly four consumers: the content-change effect \
+             and the ResizeObserver (which scroll on the strength of the pin), \
+             plus the backfill restore and the head reposition (which distrust \
+             a stale-true pin mid-fling, #505 review); found a different \
+             number of call sites"
         );
         // Whitespace-insensitive: `cargo fmt` decides how this condition wraps,
         // and a pin that a reformat can break is a pin that gets deleted.
@@ -7124,6 +8435,194 @@ mod autoscroll_wiring_pins {
             "the resize follow must watch BOTH the content wrapper and the \
              scroll container; watching only the wrapper misses the composer \
              taking height away from the history"
+        );
+    }
+
+    /// The scroll container must opt out of browser scroll anchoring (#501).
+    /// With anchoring on, any change to rendered rows above the viewport (a
+    /// window trim, date-separator churn) makes the browser rewrite
+    /// `scrollTop` behind the pin machinery's back, and
+    /// `reader_moved_up_since` attributes the browser's adjustment to the
+    /// reader — which is exactly how the windowed tail latched the follow.
+    #[test]
+    fn the_scroll_container_disables_scroll_anchoring() {
+        let dense: String = production_source()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            dense.contains(concat!("style:\"overflow-", "anchor:none;\"")),
+            "#chat-scroll-container must set `overflow-anchor: none` — browser \
+             scroll anchoring rewriting scrollTop is #501's H1"
+        );
+    }
+
+    /// The #501/#505 windowing contract: trims happen at a settle landing AT
+    /// the bottom — ours included, so the scroll-to-latest button trims too —
+    /// gated at the slack, not the threshold, so a reader parked inside the
+    /// 100px band is never clamped to the exact bottom; the backfill restore
+    /// stands down while the view is pinned (unless the reader has visibly
+    /// moved — the fling case) or a forced snap is in flight (H3); the
+    /// backfill sentinel waits for the opening snap (H2) and for the
+    /// room-switch reset to catch up. Each of these is a one-line edit away
+    /// from silently reverting, and none is visible to `cargo test` except
+    /// through these pins.
+    #[test]
+    fn the_window_trims_at_the_bottom_and_backfill_defers_to_the_pin() {
+        let prod = production_source();
+        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            dense.contains("ifdistance<=SCROLL_TOP_SLACK_PXasf64&&window_overgrown.get()"),
+            "the settle handler must trim the grown window when a settle — \
+             the reader's or ours — lands at the exact bottom"
+        );
+        assert!(
+            dense.contains("trim_landed.set(true);"),
+            "a trim must flag itself so the view is re-anchored to the bottom \
+             afterwards: the rows it removes are above the viewport, and the \
+             browser's clamp otherwise reads as the reader scrolling up, so \
+             the next arrival is not followed"
+        );
+        assert!(
+            dense.contains("if!trim_landed.get(){return;}"),
+            "the re-anchor effect must consume the trim flag"
+        );
+        // Consuming the flag is not the repair — SCROLLING is. Deleting the
+        // scroll call leaves the assertions above passing with the fix gone,
+        // so the repair itself is pinned here.
+        assert!(
+            dense.contains("trim_landed.set(false);letSome(container)=chat_scroll_container()"),
+            "the re-anchor effect must go on to measure the container after \
+             consuming the flag"
+        );
+        assert!(
+            dense.contains(
+                "if!pinned_to_bottom.get()||(max_scroll_top(&container)-container.scroll_top())asf64>BOTTOM_THRESHOLD_PX"
+            ),
+            "the re-anchor must stand down for a reader who has started \
+             moving inside the flag-to-effect window — it is otherwise the \
+             one unguarded programmatic scroll in the file"
+        );
+        assert_eq!(
+            dense
+                .matches(
+                    "scroll_history_to_bottom(&pinned_to_bottom,&last_scroll_top,web_sys::ScrollBehavior::Instant,);"
+                )
+                .count(),
+            2,
+            "both the arrival snap and the trim re-anchor must scroll through \
+             `scroll_history_to_bottom`, which is what records the offset as \
+             ours; consuming the trim flag without scrolling silently reverts \
+             the fix"
+        );
+        // Without the read the effect never re-runs — it would fire once at
+        // mount and then go silent, which no other assertion can see.
+        assert_eq!(
+            dense.matches("let_=window_items();").count(),
+            2,
+            "the trim re-anchor and the backfill restore must each subscribe \
+             to `window_items`"
+        );
+        assert!(
+            dense.contains("&&!trim_would_rearm_backfill("),
+            "the trim must be geometry-gated: on a viewport tall enough that \
+             the trimmed tail leaves the sentinel strip in range, trim and \
+             backfill oscillate at render speed (#505 re-review)"
+        );
+        let trim_at = dense
+            .find("ifdistance<=SCROLL_TOP_SLACK_PXasf64&&window_overgrown.get()")
+            .expect("asserted above");
+        let ours_early_out = dense
+            .find("ifours{return;}")
+            .expect("the settle handler early-outs for our own settles");
+        assert!(
+            trim_at < ours_early_out,
+            "the trim check must run BEFORE the `ours` early-out, or a touch \
+             reader who only returns to the bottom via the scroll-to-latest \
+             button (whose settle is ours) never trims (#505 review)"
+        );
+        assert!(
+            dense.contains(
+                "if(pinned_to_bottom.get()&&!reader_moved_up_since(&last_scroll_top))||force_scroll.get(){return;}"
+            ),
+            "the backfill restore must stand down while the view is pinned — \
+             unless the reader has visibly moved up (a fling into the sentinel \
+             band settles no pin) — or a forced snap is in flight (#501 H3, \
+             #505 review)"
+        );
+        assert!(
+            dense.contains(
+                "ifhistory_window.has_older&&opening_snap_done()&&!room_changed_this_render"
+            ),
+            "the backfill sentinel must not mount until the room-open snap has \
+             landed (#501 H2), including the one render where the previous \
+             room's `opening_snap_done` is still true"
+        );
+    }
+
+    /// The #505 blocker-1 compensation wiring: rows carry their item identity,
+    /// the render captures the new head's pre-patch offset when rendered
+    /// content above it is removed, and the reposition effect shifts a parked
+    /// reader's offset by the measured difference. Removing any leg silently
+    /// reverts to "parked readers crawl upward one row per arrival in every
+    /// at-cap room".
+    #[test]
+    fn head_swaps_reposition_a_parked_reader() {
+        let prod = production_source();
+        let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            dense.contains("\"data-item-key\":\"{key}\""),
+            "history rows must carry `data-item-key` — the reposition \
+             machinery locates rows by item identity"
+        );
+        assert!(
+            dense.contains("fnhistory_row_offset_top"),
+            "the reposition machinery needs the row-offset lookup"
+        );
+        assert!(
+            dense.contains("reposition_pending.borrow_mut().take()"),
+            "the head-reposition effect must consume the render's pre-patch \
+             capture and shift the parked reader's offset"
+        );
+        assert!(
+            dense.contains("letshift=post_top-pre_top;"),
+            "the reposition must be BY MEASUREMENT (post-patch minus pre-patch \
+             offset of a surviving row), not a guess"
+        );
+        // The reference moves BY THE SHIFT. Writing the reader's new absolute
+        // offset instead collapses `reader_moved_up_since` to false while the
+        // pin is still stale-true, and both follow paths then yank a parked
+        // reader to the bottom (#505 delta review). Two call sites: the head
+        // reposition and the backfill restore.
+        assert_eq!(
+            dense
+                .matches("last_scroll_top.set(last_scroll_top.get()+shift);")
+                .count(),
+            2,
+            "both the head reposition and the backfill restore must update \
+             `last_scroll_top` RELATIVELY — an absolute write erases the \
+             reader's movement and the follow paths drag them to the bottom"
+        );
+        assert!(
+            dense.contains("lettarget=(pre_scroll_top+shift).max(0);"),
+            "the reposition target must be computed from the PRE-patch scroll \
+             offset — the browser clamps `scrollTop` down before the effect \
+             runs when a patch shortens the content, and shifting from the \
+             clamped value applies the clamp twice (#505 delta review)"
+        );
+        assert!(
+            dense.contains("select_reposition_probe("),
+            "the capture must pick its probe through the forward walk — a \
+             head-only probe dead-fires when an at-cap drain re-keys a \
+             multi-message head group, and the parked reader crawls one \
+             intra-group line per arrival (#505 re-review blocker)"
+        );
+        assert!(
+            dense.contains("matchhistory_row_offset_top(&anchor.probe_key)"),
+            "the backfill restore must reposition by the measured probe row, \
+             not the raw scrollHeight delta — the delta counts arrivals \
+             appended BELOW the viewport in the same patch and over-shifts \
+             the reader (#505 re-review)"
         );
     }
 }

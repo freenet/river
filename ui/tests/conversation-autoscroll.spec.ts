@@ -132,8 +132,12 @@ async function insertBeforeLast(page: Page, text: string) {
 }
 
 /// Open a room and wait until the history has settled at its newest message.
-async function openRoomAtBottom(page: Page, roomName: string) {
-  await page.goto("/");
+///
+/// `path` lets a test opt into fixture variants the default build hides —
+/// the windowed-history tests load `/?deep-history-room=1` to get a room
+/// deeper than the render window without changing what every other spec sees.
+async function openRoomAtBottom(page: Page, roomName: string, path = "/") {
+  await page.goto(path);
   await waitForApp(page);
   await selectRoom(page, roomName);
   await expectSettledAtBottom(page, "opening a room should land on its newest message");
@@ -430,5 +434,442 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+  });
+});
+
+// Regression tests for freenet/river#501: the #498 windowed tail slid its
+// start index forward on every arrival, removing the oldest rendered rows in
+// the same patch that appended the new message. Browser scroll anchoring
+// rewrote scrollTop to hold the visible content still, `reader_moved_up_since`
+// attributed the browser's adjustment to the reader, and both follow paths
+// stood down — so a room deeper than the render window stopped following
+// arrivals entirely, while every room the old suite seeded (~15-20 items vs a
+// 60-item window) kept passing on the pre-window code path.
+//
+// Every test here therefore asserts its PREMISE first — the backfill sentinel
+// is attached and the rendered row count is a windowed tail, not the whole
+// fixture — so a fixture change that shrinks the room below the window makes
+// these fail loudly instead of quietly regressing into small-room tests.
+//
+// The fixture: `?deep-history-room=1` adds a room of 80 alternating-author
+// messages (alternation makes messages == display items, so >60 items is a
+// guarantee) plus the ~12 standard fixture messages. The default fixture is
+// untouched; the describes above still exercise the small-room path.
+test.describe("Windowed history follows arrivals (#501)", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  const DEEP_ROOM = "Deep History Room";
+  /// Seeded exactly at its max_recent_messages cap: every delivered arrival
+  /// drains the oldest message, shifting every item index (#505 blocker 1).
+  const CAPPED_ROOM = "Capped History Room";
+  const DEEP_ROOM_PATH = "/?deep-history-room=1";
+
+  /// Rendered history rows: display items plus date separators. A windowed
+  /// tail is ~60 items + a separator or two; the whole fixture is ~92 items.
+  function renderedRowCount(page: Page): Promise<number> {
+    return page.evaluate(
+      () =>
+        document.querySelectorAll("#chat-scroll-container .space-y-4 > *")
+          .length
+    );
+  }
+
+  /// The premise all three tests stand on: the windowed render path is
+  /// actually active. Without this, a fixture or window-size change could
+  /// turn every test below into a duplicate of the small-room suite — the
+  /// exact coverage gap that let #501 ship green.
+  async function expectWindowedRenderActive(page: Page) {
+    await expect(
+      page.locator("#top-backfill-sentinel"),
+      "premise: the backfill sentinel must be attached — if the room fits in " +
+        "the window, nothing here exercises #501's code path"
+    ).toHaveCount(1);
+    const rows = await renderedRowCount(page);
+    expect(
+      rows,
+      "premise: the deep room must render a windowed TAIL (~60 items plus " +
+        "separators), not the whole fixture — a full render means the window " +
+        "backfilled behind the reader's back or the fixture shrank"
+    ).toBeLessThan(75);
+    expect(
+      rows,
+      "premise: the windowed tail itself should be on the page"
+    ).toBeGreaterThan(40);
+  }
+
+  /// Tag the first history row fully inside the container's viewport and
+  /// return its viewport-relative top. scrollTop alone cannot see a window
+  /// slide: with scroll anchoring disabled, dropping rows above the viewport
+  /// leaves scrollTop untouched and shifts the CONTENT under it — the reader
+  /// watches their message jump away while every offset reads steady. The
+  /// probed row's rect is what catches that.
+  async function tagVisibleRow(page: Page, flag: string): Promise<number | null> {
+    return page.evaluate((f) => {
+      const container = document.getElementById("chat-scroll-container")!;
+      const cRect = container.getBoundingClientRect();
+      const rows = container.querySelectorAll(".space-y-4 > *");
+      for (const row of rows) {
+        const r = row.getBoundingClientRect();
+        if (r.top >= cRect.top && r.bottom <= cRect.bottom) {
+          (row as any)[f] = true;
+          return r.top;
+        }
+      }
+      return null;
+    }, flag);
+  }
+
+  /// The tagged row's current viewport-relative top, or null if it left the
+  /// DOM (i.e. the window slid out from under it).
+  async function taggedRowTop(page: Page, flag: string): Promise<number | null> {
+    return page.evaluate((f) => {
+      const rows = document.querySelectorAll(
+        "#chat-scroll-container .space-y-4 > *"
+      );
+      for (const row of rows) {
+        if ((row as any)[f]) {
+          return row.getBoundingClientRect().top;
+        }
+      }
+      return null;
+    }, flag);
+  }
+
+  test("keeps following a burst of arrivals in a windowed room", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // The recorded #501 failure mode: with the reader pinned to the bottom,
+    // each arrival slid the window, the shifted scrollTop read as reader
+    // movement, and the view never followed again. The loop is what catches a
+    // fix that survives one arrival and then latches. Delivered arrivals
+    // alternate authors (see `test_author` in example_data.rs), so each one
+    // is its own display item and the loop interleaves window GROWTH with the
+    // settle-at-bottom TRIM — six arrivals folding into one group would
+    // exercise the windowing arithmetic zero times.
+    for (let i = 1; i <= 6; i++) {
+      await deliver(page, `windowed arrival ${i}`);
+      await expectSettledAtBottom(
+        page,
+        `arrival ${i} in a windowed room was not followed`
+      );
+    }
+
+    // Following six arrivals must not have cost the window its bound: each
+    // follow snap settles at the bottom, and that settle trims the window
+    // back toward its initial size. Polled because the last settle's trim
+    // lands asynchronously.
+    //
+    // NOTE on what this test does and does not guard. It is what CAUGHT the
+    // trim/re-anchor bug (a trim shrinks the content, the browser clamps
+    // scrollTop, and an arrival landing before that clamp's settle was not
+    // followed) — but it only failed 5 runs in 16, so under the suite's
+    // `retries: 2` a regression has roughly a 3% chance of failing CI hard.
+    // The timing is not practical to force deterministically from a browser
+    // test. The DETERMINISTIC guard is the source pin
+    // `the_window_trims_at_the_bottom_and_backfill_defers_to_the_pin` in
+    // conversation.rs, which pins the flag, the guard and the scroll call;
+    // do not assume this test covers a revert.
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message:
+          "the settle-at-bottom trim should return the window to ~initial size " +
+          "after a followed burst",
+      })
+      .toBeLessThan(67);
+  });
+
+  test("arrivals do not move a reader parked in a windowed room's history", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // Park mid-history: far enough from the bottom to unpin, far enough from
+    // the top not to trigger a backfill.
+    const mid = Math.floor((await historyHeight(page)) / 2);
+    await readerScrollsTo(page, mid);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    const probe = await tagVisibleRow(page, "__riverProbe501");
+    expect(
+      probe,
+      "premise: a rendered row should be visible mid-history"
+    ).not.toBeNull();
+
+    for (let i = 1; i <= 3; i++) {
+      await deliver(page, `parked windowed arrival ${i}`);
+    }
+    await expectStaysPut(
+      page,
+      "arrivals in a windowed room moved a parked reader's scroll offset"
+    );
+
+    const after = await taggedRowTop(page, "__riverProbe501");
+    expect(
+      after,
+      "the probed row left the DOM — the window slid out from under a parked reader"
+    ).not.toBeNull();
+    expect(
+      Math.abs(after! - probe!),
+      "content shifted under a parked reader when arrivals landed"
+    ).toBeLessThanOrEqual(2);
+  });
+
+  test("arrivals do not crawl a parked reader in an at-cap room", async ({
+    page,
+  }) => {
+    // The at-cap room sits EXACTLY at max_recent_messages, so every arrival
+    // drains the oldest message and shifts every item index down — the
+    // steady state of every busy production room. A positional window anchor
+    // then swaps the head's IDENTITY one item per arrival: the top rendered
+    // row is removed in the same patch that appends the new one, and the
+    // parked reader crawls upward one row height each time (#505 blocker 1).
+    // The identity anchor must hold the head fixed instead.
+    await openRoomAtBottom(page, CAPPED_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    const mid = Math.floor((await historyHeight(page)) / 2);
+    await readerScrollsTo(page, mid);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    const probe = await tagVisibleRow(page, "__riverProbeAtCap");
+    expect(
+      probe,
+      "premise: a rendered row should be visible mid-history"
+    ).not.toBeNull();
+
+    for (let i = 1; i <= 4; i++) {
+      await deliver(page, `at-cap arrival ${i}`);
+    }
+    await expectStaysPut(
+      page,
+      "at-cap arrivals moved a parked reader's scroll offset"
+    );
+
+    const after = await taggedRowTop(page, "__riverProbeAtCap");
+    expect(
+      after,
+      "the probed row left the DOM — the at-cap window slid in content space"
+    ).not.toBeNull();
+    expect(
+      Math.abs(after! - probe!),
+      "content crawled under a parked reader as at-cap arrivals pruned the history"
+    ).toBeLessThanOrEqual(2);
+  });
+
+  test("a batched at-cap drain does not crawl a parked reader (re-keyed head group)", async ({
+    page,
+  }) => {
+    // The capped room's fillers come in same-author PAIRS, so its display
+    // groups hold two messages — the dominant production shape. A batch of
+    // 61 arrivals drains 61 messages: ~30 whole pairs past the window head,
+    // plus one half-pair that RE-KEYS the group at the drain boundary (a
+    // group's key is its first message's id — the new key exists in no
+    // pre-patch row). The window must re-anchor on the surviving neighbors
+    // (spare keys) and the reposition must measure through a surviving row
+    // (probe walk), or the parked reader's view is torn away (#505
+    // re-review blocker).
+    //
+    // No scrollTop-stability assertion here, deliberately: the compensation
+    // MOVES scrollTop to hold the CONTENT still. The probed row's rect is
+    // the thing that must not move.
+    await openRoomAtBottom(page, CAPPED_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // Park just far enough up to be unpinned, NOT mid-history: the 61-message
+    // batch drains ~30 display items off the FRONT of a 74-item room, so a
+    // row tagged mid-history is inside the pruned range and legitimately
+    // leaves the DOM — which row exactly depends on per-engine row heights,
+    // so tagging there is flaky by construction rather than by timing. The
+    // rows just above the fold are the newest ones; they survive the drain,
+    // and holding THEM still is the property under test.
+    //
+    // Deliberately NO settle wait before delivering: the batch lands while
+    // the reader's `scrollend` is still in flight, so this also covers the
+    // pre-settle window, where `pinned_to_bottom` is stale-true and only
+    // `reader_moved_up_since` stands the follow paths down. That is exactly
+    // what the relative `last_scroll_top` update protects, so the test would
+    // go quiet about it if it waited the pin out first.
+    const parkedAt = Math.max(
+      0,
+      (await historyHeight(page)) - (await viewportHeight(page)) - 400
+    );
+    await readerScrollsTo(page, parkedAt);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    const probe = await tagVisibleRow(page, "__riverProbeBatch");
+    expect(
+      probe,
+      "premise: a rendered row should be visible above the fold"
+    ).not.toBeNull();
+
+    const beforeBatch = await renderedRowCount(page);
+    await page.evaluate(() => (window as any).__riverTest.appendMessages(61));
+    // The batch landed and the SURVIVING remainder of the old window is still
+    // rendered (the arrivals alone add 61 rows; losing the survivors would
+    // shrink the count back toward the window size).
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message:
+          "premise: the batch should land with the surviving window rows kept",
+      })
+      .toBeGreaterThan(beforeBatch + 30);
+    // Let scroll events from the reposition settle before measuring.
+    await page.waitForTimeout(300);
+
+    const after = await taggedRowTop(page, "__riverProbeBatch");
+    expect(
+      after,
+      "the probed row left the DOM — the window lost the surviving rows " +
+        "under a parked reader"
+    ).not.toBeNull();
+    expect(
+      Math.abs(after! - probe!),
+      "content moved under a parked reader across a batched at-cap drain"
+    ).toBeLessThanOrEqual(3);
+  });
+
+  test("backfill paging reveals older history and keeps the reader's place", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+    const initialRows = await renderedRowCount(page);
+
+    // Scroll to the very top and tag the current head ITEM row IN THE SAME
+    // browser task — the sentinel's IntersectionObserver fires in a later
+    // task, so the tag always lands before the backfill. The head's date
+    // SEPARATOR is not a valid probe: when older rows land above it, the day
+    // no longer starts at the old head, so that row legitimately leaves the
+    // DOM. The item row itself survives — item identity is exactly what the
+    // window anchors on.
+    const probeTop = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      c.scrollTop = 0;
+      const row = c.querySelector(".space-y-4 > [data-item-key]") as HTMLElement;
+      (row as any).__riverPagingProbe = true;
+      return row.getBoundingClientRect().top;
+    });
+
+    // The first growth step reveals a full page of older rows...
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message: "reaching the top should backfill a page of older rows",
+      })
+      .toBeGreaterThan(initialRows + 40);
+
+    // ...and the restore keeps the row the reader was looking at where it
+    // was: the revealed rows land ABOVE, the offset is re-anchored by the
+    // container's measured growth.
+    const probeAfter = await taggedRowTop(page, "__riverPagingProbe");
+    expect(
+      probeAfter,
+      "the pre-backfill head row must survive a backfill"
+    ).not.toBeNull();
+    expect(
+      Math.abs(probeAfter! - probeTop),
+      "a backfill must not move the reader's view"
+    ).toBeLessThanOrEqual(3);
+
+    // Repeated paging must reach the very oldest history — a growth step
+    // that reveals nothing dead-ends here and the loop times out.
+    const oldestFiller = page.getByText("history filler 00", { exact: false });
+    for (let i = 0; i < 6 && (await oldestFiller.count()) === 0; i++) {
+      const before = await renderedRowCount(page);
+      await page.evaluate(() => {
+        document.getElementById("chat-scroll-container")!.scrollTop = 0;
+      });
+      await expect
+        .poll(() => renderedRowCount(page), {
+          timeout: 5_000,
+          message: `paging step ${i} revealed no further rows`,
+        })
+        .toBeGreaterThan(before);
+    }
+    expect(
+      await oldestFiller.count(),
+      "paging back through the whole room must reach the oldest filler"
+    ).toBe(1);
+  });
+
+  test("backfill still reveals older rows after arrivals grew the window", async ({
+    page,
+  }) => {
+    // #505 blocker 2: arrivals grow an anchored window past its REQUESTED
+    // size. A growth step computed from the stale request then resolves to a
+    // start the window already renders — zero new rows, no DOM change, the
+    // sentinel's IntersectionObserver never re-fires, and paging dead-ends.
+    // The growth step must come from the RENDERED size.
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // Park mid-history so the batch below grows the window (a pinned reader's
+    // follow-snap settle would trim the divergence away before paging).
+    const mid = Math.floor((await historyHeight(page)) / 2);
+    await readerScrollsTo(page, mid);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    const beforeBatch = await renderedRowCount(page);
+    // One batched delivery of more than a whole growth step, in a single
+    // state mutation — as a network delta carrying many messages does.
+    await page.evaluate(() => (window as any).__riverTest.appendMessages(61));
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message:
+          "premise: the batch should grow the anchored window past one whole " +
+          "growth step — without that divergence this test exercises nothing",
+      })
+      .toBeGreaterThan(beforeBatch + 55);
+
+    // Now page up. The FIRST sentinel fire must reveal older rows.
+    const beforePaging = await renderedRowCount(page);
+    await page.evaluate(() => {
+      document.getElementById("chat-scroll-container")!.scrollTop = 0;
+    });
+    await expect
+      .poll(() => renderedRowCount(page), {
+        timeout: 5_000,
+        message:
+          "the first backfill after an arrival burst revealed no older rows — " +
+          "the growth step dead-ended (#505 blocker 2)",
+      })
+      .toBeGreaterThan(beforePaging + 40);
+  });
+
+  test("opening a deep room lands settled at the bottom with the initial window", async ({
+    page,
+  }) => {
+    // `openRoomAtBottom` itself asserts the settle; the premise check is what
+    // rules out the H2 failure shape, where the backfill sentinel fires from
+    // scrollTop 0 before the opening snap and cascades the window over the
+    // whole room (the row count would be ~200, not ~62). Note the H2 race is
+    // timing-dependent in a live browser — this test catches it when it
+    // fires, but the deterministic guard is the source pin on the sentinel's
+    // `opening_snap_done` mount gate in conversation.rs.
+    await openRoomAtBottom(page, DEEP_ROOM, DEEP_ROOM_PATH);
+    await expectWindowedRenderActive(page);
+
+    // And it STAYS settled: a late backfill restore racing the opening snap
+    // (H3) would park the view at the restore anchor moments later.
+    await expectStaysPut(page, "the view moved after the room-open snap settled");
+    await expectSettledAtBottom(
+      page,
+      "the room should still be at its newest message after settling"
+    );
   });
 });
