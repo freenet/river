@@ -218,44 +218,44 @@ fn unread_candidate_messages(
 }
 
 /// Whether a body we could NOT read (`try_decrypt_message_content` returned
-/// `None`) is one we expect to be able to read LATER — in which case the
-/// MentionsAndReplies count includes it, because there is no way yet to tell
-/// whether it mentions the user.
+/// `None`) should nevertheless count toward the MentionsAndReplies badge,
+/// because we cannot yet tell whether it mentions the user.
 ///
-/// The distinction matters because "unreadable" is two different situations:
+/// The answer is yes for EXACTLY ONE state: the room's secrets map is empty.
+/// `RoomData.secrets` is `#[serde(skip)]`, so every cold start of an
+/// established private room lands here, and it resolves within seconds when
+/// `repopulate_secrets_from_state` rehydrates the map. Counting through that
+/// window is what stops a real mention hiding behind a silent zero.
 ///
-/// * **Transient.** The secrets map is empty (every cold start of an
-///   established private room, since `RoomData.secrets` is `#[serde(skip)]`),
-///   or the message is sealed under a version NEWER than anything we hold, so
-///   its secret is still in flight, or we hold a secret at that version and it
-///   does not decrypt the body — which `repopulate_secrets_from_state`
-///   overwrites from the owner-signed blob (see its doc: an inviter can supply
-///   a wrong secret that the authoritative blob later replaces AT THE SAME
-///   VERSION). Counting is the safe direction here: the alternative hides a
-///   real mention behind a silent zero until sync catches up.
+/// Every other unreadable state does NOT count, and the reason is that none of
+/// them is reliably transient:
 ///
-/// * **Permanent.** The message is sealed under a version OLDER than every
-///   secret we hold: a rotation the user joined after, which they will never
-///   be able to read. Counting those would put a number on the badge, the tab
-///   title and the hamburger that can never resolve down and that points at a
-///   message the user cannot read even after opening the room — which is the
-///   #500 symptom in a narrower configuration. So they do not count.
+/// * A version OLDER than everything we hold is a rotation the user joined
+///   after; they will never read it.
+/// * A version NEWER than everything we hold looks like a blob in flight, but
+///   need not be: a member who was offline across a rotation may never receive
+///   one (`MessagesV1`'s own docs describe a member missing a blob at
+///   `current_version` as a supported, unrecoverable state), and a removed
+///   member's blobs are pruned outright while their client keeps ingesting
+///   messages at the new version.
+/// * A secret PRESENT at the right version that does not decrypt the body is
+///   overwritten by `repopulate_secrets_from_state` only if the contract
+///   carries an owner-signed blob for THIS member at THAT version. If it does
+///   not, the wrong key stays.
+///
+/// Counting any of those puts a number on the badge, the tab title and the
+/// hamburger that no amount of reading can clear, pointing at a message the
+/// user cannot open — which is the freenet/river#500 symptom in a narrower
+/// configuration, and strictly worse than the under-count it avoids. An
+/// under-count here is temporary and self-healing: the message is unreadable,
+/// so the user could not act on the mention anyway, and both the message and
+/// the badge appear together if the secret ever arrives.
 fn unreadable_body_may_become_readable(
     msg: &river_core::room_state::message::AuthorizedMessageV1,
     secrets: &std::collections::HashMap<u32, [u8; 32]>,
 ) -> bool {
     match &msg.message.content {
-        river_core::room_state::message::RoomMessageBody::Private { secret_version, .. } => {
-            // Present but non-decrypting: a wrong key, replaced in place.
-            if secrets.contains_key(secret_version) {
-                return true;
-            }
-            // Absent: cold start, or a rotation still reaching us.
-            secrets
-                .keys()
-                .max()
-                .is_none_or(|newest| secret_version > newest)
-        }
+        river_core::room_state::message::RoomMessageBody::Private { .. } => secrets.is_empty(),
         // A public body always reads; this is only reached defensively.
         river_core::room_state::message::RoomMessageBody::Public { .. } => false,
     }
@@ -277,21 +277,20 @@ fn unreadable_body_may_become_readable(
 /// * `Muted` — always 0; a muted room never badges and never inflates the
 ///   totals, matching the modal's "Never notify for this room" wording.
 ///
-/// # Undecryptable private messages count (fail safe)
+/// # Unreadable private messages, during the cold-start window only
 ///
-/// In MentionsAndReplies mode a message whose secret version is missing from
-/// `room_data.secrets` is COUNTED, because there is no way to tell whether it
-/// mentions the user. Over-reporting is the safe direction: the alternative
-/// hides a real mention behind a silent zero.
+/// In MentionsAndReplies mode a body we cannot decrypt is counted while
+/// `room_data.secrets` is EMPTY, because there is no way to tell whether it
+/// mentions the user and the state resolves in seconds. `RoomData.secrets` is
+/// `#[serde(skip)]`, so every cold start of an established private room is in
+/// it; without this, such a room would badge 0 on the row, the title AND the
+/// hamburger until `repopulate_secrets_from_state` runs, hiding real mentions.
+/// The count resolves to the true mention count once the secrets arrive.
 ///
-/// This is not a corner case. `RoomData.secrets` is `#[serde(skip)]`, so
-/// EVERY cold start of an established private room has an empty secrets map
-/// until `repopulate_secrets_from_state` rehydrates it; without the
-/// fail-safe, a private mentions-mode room with unread mentions would badge
-/// 0 on the badge, the title, AND the hamburger until that resolves. There
-/// is also a permanent variant: a member who joined after a secret rotation
-/// can never decrypt older-version messages. The count therefore resolves
-/// DOWN to the true mention count once the secrets arrive.
+/// Bodies that stay unreadable with secrets in hand do NOT count. See
+/// [`unreadable_body_may_become_readable`] for why none of those states is
+/// reliably transient, and why a permanent over-count is worse than a
+/// self-healing under-count.
 ///
 /// # Cost
 ///
@@ -577,7 +576,7 @@ fn count_unread_dms_with(
 /// room key shares cache entries with every other test on the thread, so use a
 /// fresh key per test.
 ///
-/// the signal-reading wrappers are [`count_total_unread_messages`] and
+/// The signal-reading wrappers are [`count_total_unread_messages`] and
 /// [`count_unread_behind_rooms_panel`].
 pub fn count_unread_excluding_room(
     map: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
@@ -899,11 +898,10 @@ mod tests {
             let start = squashed.find(marker).unwrap_or_else(|| {
                 panic!("`{total}` is gone — re-anchor this pin, do not delete it")
             });
+            // Whole-line comments (including `///`) were filtered out above, so
+            // the next `pub fn` is the only usable end marker.
             let body = &squashed[start..];
-            let end = body
-                .find("///")
-                .or_else(|| body.find("pubfn"))
-                .unwrap_or(body.len());
+            let end = body.find("pubfn").unwrap_or(body.len());
             assert!(
                 body[..end]
                     .contains("count_unread_excluding_room(&rooms.map,&rooms.notification_modes,"),
@@ -1506,18 +1504,26 @@ mod tests {
         );
     }
 
-    /// freenet/river#500 review (H1): a secret PRESENT at the message's
-    /// version but WRONG is the case the first fail-safe missed.
-    /// `decrypt_message_content` falls through to `to_string_lossy()` there —
-    /// `"[Encrypted message: N bytes, vM]"` — which contains no mention token,
-    /// so a presence-only check reads it as a confident "not a mention" and
-    /// hides a real mention.
+    /// freenet/river#500 review: the fail-safe is bounded to the COLD-START
+    /// window, so a body that stays unreadable with secrets in hand does not
+    /// count.
     ///
-    /// Not hypothetical: `RoomData::repopulate_secrets_from_state` exists
-    /// because an inviter can supply a wrong secret that the authoritative
-    /// owner-signed blob later replaces at the same version.
+    /// Three states reach this, and none of them is reliably transient: a
+    /// version older than everything held (a rotation the user joined after), a
+    /// version newer than everything held (which need NOT be a blob in flight —
+    /// a member offline across a rotation, or one whose blobs were pruned on
+    /// removal, never receives it), and a secret present at the right version
+    /// that does not decrypt (only overwritten if the contract carries an
+    /// owner-signed blob for this member at that version).
+    ///
+    /// Counting any of them would put a number on the badge, the title and the
+    /// hamburger that no amount of reading can clear — the #500 symptom in a
+    /// narrower configuration.
+    ///
+    /// Each case gets its OWN room key: the memo is a `thread_local` keyed by
+    /// `owner_vk`, and `cargo test -- --test-threads=1` shares it across tests.
     #[test]
-    fn mentions_mode_counts_a_body_whose_secret_is_present_but_wrong() {
+    fn mentions_mode_does_not_count_unreadable_bodies_once_secrets_are_held() {
         let (self_sk, self_vk) = keypair();
         let (owner_sk, owner_vk) = keypair();
         let self_id: MemberId = (&self_vk).into();
@@ -1527,135 +1533,140 @@ mod tests {
             "hey {}!",
             river_core::mention::encode_mention(self_id, "Me")
         );
-        let messages = vec![private_msg(
-            &owner_sk,
-            &owner_vk,
-            1,
-            mention_text,
-            &real_secret,
-            1,
-        )];
-        let mut rd = room(self_sk, owner_vk, messages, None);
 
-        // Premise: the wrong key must genuinely fail to decrypt, or this test
-        // is measuring the already-covered missing-secret path.
-        rd.secrets.insert(1, wrong_secret);
-        assert!(
-            crate::components::conversation::try_decrypt_message_content(
-                &rd.room_state.recent_messages.messages[0].message.content,
-                &rd.secrets,
-            )
-            .is_none(),
-            "premise: the wrong secret must not decrypt the body"
-        );
-
-        assert_eq!(
-            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
-            1,
-            "a body sealed under a key we hold the WRONG value for must count \
-             — it may be a mention and we cannot tell"
-        );
-
-        // …and the memo must not cement that answer. Overwriting the secret
-        // AT THE SAME VERSION leaves `secrets.len()` unchanged, so a
-        // length-only fingerprint would keep serving the over-count after the
-        // authoritative blob arrives.
-        rd.secrets.insert(1, real_secret);
-        assert_eq!(
-            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
-            1,
-            "the mention is real, so the count stays 1 — but it must have been \
-             RECOMPUTED, which the next case proves"
-        );
-    }
-
-    /// The same overwrite, with a body that is NOT a mention: here the count
-    /// must actually move, which it cannot do if the memo did not notice a
-    /// same-version secret replacement.
-    #[test]
-    fn a_same_version_secret_overwrite_invalidates_the_memo() {
-        let (self_sk, _) = keypair();
-        let (owner_sk, owner_vk) = keypair();
-        let real_secret = [1u8; 32];
-        let wrong_secret = [2u8; 32];
-        let messages = vec![private_msg(
-            &owner_sk,
-            &owner_vk,
-            1,
-            "nothing to see here".to_string(),
-            &real_secret,
-            1,
-        )];
-        let mut rd = room(self_sk, owner_vk, messages, None);
-
-        rd.secrets.insert(1, wrong_secret);
-        assert_eq!(
-            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
-            1,
-            "unreadable, so counted"
-        );
-
-        rd.secrets.insert(1, real_secret);
-        assert_eq!(
-            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
-            0,
-            "the authoritative secret arrived at the SAME version, so the \
-             fail-safe over-count must resolve away — a `secrets.len()` \
-             fingerprint would still be serving the stale 1"
-        );
-    }
-
-    /// freenet/river#500 review (H2): the fail-safe must be BOUNDED. A message
-    /// sealed under a version older than every secret we hold is a rotation
-    /// the user joined after; they will never read it, opening the room will
-    /// never make it readable, and counting it puts a permanent number on the
-    /// badge, the title and the hamburger — which is the reported symptom, in
-    /// a narrower configuration.
-    #[test]
-    fn mentions_mode_does_not_count_a_body_rotated_permanently_past() {
-        let (self_sk, _) = keypair();
-        let (owner_sk, owner_vk) = keypair();
-        let old_secret = [3u8; 32];
-        let current_secret = [4u8; 32];
-        let messages = vec![private_msg(
-            &owner_sk,
-            &owner_vk,
-            1,
-            "from before you joined".to_string(),
-            &old_secret,
-            1,
-        )];
-        let mut rd = room(self_sk, owner_vk, messages, None);
-
-        // Holding v2 but not v1: joined after the rotation.
-        rd.secrets.insert(2, current_secret);
-        assert_eq!(
-            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
-            0,
-            "a permanently unreadable older-version body must not count"
-        );
-
-        // A version NEWER than anything held is the opposite case: its secret
-        // is still in flight, so it counts.
-        let mut rd2 = room(
-            SigningKey::from_bytes(&[5u8; 32]),
+        // (a) A secret PRESENT at the message's version but WRONG. Premise
+        // first: the wrong key must genuinely fail to decrypt, or this is
+        // measuring the missing-secret path instead.
+        let mut wrong_key_room = room(
+            self_sk.clone(),
             owner_vk,
             vec![private_msg(
                 &owner_sk,
                 &owner_vk,
                 1,
+                mention_text.clone(),
+                &real_secret,
+                1,
+            )],
+            None,
+        );
+        wrong_key_room.secrets.insert(1, wrong_secret);
+        assert!(
+            crate::components::conversation::try_decrypt_message_content(
+                &wrong_key_room.room_state.recent_messages.messages[0]
+                    .message
+                    .content,
+                &wrong_key_room.secrets,
+            )
+            .is_none(),
+            "premise: the wrong secret must not decrypt the body"
+        );
+        assert_eq!(
+            count_unread_in_room_data_with_mode(
+                &wrong_key_room,
+                NotificationMode::MentionsAndReplies
+            ),
+            0,
+            "a wrong key at a held version is not reliably transient, so it \
+             must not count"
+        );
+
+        // (b) A version OLDER than everything held: joined after the rotation.
+        let (other_sk, _) = keypair();
+        let (owner2_sk, owner2_vk) = keypair();
+        let mut old_room = room(
+            other_sk,
+            owner2_vk,
+            vec![private_msg(
+                &owner2_sk,
+                &owner2_vk,
+                1,
+                "from before you joined".to_string(),
+                &real_secret,
+                1,
+            )],
+            None,
+        );
+        old_room.secrets.insert(2, [4u8; 32]);
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&old_room, NotificationMode::MentionsAndReplies),
+            0,
+            "a permanently unreadable older-version body must not count"
+        );
+
+        // (c) A version NEWER than everything held. This one LOOKS transient,
+        // and the first version of the fix treated it as such — but a member
+        // offline across a rotation, or one whose blobs were pruned on removal,
+        // never receives it, so counting it is unbounded.
+        let (third_sk, _) = keypair();
+        let (owner3_sk, owner3_vk) = keypair();
+        let mut new_room = room(
+            third_sk,
+            owner3_vk,
+            vec![private_msg(
+                &owner3_sk,
+                &owner3_vk,
+                1,
                 "just rotated".to_string(),
-                &current_secret,
+                &real_secret,
                 9,
             )],
             None,
         );
-        rd2.secrets.insert(2, current_secret);
+        new_room.secrets.insert(2, [4u8; 32]);
         assert_eq!(
-            count_unread_in_room_data_with_mode(&rd2, NotificationMode::MentionsAndReplies),
+            count_unread_in_room_data_with_mode(&new_room, NotificationMode::MentionsAndReplies),
+            0,
+            "a newer-version body is not guaranteed to arrive, so it must not \
+             count indefinitely"
+        );
+    }
+
+    /// The memo must notice a secret being replaced AT THE SAME VERSION.
+    ///
+    /// `repopulate_secrets_from_state` overwrites a wrong invitation-supplied
+    /// secret with the authoritative owner-signed one at the same version, so
+    /// `secrets.len()` is unchanged — a length-only fingerprint would keep
+    /// serving the count computed against the wrong key.
+    #[test]
+    fn a_same_version_secret_overwrite_invalidates_the_memo() {
+        let (self_sk, self_vk) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let real_secret = [1u8; 32];
+        let wrong_secret = [2u8; 32];
+        let mention_text = format!(
+            "hey {}!",
+            river_core::mention::encode_mention(self_id, "Me")
+        );
+        let mut rd = room(
+            self_sk,
+            owner_vk,
+            vec![private_msg(
+                &owner_sk,
+                &owner_vk,
+                1,
+                mention_text,
+                &real_secret,
+                1,
+            )],
+            None,
+        );
+
+        rd.secrets.insert(1, wrong_secret);
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+            0,
+            "unreadable with secrets in hand, so not counted"
+        );
+
+        rd.secrets.insert(1, real_secret);
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
             1,
-            "a body sealed under a version newer than anything we hold is \
-             waiting on sync, so it counts"
+            "the authoritative secret arrived at the SAME version and the body \
+             turns out to be a mention — a `secrets.len()` fingerprint would \
+             still be serving the stale 0"
         );
     }
 

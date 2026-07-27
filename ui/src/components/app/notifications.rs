@@ -575,9 +575,14 @@ impl<'a> SelfAuthoredIndex<'a> {
 /// than spuriously notify).
 ///
 /// Single-message convenience wrapper over
-/// [`mentions_or_replies_to_self_indexed`]; a caller testing many messages
-/// against the same `recent` should build one [`SelfAuthoredIndex`] and call
-/// the indexed form instead.
+/// [`mentions_or_replies_to_self_indexed`].
+///
+/// `#[cfg(test)]`: production has no single-message caller left. The
+/// notification gate and the unread counter both scan a batch against one
+/// `recent`, so both build a [`SelfAuthoredIndex`] once and use the indexed
+/// form; re-introducing a per-message wrapper on either path re-introduces the
+/// per-message index rebuild it exists to avoid. Kept for the pure-decision
+/// tests below, which are about the predicate rather than the batching.
 ///
 /// `pub(crate)`: besides gating browser notifications here, this is the same
 /// predicate the unread counters use for rooms in MentionsAndReplies mode
@@ -594,6 +599,7 @@ impl<'a> SelfAuthoredIndex<'a> {
 /// burst of "you were mentioned" popups on every reload. The badge
 /// over-reports; the notification under-reports; both fail toward the less
 /// annoying error.
+#[cfg(test)]
 pub(crate) fn mentions_or_replies_to_self(
     msg: &AuthorizedMessageV1,
     self_member_id: MemberId,
@@ -623,7 +629,9 @@ pub(crate) fn mentions_or_replies_to_self_indexed(
 
 /// [`mentions_or_replies_to_self_indexed`] against a body that has ALREADY
 /// been decrypted, so a caller that needed the plaintext for its own reasons
-/// does not pay for a second AES-GCM decrypt of the same message.
+/// does not pay to decrypt the same message again for the mention scan. (A
+/// REPLY body is still decrypted a second time inside `extract_reply_target_id`
+/// — that is pre-existing, and unchanged either way.)
 ///
 /// This is the single definition of "qualifies" — the notification gate and
 /// the unread counter both end up here, so they cannot drift on what counts
@@ -755,11 +763,19 @@ pub fn notify_new_messages(
         .get(room_key)
         .copied()
         .unwrap_or_default();
-    let recent: Vec<AuthorizedMessageV1> = rooms
-        .map
-        .get(room_key)
-        .map(|rd| rd.room_state.recent_messages.messages.clone())
-        .unwrap_or_default();
+    // Only MentionsAndReplies needs the buffer, and it is the whole
+    // `max_recent_messages` window (ciphertext included), so `All` — the
+    // default — must not pay a deep clone of it on every delta.
+    let recent: Vec<AuthorizedMessageV1> =
+        if mode == crate::room_data::NotificationMode::MentionsAndReplies {
+            rooms
+                .map
+                .get(room_key)
+                .map(|rd| rd.room_state.recent_messages.messages.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
     drop(rooms);
     let external_messages: Vec<_> = match mode {
         crate::room_data::NotificationMode::All => external_messages,

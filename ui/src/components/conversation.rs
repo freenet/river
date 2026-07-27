@@ -731,8 +731,12 @@ pub(crate) fn try_decrypt_message_content(
     };
 
     match content {
-        // Public bodies are always readable; `decrypt_message_content`'s
-        // public arm has no placeholder path.
+        // A public body has no secret to be missing, so it is never
+        // "unreadable" in the sense this function is about. (A corrupt or
+        // forward-incompatible public payload still yields
+        // `to_string_lossy()`'s placeholder rather than `None` — nothing can
+        // make that body readable later, so there is no transient state to
+        // distinguish.)
         RoomMessageBody::Public { .. } => Some(decrypt_message_content(content, secrets)),
         RoomMessageBody::Private {
             content_type,

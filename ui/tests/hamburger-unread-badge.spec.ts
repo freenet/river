@@ -72,11 +72,19 @@ test.describe("Mobile hamburger unread badge", () => {
       timeout: 5_000,
     });
     await expect(badge).toHaveText(String(initialTotal), { timeout: 5_000 });
+    // Re-assert after another render pass (opening the panel). `toHaveText`
+    // passes on the FIRST matching poll, and the pre-update value matches, so
+    // a single check could pass against a stale frame — which would make this
+    // the one assertion here that can silently prove nothing.
+    await hamburger.click();
+    await expect(page.locator('[data-testid="room-list"]')).toBeVisible({
+      timeout: 5_000,
+    });
+    await expect(badge).toHaveText(String(initialTotal));
 
     // Now a room that DOES count. The read-marker write is deferred
     // (setTimeout 0), so wait for the badge to leave its value rather than
-    // sampling immediately.
-    await hamburger.click();
+    // sampling immediately. The panel is already open from the re-check above.
     await page.getByRole("button", { name: ALL_ROOMS[1] }).click();
     await expect(page.getByRole("heading", { name: ALL_ROOMS[1] })).toBeVisible({
       timeout: 5_000,
