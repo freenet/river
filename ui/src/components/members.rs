@@ -1274,13 +1274,24 @@ pub(crate) fn privilege_in_view(
     }
 }
 
-/// [`deputy_badges_for_viewer`] for a SINGLE member.
+/// [`deputy_badges_for_viewer`] for a SINGLE member. Same predicate, same
+/// tooltip; only the sweep is narrowed.
 ///
-/// The member-info modal wants one member's badge and is not memoised, so
-/// building the whole map there would decrypt every deputy's appointer
-/// nicknames on every render — in a private room that is an ECIES unseal per
-/// appointer per keystroke elsewhere in the app. Same predicate, same tooltip;
-/// only the sweep is narrowed.
+/// It exists because a caller wanting one member's badge should not decrypt
+/// every deputy's appointer nicknames — in a private room that is an ECIES
+/// unseal per appointer.
+///
+/// Its only caller today, the member-info modal, no longer collects that
+/// saving in full: since freenet/river#494 that modal ALSO builds the whole
+/// map, because `impersonation_checker_for_viewer` needs it to explain the ⚠
+/// in visible text (`title=` never fires on touch). The shield stays on this
+/// path deliberately — it is pinned by `modal_renders_deputy_shield_via_
+/// shared_helper` and by two Playwright specs — so the duplicate sweep is
+/// known and accepted on a click-opened, single-member surface. Reading the
+/// shield out of that map instead would be equivalent
+/// (`deputy_badges_for_viewer` keys are exactly the targets `badge_for_target`
+/// answers `Some` for), and is the obvious cleanup if this ever shows up in a
+/// profile.
 pub(crate) fn deputy_badge_for_viewer(
     members: &MembersV1,
     member_info: &river_core::room_state::member_info::MemberInfoV1,
@@ -7071,7 +7082,15 @@ mod tests {
         // cross-surface claim this test is named for, so that dropping the
         // modal fails the same test that would catch dropping either of the
         // other two.
-        let modal = include_str!("members/member_info_modal.rs");
+        // Cut at the modal's own test module: the needle below also appears
+        // inside `modal_passes_the_target_id_and_the_targets_own_privilege`'s
+        // argument pin, so scanning the whole file would make this assertion
+        // unfailable. (`member_info_modal.rs` has exactly one `#[cfg(test)]`,
+        // unlike `conversation.rs` above.)
+        let modal_src = include_str!("members/member_info_modal.rs");
+        let modal = &modal_src[..modal_src
+            .find("#[cfg(test)]")
+            .expect("member_info_modal.rs should have a `#[cfg(test)]` block")];
         assert!(
             modal.contains("impersonation_warning_for_display("),
             "the member-info modal no longer computes an impersonation \

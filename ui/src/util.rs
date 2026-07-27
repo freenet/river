@@ -334,6 +334,8 @@ pub async fn sleep(duration: Duration) {
 
 #[cfg(feature = "example-data")]
 mod name_gen;
+#[cfg(all(test, feature = "example-data"))]
+pub(crate) use name_gen::all_full_names;
 #[cfg(feature = "example-data")]
 pub use name_gen::random_full_name;
 

@@ -94,7 +94,9 @@ the wrong thing, all hit in one session (2026-07-25):
 - **A stale `dx` earlier on PATH.** `/opt/rust/bin/dx` was 0.7.3 against the
   crate's dioxus 0.7.9. It refuses to build and serves a 404 "dx is not serving
   a web app" page that reads exactly like a broken change; `~/.cargo/bin/dx`
-  was correct. Check `dx --version` against `ui/Cargo.toml` before debugging.
+  was correct. Check `dx --version` against the RESOLVED dioxus version —
+  `cargo tree -p dioxus` or `Cargo.lock`, NOT `ui/Cargo.toml`, which declares
+  `0.7.3` and would have confirmed the stale binary as correct.
 - **Port 8082 is shared.** It is the suite's default `baseURL`, so if another
   worktree already has a server on it, `npx playwright test` silently tests
   THAT build. Use a free port and set `PLAYWRIGHT_BASE_URL`.

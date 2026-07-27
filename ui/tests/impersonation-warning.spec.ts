@@ -115,9 +115,18 @@ test.describe("Impersonation warning (#489)", () => {
     // FLAGGED member's own name there would pass a non-empty check, and under
     // the two bar-class branches of `confusable_variant` the two names differ
     // by a single character — so it would also survive inspection by eye.
-    const deputyName = ((await rowsWithShield(page).first().textContent()) || "")
-      .replace(/[\u{1F6E1}\u{FE0F}\u{26A0}]/gu, "")
-      .trim();
+    // Read the NAME span rather than stripping glyphs out of the whole row:
+    // a row's text is "<nickname> <badges>", and the badge set is fixture-
+    // dependent (🌐 / 🔑 / 🎪 / 🔭 all render there under other conditions).
+    // Stripping a fixed glyph list would silently poison this string the first
+    // time the fixture grew another badge.
+    const deputyName = (
+      (await rowsWithShield(page)
+        .first()
+        .locator("span:not(.member-icon)")
+        .first()
+        .textContent()) || ""
+    ).trim();
     expect(deputyName, "could not read the deputy's name").not.toBe("");
 
     await rowsWithWarning(page).first().click();

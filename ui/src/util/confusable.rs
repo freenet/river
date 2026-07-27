@@ -380,7 +380,17 @@ impl ImpersonationWarning {
     /// `getByText`, `hasText` and `toContainText` and check each against the
     /// NEW text.
     ///
-    /// Pinned by `tooltip_contains_no_nickname_content`.
+    /// ## The leading clause is a UI label
+    ///
+    /// Everything before the FIRST colon is used verbatim as the member-info
+    /// modal's chip label, so this string must always start with a short label
+    /// followed by `:`. Drop the colon and the chip silently becomes the whole
+    /// sentence. Deriving it that way is deliberate — it is what stops that
+    /// surface inventing wording that drifts from this one definition — but it
+    /// makes the colon load-bearing rather than cosmetic.
+    ///
+    /// Pinned by `tooltip_contains_no_nickname_content` and
+    /// `tooltip_leads_with_a_short_label_before_a_colon`.
     pub fn tooltip(&self) -> String {
         if self.flagged_privilege.is_some() {
             return "Name conflict: this member's name is visually the same as \
@@ -3153,6 +3163,47 @@ mod tests {
             // ROLE is being imitated, and the badge to look for.
             assert!(baseline.contains("Impersonation warning"), "{baseline}");
             assert!(baseline.contains("is NOT"), "{baseline}");
+        }
+    }
+
+    /// The member-info modal takes everything before the FIRST colon as its
+    /// chip label (freenet/river#494), so the colon is load-bearing, not
+    /// punctuation. A reword that drops it — or that buries it a sentence in —
+    /// turns the chip into a paragraph, and nothing about the modal would say
+    /// so, because the label is derived rather than written.
+    #[test]
+    fn tooltip_leads_with_a_short_label_before_a_colon() {
+        for warning in [
+            ImpersonationWarning {
+                impersonated: ProtectedName::new(ProtectedRole::Deputy, "Anodyne", mid(1)),
+                tier: ConfusableTier::Identical,
+                flagged_privilege: None,
+            },
+            ImpersonationWarning {
+                impersonated: ProtectedName::new(ProtectedRole::Owner, "Anodyne", mid(1)),
+                tier: ConfusableTier::Identical,
+                flagged_privilege: None,
+            },
+            // The privileged branch, which has its own wording.
+            ImpersonationWarning {
+                impersonated: ProtectedName::new(ProtectedRole::Deputy, "Anodyne", mid(1)),
+                tier: ConfusableTier::Identical,
+                flagged_privilege: Some(ProtectedRole::Deputy),
+            },
+        ] {
+            let tip = warning.tooltip();
+            let label = tip
+                .split(':')
+                .next()
+                .expect("split always yields at least one part");
+            assert_ne!(
+                label, tip,
+                "the tooltip must contain a colon — the modal's chip label is                  the clause before it: {tip:?}"
+            );
+            assert!(
+                ["Impersonation warning", "Name conflict"].contains(&label),
+                "the chip label derived from this tooltip is {label:?}, which                  is not one of the two labels the modal is designed around.                  Either keep the leading clause short, or stop deriving the                  label in `member_info_modal.rs`."
+            );
         }
     }
 

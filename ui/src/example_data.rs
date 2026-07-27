@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// item: alternation makes messages == items, so the count is a guarantee
 /// rather than a hope.
 ///
-/// Sized to more than THREE windows (188 + the 12 standard messages = 200), so
+/// Sized to more than THREE windows (188 + the 13 standard messages = 201), so
 /// the backfill-paging spec takes several growth steps to exhaust the room and
 /// the #505 blocker-2 scenario (arrivals widening the rendered window past one
 /// whole growth step) is reachable with a single batched delivery. The room's
@@ -78,7 +78,7 @@ const AT_CAP_MAX_RECENT_MESSAGES: usize = 161;
 /// How deep a fixture room's message history is seeded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HistoryDepth {
-    /// The standard ~12-message fixture. Fits inside the render window, so
+    /// The standard ~13-message fixture. Fits inside the render window, so
     /// these rooms exercise the pre-window code path exactly as before.
     Standard,
     /// [`DEEP_HISTORY_FILLER_MESSAGES`] alternating-author fillers ahead of the
@@ -814,7 +814,8 @@ fn add_example_messages(
 /// generator happened to pick `Ian Clarke` — a fixture that reaches its own
 /// premise about 1 time in 1,000.
 ///
-/// Every branch is a TIER-1 collision by construction, for ANY input:
+/// The first three branches are a TIER-1 collision by construction for any
+/// ASCII input:
 ///
 /// * `I` -> `l` and `l` -> `I` swap one member of the fold's *bar class*
 ///   (`I`, `l`, `1`, `|`, `!` all fold to the same sentinel), so the VISUAL
@@ -823,8 +824,12 @@ fn add_example_messages(
 /// * A letter-for-digit swap from [`crate::util::confusable`]'s ASCII table
 ///   (`o`->`0`, `e`->`3`, `s`->`5`, `a`->`4`, `t`->`7`), which that table folds
 ///   straight back, so the skeleton is unchanged.
-/// * Uppercasing changes only case, so the CASE-INSENSITIVE skeleton is
-///   unchanged.
+/// * Uppercasing, for ASCII, changes only case, so the CASE-INSENSITIVE
+///   skeleton is unchanged. This one is NOT universal — `str::to_uppercase`
+///   is not case-only for every input (`ß` -> `SS`, `ﬁ` -> `FI` change
+///   length) — which is fine, because it is the fallback for inputs outside
+///   the generator's ASCII pools and the tests pin that it never fires for
+///   inputs inside them.
 ///
 /// **The branch ORDER is a demo decision, not an arbitrary one.** Measured
 /// exhaustively over the real pools (46 x 23 = 1,058 handles): `I`->`l` covers
@@ -835,9 +840,18 @@ fn add_example_messages(
 /// a developer reasonably reads as a FALSE POSITIVE. A fixture that teaches the
 /// reader to distrust the badge inverts its own purpose, and is the same
 /// "trains people to ignore the warning" harm the tier-1-only decision exists
-/// to avoid. The digit swap is checked first for that reason: all 544 of those
-/// handles contain at least one of `o/e/s/a/t`, so it covers the remainder
-/// completely and `B0b Smith (Member)` is what the demo shows.
+/// to avoid. The digit swap is tried BEFORE the uppercase fallback for that
+/// reason: all 544 of those handles contain at least one of `o/e/s/a/t`, so it
+/// covers the remainder completely and `B0b Smith (Member)` is what the demo
+/// shows.
+///
+/// The digit swap searches only the NAME, never the `" (Member)"` / `" (Owner)"`
+/// role suffix. The suffix contains an `e`, so an unconstrained search would
+/// always find a target there and quietly hide a name the pools cannot spoof —
+/// producing `Quinn Zhu (M3mber)`, which reads as a broken label rather than a
+/// spoofed name. `the_example_impostor_always_collides_with_the_deputy` pins
+/// that the swap lands inside the name for every handle the generator can
+/// produce.
 ///
 /// Uppercasing stays as a last resort for inputs outside the generator's pools.
 ///
@@ -860,7 +874,12 @@ fn confusable_variant(real: &str) -> String {
     }
     // Both cases: the visual fold lowercases, so `O` and `o` both end up at
     // `o`, which is where the table sends `0`.
-    for (i, c) in real.char_indices() {
+    //
+    // Searched over the NAME only — everything before the role suffix — so a
+    // name with none of `o/e/s/a/t` falls through to the fallback instead of
+    // silently mangling `" (Member)"` into `" (M3mber)"`.
+    let name_len = real.find(" (").unwrap_or(real.len());
+    for (i, c) in real[..name_len].char_indices() {
         if let Some((_, digit)) = DIGIT_FOR
             .iter()
             .find(|(letter, _)| c.eq_ignore_ascii_case(letter))
@@ -1035,32 +1054,52 @@ mod tests {
             );
         }
 
-        // The demo-QUALITY property, pinned rather than left to a comment: the
-        // uppercase fallback must be unreachable for every handle the generator
-        // can actually produce. It used to catch 51.4% of them, and
-        // `BOB SMITH (MEMBER)` beside `Bob Smith (Member)` reads as a false
-        // positive to anyone looking at the dev build — which teaches exactly
-        // the distrust of the badge this feature cannot afford.
-        for _ in 0..500 {
-            let real = random_full_name() + " (Member)";
-            assert_ne!(
-                confusable_variant(&real),
-                real.to_uppercase(),
-                "{real:?} fell through to the uppercase fallback; the demo now \
-                 shows a shouted name, which reads as a false positive"
-            );
-        }
-
-        // And against the REAL generator, which is what the fixture uses.
-        for _ in 0..500 {
-            let real = random_full_name() + " (Member)";
+        // Now against the real generator, EXHAUSTIVELY — all 1,058 handles, not
+        // a sample. Sampling ~40% of the product per run would turn a pool
+        // regression into an intermittent failure, and the doc above claims
+        // these numbers were measured over the whole pool, so the test should
+        // measure the whole pool too.
+        let mut checked = 0usize;
+        for name in crate::util::all_full_names() {
+            let real = name + " (Member)";
             let variant = confusable_variant(&real);
-            assert_ne!(variant, real);
+
+            assert_ne!(variant, real, "{real:?} produced no variant at all");
             assert!(
                 folds_together(&variant, &real),
                 "{variant:?} does not fold onto {real:?}"
             );
+
+            // The demo-QUALITY property, pinned rather than left to a comment:
+            // the uppercase fallback must be unreachable for every handle the
+            // generator can actually produce. It used to catch 51.4% of them,
+            // and `BOB SMITH (MEMBER)` beside `Bob Smith (Member)` reads as a
+            // false positive to anyone looking at the dev build — which teaches
+            // exactly the distrust of the badge this feature cannot afford.
+            assert_ne!(
+                variant,
+                real.to_uppercase(),
+                "{real:?} fell through to the uppercase fallback; the demo now \
+                 shows a shouted name, which reads as a false positive"
+            );
+
+            // …and the substitution must land in the NAME, never in the
+            // `" (Member)"` role suffix. `Quinn Zhu (M3mber)` would satisfy
+            // every assertion above while showing the reader a broken label
+            // rather than a spoofed name.
+            let suffix_at = real.find(" (").expect("the fixture appends a role");
+            assert_eq!(
+                &variant[suffix_at..],
+                &real[suffix_at..],
+                "{variant:?} mangled the role suffix instead of the name"
+            );
+            checked += 1;
         }
+        assert!(
+            checked > 1_000,
+            "premise: the enumeration must cover the whole pool product; only \
+             {checked} names were checked"
+        );
     }
 
     /// The end-to-end fixture precondition: in EVERY example room the viewer's
@@ -1130,8 +1169,12 @@ mod tests {
             assert_eq!(
                 flagged.len(),
                 1,
-                "exactly one member (the impostor) must be flagged; the deputy \
-                 is exempt from their OWN name and nobody else should collide"
+                "exactly one MEMBER (the impostor) must be flagged; the deputy \
+                 is exempt from their OWN name and nobody else should collide. \
+                 Note this sweeps `members.members`, which deliberately \
+                 excludes the owner — a warning wrongly painted on the OWNER is \
+                 caught by impersonation-warning.spec.ts, which renders the \
+                 owner as a row, not here"
             );
             assert!(
                 !deputy_badges.contains_key(&flagged[0]),
