@@ -168,14 +168,16 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
   // may truncate, and every badge is `flex-shrink-0`.
   test.use({ viewport: { width: 320, height: 568 } });
 
-  test("the ⚠ is still visible at 320px", async ({ page }) => {
+  /// Open Team Chat's member list at 320px.
+  ///
+  /// At 320px no room is selected yet and the room-list panel is hidden, so
+  /// the room cannot be clicked at all. `responsive-layout.spec.ts` hit the
+  /// same wall and solved it by selecting at desktop width and resizing back;
+  /// the LAYOUT under test is still the 320px one, which is what matters here.
+  async function openTeamChatAtNarrowWidth(page: Page) {
     await page.goto("/");
     await waitForApp(page);
 
-    // At 320px no room is selected yet and the room-list panel is hidden, so
-    // the room cannot be clicked at all. `responsive-layout.spec.ts` hit the
-    // same wall and solved it by selecting at desktop width and resizing back;
-    // the LAYOUT under test is still the 320px one, which is what matters here.
     const roomBtn = page.getByRole("button", { name: "Team Chat Room" });
     const vp = page.viewportSize();
     await page.setViewportSize({ width: 1280, height: vp?.height ?? 568 });
@@ -195,6 +197,10 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
 
     const memberList = page.locator('[data-testid="member-list"]');
     await memberList.waitFor({ state: "visible", timeout: 15_000 });
+  }
+
+  test("the ⚠ is still visible at 320px", async ({ page }) => {
+    await openTeamChatAtNarrowWidth(page);
 
     // FORCE the row to overflow before measuring anything.
     //
@@ -262,5 +268,69 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
         "container, which makes these numbers 0), so this test cannot " +
         "detect clipping",
     ).toBeGreaterThan(m.nameClientW);
+  });
+
+  // The reason this whole PR exists: `title=` never fires on touch, so the
+  // modal is the only place a phone user can READ the warning. A test that
+  // only ever opens it at 1280px would not have noticed if it were unreadable
+  // on the device the feature is for.
+  test("the modal's explanation is readable at 320px, and cannot widen the page", async ({
+    page,
+  }) => {
+    await openTeamChatAtNarrowWidth(page);
+
+    await rowsWithWarning(page).first().click();
+    await expect(page.locator(MODAL)).toBeVisible({ timeout: 15_000 });
+
+    const explanation = page.locator(MODAL_WARNING_TEXT);
+    await expect(explanation).toBeVisible();
+    await expect(explanation).toContainText(/is NOT a moderator/i);
+    await expect(page.locator(MODAL_IMITATED_NAME)).toBeVisible();
+
+    // The nickname in that chip is ATTACKER-CHOSEN, so it can be long and
+    // contain no break opportunity at all — which is the case
+    // `member_info_modal.rs`'s `max-w-full break-words` exists for. The
+    // fixture's generated names are short, so as with the row test above this
+    // has to force the condition or it measures nothing.
+    const forced = await page.locator(MODAL_IMITATED_NAME).evaluate((el) => {
+      const span = el as HTMLElement;
+      span.textContent = "W".repeat(160);
+
+      // PREMISE: the injected text must actually be wider than the panel that
+      // has to contain it. Measured on an off-screen clone with wrapping
+      // disabled, so this is the text's NATURAL width, not the wrapped one.
+      const probe = span.cloneNode(true) as HTMLElement;
+      probe.style.position = "absolute";
+      probe.style.left = "-9999px";
+      probe.style.whiteSpace = "nowrap";
+      probe.style.width = "max-content";
+      probe.style.maxWidth = "none";
+      document.body.appendChild(probe);
+      const naturalWidth = probe.getBoundingClientRect().width;
+      probe.remove();
+
+      const panel = span.closest('[data-testid="member-info-modal"]') as HTMLElement;
+      return { naturalWidth, panelWidth: panel.getBoundingClientRect().width };
+    });
+    expect(
+      forced.naturalWidth,
+      "the forced nickname is not wider than the modal panel, so nothing " +
+        "here could overflow and this test proves nothing",
+    ).toBeGreaterThan(forced.panelWidth);
+
+    // THE PROPERTY: a nickname nobody can break must not make the whole page
+    // scroll sideways. `scrollWidth` is read off the document element, so it
+    // catches the panel pushing the layout wide even when the chip itself
+    // reports a box that fits.
+    const overflow = await page.evaluate(() => ({
+      pageScrollWidth: document.documentElement.scrollWidth,
+      viewport: window.innerWidth,
+    }));
+    expect(
+      overflow.pageScrollWidth,
+      "an unbreakable nickname in the impersonation chip pushed the page " +
+        "wider than the viewport — the modal's `max-w-full break-words` is " +
+        "what prevents that",
+    ).toBeLessThanOrEqual(overflow.viewport + 1);
   });
 });
