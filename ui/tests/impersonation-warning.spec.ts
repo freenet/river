@@ -274,7 +274,7 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
   // modal is the only place a phone user can READ the warning. A test that
   // only ever opens it at 1280px would not have noticed if it were unreadable
   // on the device the feature is for.
-  test("the modal's explanation is readable at 320px, and cannot widen the page", async ({
+  test("the modal's explanation is readable at 320px", async ({
     page,
   }) => {
     await openTeamChatAtNarrowWidth(page);
@@ -296,9 +296,9 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
       const span = el as HTMLElement;
       span.textContent = "W".repeat(160);
 
-      // PREMISE: the injected text must actually be wider than the panel that
-      // has to contain it. Measured on an off-screen clone with wrapping
-      // disabled, so this is the text's NATURAL width, not the wrapped one.
+      // The text's NATURAL width, measured on an off-screen clone with
+      // wrapping disabled — that is what the premise below needs, not the
+      // wrapped width.
       const probe = span.cloneNode(true) as HTMLElement;
       probe.style.position = "absolute";
       probe.style.left = "-9999px";
@@ -310,27 +310,34 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
       probe.remove();
 
       const panel = span.closest('[data-testid="member-info-modal"]') as HTMLElement;
-      return { naturalWidth, panelWidth: panel.getBoundingClientRect().width };
+      return {
+        naturalWidth,
+        nameRight: span.getBoundingClientRect().right,
+        panelRight: panel.getBoundingClientRect().right,
+        panelWidth: panel.getBoundingClientRect().width,
+      };
     });
+
+    // THE PROPERTY, asserted before the premise for the same reason the row
+    // test does it: a broken layout should fail with the message that
+    // describes the bug. The page does NOT scroll sideways either way — an
+    // ancestor clips it — so measuring `document.scrollWidth` here would be
+    // vacuous. What actually breaks is the chip running out past the panel
+    // that is supposed to contain it: with `max-w-full break-words` removed,
+    // the measured right edge is ~2375px against a 320px panel.
+    expect(
+      forced.nameRight,
+      "an unbreakable nickname ran past the right edge of the modal panel, " +
+        "so a phone reader cannot see the name being imitated — the chip's " +
+        "`max-w-full break-words` is what prevents that",
+    ).toBeLessThanOrEqual(forced.panelRight + 1);
+
+    // PREMISE: without a name wider than the panel, nothing above could
+    // overflow and the assertion would hold with or without the fix.
     expect(
       forced.naturalWidth,
       "the forced nickname is not wider than the modal panel, so nothing " +
         "here could overflow and this test proves nothing",
     ).toBeGreaterThan(forced.panelWidth);
-
-    // THE PROPERTY: a nickname nobody can break must not make the whole page
-    // scroll sideways. `scrollWidth` is read off the document element, so it
-    // catches the panel pushing the layout wide even when the chip itself
-    // reports a box that fits.
-    const overflow = await page.evaluate(() => ({
-      pageScrollWidth: document.documentElement.scrollWidth,
-      viewport: window.innerWidth,
-    }));
-    expect(
-      overflow.pageScrollWidth,
-      "an unbreakable nickname in the impersonation chip pushed the page " +
-        "wider than the viewport — the modal's `max-w-full break-words` is " +
-        "what prevents that",
-    ).toBeLessThanOrEqual(overflow.viewport + 1);
   });
 });
