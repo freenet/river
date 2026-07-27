@@ -1227,11 +1227,15 @@ impl ComposableState for DirectMessagesV1 {
 
 /// Apply both retention caps and restore the canonical stored order.
 ///
-/// The order matters and is not interchangeable: the per-pair trim runs FIRST
-/// so the global trim can only ever shrink an already pair-legal set. Running
-/// the global trim first could leave a pair over
-/// [`MAX_DM_MESSAGES_PER_PAIR`] — which `verify` rejects — because the global
-/// trim keeps the newest room-wide, with no notion of pairs.
+/// The per-pair trim runs FIRST, and the order is load-bearing for RETENTION,
+/// not for legality: either order leaves every pair legal, because whichever
+/// trim runs last only shrinks the set further. What the swapped order loses is
+/// messages. Running the global trim first spends the global budget on DMs that
+/// the per-pair trim is about to discard anyway, so the surviving set can end up
+/// well BELOW the global cap while DMs that would have fitted were dropped —
+/// e.g. one busy pair holding the room's newest 150 DMs under a global cap of
+/// 200 yields 200 retained pair-first but only 150 global-first. Pinned by
+/// `pair_trim_runs_before_the_global_trim_so_the_budget_is_not_wasted`.
 ///
 /// Every step is a pure function of the held set, so the composition is too:
 /// two peers reaching the same union converge to the same state, and running

@@ -209,10 +209,24 @@ fn global_cap_bounds_the_whole_dm_set_keeping_the_newest() {
     // MAX_DM_MESSAGES_PER_PAIR and only the global cap can bite.
     let d = dms_holding_under(&r.state, &r.params, spread(&r, 0..150, 3));
 
+    let busiest_pair = d
+        .messages
+        .iter()
+        .fold(
+            std::collections::HashMap::<_, usize>::new(),
+            |mut acc, m| {
+                *acc.entry((m.message.sender, m.message.recipient))
+                    .or_default() += 1;
+                acc
+            },
+        )
+        .into_values()
+        .max()
+        .expect("state holds DMs");
     assert!(
-        150 / 3 < MAX_DM_MESSAGES_PER_PAIR,
-        "test premise: each pair must stay below the per-pair cap so this test \
-         isolates the global cap"
+        busiest_pair < MAX_DM_MESSAGES_PER_PAIR,
+        "test premise: no pair may reach the per-pair cap ({busiest_pair}), or \
+         the per-pair trim would be doing this test's work"
     );
     assert_eq!(
         d.messages.len(),
@@ -292,6 +306,50 @@ fn per_pair_cap_still_holds_under_a_generous_global_cap() {
     assert!(
         state.direct_messages.verify(&state, &r.params).is_ok(),
         "a state left over the PER-PAIR cap would fail verify"
+    );
+}
+
+/// Pins the ORDER of the two trims in `enforce_caps_and_sort`.
+///
+/// Either order leaves every pair legal — whichever runs last only shrinks the
+/// set — so legality cannot detect a swap. What a swap loses is RETENTION: the
+/// global trim would spend the budget on DMs the per-pair trim then discards,
+/// leaving the peer below its own cap while DMs that would have fitted were
+/// dropped.
+///
+/// One busy pair holds the room's newest 150 DMs (over the per-pair cap of
+/// 100); three quiet pairs hold 100 older ones; the global cap is 200.
+/// Pair-first retains the full 200. Global-first would keep the newest 200
+/// (all 150 busy + 50 quiet), then cut the busy pair to 100 — only 150.
+#[test]
+fn pair_trim_runs_before_the_global_trim_so_the_budget_is_not_wasted() {
+    let r = room(8, Some(200));
+
+    let mut msgs: Vec<AuthorizedDirectMessage> = spread(&r, 0..100, 3);
+    msgs.extend((100..250).map(|o| dm(&r, 6, 7, o)));
+
+    let d = dms_holding_under(&r.state, &r.params, msgs);
+
+    assert_eq!(
+        d.messages.len(),
+        200,
+        "the per-pair trim must run FIRST: trimming globally first spends the \
+         200-DM budget on messages the per-pair cap then discards, leaving only \
+         150 retained"
+    );
+    let busy = d
+        .messages
+        .iter()
+        .filter(|m| m.message.sender == r.id(6))
+        .count();
+    assert_eq!(
+        busy, MAX_DM_MESSAGES_PER_PAIR,
+        "busy pair capped at its own cap"
+    );
+    assert_eq!(
+        d.messages.len() - busy,
+        100,
+        "quiet pairs keep all their DMs"
     );
 }
 
