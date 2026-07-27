@@ -925,7 +925,10 @@ impl ComposableState for DirectMessagesV1 {
     /// the SUMMARIZING peer's own state. Passing a cheap
     /// `ChatRoomStateV1::default()` sentinel reads the DEFAULT cap instead of
     /// the room's, understating the horizon and re-opening the resend loop.
-    /// Pinned by `merge_uses_room_state_as_parent_so_horizon_is_correct`.
+    /// The DM-side pin is
+    /// `dm_global_cap_test::whole_state_gossip_under_the_cap_converges_and_stays_verifiable`
+    /// (the messages-side `merge_uses_room_state_as_parent_so_horizon_is_correct`
+    /// would not catch a DM-specific regression).
     fn summarize(
         &self,
         parent_state: &Self::ParentState,
@@ -1347,7 +1350,7 @@ fn trim_to_global_cap(s: &mut DirectMessagesV1, max_direct_messages: usize) {
     // stays. Keys are unique — `enforce_caps_and_sort` runs `dedup_by_signature`
     // first, and a signature is unique per message — so this keeps exactly
     // `max_direct_messages`. Without that dedup a repeated cutoff key would
-    // make this retain nothing.
+    // make this drop nothing, leaving the peer permanently over cap.
     s.messages.retain(|m| m.order_key() >= cutoff);
 }
 

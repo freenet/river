@@ -860,7 +860,7 @@ fn merge_incoming_state(
 /// Scope note: this asserts quiescence of the DIRECT-MESSAGE channel, not of
 /// the whole delta. The MEMBERS channel does not go quiet, for reasons that
 /// predate this PR entirely — see
-/// `member_prune_reoffer_loop_is_pre_existing_and_not_caused_by_the_dm_cap`.
+/// `member_prune_reoffer_loop_mechanism_predates_the_dm_cap`.
 #[test]
 fn whole_state_gossip_under_the_cap_converges_and_stays_verifiable() {
     const CAP: usize = 8;
@@ -913,9 +913,13 @@ fn whole_state_gossip_under_the_cap_converges_and_stays_verifiable() {
         );
 
         if dm_offer(&b, &a) == 0 && dm_offer(&a, &b) == 0 {
-            assert!(
-                a.direct_messages.messages.len() <= CAP,
-                "the global cap must hold on the whole-state path"
+            // `== CAP`, not `<= CAP`: the union here is far larger than the cap,
+            // so a mutation that cleared the set entirely would satisfy `<=` and
+            // every assertion below it.
+            assert_eq!(
+                a.direct_messages.messages.len(),
+                CAP,
+                "the global cap must hold exactly on the whole-state path"
             );
             assert_eq!(
                 a.direct_messages, b.direct_messages,
@@ -927,14 +931,30 @@ fn whole_state_gossip_under_the_cap_converges_and_stays_verifiable() {
                 "test premise: the trim must actually have pruned members, or this \
                  test never exercises the feedback loop it exists for"
             );
+            // RECORDED, not asserted-away: the member sets do NOT agree here. A
+            // has run cleanup and pruned; B has had nothing to apply, so it has
+            // not. That residual is the MembersV1 non-monotonicity characterised
+            // by `member_prune_reoffer_loop_mechanism_predates_the_dm_cap` — the
+            // cap makes it reachable in this fixture, but does not cause the
+            // mechanism, and it resolves as soon as B applies any delta. Pinned
+            // so the day MembersV1 gets a horizon this becomes an equality and
+            // someone has to look.
+            assert_ne!(
+                a.members.members.len(),
+                b.members.members.len(),
+                "the member sets now AGREE — MembersV1's non-monotonicity has \
+                 apparently been fixed. Good news: turn this into an assert_eq \
+                 and update the known-gap test."
+            );
             return;
         }
     }
     panic!("the DM channel never went quiet within 12 rounds");
 }
 
-/// Characterises a PRE-EXISTING loop that this PR does not cause and does not
-/// fix, so the next reader does not mistake it for a regression of the DM cap.
+/// Characterises a loop whose MECHANISM predates this PR, so the next reader
+/// does not mistake it for a regression of the DM cap — while being explicit
+/// that the cap does make it more reachable.
 ///
 /// `post_apply_cleanup` prunes members that nothing pins, but `MembersV1`'s
 /// summary/delta has no retention horizon — so a peer that has pruned re-offers
@@ -944,19 +964,25 @@ fn whole_state_gossip_under_the_cap_converges_and_stays_verifiable() {
 /// as deferred, alongside `BansV1`.
 ///
 /// It is reproducible on `origin/main` with **zero DMs involved** — which is
-/// what this test pins, deliberately using no DMs at all. The DM cap therefore
-/// cannot be its cause. What the DM cap does change is EXPOSURE: DM
-/// participants used to be exempt from the prune (bug #519), and now they are
-/// not, so more members fall into the pruned-and-re-offered population. It
+/// what this test pins, deliberately using no DMs at all. So the cap did not
+/// introduce the mechanism.
+///
+/// It DOES increase exposure to it, and that should not be buried: DM
+/// participants were previously exempt from the prune (which is bug #519
+/// itself), so making them prunable moves members into the
+/// pruned-and-re-offered population that would never have entered it before.
+/// `whole_state_gossip_under_the_cap_converges_and_stays_verifiable` reaches
+/// precisely that state, and records it rather than hiding it. The loop
 /// self-heals in any room with traffic, because the lagging peer runs
-/// `post_apply_cleanup` as soon as it applies any delta.
+/// `post_apply_cleanup` as soon as it applies any delta — but the loop itself
+/// never supplies that traffic.
 ///
 /// Inverted assertion, in the same style as
 /// `retention_loop_test.rs::ban_sweep_reopening_the_horizon_still_loops_known_gap`:
 /// the day `MembersV1` gets a horizon, this test fails and forces whoever fixed
 /// it to flip the polarity.
 #[test]
-fn member_prune_reoffer_loop_is_pre_existing_and_not_caused_by_the_dm_cap() {
+fn member_prune_reoffer_loop_mechanism_predates_the_dm_cap() {
     let r = room(10, Some(500));
 
     // Members pinned by NOTHING: no DMs, no messages, no secrets, no bans.
@@ -1012,15 +1038,21 @@ fn member_prune_reoffer_loop_is_pre_existing_and_not_caused_by_the_dm_cap() {
 /// with the member set still pinned.
 #[test]
 fn duplicate_entries_do_not_defeat_the_global_cap() {
-    const CAP: usize = 20;
+    const CAP: usize = 25;
     let r = room(6, Some(CAP));
 
-    // 30 copies of the single oldest DM (well under the per-pair cap, so the
-    // pair trim does not clear them) plus 25 distinct newer ones. The cutoff
-    // rank lands inside the duplicate run, which is the degenerate case.
-    let oldest = dm(&r, 0, 1, 0);
-    let mut messages: Vec<AuthorizedDirectMessage> = vec![oldest.clone(); 30];
-    messages.extend(spread(&r, 100..125, 3));
+    // The duplicate run must straddle the cutoff RANK, or the test is vacuous.
+    // 20 older distinct + 30 copies of ONE mid-range DM + 10 newer distinct =
+    // 60 entries; `excess = 60 - 25 = 35`, and ranks 20..49 are the duplicates,
+    // so rank 35 IS the repeated key. `retain(>= cutoff)` then keeps 40 rather
+    // than 25. Putting the duplicates at the OLDEST position instead (the
+    // obvious fixture) is unreachable: the cutoff rank always lands above the
+    // run, so the trim behaves identically with and without dedup and the test
+    // passes either way.
+    let duplicated = dm(&r, 0, 1, 150);
+    let mut messages: Vec<AuthorizedDirectMessage> = spread(&r, 100..120, 3);
+    messages.extend(std::iter::repeat_n(duplicated.clone(), 30));
+    messages.extend(spread(&r, 200..210, 3));
 
     let mut d = DirectMessagesV1::default();
     d.messages = messages;
@@ -1032,11 +1064,13 @@ fn duplicate_entries_do_not_defeat_the_global_cap() {
         CAP,
         "duplicates made the global trim a no-op, leaving the set over cap"
     );
-    assert!(
-        !d.messages
+    assert_eq!(
+        d.messages
             .iter()
-            .any(|m| m.sender_signature == oldest.sender_signature),
-        "the duplicated oldest DM should have been trimmed away entirely"
+            .filter(|m| m.sender_signature == duplicated.sender_signature)
+            .count(),
+        1,
+        "the duplicated DM must survive exactly once"
     );
 }
 

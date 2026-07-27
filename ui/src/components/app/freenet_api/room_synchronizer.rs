@@ -149,11 +149,17 @@ fn outbound_summary(
     //
     // That is not hypothetical. `MembersV1` (`remove_excess_members`) and
     // `BansV1` (`max_user_bans`) have the same non-monotonic defect and are
-    // deferred to a follow-up — see "Not fixed here". The moment that follow-up
-    // adds `MembersSummary.horizon`, a struct-update spread here would compile
-    // clean and silently reintroduce this exact bug on a new field: a device
-    // withholding its own member records from every outgoing update, baseline
-    // advancing anyway, never retried.
+    // deferred to a follow-up — see "Not fixed here".
+    //
+    // Scope of the guard, stated precisely because overstating it is what let
+    // freenet/river#519 through: the top-level destructure catches a new field
+    // on `ChatRoomStateV1Summary` ITSELF, and the two leaf destructures below
+    // catch one added to `MessagesSummary` or `DirectMessagesSummary`. The other
+    // seven leaf summaries — `members`, `bans`, `member_info`, `secrets`,
+    // `configuration`, `upgrade`, `version` — are bound whole and are NOT
+    // guarded. So when the `MembersV1` follow-up adds `MembersSummary.horizon`,
+    // nothing here will fail to compile; whoever writes it must remember to
+    // neutralise it and destructure that leaf too.
     let ChatRoomStateV1Summary {
         configuration,
         bans,
