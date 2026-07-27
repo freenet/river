@@ -680,6 +680,13 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // so tagging there is flaky by construction rather than by timing. The
     // rows just above the fold are the newest ones; they survive the drain,
     // and holding THEM still is the property under test.
+    //
+    // Deliberately NO settle wait before delivering: the batch lands while
+    // the reader's `scrollend` is still in flight, so this also covers the
+    // pre-settle window, where `pinned_to_bottom` is stale-true and only
+    // `reader_moved_up_since` stands the follow paths down. That is exactly
+    // what the relative `last_scroll_top` update protects, so the test would
+    // go quiet about it if it waited the pin out first.
     const parkedAt = Math.max(
       0,
       (await historyHeight(page)) - (await viewportHeight(page)) - 400
@@ -688,21 +695,6 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-    // Wait out the reader's scrollend before delivering. "Parked" means their
-    // scroll has SETTLED — which is when the pin learns they left the bottom.
-    //
-    // Delivering INSIDE that ~120ms window hits #508, which is pre-existing
-    // and NOT what this test is about: while the pin is still stale-true, the
-    // patch momentarily shrinks the content below the reader's own offset, so
-    // `reader_moved_up_since`'s `.min(max_scroll_top(..))` clamp reads them as
-    // at the bottom and the FOLLOW path scrolls them there. Verified by
-    // removing this wait and re-running: 2/4 red on mobile Safari (chromium
-    // and firefox clean), and in the red runs `scrollTop` lands on exactly
-    // `max_scroll_top` — `scroll_history_to_bottom`'s signature, not this
-    // PR's compensation, which writes `scroll_top + shift` and is observed
-    // working in the green runs (7965 -> 7272, probed row held). The
-    // bottom-settle trim that follows the yank is what removes the row.
-    await page.waitForTimeout(400);
 
     const probe = await tagVisibleRow(page, "__riverProbeBatch");
     expect(

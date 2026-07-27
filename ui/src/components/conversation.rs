@@ -1972,6 +1972,7 @@ fn install_scroll_pin_listeners(
     window_anchor: Rc<std::cell::RefCell<Option<WindowAnchor>>>,
     window_overgrown: Rc<std::cell::Cell<bool>>,
     window_rendered: Rc<std::cell::Cell<usize>>,
+    trim_landed: Rc<std::cell::Cell<bool>>,
 ) -> bool {
     use wasm_bindgen::prelude::*;
 
@@ -1990,6 +1991,7 @@ fn install_scroll_pin_listeners(
         let last_top = last_top.clone();
         let window_anchor = window_anchor.clone();
         let window_overgrown = window_overgrown.clone();
+        let trim_landed = trim_landed.clone();
         Closure::wrap(Box::new(move || {
             let Some(container) = chat_scroll_container() else {
                 return;
@@ -2043,6 +2045,16 @@ fn install_scroll_pin_listeners(
                 window_overgrown.set(false);
                 let window_anchor = window_anchor.clone();
                 let mut window_items = window_items;
+                // The trim removes rows ABOVE a view that is at the bottom, so
+                // the browser clamps `scrollTop` down by their height. That
+                // clamp is OURS, but `last_scroll_top` still holds the
+                // pre-trim bottom, so an arrival that grows the content back
+                // before the clamp's settle lands makes
+                // `reader_moved_up_since` read the clamp as the reader
+                // scrolling up — and the follow stands down, leaving them a
+                // row short of the newest message. Flagged here and repaired
+                // by the effect that watches `window_items`.
+                trim_landed.set(true);
                 crate::util::defer(move || {
                     *window_anchor.borrow_mut() = None;
                     window_items.set(INITIAL_WINDOW_ITEMS);
@@ -2143,6 +2155,10 @@ pub fn Conversation() -> Element {
     // `install_scroll_pin_listeners` has anything to do. Maintained by render,
     // read from the raw settle callback (which cannot touch signals).
     let window_overgrown = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+    // Set when the settle handler schedules a trim, cleared once the view has
+    // been re-anchored to the bottom afterwards. See the trim site in
+    // `install_scroll_pin_listeners` for why the re-anchor is required.
+    let trim_landed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
     // A pending "keep the parked reader's view still" adjustment: when a
     // render swaps the window head for a LATER item (the head was pruned out
     // from under the anchor, or a ceiling trim dropped it), the rows above
@@ -2202,6 +2218,7 @@ pub fn Conversation() -> Element {
             *window_anchor.borrow_mut() = None;
             window_rendered.set(0);
             window_overgrown.set(false);
+            trim_landed.set(false);
             *reposition_pending.borrow_mut() = None;
             // A capture from the OLD room's geometry must not restore into
             // the new room (#505 re-review).
@@ -2252,6 +2269,37 @@ pub fn Conversation() -> Element {
                 // snap has landed (#501 H2).
                 opening_snap_done.set(false);
             }
+        });
+    }
+
+    // Re-anchor to the bottom after a TRIM. The trim only ever runs from a
+    // settle that landed at the bottom, so "at the bottom" is where the view
+    // belongs afterwards — but the rows it removes are ABOVE the viewport, so
+    // the browser clamps `scrollTop` down by their height while
+    // `last_scroll_top` still holds the pre-trim bottom. Left alone, that gap
+    // reads as the reader having scrolled up (`reader_moved_up_since`), and
+    // an arrival landing before the clamp's settle is NOT followed — the
+    // reader sits a row short of the newest message, and a taller row would
+    // push them past `BOTTOM_THRESHOLD_PX` and clear the pin for good.
+    // Routing through `scroll_history_to_bottom` fixes both halves: it puts
+    // the view on the bottom and records that offset as ours.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let trim_landed = trim_landed.clone();
+        let pinned_to_bottom = pinned_to_bottom.clone();
+        let last_scroll_top = last_scroll_top.clone();
+        use_effect(move || {
+            // Subscribe, so this runs after the render the trim caused.
+            let _ = window_items();
+            if !trim_landed.get() {
+                return;
+            }
+            trim_landed.set(false);
+            scroll_history_to_bottom(
+                &pinned_to_bottom,
+                &last_scroll_top,
+                web_sys::ScrollBehavior::Instant,
+            );
         });
     }
 
@@ -2575,6 +2623,7 @@ pub fn Conversation() -> Element {
         let window_anchor = window_anchor.clone();
         let window_overgrown = window_overgrown.clone();
         let window_rendered = window_rendered.clone();
+        let trim_landed = trim_landed.clone();
         let installed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
         use_effect(move || {
             let _retry_on_content_change = message_groups.read().is_some();
@@ -2588,6 +2637,7 @@ pub fn Conversation() -> Element {
                 window_anchor.clone(),
                 window_overgrown.clone(),
                 window_rendered.clone(),
+                trim_landed.clone(),
             ) {
                 installed.set(true);
             }
@@ -8398,6 +8448,17 @@ mod autoscroll_wiring_pins {
             dense.contains("ifdistance<=SCROLL_TOP_SLACK_PXasf64&&window_overgrown.get()"),
             "the settle handler must trim the grown window when a settle — \
              the reader's or ours — lands at the exact bottom"
+        );
+        assert!(
+            dense.contains("trim_landed.set(true);"),
+            "a trim must flag itself so the view is re-anchored to the bottom \
+             afterwards: the rows it removes are above the viewport, and the \
+             browser's clamp otherwise reads as the reader scrolling up, so \
+             the next arrival is not followed"
+        );
+        assert!(
+            dense.contains("if!trim_landed.get(){return;}"),
+            "the re-anchor effect must consume the trim flag"
         );
         assert!(
             dense.contains("&&!trim_would_rearm_backfill("),
