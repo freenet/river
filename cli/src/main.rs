@@ -313,4 +313,21 @@ mod cli_tests {
         let err = parse_signing_key_bytes(&raw).expect_err("must reject empty input");
         assert!(err.contains("0 bytes"), "msg: {}", err);
     }
+
+    #[test]
+    fn message_actions_accept_negative_signed_message_ids() {
+        let cases: &[&[&str]] = &[
+            &["river", "message", "edit", "room", "-23", "replacement"],
+            &["river", "message", "delete", "room", "-23"],
+            &["river", "message", "react", "room", "-23", "👍"],
+            &["river", "message", "unreact", "room", "-23", "👍"],
+            &["river", "message", "reply", "room", "-23", "response"],
+        ];
+        for arguments in cases {
+            assert!(
+                Cli::try_parse_from(*arguments).is_ok(),
+                "failed to parse {arguments:?}"
+            );
+        }
+    }
 }

@@ -28,6 +28,15 @@ pub enum MemberCommands {
         room_id: String,
         /// Member ID to ban (8-character short ID from member list)
         member_id: String,
+        /// Refuse prefix/case-folded resolution; the supplied ID must match exactly.
+        #[arg(long)]
+        require_exact_member_id: bool,
+        /// Refuse if banning this member would also remove invite descendants.
+        #[arg(long)]
+        require_no_descendants: bool,
+        /// Refuse if any current canonical member record deputizes this member.
+        #[arg(long)]
+        require_not_deputy: bool,
     },
     /// Deputize a member so they can help moderate (ban) within your invite subtree
     Deputize {
@@ -202,7 +211,13 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
             }
             Ok(())
         }
-        MemberCommands::Ban { room_id, member_id } => {
+        MemberCommands::Ban {
+            room_id,
+            member_id,
+            require_exact_member_id,
+            require_no_descendants,
+            require_not_deputy,
+        } => {
             if !matches!(format, OutputFormat::Json) {
                 eprintln!("Banning member '{}' from room: {}", member_id, room_id);
             }
@@ -219,7 +234,15 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
             let owner_vk = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
                 .map_err(|e| anyhow!("Invalid room ID: {}", e))?;
 
-            match api.ban_member(&owner_vk, &member_id).await {
+            let safety = crate::api::BanSafety {
+                require_exact_member_id,
+                require_no_descendants,
+                require_not_deputy,
+            };
+            match api
+                .ban_member_with_safety(&owner_vk, &member_id, safety)
+                .await
+            {
                 Ok(()) => match format {
                     OutputFormat::Human => {
                         println!(
@@ -550,6 +573,35 @@ mod tests {
         let mut argv = vec!["member"];
         argv.extend_from_slice(args);
         TestCli::try_parse_from(argv).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn ban_safety_flags_are_explicit_and_closed() {
+        match parse(&[
+            "ban",
+            "ROOM",
+            "ABCDEFGH",
+            "--require-exact-member-id",
+            "--require-no-descendants",
+            "--require-not-deputy",
+        ])
+        .expect("must parse")
+        {
+            MemberCommands::Ban {
+                room_id,
+                member_id,
+                require_exact_member_id,
+                require_no_descendants,
+                require_not_deputy,
+            } => {
+                assert_eq!(room_id, "ROOM");
+                assert_eq!(member_id, "ABCDEFGH");
+                assert!(require_exact_member_id);
+                assert!(require_no_descendants);
+                assert!(require_not_deputy);
+            }
+            other => panic!("wrong subcommand: {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     #[test]
