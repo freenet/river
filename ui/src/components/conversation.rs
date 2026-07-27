@@ -1825,9 +1825,10 @@ fn first_history_row_offset(keys: &[String]) -> Option<(String, i32)> {
     let container = chat_scroll_container()?;
     let rows = container.query_selector_all("[data-item-key]").ok()?;
     // Candidate key -> offsetTop. Bounded by `keys.len()`, not by the rendered
-    // window: measuring every row would cost an `offsetTop` and a `String`
-    // allocation per row (up to the ceiling, 240) on a path that runs per
-    // arrival in an at-cap room.
+    // window: measuring every row cost an `offsetTop` and a map insert per row
+    // (up to the ceiling, 240) on a path that runs per arrival in an at-cap
+    // room. The `String` per row is NOT saved — `get_attribute` allocates one
+    // either way; what this avoids is the layout read and the insert.
     let mut present: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
     for i in 0..rows.length() {
         if present.len() == keys.len() {
@@ -2054,9 +2055,13 @@ fn install_scroll_pin_listeners(
                 // scrolling up — and the follow stands down, leaving them a
                 // row short of the newest message. Flagged here and repaired
                 // by the effect that watches `window_items`.
-                trim_landed.set(true);
+                let trim_landed = trim_landed.clone();
                 crate::util::defer(move || {
                     *window_anchor.borrow_mut() = None;
+                    // Raised in the SAME task as the write it describes, so
+                    // no other `window_items` writer can run between the two
+                    // and consume a flag meant for this trim.
+                    trim_landed.set(true);
                     window_items.set(INITIAL_WINDOW_ITEMS);
                 });
             }
@@ -2172,8 +2177,12 @@ pub fn Conversation() -> Element {
     // clamps `scrollTop` down on its own when a patch shortens the content,
     // and it does so BEFORE the effect runs: computing the target from the
     // post-clamp offset would apply the shift on top of the clamp and
-    // over-shift the reader (#505 delta review). Capture and effect run in
-    // the same task, so the captured offset cannot go stale.
+    // over-shift the reader (#505 delta review). This is a TRADE, not a
+    // strict improvement — a live read is immune to the reader scrolling
+    // between render and effect, a captured one is immune to the browser's
+    // clamp. The clamp is the far more frequent hazard here (every
+    // head-removing patch that shortens the content), and `BackfillAnchor`
+    // already captures its offset even earlier for the same reason.
     let reposition_pending =
         use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, i32, i32)>)));
     // The backfill sentinel's capture, consumed by the restore effect. See
@@ -2295,6 +2304,24 @@ pub fn Conversation() -> Element {
                 return;
             }
             trim_landed.set(false);
+            let Some(container) = chat_scroll_container() else {
+                return;
+            };
+            // The trim fired from a settle AT the bottom, but this effect runs
+            // a task later — long enough on a mid-range phone for the reader
+            // to have started swiping up. Re-anchoring then yanks them back,
+            // re-arms the pin, and records their position as ours, so their
+            // own `scrollend` is discarded and nothing self-corrects inside
+            // the gesture. Both halves are needed and neither subsumes the
+            // other: the pin catches a reader whose settle beat this effect,
+            // the distance catches one still inside the pre-settle window.
+            // Same shape as the arrival snap's gate.
+            if !pinned_to_bottom.get()
+                || (max_scroll_top(&container) - container.scroll_top()) as f64
+                    > BOTTOM_THRESHOLD_PX
+            {
+                return;
+            }
             scroll_history_to_bottom(
                 &pinned_to_bottom,
                 &last_scroll_top,
@@ -8459,6 +8486,42 @@ mod autoscroll_wiring_pins {
         assert!(
             dense.contains("if!trim_landed.get(){return;}"),
             "the re-anchor effect must consume the trim flag"
+        );
+        // Consuming the flag is not the repair — SCROLLING is. Deleting the
+        // scroll call leaves the assertions above passing with the fix gone,
+        // so the repair itself is pinned here.
+        assert!(
+            dense.contains("trim_landed.set(false);letSome(container)=chat_scroll_container()"),
+            "the re-anchor effect must go on to measure the container after \
+             consuming the flag"
+        );
+        assert!(
+            dense.contains(
+                "if!pinned_to_bottom.get()||(max_scroll_top(&container)-container.scroll_top())asf64>BOTTOM_THRESHOLD_PX"
+            ),
+            "the re-anchor must stand down for a reader who has started \
+             moving inside the flag-to-effect window — it is otherwise the \
+             one unguarded programmatic scroll in the file"
+        );
+        assert_eq!(
+            dense
+                .matches(
+                    "scroll_history_to_bottom(&pinned_to_bottom,&last_scroll_top,web_sys::ScrollBehavior::Instant,);"
+                )
+                .count(),
+            2,
+            "both the arrival snap and the trim re-anchor must scroll through \
+             `scroll_history_to_bottom`, which is what records the offset as \
+             ours; consuming the trim flag without scrolling silently reverts \
+             the fix"
+        );
+        // Without the read the effect never re-runs — it would fire once at
+        // mount and then go silent, which no other assertion can see.
+        assert_eq!(
+            dense.matches("let_=window_items();").count(),
+            2,
+            "the trim re-anchor and the backfill restore must each subscribe \
+             to `window_items`"
         );
         assert!(
             dense.contains("&&!trim_would_rearm_backfill("),

@@ -561,6 +561,17 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // follow snap settles at the bottom, and that settle trims the window
     // back toward its initial size. Polled because the last settle's trim
     // lands asynchronously.
+    //
+    // NOTE on what this test does and does not guard. It is what CAUGHT the
+    // trim/re-anchor bug (a trim shrinks the content, the browser clamps
+    // scrollTop, and an arrival landing before that clamp's settle was not
+    // followed) — but it only failed 5 runs in 16, so under the suite's
+    // `retries: 2` a regression has roughly a 3% chance of failing CI hard.
+    // The timing is not practical to force deterministically from a browser
+    // test. The DETERMINISTIC guard is the source pin
+    // `the_window_trims_at_the_bottom_and_backfill_defers_to_the_pin` in
+    // conversation.rs, which pins the flag, the guard and the scroll call;
+    // do not assume this test covers a revert.
     await expect
       .poll(() => renderedRowCount(page), {
         timeout: 5_000,
