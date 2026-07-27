@@ -467,6 +467,13 @@ pub(crate) enum SubscribeAck {
     NotYet,
 }
 
+/// Cap on responses buffered while awaiting the SUBSCRIBE acknowledgement.
+///
+/// Small on purpose: each queued notification only triggers a full-state
+/// re-fetch, so keeping more than a handful buys nothing, while an unbounded
+/// queue fed by the node would be a memory amplification vector.
+pub(crate) const MAX_PENDING_DURING_HANDSHAKE: usize = 16;
+
 pub(crate) fn classify_subscribe_response(response: &HostResponse) -> SubscribeAck {
     match response {
         HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
@@ -5263,8 +5270,19 @@ impl ApiClient {
                     // the socket, so it goes through exactly the same handling
                     // it would have had if it arrived a moment later.
                     SubscribeAck::NotYet => {
-                        debug!("Response overtook the SUBSCRIBE ack, queuing it: {response:?}");
-                        pending.push_back(response);
+                        // Bounded because the node feeds this queue and a busy
+                        // room can emit a lot inside the handshake window; an
+                        // unbounded queue here would be a memory amplification
+                        // vector. Collapsing is lossless: the handler below
+                        // discards the delta (`let _ = update;`) and re-fetches
+                        // authoritative full state, so N queued notifications
+                        // produce exactly the same result as one.
+                        if pending.len() < MAX_PENDING_DURING_HANDSHAKE {
+                            debug!("Response overtook the SUBSCRIBE ack, queuing it");
+                            pending.push_back(response);
+                        } else {
+                            debug!("Response overtook the SUBSCRIBE ack; queue full, collapsing");
+                        }
                     }
                 }
             }
@@ -7748,6 +7766,19 @@ mod subscribe_handshake_tests {
         assert_eq!(
             classify_subscribe_response(&ack(false)),
             SubscribeAck::Refused
+        );
+    }
+
+    /// The queue the streaming path fills during the handshake is fed by the
+    /// node, so it must be bounded (`.claude/rules` — never an unbounded
+    /// collection an external actor can grow). Collapsing is lossless because
+    /// each notification only triggers a full-state re-fetch.
+    #[test]
+    fn the_handshake_queue_is_bounded() {
+        assert!(
+            MAX_PENDING_DURING_HANDSHAKE > 0 && MAX_PENDING_DURING_HANDSHAKE <= 64,
+            "handshake queue must be bounded and small; an unbounded queue fed \
+             by the node is a memory amplification vector"
         );
     }
 
