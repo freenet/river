@@ -1594,11 +1594,15 @@ fn relocate_window(
 ///   the first `k` candidates cannot have pre-patch rows either.
 ///
 /// A head-only — or too-short — probe dead-fires, and the parked reader is
-/// left uncompensated. Sized to [`WINDOW_ANCHOR_KEYS`] so the walk always
-/// outlasts the deepest spare the anchor can relocate through (`k <=
-/// WINDOW_ANCHOR_KEYS - 1`, needing `k + 1` candidates). For a
-/// top-contiguous removal every surviving row at or below the head shifts by
-/// the same amount, so whichever candidate lands measures the shift exactly.
+/// left uncompensated. Sized to [`WINDOW_ANCHOR_KEYS`] so the walk covers the
+/// SPARE term exactly (`k <= WINDOW_ANCHOR_KEYS - 1`, needing `k + 1`
+/// candidates). The full count of leading candidates without pre-patch rows is
+/// `k + (relocated.start - history_window.start)`, and that second term is
+/// non-zero only when `resolve` pulls the start back below the relocated head
+/// — the bulk mid-window removal `relocate_window` already declares
+/// out of scope. For a top-contiguous removal every surviving row at or below
+/// the head shifts by the same amount, so whichever candidate lands measures
+/// the shift exactly.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const REPOSITION_PROBE_ROWS: usize = WINDOW_ANCHOR_KEYS;
 
@@ -1805,26 +1809,41 @@ fn history_row_offset_top(key: &str) -> Option<i32> {
 /// The first of `keys` (in order) that has a row in the CURRENT DOM, as
 /// `(key, offsetTop)`.
 ///
-/// One DOM pass for the whole candidate list rather than one per candidate:
-/// the reposition capture runs inside the render body, where each
-/// `query_selector_all` + `offsetTop` pair forces a reflow, and the walk can
-/// legitimately need to try [`REPOSITION_PROBE_ROWS`] of them.
+/// One DOM pass for the whole candidate list rather than one pass per
+/// candidate: the walk can legitimately need to try [`REPOSITION_PROBE_ROWS`]
+/// of them, and the old shape re-ran `querySelectorAll` plus an attribute read
+/// per row for each — `candidates x rows` FFI calls. (Not repeated reflows:
+/// the DOM does not change between scans, so layout stayed cached after the
+/// first `offsetTop`.) Only CANDIDATE rows are measured, so a match on the
+/// first row costs a handful of string compares and a single `offsetTop`.
 #[cfg(target_arch = "wasm32")]
 fn first_history_row_offset(keys: &[String]) -> Option<(String, i32)> {
     use wasm_bindgen::JsCast;
+    if keys.is_empty() {
+        return None;
+    }
     let container = chat_scroll_container()?;
     let rows = container.query_selector_all("[data-item-key]").ok()?;
-    // Rendered key -> offsetTop, built in one pass.
+    // Candidate key -> offsetTop. Bounded by `keys.len()`, not by the rendered
+    // window: measuring every row would cost an `offsetTop` and a `String`
+    // allocation per row (up to the ceiling, 240) on a path that runs per
+    // arrival in an at-cap room.
     let mut present: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
     for i in 0..rows.length() {
+        if present.len() == keys.len() {
+            break;
+        }
         let Some(node) = rows.item(i) else { continue };
         let Some(el) = node.dyn_ref::<web_sys::HtmlElement>() else {
             continue;
         };
         if let Some(k) = el.get_attribute("data-item-key") {
-            present.entry(k).or_insert_with(|| el.offset_top());
+            if keys.iter().any(|c| c == &k) {
+                present.entry(k).or_insert_with(|| el.offset_top());
+            }
         }
     }
+    // Priority is the CANDIDATE order (nearest the head first), not DOM order.
     keys.iter()
         .find_map(|k| present.get(k).map(|top| (k.clone(), *top)))
 }
@@ -2132,7 +2151,15 @@ pub fn Conversation() -> Element {
     // `offsetTop` here (see `select_reposition_probe`); the `head_reposition`
     // effect below re-measures it after the patch and shifts `scrollTop` by
     // the difference. `(key, pre_patch_offset_top)`.
-    let reposition_pending = use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, i32)>)));
+    // `(probe key, its pre-patch offsetTop, the container's pre-patch
+    // scrollTop)`. The scroll offset is captured too because the browser
+    // clamps `scrollTop` down on its own when a patch shortens the content,
+    // and it does so BEFORE the effect runs: computing the target from the
+    // post-clamp offset would apply the shift on top of the clamp and
+    // over-shift the reader (#505 delta review). Capture and effect run in
+    // the same task, so the captured offset cannot go stale.
+    let reposition_pending =
+        use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, i32, i32)>)));
     // The backfill sentinel's capture, consumed by the restore effect. See
     // `BackfillAnchor`. Not `cfg`-gated — the sentinel's handler is compiled
     // on every target, only the DOM reads inside it are wasm-only.
@@ -2597,7 +2624,8 @@ pub fn Conversation() -> Element {
         use_effect(move || {
             // Subscribe: head swaps only happen on content changes.
             let _ = message_groups.read().is_some();
-            let Some((key, pre_top)) = reposition_pending.borrow_mut().take() else {
+            let Some((key, pre_top, pre_scroll_top)) = reposition_pending.borrow_mut().take()
+            else {
                 return;
             };
             // A pinned reader needs no compensation — the arrival effect
@@ -2632,7 +2660,12 @@ pub fn Conversation() -> Element {
             };
             let shift = post_top - pre_top;
             if shift != 0 {
-                let target = (container.scroll_top() + shift).max(0);
+                // From the PRE-patch offset, not the live one: when the patch
+                // shortens the content the browser has already clamped
+                // `scrollTop` down by the time this runs, and shifting from
+                // the clamped value applies the clamp twice (#505 delta
+                // review). Clamping the result is left to the browser.
+                let target = (pre_scroll_top + shift).max(0);
                 // Move the reference BY THE SHIFT, not to the new absolute
                 // offset. `last_scroll_top` is what `reader_moved_up_since`
                 // measures against, and it is only meaningful in the window
@@ -2642,10 +2675,13 @@ pub fn Conversation() -> Element {
                 // still stale-true BOTH follow paths then yank them to the
                 // bottom (#505 delta review). A relative update preserves
                 // their gap to the reference in both directions, so the guard
-                // keeps answering truthfully. It also resolves the pin
-                // correctly: this settle now reads as the READER's, so the
-                // handler re-measures and clears the stale pin — right, since
-                // this effect only runs for a genuinely parked reader.
+                // keeps answering truthfully. The pin resolves correctly
+                // either way: in the pre-settle window the reference and the
+                // view differ, so this settle reads as the READER's and the
+                // handler re-measures and clears the stale pin; for a reader
+                // whose settle already landed the two move together, so it
+                // reads as ours and leaves their (already correct) pin
+                // alone.
                 last_scroll_top.set(last_scroll_top.get() + shift);
                 container.set_scroll_top(target);
             }
@@ -3739,21 +3775,31 @@ pub fn Conversation() -> Element {
                                     };
                                     if head_removed {
                                         // Capture a surviving row's PRE-patch
-                                        // offset; the DOM still shows the
-                                        // previous render here. Not
-                                        // necessarily the head itself: a
-                                        // re-keyed head group has no
-                                        // pre-patch row under its new key
-                                        // (#505 re-review blocker; see
-                                        // `select_reposition_probe`).
+                                        // offset, AND the container's
+                                        // pre-patch scrollTop; the DOM still
+                                        // shows the previous render here. The
+                                        // probe row is not necessarily the
+                                        // head itself: a re-keyed head group
+                                        // has no pre-patch row under its new
+                                        // key (#505 re-review blocker; see
+                                        // `select_reposition_probe`). The
+                                        // scroll offset is captured because
+                                        // the browser clamps it down before
+                                        // the effect can read it when the
+                                        // patch shortens the content (#505
+                                        // delta review).
                                         #[cfg(target_arch = "wasm32")]
-                                        if let Some(probe) = select_reposition_probe(
-                                            groups[history_window.start..]
-                                                .iter()
-                                                .map(display_item_key),
-                                            first_history_row_offset,
+                                        if let (Some((key, pre_top)), Some(container)) = (
+                                            select_reposition_probe(
+                                                groups[history_window.start..]
+                                                    .iter()
+                                                    .map(display_item_key),
+                                                first_history_row_offset,
+                                            ),
+                                            chat_scroll_container(),
                                         ) {
-                                            *reposition_pending.borrow_mut() = Some(probe);
+                                            *reposition_pending.borrow_mut() =
+                                                Some((key, pre_top, container.scroll_top()));
                                         }
                                     }
                                     // Remember where this render started so the
@@ -8432,6 +8478,13 @@ mod autoscroll_wiring_pins {
             "both the head reposition and the backfill restore must update \
              `last_scroll_top` RELATIVELY — an absolute write erases the \
              reader's movement and the follow paths drag them to the bottom"
+        );
+        assert!(
+            dense.contains("lettarget=(pre_scroll_top+shift).max(0);"),
+            "the reposition target must be computed from the PRE-patch scroll \
+             offset — the browser clamps `scrollTop` down before the effect \
+             runs when a patch shortens the content, and shifting from the \
+             clamped value applies the clamp twice (#505 delta review)"
         );
         assert!(
             dense.contains("select_reposition_probe("),

@@ -852,7 +852,8 @@ mod tests {
         // Still deeper than the render window in display ITEMS, so the
         // windowed premise assertions hold for this room too. Counted from
         // the seeded DATA (runs of same-author adjacent messages collapse,
-        // exactly as `group_messages` groups them) rather than from the
+        // as `group_messages` does — modulo its 5-minute threshold, which
+        // these fixed 60s-apart fillers never cross) rather than from the
         // constant, so a fixture change that alters the authoring pattern —
         // not just the count — fails here.
         let display_items = fillers
