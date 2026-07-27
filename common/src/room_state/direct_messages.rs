@@ -93,6 +93,16 @@
 //!
 //! # Bounds
 //!
+//! - `Configuration::effective_max_direct_messages`: owner-tunable GLOBAL cap
+//!   on `messages`, defaulting to
+//!   [`crate::room_state::configuration::DEFAULT_MAX_DIRECT_MESSAGES`]. Added
+//!   for freenet/river#519: the per-pair cap below bounds any one
+//!   conversation but nothing bounded the set as a whole, and because
+//!   `ChatRoomStateV1::post_apply_cleanup` exempts every DM participant from
+//!   inactivity-prune (via [`DirectMessagesV1::active_participants`]), an
+//!   unbounded DM set pinned an unbounded member set. Enforced in
+//!   `apply_delta` only, NEVER in `verify` — see the note on
+//!   [`DmRetentionHorizon`] and `trim_to_global_cap`.
 //! - [`MAX_DM_MESSAGES_PER_PAIR`]: per (sender, recipient) ordered pair.
 //! - [`MAX_DM_CIPHERTEXT_BYTES`]: per-message ciphertext size cap.
 //! - [`MAX_PURGED_TOMBSTONES_PER_RECIPIENT`]: cap on per-recipient
@@ -734,6 +744,32 @@ impl DirectMessagesV1 {
         horizons
     }
 
+    /// The [`DmRetentionHorizon`] this peer publishes for the given global cap.
+    ///
+    /// Computed as the MINIMUM held key rather than the exact post-trim cutoff,
+    /// and only once the peer is at or over the cap, so it never over-states —
+    /// see [`DmRetentionHorizon`] for why that direction is the safe one.
+    ///
+    /// Does not assume `self.messages` is sorted, and could not rely on it if
+    /// it were: `sort_state` orders by `(sender, recipient, timestamp,
+    /// signature)`, so the room-wide oldest DM is NOT at index 0. `verify` does
+    /// not enforce any ordering either, so a hand-built or hostile full-state
+    /// PUT can arrive in any order. Taking the min is correct regardless.
+    pub fn global_retention_horizon(&self, max_direct_messages: usize) -> DmRetentionHorizon {
+        if max_direct_messages == 0 {
+            return DmRetentionHorizon::Closed;
+        }
+        if self.messages.len() < max_direct_messages {
+            return DmRetentionHorizon::Open;
+        }
+        match self.messages.iter().map(|m| m.order_key()).min() {
+            Some(oldest) => DmRetentionHorizon::OldestRetained(oldest),
+            // Unreachable: len >= max_direct_messages >= 1 means non-empty.
+            // `Open` is the safe fallback (offers more, never withholds).
+            None => DmRetentionHorizon::Open,
+        }
+    }
+
     /// Drop any DM whose sender or recipient is banned (`banned_ids`),
     /// or is not a current member of the room (`active_member_ids`,
     /// owner-implicit). Called by `ChatRoomStateV1::post_apply_cleanup`
@@ -882,9 +918,17 @@ impl ComposableState for DirectMessagesV1 {
         Ok(())
     }
 
+    /// NOTE: this `summarize` READS `parent_state`, for the global DM cap that
+    /// sizes [`DirectMessagesSummary::global_horizon`] — the same dependency
+    /// [`crate::room_state::message::MessagesV1::summarize`] has on
+    /// `max_recent_messages`, and with the same requirement: callers MUST pass
+    /// the SUMMARIZING peer's own state. Passing a cheap
+    /// `ChatRoomStateV1::default()` sentinel reads the DEFAULT cap instead of
+    /// the room's, understating the horizon and re-opening the resend loop.
+    /// Pinned by `merge_uses_room_state_as_parent_so_horizon_is_correct`.
     fn summarize(
         &self,
-        _parent_state: &Self::ParentState,
+        parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
         let message_signatures: BTreeSet<SignatureBytes> = self
@@ -907,6 +951,12 @@ impl ComposableState for DirectMessagesV1 {
             message_signatures,
             purge_versions,
             pair_horizons: self.pair_horizons(),
+            global_horizon: self.global_retention_horizon(
+                parent_state
+                    .configuration
+                    .configuration
+                    .effective_max_direct_messages(),
+            ),
         }
     }
 
@@ -943,6 +993,15 @@ impl ComposableState for DirectMessagesV1 {
                     Some(oldest) => m.order_key() > **oldest,
                 },
             )
+            // Same rule again on the GLOBAL axis: a DM can sit comfortably
+            // inside its own pair's window and still be the oldest DM in the
+            // room, so clearing `pair_horizons` is not enough to know the
+            // receiver will keep it. See [`DmRetentionHorizon`].
+            .filter(|m| match &old_state_summary.global_horizon {
+                DmRetentionHorizon::Open => true,
+                DmRetentionHorizon::OldestRetained(oldest) => m.order_key() > *oldest,
+                DmRetentionHorizon::Closed => false,
+            })
             .cloned()
             .collect();
 
@@ -975,10 +1034,20 @@ impl ComposableState for DirectMessagesV1 {
         parameters: &Self::Parameters,
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
+        let max_direct_messages = parent_state
+            .configuration
+            .configuration
+            .effective_max_direct_messages();
+
         let Some(delta) = delta else {
-            // Even when no delta arrived, re-sort for deterministic
-            // ordering (cheap, ensures verify-time invariant).
-            sort_state(self);
+            // Even when no delta arrived, enforce the caps and re-sort. The
+            // caps run unconditionally (as `MessagesV1::apply_delta` runs
+            // `max_recent_messages`) so a state that arrived over-cap by a
+            // path that skips this function — a full-state PUT, or the #292
+            // migration PUT carrying a legacy set larger than the room's
+            // current cap — converges down instead of sitting over-cap until
+            // the next DM happens to arrive.
+            enforce_caps_and_sort(self, max_direct_messages);
             return Ok(());
         };
 
@@ -1149,14 +1218,28 @@ impl ComposableState for DirectMessagesV1 {
                 .is_some_and(|set| set.contains(&m.purge_token()))
         });
 
-        // ---- 4. Enforce the per-pair cap, newest-first ----
-        trim_pairs_to_cap(self);
-
-        // ---- 5. Deterministic ordering for CRDT convergence ----
-        sort_state(self);
+        // ---- 4. Enforce the caps, newest-first, then sort ----
+        enforce_caps_and_sort(self, max_direct_messages);
 
         Ok(())
     }
+}
+
+/// Apply both retention caps and restore the canonical stored order.
+///
+/// The order matters and is not interchangeable: the per-pair trim runs FIRST
+/// so the global trim can only ever shrink an already pair-legal set. Running
+/// the global trim first could leave a pair over
+/// [`MAX_DM_MESSAGES_PER_PAIR`] — which `verify` rejects — because the global
+/// trim keeps the newest room-wide, with no notion of pairs.
+///
+/// Every step is a pure function of the held set, so the composition is too:
+/// two peers reaching the same union converge to the same state, and running
+/// this twice changes nothing after the first pass (idempotent).
+fn enforce_caps_and_sort(s: &mut DirectMessagesV1, max_direct_messages: usize) {
+    trim_pairs_to_cap(s);
+    trim_to_global_cap(s, max_direct_messages);
+    sort_state(s);
 }
 
 /// Keep only the newest [`MAX_DM_MESSAGES_PER_PAIR`] messages in each ordered
@@ -1197,6 +1280,44 @@ fn trim_pairs_to_cap(s: &mut DirectMessagesV1) {
         s.messages
             .retain(|m| !dropped.contains(&SignatureBytes(m.sender_signature.to_bytes())));
     }
+}
+
+/// Keep only the newest `max_direct_messages` messages across the WHOLE set, by
+/// [`AuthorizedDirectMessage::order_key`] — the global counterpart of
+/// [`trim_pairs_to_cap`], added for freenet/river#519.
+///
+/// Ordering by `(timestamp, signature)` room-wide is a strict total order
+/// (signatures are unique per message), so "newest N" is unambiguous. Like the
+/// per-pair trim this is a pure function of the held set, so every peer that
+/// ends up with the same union trims to the same result regardless of arrival
+/// order; the paired [`DmRetentionHorizon`] in the summary is what stops a
+/// sender re-offering the entries this drops.
+///
+/// Runs AFTER [`trim_pairs_to_cap`], so the pair cap can never be violated by
+/// the global trim keeping a message the pair cap had already discarded.
+fn trim_to_global_cap(s: &mut DirectMessagesV1, max_direct_messages: usize) {
+    if s.messages.len() <= max_direct_messages {
+        return;
+    }
+    if max_direct_messages == 0 {
+        s.messages.clear();
+        return;
+    }
+
+    // Select the cutoff by ranking keys rather than sorting `messages` itself:
+    // `sort_state` owns the stored order, and reordering here would silently
+    // couple the two.
+    let mut keys: Vec<DmOrderKey> = s.messages.iter().map(|m| m.order_key()).collect();
+    // `select_nth_unstable` puts the element that WOULD be at this index in
+    // sorted order there, with everything smaller before it — exactly the
+    // "drop the oldest `excess`" boundary, in O(n).
+    let excess = keys.len() - max_direct_messages;
+    keys.select_nth_unstable(excess);
+    let cutoff = keys[excess].clone();
+
+    // Strictly-below-cutoff goes; the cutoff key itself and everything above it
+    // stays. Keys are unique, so this keeps exactly `max_direct_messages`.
+    s.messages.retain(|m| m.order_key() >= cutoff);
 }
 
 fn sort_state(s: &mut DirectMessagesV1) {
@@ -1248,6 +1369,69 @@ pub struct DirectMessagesSummary {
     /// summary comparison, and `serde_json` compatibility.
     #[serde(default)]
     pub pair_horizons: Vec<DmPairHorizon>,
+
+    /// The whole-set counterpart of `pair_horizons`, for the GLOBAL cap
+    /// (`Configuration::effective_max_direct_messages`). See
+    /// [`DmRetentionHorizon`].
+    ///
+    /// `#[serde(default)]` yields [`DmRetentionHorizon::Open`], which is the
+    /// safe direction: a peer whose summary predates this field is treated as
+    /// accepting everything, so nothing is silently withheld from it.
+    #[serde(default)]
+    pub global_horizon: DmRetentionHorizon,
+}
+
+/// How much appetite a peer has for older direct messages GLOBALLY, published
+/// in [`DirectMessagesSummary`] so a sender never offers a DM the receiver
+/// would discard the instant it applied it.
+///
+/// # Why this exists, separately from [`DmPairHorizon`]
+///
+/// [`DmPairHorizon`] solves the identical problem one ordered pair at a time,
+/// for the per-pair cap [`MAX_DM_MESSAGES_PER_PAIR`]. The global cap
+/// introduced for freenet/river#519 prunes across ALL pairs, so it makes the
+/// merge non-monotonic along an axis no per-pair horizon can describe: a DM
+/// can be well inside its own pair's window and still be the oldest DM in the
+/// room. Without this second horizon, `delta` re-offers exactly those DMs on
+/// every fan-out, the receiver re-prunes them, neither summary changes, and
+/// the pair loops forever — the same failure that drove the 2026-07-25
+/// bandwidth incident, at up to [`MAX_DM_CIPHERTEXT_BYTES`] per message.
+///
+/// # Why it terminates
+///
+/// [`DmRetentionHorizon::OldestRetained`] is the smallest [`DmOrderKey`] the
+/// peer currently holds, published only once it is AT the global cap. A sender
+/// offers only strictly-greater keys. Applying any of them pushes the peer
+/// over the cap, so [`trim_to_global_cap`] drops at least the horizon message
+/// itself and the horizon strictly increases. A peer BELOW the cap publishes
+/// `Open` and discards nothing globally, so its signature set only grows.
+///
+/// The two horizons compose without interfering: an offered DM either survives
+/// both trims (the set grew), or the pair trim drops the pair's oldest (that
+/// pair's horizon rose), or the global trim drops the room's oldest (this
+/// horizon rose). Every exchange therefore grows a bounded set or strictly
+/// advances a bounded key, so there are no cycles.
+///
+/// Deliberately conservative in the same direction as
+/// [`crate::room_state::message::RetentionHorizon`]: publishing the oldest
+/// HELD key rather than the exact post-merge cutoff can cost one extra round,
+/// whereas over-stating would silently withhold DMs the peer would have kept.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DmRetentionHorizon {
+    /// The peer holds fewer than the global cap; it retains anything.
+    #[default]
+    Open,
+    /// The peer is at (or over) the global cap and holds nothing ordering
+    /// before this key. Anything at or below it is discarded on arrival.
+    OldestRetained(DmOrderKey),
+    /// The cap is `0`: the peer retains no direct messages at all.
+    ///
+    /// `AuthorizedConfigurationV1::apply_delta` rejects a zero cap, but
+    /// `verify` does not, so an owner-signed zero can still arrive on the
+    /// full-state path. Represented explicitly rather than folded into
+    /// `OldestRetained` so the sender suppresses the delta instead of looping
+    /// against a peer that keeps nothing.
+    Closed,
 }
 
 /// The retention horizon for one ordered `(sender, recipient)` pair.

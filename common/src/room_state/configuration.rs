@@ -85,6 +85,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
                 || delta.configuration.max_members == 0
                 || delta.configuration.max_room_name == 0
                 || delta.configuration.max_room_description == 0
+                || delta.configuration.max_direct_messages == Some(0)
             {
                 return Err("Invalid configuration values".to_string());
             }
@@ -183,6 +184,11 @@ impl Default for Configuration {
             max_members: 200,
             max_room_name: 100,
             max_room_description: 500,
+            // `None`, not `Some(DEFAULT_MAX_DIRECT_MESSAGES)`: the cap is read
+            // through `effective_max_direct_messages`, so leaving it unset
+            // gives new rooms the same bound while keeping the serialized
+            // default configuration byte-identical to pre-#519 bytes.
+            max_direct_messages: None,
         }
     }
 }
@@ -212,6 +218,54 @@ pub struct Configuration {
     pub max_members: usize,
     pub max_room_name: usize,
     pub max_room_description: usize,
+
+    /// Owner-tunable global bound on `direct_messages.messages`, mirroring how
+    /// `max_recent_messages` bounds `recent_messages`. `None` means "this
+    /// configuration was signed before the field existed"; read it through
+    /// [`Configuration::effective_max_direct_messages`], which substitutes
+    /// [`DEFAULT_MAX_DIRECT_MESSAGES`], so pre-existing rooms are bounded
+    /// without the owner having to re-sign anything.
+    ///
+    /// # Why `Option` + `skip_serializing_if`, and why that is NOT optional
+    ///
+    /// [`AuthorizedConfigurationV1::verify_signature`] re-serializes this
+    /// whole struct with ciborium and checks the owner's signature over those
+    /// bytes. A plain `#[serde(default)] usize` deserializes old bytes to `0`
+    /// and then re-serializes them WITH the extra map entry, so the bytes no
+    /// longer match what the owner signed: every room created before this
+    /// field existed would fail `verify`, which also gates the #292 migration
+    /// PUT — i.e. every existing room bricked, unrecoverably.
+    ///
+    /// `Option` + `skip_serializing_if` makes the addition byte-neutral: an
+    /// old configuration decodes to `None`, re-encodes without the key, and
+    /// its signature still verifies. Pinned by
+    /// `legacy_configuration_signature_survives_max_direct_messages_field`.
+    /// Any future field added to `Configuration` MUST follow this pattern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_direct_messages: Option<usize>,
+}
+
+/// Global cap applied to `direct_messages.messages` when a room's
+/// [`Configuration::max_direct_messages`] is unset.
+///
+/// Sized to sit just above the largest live room's DM set at the time the cap
+/// was introduced (the official room held 499), so enabling the bound does not
+/// mass-delete history on rollout; it stops the set — and therefore the
+/// DM-pinned member set that `post_apply_cleanup` refuses to prune — from
+/// growing without limit. Owners who want a tighter or looser bound set
+/// `max_direct_messages` explicitly. See freenet/river#519.
+pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 500;
+
+impl Configuration {
+    /// The global DM cap in force for this room: the owner's explicit
+    /// [`Self::max_direct_messages`], or [`DEFAULT_MAX_DIRECT_MESSAGES`] when
+    /// unset. Every retention and horizon decision MUST read the cap through
+    /// here so a legacy (`None`) configuration and an explicitly-defaulted one
+    /// behave identically.
+    pub fn effective_max_direct_messages(&self) -> usize {
+        self.max_direct_messages
+            .unwrap_or(DEFAULT_MAX_DIRECT_MESSAGES)
+    }
 }
 
 #[cfg(test)]
