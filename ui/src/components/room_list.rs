@@ -105,6 +105,32 @@ fn unread_badge_label(unread: usize, is_mentions: bool) -> String {
     }
 }
 
+/// [`room_list_display_state`] read from the live signals.
+///
+/// Shared with the conversation panel's no-room screen (freenet/river#509).
+/// That screen and this rail must never disagree about whether rooms are still
+/// loading: below the 768px breakpoint the rail is `display:none` rather than
+/// unmounted, and the default mobile view is Chat, so for the whole load window
+/// the ONLY thing a phone user can see is the conversation panel. #397 put the
+/// loading / migrating / failed states in the rail and nowhere else, which is
+/// how "Create a new room, or get invited to an existing one" ended up being
+/// what mobile shows a user whose rooms are still arriving — and, worse, what
+/// it shows when the load has FAILED, hiding the Retry button behind advice to
+/// create a room.
+///
+/// Reads are fallible per the Dioxus signal-safety rules, with the same
+/// `Loading` fallback the rail uses: an unresolved read must never resolve to
+/// `Empty`, because `Empty` is the one state that tells the user there is
+/// nothing to wait for.
+pub(crate) fn current_room_list_display() -> RoomListDisplay {
+    let load_state = ROOMS_LOAD_STATE
+        .try_read()
+        .map(|g| *g)
+        .unwrap_or(RoomsLoadState::Loading);
+    let room_count = ROOMS.try_read().map(|rooms| rooms.map.len()).unwrap_or(0);
+    room_list_display_state(load_state, room_count)
+}
+
 /// Convert UTC ISO timestamp to local time string
 fn format_build_time_local() -> String {
     #[cfg(target_arch = "wasm32")]

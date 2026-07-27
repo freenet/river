@@ -4406,6 +4406,59 @@ pub fn Conversation() -> Element {
                                 }
                             }
                         }
+                        // freenet/river#509: this panel is the ONLY thing a
+                        // phone user can see while rooms load — below 768px the
+                        // rail that carries #397's loading / migrating / failed
+                        // states is `display:none`, not unmounted, and the
+                        // default mobile view is Chat. Rendering the Welcome
+                        // copy unconditionally therefore told a mid-load user
+                        // they had no rooms, and hid a FAILED load (and its
+                        // Retry button) behind advice to create one.
+                        //
+                        // Branch on the same shared state the rail uses, so the
+                        // two surfaces cannot disagree. This is viewport-
+                        // independent on purpose: the desktop centre panel had
+                        // the same false-empty text.
+                        match crate::components::room_list::current_room_list_display() {
+                            crate::components::room_list::RoomListDisplay::Loading => rsx! {
+                                div {
+                                    class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
+                                    "data-testid": "conversation-rooms-loading",
+                                    div { class: "animate-spin w-6 h-6 border-2 border-text-muted border-t-transparent rounded-full" }
+                                    span { class: "text-sm text-text-muted", "Loading your rooms…" }
+                                }
+                            },
+                            crate::components::room_list::RoomListDisplay::Migrating => rsx! {
+                                div {
+                                    class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
+                                    "data-testid": "conversation-rooms-migrating",
+                                    div { class: "animate-spin w-6 h-6 border-2 border-text-muted border-t-transparent rounded-full" }
+                                    span { class: "text-sm text-text-muted", "Migrating your rooms…" }
+                                    span { class: "text-xs text-text-muted opacity-70", "(one-time step after an update)" }
+                                }
+                            },
+                            crate::components::room_list::RoomListDisplay::LoadFailed => rsx! {
+                                div {
+                                    class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
+                                    "data-testid": "conversation-rooms-error",
+                                    span { class: "text-sm text-text-muted", "Couldn't load your rooms" }
+                                    span { class: "text-xs text-text-muted opacity-70", "Check your connection and try again." }
+                                    button {
+                                        "data-testid": "conversation-rooms-retry-button",
+                                        class: "flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
+                                        // Same entry point as the rail's Retry.
+                                        // Safe to call directly — `retry_rooms_load`
+                                        // defers its signal write and spawns via
+                                        // setTimeout(0) (Dioxus signal-safety rules).
+                                        onclick: move |_| crate::components::app::chat_delegate::retry_rooms_load(),
+                                        span { "Retry" }
+                                    }
+                                }
+                            },
+                            // Empty (the load resolved and there really are no
+                            // rooms) or List (rooms exist, none selected yet):
+                            // today's screen, unchanged.
+                            _ => rsx! {
                         div { class: "flex-1 flex flex-col items-center justify-center text-center p-8",
                             img {
                                 class: "w-24 h-24 mb-6 opacity-50",
@@ -4437,9 +4490,18 @@ pub fn Conversation() -> Element {
                             // seeing the left-rail indicator. Render the
                             // pill inline so they get the same WebSocket
                             // signal regardless of viewport.
+                            //
+                            // Deliberately NOT rendered in the loading and
+                            // migrating arms above: the pill reflects only
+                            // WebSocket transport and flips to a green
+                            // "Connected" within about a second, which on a
+                            // still-loading screen reads as "everything is
+                            // done" (freenet/river#509).
                             div { class: "mt-8 md:hidden",
                                 crate::components::members::ConnectionStatusIndicator {}
                             }
+                        }
+                            },
                         }
                     },
                 }
@@ -5676,6 +5738,76 @@ mod tests {
             !squashed.contains(concat!("sign_message_", "with_fallback")),
             "message signing must not go through the delegate on any path \
              (freenet/river#512)"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#509): the no-room screen must branch on
+    /// the SHARED room-list display state.
+    ///
+    /// Below 768px the rooms rail is `display:none` rather than unmounted and
+    /// the default mobile view is Chat, so for the whole load window this panel
+    /// is the only thing a phone user can see. Rendering the Welcome copy
+    /// unconditionally told a mid-load user they had no rooms, and hid a FAILED
+    /// load — and its Retry button — behind advice to create one.
+    ///
+    /// The states themselves are covered by `room_list_display_state`'s unit
+    /// tests and by `rooms-loading-state.spec.ts`; what this pins is the
+    /// WIRING, which is what #397 left undone: it added the states to the rail
+    /// and never touched `app.rs` or this file, so `ROOMS_LOAD_STATE` had
+    /// exactly one consumer in the whole UI.
+    #[test]
+    fn the_no_room_screen_branches_on_the_shared_load_state() {
+        let source = include_str!("conversation.rs");
+        let prod = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
+        let code: String = prod
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            squashed.contains("current_room_list_display()"),
+            "the no-room screen must read the shared room-list display state, \
+             not render the Welcome copy unconditionally — that is what mobile \
+             showed a user mid-load (freenet/river#509)"
+        );
+        for (arm, testid) in [
+            ("Loading", "conversation-rooms-loading"),
+            ("Migrating", "conversation-rooms-migrating"),
+            ("LoadFailed", "conversation-rooms-error"),
+        ] {
+            assert!(
+                squashed.contains(&format!("RoomListDisplay::{arm}=>")),
+                "the no-room screen must handle `RoomListDisplay::{arm}`"
+            );
+            assert!(
+                squashed.contains(&format!("\"data-testid\":\"{testid}\"")),
+                "the {arm} arm must render its `{testid}` element"
+            );
+        }
+        assert!(
+            squashed.contains("retry_rooms_load()"),
+            "the failed arm must offer Retry — a stalled load is otherwise \
+             pixel-identical to an empty account, and the advice on screen is \
+             to create a room"
+        );
+        // The green "Connected" pill reflects only WebSocket transport and
+        // flips within about a second, so on a still-loading screen it reads
+        // as "nothing is pending". It belongs to the Welcome arm only.
+        let welcome_at = squashed
+            .find("WelcometoRiver")
+            .expect("the Welcome copy must still exist for the resolved states");
+        let pill_at = squashed
+            .find("ConnectionStatusIndicator{}")
+            .expect("the no-room screen must still show the connection pill");
+        assert!(
+            pill_at > welcome_at,
+            "the connection pill must sit inside the Welcome arm, not above \
+             the load-state branch where it would reassure a user whose rooms \
+             are still loading"
         );
     }
 

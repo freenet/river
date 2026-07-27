@@ -1337,6 +1337,46 @@ pub fn install_test_hooks() {
     );
     append_many.forget();
 
+    // Drive the no-room screen's load states (freenet/river#509). The example
+    // build always seeds rooms and never leaves `ROOMS_LOAD_STATE` anywhere
+    // but its default, so Loading / Migrating / LoadFailed are otherwise
+    // unreachable from a browser test — which is exactly why #397's states
+    // shipped with Rust unit tests only, and why nobody noticed they were
+    // invisible on mobile.
+    //
+    // Clears ROOMS as well as setting the state: `room_list_display_state`
+    // renders the list whenever there is anything to show, so a state change
+    // alone would change nothing.
+    let set_load_state = Closure::wrap(Box::new(move |state: String| {
+        use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
+        let parsed = match state.as_str() {
+            "loading" => RoomsLoadState::Loading,
+            "migrating" => RoomsLoadState::Migrating,
+            "failed" => RoomsLoadState::LoadFailed,
+            "loaded" => RoomsLoadState::Loaded,
+            other => {
+                crate::util::debug_log(&format!("[test] unknown rooms load state {other:?}"));
+                return;
+            }
+        };
+        crate::util::defer(move || {
+            crate::components::app::ROOMS.with_mut(|rooms| {
+                rooms.map.clear();
+                rooms.room_order.clear();
+                rooms.current_room_key = None;
+            });
+            *crate::components::app::CURRENT_ROOM.write() =
+                crate::room_data::CurrentRoom { owner_key: None };
+            *ROOMS_LOAD_STATE.write() = parsed;
+        });
+    }) as Box<dyn FnMut(String)>);
+    let _ = js_sys::Reflect::set(
+        &hooks,
+        &JsValue::from_str("setRoomsLoadState"),
+        set_load_state.as_ref(),
+    );
+    set_load_state.forget();
+
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 
