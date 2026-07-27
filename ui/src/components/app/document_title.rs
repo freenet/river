@@ -32,7 +32,7 @@ pub static TOTAL_UNREAD_COUNT: GlobalSignal<usize> = Global::new(|| 0);
 
 thread_local! {
     /// Cache the last title to avoid redundant postMessage calls
-    static LAST_TITLE: RefCell<String> = RefCell::new(String::new());
+    static LAST_TITLE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// Get the current document visibility state
@@ -163,6 +163,16 @@ fn get_current_room_name() -> Option<String> {
 /// are shown by `display_messages()` but deliberately excluded here
 /// (freenet/river#500): they are ambient activity, not something waiting
 /// to be read, so they must not inflate the badge or title counts.
+pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usize {
+    unread_candidate_messages(room_data).count()
+}
+
+/// The unread tail of `room_data` as an iterator: display messages
+/// (non-action, non-deleted, non-event) authored by other users after
+/// `last_read_message_id`. Shared core of both counting modes
+/// ([`count_unread_in_room_data`] and the MentionsAndReplies arm of
+/// [`count_unread_in_room_data_with_mode`]) so the tail-slicing and
+/// exclusion rules can't drift between them.
 ///
 /// The marker is located in the full ordered message list, not the
 /// display-filtered view: a last-read message that was later *deleted* is
@@ -174,16 +184,6 @@ fn get_current_room_name() -> Option<String> {
 /// Assumes `recent.messages` is in chronological `(time, id)` order — the
 /// invariant `MessagesV1::apply_delta` maintains — so the slice after the
 /// marker's index is exactly the set of messages newer than the marker.
-pub fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usize {
-    unread_candidate_messages(room_data).count()
-}
-
-/// The unread tail of `room_data` as an iterator: display messages
-/// (non-action, non-deleted, non-event) authored by other users after
-/// `last_read_message_id`. Shared core of both counting modes
-/// ([`count_unread_in_room_data`] and the MentionsAndReplies arm of
-/// [`count_unread_in_room_data_with_mode`]) so the tail-slicing and
-/// exclusion rules can't drift between them.
 fn unread_candidate_messages(
     room_data: &crate::room_data::RoomData,
 ) -> impl Iterator<Item = &river_core::room_state::message::AuthorizedMessageV1> {
@@ -212,6 +212,27 @@ fn unread_candidate_messages(
         .filter(move |m| m.message.author != self_member_id)
 }
 
+/// Whether `msg`'s body is sealed under a secret version this client does
+/// not hold, so no mention/reply check can see through it.
+///
+/// `decrypt_message_content` returns a human-readable PLACEHOLDER for such a
+/// message rather than failing, so `contains_mention_of` on that placeholder
+/// is always false and `extract_reply_target_id` always returns `None`:
+/// undecryptable would silently read as "not a mention". This predicate is
+/// what lets the MentionsAndReplies count fail SAFE instead — see
+/// [`count_unread_in_room_data_with_mode`].
+fn is_undecryptable(
+    msg: &river_core::room_state::message::AuthorizedMessageV1,
+    secrets: &std::collections::HashMap<u32, [u8; 32]>,
+) -> bool {
+    match &msg.message.content {
+        river_core::room_state::message::RoomMessageBody::Private { secret_version, .. } => {
+            !secrets.contains_key(secret_version)
+        }
+        river_core::room_state::message::RoomMessageBody::Public { .. } => false,
+    }
+}
+
 /// Count the unread messages in `room_data` that its
 /// [`NotificationMode`](crate::room_data::NotificationMode) surfaces
 /// (freenet/river#500). This is THE per-room badge value: the room-list
@@ -222,16 +243,42 @@ fn unread_candidate_messages(
 ///   ([`count_unread_in_room_data`]).
 /// * `MentionsAndReplies` — only unread messages that @mention the user or
 ///   reply to one of their messages (the same
-///   [`mentions_or_replies_to_self`] predicate that gates browser
-///   notifications). Zero qualifying messages means no badge even when
-///   other unreads exist.
+///   [`crate::components::app::notifications::mentions_or_replies_to_self`]
+///   predicate that gates browser notifications). Zero qualifying messages
+///   means no badge even when other unreads exist.
 /// * `Muted` — always 0; a muted room never badges and never inflates the
 ///   totals, matching the modal's "Never notify for this room" wording.
 ///
-/// Performance: the mention scan decrypts message content, so it runs only
-/// over the unread tail (the `start..` slice inside
-/// [`unread_candidate_messages`], typically small) and only for rooms in
-/// MentionsAndReplies mode — All and Muted rooms never decrypt anything.
+/// # Undecryptable private messages count (fail safe)
+///
+/// In MentionsAndReplies mode a message whose secret version is missing from
+/// `room_data.secrets` is COUNTED, because there is no way to tell whether it
+/// mentions the user. Over-reporting is the safe direction: the alternative
+/// hides a real mention behind a silent zero.
+///
+/// This is not a corner case. `RoomData.secrets` is `#[serde(skip)]`, so
+/// EVERY cold start of an established private room has an empty secrets map
+/// until `repopulate_secrets_from_state` rehydrates it; without the
+/// fail-safe, a private mentions-mode room with unread mentions would badge
+/// 0 on the badge, the title, AND the hamburger until that resolves. There
+/// is also a permanent variant: a member who joined after a secret rotation
+/// can never decrypt older-version messages. The count therefore resolves
+/// DOWN to the true mention count once the secrets arrive.
+///
+/// # Cost
+///
+/// The mention scan decrypts message content, so it runs only over the
+/// unread tail (the `start..` slice inside [`unread_candidate_messages`])
+/// and only for rooms in MentionsAndReplies mode; All and Muted rooms never
+/// decrypt anything. That tail is NOT reliably small: `start` is 0 whenever
+/// the room has never been opened or the marker aged out of the buffer, and
+/// those are exactly the states a mentions-mode room lives in (a room is set
+/// to mentions-only precisely so it stops being opened), so the tail is
+/// routinely the whole `max_recent_messages` buffer (default 100,
+/// owner-configurable with no upper bound). Each private message costs a
+/// fresh AES-GCM key schedule plus a decrypt, a CBOR decode and a mention
+/// parse, so the scan is memoized per room by
+/// [`cached_mention_unread_count`] — see its docs for why that matters.
 pub fn count_unread_in_room_data_with_mode(
     room_data: &crate::room_data::RoomData,
     mode: crate::room_data::NotificationMode,
@@ -240,21 +287,126 @@ pub fn count_unread_in_room_data_with_mode(
     match mode {
         NotificationMode::All => count_unread_in_room_data(room_data),
         NotificationMode::Muted => 0,
-        NotificationMode::MentionsAndReplies => {
-            let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
-            let recent = &room_data.room_state.recent_messages.messages;
-            unread_candidate_messages(room_data)
-                .filter(|m| {
-                    crate::components::app::notifications::mentions_or_replies_to_self(
-                        m,
-                        self_member_id,
-                        &room_data.secrets,
-                        recent,
-                    )
-                })
-                .count()
-        }
+        NotificationMode::MentionsAndReplies => cached_mention_unread_count(room_data),
     }
+}
+
+/// Uncached core of the MentionsAndReplies count. Callers should go through
+/// [`cached_mention_unread_count`].
+fn compute_mention_unread_count(room_data: &crate::room_data::RoomData) -> usize {
+    use crate::components::app::notifications::{
+        mentions_or_replies_to_self_indexed, SelfAuthoredIndex,
+    };
+
+    let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
+    let recent = &room_data.room_state.recent_messages.messages;
+    // One lazily-built index of self-authored message ids for the whole
+    // scan: the reply check would otherwise re-hash every message in the
+    // buffer (`id()` is a 64-byte rolling hash) once per reply candidate.
+    let self_authored = SelfAuthoredIndex::new(recent, self_member_id);
+
+    unread_candidate_messages(room_data)
+        .filter(|m| {
+            // Fail safe: a body we cannot decrypt might mention the user, so
+            // count it rather than silently reading it as "not a mention".
+            is_undecryptable(m, &room_data.secrets)
+                || mentions_or_replies_to_self_indexed(
+                    m,
+                    self_member_id,
+                    &room_data.secrets,
+                    &self_authored,
+                )
+        })
+        .count()
+}
+
+thread_local! {
+    /// Per-room memo for the MentionsAndReplies unread count, keyed by room
+    /// owner key and validated by [`mention_count_fingerprint`].
+    static MENTION_COUNT_CACHE: RefCell<
+        std::collections::HashMap<ed25519_dalek::VerifyingKey, (u64, usize)>,
+    > = RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only counter of full (cache-missing) mention scans, so a test can
+    /// prove the memo actually skips recompute. `thread_local`, and the test
+    /// harness gives each test its own thread, so tests don't interfere.
+    static MENTION_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Upper bound on memo entries. The natural bound is "rooms the user has in
+/// mentions mode", which is tiny, but a session that joins and leaves many
+/// rooms would otherwise accumulate dead keys; clearing wholesale on
+/// overflow costs one recompute per live room and keeps this O(1) to reason
+/// about.
+const MENTION_COUNT_CACHE_MAX: usize = 256;
+
+/// Fingerprint of every input [`compute_mention_unread_count`] reads, cheap
+/// enough (all O(1)) to compute on every call:
+///
+/// * `messages.len()` and the first/last message id — any append, eviction
+///   or replacement of the buffer changes one of them;
+/// * `last_read_message_id` — moves the tail's start;
+/// * `secrets.len()` — arriving secrets change decryptability, which is what
+///   resolves the fail-safe over-count down to the true count;
+/// * `deleted.len()` — deletions change which messages are candidates;
+/// * the local member id — an identity import re-keys "self".
+fn mention_count_fingerprint(room_data: &crate::room_data::RoomData) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let recent = &room_data.room_state.recent_messages;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    recent.messages.len().hash(&mut h);
+    recent.messages.first().map(|m| m.id()).hash(&mut h);
+    recent.messages.last().map(|m| m.id()).hash(&mut h);
+    room_data.last_read_message_id.hash(&mut h);
+    room_data.secrets.len().hash(&mut h);
+    recent.actions_state.deleted.len().hash(&mut h);
+    MemberId::from(room_data.self_sk.verifying_key()).hash(&mut h);
+    h.finish()
+}
+
+/// Memoized [`compute_mention_unread_count`].
+///
+/// The scan is expensive (see [`count_unread_in_room_data_with_mode`]) and
+/// runs up to three times per `ROOMS` write, because all three consumers are
+/// always mounted: the room-list badge memo, the conversation header's
+/// hamburger badge memo, and `update_document_title`. Without a memo this
+/// reproduces the shape of a documented incident in the sibling render path
+/// — re-parsing every buffered message body on each update was "a major
+/// source of the mobile jank users reported", fixed by `MESSAGE_HTML_CACHE`
+/// in `conversation.rs` — except worse placed, since these consumers run for
+/// rooms the user is not even looking at.
+///
+/// Returns a value always identical to calling the uncached form; the memo
+/// only skips redundant rescans.
+fn cached_mention_unread_count(room_data: &crate::room_data::RoomData) -> usize {
+    let fp = mention_count_fingerprint(room_data);
+    let key = room_data.owner_vk;
+
+    if let Some(hit) = MENTION_COUNT_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&key)
+            .filter(|(cached_fp, _)| *cached_fp == fp)
+            .map(|(_, count)| *count)
+    }) {
+        return hit;
+    }
+
+    let count = compute_mention_unread_count(room_data);
+    #[cfg(test)]
+    MENTION_SCAN_COUNT.with(|c| c.set(c.get() + 1));
+
+    MENTION_COUNT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= MENTION_COUNT_CACHE_MAX && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, (fp, count));
+    });
+    count
 }
 
 /// Count total unread messages across all rooms — room messages plus
@@ -1093,10 +1245,11 @@ mod tests {
     }
 
     #[test]
-    fn mentions_mode_scans_only_the_unread_tail() {
-        // Performance + correctness guard: the mention scan runs over the
-        // unread tail only. A mention BEFORE the last-read marker is read —
-        // it must not count (and must not be scanned at all).
+    fn mentions_mode_ignores_a_mention_before_the_last_read_marker() {
+        // The mention count is scoped to the unread tail: a mention the user
+        // has already read must not keep the badge lit. (This pins the
+        // COUNT, not the scan bound — the scan bound is pinned by
+        // `mention_count_memo_skips_recompute_until_inputs_change`.)
         let (self_sk, self_vk) = keypair();
         let (owner_sk, owner_vk) = keypair();
         let self_id: MemberId = (&self_vk).into();
@@ -1109,6 +1262,236 @@ mod tests {
         assert_eq!(
             count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
             0
+        );
+    }
+
+    #[test]
+    fn mentions_mode_with_an_evicted_marker_counts_the_whole_buffer() {
+        // When `last_read_message_id` has aged out of the bounded buffer the
+        // tail falls back to everything (the documented `start = 0` case) —
+        // in mentions mode that means every qualifying message in the
+        // buffer, not zero. This is also the state a mentions-mode room
+        // typically lives in, since it is set to mentions-only precisely so
+        // the user stops opening it.
+        let (self_sk, self_vk) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let evicted = msg(&owner_sk, &owner_vk, 99);
+        let messages = vec![
+            mention_msg(&owner_sk, &owner_vk, 1, self_id),
+            msg(&owner_sk, &owner_vk, 2),
+            mention_msg(&owner_sk, &owner_vk, 3, self_id),
+        ];
+        let rd = room(self_sk, owner_vk, messages, Some(evicted.id()));
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+            2
+        );
+    }
+
+    #[test]
+    fn mentions_mode_skips_a_reply_whose_target_left_the_buffer() {
+        // Reply authorship can only be confirmed against messages still in
+        // the buffer. With the target evicted we cannot tell whether it was
+        // the user's, so the shared predicate conservatively says no — a
+        // miss rather than a badge for someone else's conversation.
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let target = msg_with_body(
+            &self_sk,
+            &owner_vk,
+            1,
+            RoomMessageBody::public("my old message".to_string()),
+        );
+        // `target` is deliberately NOT placed in the room's buffer.
+        let messages = vec![msg_with_body(
+            &owner_sk,
+            &owner_vk,
+            2,
+            RoomMessageBody::reply(
+                "re".to_string(),
+                target.id(),
+                "Me".to_string(),
+                "my old message".to_string(),
+            ),
+        )];
+        let rd = room(self_sk, owner_vk, messages, None);
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::All),
+            1
+        );
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+            0
+        );
+    }
+
+    /// Build a private (sealed) message body under `secret` at `version`.
+    fn private_msg(
+        author_sk: &SigningKey,
+        owner_vk: &VerifyingKey,
+        n: u64,
+        text: String,
+        secret: &[u8; 32],
+        version: u32,
+    ) -> AuthorizedMessageV1 {
+        use river_core::room_state::content::{TextContentV1, CONTENT_TYPE_TEXT};
+        let (ciphertext, nonce) = crate::util::ecies::encrypt_with_symmetric_key(
+            secret,
+            &TextContentV1::new(text).encode(),
+        );
+        msg_with_body(
+            author_sk,
+            owner_vk,
+            n,
+            RoomMessageBody::private(CONTENT_TYPE_TEXT, 1, ciphertext, nonce, version),
+        )
+    }
+
+    #[test]
+    fn mentions_mode_counts_undecryptable_private_messages() {
+        // freenet/river#500 fail-safe: `decrypt_message_content` returns a
+        // PLACEHOLDER (not an error) when the secret is missing, so a
+        // mention check against it is always false. Counting undecryptable
+        // messages is the only way a real mention isn't silently hidden.
+        //
+        // This is the EVERY-COLD-START state for a private room:
+        // `RoomData.secrets` is `#[serde(skip)]`, so the map is empty until
+        // `repopulate_secrets_from_state` rehydrates it.
+        let (self_sk, self_vk) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let secret = [7u8; 32];
+        let mention_text = format!(
+            "hey {}!",
+            river_core::mention::encode_mention(self_id, "Me")
+        );
+        let messages = vec![
+            private_msg(&owner_sk, &owner_vk, 1, mention_text, &secret, 1),
+            private_msg(
+                &owner_sk,
+                &owner_vk,
+                2,
+                "just chatting".to_string(),
+                &secret,
+                1,
+            ),
+        ];
+        let mut rd = room(self_sk, owner_vk, messages, None);
+
+        // (a) Secrets not yet available: neither body can be inspected, so
+        // both count. Non-zero is the point — a silent 0 would hide a real
+        // mention behind an empty badge.
+        assert!(rd.secrets.is_empty());
+        let unresolved =
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies);
+        assert_eq!(
+            unresolved, 2,
+            "undecryptable private messages must count, not silently read as 'not a mention'"
+        );
+
+        // (b) Once the secret arrives the count resolves DOWN to the true
+        // mention count. (Inserting a secret changes `secrets.len()`, which
+        // is part of the memo fingerprint, so the memo must not serve the
+        // stale 2 here — that is also a live guard on the fingerprint.)
+        rd.secrets.insert(1, secret);
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+            1,
+            "with secrets available the count must resolve to the true mention count"
+        );
+    }
+
+    #[test]
+    fn all_mode_is_unaffected_by_undecryptable_private_messages() {
+        // The fail-safe is scoped to mentions mode: `All` never inspects
+        // content, so undecryptable bodies count exactly like any other
+        // unread message (no double-counting, no behaviour change).
+        let (self_sk, _) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let secret = [9u8; 32];
+        let messages = vec![
+            private_msg(&owner_sk, &owner_vk, 1, "one".to_string(), &secret, 3),
+            private_msg(&owner_sk, &owner_vk, 2, "two".to_string(), &secret, 3),
+        ];
+        let rd = room(self_sk, owner_vk, messages, None);
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::All),
+            2
+        );
+    }
+
+    /// Number of full (cache-missing) mention scans on this thread.
+    fn mention_scans() -> usize {
+        MENTION_SCAN_COUNT.with(|c| c.get())
+    }
+
+    #[test]
+    fn mention_count_memo_skips_recompute_until_inputs_change() {
+        // The mentions scan decrypts bodies over what is routinely the whole
+        // message buffer, and runs up to three times per ROOMS write (rail
+        // badge, hamburger badge, document title). The memo is what keeps
+        // that affordable — this pins that it actually skips recompute, and
+        // that it still invalidates when the room changes.
+        //
+        // Deltas (not absolute counts) and a per-test random room key keep
+        // this correct whether or not the harness shares a thread between
+        // tests.
+        let (self_sk, self_vk) = keypair();
+        let (owner_sk, owner_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let messages = vec![
+            mention_msg(&owner_sk, &owner_vk, 1, self_id),
+            msg(&owner_sk, &owner_vk, 2),
+        ];
+        let mut rd = room(self_sk, owner_vk, messages, None);
+
+        let baseline = mention_scans();
+        let first = count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies);
+        assert_eq!(first, 1);
+        assert_eq!(
+            mention_scans(),
+            baseline + 1,
+            "the first call must actually compute"
+        );
+
+        // Two more reads with identical inputs — the other two always-mounted
+        // consumers — must be served from the memo.
+        for _ in 0..2 {
+            assert_eq!(
+                count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+                first
+            );
+        }
+        assert_eq!(
+            mention_scans(),
+            baseline + 1,
+            "memo recomputed despite unchanged inputs"
+        );
+
+        // A new message must invalidate the memo and change the answer.
+        rd.room_state
+            .recent_messages
+            .messages
+            .push(mention_msg(&owner_sk, &owner_vk, 3, self_id));
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+            2,
+            "memo served a stale count after a new message arrived"
+        );
+        assert_eq!(
+            mention_scans(),
+            baseline + 2,
+            "a changed room must trigger exactly one recompute"
+        );
+
+        // Marking the room read must also invalidate it.
+        let latest = rd.room_state.recent_messages.messages.last().unwrap().id();
+        rd.last_read_message_id = Some(latest);
+        assert_eq!(
+            count_unread_in_room_data_with_mode(&rd, NotificationMode::MentionsAndReplies),
+            0,
+            "memo served a stale count after the last-read marker moved"
         );
     }
 
@@ -1169,6 +1552,12 @@ mod tests {
         assert_eq!(
             count_unread_excluding_room(&map, &modes, Some(&owner_b_vk)),
             2
+        );
+        // Excluding the MUTED room changes nothing — it was already
+        // contributing 0, so opening it can't move the hamburger total.
+        assert_eq!(
+            count_unread_excluding_room(&map, &modes, Some(&owner_c_vk)),
+            3
         );
     }
 

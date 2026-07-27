@@ -14,7 +14,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::MemberInfoV1;
-use river_core::room_state::message::{AuthorizedMessageV1, RoomMessageBody};
+use river_core::room_state::message::{AuthorizedMessageV1, MessageId, RoomMessageBody};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::prelude::*;
@@ -496,6 +496,69 @@ fn create_notification_internal(
     }
 }
 
+/// Whether `msg` is a candidate for a browser notification to the local
+/// user: authored by someone else, and not a room event.
+///
+/// Room events ("X joined the room", `CONTENT_TYPE_EVENT`) are ambient
+/// activity, not something waiting to be read.
+/// [`crate::components::app::document_title::count_unread_in_room_data`]
+/// excludes them from every unread surface (freenet/river#500), so notifying
+/// on one would make the notification and the badge disagree by construction:
+/// a join would pop a browser notification while contributing to no badge and
+/// no title count.
+///
+/// Known remaining asymmetry, pre-existing and deliberately unchanged here:
+/// action messages (edits, reactions, deletes — `is_action()`) are likewise
+/// excluded from the counts but are NOT filtered out of notifications, so a
+/// reaction can still notify without badging. Changing that would alter
+/// user-visible notification behaviour beyond the scope of #500.
+pub(crate) fn is_notifiable_external_message(
+    msg: &AuthorizedMessageV1,
+    self_member_id: MemberId,
+) -> bool {
+    msg.message.author != self_member_id && !msg.message.content.is_event()
+}
+
+/// Lazily-built index of the ids of messages in `recent` authored by
+/// `self_member_id` — the set a reply's target is tested against.
+///
+/// Exists because `AuthorizedMessageV1::id()` is a 64-byte rolling hash, so
+/// the naive `recent.iter().any(|m| m.id() == target)` per reply is O(N)
+/// hashes *per candidate message* (O(N²) over a reply-heavy buffer). Scanning
+/// a whole room's unread tail (freenet/river#500) makes that the hot path, so
+/// the ids are hashed once per scan and reused.
+///
+/// Built lazily via `OnceCell`: a scan whose candidates contain no replies
+/// (the common case) never pays for the index at all.
+pub(crate) struct SelfAuthoredIndex<'a> {
+    recent: &'a [AuthorizedMessageV1],
+    self_member_id: MemberId,
+    ids: std::cell::OnceCell<std::collections::HashSet<MessageId>>,
+}
+
+impl<'a> SelfAuthoredIndex<'a> {
+    pub(crate) fn new(recent: &'a [AuthorizedMessageV1], self_member_id: MemberId) -> Self {
+        Self {
+            recent,
+            self_member_id,
+            ids: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether `target_id` names a message in `recent` authored by self.
+    fn contains(&self, target_id: &MessageId) -> bool {
+        self.ids
+            .get_or_init(|| {
+                self.recent
+                    .iter()
+                    .filter(|m| m.message.author == self.self_member_id)
+                    .map(|m| m.id())
+                    .collect()
+            })
+            .contains(target_id)
+    }
+}
+
 /// Pure decision for [`crate::room_data::NotificationMode::MentionsAndReplies`]:
 /// does `msg` @mention `self_member_id`, OR is it a reply to a message that
 /// `self_member_id` authored among `recent`? No globals, so it is unit-testable.
@@ -504,6 +567,11 @@ fn create_notification_internal(
 /// that message's author to self. If the target has scrolled out of `recent` we
 /// cannot confirm authorship, so we conservatively return `false` (miss rather
 /// than spuriously notify).
+///
+/// Single-message convenience wrapper over
+/// [`mentions_or_replies_to_self_indexed`]; a caller testing many messages
+/// against the same `recent` should build one [`SelfAuthoredIndex`] and call
+/// the indexed form instead.
 ///
 /// `pub(crate)`: besides gating browser notifications here, this is the same
 /// predicate the unread counters use for rooms in MentionsAndReplies mode
@@ -515,6 +583,23 @@ pub(crate) fn mentions_or_replies_to_self(
     room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
     recent: &[AuthorizedMessageV1],
 ) -> bool {
+    mentions_or_replies_to_self_indexed(
+        msg,
+        self_member_id,
+        room_secrets,
+        &SelfAuthoredIndex::new(recent, self_member_id),
+    )
+}
+
+/// [`mentions_or_replies_to_self`] against a pre-built (or lazily-built)
+/// self-authored id index, so a multi-message scan hashes `recent` at most
+/// once instead of once per candidate.
+pub(crate) fn mentions_or_replies_to_self_indexed(
+    msg: &AuthorizedMessageV1,
+    self_member_id: MemberId,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
+    self_authored: &SelfAuthoredIndex<'_>,
+) -> bool {
     use crate::components::conversation::{decrypt_message_content, extract_reply_target_id};
 
     // (a) An @mention of self anywhere in the (decrypted) message text.
@@ -525,9 +610,7 @@ pub(crate) fn mentions_or_replies_to_self(
 
     // (b) A reply to a message authored by self.
     if let Some(target_id) = extract_reply_target_id(&msg.message.content, room_secrets) {
-        return recent
-            .iter()
-            .any(|m| m.id() == target_id && m.message.author == self_member_id);
+        return self_authored.contains(&target_id);
     }
     false
 }
@@ -619,10 +702,10 @@ pub fn notify_new_messages(
     //     return;
     // }
 
-    // Filter to messages from other users
+    // Filter to messages from other users, excluding room events.
     let external_messages: Vec<_> = new_messages
         .iter()
-        .filter(|msg| msg.message.author != self_member_id)
+        .filter(|msg| is_notifiable_external_message(msg, self_member_id))
         .collect();
 
     info!(
@@ -1016,6 +1099,47 @@ mod notify_gate_tests {
             &secrets,
             &[]
         ));
+    }
+
+    #[test]
+    fn room_events_are_not_notifiable() {
+        // freenet/river#500: room events are excluded from every unread
+        // count, so notifying on one would make the notification and the
+        // badge disagree by construction (a join pops a notification while
+        // contributing to no badge).
+        let me = key(1);
+        let other = key(2);
+        let join = public_msg(&other, RoomMessageBody::join_event());
+        assert!(!is_notifiable_external_message(&join, id_of(&me)));
+        // An ordinary message from someone else still notifies…
+        let chat = public_msg(&other, RoomMessageBody::public("hello".to_string()));
+        assert!(is_notifiable_external_message(&chat, id_of(&me)));
+        // …and self-authored messages still don't.
+        let mine = public_msg(&me, RoomMessageBody::public("hello".to_string()));
+        assert!(!is_notifiable_external_message(&mine, id_of(&me)));
+    }
+
+    /// `notify_new_messages` is `wasm`-only, so no behavioural test in this
+    /// crate can reach it: re-inlining the author-only filter would silently
+    /// restore join-event notifications with every other test still green.
+    #[test]
+    fn notify_new_messages_filters_through_the_notifiable_predicate() {
+        let source = include_str!("notifications.rs");
+        let (production, _) = source
+            .split_once("mod notify_gate_tests")
+            .expect("this test module's own declaration marks the end of production code");
+
+        assert!(
+            production.contains("is_notifiable_external_message(msg, self_member_id)"),
+            "the new-message filter stopped delegating to \
+             `is_notifiable_external_message`, so room events can notify again"
+        );
+        // The pre-fix predicate, re-inlined, would drop the event exclusion.
+        assert!(
+            !production.contains("filter(|msg| msg.message.author != self_member_id)"),
+            "the author-only filter was re-inlined, which skips the room-event \
+             exclusion that keeps notifications and unread badges in agreement"
+        );
     }
 
     #[test]
