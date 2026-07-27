@@ -239,8 +239,21 @@ pub struct Configuration {
     /// `Option` + `skip_serializing_if` makes the addition byte-neutral: an
     /// old configuration decodes to `None`, re-encodes without the key, and
     /// its signature still verifies. Pinned by
-    /// `legacy_configuration_signature_survives_max_direct_messages_field`.
-    /// Any future field added to `Configuration` MUST follow this pattern.
+    /// `legacy_configuration_bytes_still_verify_after_adding_the_field`.
+    ///
+    /// Any future field added to `Configuration` MUST follow this pattern AND
+    /// be appended LAST — inserting an `Option` field mid-struct reorders the
+    /// CBOR map for configurations that set it.
+    ///
+    /// The pattern is one-directional, and deliberately so. It protects OLD
+    /// bytes read by NEW code. The reverse — an old-struct client reading a
+    /// configuration that actually SETS this field — still breaks: serde has no
+    /// `deny_unknown_fields` here, so such a client silently drops the key,
+    /// re-serializes one entry short, and the owner signature fails. That is
+    /// unreachable only because the contract key is `BLAKE3(wasm, params)` and
+    /// both the UI and riverctl `include_bytes!` the WASM they derive the key
+    /// from: a client with the old struct also derives the OLD contract key and
+    /// never sees state carrying this field. Do not weaken that coupling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_direct_messages: Option<usize>,
 }

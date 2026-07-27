@@ -1241,9 +1241,33 @@ impl ComposableState for DirectMessagesV1 {
 /// two peers reaching the same union converge to the same state, and running
 /// this twice changes nothing after the first pass (idempotent).
 fn enforce_caps_and_sort(s: &mut DirectMessagesV1, max_direct_messages: usize) {
+    dedup_by_signature(s);
     trim_pairs_to_cap(s);
     trim_to_global_cap(s, max_direct_messages);
     sort_state(s);
+}
+
+/// Drop duplicate entries, keeping the first occurrence of each signature.
+///
+/// `apply_delta` already dedupes on insert, so a peer that only ever merges
+/// deltas never holds duplicates. `verify` does NOT reject them, though — it
+/// counts duplicates toward the per-pair cap but has no distinct-signature
+/// check — so a hand-built or hostile full-state PUT can carry them, and
+/// `validate_state` is `verify`.
+///
+/// That matters because both trims key off [`DmOrderKey`], and duplicate
+/// entries carry IDENTICAL keys (same timestamp, same signature). Without this,
+/// [`trim_to_global_cap`]'s cutoff can land on a repeated key, in which case
+/// `retain(>= cutoff)` drops nothing and the peer sits permanently over the cap
+/// — the exact failure the cap exists to prevent. Deduping first makes the
+/// "keys are unique" premise TRUE rather than assumed.
+///
+/// Removal-only, so it cannot make a verifying state fail `verify`, and it is a
+/// pure function of the held set, so it preserves convergence.
+fn dedup_by_signature(s: &mut DirectMessagesV1) {
+    let mut seen: HashSet<SignatureBytes> = HashSet::with_capacity(s.messages.len());
+    s.messages
+        .retain(|m| seen.insert(SignatureBytes(m.sender_signature.to_bytes())));
 }
 
 /// Keep only the newest [`MAX_DM_MESSAGES_PER_PAIR`] messages in each ordered
@@ -1320,7 +1344,10 @@ fn trim_to_global_cap(s: &mut DirectMessagesV1, max_direct_messages: usize) {
     let cutoff = keys[excess].clone();
 
     // Strictly-below-cutoff goes; the cutoff key itself and everything above it
-    // stays. Keys are unique, so this keeps exactly `max_direct_messages`.
+    // stays. Keys are unique — `enforce_caps_and_sort` runs `dedup_by_signature`
+    // first, and a signature is unique per message — so this keeps exactly
+    // `max_direct_messages`. Without that dedup a repeated cutoff key would
+    // make this retain nothing.
     s.messages.retain(|m| m.order_key() >= cutoff);
 }
 
@@ -1405,16 +1432,23 @@ pub struct DirectMessagesSummary {
 ///
 /// [`DmRetentionHorizon::OldestRetained`] is the smallest [`DmOrderKey`] the
 /// peer currently holds, published only once it is AT the global cap. A sender
-/// offers only strictly-greater keys. Applying any of them pushes the peer
-/// over the cap, so [`trim_to_global_cap`] drops at least the horizon message
-/// itself and the horizon strictly increases. A peer BELOW the cap publishes
-/// `Open` and discards nothing globally, so its signature set only grows.
+/// offers only strictly-greater keys. A peer BELOW the cap publishes `Open` and
+/// discards nothing globally, so its signature set only grows.
 ///
-/// The two horizons compose without interfering: an offered DM either survives
-/// both trims (the set grew), or the pair trim drops the pair's oldest (that
-/// pair's horizon rose), or the global trim drops the room's oldest (this
-/// horizon rose). Every exchange therefore grows a bounded set or strictly
-/// advances a bounded key, so there are no cycles.
+/// Note the global horizon does NOT necessarily move on every accepted DM, and
+/// the argument must not claim it does: when the arrival's own pair is at
+/// [`MAX_DM_MESSAGES_PER_PAIR`], `trim_pairs_to_cap` runs first, drops that
+/// pair's oldest, and returns the set to exactly the cap — so
+/// [`trim_to_global_cap`] early-returns and this horizon is unchanged.
+///
+/// Termination comes from the two horizons TOGETHER, via the invariant that
+/// every message either trim drops is strictly below at least one horizon the
+/// peer publishes immediately afterwards. So an accepted DM always advances
+/// something: either the set grew, or the pair trim dropped that pair's oldest
+/// (that pair's horizon rose), or the global trim dropped the room's oldest
+/// (this horizon rose). A dropped message is never re-offered, because it now
+/// sits below a published horizon. Every exchange therefore grows a bounded set
+/// or strictly advances a bounded key, so there are no cycles.
 ///
 /// Deliberately conservative in the same direction as
 /// [`crate::room_state::message::RetentionHorizon`]: publishing the oldest

@@ -207,10 +207,13 @@ fn global_cap_bounds_the_whole_dm_set_keeping_the_newest() {
 
     // 150 DMs over 3 pairs: 50 per pair, so no pair is anywhere near
     // MAX_DM_MESSAGES_PER_PAIR and only the global cap can bite.
-    let d = dms_holding_under(&r.state, &r.params, spread(&r, 0..150, 3));
+    let input = spread(&r, 0..150, 3);
 
-    let busiest_pair = d
-        .messages
+    // Premise measured on the INPUT, not on the trimmed result. Folding over
+    // the post-trim state would be unfalsifiable: it holds at most `cap` (40)
+    // messages in total, so no pair could ever reach 100 whatever the fixture
+    // did, and the guard would pass vacuously.
+    let busiest_pair = input
         .iter()
         .fold(
             std::collections::HashMap::<_, usize>::new(),
@@ -228,6 +231,8 @@ fn global_cap_bounds_the_whole_dm_set_keeping_the_newest() {
         "test premise: no pair may reach the per-pair cap ({busiest_pair}), or \
          the per-pair trim would be doing this test's work"
     );
+
+    let d = dms_holding_under(&r.state, &r.params, input);
     assert_eq!(
         d.messages.len(),
         40,
@@ -575,6 +580,62 @@ fn offset_windows_converge_and_go_quiet() {
     panic!("the exchange never went quiet");
 }
 
+/// INTERLEAVED windows — the case that pins the horizon's DIRECTION.
+///
+/// `offset_windows_converge_and_go_quiet` above uses contiguous overlapping
+/// windows, which converge even if `global_retention_horizon` published the
+/// NEWEST held key instead of the oldest: each peer simply offers less and the
+/// pair still ends up agreeing. That makes it blind to the one error mode the
+/// design docs call the dangerous one — an OVER-stated horizon silently
+/// withholding DMs the peer would have kept.
+///
+/// Interleaved windows expose it. A holds the even offsets, B the odd ones, so
+/// every DM either peer lacks is interior to the other's range. With the
+/// correct `min`, both converge on the newest 30 of the union. With a
+/// max-published horizon, A is offered only the single key above its own
+/// maximum, both sides then have nothing to offer, and the exchange goes quiet
+/// with the two peers holding DIFFERENT sets — silent divergence, which is
+/// worse than a loop because nothing surfaces it.
+#[test]
+fn interleaved_windows_converge_so_the_horizon_cannot_be_over_stated() {
+    let r = room(6, Some(30));
+
+    let evens: Vec<u64> = (60..120).step_by(2).collect();
+    let odds: Vec<u64> = (61..120).step_by(2).collect();
+    let mut a = dms_holding_under(&r.state, &r.params, spread(&r, evens, 3));
+    let mut b = dms_holding_under(&r.state, &r.params, spread(&r, odds, 3));
+
+    assert_eq!(a.messages.len(), 30, "test premise: A is at the global cap");
+    assert_eq!(b.messages.len(), 30, "test premise: B is at the global cap");
+
+    for _ in 0..12 {
+        let to_a = b.delta(&r.state, &r.params, &a.summarize(&r.state, &r.params));
+        if let Some(d) = &to_a {
+            apply(&mut a, &r.state, &r.params, d.new_messages.clone());
+        }
+        let to_b = a.delta(&r.state, &r.params, &b.summarize(&r.state, &r.params));
+        if let Some(d) = &to_b {
+            apply(&mut b, &r.state, &r.params, d.new_messages.clone());
+        }
+        if to_a.is_none() && to_b.is_none() {
+            assert_eq!(
+                held(&a),
+                (90..120).collect::<Vec<u64>>(),
+                "the pair must converge on the newest 30 of the union; a horizon \
+                 published from the NEWEST held key instead of the oldest leaves A \
+                 holding its own window plus one"
+            );
+            assert_eq!(
+                a, b,
+                "the peers went quiet holding DIFFERENT sets — the horizon was \
+                 over-stated, so each silently withheld DMs the other would have kept"
+            );
+            return;
+        }
+    }
+    panic!("the interleaved exchange never went quiet");
+}
+
 /// A peer BELOW the global cap publishes `Open` and must still be offered older
 /// DMs — the horizon must not suppress legitimate back-fill.
 #[test]
@@ -721,7 +782,20 @@ fn global_cap_bounds_the_dm_pinned_member_set() {
     assert_eq!(
         state.members.members.len(),
         6,
-        "the DM-pinned member set must be bounded by the DM cap"
+        "the member set pinned by DM MESSAGES must be bounded by the DM cap"
+    );
+    // Scoped to this fixture on purpose. `2 * CAP` bounds the members pinned by
+    // retained MESSAGES, and this fixture has no purge envelopes — but
+    // `active_participants` ALSO pins every `purges[].recipient_id`, and nothing
+    // bounds the NUMBER of purge envelopes (`MAX_PURGED_TOMBSTONES_PER_RECIPIENT`
+    // caps entries WITHIN one envelope, not the envelope count). So a member who
+    // purges their last DM still pins themselves indefinitely. That half of the
+    // pinning problem is NOT closed by this change; asserting an unconditional
+    // `<= 2 * CAP` here would claim a bound the code does not provide.
+    assert!(
+        state.direct_messages.purges.is_empty(),
+        "fixture premise: no purge envelopes, so the members pinned here are \
+         exactly those pinned by retained messages"
     );
     assert!(
         state.members.members.len() <= 2 * CAP,
@@ -751,6 +825,218 @@ fn post_apply_cleanup_stays_idempotent_under_the_global_cap() {
     assert_eq!(
         once.direct_messages, twice.direct_messages,
         "cleanup(S) != cleanup(cleanup(S)) for direct messages"
+    );
+}
+
+/// The client-side merge, unrolled exactly as `room_synchronizer`'s
+/// `merge_incoming_state` does it: the receiver summarises against its OWN
+/// state (so the horizon reads the room's real cap), while `apply_delta` keeps
+/// the cheap sentinel parent the `#[composable]` macro ignores anyway.
+fn merge_incoming_state(
+    local: &mut ChatRoomStateV1,
+    params: &ChatRoomParametersV1,
+    incoming: &ChatRoomStateV1,
+) -> Result<(), String> {
+    let summary = local.summarize(local, params);
+    let delta = incoming.delta(incoming, params, &summary);
+    local.apply_delta(&ChatRoomStateV1::default(), params, &delta)
+}
+
+/// WHOLE-STATE gossip through the real client merge path, asserting `verify()`
+/// after every round.
+///
+/// The field-level tests above drive `DirectMessagesV1` against a FIXED parent
+/// whose member list never changes. That misses the feedback loop this change
+/// creates: trimming DMs makes `post_apply_cleanup` prune members (step 3 is an
+/// unconditional `retain`, NOT gated on `max_members`), and the pruned member
+/// set feeds straight back into `apply_delta`'s silent `resolve_member_vk` drop
+/// and `sweep_after_membership_change`. Before this change a DM participant
+/// could never be pruned — their DM was held forever, which is bug #519 — so
+/// this path is newly live and has to be exercised end to end.
+///
+/// A state that fails `verify` here would not be a test failure but a broken
+/// room: freenet-core rejects the update outright.
+///
+/// Scope note: this asserts quiescence of the DIRECT-MESSAGE channel, not of
+/// the whole delta. The MEMBERS channel does not go quiet, for reasons that
+/// predate this PR entirely — see
+/// `member_prune_reoffer_loop_is_pre_existing_and_not_caused_by_the_dm_cap`.
+#[test]
+fn whole_state_gossip_under_the_cap_converges_and_stays_verifiable() {
+    const CAP: usize = 8;
+    let r = room(12, Some(CAP));
+
+    // Per-pair CONTIGUOUS blocks, not the round-robin `spread`: pair k owns
+    // offsets [100 + 20k, 120 + 20k). That concentrates the newest DMs in the
+    // last pair or two, so the trim leaves most members unpinned and the prune
+    // actually fires. Round-robin offsets would spread the surviving `CAP` DMs
+    // across every pair and pin all 12 members, making this test vacuous.
+    let blocks = |offsets: std::ops::Range<u64>| -> Vec<AuthorizedDirectMessage> {
+        offsets
+            .map(|o| {
+                let k = ((o - 100) / 20) as usize;
+                dm(&r, 2 * k, 2 * k + 1, o)
+            })
+            .collect()
+    };
+
+    // Nobody authors a room message, so DMs are the ONLY thing keeping any
+    // member in the list — which is what makes the trim prune members.
+    let mut a = r.state.clone();
+    a.direct_messages = dms_holding_under(&r.state, &r.params, blocks(100..190));
+    let mut b = r.state.clone();
+    b.direct_messages = dms_holding_under(&r.state, &r.params, blocks(130..220));
+
+    let members_before = r.state.members.members.len();
+    let dm_offer = |from: &ChatRoomStateV1, to: &ChatRoomStateV1| -> usize {
+        from.delta(from, &r.params, &to.summarize(to, &r.params))
+            .and_then(|d| d.direct_messages.map(|dm| dm.new_messages.len()))
+            .unwrap_or(0)
+    };
+
+    for round in 0..12 {
+        merge_incoming_state(&mut a, &r.params, &b)
+            .unwrap_or_else(|e| panic!("round {round}: merge into A failed: {e}"));
+        assert!(
+            a.verify(&a, &r.params).is_ok(),
+            "round {round}: A failed verify after a merge — the cap-driven trim plus \
+             member prune left state freenet-core would reject: {:?}",
+            a.verify(&a, &r.params)
+        );
+
+        merge_incoming_state(&mut b, &r.params, &a)
+            .unwrap_or_else(|e| panic!("round {round}: merge into B failed: {e}"));
+        assert!(
+            b.verify(&b, &r.params).is_ok(),
+            "round {round}: B failed verify after a merge: {:?}",
+            b.verify(&b, &r.params)
+        );
+
+        if dm_offer(&b, &a) == 0 && dm_offer(&a, &b) == 0 {
+            assert!(
+                a.direct_messages.messages.len() <= CAP,
+                "the global cap must hold on the whole-state path"
+            );
+            assert_eq!(
+                a.direct_messages, b.direct_messages,
+                "the DM channel went quiet with the peers holding different sets — \
+                 silent divergence"
+            );
+            assert!(
+                a.members.members.len() < members_before,
+                "test premise: the trim must actually have pruned members, or this \
+                 test never exercises the feedback loop it exists for"
+            );
+            return;
+        }
+    }
+    panic!("the DM channel never went quiet within 12 rounds");
+}
+
+/// Characterises a PRE-EXISTING loop that this PR does not cause and does not
+/// fix, so the next reader does not mistake it for a regression of the DM cap.
+///
+/// `post_apply_cleanup` prunes members that nothing pins, but `MembersV1`'s
+/// summary/delta has no retention horizon — so a peer that has pruned re-offers
+/// nothing while a peer that has NOT pruned re-offers the same member records
+/// forever, and the pruning peer discards them on every round. This is the
+/// `MembersV1` non-monotonicity that `outbound_summary` in the UI already names
+/// as deferred, alongside `BansV1`.
+///
+/// It is reproducible on `origin/main` with **zero DMs involved** — which is
+/// what this test pins, deliberately using no DMs at all. The DM cap therefore
+/// cannot be its cause. What the DM cap does change is EXPOSURE: DM
+/// participants used to be exempt from the prune (bug #519), and now they are
+/// not, so more members fall into the pruned-and-re-offered population. It
+/// self-heals in any room with traffic, because the lagging peer runs
+/// `post_apply_cleanup` as soon as it applies any delta.
+///
+/// Inverted assertion, in the same style as
+/// `retention_loop_test.rs::ban_sweep_reopening_the_horizon_still_loops_known_gap`:
+/// the day `MembersV1` gets a horizon, this test fails and forces whoever fixed
+/// it to flip the polarity.
+#[test]
+fn member_prune_reoffer_loop_is_pre_existing_and_not_caused_by_the_dm_cap() {
+    let r = room(10, Some(500));
+
+    // Members pinned by NOTHING: no DMs, no messages, no secrets, no bans.
+    assert!(
+        r.state.direct_messages.messages.is_empty(),
+        "test premise: no DMs, so the DM cap cannot be implicated"
+    );
+
+    let mut pruned = r.state.clone();
+    pruned
+        .post_apply_cleanup(&r.params)
+        .expect("cleanup must succeed");
+    assert!(
+        pruned.members.members.is_empty(),
+        "test premise: unpinned members must be pruned by cleanup"
+    );
+    let lagging = r.state.clone();
+
+    for round in 0..5 {
+        let offered = lagging
+            .delta(&lagging, &r.params, &pruned.summarize(&pruned, &r.params))
+            .unwrap_or_else(|| {
+                panic!(
+                    "round {round}: the lagging peer had nothing to offer. The \
+                     MembersV1 non-monotonicity this test characterises has been \
+                     CLOSED — that is good news. Rename this test, restore a \
+                     terminating assertion, and update the note in \
+                     `whole_state_gossip_under_the_cap_converges_and_stays_verifiable`."
+                )
+            });
+        assert_eq!(
+            offered.members.as_ref().map(|m| m.added().len()),
+            Some(10),
+            "round {round}: the offer must be the 10 member records the prune removed"
+        );
+        merge_incoming_state(&mut pruned, &r.params, &lagging)
+            .unwrap_or_else(|e| panic!("round {round}: merge failed: {e}"));
+        assert!(
+            pruned.members.members.is_empty(),
+            "round {round}: cleanup must re-prune them, which is exactly why the \
+             lagging peer never learns and re-offers forever"
+        );
+    }
+}
+
+/// Duplicate entries must not defeat the cap.
+///
+/// `apply_delta` dedupes on insert, but `verify` has no distinct-signature
+/// check, so a hand-built or hostile full-state PUT can carry duplicates. Both
+/// trims key off `DmOrderKey`, and duplicates share one — so without
+/// `dedup_by_signature` the global trim's cutoff can land on a repeated key and
+/// `retain(>= cutoff)` drops NOTHING, leaving the peer permanently over the cap
+/// with the member set still pinned.
+#[test]
+fn duplicate_entries_do_not_defeat_the_global_cap() {
+    const CAP: usize = 20;
+    let r = room(6, Some(CAP));
+
+    // 30 copies of the single oldest DM (well under the per-pair cap, so the
+    // pair trim does not clear them) plus 25 distinct newer ones. The cutoff
+    // rank lands inside the duplicate run, which is the degenerate case.
+    let oldest = dm(&r, 0, 1, 0);
+    let mut messages: Vec<AuthorizedDirectMessage> = vec![oldest.clone(); 30];
+    messages.extend(spread(&r, 100..125, 3));
+
+    let mut d = DirectMessagesV1::default();
+    d.messages = messages;
+    d.apply_delta(&r.state, &r.params, &None)
+        .expect("empty delta must apply");
+
+    assert_eq!(
+        d.messages.len(),
+        CAP,
+        "duplicates made the global trim a no-op, leaving the set over cap"
+    );
+    assert!(
+        !d.messages
+            .iter()
+            .any(|m| m.sender_signature == oldest.sender_signature),
+        "the duplicated oldest DM should have been trimmed away entirely"
     );
 }
 
