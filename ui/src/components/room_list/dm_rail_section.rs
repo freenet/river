@@ -12,12 +12,18 @@
 //!
 //! Each row also carries a rollover **Archive** ✕ button (issue #266 —
 //! the previous "Hide" button in the modal header sat next to the close
-//! ✕ and was repeatedly mistaken for it). On desktop the button is
-//! hidden until the row is hovered/focused; on mobile it's dimmed always-
-//! visible so it's tappable without a hover state. Archived threads stay
-//! out of the rail until either side sends a new DM. The "Archived (N)"
-//! link at the bottom of the section lists currently-archived threads
-//! and offers per-row Un-archive, closing #266.
+//! ✕ and was repeatedly mistaken for it). Reveal is gated on *hover
+//! capability*, not viewport width (issue #462): on a hover-pointer
+//! device the button is `opacity-0` until the row is hovered/focused;
+//! on a touch device (`@media (hover: none)`) `.dm-archive-btn` in
+//! `main.css` forces it fully visible with a 44px tap target, because
+//! the `group-hover` reveal Tailwind emits is itself wrapped in
+//! `@media (hover: hover)` and can never fire there. This mirrors the
+//! `.hover-actions` / `.touch-actions` split #402 introduced for the
+//! message action bar. Archived threads stay out of the rail until
+//! either side sends a new DM. The "Archived (N)" link at the bottom of
+//! the section lists currently-archived threads and offers per-row
+//! Un-archive, closing #266.
 //!
 //! Hidden when empty so the rail doesn't show an empty section on first
 //! load. Sorts unread threads first, then by most-recent message time.
@@ -181,9 +187,12 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
     };
 
     // `group` + `group-hover:opacity-100` keeps the ✕ off-screen at rest
-    // on desktop; on mobile (`<md`) it stays dimmed but visible so the
-    // hover-only affordance doesn't strand touch users. `group-focus-within`
-    // mirrors hover for keyboard users tab-stopping into the row.
+    // on a hover-pointer device. On a touch device the `.dm-archive-btn`
+    // rule in main.css (`@media (hover: none)`) forces it visible with a
+    // real tap target, because Tailwind wraps `group-hover:*` in
+    // `@media (hover: hover)` so it can never fire on touch (#462).
+    // `group-focus-within` mirrors hover for keyboard users tab-stopping
+    // into the row.
     let archive_click = move |evt: Event<MouseData>| {
         // The archive button is a sibling of the row's "open thread"
         // button (not nested inside it), so the row click handler
@@ -203,7 +212,10 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
         li {
             div { class: "group relative w-full",
                 button {
-                    class: "w-full text-left pl-3 pr-9 py-1.5 rounded-lg text-sm transition-colors text-text hover:bg-surface flex items-center gap-2",
+                    // `dm-rail-row-btn`: main.css widens the right padding on
+                    // touch devices so the enlarged always-visible archive ✕
+                    // (below) doesn't overlap the nickname / unread badge (#462).
+                    class: "dm-rail-row-btn w-full text-left pl-3 pr-9 py-1.5 rounded-lg text-sm transition-colors text-text hover:bg-surface flex items-center gap-2",
                     onclick: click,
                     div { class: "flex-1 min-w-0",
                         div { class: "truncate text-sm",
@@ -220,8 +232,12 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
                     }
                 }
                 button {
-                    class: "absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded text-text-muted \
-                            opacity-40 md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 \
+                    // `dm-archive-btn`: opacity-0 at rest so the hover reveal
+                    // stays clean on desktop; main.css forces it visible with a
+                    // 44px tap target under `@media (hover: none)` (#462).
+                    class: "dm-archive-btn absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded text-text-muted \
+                            flex items-center justify-center opacity-0 \
+                            group-hover:opacity-100 group-focus-within:opacity-100 \
                             hover:text-red-400 hover:bg-surface focus:opacity-100 \
                             transition-opacity transition-colors",
                     title: "{archive_title}",
@@ -1779,5 +1795,158 @@ mod tests {
         assert_eq!(last_good_archived_count(), 7);
         set_last_good_archived_count(0);
         assert_eq!(last_good_archived_count(), 0);
+    }
+
+    // ---- #462: archive ✕ must be reachable on touch devices ----
+    //
+    // The archive reveal can't be driven end-to-end in Playwright through the
+    // real rail (the example-data build ships no DMs, so no row renders — see
+    // `ui/tests/dm-archive-ux.spec.ts`), so the CASCADE is pinned in the
+    // browser by `dm-archive-touch.spec.ts`, which probes the shipped
+    // stylesheets directly. These two pin the SOURCE side: that the markup
+    // still carries the hooks that stylesheet targets, and that the rule is
+    // still inside a pointer-capability media query rather than at top level.
+    //
+    // Both cut production off at `mod tests` for the reason spelled out on
+    // `rail_builders_read_infallible_guard_before_first_fallible_read` above:
+    // `include_str!` reads this file back, assert MESSAGES included, so an
+    // uncut needle is satisfied by the test that is supposed to be checking it.
+
+    const DM_RAIL_SRC: &str = include_str!("dm_rail_section.rs");
+    const MAIN_CSS: &str = include_str!("../../../assets/main.css");
+
+    /// This file's production half, with the test module (and its assert
+    /// messages) cut off.
+    fn dm_rail_production() -> &'static str {
+        &DM_RAIL_SRC[..DM_RAIL_SRC
+            .find("mod tests")
+            .expect("dm_rail_section.rs has exactly one `mod tests`")]
+    }
+
+    /// The archive ✕ must gate its reveal on pointer capability, not the
+    /// viewport breakpoint. Gating on the breakpoint was the #462 bug: a
+    /// tablet clears the breakpoint yet has no hover pointer, so the button
+    /// became invisible-but-tappable there.
+    #[test]
+    fn archive_button_not_viewport_gated() {
+        let prod = dm_rail_production();
+        // Whitespace-stripped and anchored on the CLASS ATTRIBUTE, not a bare
+        // substring: `dm-archive-btn` also appears in prose above, so a
+        // file-wide `contains` stays green even if the class is deleted from
+        // the markup — which is the one mutation this test exists to catch.
+        let squashed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squashed.contains(concat!("class:\"", "dm-archive-btn")),
+            "the archive ✕ must carry the `dm-archive-btn` class so main.css \
+             can force it visible on touch (#462)"
+        );
+        assert!(
+            squashed.contains(concat!("class:\"", "dm-rail-row-btn")),
+            "the rail row must carry `dm-rail-row-btn` so its right padding \
+             widens on touch and the enlarged ✕ does not overlap the nickname \
+             or unread badge (#462)"
+        );
+        // The reveal itself, in the class attribute rather than in prose.
+        assert!(
+            squashed.contains("group-hover:opacity-100"),
+            "the archive ✕ must reveal via `group-hover` (pointer-capability \
+             gated) rather than a viewport breakpoint (#462)"
+        );
+        assert!(
+            squashed.contains("opacity-0"),
+            "the archive ✕ must be `opacity-0` at rest, or the hover reveal on \
+             a mouse-only desktop is meaningless (#462)"
+        );
+        // Reconstruct the forbidden token from fragments so this file (which
+        // `include_str!` reads back) does not itself contain the literal.
+        assert!(
+            !prod.contains(concat!("md:", "opacity-0")),
+            "the archive ✕ must not gate its reveal on the md viewport \
+             breakpoint — a tablet clears the breakpoint but has no hover \
+             pointer, which is exactly the #462 invisible-but-tappable bug"
+        );
+    }
+
+    /// main.css must force `.dm-archive-btn` visible with a real tap target
+    /// inside a POINTER-CAPABILITY media query, and widen the row padding.
+    ///
+    /// The containment check is a brace scan, not a prefix search. `main.css`
+    /// already opens a touch media query for the #402 message-action bar well
+    /// above this rule, so "some `@media` opens somewhere earlier in the file"
+    /// is satisfied by ANY placement below it — including moving the rule out
+    /// to top level, which would force the ✕ permanently visible on a
+    /// mouse-only desktop and silently destroy the hover reveal.
+    #[test]
+    fn touch_devices_reveal_archive_button() {
+        let idx = MAIN_CSS
+            .find(".dm-archive-btn")
+            .expect("main.css must style `.dm-archive-btn` (#462)");
+
+        // Walk every `@media` before the rule, tracking brace depth, and keep
+        // the innermost one still open at `idx`.
+        let mut enclosing: Option<&str> = None;
+        let mut depth_of: Vec<(usize, &str)> = Vec::new();
+        let mut depth = 0usize;
+        let mut pending: Option<&str> = None;
+        for (i, ch) in MAIN_CSS[..idx].char_indices() {
+            if MAIN_CSS[i..].starts_with("@media") {
+                let rest = &MAIN_CSS[i..];
+                let brace = rest.find('{').unwrap_or(0);
+                pending = Some(rest[..brace].trim());
+            }
+            match ch {
+                '{' => {
+                    depth += 1;
+                    if let Some(q) = pending.take() {
+                        depth_of.push((depth, q));
+                    }
+                }
+                '}' => {
+                    depth_of.retain(|(d, _)| *d < depth);
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+        if let Some((_, q)) = depth_of.last() {
+            enclosing = Some(q);
+        }
+        let query = enclosing.unwrap_or_else(|| {
+            panic!(
+                "`.dm-archive-btn` is at top level in main.css — it must sit \
+                 inside a pointer-capability media query, or the ✕ is forced \
+                 permanently visible on a mouse-only desktop and the hover \
+                 reveal is gone (#462)"
+            )
+        });
+        assert!(
+            query.contains("any-pointer: coarse"),
+            "the rule enclosing `.dm-archive-btn` is `{query}`, which must \
+             include `any-pointer: coarse`. `hover: none` alone reports the \
+             PRIMARY input, so a touchscreen laptop answers `hover: hover` and \
+             keeps an invisible-but-tappable button — the #462 hazard moved to \
+             another device class"
+        );
+
+        // Slice by CHAR boundary, not byte arithmetic: main.css contains ✕, —
+        // and ⋮ in its comments, so a fixed byte window can land mid-codepoint
+        // and panic with an error that looks nothing like the real failure.
+        let rule = MAIN_CSS[idx..]
+            .split_once('}')
+            .map(|(head, _)| head)
+            .unwrap_or(&MAIN_CSS[idx..]);
+        assert!(
+            rule.contains("opacity: 1"),
+            "the touch rule must set the archive ✕ to full opacity (#462)"
+        );
+        assert!(
+            rule.contains("min-height"),
+            "the touch rule must give the archive ✕ a real tap target (#462)"
+        );
+        assert!(
+            MAIN_CSS.contains(".dm-rail-row-btn"),
+            "the row padding must widen on touch so the enlarged ✕ doesn't \
+             overlap the nickname / unread badge (#462)"
+        );
     }
 }
