@@ -2154,6 +2154,41 @@ fn install_scroll_pin_listeners(
     true
 }
 
+/// The two affordances the no-room screen must offer in EVERY load state
+/// (freenet/river#509).
+///
+/// * The #159 quickstart invite link. A brand-new user has `room_count == 0`,
+///   so they are in an unresolved state for the whole load window; putting the
+///   link only on the resolved screen would hide their one concrete next step
+///   for exactly as long as they need it.
+/// * The connection pill. On mobile the rooms rail is `display:none`, so this
+///   is the only copy of it a phone user can see (Bug #5, Ivvor 2026-05-17).
+///   It matters most in the unresolved states: a node that never connects
+///   leaves `ROOMS_LOAD_STATE` at its `Loading` default forever, because
+///   `begin_load_attempt` — which arms the 60s backstop — runs only after a
+///   successful connect. Without the pill that user watches a spinner with
+///   nothing on screen saying the socket is down. It is also what makes the
+///   failed state's "Check your connection and try again" actionable.
+///
+/// One component so the three unresolved arms and the Welcome arm cannot drift.
+#[component]
+fn NoRoomFooter() -> Element {
+    rsx! {
+        p { class: "text-text-muted mt-3",
+            a {
+                class: "text-accent hover:underline",
+                href: "https://freenet.org/quickstart#invite-form",
+                target: "_blank",
+                rel: "noopener noreferrer",
+                "Click here to get an invitation to channel \"Freenet Official\""
+            }
+        }
+        div { class: "mt-8 md:hidden",
+            crate::components::members::ConnectionStatusIndicator {}
+        }
+    }
+}
+
 #[component]
 pub fn Conversation() -> Element {
     let current_room_data = {
@@ -4406,40 +4441,94 @@ pub fn Conversation() -> Element {
                                 }
                             }
                         }
-                        div { class: "flex-1 flex flex-col items-center justify-center text-center p-8",
-                            img {
-                                class: "w-24 h-24 mb-6 opacity-50",
-                                src: asset!("/assets/river_logo.svg"),
-                                alt: "River Logo"
-                            }
-                            h1 { class: "text-2xl font-semibold text-text mb-2",
-                                "Welcome to River"
-                            }
-                            p { class: "text-text-muted",
-                                "Create a new room, or get invited to an existing one."
-                            }
-                            // Issue #159: new users (especially on mobile) need a
-                            // concrete next step. Link to the Freenet quickstart
-                            // invite form so they can get into the "Freenet
-                            // Official" room.
-                            p { class: "text-text-muted mt-3",
-                                a {
-                                    class: "text-accent hover:underline",
-                                    href: "https://freenet.org/quickstart#invite-form",
-                                    target: "_blank",
-                                    rel: "noopener noreferrer",
-                                    "Click here to get an invitation to channel \"Freenet Official\""
+                        // freenet/river#509: this panel is the ONLY thing a
+                        // phone user can see while rooms load — below 768px the
+                        // rail that carries #397's loading / migrating / failed
+                        // states is `display:none`, not unmounted, and the
+                        // default mobile view is Chat. Rendering the Welcome
+                        // copy unconditionally therefore told a mid-load user
+                        // they had no rooms, and hid a FAILED load (and its
+                        // Retry button) behind advice to create one.
+                        //
+                        // Branches on the SAME call the rail makes, so the two
+                        // surfaces cannot disagree. Viewport-independent on
+                        // purpose: the desktop centre panel had the same
+                        // false-empty text.
+                        //
+                        // Every arm keeps the two things that are useful in any
+                        // state: the #159 quickstart invite link (a brand-new
+                        // user has `room_count == 0`, so they are in the
+                        // unresolved states for the whole load window and would
+                        // otherwise lose their only onboarding affordance) and
+                        // the connection pill. The pill matters MOST here: a
+                        // node that never connects leaves `ROOMS_LOAD_STATE` at
+                        // its `Loading` default indefinitely — `begin_load_attempt`,
+                        // which arms the 60s backstop, runs only after a
+                        // successful connect — so without the pill that user
+                        // would watch a spinner with nothing telling them the
+                        // socket is down (#509 review).
+                        match crate::components::room_list::current_room_list_display() {
+                            crate::components::room_list::RoomListDisplay::Loading => rsx! {
+                                div {
+                                    class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
+                                    "data-testid": "conversation-rooms-loading",
+                                    div { class: "animate-spin w-6 h-6 border-2 border-text-muted border-t-transparent rounded-full" }
+                                    span { class: "text-sm text-text-muted", "Loading your rooms…" }
+                                    NoRoomFooter {}
                                 }
-                            }
-                            // Bug #5 (Ivvor, Matrix 2026-05-17): on mobile,
-                            // the default MOBILE_VIEW is Chat, so a brand-new
-                            // user with no rooms lands here without ever
-                            // seeing the left-rail indicator. Render the
-                            // pill inline so they get the same WebSocket
-                            // signal regardless of viewport.
-                            div { class: "mt-8 md:hidden",
-                                crate::components::members::ConnectionStatusIndicator {}
-                            }
+                            },
+                            crate::components::room_list::RoomListDisplay::Migrating => rsx! {
+                                div {
+                                    class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
+                                    "data-testid": "conversation-rooms-migrating",
+                                    div { class: "animate-spin w-6 h-6 border-2 border-text-muted border-t-transparent rounded-full" }
+                                    span { class: "text-sm text-text-muted", "Migrating your rooms…" }
+                                    span { class: "text-xs text-text-muted opacity-70", "(one-time step after an update)" }
+                                    NoRoomFooter {}
+                                }
+                            },
+                            crate::components::room_list::RoomListDisplay::LoadFailed => rsx! {
+                                div {
+                                    class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
+                                    "data-testid": "conversation-rooms-error",
+                                    span { class: "text-sm text-text-muted", "Couldn't load your rooms" }
+                                    span { class: "text-xs text-text-muted opacity-70", "Check your connection and try again." }
+                                    button {
+                                        "data-testid": "conversation-rooms-retry-button",
+                                        class: "flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-text-muted bg-surface hover:bg-surface-hover transition-colors",
+                                        // Same entry point as the rail's Retry.
+                                        // Safe to call directly — `retry_rooms_load`
+                                        // defers its signal write and spawns via
+                                        // setTimeout(0) (Dioxus signal-safety rules).
+                                        onclick: move |_| crate::components::app::chat_delegate::retry_rooms_load(),
+                                        span { "Retry" }
+                                    }
+                                    NoRoomFooter {}
+                                }
+                            },
+                            // The load resolved and there really are no rooms,
+                            // or rooms exist and none is selected yet: today's
+                            // screen, unchanged. Spelled out rather than `_` so
+                            // a future variant is a compile error here instead
+                            // of silently falling back to "you have no rooms" —
+                            // which is the #397 -> #509 story exactly.
+                            crate::components::room_list::RoomListDisplay::Empty
+                            | crate::components::room_list::RoomListDisplay::List => rsx! {
+                                div { class: "flex-1 flex flex-col items-center justify-center text-center p-8",
+                                    img {
+                                        class: "w-24 h-24 mb-6 opacity-50",
+                                        src: asset!("/assets/river_logo.svg"),
+                                        alt: "River Logo"
+                                    }
+                                    h1 { class: "text-2xl font-semibold text-text mb-2",
+                                        "Welcome to River"
+                                    }
+                                    p { class: "text-text-muted",
+                                        "Create a new room, or get invited to an existing one."
+                                    }
+                                    NoRoomFooter {}
+                                }
+                            },
                         }
                     },
                 }
@@ -5676,6 +5765,83 @@ mod tests {
             !squashed.contains(concat!("sign_message_", "with_fallback")),
             "message signing must not go through the delegate on any path \
              (freenet/river#512)"
+        );
+    }
+
+    /// Source-grep pin (freenet/river#509): the no-room screen must branch on
+    /// the SHARED room-list display state.
+    ///
+    /// Below 768px the rooms rail is `display:none` rather than unmounted and
+    /// the default mobile view is Chat, so for the whole load window this panel
+    /// is the only thing a phone user can see. Rendering the Welcome copy
+    /// unconditionally told a mid-load user they had no rooms, and hid a FAILED
+    /// load — and its Retry button — behind advice to create one.
+    ///
+    /// The states themselves are covered by `room_list_display_state`'s unit
+    /// tests and by `rooms-loading-state.spec.ts`; what this pins is the
+    /// WIRING, which is what #397 left undone: it added the states to the rail
+    /// and never touched `app.rs` or this file, so `ROOMS_LOAD_STATE` had
+    /// exactly one consumer in the whole UI.
+    #[test]
+    fn the_no_room_screen_branches_on_the_shared_load_state() {
+        let source = include_str!("conversation.rs");
+        let prod = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
+        let code: String = prod
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            squashed.contains("current_room_list_display()"),
+            "the no-room screen must read the shared room-list display state, \
+             not render the Welcome copy unconditionally — that is what mobile \
+             showed a user mid-load (freenet/river#509)"
+        );
+        for (arm, testid) in [
+            ("Loading", "conversation-rooms-loading"),
+            ("Migrating", "conversation-rooms-migrating"),
+            ("LoadFailed", "conversation-rooms-error"),
+        ] {
+            assert!(
+                squashed.contains(&format!("RoomListDisplay::{arm}=>")),
+                "the no-room screen must handle `RoomListDisplay::{arm}`"
+            );
+            assert!(
+                squashed.contains(&format!("\"data-testid\":\"{testid}\"")),
+                "the {arm} arm must render its `{testid}` element"
+            );
+        }
+        assert!(
+            squashed.contains("retry_rooms_load()"),
+            "the failed arm must offer Retry — a stalled load is otherwise \
+             pixel-identical to an empty account, and the advice on screen is \
+             to create a room"
+        );
+        // The invite link and the connection pill must reach EVERY arm, which
+        // is what `NoRoomFooter` is for. The pill in particular is the only
+        // thing on screen that can explain an unbounded `Loading`: a node that
+        // never connects never runs `begin_load_attempt`, so the 60s backstop
+        // is never armed either.
+        assert_eq!(
+            squashed.matches("NoRoomFooter{}").count(),
+            4,
+            "every arm of the no-room screen must render `NoRoomFooter` — the \
+             invite link and the connection pill are useful in all of them, and \
+             the pill is what makes 'Check your connection' actionable"
+        );
+        assert!(
+            squashed.contains("fnNoRoomFooter()->Element{"),
+            "the shared footer must exist as one component, so the arms cannot \
+             drift on what it contains"
+        );
+        assert!(
+            !squashed.contains("RoomListDisplay::List=>rsx!{}"),
+            "the conversation panel must not copy the rail's empty `List` arm; \
+             it renders the Welcome screen for List"
         );
     }
 
