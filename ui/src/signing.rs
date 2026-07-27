@@ -1,11 +1,17 @@
-//! Signing API for delegate-based signing operations.
+//! Signing API for room payloads.
 //!
-//! This module provides async wrapper functions that send signing requests
-//! to the chat delegate and wait for responses. The delegate holds the signing
-//! keys and performs all signing operations, so private keys never leave the delegate.
+//! The chat delegate holds a copy of each room's signing key, and most signable
+//! types (member, ban, config, member_info, secret, upgrade) are signed by
+//! asking it over the WebSocket — see the `sign_*_with_fallback` functions.
 //!
-//! The module also provides fallback functionality that signs locally if the
-//! delegate signing fails, for backwards compatibility during migration.
+//! `RoomData::self_sk` is the authoritative key in every case, though: a
+//! delegate answer is used only when it verifies under it, and otherwise the
+//! payload is signed locally. Chat messages skip the round-trip entirely and
+//! sign locally (`sign_message_locally`, freenet/river#512), because the answer
+//! could not differ and waiting for it is what the sender sees as lag.
+//!
+//! This module also owns the signing-key migration that puts `self_sk` into the
+//! delegate in the first place.
 
 use crate::components::app::chat_delegate::{generate_request_id, send_delegate_request};
 use dioxus::logger::tracing::{info, warn};
@@ -471,9 +477,10 @@ async fn delegate_sign_or_fallback(
 /// executor, with a 10s timeout before the local fallback — seconds of blank
 /// composer for a signature the browser could produce in microseconds.
 ///
-/// The other `sign_*_with_fallback` functions keep the delegate call: they are
-/// off the interactive send path, so the argument about latency does not apply
-/// and there is no reason to change them in the same breath.
+/// The same three facts hold for the other `sign_*_with_fallback` functions —
+/// their delegate answers are equally unable to change the bytes — so the
+/// delegate call is not buying them correctness either. They are left alone
+/// because none of them is on the send path, not because they need it.
 pub fn sign_message_locally(message_bytes: &[u8], self_sk: &SigningKey) -> Signature {
     self_sk.sign(message_bytes)
 }
@@ -686,6 +693,60 @@ mod tests {
             local.to_bytes(),
             "a failed delegate sign must fall back to the local signature"
         );
+    }
+
+    /// freenet/river#512: the send path hand-rolls the signing preimage —
+    /// CBOR-encode `MessageV1`, then `sign_message_locally` those bytes —
+    /// because it needs to fail gracefully on a serialization error where
+    /// `sign_struct` would panic in WASM. That leaves four copies of the
+    /// preimage that must stay byte-identical to what the contract verifies,
+    /// held together by convention alone. Pin the two together: if
+    /// `sign_struct` ever gains a domain separator or a version tag, every
+    /// message a user sends would be rejected by the contract while every
+    /// other test still passed.
+    #[test]
+    fn a_locally_signed_message_is_what_the_contract_verifies() {
+        let self_sk = SigningKey::from_bytes(&[5u8; 32]);
+        let owner_vk = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+        let message = MessageV1 {
+            room_owner: MemberId::from(&owner_vk),
+            author: MemberId::from(&self_sk.verifying_key()),
+            content: RoomMessageBody::public("hello".to_string()),
+            time: std::time::SystemTime::UNIX_EPOCH,
+        };
+
+        // Exactly what the four call sites in `conversation.rs` do.
+        let mut message_bytes = Vec::new();
+        ciborium::ser::into_writer(&message, &mut message_bytes).expect("MessageV1 must serialize");
+        let sent = AuthorizedMessageV1::with_signature(
+            message.clone(),
+            sign_message_locally(&message_bytes, &self_sk),
+        );
+
+        sent.validate(&self_sk.verifying_key()).expect(
+            "a message signed on the send path must verify under the author's \
+             own key — this is what the room contract checks before accepting it",
+        );
+        assert_eq!(
+            sent.signature.to_bytes(),
+            AuthorizedMessageV1::new(message, &self_sk)
+                .signature
+                .to_bytes(),
+            "the send path's hand-rolled preimage must match `sign_struct`'s"
+        );
+    }
+
+    /// freenet/river#512 rests on `RoomData::self_sk` being present and
+    /// authoritative — the send path signs with it and never consults the
+    /// delegate. If it ever becomes optional (delegate-only custody, a
+    /// hardware key), the message path needs rethinking rather than an
+    /// `unwrap`, and this is what says so at compile time.
+    #[test]
+    fn the_send_path_always_has_a_local_signing_key() {
+        fn assert_plain_signing_key(room: &crate::room_data::RoomData) -> &SigningKey {
+            &room.self_sk
+        }
+        let _ = assert_plain_signing_key;
     }
 
     /// freenet/river#414 (Codex round-8): an AUTHORITATIVE identity choice records

@@ -194,20 +194,19 @@ without `?debug=1`.
 A WASM panic hook creates a visible red error overlay showing the panic
 message. Appears automatically on any crash, no query param needed.
 
-### Delegate signing flow
+### Signing flow
 
-Message sending uses a delegate-based signing architecture:
-
-1. **Room creation** → `create_room_modal.rs` generates `SigningKey`, stores in ROOMS signal, and calls `store_signing_key()` to save it in the chat delegate
-2. **Message send** → UI calls `sign_message_with_fallback(room_key, msg, fallback_sk)`
-3. **Delegate signing** → `send_delegate_request(SignMessage{...})` → delegate looks up `signing_key:{origin}:{room_key}` → returns signature
-4. **Fallback** → If delegate fails, signs locally with `fallback_sk.sign()`
+1. **Room creation** → `create_room_modal.rs` generates `SigningKey`, stores it in the ROOMS signal as `RoomData::self_sk`, and calls `store_signing_key()` to save a copy in the chat delegate
+2. **Message send** → UI signs locally and synchronously: `sign_message_locally(&msg_bytes, &self_sk)`. There is **no** delegate round-trip on the message path (freenet/river#512) — it could not change the signature bytes and it cost seconds of visible lag
+3. **Everything else** (member, ban, config, member_info, secret, upgrade) → `sign_*_with_fallback` → `send_delegate_request(Sign*{...})` → delegate looks up `signing_key:{origin}:{room_key}` → returns signature
+4. **Fallback** → the delegate's answer is used only if it verifies under `self_sk`; otherwise (and on any delegate failure) the payload is signed locally with `self_sk`
 5. **Delta applied** → Message added to local state → `NEEDS_SYNC` set → `ProcessRooms` → UPDATE sent
 
 Key debugging points:
-- Node logs show `"Sign request for room, signature created: true/false"` — if false, delegate doesn't have the key
-- Browser console shows fallback path: `"Delegate signing failed, using fallback"`
-- If no UPDATE appears in node logs after signing, check if WebSocket is still connected
+- A slow or failed **message** send is never the delegate — nothing is asked of it. Look at step 5 (UPDATE / WebSocket) instead
+- For the other payload types, node logs show `"Sign request for room, signature created: true/false"` — if false, the delegate doesn't have the key
+- Browser console shows the fallback path: `"Delegate signing failed, using fallback"`
+- If no UPDATE appears in node logs after signing, check if the WebSocket is still connected
 
 ### Check contract state via riverctl
 
@@ -217,12 +216,14 @@ riverctl --node-url ws://127.0.0.1:7510/v1/contract/command?encodingProtocol=nat
 
 ### Timeline analysis for message send
 
-1. `SignMessage received` → delegate got the sign request
-2. `signature created: true/false` → delegate had (or didn't have) the key
+1. `[send] signed OK` (browser, with `?debug=1`) → the message was signed locally
+2. `[send] delta applied OK` → it is in local state and on screen
 3. `Update { key: ... }` → UPDATE arrived at node
 4. `ResultRouter received result` → UPDATE processed, result sent back to client
 
-If step 1 happens but step 3 doesn't, the browser died between signing and sending the UPDATE.
+If step 2 happens but step 3 doesn't, the browser died between applying the
+message locally and sending the UPDATE. There is no delegate step here — see
+"Signing flow" above.
 
 ### Firefox mobile: Dioxus RefCell re-entrant borrow panics
 

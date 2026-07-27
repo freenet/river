@@ -1914,6 +1914,90 @@ mod tests {
         assert!(messages.reactions(&original_id).is_none());
     }
 
+    /// Swapping one reaction for another emits remove(old) + add(new) as a
+    /// PAIR, and since freenet/river#512 removed the delegate round-trip that
+    /// used to separate them, both are stamped from the same `Date.now()` —
+    /// so they now essentially always share a millisecond. `MessageOrderKey`
+    /// then breaks the tie by message id, which is a signature hash: the
+    /// replay order is effectively random and differs between peers.
+    ///
+    /// That is only safe because `ACTION_TYPE_REMOVE_REACTION` is scoped to
+    /// its own emoji, so the two actions touch disjoint map keys and commute.
+    /// If `remove_reaction` is ever widened to "clear this actor's reaction on
+    /// this target" — the natural reading of the one-reaction-per-user rule
+    /// the UI enforces client-side — a reaction swap starts silently
+    /// no-opping about half the time, on a hash comparison. This is what says
+    /// so.
+    #[test]
+    fn a_same_millisecond_reaction_swap_converges_either_way() {
+        let user_sk = SigningKey::generate(&mut OsRng);
+        let user_id = MemberId::from(&user_sk.verifying_key());
+        let owner_id = user_id;
+
+        let original = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: user_id,
+                time: SystemTime::UNIX_EPOCH,
+                content: RoomMessageBody::public("React to me!".to_string()),
+            },
+            &user_sk,
+        );
+        let target = original.id();
+
+        let react = |emoji: &str, remove: bool, time: SystemTime| {
+            let content = if remove {
+                RoomMessageBody::remove_reaction(target.clone(), emoji.to_string())
+            } else {
+                RoomMessageBody::reaction(target.clone(), emoji.to_string())
+            };
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: user_id,
+                    time,
+                    content,
+                },
+                &user_sk,
+            )
+        };
+
+        let first = react("👍", false, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        // The swap pair: identical timestamps, as the UI now produces them.
+        let swap_at = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
+        let remove_old = react("👍", true, swap_at);
+        let add_new = react("❤️", false, swap_at);
+        assert_eq!(
+            remove_old.message.time, add_new.message.time,
+            "premise: the swap pair must share a timestamp, or this test \
+             proves nothing about the tie-break"
+        );
+
+        for (label, pair) in [
+            ("remove first", vec![remove_old.clone(), add_new.clone()]),
+            ("add first", vec![add_new, remove_old]),
+        ] {
+            let mut messages = MessagesV1 {
+                messages: [vec![original.clone(), first.clone()], pair].concat(),
+                ..Default::default()
+            };
+            messages.rebuild_actions_state();
+
+            let reactions = messages
+                .reactions(&target)
+                .unwrap_or_else(|| panic!("{label}: the swapped-in reaction must survive"));
+            assert_eq!(
+                reactions.get("❤️").map(|r| r.as_slice()),
+                Some([user_id].as_slice()),
+                "{label}: the new reaction must be present"
+            );
+            assert!(
+                !reactions.contains_key("👍"),
+                "{label}: the old reaction must be gone"
+            );
+        }
+    }
+
     #[test]
     fn test_action_on_deleted_message_ignored() {
         let signing_key = SigningKey::generate(&mut OsRng);

@@ -3023,6 +3023,11 @@ pub fn Conversation() -> Element {
                 let clicked_same = existing_reaction.as_ref() == Some(&emoji);
                 let has_existing = existing_reaction.is_some();
 
+                // Retained even though this block no longer awaits anything:
+                // `spawn_local` defers the body to a microtask, so it runs
+                // after the event handler's stack (and any Dioxus borrow) has
+                // unwound. Inlining it would re-introduce the Firefox-mobile
+                // re-entrant RefCell panics (freenet/river#512 review).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -3191,6 +3196,11 @@ pub fn Conversation() -> Element {
                     .get_secret()
                     .map(|(secret, version)| (*secret, version));
 
+                // Retained even though this block no longer awaits anything:
+                // `spawn_local` defers the body to a microtask, so it runs
+                // after the event handler's stack (and any Dioxus borrow) has
+                // unwound. Inlining it would re-introduce the Firefox-mobile
+                // re-entrant RefCell panics (freenet/river#512 review).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -3312,6 +3322,11 @@ pub fn Conversation() -> Element {
                     return;
                 }
 
+                // Retained even though this block no longer awaits anything:
+                // `spawn_local` defers the body to a microtask, so it runs
+                // after the event handler's stack (and any Dioxus borrow) has
+                // unwound. Inlining it would re-introduce the Firefox-mobile
+                // re-entrant RefCell panics (freenet/river#512 review).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -3437,6 +3452,11 @@ pub fn Conversation() -> Element {
                 // rather than snapping a later unrelated message to the bottom
                 // (#402 review).
                 let force_scroll = force_scroll.clone();
+                // Retained even though this block no longer awaits anything:
+                // `spawn_local` defers the body to a microtask, so it runs
+                // after the event handler's stack (and any Dioxus borrow) has
+                // unwound. Inlining it would re-introduce the Firefox-mobile
+                // re-entrant RefCell panics (freenet/river#512 review).
                 spawn_local(async move {
                     use river_core::room_state::content::{
                         ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
@@ -3607,10 +3627,14 @@ pub fn Conversation() -> Element {
                         if delta_applied {
                             // Local apply succeeded and a message will mount:
                             // scroll it into view — but only if the user is still
-                            // viewing the room this send targeted. Signing is
-                            // async, so they may have switched rooms; arming the
-                            // conversation-wide flag then would snap the NEW room
-                            // to the bottom on its next message (#402 review).
+                            // viewing the room this send targeted. This runs two
+                            // task hops after the keypress (`spawn_local`, then
+                            // `defer`'s setTimeout), so they may have switched
+                            // rooms; arming the conversation-wide flag then would
+                            // snap the NEW room to the bottom on its next message
+                            // (#402 review). Still required now that signing is
+                            // synchronous — the hops, not the signature, are what
+                            // let a room switch interleave.
                             if CURRENT_ROOM.peek().owner_key == Some(current_room) {
                                 force_scroll.set(true);
                             }
@@ -5511,26 +5535,28 @@ mod tests {
         );
     }
 
-    /// Source-grep pin (freenet/river#512): nothing on the send path may be
-    /// awaited between the user pressing Enter and the message reaching
-    /// `ROOMS`.
+    /// Source-grep pin (freenet/river#512): nothing may be awaited between the
+    /// user acting on a message and that message reaching `ROOMS`.
     ///
-    /// The composer clears synchronously and the render is driven by the
-    /// optimistic write to `ROOMS`, so every suspension point in between is
-    /// dead air with an empty input box and no message. The one that shipped
-    /// was a delegate signing round-trip: on a hosted node that is a WAN hop
-    /// queued behind contract merges on a serial WASM executor, with a 10s
-    /// timeout before the local fallback.
+    /// All four handlers — send, reaction, delete, edit — render optimistically:
+    /// the composer (or the reaction pill) updates the instant the delta is
+    /// applied to `ROOMS`, and nothing waits for the network echo. So every
+    /// suspension point before that write is dead air, with the composer
+    /// already cleared and no message in its place.
     ///
-    /// It cost seconds and could not change the produced bytes — see
+    /// The one that shipped was a delegate signing round-trip. On a hosted node
+    /// that is a WAN hop queued behind contract merges on a serial WASM
+    /// executor, with a 10s timeout before the local fallback. It cost seconds
+    /// and could not change the produced bytes — see
     /// `signing::a_delegate_signature_can_never_differ_from_the_local_one`.
+    ///
     /// It is also invisible in development: with `--features no-sync` the
     /// delegate request fails instantly, so `dev-example` and every Playwright
     /// spec only ever exercise the fast path. Nothing but this pin stands
     /// between a future `.await` here and another silent multi-second
     /// regression.
     #[test]
-    fn nothing_is_awaited_between_pressing_enter_and_the_message_appearing() {
+    fn nothing_is_awaited_between_acting_on_a_message_and_it_appearing() {
         let source = include_str!("conversation.rs");
         // Same cut as the pins around it — see
         // `author_deputy_badge_uses_the_shared_helper` for why it must be this
@@ -5538,51 +5564,74 @@ mod tests {
         let prod = &source[..source
             .find("#[cfg(test)]\nmod tests {")
             .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
-        // Strip line comments first: prose about awaiting (this file has
-        // plenty) must not satisfy the search, and a doc comment must not be
-        // able to disarm the assertion by accident either.
+        // Drop whole-line comments, so prose about awaiting (this file has
+        // plenty) cannot satisfy the search. Deliberately NOT `split_once`,
+        // which would also truncate a line at a `//` inside a string literal
+        // (`"https://…"`) and could hide a real trailing `.await`. A trailing
+        // comment that happens to contain the needle now fails the test
+        // instead, which is the safe direction: loud, not silent.
         let code: String = prod
             .lines()
-            .map(|line| line.split_once("//").map(|(c, _)| c).unwrap_or(line))
+            .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
         // Whitespace-stripped so a rustfmt re-wrap cannot silently disarm it.
         let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
-        let entry = "lethandle_send_message={";
-        let rooms_write = "letdelta_applied=ROOMS.with_mut(";
-        let start = squashed.find(entry).expect(
-            "the send handler must still be `let handle_send_message = { … }` \
-             in conversation.rs — re-anchor this pin if it was renamed, do not \
-             delete it",
-        );
-        let end = squashed[start..]
-            .find(rooms_write)
-            .map(|i| start + i)
-            .expect(
-                "the send handler must still reach its optimistic \
-             `ROOMS.with_mut` write — re-anchor this pin if that was renamed, \
-             do not delete it",
+        // Every optimistic-render handler, not just the one #512 was reported
+        // against: they are the same shape, and all four carried the same await.
+        // Each ends at the `defer` that performs its `ROOMS` write.
+        for handler in [
+            "lethandle_send_message={",
+            "lethandle_toggle_reaction={",
+            "lethandle_delete_message={",
+            "lethandle_edit_message={",
+        ] {
+            let start = squashed.find(handler).unwrap_or_else(|| {
+                panic!(
+                    "conversation.rs no longer defines `{handler}` — re-anchor \
+                     this pin on whatever replaced it, do not delete it"
+                )
+            });
+            let end = squashed[start..]
+                .find("crate::util::defer(move||{")
+                .map(|i| start + i)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{handler}` no longer defers its optimistic ROOMS \
+                         write — re-anchor this pin, do not delete it"
+                    )
+                });
+
+            assert!(
+                !squashed[start..end].contains(".await"),
+                "`{handler}` awaits something before its optimistic ROOMS \
+                 write. The UI is already committed to the action by then, so \
+                 the user waits with nothing on screen for as long as that \
+                 future takes — which is what freenet/river#512 was. Do the \
+                 work after the local apply, or off this path entirely."
             );
+        }
 
-        let send_path = &squashed[start..end];
+        // The send path specifically must still reach its `ROOMS` write, or
+        // the loop above would be scanning a region that no longer renders
+        // anything.
+        let send = squashed
+            .find("lethandle_send_message={")
+            .expect("checked above");
         assert!(
-            !send_path.contains(".await"),
-            "the send path awaits something between the handler entry and the \
-             optimistic ROOMS write. The composer is already cleared by then, \
-             so the user stares at an empty input box for as long as that \
-             future takes — which is what freenet/river#512 was. Do the work \
-             after the local apply (or off the send path entirely)."
-        );
-        assert!(
-            send_path.contains("sign_message_locally(&message_bytes,&self_sk)"),
-            "the send path must sign with the room's own key, synchronously"
+            squashed[send..].contains("letdelta_applied=ROOMS.with_mut("),
+            "the send handler must still apply the message to ROOMS optimistically"
         );
 
-        // Reactions, deletes and edits render optimistically the same way and
-        // sign the same `MessageV1` with the same key, so the delegate
-        // round-trip is exactly as pointless — and as slow — on those paths.
+        // One per handler, and no path may fall back to asking the delegate.
         // Split so the needle cannot match its own text via `include_str!`.
+        assert_eq!(
+            squashed.matches("sign_message_locally(").count(),
+            4,
+            "all four message paths must sign with the room's own key, \
+             synchronously"
+        );
         assert!(
             !squashed.contains(concat!("sign_message_", "with_fallback")),
             "message signing must not go through the delegate on any path \
