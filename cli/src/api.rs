@@ -451,6 +451,44 @@ pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
 /// always thread the room `secrets` via [`message_display_text_with_secrets`];
 /// this 2-arg form is retained for the tests that exercise public content and
 /// the genuine `<encrypted>` fallback (empty secrets).
+/// What a response received while awaiting a SUBSCRIBE acknowledgement means.
+///
+/// Split out so the interleaving case is directly testable: the node multiplexes
+/// its responses onto one connection, so an `UpdateNotification` can overtake the
+/// acknowledgement. Treating the first message as the answer made that race fatal
+/// (freenet-core#4970).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SubscribeAck {
+    /// The node acknowledged and we are subscribed.
+    Subscribed,
+    /// The node answered, and refused.
+    Refused,
+    /// Not the acknowledgement — keep waiting, and do not discard this.
+    NotYet,
+}
+
+/// Cap on responses buffered while awaiting the SUBSCRIBE acknowledgement.
+///
+/// Small on purpose: each queued notification only triggers a full-state
+/// re-fetch, so keeping more than a handful buys nothing, while an unbounded
+/// queue fed by the node would be a memory amplification vector.
+pub(crate) const MAX_PENDING_DURING_HANDSHAKE: usize = 16;
+
+pub(crate) fn classify_subscribe_response(response: &HostResponse) -> SubscribeAck {
+    match response {
+        HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            subscribed, ..
+        }) => {
+            if *subscribed {
+                SubscribeAck::Subscribed
+            } else {
+                SubscribeAck::Refused
+            }
+        }
+        _ => SubscribeAck::NotYet,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn message_display_text(
     room_state: &ChatRoomStateV1,
@@ -2229,23 +2267,45 @@ impl ApiClient {
             .send(ClientRequest::ContractOp(subscribe_request))
             .await
             .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {e}"))?;
-        match tokio::time::timeout(Duration::from_secs(5), web_api.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
-                subscribed,
-                ..
-            }))) => {
-                if subscribed {
-                    info!("Successfully subscribed to contract");
-                    Ok(())
-                } else {
-                    Err(anyhow!("Failed to subscribe to contract"))
+        // Same multiplexing race as the streaming path (freenet-core#4970): an
+        // UpdateNotification can overtake the SUBSCRIBE acknowledgement, and
+        // treating the first message as the answer turned that into a fatal
+        // error. Read until the acknowledgement arrives.
+        //
+        // Unlike the streaming path there is no loop here to hand an
+        // overtaking notification to, so it is logged and dropped. That is a
+        // deliberate, strictly-better trade: previously the whole subscription
+        // failed, which lost the same notification AND left the caller
+        // unsubscribed. Callers of this helper re-read contract state rather
+        // than relying on notifications for correctness.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "Timeout waiting for SUBSCRIBE response after 5 seconds"
+                ));
+            }
+            match tokio::time::timeout(remaining, web_api.recv()).await {
+                Ok(Ok(response)) => match classify_subscribe_response(&response) {
+                    SubscribeAck::Subscribed => {
+                        info!("Successfully subscribed to contract");
+                        return Ok(());
+                    }
+                    SubscribeAck::Refused => {
+                        return Err(anyhow!("Failed to subscribe to contract"))
+                    }
+                    SubscribeAck::NotYet => {
+                        debug!("Response overtook the SUBSCRIBE ack, ignoring it: {response:?}");
+                    }
+                },
+                Ok(Err(e)) => return Err(anyhow!("Failed to receive subscription response: {e}")),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timeout waiting for SUBSCRIBE response after 5 seconds"
+                    ))
                 }
             }
-            Ok(Ok(_)) => Err(anyhow!("Unexpected response to SUBSCRIBE request")),
-            Ok(Err(e)) => Err(anyhow!("Failed to receive subscription response: {e}")),
-            Err(_) => Err(anyhow!(
-                "Timeout waiting for SUBSCRIBE response after 5 seconds"
-            )),
         }
     }
 
@@ -5150,6 +5210,11 @@ impl ApiClient {
             }
         }
 
+        // Responses that arrive before the SUBSCRIBE acknowledgement; drained
+        // by the main loop below so none is lost.
+        let mut pending: std::collections::VecDeque<HostResponse> =
+            std::collections::VecDeque::new();
+
         // Subscribe to the contract
         {
             let subscribe_request = ContractRequest::Subscribe {
@@ -5165,31 +5230,61 @@ impl ApiClient {
                 .await
                 .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
 
-            // Wait for subscription response (30s to accommodate slow gateways)
-            let response = match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                web_api.recv(),
-            )
-            .await
-            {
-                Ok(result) => result.map_err(|e| anyhow!("Failed to receive response: {}", e))?,
-                Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response")),
-            };
-
-            match response {
-                HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
-                    subscribed,
-                    ..
-                }) => {
-                    if subscribed {
+            // The node's responses share one multiplexed connection, so an
+            // UpdateNotification for a contract we are already watching can
+            // arrive between our SUBSCRIBE and its acknowledgement. Treating
+            // the first message as the answer made that race fatal: the
+            // session died with "Unexpected response to SUBSCRIBE request",
+            // reconnected, and raced again. On 2026-07-27 that produced 299
+            // failures in four hours and up to 184 reconnects in a single
+            // hour against the official room (freenet-core#4970), and each
+            // reconnect dragged a catch-up batch behind it.
+            //
+            // So read until the acknowledgement actually arrives, and keep
+            // anything that overtakes it. The PUT path above already tolerates
+            // an interleaved UpdateNotification the same way.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(anyhow!("Timeout waiting for SUBSCRIBE response"));
+                }
+                let response = match tokio::time::timeout(remaining, web_api.recv()).await {
+                    Ok(result) => {
+                        result.map_err(|e| anyhow!("Failed to receive response: {}", e))?
+                    }
+                    Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response")),
+                };
+                match classify_subscribe_response(&response) {
+                    SubscribeAck::Subscribed => {
                         if matches!(format, OutputFormat::Human) {
                             eprintln!("Successfully subscribed. Waiting for updates...\n");
                         }
-                    } else {
-                        return Err(anyhow!("Failed to subscribe to contract"));
+                        break;
+                    }
+                    SubscribeAck::Refused => {
+                        return Err(anyhow!("Failed to subscribe to contract"))
+                    }
+                    // Queued rather than dropped: this is a real state change,
+                    // and the main loop below drains `pending` before reading
+                    // the socket, so it goes through exactly the same handling
+                    // it would have had if it arrived a moment later.
+                    SubscribeAck::NotYet => {
+                        // Bounded because the node feeds this queue and a busy
+                        // room can emit a lot inside the handshake window; an
+                        // unbounded queue here would be a memory amplification
+                        // vector. Collapsing is lossless: the handler below
+                        // discards the delta (`let _ = update;`) and re-fetches
+                        // authoritative full state, so N queued notifications
+                        // produce exactly the same result as one.
+                        if pending.len() < MAX_PENDING_DURING_HANDSHAKE {
+                            debug!("Response overtook the SUBSCRIBE ack, queuing it");
+                            pending.push_back(response);
+                        } else {
+                            debug!("Response overtook the SUBSCRIBE ack; queue full, collapsing");
+                        }
                     }
                 }
-                _ => return Err(anyhow!("Unexpected response to SUBSCRIBE request")),
             }
         }
 
@@ -5224,9 +5319,14 @@ impl ApiClient {
             }
 
             // Wait for next message with a short timeout to allow checking shutdown
+            // The guard is taken in both branches so the notification handler
+            // below can still `drop(web_api)` before it calls `get_room`.
             let mut web_api = self.web_api.lock().await;
-            let recv_result =
-                tokio::time::timeout(std::time::Duration::from_millis(500), web_api.recv()).await;
+            let recv_result = if let Some(queued) = pending.pop_front() {
+                Ok(Ok(queued))
+            } else {
+                tokio::time::timeout(std::time::Duration::from_millis(500), web_api.recv()).await
+            };
 
             match recv_result {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
@@ -7604,6 +7704,90 @@ mod reaccept_guard_tests {
             guard_idx < get_idx,
             "the re-accept guard must run BEFORE the network GET so a refused re-accept \
              does no network or storage work"
+        );
+    }
+}
+
+#[cfg(test)]
+mod subscribe_handshake_tests {
+    use super::*;
+
+    fn key() -> ContractKey {
+        ContractKey::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(vec![0u8]),
+            &freenet_stdlib::prelude::ContractCode::from(vec![1u8, 2, 3]),
+        )
+    }
+
+    fn notification() -> HostResponse {
+        HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+            key: key(),
+            update: freenet_stdlib::prelude::UpdateData::Delta(
+                freenet_stdlib::prelude::StateDelta::from(vec![1u8, 2, 3]),
+            ),
+        })
+    }
+
+    fn ack(subscribed: bool) -> HostResponse {
+        HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key: key(),
+            subscribed,
+        })
+    }
+
+    /// The regression (freenet-core#4970): the node multiplexes its responses,
+    /// so an UpdateNotification can overtake the SUBSCRIBE acknowledgement.
+    /// That MUST NOT be read as the answer — doing so killed the session with
+    /// "Unexpected response to SUBSCRIBE request", and on 2026-07-27 produced
+    /// 299 failures in four hours against the official room.
+    #[test]
+    fn an_update_notification_does_not_answer_the_subscribe() {
+        assert_eq!(
+            classify_subscribe_response(&notification()),
+            SubscribeAck::NotYet,
+            "a notification overtaking the ack must leave us waiting, not fail \
+             the subscription"
+        );
+    }
+
+    #[test]
+    fn the_acknowledgement_is_recognised() {
+        assert_eq!(
+            classify_subscribe_response(&ack(true)),
+            SubscribeAck::Subscribed
+        );
+    }
+
+    /// A refusal is a real answer and must stay distinguishable from "keep
+    /// waiting" — otherwise a refused subscribe would hang until timeout
+    /// instead of reporting why.
+    #[test]
+    fn a_refusal_is_an_answer_not_a_reason_to_keep_waiting() {
+        assert_eq!(
+            classify_subscribe_response(&ack(false)),
+            SubscribeAck::Refused
+        );
+    }
+
+    /// The queue the streaming path fills during the handshake is fed by the
+    /// node, so it must be bounded (`.claude/rules` — never an unbounded
+    /// collection an external actor can grow). Collapsing is lossless because
+    /// each notification only triggers a full-state re-fetch.
+    #[test]
+    fn the_handshake_queue_is_bounded() {
+        assert!(
+            MAX_PENDING_DURING_HANDSHAKE > 0 && MAX_PENDING_DURING_HANDSHAKE <= 64,
+            "handshake queue must be bounded and small; an unbounded queue fed \
+             by the node is a memory amplification vector"
+        );
+    }
+
+    /// Anything else the node may send is also non-fatal.
+    #[test]
+    fn other_responses_are_tolerated() {
+        assert_eq!(
+            classify_subscribe_response(&HostResponse::Ok),
+            SubscribeAck::NotYet
         );
     }
 }
