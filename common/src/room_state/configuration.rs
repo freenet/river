@@ -261,13 +261,35 @@ pub struct Configuration {
 /// Global cap applied to `direct_messages.messages` when a room's
 /// [`Configuration::max_direct_messages`] is unset.
 ///
-/// Sized to sit just above the largest live room's DM set at the time the cap
-/// was introduced (the official room held 499), so enabling the bound does not
-/// mass-delete history on rollout; it stops the set — and therefore the
-/// DM-pinned member set that `post_apply_cleanup` refuses to prune — from
-/// growing without limit. Owners who want a tighter or looser bound set
-/// `max_direct_messages` explicitly. See freenet/river#519.
-pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 500;
+/// Stops the DM set — and therefore the DM-pinned member set that
+/// `post_apply_cleanup` refuses to prune — from growing without limit. Owners
+/// who want a tighter or looser bound set `max_direct_messages` explicitly.
+/// See freenet/river#519.
+///
+/// # Why 300
+///
+/// Measured on the live official room when the cap was set: 499 DMs, of which
+/// 377 were already older than 24 hours, occupying ~128 KB of a ~260 KB room
+/// state — about half the state was DMs. 300 sheds roughly 40% of that set and
+/// roughly halves the DM share of state, without being as aggressive as 200.
+///
+/// This DOES delete history on rollout, including messages the recipient has
+/// not read yet. That cost is accepted deliberately (Ian, 2026-07-27: "people
+/// are gonna lose direct messages before they've read them, but I think we just
+/// need to accept that for now"). Do NOT add machinery to avoid it — read
+/// tracking, age exemptions, or a grace period would all be wall-clock-
+/// dependent, which `ChatRoomStateV1::post_apply_cleanup` forbids, and would be
+/// thrown away by the successor design below.
+///
+/// # This bound is interim
+///
+/// The intended long-term fix is moving DMs out of the room contract entirely,
+/// into dedicated per-member contracts. This cap exists to bound the damage
+/// until then, so it is deliberately the simplest correct thing: a count, a
+/// deterministic order, and a horizon. The trim lives wholly inside
+/// `direct_messages.rs` and `post_apply_cleanup` was not touched, so extracting
+/// DMs later is a deletion rather than an unpick.
+pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 300;
 
 impl Configuration {
     /// The global DM cap in force for this room: the owner's explicit

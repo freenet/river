@@ -95,7 +95,10 @@
 //!
 //! - `Configuration::effective_max_direct_messages`: owner-tunable GLOBAL cap
 //!   on `messages`, defaulting to
-//!   [`crate::room_state::configuration::DEFAULT_MAX_DIRECT_MESSAGES`]. Added
+//!   [`crate::room_state::configuration::DEFAULT_MAX_DIRECT_MESSAGES`] (300).
+//!   An INTERIM bound — the intended fix is moving DMs into per-member
+//!   contracts — so it is deliberately the simplest correct thing and is kept
+//!   wholly inside this module. Added
 //!   for freenet/river#519: the per-pair cap below bounds any one
 //!   conversation but nothing bounded the set as a whole, and because
 //!   `ChatRoomStateV1::post_apply_cleanup` exempts every DM participant from

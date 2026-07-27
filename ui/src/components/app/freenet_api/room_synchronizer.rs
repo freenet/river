@@ -2463,9 +2463,9 @@ mod tests {
     /// Its blast radius is larger than the pair horizon's: `pair_horizons` needs
     /// `MAX_DM_MESSAGES_PER_PAIR` (100) DMs in ONE ordered pair before it
     /// publishes anything, whereas the global horizon fires once the room holds
-    /// `max_direct_messages` DMs in total across every pair — and the default of
-    /// 500 was chosen because the live official room already held 499. So the
-    /// filter would have been active on essentially every sync tick there.
+    /// `max_direct_messages` DMs in total across every pair — and the default is
+    /// 300 against a live official room already holding 499. So the filter would
+    /// have been active on every sync tick there, permanently.
     ///
     /// Every pair here stays far below its own cap, so `pair_horizons` is empty
     /// and only the global horizon can do the filtering.
