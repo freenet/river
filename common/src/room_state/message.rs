@@ -1967,11 +1967,6 @@ mod tests {
         let swap_at = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
         let remove_old = react("👍", true, swap_at);
         let add_new = react("❤️", false, swap_at);
-        assert_eq!(
-            remove_old.message.time, add_new.message.time,
-            "premise: the swap pair must share a timestamp, or this test \
-             proves nothing about the tie-break"
-        );
 
         for (label, pair) in [
             ("remove first", vec![remove_old.clone(), add_new.clone()]),
@@ -1981,7 +1976,18 @@ mod tests {
                 messages: [vec![original.clone(), first.clone()], pair].concat(),
                 ..Default::default()
             };
+            let replay_order: Vec<_> = messages.messages.iter().map(|m| m.id()).collect();
             messages.rebuild_actions_state();
+            // Premise: the replay really is in vector order, so the two
+            // iterations of this loop exercise two DIFFERENT orders. If a
+            // future refactor sorts inside `rebuild_actions_state`, this test
+            // would otherwise degenerate into running one order twice and
+            // stay green.
+            assert_eq!(
+                messages.messages.iter().map(|m| m.id()).collect::<Vec<_>>(),
+                replay_order,
+                "{label}: rebuild_actions_state must replay in vector order"
+            );
 
             let reactions = messages
                 .reactions(&target)

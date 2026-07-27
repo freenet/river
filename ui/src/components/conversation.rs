@@ -3024,10 +3024,11 @@ pub fn Conversation() -> Element {
                 let has_existing = existing_reaction.is_some();
 
                 // Retained even though this block no longer awaits anything:
-                // `spawn_local` defers the body to a microtask, so it runs
-                // after the event handler's stack (and any Dioxus borrow) has
-                // unwound. Inlining it would re-introduce the Firefox-mobile
-                // re-entrant RefCell panics (freenet/river#512 review).
+                // it keeps the body off the event handler's stack. The guard
+                // that actually protects the ROOMS write is the
+                // `crate::util::defer` below (a real setTimeout) — inlining
+                // this block would put everything up to it back on the
+                // handler's stack (freenet/river#512 review).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -3197,10 +3198,11 @@ pub fn Conversation() -> Element {
                     .map(|(secret, version)| (*secret, version));
 
                 // Retained even though this block no longer awaits anything:
-                // `spawn_local` defers the body to a microtask, so it runs
-                // after the event handler's stack (and any Dioxus borrow) has
-                // unwound. Inlining it would re-introduce the Firefox-mobile
-                // re-entrant RefCell panics (freenet/river#512 review).
+                // it keeps the body off the event handler's stack. The guard
+                // that actually protects the ROOMS write is the
+                // `crate::util::defer` below (a real setTimeout) — inlining
+                // this block would put everything up to it back on the
+                // handler's stack (freenet/river#512 review).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -3323,10 +3325,11 @@ pub fn Conversation() -> Element {
                 }
 
                 // Retained even though this block no longer awaits anything:
-                // `spawn_local` defers the body to a microtask, so it runs
-                // after the event handler's stack (and any Dioxus borrow) has
-                // unwound. Inlining it would re-introduce the Firefox-mobile
-                // re-entrant RefCell panics (freenet/river#512 review).
+                // it keeps the body off the event handler's stack. The guard
+                // that actually protects the ROOMS write is the
+                // `crate::util::defer` below (a real setTimeout) — inlining
+                // this block would put everything up to it back on the
+                // handler's stack (freenet/river#512 review).
                 spawn_local(async move {
                     use crate::util::ecies::encrypt_with_symmetric_key;
                     use river_core::room_state::content::ActionContentV1;
@@ -3453,10 +3456,11 @@ pub fn Conversation() -> Element {
                 // (#402 review).
                 let force_scroll = force_scroll.clone();
                 // Retained even though this block no longer awaits anything:
-                // `spawn_local` defers the body to a microtask, so it runs
-                // after the event handler's stack (and any Dioxus borrow) has
-                // unwound. Inlining it would re-introduce the Firefox-mobile
-                // re-entrant RefCell panics (freenet/river#512 review).
+                // it keeps the body off the event handler's stack. The guard
+                // that actually protects the ROOMS write is the
+                // `crate::util::defer` below (a real setTimeout) — inlining
+                // this block would put everything up to it back on the
+                // handler's stack (freenet/river#512 review).
                 spawn_local(async move {
                     use river_core::room_state::content::{
                         ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
@@ -5593,45 +5597,47 @@ mod tests {
                      this pin on whatever replaced it, do not delete it"
                 )
             });
+            // Anchored on the ROOMS write itself, not on the `defer` that
+            // wraps it: a future edit adding an EARLIER defer to a handler (a
+            // scroll defer, a focus defer) would otherwise shrink the region
+            // and quietly let an await through behind it.
             let end = squashed[start..]
-                .find("crate::util::defer(move||{")
+                .find("ROOMS.with_mut(")
                 .map(|i| start + i)
                 .unwrap_or_else(|| {
                     panic!(
-                        "`{handler}` no longer defers its optimistic ROOMS \
-                         write — re-anchor this pin, do not delete it"
+                        "`{handler}` no longer applies its result to ROOMS \
+                         optimistically — re-anchor this pin, do not delete it"
                     )
                 });
+            let region = &squashed[start..end];
 
             assert!(
-                !squashed[start..end].contains(".await"),
+                !region.contains(".await"),
                 "`{handler}` awaits something before its optimistic ROOMS \
                  write. The UI is already committed to the action by then, so \
                  the user waits with nothing on screen for as long as that \
                  future takes — which is what freenet/river#512 was. Do the \
                  work after the local apply, or off this path entirely."
             );
+            // Per-region, so it also fails if signing moves INTO the deferred
+            // closure (outside the scanned region) or switches to another key.
+            assert!(
+                region.contains("sign_message_locally(&message_bytes,&self_sk)"),
+                "`{handler}` must sign with the room's own key, synchronously, \
+                 before the message reaches ROOMS"
+            );
+            // The write must still be deferred to a clean execution context —
+            // that `setTimeout`, not `spawn_local`, is what keeps the Dioxus
+            // signal write off the event handler's stack.
+            assert!(
+                region.contains("crate::util::defer(move||{"),
+                "`{handler}`'s ROOMS write must stay inside `crate::util::defer`"
+            );
         }
 
-        // The send path specifically must still reach its `ROOMS` write, or
-        // the loop above would be scanning a region that no longer renders
-        // anything.
-        let send = squashed
-            .find("lethandle_send_message={")
-            .expect("checked above");
-        assert!(
-            squashed[send..].contains("letdelta_applied=ROOMS.with_mut("),
-            "the send handler must still apply the message to ROOMS optimistically"
-        );
-
-        // One per handler, and no path may fall back to asking the delegate.
-        // Split so the needle cannot match its own text via `include_str!`.
-        assert_eq!(
-            squashed.matches("sign_message_locally(").count(),
-            4,
-            "all four message paths must sign with the room's own key, \
-             synchronously"
-        );
+        // No path may fall back to asking the delegate. Split so the needle
+        // cannot match its own text via `include_str!`.
         assert!(
             !squashed.contains(concat!("sign_message_", "with_fallback")),
             "message signing must not go through the delegate on any path \

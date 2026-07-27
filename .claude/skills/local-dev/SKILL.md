@@ -203,7 +203,10 @@ message. Appears automatically on any crash, no query param needed.
 5. **Delta applied** → Message added to local state → `NEEDS_SYNC` set → `ProcessRooms` → UPDATE sent
 
 Key debugging points:
-- A slow or failed **message** send is never the delegate — nothing is asked of it. Look at step 5 (UPDATE / WebSocket) instead
+- A slow **message** send is not the SIGNING step — nothing is asked of the
+  delegate there. Step 5 is a different matter: the `NEEDS_SYNC` effect also
+  fires `save_rooms_to_delegate()` alongside the UPDATE, so a delegate op does
+  contend for the same node afterwards
 - For the other payload types, node logs show `"Sign request for room, signature created: true/false"` — if false, the delegate doesn't have the key
 - Browser console shows the fallback path: `"Delegate signing failed, using fallback"`
 - If no UPDATE appears in node logs after signing, check if the WebSocket is still connected
