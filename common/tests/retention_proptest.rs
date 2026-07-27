@@ -1059,10 +1059,17 @@ fn whole_room_state_gossip_terminates_across_the_cbor_round_trip() {
 // ---------------------------------------------------------------------------
 //
 // Every DM property above leaves `max_direct_messages` unset, so it runs at the
-// default of 500 while `DM_POOL` allows at most 200 retained DMs across the two
-// ordered pairs — the global trim can never fire and the global horizon is
-// permanently `Open`. These properties supply a cap that BITES, so the third
+// DEFAULT (300) while `DM_POOL` allows at most 200 retained DMs across the two
+// ordered pairs — the global trim can never fire there and the global horizon
+// is permanently `Open`. These properties supply a cap that BITES, so the third
 // retention rule gets the same generalised treatment as the other two.
+//
+// That headroom is now only 100 (200 held vs a 300 default), where it used to
+// be 300. If `DEFAULT_MAX_DIRECT_MESSAGES` ever drops to 200 or below, the
+// properties above silently START exercising the global trim against an oracle
+// (`newest_dm_keys`) that models only the per-pair rule, and they will fail.
+// That is the correct failure — fix them by threading the cap through, not by
+// raising the pool.
 
 /// The largest global DM cap these properties generate. Kept well below the
 /// ~200 a peer can hold after the per-pair trim, so the global cap genuinely

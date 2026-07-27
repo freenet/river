@@ -273,6 +273,23 @@ pub struct Configuration {
 /// state — about half the state was DMs. 300 sheds roughly 40% of that set and
 /// roughly halves the DM share of state, without being as aggressive as 200.
 ///
+/// # What 300 costs, stated plainly
+///
+/// Against the per-pair cap of 100, a global 300 fixes room-wide capacity at
+/// about THREE saturated ordered pairs — and ordered pairs are directional, so
+/// that is one member writing to three correspondents, not three separate
+/// relationships. A busy few conversations can therefore evict every other
+/// conversation in the room to zero. At 500 that took five. This is a real
+/// consequence of a global (rather than per-pair) bound and is accepted for the
+/// same reason as the rest: per-member DM contracts make it moot.
+///
+/// The adversarial form is worth knowing: `verify` cannot check timestamps (a
+/// contract has no wall clock) and [`check_dm_future_skew`] only runs at
+/// signing time on an honest client, so a skewed or hostile client can post 100
+/// future-dated DMs into each of three pairs and evict the room's DM history
+/// for everyone. That property belongs to the global bound itself, not to this
+/// particular number; 300 makes it cheaper than 500 did.
+///
 /// This DOES delete history on rollout, including messages the recipient has
 /// not read yet. That cost is accepted deliberately (Ian, 2026-07-27: "people
 /// are gonna lose direct messages before they've read them, but I think we just
@@ -287,8 +304,15 @@ pub struct Configuration {
 /// into dedicated per-member contracts. This cap exists to bound the damage
 /// until then, so it is deliberately the simplest correct thing: a count, a
 /// deterministic order, and a horizon. The trim lives wholly inside
-/// `direct_messages.rs` and `post_apply_cleanup` was not touched, so extracting
-/// DMs later is a deletion rather than an unpick.
+/// `direct_messages.rs` and `post_apply_cleanup` was not touched, so the
+/// retention logic is a clean deletion later.
+///
+/// One piece does NOT delete cleanly, and it is worth knowing now:
+/// [`Configuration::max_direct_messages`] is a signed wire field. Once any
+/// owner has set it explicitly, a future struct that removes it re-serializes
+/// one CBOR entry short and that owner's signature fails — see the field's own
+/// note. So the field itself is effectively permanent even after DMs move out;
+/// it would have to be kept and ignored, not dropped.
 pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 300;
 
 impl Configuration {
