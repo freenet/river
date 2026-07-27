@@ -61,22 +61,36 @@ for (const { label, viewport, isMobile } of [
       await expect(loading).toBeVisible({ timeout: 5_000 });
       await expect(loading.getByText("Loading your rooms…")).toBeVisible();
 
+      // The two surfaces read one shared state, so the rail must agree. This
+      // is also the first browser coverage #397's rail states have ever had —
+      // their absence is why #509 went unnoticed.
+      await expect(page.getByTestId("room-list-loading")).toHaveCount(1);
+
       // The bug: the false-empty invitation to create a room.
       await expect(page.getByText(WELCOME)).toHaveCount(0);
 
-      // …and the green "Connected" pill, which reflects only WebSocket
-      // transport and flips within about a second, must not be sitting on a
-      // still-loading screen telling the user nothing is pending.
+      // The connection pill must SURVIVE this state, not be hidden by it.
+      // A node that never connects leaves the load state at its `Loading`
+      // default indefinitely — `begin_load_attempt`, which arms the 60s
+      // backstop, only runs after a successful connect — so the pill is the
+      // only thing on this screen that can tell the user the socket is down.
       //
-      // Mobile only: on desktop the rooms rail carries its own persistent
-      // pill, which is correct and not what #509 is about. Counting VISIBLE
-      // matches rather than all of them, because below 768px the rail is
-      // `display:none`, so its pill is in the DOM either way.
+      // Mobile only: on desktop the rooms rail carries its own copy, so this
+      // would not be measuring the conversation panel's. Counting VISIBLE
+      // matches, because below 768px the rail is `display:none` and its pill
+      // is in the DOM either way.
       if (isMobile) {
         await expect(
           page.locator('[data-testid="connection-status-indicator"]:visible')
-        ).toHaveCount(0);
+        ).toHaveCount(1);
       }
+
+      // …and so must the #159 quickstart invite link: a brand-new user has no
+      // rooms, so they are in THIS state for the whole load window, and it is
+      // their only concrete next step.
+      await expect(
+        page.locator('a[href="https://freenet.org/quickstart#invite-form"]')
+      ).toBeVisible();
     });
 
     test("a migrating account is told so", async ({ page }) => {
@@ -90,6 +104,7 @@ for (const { label, viewport, isMobile } of [
       const migrating = page.getByTestId("conversation-rooms-migrating");
       await expect(migrating).toBeVisible({ timeout: 5_000 });
       await expect(migrating.getByText("Migrating your rooms…")).toBeVisible();
+      await expect(page.getByTestId("room-list-migrating")).toHaveCount(1);
       await expect(page.getByText(WELCOME)).toHaveCount(0);
     });
 
@@ -106,10 +121,19 @@ for (const { label, viewport, isMobile } of [
       const failed = page.getByTestId("conversation-rooms-error");
       await expect(failed).toBeVisible({ timeout: 5_000 });
       await expect(failed.getByText(/Couldn.t load your rooms/)).toBeVisible();
+      await expect(page.getByTestId("room-list-error")).toHaveCount(1);
       await expect(
         page.getByTestId("conversation-rooms-retry-button")
       ).toBeVisible();
       await expect(page.getByText(WELCOME)).toHaveCount(0);
+
+      // "Check your connection and try again" is only actionable if the
+      // connection status is on the same screen.
+      if (isMobile) {
+        await expect(
+          page.locator('[data-testid="connection-status-indicator"]:visible')
+        ).toHaveCount(1);
+      }
     });
 
     test("a genuinely empty account still gets the Welcome screen", async ({
@@ -117,15 +141,25 @@ for (const { label, viewport, isMobile } of [
     }) => {
       await page.goto("/");
       await waitForApp(page);
-      // Settle on the Welcome screen first, so the hook is not racing
-      // the fixture's own first render.
       await expect(page.getByText(WELCOME)).toBeVisible({ timeout: 10_000 });
+
+      // Drive a REAL transition. Asserting "loaded" straight from the fixture's
+      // own start state would be satisfied by the pre-hook DOM: Welcome is
+      // already visible and neither state element exists, so the assertions
+      // would resolve against the old render and pass even if the hook did
+      // nothing (it logs and returns on an unrecognised string) or if the
+      // Empty arm were broken.
+      await setLoadState(page, "loading");
+      await expect(page.getByText(WELCOME)).toHaveCount(0, { timeout: 5_000 });
+
       await setLoadState(page, "loaded");
 
       // The one state that SHOULD say "create a room": the load resolved and
-      // there really is nothing. Without this the fix could suppress the
-      // Welcome screen entirely and every assertion above would still pass.
+      // there really is nothing. `room-list-empty` proves BOTH halves of the
+      // premise — the state reached Loaded and ROOMS really was cleared —
+      // which `WELCOME` alone cannot, since it also renders for `List`.
       await expect(page.getByText(WELCOME)).toBeVisible({ timeout: 5_000 });
+      await expect(page.getByTestId("room-list-empty")).toHaveCount(1);
       await expect(
         page.getByTestId("conversation-rooms-loading")
       ).toHaveCount(0);

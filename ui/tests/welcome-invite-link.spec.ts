@@ -18,7 +18,10 @@ async function expectInviteLink(page: Page) {
   await page.goto("/");
   await waitForApp(page);
 
-  // Confirm we're on the Welcome screen (no room selected on first load).
+  // Confirm we're on the Welcome screen (the fixture seeds rooms and selects
+  // none, so the load state resolves to `List`). Since freenet/river#509 the
+  // no-room screen has four states; the link survives all of them via
+  // `NoRoomFooter`, and `rooms-loading-state.spec.ts` covers the other three.
   await expect(page.getByText("Welcome to River")).toBeVisible({
     timeout: 5_000,
   });

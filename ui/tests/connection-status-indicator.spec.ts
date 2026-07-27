@@ -207,9 +207,15 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
 
 test.describe("Connection status indicator on mobile (Bug #5)", () => {
   // Mobile-Chat is the default `MOBILE_VIEW`, so a brand-new user with
-  // no rooms lands on the Welcome screen with the left rail hidden
-  // behind `hidden md:flex`. Without the inline Welcome-screen copy of
-  // the indicator, Bug #5 would reappear on mobile.
+  // no rooms lands on the no-room screen with the left rail hidden
+  // behind `hidden md:flex`. Without the inline copy of the indicator,
+  // Bug #5 would reappear on mobile.
+  //
+  // Since freenet/river#509 that screen has four states, and the inline copy
+  // lives in `NoRoomFooter` so it reaches all of them — which matters most in
+  // the states these tests do NOT reach: a node that never connects leaves the
+  // load state at `Loading` indefinitely, and the pill is the only thing on
+  // that screen that says so. `rooms-loading-state.spec.ts` covers those.
   test.use({ viewport: { width: 375, height: 812 } });
 
   test("exactly one indicator is visible on the mobile Welcome screen", async ({

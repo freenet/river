@@ -118,10 +118,17 @@ fn unread_badge_label(unread: usize, is_mentions: bool) -> String {
 /// it shows when the load has FAILED, hiding the Retry button behind advice to
 /// create a room.
 ///
-/// Reads are fallible per the Dioxus signal-safety rules, with the same
-/// `Loading` fallback the rail uses: an unresolved read must never resolve to
-/// `Empty`, because `Empty` is the one state that tells the user there is
-/// nothing to wait for.
+/// Reads are fallible per the Dioxus signal-safety rules. An unresolved
+/// LOAD-STATE read falls back to `Loading`, never `Empty` — `Empty` is the one
+/// state that tells the user there is nothing to wait for, so it must never be
+/// something a failed read can produce.
+///
+/// The room-count read has no such guarantee, and deliberately: an unresolved
+/// `ROOMS` read yields 0, so a successfully-read `Loaded` plus a failed count
+/// does render `Empty`. That matches what the rail has always done (its
+/// `room_items` memo returns an empty `Vec` on the same failure), and the
+/// alternative — inventing a non-zero count — would render a list with nothing
+/// in it. Both reads are one poll from correcting.
 pub(crate) fn current_room_list_display() -> RoomListDisplay {
     let load_state = ROOMS_LOAD_STATE
         .try_read()
@@ -303,17 +310,15 @@ pub fn RoomList() -> Element {
     // room there is nothing to reorder.
     let room_count: usize = room_items.read().len();
 
-    // Rail display state (freenet/river#397). Read the load-state signal
-    // reactively (fallible per the Dioxus signal-safety rules — a concurrent
-    // write returns Err, in which case we treat the load as still `Loading` and
-    // re-render on the next signal settle rather than panicking on Firefox).
-    // Combined with `room_count` this decides whether the rail shows the list,
-    // a loading spinner, a migrating spinner, or the calm empty state.
-    let load_state: RoomsLoadState = ROOMS_LOAD_STATE
-        .try_read()
-        .map(|g| *g)
-        .unwrap_or(RoomsLoadState::Loading);
-    let display = room_list_display_state(load_state, room_count);
+    // Rail display state (freenet/river#397): the list, a loading spinner, a
+    // migrating spinner, the failed block, or the calm empty state.
+    //
+    // Through the SHARED reader, which the conversation panel's no-room screen
+    // also calls (freenet/river#509). Deriving it separately here is what let
+    // the two surfaces disagree in the first place: #397 wired these states
+    // into the rail and nowhere else, and below 768px the rail is
+    // `display:none`, so mobile users saw none of them.
+    let display = current_room_list_display();
 
     rsx! {
         aside {
