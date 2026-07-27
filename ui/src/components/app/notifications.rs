@@ -545,6 +545,12 @@ impl<'a> SelfAuthoredIndex<'a> {
         }
     }
 
+    /// The member this index treats as "self" — the single source of that
+    /// answer for every caller, so no caller can supply a second one.
+    pub(crate) fn self_member_id(&self) -> MemberId {
+        self.self_member_id
+    }
+
     /// Whether `target_id` names a message in `recent` authored by self.
     fn contains(&self, target_id: &MessageId) -> bool {
         self.ids
@@ -576,7 +582,18 @@ impl<'a> SelfAuthoredIndex<'a> {
 /// `pub(crate)`: besides gating browser notifications here, this is the same
 /// predicate the unread counters use for rooms in MentionsAndReplies mode
 /// (`document_title::count_unread_in_room_data_with_mode`, freenet/river#500),
-/// so the badge and the notification can't disagree about what "qualifies".
+/// so the badge and the notification can't drift on what a mention or a reply
+/// IS.
+///
+/// They do deliberately differ on one thing: a body that cannot be decrypted
+/// at all. The counter counts it (see
+/// `document_title::unreadable_body_may_become_readable`) because a wrong
+/// number that resolves down is better than a badge that hides a mention. A
+/// notification cannot be taken back, and every cold start of a private room
+/// has an empty secrets map, so applying the same fail-safe here would fire a
+/// burst of "you were mentioned" popups on every reload. The badge
+/// over-reports; the notification under-reports; both fail toward the less
+/// annoying error.
 pub(crate) fn mentions_or_replies_to_self(
     msg: &AuthorizedMessageV1,
     self_member_id: MemberId,
@@ -585,7 +602,6 @@ pub(crate) fn mentions_or_replies_to_self(
 ) -> bool {
     mentions_or_replies_to_self_indexed(
         msg,
-        self_member_id,
         room_secrets,
         &SelfAuthoredIndex::new(recent, self_member_id),
     )
@@ -596,15 +612,35 @@ pub(crate) fn mentions_or_replies_to_self(
 /// once instead of once per candidate.
 pub(crate) fn mentions_or_replies_to_self_indexed(
     msg: &AuthorizedMessageV1,
-    self_member_id: MemberId,
     room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
     self_authored: &SelfAuthoredIndex<'_>,
 ) -> bool {
-    use crate::components::conversation::{decrypt_message_content, extract_reply_target_id};
+    use crate::components::conversation::decrypt_message_content;
 
-    // (a) An @mention of self anywhere in the (decrypted) message text.
     let text = decrypt_message_content(&msg.message.content, room_secrets);
-    if river_core::mention::contains_mention_of(&text, self_member_id) {
+    text_mentions_or_replies_to_self(msg, &text, room_secrets, self_authored)
+}
+
+/// [`mentions_or_replies_to_self_indexed`] against a body that has ALREADY
+/// been decrypted, so a caller that needed the plaintext for its own reasons
+/// does not pay for a second AES-GCM decrypt of the same message.
+///
+/// This is the single definition of "qualifies" — the notification gate and
+/// the unread counter both end up here, so they cannot drift on what counts
+/// as a mention or a reply.
+pub(crate) fn text_mentions_or_replies_to_self(
+    msg: &AuthorizedMessageV1,
+    text: &str,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
+    self_authored: &SelfAuthoredIndex<'_>,
+) -> bool {
+    use crate::components::conversation::extract_reply_target_id;
+
+    // "Self" is taken from the index and nowhere else. Passing it separately
+    // as well let the mention arm and the reply arm disagree about whose
+    // messages these are — the paired-field shape the project's bug-prevention
+    // rules call out.
+    if river_core::mention::contains_mention_of(text, self_authored.self_member_id()) {
         return true;
     }
 
@@ -615,32 +651,10 @@ pub(crate) fn mentions_or_replies_to_self_indexed(
     false
 }
 
-/// Whether `msg` should notify the local user under
-/// [`crate::room_data::NotificationMode::MentionsAndReplies`]: it either
-/// @mentions them or is a reply to one of their own messages.
-///
-/// Reads `recent_messages` from `ROOMS` (needed for reply-authorship) and
-/// delegates the decision to the pure [`mentions_or_replies_to_self`] helper.
-fn message_notifies_self(
-    msg: &AuthorizedMessageV1,
-    self_member_id: MemberId,
-    room_key: &VerifyingKey,
-    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
-) -> bool {
-    if let Ok(rooms) = ROOMS.try_read() {
-        if let Some(rd) = rooms.map.get(room_key) {
-            return mentions_or_replies_to_self(
-                msg,
-                self_member_id,
-                room_secrets,
-                &rd.room_state.recent_messages.messages,
-            );
-        }
-    }
-    // ROOMS unreadable / room missing: the @mention check needs no room
-    // context, so still honour it with an empty recent-message window.
-    mentions_or_replies_to_self(msg, self_member_id, room_secrets, &[])
-}
+// NOTE: there is deliberately no per-message `message_notifies_self` helper
+// any more. It re-read `ROOMS` and rebuilt a `SelfAuthoredIndex` once per
+// message, so a K-message delta did K signal reads and K index builds;
+// `notify_new_messages` now reads once and builds one index for the batch.
 
 /// Process new messages and show notifications if appropriate
 /// Called from apply_delta when new messages are received
@@ -721,12 +735,32 @@ pub fn notify_new_messages(
     }
 
     // Apply the per-room notification preference (a local user setting).
-    let mode = ROOMS
-        .read()
+    //
+    // Read ONCE, and fallibly: `.read()` panics on a re-entrant borrow
+    // (`.claude/rules/dioxus-signal-safety.md`), and this runs from
+    // `apply_delta`. The fallback is `return`, NOT `unwrap_or_default()` — the
+    // default is `All`, so defaulting here would notify a MUTED room, which is
+    // exactly the setting the user chose to prevent. A missed notification on
+    // an unreadable signal is the safe direction.
+    //
+    // The room's recent messages come out of the same read, so the per-message
+    // mention check below does not re-read `ROOMS` (and does not rebuild its
+    // self-authored index) once per message.
+    let Ok(rooms) = ROOMS.try_read() else {
+        warn!("ROOMS unreadable while deciding notifications; skipping");
+        return;
+    };
+    let mode = rooms
         .notification_modes
         .get(room_key)
         .copied()
         .unwrap_or_default();
+    let recent: Vec<AuthorizedMessageV1> = rooms
+        .map
+        .get(room_key)
+        .map(|rd| rd.room_state.recent_messages.messages.clone())
+        .unwrap_or_default();
+    drop(rooms);
     let external_messages: Vec<_> = match mode {
         crate::room_data::NotificationMode::All => external_messages,
         crate::room_data::NotificationMode::Muted => {
@@ -736,27 +770,35 @@ pub fn notify_new_messages(
             );
             return;
         }
-        crate::room_data::NotificationMode::MentionsAndReplies => external_messages
-            .into_iter()
-            .filter(|msg| message_notifies_self(msg, self_member_id, room_key, room_secrets))
-            .collect(),
+        crate::room_data::NotificationMode::MentionsAndReplies => {
+            let self_authored = SelfAuthoredIndex::new(&recent, self_member_id);
+            external_messages
+                .into_iter()
+                .filter(|msg| {
+                    mentions_or_replies_to_self_indexed(msg, room_secrets, &self_authored)
+                })
+                .collect()
+        }
     };
     if external_messages.is_empty() {
         info!("No messages match the room's mentions-and-replies filter");
         return;
     }
 
-    // Get room name (decrypt if private)
+    // Get room name (decrypt if private). Fallible for the same reason as the
+    // mode read above; unlike the mode, an unavailable NAME is cosmetic, so
+    // the fallback is the generic label rather than a `return`.
     let room_name = ROOMS
-        .read()
-        .map
-        .get(room_key)
-        .map(|rd| {
-            let sealed_name = &rd.room_state.configuration.configuration.display.name;
-            match unseal_bytes_with_secrets(sealed_name, room_secrets) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                Err(_) => sealed_name.to_string_lossy(),
-            }
+        .try_read()
+        .ok()
+        .and_then(|rooms| {
+            rooms.map.get(room_key).map(|rd| {
+                let sealed_name = &rd.room_state.configuration.configuration.display.name;
+                match unseal_bytes_with_secrets(sealed_name, room_secrets) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                    Err(_) => sealed_name.to_string_lossy(),
+                }
+            })
         })
         .unwrap_or_else(|| "Room".to_string());
 
@@ -1128,15 +1170,19 @@ mod notify_gate_tests {
         let (production, _) = source
             .split_once("mod notify_gate_tests")
             .expect("this test module's own declaration marks the end of production code");
+        // Whitespace-stripped: rustfmt re-wraps a growing call's arguments, and
+        // a contiguous-text needle would go silently vacuous the first time it
+        // did (this repo has been bitten by exactly that).
+        let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
 
         assert!(
-            production.contains("is_notifiable_external_message(msg, self_member_id)"),
+            squashed.contains("is_notifiable_external_message(msg,self_member_id)"),
             "the new-message filter stopped delegating to \
              `is_notifiable_external_message`, so room events can notify again"
         );
         // The pre-fix predicate, re-inlined, would drop the event exclusion.
         assert!(
-            !production.contains("filter(|msg| msg.message.author != self_member_id)"),
+            !squashed.contains("filter(|msg|msg.message.author!=self_member_id)"),
             "the author-only filter was re-inlined, which skips the room-event \
              exclusion that keeps notifications and unread badges in agreement"
         );

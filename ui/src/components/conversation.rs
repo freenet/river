@@ -712,6 +712,54 @@ fn format_event_summary(names: &[String]) -> String {
     }
 }
 
+/// The message body's readable text, or `None` when the body is private and
+/// cannot be read at all — either its secret version is missing, or the
+/// secret we hold for that version does not decrypt it.
+///
+/// [`decrypt_message_content`] answers the same question but substitutes a
+/// human-readable PLACEHOLDER in those cases, which is right for rendering
+/// and wrong for anything that then INSPECTS the text: a mention scan over
+/// `"[Encrypted message: 42 bytes, v2]"` finds no mention and reads as a
+/// confident "not a mention". Callers that need to tell "no mention" from
+/// "could not look" must use this (freenet/river#500).
+pub(crate) fn try_decrypt_message_content(
+    content: &RoomMessageBody,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> Option<String> {
+    use river_core::room_state::content::{
+        ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
+    };
+
+    match content {
+        // Public bodies are always readable; `decrypt_message_content`'s
+        // public arm has no placeholder path.
+        RoomMessageBody::Public { .. } => Some(decrypt_message_content(content, secrets)),
+        RoomMessageBody::Private {
+            content_type,
+            ciphertext,
+            nonce,
+            secret_version,
+            ..
+        } => {
+            use crate::util::ecies::decrypt_with_symmetric_key;
+            let secret = secrets.get(secret_version)?;
+            let plaintext =
+                decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce).ok()?;
+            if *content_type == CONTENT_TYPE_TEXT {
+                if let Ok(text_content) = TextContentV1::decode(&plaintext) {
+                    return Some(text_content.text);
+                }
+            }
+            if *content_type == CONTENT_TYPE_REPLY {
+                if let Ok(reply) = ReplyContentV1::decode(&plaintext) {
+                    return Some(reply.text);
+                }
+            }
+            Some(String::from_utf8_lossy(&plaintext).to_string())
+        }
+    }
+}
+
 pub(crate) fn decrypt_message_content(
     content: &RoomMessageBody,
     secrets: &HashMap<u32, [u8; 32]>,
@@ -743,35 +791,17 @@ pub(crate) fn decrypt_message_content(
             // Unknown content type
             content.to_string_lossy()
         }
-        RoomMessageBody::Private {
-            content_type,
-            ciphertext,
-            nonce,
-            secret_version,
-            ..
-        } => {
-            // Look up the secret for this message's version
-            if let Some(secret) = secrets.get(secret_version) {
-                use crate::util::ecies::decrypt_with_symmetric_key;
-                // Decrypt the ciphertext
-                if let Ok(decrypted_bytes) =
-                    decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce)
-                {
-                    // For text messages, decode the content
-                    if *content_type == CONTENT_TYPE_TEXT {
-                        if let Ok(text_content) = TextContentV1::decode(&decrypted_bytes) {
-                            return text_content.text;
-                        }
-                    }
-                    // For reply messages, decode and return reply text
-                    if *content_type == CONTENT_TYPE_REPLY {
-                        if let Ok(reply) = ReplyContentV1::decode(&decrypted_bytes) {
-                            return reply.text;
-                        }
-                    }
-                    // Fallback to UTF-8 string
-                    return String::from_utf8_lossy(&decrypted_bytes).to_string();
-                }
+        RoomMessageBody::Private { secret_version, .. } => {
+            // The read itself lives in `try_decrypt_message_content`, so there
+            // is ONE definition of "what does this body say". Everything below
+            // is the placeholder to render when it says nothing.
+            if let Some(text) = try_decrypt_message_content(content, secrets) {
+                return text;
+            }
+            if secrets.contains_key(secret_version) {
+                // We hold a secret at this version and it did not decrypt the
+                // body — a wrong key, which `repopulate_secrets_from_state`
+                // overwrites from the owner-signed blob when it arrives.
                 content.to_string_lossy()
             } else if secrets.is_empty() {
                 // Issue freenet/river#284: when the in-memory `secrets`

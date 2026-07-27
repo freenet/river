@@ -1201,6 +1201,45 @@ mod tests {
         let rooms = create_example_rooms();
         assert_eq!(rooms.map.len(), 3);
 
+        // The muted-room fixture's PREMISE, pinned here rather than left to
+        // the browser suite (freenet/river#500 review I2). `room-unread-badge`
+        // asserts a muted room shows no badge; that assertion is only
+        // meaningful while the room genuinely HAS unread other-authored
+        // messages. If a future fixture edit made them self-authored, or gave
+        // the room a read marker, the spec would keep passing and prove
+        // nothing — which is exactly how #501 shipped green.
+        let muted: Vec<_> = rooms
+            .notification_modes
+            .iter()
+            .filter(|(_, mode)| **mode == crate::room_data::NotificationMode::Muted)
+            .map(|(vk, _)| *vk)
+            .collect();
+        assert_eq!(muted.len(), 1, "exactly one example room must be muted");
+        let muted_room = rooms.map.get(&muted[0]).expect("muted room must exist");
+        assert!(
+            muted_room.last_read_message_id.is_none(),
+            "the muted room must have no read marker, or it has nothing unread \
+             to suppress"
+        );
+        let self_id: river_core::room_state::member::MemberId =
+            muted_room.self_sk.verifying_key().into();
+        let unread = muted_room
+            .room_state
+            .recent_messages
+            .messages
+            .iter()
+            .filter(|m| {
+                m.message.author != self_id
+                    && !m.message.content.is_action()
+                    && !m.message.content.is_event()
+            })
+            .count();
+        assert!(
+            unread > 0,
+            "the muted room must have unread other-authored messages, or the \
+             'no badge' assertion in room-unread-badge.spec.ts is vacuous"
+        );
+
         for (owner_vk, room_data) in rooms.map.iter() {
             // Verify the room state
             let verification_result = room_data.room_state.verify(

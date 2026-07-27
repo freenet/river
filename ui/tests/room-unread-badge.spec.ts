@@ -95,6 +95,11 @@ test.describe("Muted rooms and the cross-surface totals", () => {
   // hamburger badge must all sum the SAME per-room values. Example data has
   // no direct messages, so the hamburger total is exactly the sum of the
   // room badges — and a muted room contributes to neither.
+  //
+  // That "no DMs" premise is load-bearing and NOT general: `panel_unread`
+  // includes DM unread, which has no room badge. If the fixture ever seeds a
+  // DM this fails with a diff that reads like a counting regression, so read
+  // this comment before chasing it.
   test("hamburger total equals the sum of the room badges", async ({
     page,
   }) => {
@@ -113,12 +118,15 @@ test.describe("Muted rooms and the cross-surface totals", () => {
     await expect(page.locator('[data-testid="room-list"]')).toBeVisible({
       timeout: 5_000,
     });
-    const badges = await page
-      .locator('[data-testid="room-list"] [data-testid="room-unread-badge"]')
-      .allTextContents();
-
     // The muted room renders no badge, so only two of the three rooms do.
-    expect(badges).toHaveLength(2);
+    // `toHaveCount` retries; `allTextContents()` does not, so assert the count
+    // first rather than sampling a half-rendered list into a length check that
+    // `retries: 2` would then hide.
+    const badgeLocator = page.locator(
+      '[data-testid="room-list"] [data-testid="room-unread-badge"]'
+    );
+    await expect(badgeLocator).toHaveCount(2, { timeout: 5_000 });
+    const badges = await badgeLocator.allTextContents();
     const sum = badges.reduce((acc, t) => acc + Number(t), 0);
     expect(sum).toBe(total);
   });
