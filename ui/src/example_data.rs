@@ -134,7 +134,19 @@ pub fn create_example_rooms() -> Rooms {
         None,
         HistoryDepth::Standard,
     );
+    let muted_room_vk = room3.owner_vk;
     map.insert(room3.owner_vk, room3.room_data);
+
+    // Seed ONE room as Muted (freenet/river#500). Every example room starts
+    // with unread other-authored messages and no last-read marker, so a muted
+    // room here is exactly the case the bug was reported for: unreads present,
+    // but no badge and no contribution to the title / hamburger totals.
+    // Without this seeding the muted semantics are unreachable from a browser
+    // test — the bell modal only opens from the CURRENT room's header, and
+    // opening a room marks it read, so the badge would be absent either way.
+    // Pinned by `room-unread-badge.spec.ts`.
+    let mut notification_modes = HashMap::new();
+    notification_modes.insert(muted_room_vk, crate::room_data::NotificationMode::Muted);
 
     // Rooms deeper than the render window, for the windowing specs (#501):
     // one with prune headroom, one exactly at its message cap so delivered
@@ -161,7 +173,7 @@ pub fn create_example_rooms() -> Rooms {
         map,
         current_room_key: None,
         removed_rooms: std::collections::HashSet::new(),
-        notification_modes: Default::default(),
+        notification_modes,
         migrated_rooms: Vec::new(),
         room_order: Vec::new(),
     }

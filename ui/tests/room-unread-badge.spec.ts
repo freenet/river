@@ -58,4 +58,68 @@ test.describe("Rooms list unread badge", () => {
       timeout: 5_000,
     });
   });
+
+  // freenet/river#500: a room set to "Muted" must not badge, even though it
+  // has unread messages, and must not inflate the title / hamburger totals.
+  // The example build seeds "Your Private Room" as Muted (example_data.rs) so
+  // this is reachable from the browser at all — the bell modal only opens
+  // from the CURRENT room's header, and opening a room marks it read.
+  test("a muted room shows no badge despite having unread messages", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+
+    const muted = page.getByRole("button", { name: "Your Private Room" });
+    await expect(muted).toBeVisible({ timeout: 5_000 });
+
+    // The two non-muted rooms badge as usual…
+    for (const name of ["Public Discussion Room", "Team Chat Room"]) {
+      await expect(
+        page.getByRole("button", { name }).locator('[data-testid="room-unread-badge"]')
+      ).toBeVisible({ timeout: 5_000 });
+    }
+
+    // …while the muted one never does.
+    await expect(
+      muted.locator('[data-testid="room-unread-badge"]')
+    ).toHaveCount(0);
+  });
+});
+
+test.describe("Muted rooms and the cross-surface totals", () => {
+  // The hamburger badge is `md:hidden`, so this needs a mobile viewport.
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  // freenet/river#500: the room-row badges, the document title and the
+  // hamburger badge must all sum the SAME per-room values. Example data has
+  // no direct messages, so the hamburger total is exactly the sum of the
+  // room badges — and a muted room contributes to neither.
+  test("hamburger total equals the sum of the room badges", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+
+    const hamburgerBadge = page.locator(
+      '[data-testid="hamburger-rooms-button"] [data-testid="hamburger-unread-badge"]'
+    );
+    await expect(hamburgerBadge).toBeVisible({ timeout: 5_000 });
+    const total = Number(await hamburgerBadge.textContent());
+    expect(total).toBeGreaterThan(0);
+
+    // Open the rooms panel and add up every rendered room badge.
+    await page.locator('[data-testid="hamburger-rooms-button"]').click();
+    await expect(page.locator('[data-testid="room-list"]')).toBeVisible({
+      timeout: 5_000,
+    });
+    const badges = await page
+      .locator('[data-testid="room-list"] [data-testid="room-unread-badge"]')
+      .allTextContents();
+
+    // The muted room renders no badge, so only two of the three rooms do.
+    expect(badges).toHaveLength(2);
+    const sum = badges.reduce((acc, t) => acc + Number(t), 0);
+    expect(sum).toBe(total);
+  });
 });
