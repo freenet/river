@@ -162,11 +162,104 @@ field with `#[serde(default)]` so old bytes still decode. **Do not add
 a second top-level delegate storage key for hide state**: a new key
 needs its own probe in `fire_legacy_migration_request` and routing in
 `response_handler.rs`, AND splits the multi-device save path into two
-writes that can race. Filter helper `chat_delegate::is_thread_hidden`
+writes that can race. Filter helper `direct_messages::is_thread_hidden_for`
 uses strict `<=`; rail-side pure helper
 `dm_rail_section::filter_rail_entries` is pinned by
 `filter_rail_entries_*` tests; the "click Archive again after revival
 must re-hide" branch is pinned by `hide_unhide_rehide_round_trip`.
+
+### Two coupled invariants — do not change one without the other (#526)
+
+**1. `hidden_at_ts` is the newest INBOUND message timestamp**, computed as
+`max(rendered row value, live recompute from ROOMS)` and NOT clamped against
+wall-clock time.
+
+*Inbound-only.* `last_any_ts` also covers our OWN outbound DMs, whose
+timestamp is our local wall clock — so a thread where we replied last would be
+archived against OUR clock while the gate below compares a SENDER's timestamp,
+and a peer DM already in flight across the click would land at or below the
+cutoff and vanish from the rail, the unread badge, and everything else (DMs
+raise no notification). Our own sends revive the thread through the
+unconditional `unhide_dm_thread` in `do_send` / `send_structured_dm` — on the
+SENDING DEVICE only: hydration never propagates a removal, and `riverctl dm
+send` does not call it, so archiving on a laptop and replying from a phone
+leaves the laptop archived until the peer writes.
+
+*Live recompute.* The rendered row can lag (`LAST_GOOD_RAIL`, or a DM landing
+between the memo's last clean pass and the click), and while the membership
+sweep is atomic per pair, the RE-LAND is not — a peer may restore only a
+subset. A cutoff below the pair's true inbound max lets the rest re-land
+looking newer than the archive. Cost: the live read can cover an inbound DM
+that was never rendered, so archiving may swallow one message until the peer
+writes again.
+
+*Not clamped.* An earlier revision clamped the cutoff at
+`now + MAX_DM_FUTURE_SKEW_SECS`. That broke the load-bearing invariant **every
+existing inbound DM satisfies `ts <= cutoff`**: the rail filter compares the
+UNCLAMPED observed clock, so Archive became a visible no-op that still showed a
+success toast, AND the next sweep-and-re-offer saw `ts > cutoff` and destroyed
+the persisted archive — #526 itself, narrowed to skew-violating peers. Clamping
+one side of a comparison is what created the hole. The forged-timestamp concern
+is handled where it cannot break the invariant instead: the GATE bounds the
+incoming timestamp. That bound is narrow — it binds only once a forgery has
+already inflated the cutoff, stopping a peer escalating to a larger one; a
+first forgery can still revive a normally-archived thread. It is
+safe-directional regardless (the bounded value is never above the raw one, so
+it can only make the gate more conservative).
+
+The inbound-only anchoring works because `sweep_after_membership_change`
+retains on `alive(sender) && alive(recipient)` and every DM in a pair shares
+the same sender/recipient set, so the sweep is **all-or-nothing per pair** — it
+can never leave a thread partially swept.
+
+The sweep is atomic; the RE-LAND is not. If a peer re-offers only part of a
+swept pair and the rail memo refreshes cleanly in between, both the row and the
+live read agree on a value below the pair's true max, and a later re-offer of
+the rest fires the gate and destroys that archive. `max(row, live)` covers a
+row stale from BEFORE the sweep, not a cutoff taken inside the partial window.
+Narrow, but a residual — do not restate this invariant as absolute.
+
+Pinned by `archive_cutoff_*`, `archive_row_uses_inbound_and_live_cutoff`,
+`rail_row_passes_the_inbound_clock_to_archive_row`,
+`rail_filter_compares_inbound_timestamp`, and
+`archived_projections_use_the_inbound_clock`.
+
+**2. Inbound-sync paths must use the cutoff-gated unhide; explicit user
+actions must not.** The two `room_synchronizer` sites (`apply_delta_inner`,
+`update_room_state_inner`) call `unhide_dm_thread_if_dm_is_newer`, which drops
+the archive entry only when the DM's timestamp is strictly past
+`hidden_at_ts`. Their "newly landed" predicate is a diff against **local
+state**, which cannot distinguish a genuinely new DM from an old one the sweep
+removed and a peer re-offered — nor, on the full-state path, from the case
+where the pre-merge snapshot is empty because DM state has not hydrated yet
+(there, *every* DM reads as newly landed). Calling the unconditional
+`unhide_dm_thread` from either site destroys the archive on ordinary sync
+churn and **persists** the destruction (it also writes a session
+`RECENTLY_UNHIDDEN` tombstone, which then suppresses the entry when the
+delegate blob hydrates).
+
+The four explicit-user-action call sites — Undo toast and Archived-panel
+Un-archive (`dm_rail_section.rs`), and the outbound sends in `do_send`
+(`dm_thread_modal.rs`) and `send_structured_dm` (`direct_messages.rs`) — keep
+the UNCONDITIONAL form. Routing any through the gated one makes it a silent
+no-op, because at that moment the inbound clock is by construction at or below
+the cutoff. Each file pins its own sites:
+`explicit_user_actions_keep_the_unconditional_unhide` (rail) and
+`outbound_send_keeps_the_unconditional_unhide` (both send files). Those pins
+were briefly lost to a `git checkout` during mutation testing and restored —
+if you touch them, confirm they still exist rather than trusting a green run.
+
+Accepted residuals — all defer messages from one peer the user already chose
+to archive, none destroys state: a new inbound DM in the same unix second as
+the peer's previous one; a peer whose clock moves backward relative to their
+own previous message; and a peer who stamps far in the future, whose later
+genuine DMs wait until real time passes that stamp. Irreducible under
+timestamp gating — the real remedy is a block/ignore list, #461.
+
+Two narrower cases can still cost an archive ENTRY (not just defer a message):
+a cutoff taken inside a partial re-land window, and a DM the live read missed
+because `ROOMS` was contended AND the rendered row lagged. Both need an archive
+clicked inside a specific race; neither is the systematic churn #526 is about.
 
 The per-row rollover ✕ in `DmRailSection` is the archive control (the
 old modal-header "Hide" button next to close ✕ was repeatedly

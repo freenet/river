@@ -285,6 +285,35 @@ pub(crate) fn send_member_info_heal_update(
     });
 }
 
+/// Collapse a batch of newly-landed `(sender, timestamp)` inbound DMs to one
+/// entry per sender, keeping the sender's LARGEST timestamp.
+///
+/// One merge can land several DMs from the same peer, and after issue
+/// freenet/river#526 the archive decision is made against a timestamp rather
+/// than fired unconditionally — so the batch must be reduced by `max`, not by
+/// "first seen wins". A batch mixing a re-landed old DM with a genuinely new
+/// one has to revive the thread; picking an arbitrary member of the batch
+/// would make that outcome depend on merge order.
+///
+/// De-duplicating also keeps one delegate save per peer per merge, which is
+/// what the pre-#526 `HashSet` pass was for.
+///
+/// Pinned by the `fold_newly_landed_to_max_ts_*` tests.
+fn fold_newly_landed_to_max_ts(landed: Vec<(MemberId, u64)>) -> Vec<(MemberId, u64)> {
+    let mut best: HashMap<MemberId, u64> = HashMap::new();
+    for (sender, ts) in landed {
+        let slot = best.entry(sender).or_insert(ts);
+        if ts > *slot {
+            *slot = ts;
+        }
+    }
+    let mut out: Vec<(MemberId, u64)> = best.into_iter().collect();
+    // `HashMap` iteration order is per-process random; sort so the resulting
+    // sequence of unhide/save calls is deterministic.
+    out.sort_by_key(|(sender, _)| *sender);
+    out
+}
+
 /// Identifies contracts that have changed in order to send state updates to Freene
 #[derive(Clone)]
 pub struct RoomSynchronizer {
@@ -328,7 +357,7 @@ impl RoomSynchronizer {
         // diffing the post-merge `direct_messages.messages` list
         // against a pre-merge signature snapshot, we only unhide for
         // DMs that genuinely just landed.
-        let mut newly_landed_inbound_senders: Vec<MemberId> = Vec::new();
+        let mut newly_landed_inbound_senders: Vec<(MemberId, u64)> = Vec::new();
 
         // Will be populated inside with_mut if new messages need notification
         let mut pending_notification: Option<(
@@ -475,7 +504,8 @@ impl RoomSynchronizer {
                                 // but defence-in-depth.
                                 continue;
                             }
-                            newly_landed_inbound_senders.push(msg.message.sender);
+                            newly_landed_inbound_senders
+                                .push((msg.message.sender, msg.message.timestamp));
                         }
 
                         // NOTE: We do not update last_synced_state in the delta path.
@@ -528,17 +558,19 @@ impl RoomSynchronizer {
         // their own `unhide_dm_thread` call site in
         // `dm_thread_modal::do_send` / `direct_messages::send_structured_dm`,
         // so we don't need a self-id filter on this path.
-        if !newly_landed_inbound_senders.is_empty() {
-            // De-duplicate before firing the unhide (multiple inbound
-            // DMs from the same peer in one batch only need one unhide
-            // call). `unhide_dm_thread` is idempotent, so duplicates
-            // are safe, but de-duping avoids redundant delegate saves.
-            let mut seen: std::collections::HashSet<MemberId> = std::collections::HashSet::new();
-            for sender in newly_landed_inbound_senders {
-                if seen.insert(sender) {
-                    crate::components::app::chat_delegate::unhide_dm_thread(owner_vk, sender);
-                }
-            }
+        //
+        // Issue freenet/river#526: crossing the dedupe means "was not in
+        // LOCAL state a moment ago", which is NOT the same as "is new
+        // content". `post_apply_cleanup`'s membership sweep removes DMs
+        // whose counterparty is momentarily absent from `members`, peers
+        // re-offer them, and they re-land — indistinguishable here from a
+        // genuinely new message. So the timestamp goes with the sender and
+        // the decision is made against the pair's archive cutoff by
+        // `unhide_dm_thread_if_dm_is_newer`, never unconditionally.
+        for (sender, dm_ts) in fold_newly_landed_to_max_ts(newly_landed_inbound_senders) {
+            crate::components::app::chat_delegate::unhide_dm_thread_if_dm_is_newer(
+                owner_vk, sender, dm_ts,
+            );
         }
 
         // freenet/river#295: a private-room secret arrived in this delta and
@@ -1256,7 +1288,7 @@ impl RoomSynchronizer {
         // Issue freenet/river#267 (full-state path): post-merge inbound
         // DM senders for hidden-thread revival. Same shape as the
         // delta-path local in apply_delta_inner.
-        let mut newly_landed_inbound_senders: Vec<MemberId> = Vec::new();
+        let mut newly_landed_inbound_senders: Vec<(MemberId, u64)> = Vec::new();
         // freenet/river#295 (full-state path): same shape as the delta-path
         // local in apply_delta_inner — a newly-arrived private-room secret may
         // let us finally seal & publish our own member_info.
@@ -1387,7 +1419,8 @@ impl RoomSynchronizer {
                                 if msg.message.sender == self_id {
                                     continue;
                                 }
-                                newly_landed_inbound_senders.push(msg.message.sender);
+                                newly_landed_inbound_senders
+                                    .push((msg.message.sender, msg.message.timestamp));
                             }
                         }
 
@@ -1486,13 +1519,26 @@ impl RoomSynchronizer {
         // whose post-merge DM set gained a new inbound DM from the
         // peer. Symmetric with the apply_delta_inner path. Codex
         // review finding on PR #286.
-        if !newly_landed_inbound_senders.is_empty() {
-            let mut seen: std::collections::HashSet<MemberId> = std::collections::HashSet::new();
-            for sender in newly_landed_inbound_senders {
-                if seen.insert(sender) {
-                    crate::components::app::chat_delegate::unhide_dm_thread(room_owner_vk, sender);
-                }
-            }
+        //
+        // Issue freenet/river#526: this path is the WORSE of the two. Its
+        // pre-merge snapshot is empty whenever the room is present in `ROOMS`
+        // but its DM state has not hydrated yet — a full-state GET can land
+        // first. Every DM in the incoming state then reads as newly landed,
+        // so the old unconditional unhide destroyed EVERY archive in the room
+        // at once. (The room-NOT-found branch above is inert for a different
+        // reason: it nulls `self_member_id` too, so the collection loop is
+        // skipped entirely and no sender is ever gathered.)
+        //
+        // Now the timestamps decide: an already-existing DM is at or below
+        // the pair's cutoff, so it cannot revive the thread, and a pair whose
+        // archive entry has not hydrated yet is inert with no tombstone
+        // written.
+        for (sender, dm_ts) in fold_newly_landed_to_max_ts(newly_landed_inbound_senders) {
+            crate::components::app::chat_delegate::unhide_dm_thread_if_dm_is_newer(
+                room_owner_vk,
+                sender,
+                dm_ts,
+            );
         }
 
         // freenet/river#295 (full-state path): publish the self-heal built
@@ -1674,6 +1720,7 @@ pub struct ContractSyncInfo {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use freenet_scaffold::util::FastHash;
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
     use std::time::SystemTime;
 
@@ -1939,7 +1986,19 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn apply_delta_inner_revives_hidden_thread_for_inbound_dm_sender() {
-        let src = include_str!("room_synchronizer.rs");
+        // Slice at the function head so this pin genuinely scopes to
+        // `apply_delta_inner` — without it, wiring present only in
+        // `update_room_state_inner` would satisfy every assertion below while
+        // the delta path had none.
+        let whole = production_source_whitespace_stripped();
+        let split_at = whole
+            .find("fnapply_delta_inner(")
+            .expect("apply_delta_inner must exist in this file");
+        let tail = &whole[split_at..];
+        let end = tail
+            .find("fnupdate_room_state_inner(")
+            .unwrap_or(tail.len());
+        let src = &tail[..end];
         // The unhide MUST be computed from the post-merge signature
         // diff, NOT from the raw delta. The raw delta can carry
         // re-deliveries that the contract silently drops; firing
@@ -1957,12 +2016,126 @@ mod tests {
              can diff against the post-merge set to find genuinely new DMs (#267)."
         );
         assert!(
-            src.contains("chat_delegate::unhide_dm_thread("),
-            "apply_delta_inner must call unhide_dm_thread on each newly-landed \
-             inbound DM sender so a hidden thread is revived even when the new \
-             DM's timestamp matches the hide cutoff exactly (#267). The filter's \
-             strict-`<=` rule alone is not sufficient for the same-second case."
+            src.contains(&gated_unhide_needle()),
+            "apply_delta_inner must route each newly-landed inbound DM through \
+             unhide_dm_thread_if_dm_is_newer so a hidden thread is revived when \
+             the DM is past the archive cutoff (#267)."
         );
+    }
+
+    /// Needle for the GATED unhide call, assembled at runtime so this pin
+    /// cannot match its own source text via `include_str!` (the trap the
+    /// pre-#526 version of these tests fell into: it searched for a literal
+    /// that its own assertion contained, making it vacuous).
+    fn gated_unhide_needle() -> String {
+        format!(
+            "chat_delegate::{}{}",
+            "unhide_dm_thread_if_dm_is_newer", "("
+        )
+    }
+
+    /// Needle for the UNCONDITIONAL unhide call, assembled the same way.
+    ///
+    /// Deliberately NOT prefixed with `chat_delegate::`: every other caller in
+    /// the codebase imports the function and calls it bare
+    /// (`dm_rail_section.rs`, `dm_thread_modal.rs`, `direct_messages.rs`), so
+    /// a fully-qualified-only needle would miss the most likely re-regression
+    /// — someone adding a `use` and a bare call. Safe against false positives
+    /// because the gated name has `_if_dm_is_newer` between `thread` and `(`.
+    fn unconditional_unhide_needle() -> String {
+        format!("{}{}", "unhide_dm_thread", "(")
+    }
+
+    /// This file's source with the test module and all whitespace removed.
+    ///
+    /// Cutting at `mod tests` (not `#[cfg(test)]`) is what keeps these pins
+    /// from matching their own assertion literals. Stripping whitespace keeps
+    /// them alive across a rustfmt pass that splits a growing call's arguments
+    /// over several lines.
+    fn production_source_whitespace_stripped() -> String {
+        let src = include_str!("room_synchronizer.rs");
+        let cut = src
+            .find("mod tests {")
+            .expect("this file must have a `mod tests {` to cut at");
+        src[..cut].chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Issue freenet/river#526 regression guard.
+    ///
+    /// The two inbound-sync call sites must use the CUTOFF-GATED unhide.
+    /// Their "newly landed" predicate is a diff against local state, which
+    /// cannot tell a genuinely new DM from an old one that left local state
+    /// (`post_apply_cleanup`'s membership sweep) and was re-offered by a peer
+    /// — nor from the empty-pre-merge-snapshot case on the full-state path,
+    /// where EVERY DM reads as newly landed. Calling the unconditional
+    /// `unhide_dm_thread` from either site destroys the user's archive on
+    /// ordinary sync churn, and persists the destruction.
+    ///
+    /// The unconditional variant is still correct for the explicit-user-action
+    /// call sites (Undo toast, Archived-panel Un-archive, outbound send) —
+    /// those live in other files, so this pin is scoped to this one.
+    #[test]
+    fn inbound_sync_paths_never_unhide_unconditionally() {
+        let src = production_source_whitespace_stripped();
+        assert!(
+            !src.contains(&unconditional_unhide_needle()),
+            "room_synchronizer must never call the unconditional \
+             chat_delegate::unhide_dm_thread — an inbound DM that merely \
+             RE-landed after a membership sweep would destroy the pair's \
+             archive entry (#526). Use unhide_dm_thread_if_dm_is_newer, which \
+             compares the DM's timestamp against the archive cutoff."
+        );
+        assert_eq!(
+            src.matches(&gated_unhide_needle()).count(),
+            2,
+            "both inbound-sync paths (apply_delta_inner and \
+             update_room_state_inner) must route through the gated unhide \
+             (#526). A dropped call site silently re-regresses one of them."
+        );
+    }
+
+    /// The batch fold keeps the LARGEST timestamp per sender, so a merge that
+    /// mixes a re-landed old DM with a genuinely new one still revives the
+    /// thread (#526).
+    #[test]
+    fn fold_newly_landed_to_max_ts_keeps_largest_per_sender() {
+        let a = MemberId(FastHash(1));
+        let b = MemberId(FastHash(2));
+        let folded = fold_newly_landed_to_max_ts(vec![(a, 500), (b, 10), (a, 1_500), (a, 900)]);
+        assert_eq!(folded.len(), 2, "one entry per sender");
+        let a_ts = folded.iter().find(|(s, _)| *s == a).unwrap().1;
+        let b_ts = folded.iter().find(|(s, _)| *s == b).unwrap().1;
+        assert_eq!(
+            a_ts, 1_500,
+            "the newest DM in the batch must win — picking an arbitrary member \
+             would make revival depend on merge order"
+        );
+        assert_eq!(b_ts, 10);
+    }
+
+    /// Order must not depend on `HashMap` iteration order, so the sequence of
+    /// unhide/save calls is deterministic across runs.
+    #[test]
+    fn fold_newly_landed_to_max_ts_is_deterministically_ordered() {
+        // Eight senders, not three: with three keys a HashMap fold would
+        // coincidentally match the sorted order on roughly one run in six, so
+        // dropping the sort would survive the mutation a meaningful fraction
+        // of the time. Eight makes that ~1e-5.
+        let ids: Vec<MemberId> = (1..=8).map(|i| MemberId(FastHash(i))).collect();
+        let input: Vec<(MemberId, u64)> = ids.iter().map(|id| (*id, 10u64)).collect();
+        let mut expected = input.clone();
+        expected.sort_by_key(|(s, _)| *s);
+
+        assert_eq!(fold_newly_landed_to_max_ts(input.clone()), expected);
+        let mut reversed = input;
+        reversed.reverse();
+        assert_eq!(fold_newly_landed_to_max_ts(reversed), expected);
+    }
+
+    /// An empty batch produces no unhide calls at all.
+    #[test]
+    fn fold_newly_landed_to_max_ts_empty_is_empty() {
+        assert!(fold_newly_landed_to_max_ts(Vec::new()).is_empty());
     }
 
     /// Codex review finding on PR #286: the delta-path unhide alone
@@ -1972,13 +2145,18 @@ mod tests {
     /// apply the same diff-and-unhide logic.
     #[test]
     fn update_room_state_inner_also_revives_hidden_thread_for_inbound_dm() {
-        let src = include_str!("room_synchronizer.rs");
         // Find the update_room_state_inner function body and assert
         // the pre-merge snapshot + post-merge collection + unhide
         // call all appear AFTER its declaration. We don't try to
         // parse Rust; instead we split the file at the function
         // signature and look at the suffix.
-        let marker = "fn update_room_state_inner(";
+        //
+        // The slice is taken from the TEST-STRIPPED source (#526): the test
+        // module sits after this function in the file, so a suffix of the raw
+        // source would include these assertions' own literals and the pin
+        // would pass no matter what the production code did.
+        let src = production_source_whitespace_stripped();
+        let marker = "fnupdate_room_state_inner(";
         let split_at = src.find(marker).expect(
             "update_room_state_inner must exist in this file — the test is targeting the wrong path",
         );
@@ -1996,11 +2174,11 @@ mod tests {
              senders post-merge (#267)."
         );
         assert!(
-            suffix.contains("chat_delegate::unhide_dm_thread("),
-            "update_room_state_inner must call unhide_dm_thread on each \
-             newly-landed inbound DM sender so the #267 fix covers both the \
-             delta path AND the full-state merge path. Without this, a \
-             refresh GET that delivers a new inbound DM into a hidden thread \
+            suffix.contains(&gated_unhide_needle()),
+            "update_room_state_inner must route each newly-landed inbound DM \
+             through unhide_dm_thread_if_dm_is_newer so the #267 fix covers \
+             both the delta path AND the full-state merge path. Without this, \
+             a refresh GET that delivers a new inbound DM into a hidden thread \
              leaves the thread archived."
         );
     }

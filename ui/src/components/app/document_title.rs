@@ -496,8 +496,8 @@ fn count_unread_dms(rooms: &crate::room_data::Rooms) -> usize {
 /// the thread is actually visible in the panel. A hidden (archived)
 /// thread is skipped unless a message STRICTLY newer than its
 /// `hidden_at_ts` revived it — the same `is_thread_hidden_for` rule
-/// `filter_rail_entries` applies, and revival considers messages in both
-/// directions, exactly like the rail's `last_any_ts`. Without this
+/// `filter_rail_entries` applies. Revival is INBOUND-only, exactly like the
+/// rail's `last_inbound_ts` (issue freenet/river#526). Without this
 /// filter the unread tallies (title, hamburger badge) count messages the
 /// user has no visible thread for and no way to clear.
 fn count_unread_dms_with(
@@ -513,9 +513,11 @@ fn count_unread_dms_with(
         let self_id: MemberId = room_data.self_sk.verifying_key().into();
 
         // Per-peer accumulation: unread inbound messages plus the newest
-        // timestamp in either direction (the revival clock).
+        // INBOUND timestamp (the revival clock — see the rail's
+        // `last_inbound_ts` and issue freenet/river#526 for why our own
+        // outbound sends must not feed it).
         struct Acc {
-            last_any_ts: u64,
+            last_inbound_ts: u64,
             unread: usize,
         }
         let mut per_peer: std::collections::HashMap<MemberId, Acc> =
@@ -532,13 +534,13 @@ fn count_unread_dms_with(
                 msg.message.sender
             };
             let acc = per_peer.entry(peer).or_insert(Acc {
-                last_any_ts: 0,
+                last_inbound_ts: 0,
                 unread: 0,
             });
-            if msg.message.timestamp > acc.last_any_ts {
-                acc.last_any_ts = msg.message.timestamp;
-            }
             if is_self_recipient {
+                if msg.message.timestamp > acc.last_inbound_ts {
+                    acc.last_inbound_ts = msg.message.timestamp;
+                }
                 let cutoff = last_seen.get(&(*owner_key, peer)).copied().unwrap_or(0);
                 if msg.message.timestamp > cutoff {
                     acc.unread += 1;
@@ -547,11 +549,15 @@ fn count_unread_dms_with(
         }
 
         for (peer, acc) in per_peer {
+            // INBOUND-only, matching the rail filter (issue freenet/river#526).
+            // Using `last_any_ts` here would let our OWN outbound DM's
+            // locally-clocked timestamp decide whether a peer's message counts
+            // as unread, which is how an in-flight inbound DM lost its badge.
             if crate::components::direct_messages::is_thread_hidden_for(
                 hidden,
                 owner_key,
                 peer,
-                acc.last_any_ts,
+                acc.last_inbound_ts,
             ) {
                 continue;
             }
@@ -1927,10 +1933,18 @@ mod tests {
     }
 
     #[test]
-    fn dm_unread_outbound_message_revives_hidden_thread() {
-        // The revival clock counts BOTH directions (the rail's
-        // `last_any_ts`): replying into a hidden thread makes it visible
-        // again, so its older unread inbound must count again too.
+    fn dm_unread_outbound_message_does_not_by_itself_revive_a_hidden_thread() {
+        // Issue freenet/river#526: the revival clock is INBOUND-only. This
+        // test previously asserted the opposite (that replying revived the
+        // thread for unread purposes) because the clock covered both
+        // directions — and that is exactly what made an in-flight inbound DM
+        // invisible: our own outbound timestamp is our LOCAL wall clock, so it
+        // decided whether a PEER's message counted.
+        //
+        // Replying still revives the thread in practice, but through the
+        // unconditional `unhide_dm_thread` in `do_send` / `send_structured_dm`
+        // — i.e. by REMOVING the entry, which the second half asserts. That is
+        // a stronger mechanism than the timestamp race it replaces.
         let (self_sk, self_vk) = keypair();
         let (_owner_sk, owner_vk) = keypair();
         let (peer_sk, peer_vk) = keypair();
@@ -1954,9 +1968,54 @@ mod tests {
                 hidden_at_ts: 90,
             },
         );
-        // last_any_ts = 150 (outbound) > hidden_at 90 → revived → the
-        // ts=90 inbound counts.
-        assert_eq!(count_unread_dms_with(&map, &HashMap::new(), &hidden), 1);
+
+        // last_inbound_ts = 90 <= hidden_at 90 -> still archived. The
+        // outbound at 150 does NOT drag it back into the tally.
+        assert_eq!(
+            count_unread_dms_with(&map, &HashMap::new(), &hidden),
+            0,
+            "an outbound reply must not revive the thread via the timestamp \
+             filter (#526) - revival comes from the explicit unhide"
+        );
+
+        // What `do_send` actually does: drop the entry. Now it counts.
+        hidden.remove(&(owner_vk, peer_id));
+        assert_eq!(
+            count_unread_dms_with(&map, &HashMap::new(), &hidden),
+            1,
+            "the explicit unhide on outbound send is what revives the thread"
+        );
+    }
+
+    #[test]
+    fn dm_unread_inbound_message_revives_hidden_thread() {
+        // The other half of #526: a genuinely new INBOUND DM past the cutoff
+        // still revives the thread through the filter, unchanged.
+        let (self_sk, self_vk) = keypair();
+        let (_owner_sk, owner_vk) = keypair();
+        let (peer_sk, peer_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let peer_id: MemberId = (&peer_vk).into();
+
+        let mut rd = room(self_sk, owner_vk, vec![], None);
+        rd.room_state.direct_messages.messages = vec![
+            dm(peer_id, self_id, 90, &peer_sk),  // inbound, archived over
+            dm(peer_id, self_id, 150, &peer_sk), // inbound, after the archive
+        ];
+        let mut map = HashMap::new();
+        map.insert(owner_vk, rd);
+
+        let mut hidden = HashMap::new();
+        hidden.insert(
+            (owner_vk, peer_id),
+            river_core::chat_delegate::HiddenDmThreadEntry {
+                room_owner_vk: owner_vk.to_bytes(),
+                peer: peer_id,
+                hidden_at_ts: 90,
+            },
+        );
+        // last_inbound_ts = 150 > 90 -> revived, and BOTH inbound DMs count.
+        assert_eq!(count_unread_dms_with(&map, &HashMap::new(), &hidden), 2);
     }
 
     #[test]
