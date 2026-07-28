@@ -5,7 +5,7 @@ use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    mark_legacy_migration_done, reset_ensure_subscription_dedup, set_up_chat_delegate,
+    request_legacy_seal_on_quiescence, reset_ensure_subscription_dedup, set_up_chat_delegate,
 };
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
@@ -701,8 +701,21 @@ impl FreenetSynchronizer {
                                 if e.to_string().contains("delegate")
                                     && e.to_string().contains("not found")
                                 {
-                                    info!("Delegate not found error (likely legacy migration) - marking migration complete");
-                                    mark_legacy_migration_done();
+                                    info!("Delegate not found error (likely legacy migration) - requesting migration seal on quiescence");
+                                    // Quiescence-gated, NOT immediate
+                                    // (freenet/river#527). The fan-out probes ~26
+                                    // generations at once and most are not
+                                    // installed on any given node, so this error
+                                    // arrives within milliseconds of the probes
+                                    // going out — long before any generation that
+                                    // DOES hold data has answered. Sealing here
+                                    // ends the migration for good: a later session
+                                    // whose current delegate is still empty takes
+                                    // the FireMigration branch, finds the seal
+                                    // already set, and probes nothing. One absent
+                                    // legacy delegate must not speak for the other
+                                    // twenty-five.
+                                    request_legacy_seal_on_quiescence();
                                 }
 
                                 // Special handling for "not supported" errors

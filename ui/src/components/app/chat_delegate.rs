@@ -255,6 +255,70 @@ pub fn is_legacy_delegate_key(key_bytes: &[u8]) -> bool {
         .any(|(dk, _)| dk.as_slice() == key_bytes)
 }
 
+// =============================================================================
+// DELEGATE-GENERATION AUTHORITY (freenet/river#527)
+// =============================================================================
+//
+// `fire_legacy_migration_request` probes EVERY legacy delegate generation at
+// once, and each one that still holds data hydrates independently. Their
+// responses race, so something has to decide which copy of a room is
+// authoritative when two generations disagree about the user's identity for it.
+//
+// Before #527 nothing did: `Rooms::merge` kept whichever copy landed FIRST and
+// silently skipped the rest. Probes are dispatched oldest-generation-first (the
+// `LEGACY_DELEGATES` order), so the oldest surviving copy usually answered
+// first — rolling a long-time user back to an identity from months earlier.
+//
+// The rank below is that missing order. `LEGACY_DELEGATES` is generated from
+// `legacy_delegates.toml` in age order (V1 oldest first), so an entry's INDEX
+// is its generation: higher index = newer delegate = more authoritative, and
+// the current delegate outranks every legacy generation.
+
+/// Rank of the CURRENT delegate — above every legacy generation.
+pub(crate) fn current_delegate_source_rank() -> u32 {
+    LEGACY_DELEGATES.len() as u32
+}
+
+/// Rank of the delegate generation `key_bytes` identifies. An unrecognised key
+/// is the current delegate (the only non-legacy delegate River talks to).
+pub(crate) fn source_rank_for_delegate_key(key_bytes: &[u8]) -> u32 {
+    LEGACY_DELEGATES
+        .iter()
+        .position(|(dk, _)| dk.as_slice() == key_bytes)
+        .map(|i| i as u32)
+        .unwrap_or_else(current_delegate_source_rank)
+}
+
+/// Which source supplied the identity each room in `ROOMS` currently carries,
+/// so a later-arriving copy can be ranked against it. Runtime-only (never
+/// persisted): it describes where the in-memory copy came from this session.
+///
+/// A plain `Mutex`, not a signal — it is read from `Rooms::merge` inside a
+/// `with_mut`, and from spawned tasks with no Dioxus runtime, where reading a
+/// `GlobalSignal` would panic (the same reasoning as `CURRENT_ROOM_IDENTITY` in
+/// `signing.rs`). Single-threaded WASM, so it never contends.
+static ROOM_IDENTITY_SOURCE_RANKS: LazyLock<Mutex<HashMap<RoomKey, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Run `f` against the identity-source-rank registry.
+pub(crate) fn with_identity_source_ranks<R>(f: impl FnOnce(&mut HashMap<RoomKey, u32>) -> R) -> R {
+    let mut guard = ROOM_IDENTITY_SOURCE_RANKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut guard)
+}
+
+/// Record that this room's identity was chosen DELIBERATELY by the user (an
+/// identity import, or accepting an invitation) rather than loaded from a
+/// delegate. Nothing outranks an explicit choice, so no delegate copy — however
+/// new its generation — can overwrite it (this is what preserves the
+/// freenet/river#414 guarantee now that merge can adopt an incoming identity).
+pub(crate) fn mark_identity_source_authoritative(room_key: RoomKey) {
+    with_identity_source_ranks(|ranks| {
+        ranks.insert(room_key, crate::room_data::SOURCE_RANK_AUTHORITATIVE);
+    });
+}
+
 // Prefixes for different pending request types
 const SIGNING_KEY_PREFIX: &[u8] = b"__signing_key:";
 const PUBLIC_KEY_PREFIX: &[u8] = b"__public_key:";
@@ -640,6 +704,351 @@ pub(crate) fn reset_ensure_subscription_dedup() {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    /// freenet/river#527: the whole generation-ranked identity fix rests on
+    /// `LEGACY_DELEGATES` being in AGE order (oldest first), because an entry's
+    /// INDEX is used as its authority. `legacy_delegates.toml` is append-only
+    /// and `freenet-migrate-build` emits it in file order, but nothing else
+    /// enforces that — if a future generator ever sorted or reversed the list,
+    /// the fix would silently INVERT and start preferring the oldest copy,
+    /// which is the exact bug it exists to prevent.
+    ///
+    /// The load-bearing check is the DATE MONOTONICITY assertion below. Every
+    /// index-based assertion here is an identity — `source_rank_for_delegate_key`
+    /// IS `position()` over this array, so "rank == index" holds for ANY
+    /// ordering — and anchoring on two specific keys is not enough either: a
+    /// lexicographic sort by version string ("V10" < "V2") leaves V1 first and
+    /// V29 late, so `rank(V1) < rank(V29)` would still pass while V3 outranked
+    /// V29. Only reading the emitted DATES, which the array position cannot
+    /// influence, actually detects a reordering.
+    #[test]
+    fn legacy_delegate_ranks_run_oldest_to_newest_and_below_the_current_delegate() {
+        assert!(
+            LEGACY_DELEGATES.len() >= 2,
+            "need at least two generations to have an order to check"
+        );
+
+        // THE REAL CHECK: the generated registry carries each entry's date as a
+        // trailing `(YYYY-MM-DD)` comment, emitted in array order. Those dates
+        // must be non-decreasing, or the array is no longer in age order and
+        // every rank derived from it is wrong.
+        let generated = include_str!(concat!(env!("OUT_DIR"), "/legacy_delegates.rs"));
+        let dates: Vec<&str> = generated
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("// V"))
+            .filter_map(|l| {
+                // The description itself may contain parentheses, so take the
+                // LAST parenthesised group on the line.
+                let open = l.rfind('(')?;
+                let close = l.rfind(')')?;
+                (close > open).then(|| &l[open + 1..close])
+            })
+            .filter(|d| d.len() == 10 && d.as_bytes()[4] == b'-')
+            .collect();
+
+        // Vacuity guard: if the comment format ever changes, the parse above
+        // would silently yield nothing and the monotonicity check would pass
+        // over an empty list.
+        assert_eq!(
+            dates.len(),
+            LEGACY_DELEGATES.len(),
+            "must parse one date per legacy entry — got {dates:?}; if the codegen's \
+             comment format changed, this pin has gone blind and must be updated"
+        );
+
+        // ISO-8601 dates compare chronologically as strings.
+        for pair in dates.windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "legacy delegate registry is NOT in age order ({} comes before {}) — \
+                 an entry's index is its authority rank, so the #527 identity \
+                 ordering is now inverted and the OLDEST copy would win conflicts",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // Each entry's rank is its index (identity given the implementation, but
+        // it also catches duplicate keys, which would collapse two generations
+        // onto one rank).
+        for (i, (key_bytes, _)) in LEGACY_DELEGATES.iter().enumerate() {
+            assert_eq!(
+                source_rank_for_delegate_key(key_bytes.as_slice()),
+                i as u32,
+                "legacy entry {i} must rank at its index"
+            );
+        }
+
+        // Anchor to two SPECIFIC keys of known age, taken from
+        // legacy_delegates.toml: V1 (2026-01-15, the first entry ever recorded)
+        // and V29 (2026-07-27, the generation immediately before this fix).
+        //
+        // This anchoring is the whole point of the test. Asserting "rank ==
+        // index" above only checks `position()` against itself: if the codegen
+        // ever emitted the registry in a different order, every index-based
+        // assertion would still pass while the authority order silently
+        // inverted and the fix started preferring the OLDEST copy — the exact
+        // bug it exists to prevent. Only comparing keys whose real-world age we
+        // know independently can catch that.
+        //
+        // This does not rot as entries are appended: V1 stays older than V29
+        // no matter how many generations follow.
+        fn hex32(s: &str) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("valid hex byte");
+            }
+            out
+        }
+        let v1_oldest = hex32("1a9330820e806cda54eca7dab22b84f20cfa793ebe61a2615312cc6e6ebcfff6");
+        let v29_newest = hex32("d46b5363858c82ed91f0709d179c620c74c1ab84483b114181594c08a3d4b915");
+
+        // Both must still BE legacy entries — otherwise `source_rank_for_delegate_key`
+        // falls through to the current-delegate rank and the comparison below
+        // would pass for the wrong reason.
+        assert!(
+            is_legacy_delegate_key(&v1_oldest),
+            "V1 must still be in the registry for this test to mean anything"
+        );
+        assert!(
+            is_legacy_delegate_key(&v29_newest),
+            "V29 must still be in the registry for this test to mean anything"
+        );
+
+        let oldest = source_rank_for_delegate_key(&v1_oldest);
+        let newest = source_rank_for_delegate_key(&v29_newest);
+        assert!(
+            oldest < newest,
+            "V1 (2026-01-15) must rank BELOW V29 (2026-07-27) — if this fails, \
+             legacy_delegates.toml or its codegen changed order and the #527 \
+             identity ordering is now inverted, so the oldest copy would win"
+        );
+        assert!(
+            newest < current_delegate_source_rank(),
+            "the current delegate must outrank every legacy generation"
+        );
+    }
+
+    /// An unrecognised key is the current delegate — the only non-legacy
+    /// delegate River talks to — so it must get the top delegate rank rather
+    /// than accidentally ranking as the oldest generation (index 0).
+    #[test]
+    fn an_unknown_delegate_key_ranks_as_the_current_delegate() {
+        let unknown = [0xABu8; 32];
+        assert!(
+            !is_legacy_delegate_key(&unknown),
+            "fixture must not collide with a real legacy key"
+        );
+        assert_eq!(
+            source_rank_for_delegate_key(&unknown),
+            current_delegate_source_rank()
+        );
+    }
+
+    /// freenet/river#527 (third cause): the seal must be DEBOUNCED, not merely
+    /// requested.
+    ///
+    /// The response-handler pin only asserts that the legacy re-save CALLS
+    /// `request_legacy_seal_on_quiescence()` instead of sealing inline. That
+    /// says nothing about when the seal actually lands: make this function
+    /// write the seal immediately and that pin stays green while the third
+    /// cause of #527 returns in full — the migration ends while newer delegate
+    /// generations are still answering, and a tab closed in that window leaves
+    /// the rollback permanent.
+    ///
+    /// So pin the property here: the seal is only ever written from inside the
+    /// idle-gated closure, after a `LOAD_IDLE_MS` wait.
+    #[test]
+    fn the_legacy_seal_is_written_only_behind_the_quiescence_debounce() {
+        // NOTE: this file's `mod tests` is MID-FILE, so the usual
+        // `split("mod tests {").next()` trick would slice away everything after
+        // it — including both functions under test — and every assertion below
+        // would fail (or, with `contains`, pass vacuously). Search the whole
+        // source with `rfind` instead, as the other pins in this file do: both
+        // definitions live AFTER this test module, so the last occurrence is
+        // the real definition rather than a needle in this test's own source.
+        let src = include_str!("chat_delegate.rs");
+
+        // The request path must NOT seal — it only sets the flag and pokes the
+        // settle check.
+        let req = src
+            .rfind("pub(crate) fn request_legacy_seal_on_quiescence() {")
+            .expect("request_legacy_seal_on_quiescence must exist");
+        let req_end = src[req..].find("\n}\n").expect("function must terminate");
+        let req_body = &src[req..req + req_end];
+        assert!(
+            !req_body.contains("mark_legacy_migration_done("),
+            "requesting the seal must NOT write it — that is sealing inline by \
+             another name and re-opens the third cause of #527"
+        );
+        assert!(
+            req_body.contains("LEGACY_SEAL_PENDING.store(true"),
+            "the request must record that a seal is owed"
+        );
+
+        // The scheduler must wait, re-check quiescence, and only then seal.
+        let sched = src
+            .rfind("fn schedule_legacy_seal(")
+            .expect("schedule_legacy_seal must exist");
+        let sched_body = &src[sched..];
+        let sched_body = &sched_body[..sched_body.find("\n}\n").expect("function must terminate")];
+        assert!(
+            sched_body.contains("LOAD_IDLE_MS"),
+            "the seal must wait out the quiescence window"
+        );
+        assert!(
+            sched_body.contains("idle_should_apply("),
+            "the seal must re-check that no newer generation started answering — \
+             a later worker cancels it and re-arms on its own settle"
+        );
+        assert!(
+            sched_body.contains("mark_legacy_migration_done()"),
+            "the seal is written here, or nowhere"
+        );
+        // Ordering: the gate precedes the write.
+        let gate = sched_body
+            .find("idle_should_apply(")
+            .expect("gate must be present");
+        let write = sched_body
+            .find("mark_legacy_migration_done()")
+            .expect("write must be present");
+        assert!(
+            gate < write,
+            "the quiescence gate must run BEFORE the seal is written"
+        );
+
+        // The arming block must exist, or the seal simply never lands: every
+        // assertion above would still pass while nothing ever writes it.
+        let settled = src
+            .rfind("pub(crate) fn on_load_worker_settled() {")
+            .expect("on_load_worker_settled must exist");
+        let settled_body = &src[settled..];
+        let settled_body =
+            &settled_body[..settled_body.find("\n}\n").expect("function must terminate")];
+        assert!(
+            settled_body.contains("LEGACY_SEAL_PENDING.load(Ordering::Relaxed)")
+                && settled_body.contains("schedule_legacy_seal(armed_gen, armed_attempt)"),
+            "load settlement must ARM the debounced seal, or a requested seal is never written"
+        );
+    }
+
+    /// freenet/river#527 — SINGLE WRITER for the legacy-migration seal.
+    ///
+    /// The seal is what ends legacy migration for good: once set, a later
+    /// session whose current delegate is still empty takes the FireMigration
+    /// branch, finds the seal, and probes nothing. Any code path that sets it
+    /// while the ~26-generation fan-out is still answering can permanently
+    /// strand rooms that live in a generation which had not replied yet.
+    ///
+    /// There were FOUR such doors, all sealing inline. The loudest was in
+    /// `freenet_synchronizer.rs`: it seals on any "delegate not found" API
+    /// error, which the fan-out itself provokes within milliseconds on every
+    /// node where some legacy delegate WASM was never installed — so one absent
+    /// generation spoke for all the others.
+    ///
+    /// They now all route through `request_legacy_seal_on_quiescence`, leaving
+    /// exactly ONE writer. This pin fails any future fifth door.
+    #[test]
+    fn the_seal_has_exactly_one_writer() {
+        // This file's `mod tests` is MID-FILE, so a plain `split(...).next()`
+        // would cover only the ~700 lines ahead of it and miss the region where
+        // the seal machinery actually lives. Excise the test module instead —
+        // inside it every item's closing brace is indented, so the first
+        // column-0 `}` after the module header is the module's own.
+        let src = include_str!("chat_delegate.rs");
+        let tests_start = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("test module must exist");
+        let tests_end = tests_start
+            + src[tests_start..]
+                .find("\n}\n")
+                .expect("test module must terminate")
+            + 3;
+        let production = format!("{}{}", &src[..tests_start], &src[tests_end..]);
+
+        // The CALL form carries a semicolon; the definition ends in `{` and the
+        // doc-comment mentions have neither, so this counts real writers only.
+        assert_eq!(
+            production.matches("mark_legacy_migration_done();").count(),
+            1,
+            "exactly ONE writer of the seal — the quiescence-gated write in \
+             schedule_legacy_seal. A second is a new door onto the third cause \
+             of freenet/river#527."
+        );
+        // Guard the excision itself: if the module bounds are ever computed
+        // wrongly, the count above could pass by looking at the wrong text.
+        assert!(
+            production.contains("fn schedule_legacy_seal(")
+                && !production.contains("fn the_seal_has_exactly_one_writer("),
+            "the excision must keep production and drop the test module"
+        );
+
+        // freenet_synchronizer.rs must NEVER seal inline. This is the door that
+        // caused the harm: it seals on any "delegate not found" API error, which
+        // the fan-out itself provokes within milliseconds on any node missing an
+        // old delegate WASM — so it could fire before any generation holding
+        // data had answered.
+        let sync_src = include_str!("freenet_api/freenet_synchronizer.rs");
+        let sync_production = sync_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        assert!(
+            !sync_production.contains("mark_legacy_migration_done()"),
+            "freenet_synchronizer.rs must seal via request_legacy_seal_on_quiescence() — \
+             it fires on errors the fan-out itself provokes (freenet/river#527)"
+        );
+
+        // response_handler.rs MAY seal inline, but ONLY at the doors where the
+        // current delegate is authoritative and no fan-out is in flight, and
+        // only with the rationale recorded. Every inline seal must be paired
+        // with a "SYNCHRONOUS, deliberately" marker, so a new undocumented one
+        // fails here rather than silently re-opening the third cause.
+        let rh_src = include_str!("freenet_api/response_handler.rs");
+        let rh_production = rh_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let inline_seals = rh_production
+            .matches("mark_legacy_migration_done()")
+            .count();
+        let documented = rh_production.matches("SYNCHRONOUS, deliberately").count();
+        assert_eq!(
+            inline_seals, documented,
+            "every inline seal in response_handler.rs must carry the \
+             'SYNCHRONOUS, deliberately' rationale explaining why no fan-out is \
+             in flight at that door (freenet/river#527)"
+        );
+        assert_eq!(
+            inline_seals, 2,
+            "expected exactly the two current-delegate-authoritative doors to seal \
+             inline; a change here needs a deliberate decision about fan-out overlap"
+        );
+        assert!(
+            rh_production
+                .matches("request_legacy_seal_on_quiescence()")
+                .count()
+                >= 2,
+            "the legacy re-save and the blob-explosion save must both request a \
+             quiescence-gated seal"
+        );
+    }
+
+    /// A deliberate identity choice must outrank every delegate generation, so
+    /// no load — however new — can undo an import (freenet/river#414 + #527).
+    #[test]
+    fn an_authoritative_identity_source_outranks_every_delegate() {
+        // A room key no other test uses: the registry is a process-global.
+        let room_key = [0x5Au8; 32];
+        mark_identity_source_authoritative(room_key);
+        let rank = with_identity_source_ranks(|ranks| ranks.get(&room_key).copied());
+        assert_eq!(rank, Some(crate::room_data::SOURCE_RANK_AUTHORITATIVE));
+        assert!(
+            rank.unwrap() > current_delegate_source_rank(),
+            "an explicit choice must outrank the current delegate too"
+        );
+    }
 
     /// Blocker-1 pin (freenet/river#394): the chat-delegate cipher/nonce must be
     /// STABLE within a process. In the production gateway iframe `localStorage`
@@ -5550,6 +5959,62 @@ pub(crate) fn on_load_worker_settled() {
             None if room_count_zero => schedule_idle_resolution(armed_gen, armed_attempt),
             None => {} // rooms present → List renders, leave the state
         }
+        // A legacy migration that completed this session seals only after the
+        // fan-out is quiescent (freenet/river#527), so every generation that
+        // was going to answer has been merged first. Armed here rather than at
+        // the re-save because this is the point where "no load work is
+        // outstanding" is known. Runs for the rooms-present case too, which
+        // `settle_terminal` deliberately leaves alone.
+        if LEGACY_SEAL_PENDING.load(Ordering::Relaxed) {
+            schedule_legacy_seal(armed_gen, armed_attempt);
+        }
+    });
+}
+
+/// A legacy migration re-saved successfully; seal it once the load goes quiet.
+/// See [`schedule_legacy_seal`].
+pub(crate) fn request_legacy_seal_on_quiescence() {
+    LEGACY_SEAL_PENDING.store(true, Ordering::Relaxed);
+    // The re-save runs in its own spawned task, so the load may ALREADY be
+    // quiescent (every worker dropped while the save was in flight) and no
+    // further settle would fire. Drive one now; it no-ops if work is pending.
+    on_load_worker_settled();
+}
+
+/// Set when a legacy migration's re-save succeeds, cleared when the seal is
+/// written. See [`request_legacy_seal_on_quiescence`].
+static LEGACY_SEAL_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Write the legacy-migration seal after [`LOAD_IDLE_MS`] of quiescence, using
+/// the same debounce as the idle load resolution: any new worker (a later
+/// generation answering) bumps the activity gen and cancels this, and the seal
+/// is re-armed when THAT worker settles. So the seal lands only after the last
+/// responding delegate generation has been merged (freenet/river#527).
+fn schedule_legacy_seal(armed_gen: u32, armed_attempt: u32) {
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(std::time::Duration::from_millis(LOAD_IDLE_MS)).await;
+        crate::util::defer(move || {
+            let cur_gen = LOAD_ACTIVITY_GEN.load(Ordering::Relaxed);
+            let cur_attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+            let pending = PENDING_LOADS.load(Ordering::Relaxed);
+            if !idle_should_apply(armed_gen, cur_gen, armed_attempt, cur_attempt, pending) {
+                return; // a later generation is still answering — re-armed on its settle
+            }
+            // Never seal over a migration that is mid-flight or has FAILED.
+            // The legacy re-save holds no load-worker guard, so quiescence can
+            // be reached while it is still running; and the not-found door sets
+            // the pending flag unconditionally, saying nothing about success.
+            // Sealing either case would kill the freenet/river#345 recovery
+            // across sessions, since `fire_legacy_migration_request` checks the
+            // seal BEFORE the in-progress flag. Leaving it unsealed just means a
+            // harmless re-probe next session — the safe direction.
+            if is_legacy_migration_in_progress() {
+                return;
+            }
+            if LEGACY_SEAL_PENDING.swap(false, Ordering::Relaxed) {
+                mark_legacy_migration_done();
+            }
+        });
     });
 }
 
