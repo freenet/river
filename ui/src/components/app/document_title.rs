@@ -7,7 +7,7 @@
 //! - Tracking document visibility state
 //! - Marking messages as read when tab becomes visible
 
-use crate::components::app::chat_delegate::save_rooms_to_delegate;
+use crate::components::app::chat_delegate::{flush_rooms_to_delegate, save_rooms_to_delegate};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{debug, info, warn};
@@ -763,8 +763,14 @@ pub fn mark_all_rooms_as_read() {
 
         info!("Marked {} room(s) as read on tab hide", updates.len());
 
+        // FLUSH, not a plain save (freenet/river#533). The tab is going away,
+        // and an ordinary save may defer a cache-only change for up to
+        // ROOM_SNAPSHOT_MIN_INTERVAL_MS. For a quiet room the next change might
+        // never come, which would strand both the room-state snapshot and the
+        // `last_read_message_id` we just advanced — the user would come back to
+        // a stale unread badge. Flushing here bypasses the debounce.
         crate::util::safe_spawn_local(async {
-            if let Err(e) = save_rooms_to_delegate().await {
+            if let Err(e) = flush_rooms_to_delegate().await {
                 warn!("Failed to save rooms after marking all as read: {}", e);
             }
         });

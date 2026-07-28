@@ -1252,6 +1252,161 @@ mod tests {
         );
     }
 
+    // ---- freenet/river#533: room-state snapshot debounce ----
+    //
+    // These pin the field classification that makes the debounce safe. If a
+    // field that CANNOT be reconstructed from the room contract ever stops
+    // moving `critical_hash`, its write would be deferred by up to
+    // ROOM_SNAPSHOT_MIN_INTERVAL_MS, and a tab closed inside that window would
+    // lose it permanently. `self_sk` is the sharp case: lose it and the user
+    // loses their identity in that room.
+
+    fn room_fixture() -> RoomData {
+        crate::room_data::test_minimal_room_data(SigningKey::from_bytes(&[9u8; 32]).verifying_key())
+    }
+
+    /// Boundary + clock-skew behaviour of the debounce decision.
+    ///
+    /// The negative case is the important one. `now_ms()` is a WALL clock and
+    /// can jump backwards (NTP correction, sleep/resume). A naive
+    /// `elapsed < INTERVAL` test would read a backwards jump as "not elapsed
+    /// yet" and defer the snapshot until the clock caught back up, stranding it
+    /// for an unbounded time. It must fail safe toward writing instead.
+    #[test]
+    fn cache_only_save_defers_only_within_a_sane_elapsed_window() {
+        assert!(should_defer_cache_only_save(0.0), "just written — defer");
+        assert!(
+            should_defer_cache_only_save(ROOM_SNAPSHOT_MIN_INTERVAL_MS - 1.0),
+            "just inside the interval — defer"
+        );
+        assert!(
+            !should_defer_cache_only_save(ROOM_SNAPSHOT_MIN_INTERVAL_MS),
+            "at the interval — write"
+        );
+        assert!(
+            !should_defer_cache_only_save(ROOM_SNAPSHOT_MIN_INTERVAL_MS + 1.0),
+            "past the interval — write"
+        );
+        assert!(
+            !should_defer_cache_only_save(-1000.0),
+            "clock jumped BACKWARDS — must write, not defer, or the snapshot is \
+             stranded until the wall clock catches up"
+        );
+        assert!(
+            !should_defer_cache_only_save(f64::NAN),
+            "non-finite elapsed must fail safe toward writing"
+        );
+        assert!(
+            !should_defer_cache_only_save(f64::INFINITY),
+            "non-finite elapsed must fail safe toward writing"
+        );
+    }
+
+    /// The whole point: a new message mutates `room_state`, and that must NOT
+    /// register as critical, otherwise nothing is ever deferred and the fix is
+    /// inert.
+    #[test]
+    fn critical_hash_ignores_room_state_changes() {
+        let base = room_fixture();
+        let mut with_message = base.clone();
+        with_message
+            .room_state
+            .configuration
+            .configuration
+            .max_recent_messages = 999;
+
+        assert_ne!(
+            content_hash(&{
+                let mut b = Vec::new();
+                ciborium::ser::into_writer(&with_message, &mut b).unwrap();
+                b
+            }),
+            content_hash(&{
+                let mut b = Vec::new();
+                ciborium::ser::into_writer(&base, &mut b).unwrap();
+                b
+            }),
+            "precondition: the mutation must change the FULL serialization, \
+             otherwise this test proves nothing about the critical projection"
+        );
+        assert_eq!(
+            critical_hash(&base),
+            critical_hash(&with_message),
+            "a room_state change must not be treated as critical — it is \
+             reconstructible from the room contract"
+        );
+    }
+
+    /// `last_read_message_id` advances on every message received while the room
+    /// is open, so it must ride the cache tier too or the debounce never fires.
+    #[test]
+    fn critical_hash_ignores_last_read_message_id() {
+        let base = room_fixture();
+        let mut read = base.clone();
+        read.last_read_message_id = Some(river_core::room_state::message::MessageId(
+            freenet_scaffold::util::fast_hash(&[7u8]),
+        ));
+
+        assert_eq!(
+            critical_hash(&base),
+            critical_hash(&read),
+            "last_read_message_id is a cache field (unread badge), not critical"
+        );
+    }
+
+    /// THE data-loss guard. `self_sk` cannot be re-derived from the network, so
+    /// a change to it must force an immediate write and never be debounced.
+    #[test]
+    fn critical_hash_reacts_to_self_sk() {
+        let base = room_fixture();
+        let mut rotated = base.clone();
+        rotated.self_sk = SigningKey::from_bytes(&[42u8; 32]);
+
+        assert_ne!(
+            critical_hash(&base),
+            critical_hash(&rotated),
+            "self_sk MUST be critical — it is unrecoverable, so deferring its \
+             write risks permanent loss of the user's room identity"
+        );
+    }
+
+    /// Membership proof and invite provenance are likewise not reconstructible
+    /// from local state alone.
+    #[test]
+    fn critical_hash_reacts_to_invite_chain() {
+        let base = room_fixture();
+        let mut invited = base.clone();
+        let owner_sk = SigningKey::from_bytes(&[5u8; 32]);
+        let member = river_core::room_state::member::Member {
+            owner_member_id: owner_sk.verifying_key().into(),
+            invited_by: owner_sk.verifying_key().into(),
+            member_vk: SigningKey::from_bytes(&[6u8; 32]).verifying_key(),
+        };
+        invited.invite_chain = vec![river_core::room_state::member::AuthorizedMember::new(
+            member, &owner_sk,
+        )];
+
+        assert_ne!(
+            critical_hash(&base),
+            critical_hash(&invited),
+            "invite_chain must be critical"
+        );
+    }
+
+    /// Identity of the room itself must never be deferred.
+    #[test]
+    fn critical_hash_reacts_to_owner_vk() {
+        let base = room_fixture();
+        let mut other = base.clone();
+        other.owner_vk = SigningKey::from_bytes(&[11u8; 32]).verifying_key();
+
+        assert_ne!(
+            critical_hash(&base),
+            critical_hash(&other),
+            "owner_vk must be critical"
+        );
+    }
+
     fn present_slot_bytes(room: &RoomData) -> Vec<u8> {
         let mut b = Vec::new();
         ciborium::ser::into_writer(&RoomSlot::Present(Box::new(room.clone())), &mut b).unwrap();
@@ -3864,7 +4019,92 @@ const ROOMS_CAS_MAX_ATTEMPTS: u32 = 8;
 /// catch-up that covered our snapshot — see `coalesce_save` for the
 /// queued-caller propagation invariant).
 pub async fn save_rooms_to_delegate() -> Result<(), String> {
-    coalesce_save(&ROOMS_SAVE_STATE, "Rooms", do_save_rooms_to_delegate).await
+    coalesce_save(&ROOMS_SAVE_STATE, "Rooms", || {
+        do_save_rooms_to_delegate(false)
+    })
+    .await
+}
+
+/// Save rooms, bypassing the room-state snapshot debounce
+/// (freenet/river#533).
+///
+/// Ordinary saves defer a cache-only change for up to
+/// [`ROOM_SNAPSHOT_MIN_INTERVAL_MS`]. If the tab goes away while a change is
+/// deferred, that snapshot would otherwise sit unwritten until the room next
+/// changes — which for a quiet room could be never, leaving a stale cache and a
+/// stale unread badge. Call this when the tab is being hidden or torn down so
+/// the deferred snapshot lands.
+///
+/// This never affects correctness of key material: critical fields are written
+/// immediately by the normal path and never wait for a flush.
+pub async fn flush_rooms_to_delegate() -> Result<(), String> {
+    coalesce_save(&ROOMS_SAVE_STATE, "Rooms(flush)", || {
+        do_save_rooms_to_delegate(true)
+    })
+    .await
+}
+
+/// Minimum interval between writes that carry ONLY room-state cache changes
+/// (freenet/river#533). A new chat message mutates `room_state`, which changes
+/// the whole serialized `RoomData` and used to force a full re-encrypt +
+/// rewrite of that room's delegate blob for EVERY member. Measured on
+/// try.freenet.org: ~373 KiB rewritten per member per message, ~306 MiB/hour of
+/// node disk writes.
+///
+/// Safe to delay because `room_state` is a CACHE — the room contract is the
+/// authoritative replica, so a snapshot up to this stale only costs a slightly
+/// colder start. Critical fields bypass this entirely; see [`critical_hash`].
+const ROOM_SNAPSHOT_MIN_INTERVAL_MS: f64 = 5.0 * 60.0 * 1000.0;
+
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0)
+    }
+}
+
+/// Whether a cache-only change may be deferred, given how long ago this room
+/// was last written (freenet/river#533).
+///
+/// Split out as a pure function so the boundary and clock-skew behaviour is
+/// unit-testable without a time source.
+///
+/// `elapsed_ms` comes from `now_ms()`, which is a WALL clock
+/// (`js_sys::Date::now()`), not a monotonic one — it can jump backwards on an
+/// NTP correction or after the machine sleeps. A negative (or NaN) elapsed must
+/// therefore fail SAFE toward writing: treating it as "the interval hasn't
+/// passed yet" would strand the snapshot until the clock caught back up, which
+/// could be arbitrarily long. Writing early is always correct and only costs
+/// I/O, so every non-finite or negative case resolves to "write now".
+fn should_defer_cache_only_save(elapsed_ms: f64) -> bool {
+    elapsed_ms.is_finite() && elapsed_ms >= 0.0 && elapsed_ms < ROOM_SNAPSHOT_MIN_INTERVAL_MS
+}
+
+/// Hash of the room's UNRECOVERABLE fields — everything persisted EXCEPT the
+/// reconstructible cache (`room_state`, `last_read_message_id`).
+///
+/// Computed structurally, by blanking the two cache fields on a clone and
+/// hashing the rest, rather than by listing the critical fields. That direction
+/// is deliberate and load-bearing: a field added to `RoomData` later is
+/// automatically treated as CRITICAL (written immediately) instead of silently
+/// inheriting the 5-minute debounce. Getting that backwards could delay
+/// persisting key material, and `self_sk` cannot be re-derived from the network
+/// — losing it loses the user's identity in that room.
+fn critical_hash(room_data: &RoomData) -> Option<u64> {
+    let mut probe = room_data.clone();
+    probe.room_state = Default::default();
+    probe.last_read_message_id = None;
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&probe, &mut buf).ok()?;
+    Some(content_hash(&buf))
 }
 
 /// What we last persisted for a room key, so a save only writes the rooms that
@@ -3872,8 +4112,18 @@ pub async fn save_rooms_to_delegate() -> Result<(), String> {
 /// R's key, so it can't resurrect R's tombstone (freenet/river#345 round-9).
 #[derive(Clone, Copy, PartialEq)]
 enum SavedSlot {
-    /// Last-saved content hash of the room's serialized `RoomData`.
-    Present(u64),
+    /// Last-saved content hash of the room's serialized `RoomData`, plus the
+    /// hash of just its critical fields and when we last wrote it, so a
+    /// cache-only change can be deferred (freenet/river#533).
+    Present {
+        /// Hash of the FULL serialized `RoomData`.
+        content: u64,
+        /// Hash of the unrecoverable subset. `None` if the critical projection
+        /// failed to serialize, which forces the write (fail-safe).
+        critical: Option<u64>,
+        /// `now_ms()` at the last successful write of this room's key.
+        written_at_ms: f64,
+    },
     /// We've persisted this room as a tombstone (the user left it).
     Tombstone,
 }
@@ -4161,8 +4411,10 @@ fn reconcile_meta(current: Option<&[u8]>, local: &RoomsMeta) -> Result<Option<Ve
     Ok(Some(out))
 }
 
-async fn do_save_rooms_to_delegate() -> Result<(), String> {
-    info!("Saving rooms to delegate storage (per-room CAS)");
+/// `force_flush` bypasses the room-state snapshot debounce (freenet/river#533);
+/// see [`flush_rooms_to_delegate`].
+async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
+    info!("Saving rooms to delegate storage (per-room CAS, force_flush={force_flush})");
 
     // Snapshot this tab's explicit state once. We never mutate the ROOMS signal
     // here; each per-room save reads that one room's delegate key and reconciles
@@ -4195,9 +4447,48 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
             continue;
         }
         let h = content_hash(&buf);
-        if ROOM_SLOT_STATE.with(|c| c.borrow().get(vk) == Some(&SavedSlot::Present(h))) {
-            continue;
+        let crit = critical_hash(room_data);
+        let prev = ROOM_SLOT_STATE.with(|c| c.borrow().get(vk).copied());
+
+        // Unchanged since the last write — nothing to do (pre-existing dedupe).
+        if let Some(SavedSlot::Present { content, .. }) = prev {
+            if content == h {
+                continue;
+            }
         }
+
+        // Something changed. Decide whether it must be written NOW or can ride
+        // the snapshot cadence (freenet/river#533).
+        //
+        // Write immediately when the UNRECOVERABLE fields changed, when this is
+        // a room we haven't written this session, when the previous slot was a
+        // tombstone (a rejoin), when the caller asked for a flush, or when the
+        // critical projection failed to serialize. Only a pure `room_state` /
+        // `last_read_message_id` change on an already-persisted room is
+        // deferred, and only until the interval elapses.
+        //
+        // Deferring is safe ONLY for the cache: `room_state` is replicated in
+        // the room contract, so a stale snapshot costs a colder start and never
+        // loses data. `self_sk` cannot be re-derived from the network, which is
+        // why it must never fall into this branch.
+        if !force_flush {
+            if let Some(SavedSlot::Present {
+                critical,
+                written_at_ms,
+                ..
+            }) = prev
+            {
+                let cache_only_change = crit.is_some() && critical == crit;
+                let elapsed_ms = now_ms() - written_at_ms;
+                if cache_only_change && should_defer_cache_only_save(elapsed_ms) {
+                    debug!(
+                        "room {vk:?}: deferring cache-only save ({elapsed_ms}ms since last write)"
+                    );
+                    continue;
+                }
+            }
+        }
+
         let rejoined = REJOINED_THIS_SESSION.with(|s| s.borrow().contains(vk));
         let rd = room_data.clone();
         let owner = *vk;
@@ -4216,7 +4507,11 @@ async fn do_save_rooms_to_delegate() -> Result<(), String> {
                     c.borrow_mut().insert(
                         *vk,
                         if wrote {
-                            SavedSlot::Present(h)
+                            SavedSlot::Present {
+                                content: h,
+                                critical: crit,
+                                written_at_ms: now_ms(),
+                            }
                         } else {
                             SavedSlot::Tombstone
                         },
