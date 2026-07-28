@@ -917,6 +917,82 @@ mod tests {
             gate < write,
             "the quiescence gate must run BEFORE the seal is written"
         );
+
+        // The arming block must exist, or the seal simply never lands: every
+        // assertion above would still pass while nothing ever writes it.
+        let settled = src
+            .rfind("pub(crate) fn on_load_worker_settled() {")
+            .expect("on_load_worker_settled must exist");
+        let settled_body = &src[settled..];
+        let settled_body =
+            &settled_body[..settled_body.find("\n}\n").expect("function must terminate")];
+        assert!(
+            settled_body.contains("LEGACY_SEAL_PENDING.load(Ordering::Relaxed)")
+                && settled_body.contains("schedule_legacy_seal(armed_gen, armed_attempt)"),
+            "load settlement must ARM the debounced seal, or a requested seal is never written"
+        );
+    }
+
+    /// freenet/river#527 — SINGLE WRITER for the legacy-migration seal.
+    ///
+    /// The seal is what ends legacy migration for good: once set, a later
+    /// session whose current delegate is still empty takes the FireMigration
+    /// branch, finds the seal, and probes nothing. Any code path that sets it
+    /// while the ~26-generation fan-out is still answering can permanently
+    /// strand rooms that live in a generation which had not replied yet.
+    ///
+    /// There were FOUR such doors, all sealing inline. The loudest was in
+    /// `freenet_synchronizer.rs`: it seals on any "delegate not found" API
+    /// error, which the fan-out itself provokes within milliseconds on every
+    /// node where some legacy delegate WASM was never installed — so one absent
+    /// generation spoke for all the others.
+    ///
+    /// They now all route through `request_legacy_seal_on_quiescence`, leaving
+    /// exactly ONE writer. This pin fails any future fifth door.
+    #[test]
+    fn the_seal_has_exactly_one_writer() {
+        // SCOPE NOTE: this file's `mod tests` is MID-FILE, so there is no clean
+        // "production only" slice to count over — the seal machinery lives
+        // AFTER the test module. So this pins the two things it can verify
+        // exactly, which is where all four original doors actually were:
+        //   (1) no OTHER module seals inline (three of the four doors), and
+        //   (2) the region of THIS file before the test module has no door.
+        // The remaining possibility — a new inline seal added after the test
+        // module in this same file — is covered by the companion test
+        // `the_legacy_seal_is_written_only_behind_the_quiescence_debounce`,
+        // which pins that the write sits behind the gate in schedule_legacy_seal.
+        let src = include_str!("chat_delegate.rs");
+        let before_tests = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("code before the test module");
+        assert_eq!(
+            before_tests.matches("mark_legacy_migration_done()").count(),
+            0,
+            "no inline seal may be added ahead of the test module — every seal \
+             must route through request_legacy_seal_on_quiescence (freenet/river#527)"
+        );
+
+        // No OTHER module may call it directly.
+        for (name, other) in [
+            (
+                "response_handler.rs",
+                include_str!("freenet_api/response_handler.rs"),
+            ),
+            (
+                "freenet_synchronizer.rs",
+                include_str!("freenet_api/freenet_synchronizer.rs"),
+            ),
+        ] {
+            let other_production = other
+                .split("mod tests {")
+                .next()
+                .expect("production code before `mod tests`");
+            assert!(
+                !other_production.contains("mark_legacy_migration_done()"),
+                "{name} must seal via request_legacy_seal_on_quiescence(), not inline"
+            );
+        }
     }
 
     /// A deliberate identity choice must outrank every delegate generation, so

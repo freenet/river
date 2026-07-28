@@ -417,6 +417,23 @@ pub async fn handle_get_response(
                 }
             };
 
+            // Rank this identity above every delegate generation IMMEDIATELY,
+            // synchronously, before the deferred insert below (freenet/river#527).
+            //
+            // Accepting an invitation is a deliberate identity choice, so no
+            // delegate copy may outrank it. The spawned `migrate_signing_key(..,
+            // true)` further down also marks it, but only from inside a task:
+            // that leaves a window where ROOMS carries the new identity while
+            // the registry still holds a stale rank from an earlier load of the
+            // same room (a same-session leave-then-rejoin), and a legacy
+            // generation ranked above that stale value would adopt its identity
+            // over the one just accepted. `complete_identity_import` marks
+            // synchronously for exactly this reason; the two rejoin paths must
+            // agree.
+            crate::components::app::chat_delegate::mark_identity_source_authoritative(
+                owner_vk.to_bytes(),
+            );
+
             // Update the room data
             crate::util::defer(move || {
                 ROOMS.with_mut(|rooms| {

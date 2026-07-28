@@ -18,9 +18,9 @@ use crate::components::app::chat_delegate::{
     enqueue_delegate_request, fire_legacy_migration_request, get_versioned_correlation_key,
     hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
     is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
-    per_room_terminal, prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence,
-    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
+    mark_legacy_migration_in_progress, parse_room_storage_key, per_room_terminal,
+    prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, room_storage_key,
+    save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
     send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
     LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
     OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
@@ -349,7 +349,7 @@ impl ResponseHandler {
                                                                     info!(
                                                                         "Current delegate has rooms_data — marking legacy migration done"
                                                                     );
-                                                                    mark_legacy_migration_done();
+                                                                    request_legacy_seal_on_quiescence();
                                                                     info!("Successfully loaded rooms from delegate");
                                                                 }
                                                                 LegacyMigrationAction::FireMigration => {
@@ -714,7 +714,7 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             let migration_interrupted = is_legacy_migration_in_progress();
             let action = decide_per_room_load_action(migration_interrupted);
             if action.mark_done {
-                mark_legacy_migration_done();
+                request_legacy_seal_on_quiescence();
             }
 
             // Defensive dedup (PR #419 review): the concurrent fan-out registers
@@ -1075,7 +1075,7 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                     match save_rooms_to_delegate().await {
                         Ok(_) => {
                             clear_legacy_migration_in_progress();
-                            mark_legacy_migration_done();
+                            request_legacy_seal_on_quiescence();
                             // Resolve to `Loaded` only if we merged live rooms;
                             // otherwise let the backstop own the terminal.
                             if had_rooms {
