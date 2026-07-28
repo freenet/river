@@ -2991,7 +2991,7 @@ mod tests {
         let old_identity = SigningKey::generate(&mut rng);
         let current_identity = SigningKey::generate(&mut rng);
 
-        // Local copy: carries a private message sealed at secret version 7.
+        // Local copy: an ordinary PUBLIC room with a public message.
         let mut old_room = make_rejoin_test_room(&owner, &old_identity, true);
         use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
         let msg = AuthorizedMessageV1::new(
@@ -2999,13 +2999,7 @@ mod tests {
                 room_owner: vk.into(),
                 author: vk.into(),
                 time: get_current_system_time(),
-                content: RoomMessageBody::Private {
-                    content_type: 0,
-                    content_version: 0,
-                    ciphertext: vec![1, 2, 3],
-                    nonce: [0u8; 12],
-                    secret_version: 7,
-                },
+                content: RoomMessageBody::public("public message".to_string()),
             },
             &owner,
         );
@@ -3018,23 +3012,43 @@ mod tests {
             .expect("seeding the local copy must succeed");
         assert!(local.map.contains_key(&vk), "precondition: room is present");
 
-        // A newer generation whose state has no secret version 7.
-        let newer = make_rejoin_test_room(&owner, &current_identity, true);
+        // The newer generation has flipped the room to PRIVATE. Folding the
+        // older copy's PUBLIC message into it hits
+        // "Cannot send public messages in private room"
+        // (common/src/room_state/message.rs), so the fold genuinely fails.
+        // An earlier version of this test used an ordinary public room, where
+        // the fold SUCCEEDS — and it therefore passed even with the map mutated
+        // before the merge, i.e. it was vacuous for the bug it exists to catch.
+        let mut newer = make_rejoin_test_room(&owner, &current_identity, true);
+        newer.room_state.configuration = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: vk.into(),
+                configuration_version: 2,
+                privacy_mode: PrivacyMode::Private,
+                ..Configuration::default()
+            },
+            &owner,
+        );
         let result = local.merge_from_source(rooms_holding(vk, newer), 30, &mut ranks);
 
-        // Whether the fold succeeds or fails is a property of the contract's
-        // delta validation and may change; what must NEVER happen is the room
-        // disappearing. Assert the invariant, not the outcome.
+        // PREMISE CHECK: if this ever stops erroring the assertions below go
+        // vacuous, so fail loudly rather than silently guarding nothing.
+        assert!(
+            result.is_err(),
+            "fixture must actually make the fold FAIL, or this test cannot \
+             detect a map mutated before the merge"
+        );
+
+        // THE INVARIANT: a failed fold must leave the room exactly as it was.
         assert!(
             local.map.contains_key(&vk),
-            "the room must still be present regardless of whether the fold \
-             succeeded (result: {result:?}) — a failed adopt must not delete it"
+            "a failed adopt must NOT delete the room — it vanishes from the UI \
+             and, if this pass is the one that re-saves, is stranded for good"
         );
-        let survivor = local.map.get(&vk).unwrap();
-        assert!(
-            survivor.self_sk.to_bytes() == current_identity.to_bytes()
-                || survivor.self_sk.to_bytes() == old_identity.to_bytes(),
-            "and it must hold one of the two real identities, not a blank"
+        assert_eq!(
+            local.map.get(&vk).unwrap().self_sk.to_bytes(),
+            old_identity.to_bytes(),
+            "and it must still hold the identity it had before the failed adopt"
         );
     }
 
