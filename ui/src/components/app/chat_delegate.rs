@@ -736,14 +736,49 @@ mod tests {
             );
         }
 
-        let oldest = source_rank_for_delegate_key(LEGACY_DELEGATES[0].0.as_slice());
-        let newest =
-            source_rank_for_delegate_key(LEGACY_DELEGATES[LEGACY_DELEGATES.len() - 1].0.as_slice());
+        // Anchor to two SPECIFIC keys of known age, taken from
+        // legacy_delegates.toml: V1 (2026-01-15, the first entry ever recorded)
+        // and V29 (2026-07-27, the generation immediately before this fix).
+        //
+        // This anchoring is the whole point of the test. Asserting "rank ==
+        // index" above only checks `position()` against itself: if the codegen
+        // ever emitted the registry in a different order, every index-based
+        // assertion would still pass while the authority order silently
+        // inverted and the fix started preferring the OLDEST copy — the exact
+        // bug it exists to prevent. Only comparing keys whose real-world age we
+        // know independently can catch that.
+        //
+        // This does not rot as entries are appended: V1 stays older than V29
+        // no matter how many generations follow.
+        fn hex32(s: &str) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("valid hex byte");
+            }
+            out
+        }
+        let v1_oldest = hex32("1a9330820e806cda54eca7dab22b84f20cfa793ebe61a2615312cc6e6ebcfff6");
+        let v29_newest = hex32("d46b5363858c82ed91f0709d179c620c74c1ab84483b114181594c08a3d4b915");
+
+        // Both must still BE legacy entries — otherwise `source_rank_for_delegate_key`
+        // falls through to the current-delegate rank and the comparison below
+        // would pass for the wrong reason.
+        assert!(
+            is_legacy_delegate_key(&v1_oldest),
+            "V1 must still be in the registry for this test to mean anything"
+        );
+        assert!(
+            is_legacy_delegate_key(&v29_newest),
+            "V29 must still be in the registry for this test to mean anything"
+        );
+
+        let oldest = source_rank_for_delegate_key(&v1_oldest);
+        let newest = source_rank_for_delegate_key(&v29_newest);
         assert!(
             oldest < newest,
-            "the FIRST registry entry must be the OLDEST generation (lowest authority) — \
-             if this fails, legacy_delegates.toml or its codegen changed order and the \
-             #527 identity ordering is now inverted"
+            "V1 (2026-01-15) must rank BELOW V29 (2026-07-27) — if this fails, \
+             legacy_delegates.toml or its codegen changed order and the #527 \
+             identity ordering is now inverted, so the oldest copy would win"
         );
         assert!(
             newest < current_delegate_source_rank(),
