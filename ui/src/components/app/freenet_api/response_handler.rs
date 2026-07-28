@@ -1406,8 +1406,10 @@ fn hydrate_loaded_rooms(
         }
     }
 
-    // Collect room keys and signing keys before merge
-    // (must extract before loaded_rooms is moved into defer)
+    // Collect the room keys before the merge, since `loaded_rooms` is moved
+    // into the deferred merge below. These are the rooms THIS response brought;
+    // the identity each one ends up with is whatever the merge settles on, read
+    // back afterwards (freenet/river#527).
     // Filter out tombstoned rooms so we don't
     // re-subscribe / re-sync rooms the user
     // explicitly left (skeptical-review H1).
