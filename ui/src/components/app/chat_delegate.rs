@@ -1265,6 +1265,43 @@ mod tests {
         crate::room_data::test_minimal_room_data(SigningKey::from_bytes(&[9u8; 32]).verifying_key())
     }
 
+    /// Boundary + clock-skew behaviour of the debounce decision.
+    ///
+    /// The negative case is the important one. `now_ms()` is a WALL clock and
+    /// can jump backwards (NTP correction, sleep/resume). A naive
+    /// `elapsed < INTERVAL` test would read a backwards jump as "not elapsed
+    /// yet" and defer the snapshot until the clock caught back up, stranding it
+    /// for an unbounded time. It must fail safe toward writing instead.
+    #[test]
+    fn cache_only_save_defers_only_within_a_sane_elapsed_window() {
+        assert!(should_defer_cache_only_save(0.0), "just written — defer");
+        assert!(
+            should_defer_cache_only_save(ROOM_SNAPSHOT_MIN_INTERVAL_MS - 1.0),
+            "just inside the interval — defer"
+        );
+        assert!(
+            !should_defer_cache_only_save(ROOM_SNAPSHOT_MIN_INTERVAL_MS),
+            "at the interval — write"
+        );
+        assert!(
+            !should_defer_cache_only_save(ROOM_SNAPSHOT_MIN_INTERVAL_MS + 1.0),
+            "past the interval — write"
+        );
+        assert!(
+            !should_defer_cache_only_save(-1000.0),
+            "clock jumped BACKWARDS — must write, not defer, or the snapshot is \
+             stranded until the wall clock catches up"
+        );
+        assert!(
+            !should_defer_cache_only_save(f64::NAN),
+            "non-finite elapsed must fail safe toward writing"
+        );
+        assert!(
+            !should_defer_cache_only_save(f64::INFINITY),
+            "non-finite elapsed must fail safe toward writing"
+        );
+    }
+
     /// The whole point: a new message mutates `room_state`, and that must NOT
     /// register as critical, otherwise nothing is ever deferred and the fix is
     /// inert.
@@ -4034,6 +4071,23 @@ fn now_ms() -> f64 {
     }
 }
 
+/// Whether a cache-only change may be deferred, given how long ago this room
+/// was last written (freenet/river#533).
+///
+/// Split out as a pure function so the boundary and clock-skew behaviour is
+/// unit-testable without a time source.
+///
+/// `elapsed_ms` comes from `now_ms()`, which is a WALL clock
+/// (`js_sys::Date::now()`), not a monotonic one — it can jump backwards on an
+/// NTP correction or after the machine sleeps. A negative (or NaN) elapsed must
+/// therefore fail SAFE toward writing: treating it as "the interval hasn't
+/// passed yet" would strand the snapshot until the clock caught back up, which
+/// could be arbitrarily long. Writing early is always correct and only costs
+/// I/O, so every non-finite or negative case resolves to "write now".
+fn should_defer_cache_only_save(elapsed_ms: f64) -> bool {
+    elapsed_ms.is_finite() && elapsed_ms >= 0.0 && elapsed_ms < ROOM_SNAPSHOT_MIN_INTERVAL_MS
+}
+
 /// Hash of the room's UNRECOVERABLE fields — everything persisted EXCEPT the
 /// reconstructible cache (`room_state`, `last_read_message_id`).
 ///
@@ -4425,10 +4479,10 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
             }) = prev
             {
                 let cache_only_change = crit.is_some() && critical == crit;
-                if cache_only_change && now_ms() - written_at_ms < ROOM_SNAPSHOT_MIN_INTERVAL_MS {
+                let elapsed_ms = now_ms() - written_at_ms;
+                if cache_only_change && should_defer_cache_only_save(elapsed_ms) {
                     debug!(
-                        "room {vk:?}: deferring cache-only save ({}ms since last write)",
-                        now_ms() - written_at_ms
+                        "room {vk:?}: deferring cache-only save ({elapsed_ms}ms since last write)"
                     );
                     continue;
                 }
