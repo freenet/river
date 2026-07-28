@@ -2001,6 +2001,16 @@ impl Rooms {
                 continue;
             }
 
+            // Record provenance BEFORE the fallible merge below. If the state
+            // merge errors, the identity in the map is still the one THIS
+            // source corroborated, so the rank must reflect that: leaving it
+            // under-stated lets a later, OLDER generation out-rank it and adopt
+            // its identity — the very rollback this ordering exists to stop.
+            let already_present = self.map.contains_key(&vk);
+            if already_present {
+                record_identity_source(identity_ranks, &vk, source_rank, false);
+            }
+
             // If not already in the map, add the room
             let was_vacant =
                 if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(vk) {
@@ -3088,6 +3098,64 @@ mod tests {
             Some(&30),
             "and the recorded provenance must be the highest rank seen, so a \
              later older response still loses"
+        );
+    }
+
+    /// The chosen nickname must survive an adopt when the newer copy has none,
+    /// and must NOT override one the newer copy does carry.
+    ///
+    /// `self_nickname` is `None` for imported rooms and for rooms joined before
+    /// the field existed — i.e. exactly the long-lived rooms a legacy fan-out
+    /// turns up — so adopting such a copy would silently drop the user's chosen
+    /// name and leave the member-info heal to invent a generated handle. Same
+    /// class as the `invitation_secrets` loss, which got a fix AND a test; this
+    /// one had only a fix, so the three lines could be deleted with CI green.
+    #[test]
+    fn adopting_a_newer_identity_keeps_a_nickname_the_newer_copy_lacks() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let old_identity = SigningKey::generate(&mut rng);
+        let current_identity = SigningKey::generate(&mut rng);
+
+        // Case 1: newer copy has no nickname — the local one must survive.
+        let mut old_room = make_rejoin_test_room(&owner, &old_identity, true);
+        old_room.self_nickname = Some("UserPicked".to_string());
+        let mut newer = make_rejoin_test_room(&owner, &current_identity, true);
+        newer.self_nickname = None;
+
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = HashMap::new();
+        local
+            .merge_from_source(rooms_holding(vk, old_room), 3, &mut ranks)
+            .expect("seed");
+        local
+            .merge_from_source(rooms_holding(vk, newer), 30, &mut ranks)
+            .expect("adopt");
+        assert_eq!(
+            local.map.get(&vk).unwrap().self_nickname.as_deref(),
+            Some("UserPicked"),
+            "a nickname the adopted copy lacks must be carried forward"
+        );
+
+        // Case 2: the newer copy's own choice wins.
+        let mut old_room2 = make_rejoin_test_room(&owner, &old_identity, true);
+        old_room2.self_nickname = Some("Stale".to_string());
+        let mut newer2 = make_rejoin_test_room(&owner, &current_identity, true);
+        newer2.self_nickname = Some("Current".to_string());
+
+        let mut local2 = empty_rooms_for_merge();
+        let mut ranks2 = HashMap::new();
+        local2
+            .merge_from_source(rooms_holding(vk, old_room2), 3, &mut ranks2)
+            .expect("seed");
+        local2
+            .merge_from_source(rooms_holding(vk, newer2), 30, &mut ranks2)
+            .expect("adopt");
+        assert_eq!(
+            local2.map.get(&vk).unwrap().self_nickname.as_deref(),
+            Some("Current"),
+            "the adopted copy's own nickname must not be overwritten by the older one"
         );
     }
 

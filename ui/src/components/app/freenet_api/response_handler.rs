@@ -18,9 +18,9 @@ use crate::components::app::chat_delegate::{
     enqueue_delegate_request, fire_legacy_migration_request, get_versioned_correlation_key,
     hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
     is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_legacy_migration_in_progress, parse_room_storage_key, per_room_terminal,
-    prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, room_storage_key,
-    save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
+    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
+    per_room_terminal, prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence,
+    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
     send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
     LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
     OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
@@ -349,7 +349,16 @@ impl ResponseHandler {
                                                                     info!(
                                                                         "Current delegate has rooms_data — marking legacy migration done"
                                                                     );
-                                                                    request_legacy_seal_on_quiescence();
+                                                                    // SYNCHRONOUS, deliberately. This door is not a
+                                                                    // migration completion — the current delegate is
+                                                                    // authoritative and its sibling arm is the one that
+                                                                    // fires the fan-out, so there are no probes in
+                                                                    // flight to wait for. Deferring it behind the
+                                                                    // debounce would buy nothing and would weaken the
+                                                                    // freenet/river#253 guard, since a reconnect inside
+                                                                    // the window cancels the pending seal and could let
+                                                                    // the fan-out fire for a user who HAS data.
+                                                                    mark_legacy_migration_done();
                                                                     info!("Successfully loaded rooms from delegate");
                                                                 }
                                                                 LegacyMigrationAction::FireMigration => {
@@ -714,7 +723,13 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             let migration_interrupted = is_legacy_migration_in_progress();
             let action = decide_per_room_load_action(migration_interrupted);
             if action.mark_done {
-                request_legacy_seal_on_quiescence();
+                // SYNCHRONOUS, deliberately — see the rooms_data door above.
+                // The per-room set being authoritative is precisely the
+                // freenet/river#253 condition under which legacy must never be
+                // probed; a deferred seal here is cancellable by a reconnect and
+                // would re-open that. When this fires, `migration_interrupted`
+                // is false, so no recovery re-probe is pending either.
+                mark_legacy_migration_done();
             }
 
             // Defensive dedup (PR #419 review): the concurrent fan-out registers

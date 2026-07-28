@@ -951,48 +951,88 @@ mod tests {
     /// exactly ONE writer. This pin fails any future fifth door.
     #[test]
     fn the_seal_has_exactly_one_writer() {
-        // SCOPE NOTE: this file's `mod tests` is MID-FILE, so there is no clean
-        // "production only" slice to count over — the seal machinery lives
-        // AFTER the test module. So this pins the two things it can verify
-        // exactly, which is where all four original doors actually were:
-        //   (1) no OTHER module seals inline (three of the four doors), and
-        //   (2) the region of THIS file before the test module has no door.
-        // The remaining possibility — a new inline seal added after the test
-        // module in this same file — is covered by the companion test
-        // `the_legacy_seal_is_written_only_behind_the_quiescence_debounce`,
-        // which pins that the write sits behind the gate in schedule_legacy_seal.
+        // This file's `mod tests` is MID-FILE, so a plain `split(...).next()`
+        // would cover only the ~700 lines ahead of it and miss the region where
+        // the seal machinery actually lives. Excise the test module instead —
+        // inside it every item's closing brace is indented, so the first
+        // column-0 `}` after the module header is the module's own.
         let src = include_str!("chat_delegate.rs");
-        let before_tests = src
-            .split("#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("code before the test module");
+        let tests_start = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("test module must exist");
+        let tests_end = tests_start
+            + src[tests_start..]
+                .find("\n}\n")
+                .expect("test module must terminate")
+            + 3;
+        let production = format!("{}{}", &src[..tests_start], &src[tests_end..]);
+
+        // The CALL form carries a semicolon; the definition ends in `{` and the
+        // doc-comment mentions have neither, so this counts real writers only.
         assert_eq!(
-            before_tests.matches("mark_legacy_migration_done()").count(),
-            0,
-            "no inline seal may be added ahead of the test module — every seal \
-             must route through request_legacy_seal_on_quiescence (freenet/river#527)"
+            production.matches("mark_legacy_migration_done();").count(),
+            1,
+            "exactly ONE writer of the seal — the quiescence-gated write in \
+             schedule_legacy_seal. A second is a new door onto the third cause \
+             of freenet/river#527."
+        );
+        // Guard the excision itself: if the module bounds are ever computed
+        // wrongly, the count above could pass by looking at the wrong text.
+        assert!(
+            production.contains("fn schedule_legacy_seal(")
+                && !production.contains("fn the_seal_has_exactly_one_writer("),
+            "the excision must keep production and drop the test module"
         );
 
-        // No OTHER module may call it directly.
-        for (name, other) in [
-            (
-                "response_handler.rs",
-                include_str!("freenet_api/response_handler.rs"),
-            ),
-            (
-                "freenet_synchronizer.rs",
-                include_str!("freenet_api/freenet_synchronizer.rs"),
-            ),
-        ] {
-            let other_production = other
-                .split("mod tests {")
-                .next()
-                .expect("production code before `mod tests`");
-            assert!(
-                !other_production.contains("mark_legacy_migration_done()"),
-                "{name} must seal via request_legacy_seal_on_quiescence(), not inline"
-            );
-        }
+        // freenet_synchronizer.rs must NEVER seal inline. This is the door that
+        // caused the harm: it seals on any "delegate not found" API error, which
+        // the fan-out itself provokes within milliseconds on any node missing an
+        // old delegate WASM — so it could fire before any generation holding
+        // data had answered.
+        let sync_src = include_str!("freenet_api/freenet_synchronizer.rs");
+        let sync_production = sync_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        assert!(
+            !sync_production.contains("mark_legacy_migration_done()"),
+            "freenet_synchronizer.rs must seal via request_legacy_seal_on_quiescence() — \
+             it fires on errors the fan-out itself provokes (freenet/river#527)"
+        );
+
+        // response_handler.rs MAY seal inline, but ONLY at the doors where the
+        // current delegate is authoritative and no fan-out is in flight, and
+        // only with the rationale recorded. Every inline seal must be paired
+        // with a "SYNCHRONOUS, deliberately" marker, so a new undocumented one
+        // fails here rather than silently re-opening the third cause.
+        let rh_src = include_str!("freenet_api/response_handler.rs");
+        let rh_production = rh_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let inline_seals = rh_production
+            .matches("mark_legacy_migration_done()")
+            .count();
+        let documented = rh_production.matches("SYNCHRONOUS, deliberately").count();
+        assert_eq!(
+            inline_seals, documented,
+            "every inline seal in response_handler.rs must carry the \
+             'SYNCHRONOUS, deliberately' rationale explaining why no fan-out is \
+             in flight at that door (freenet/river#527)"
+        );
+        assert_eq!(
+            inline_seals, 2,
+            "expected exactly the two current-delegate-authoritative doors to seal \
+             inline; a change here needs a deliberate decision about fan-out overlap"
+        );
+        assert!(
+            rh_production
+                .matches("request_legacy_seal_on_quiescence()")
+                .count()
+                >= 2,
+            "the legacy re-save and the blob-explosion save must both request a \
+             quiescence-gated seal"
+        );
     }
 
     /// A deliberate identity choice must outrank every delegate generation, so
@@ -5959,6 +5999,17 @@ fn schedule_legacy_seal(armed_gen: u32, armed_attempt: u32) {
             let pending = PENDING_LOADS.load(Ordering::Relaxed);
             if !idle_should_apply(armed_gen, cur_gen, armed_attempt, cur_attempt, pending) {
                 return; // a later generation is still answering — re-armed on its settle
+            }
+            // Never seal over a migration that is mid-flight or has FAILED.
+            // The legacy re-save holds no load-worker guard, so quiescence can
+            // be reached while it is still running; and the not-found door sets
+            // the pending flag unconditionally, saying nothing about success.
+            // Sealing either case would kill the freenet/river#345 recovery
+            // across sessions, since `fire_legacy_migration_request` checks the
+            // seal BEFORE the in-progress flag. Leaving it unsealed just means a
+            // harmless re-probe next session — the safe direction.
+            if is_legacy_migration_in_progress() {
+                return;
             }
             if LEGACY_SEAL_PENDING.swap(false, Ordering::Relaxed) {
                 mark_legacy_migration_done();
