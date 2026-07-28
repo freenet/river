@@ -2306,16 +2306,16 @@ mod tests {
         // next time a parameter is added.
         let strip_ws = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
         let squeezed = strip_ws(production);
-        let signature = strip_ws(concat!(
-            "fn hydrate_loaded_rooms(",
-            " loaded_rooms: Rooms,",
-            " is_legacy_delegate: bool,",
-            " source_rank: u32,",
-            " attempt: u32,",
-            ")"
-        ));
+        // Matched piecewise, WITHOUT the closing paren: rustfmt drops the
+        // trailing comma if the signature ever fits on one line, which would
+        // fail a whole-signature needle spuriously.
+        let has_param = |p: &str| squeezed.contains(&strip_ws(p));
         assert!(
-            squeezed.contains(&signature),
+            has_param("fn hydrate_loaded_rooms(")
+                && has_param("loaded_rooms: Rooms,")
+                && has_param("is_legacy_delegate: bool,")
+                && has_param("source_rank: u32,")
+                && has_param("attempt: u32"),
             "hydrate_loaded_rooms must take an attempt to gate its legacy load-state writes, \
              and a source_rank so identity conflicts are resolved by delegate generation \
              rather than response arrival order (freenet/river#527)"
@@ -3027,9 +3027,87 @@ mod tests {
             "it must NOT read the pre-merge loaded copy — that is the #527 bug: \
              pushing an identity the merge rejected over the good one"
         );
+        // Anti-vacuity: match the actual CALL, not the words. The previous
+        // needle ("migrate_signing_key") also matched a comment further down,
+        // so deleting the real call left this pin green.
+        let squeeze = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
         assert!(
-            block.contains("migrate_signing_key"),
-            "guard against this pin going vacuous if the block is renamed away"
+            squeeze(block).contains(&squeeze(
+                "crate::signing::migrate_signing_key(delegate_room_key, &signing_key, false)"
+            )),
+            "the block must still make the real migrate_signing_key call — otherwise              this pin is guarding nothing"
+        );
+        // The skip-on-absent is the actual mechanism: a room the merge DROPPED
+        // (tombstoned, or an identity conflict resolved against this copy) must
+        // yield no signing key at all. Turn this `?` into a fallback and the
+        // second cause of #527 returns while every other assertion here holds.
+        assert!(
+            squeeze(block).contains(&squeeze("let room_data = rooms.map.get(vk)?;")),
+            "a room absent from the merged map must be SKIPPED, not defaulted —              pushing a key for it is exactly the identity the merge rejected"
+        );
+    }
+
+    /// freenet/river#527 — THE WIRING PIN.
+    ///
+    /// Every behavioural test for the fix lives at the `Rooms::merge_from_source`
+    /// layer and supplies its own ranks map, so they all keep passing if the
+    /// production CALL SITE stops feeding that layer real inputs. Two one-line
+    /// edits revert the entire fix with green CI:
+    ///
+    ///   1. `with_identity_source_ranks(...)` -> `&mut HashMap::new()`. Every
+    ///      conflict then reads `unwrap_or(SOURCE_RANK_AUTHORITATIVE)` for the
+    ///      local rank, so nothing ever outranks it and merge keeps local
+    ///      always — exactly the pre-fix behaviour.
+    ///   2. the threaded `source_rank` -> a constant. Every generation then
+    ///      ranks equal, equal ranks keep local, and first-responder-wins (the
+    ///      original bug) is back.
+    ///
+    /// So pin the wiring itself: the shared registry, the threaded rank, and
+    /// the per-generation rank at the legacy call site.
+    #[test]
+    fn hydrate_wires_the_shared_registry_and_a_per_generation_rank() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let strip_ws = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let squeezed = strip_ws(production);
+
+        // (1) The merge reads the SHARED, process-global rank registry — not a
+        // throwaway map — so ranks recorded by one delegate generation's
+        // hydration are visible to the next one's.
+        assert!(
+            squeezed.contains(&strip_ws(
+                "chat_delegate::with_identity_source_ranks( |identity_ranks| {"
+            )),
+            "the merge must read the SHARED identity-source registry; a fresh map \
+             per hydration makes every conflict keep local and silently reverts #527"
+        );
+
+        // (2) The rank passed to the merge is the THREADED parameter.
+        assert!(
+            squeezed.contains(&strip_ws(
+                "current_rooms.merge_from_source(loaded_rooms, source_rank, identity_ranks)"
+            )),
+            "the merge must be given the threaded per-response source_rank"
+        );
+
+        // (3) The legacy per-room call site derives the rank from THAT
+        // delegate's key, so different generations actually get different
+        // ranks. A constant here collapses them and restores first-wins.
+        assert!(
+            squeezed.contains(&strip_ws(
+                "source_rank_for_delegate_key(legacy_key.bytes())"
+            )),
+            "the legacy per-room hydrate must rank by the responding delegate's own key"
+        );
+        // And the single-blob path ranks by the responding delegate too.
+        assert!(
+            squeezed.contains(&strip_ws(
+                "let delegate_source_rank = source_rank_for_delegate_key(key.bytes());"
+            )),
+            "the delegate-response path must capture the responding generation's rank"
         );
     }
 

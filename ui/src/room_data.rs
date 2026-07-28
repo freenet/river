@@ -2873,6 +2873,97 @@ mod tests {
         );
     }
 
+    /// Adopting a newer identity REPLACES the local `RoomData` wholesale, so
+    /// every field not explicitly carried over is silently discarded. That is
+    /// how the `invitation_secrets` loss got in — caught in review, not by a
+    /// test, and only because someone happened to look.
+    ///
+    /// This destructures `RoomData` exhaustively, so ADDING A FIELD BREAKS THE
+    /// BUILD here and forces a decision about what the adopt path should do
+    /// with it. The disposition of each existing field is recorded below.
+    ///
+    /// If you are here because you added a field: decide which group it joins,
+    /// add it to that group, and if it belongs in "must be carried over" then
+    /// also update the adopt path in `merge_from_source`.
+    #[test]
+    fn adopt_path_accounts_for_every_room_data_field() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let self_sk = SigningKey::generate(&mut rng);
+        let room = make_rejoin_test_room(&owner, &self_sk, true);
+
+        let RoomData {
+            // --- Identity and its derived state: correctly taken from the
+            // ADOPTED copy. Using the local values would defeat the adopt.
+            owner_vk: _,
+            self_sk: _,
+            contract_key: _,
+            self_authorized_member: _,
+            invite_chain: _,
+            self_member_info: _,
+            self_nickname: _,
+
+            // --- Must be carried over from the local copy (identity-independent
+            // state the older generation may hold and the newer may not).
+            // Both are handled in the adopt path.
+            room_state: _,         // CRDT-merged, so no messages are lost
+            invitation_secrets: _, // unioned; adopted copy wins on collision
+
+            // --- `#[serde(skip)]`: not persisted, so the local values are
+            // runtime-only and are rebuilt after the merge —
+            // `repopulate_secrets_from_state` for the secret trio, and the
+            // signing-key migration re-derives `key_migrated_to_delegate`.
+            secrets: _,
+            current_secret_version: _,
+            last_secret_rotation: _,
+            key_migrated_to_delegate: _,
+
+            // --- Deliberately taken from the adopted copy; losing the local
+            // value is cosmetic or self-correcting.
+            last_read_message_id: _, // at worst some messages re-show as unread
+            previous_contract_key: _, // re-derived by regenerate_contract_key
+        } = room;
+    }
+
+    /// The pairwise decision must still hold with MORE than two generations
+    /// answering, in any order — the real fan-out probes ~26 of them.
+    #[test]
+    fn the_newest_of_several_generations_wins_regardless_of_order() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let id_old = SigningKey::generate(&mut rng);
+        let id_mid = SigningKey::generate(&mut rng);
+        let id_new = SigningKey::generate(&mut rng);
+
+        // Deliberately interleaved: newest in the middle, oldest last.
+        let arrivals = [(12u32, &id_mid), (30u32, &id_new), (3u32, &id_old)];
+
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = HashMap::new();
+        for (rank, sk) in arrivals {
+            local
+                .merge_from_source(
+                    rooms_holding(vk, make_rejoin_test_room(&owner, sk, true)),
+                    rank,
+                    &mut ranks,
+                )
+                .expect("merge");
+        }
+
+        assert_eq!(
+            local.map.get(&vk).unwrap().self_sk.to_bytes(),
+            id_new.to_bytes(),
+            "the newest generation must win across three sources in any order"
+        );
+        assert_eq!(
+            ranks.get(&vk.to_bytes()),
+            Some(&30),
+            "and the recorded provenance must be the highest rank seen, so a \
+             later older response still loses"
+        );
+    }
+
     /// `merge` (the single-source wrapper) must keep its historical
     /// keep-local-on-conflict behaviour — several callers rely on it.
     #[test]

@@ -705,14 +705,6 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
-    /// Blocker-1 pin (freenet/river#394): the chat-delegate cipher/nonce must be
-    /// STABLE within a process. In the production gateway iframe `localStorage`
-    /// throws (opaque origin), so both persistence sides no-op; the pre-fix code
-    /// therefore re-generated fresh material on every `set_up_chat_delegate()`
-    /// (fired on each reconnect / sleep-wake), rotating the cipher within a page.
-    /// On the native target there is no `localStorage` cfg block, so this
-    /// exercises exactly that fallback: repeated calls must return identical
-    /// bytes via the in-memory cache.
     /// freenet/river#527: the whole generation-ranked identity fix rests on
     /// `LEGACY_DELEGATES` being in AGE order (oldest first), because an entry's
     /// INDEX is used as its authority. `legacy_delegates.toml` is append-only
@@ -720,6 +712,15 @@ mod tests {
     /// enforces that — if a future generator ever sorted or reversed the list,
     /// the fix would silently INVERT and start preferring the oldest copy,
     /// which is the exact bug it exists to prevent.
+    ///
+    /// The load-bearing check is the DATE MONOTONICITY assertion below. Every
+    /// index-based assertion here is an identity — `source_rank_for_delegate_key`
+    /// IS `position()` over this array, so "rank == index" holds for ANY
+    /// ordering — and anchoring on two specific keys is not enough either: a
+    /// lexicographic sort by version string ("V10" < "V2") leaves V1 first and
+    /// V29 late, so `rank(V1) < rank(V29)` would still pass while V3 outranked
+    /// V29. Only reading the emitted DATES, which the array position cannot
+    /// influence, actually detects a reordering.
     #[test]
     fn legacy_delegate_ranks_run_oldest_to_newest_and_below_the_current_delegate() {
         assert!(
@@ -727,7 +728,50 @@ mod tests {
             "need at least two generations to have an order to check"
         );
 
-        // Each entry's rank is its index, so ranks strictly increase with age.
+        // THE REAL CHECK: the generated registry carries each entry's date as a
+        // trailing `(YYYY-MM-DD)` comment, emitted in array order. Those dates
+        // must be non-decreasing, or the array is no longer in age order and
+        // every rank derived from it is wrong.
+        let generated = include_str!(concat!(env!("OUT_DIR"), "/legacy_delegates.rs"));
+        let dates: Vec<&str> = generated
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("// V"))
+            .filter_map(|l| {
+                // The description itself may contain parentheses, so take the
+                // LAST parenthesised group on the line.
+                let open = l.rfind('(')?;
+                let close = l.rfind(')')?;
+                (close > open).then(|| &l[open + 1..close])
+            })
+            .filter(|d| d.len() == 10 && d.as_bytes()[4] == b'-')
+            .collect();
+
+        // Vacuity guard: if the comment format ever changes, the parse above
+        // would silently yield nothing and the monotonicity check would pass
+        // over an empty list.
+        assert_eq!(
+            dates.len(),
+            LEGACY_DELEGATES.len(),
+            "must parse one date per legacy entry — got {dates:?}; if the codegen's \
+             comment format changed, this pin has gone blind and must be updated"
+        );
+
+        // ISO-8601 dates compare chronologically as strings.
+        for pair in dates.windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "legacy delegate registry is NOT in age order ({} comes before {}) — \
+                 an entry's index is its authority rank, so the #527 identity \
+                 ordering is now inverted and the OLDEST copy would win conflicts",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // Each entry's rank is its index (identity given the implementation, but
+        // it also catches duplicate keys, which would collapse two generations
+        // onto one rank).
         for (i, (key_bytes, _)) in LEGACY_DELEGATES.iter().enumerate() {
             assert_eq!(
                 source_rank_for_delegate_key(key_bytes.as_slice()),
@@ -802,6 +846,79 @@ mod tests {
         );
     }
 
+    /// freenet/river#527 (third cause): the seal must be DEBOUNCED, not merely
+    /// requested.
+    ///
+    /// The response-handler pin only asserts that the legacy re-save CALLS
+    /// `request_legacy_seal_on_quiescence()` instead of sealing inline. That
+    /// says nothing about when the seal actually lands: make this function
+    /// write the seal immediately and that pin stays green while the third
+    /// cause of #527 returns in full — the migration ends while newer delegate
+    /// generations are still answering, and a tab closed in that window leaves
+    /// the rollback permanent.
+    ///
+    /// So pin the property here: the seal is only ever written from inside the
+    /// idle-gated closure, after a `LOAD_IDLE_MS` wait.
+    #[test]
+    fn the_legacy_seal_is_written_only_behind_the_quiescence_debounce() {
+        // NOTE: this file's `mod tests` is MID-FILE, so the usual
+        // `split("mod tests {").next()` trick would slice away everything after
+        // it — including both functions under test — and every assertion below
+        // would fail (or, with `contains`, pass vacuously). Search the whole
+        // source with `rfind` instead, as the other pins in this file do: both
+        // definitions live AFTER this test module, so the last occurrence is
+        // the real definition rather than a needle in this test's own source.
+        let src = include_str!("chat_delegate.rs");
+
+        // The request path must NOT seal — it only sets the flag and pokes the
+        // settle check.
+        let req = src
+            .rfind("pub(crate) fn request_legacy_seal_on_quiescence() {")
+            .expect("request_legacy_seal_on_quiescence must exist");
+        let req_end = src[req..].find("\n}\n").expect("function must terminate");
+        let req_body = &src[req..req + req_end];
+        assert!(
+            !req_body.contains("mark_legacy_migration_done("),
+            "requesting the seal must NOT write it — that is sealing inline by \
+             another name and re-opens the third cause of #527"
+        );
+        assert!(
+            req_body.contains("LEGACY_SEAL_PENDING.store(true"),
+            "the request must record that a seal is owed"
+        );
+
+        // The scheduler must wait, re-check quiescence, and only then seal.
+        let sched = src
+            .rfind("fn schedule_legacy_seal(")
+            .expect("schedule_legacy_seal must exist");
+        let sched_body = &src[sched..];
+        let sched_body = &sched_body[..sched_body.find("\n}\n").expect("function must terminate")];
+        assert!(
+            sched_body.contains("LOAD_IDLE_MS"),
+            "the seal must wait out the quiescence window"
+        );
+        assert!(
+            sched_body.contains("idle_should_apply("),
+            "the seal must re-check that no newer generation started answering — \
+             a later worker cancels it and re-arms on its own settle"
+        );
+        assert!(
+            sched_body.contains("mark_legacy_migration_done()"),
+            "the seal is written here, or nowhere"
+        );
+        // Ordering: the gate precedes the write.
+        let gate = sched_body
+            .find("idle_should_apply(")
+            .expect("gate must be present");
+        let write = sched_body
+            .find("mark_legacy_migration_done()")
+            .expect("write must be present");
+        assert!(
+            gate < write,
+            "the quiescence gate must run BEFORE the seal is written"
+        );
+    }
+
     /// A deliberate identity choice must outrank every delegate generation, so
     /// no load — however new — can undo an import (freenet/river#414 + #527).
     #[test]
@@ -817,6 +934,14 @@ mod tests {
         );
     }
 
+    /// Blocker-1 pin (freenet/river#394): the chat-delegate cipher/nonce must be
+    /// STABLE within a process. In the production gateway iframe `localStorage`
+    /// throws (opaque origin), so both persistence sides no-op; the pre-fix code
+    /// therefore re-generated fresh material on every `set_up_chat_delegate()`
+    /// (fired on each reconnect / sleep-wake), rotating the cipher within a page.
+    /// On the native target there is no `localStorage` cfg block, so this
+    /// exercises exactly that fallback: repeated calls must return identical
+    /// bytes via the in-memory cache.
     #[test]
     fn cipher_material_is_stable_within_process() {
         let a = chat_delegate_cipher_material();
