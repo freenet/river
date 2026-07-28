@@ -1944,6 +1944,19 @@ impl Rooms {
                     &ChatRoomParametersV1 { owner: vk },
                     &existing.room_state,
                 )?;
+                // Union the invitation-carried secrets, same rule as the save-side
+                // reconcile (`chat_delegate::reconcile_room_present`): these are
+                // DECRYPTED per-version room secrets, so they are identity-
+                // INDEPENDENT recovery state, and the older copy may hold a
+                // version the newer one lacks. Dropping them wholesale would
+                // leave a private-room member unable to decrypt messages sealed
+                // under that version. The adopted (newer) copy wins on collision.
+                for (version, secret) in existing.invitation_secrets {
+                    room_data
+                        .invitation_secrets
+                        .entry(version)
+                        .or_insert(secret);
+                }
                 self.map.insert(vk, room_data);
                 record_identity_source(
                     identity_ranks,
@@ -2808,6 +2821,55 @@ mod tests {
             merged.room_state.recent_messages.messages.len(),
             expected_messages,
             "…but the older copy's messages are folded in, not discarded"
+        );
+    }
+
+    /// Adopting a newer identity must not drop invitation-carried room secrets
+    /// the older copy held: they are DECRYPTED per-version secrets, so they are
+    /// identity-independent, and losing one leaves a private-room member unable
+    /// to decrypt messages sealed under that version. Mirrors the save-side rule
+    /// pinned by `chat_delegate::reconcile_room_present_unions_invitation_secrets`.
+    #[test]
+    fn adopting_a_newer_identity_unions_invitation_secrets() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let old_identity = SigningKey::generate(&mut rng);
+        let current_identity = SigningKey::generate(&mut rng);
+
+        // The OLD generation holds v0 and v1; the newer holds v1 (different
+        // bytes) and v2.
+        let mut old_room = make_rejoin_test_room(&owner, &old_identity, true);
+        old_room.invitation_secrets.insert(0, [10u8; 32]);
+        old_room.invitation_secrets.insert(1, [11u8; 32]);
+        let mut new_room = make_rejoin_test_room(&owner, &current_identity, true);
+        new_room.invitation_secrets.insert(1, [99u8; 32]);
+        new_room.invitation_secrets.insert(2, [22u8; 32]);
+
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = HashMap::new();
+        local
+            .merge_from_source(rooms_holding(vk, old_room), 3, &mut ranks)
+            .expect("old generation merge");
+        local
+            .merge_from_source(rooms_holding(vk, new_room), 30, &mut ranks)
+            .expect("newer generation merge");
+
+        let merged = local.map.get(&vk).unwrap();
+        assert_eq!(
+            merged.invitation_secrets.get(&0),
+            Some(&[10u8; 32]),
+            "a version only the older copy had must survive the adopt"
+        );
+        assert_eq!(
+            merged.invitation_secrets.get(&1),
+            Some(&[99u8; 32]),
+            "on collision the adopted (newer) copy wins"
+        );
+        assert_eq!(
+            merged.invitation_secrets.get(&2),
+            Some(&[22u8; 32]),
+            "the adopted copy's own versions are kept"
         );
     }
 
