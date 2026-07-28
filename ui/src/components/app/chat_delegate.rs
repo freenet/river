@@ -255,6 +255,70 @@ pub fn is_legacy_delegate_key(key_bytes: &[u8]) -> bool {
         .any(|(dk, _)| dk.as_slice() == key_bytes)
 }
 
+// =============================================================================
+// DELEGATE-GENERATION AUTHORITY (freenet/river#527)
+// =============================================================================
+//
+// `fire_legacy_migration_request` probes EVERY legacy delegate generation at
+// once, and each one that still holds data hydrates independently. Their
+// responses race, so something has to decide which copy of a room is
+// authoritative when two generations disagree about the user's identity for it.
+//
+// Before #527 nothing did: `Rooms::merge` kept whichever copy landed FIRST and
+// silently skipped the rest. Probes are dispatched oldest-generation-first (the
+// `LEGACY_DELEGATES` order), so the oldest surviving copy usually answered
+// first — rolling a long-time user back to an identity from months earlier.
+//
+// The rank below is that missing order. `LEGACY_DELEGATES` is generated from
+// `legacy_delegates.toml` in age order (V1 oldest first), so an entry's INDEX
+// is its generation: higher index = newer delegate = more authoritative, and
+// the current delegate outranks every legacy generation.
+
+/// Rank of the CURRENT delegate — above every legacy generation.
+pub(crate) fn current_delegate_source_rank() -> u32 {
+    LEGACY_DELEGATES.len() as u32
+}
+
+/// Rank of the delegate generation `key_bytes` identifies. An unrecognised key
+/// is the current delegate (the only non-legacy delegate River talks to).
+pub(crate) fn source_rank_for_delegate_key(key_bytes: &[u8]) -> u32 {
+    LEGACY_DELEGATES
+        .iter()
+        .position(|(dk, _)| dk.as_slice() == key_bytes)
+        .map(|i| i as u32)
+        .unwrap_or_else(current_delegate_source_rank)
+}
+
+/// Which source supplied the identity each room in `ROOMS` currently carries,
+/// so a later-arriving copy can be ranked against it. Runtime-only (never
+/// persisted): it describes where the in-memory copy came from this session.
+///
+/// A plain `Mutex`, not a signal — it is read from `Rooms::merge` inside a
+/// `with_mut`, and from spawned tasks with no Dioxus runtime, where reading a
+/// `GlobalSignal` would panic (the same reasoning as `CURRENT_ROOM_IDENTITY` in
+/// `signing.rs`). Single-threaded WASM, so it never contends.
+static ROOM_IDENTITY_SOURCE_RANKS: LazyLock<Mutex<HashMap<RoomKey, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Run `f` against the identity-source-rank registry.
+pub(crate) fn with_identity_source_ranks<R>(f: impl FnOnce(&mut HashMap<RoomKey, u32>) -> R) -> R {
+    let mut guard = ROOM_IDENTITY_SOURCE_RANKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut guard)
+}
+
+/// Record that this room's identity was chosen DELIBERATELY by the user (an
+/// identity import, or accepting an invitation) rather than loaded from a
+/// delegate. Nothing outranks an explicit choice, so no delegate copy — however
+/// new its generation — can overwrite it (this is what preserves the
+/// freenet/river#414 guarantee now that merge can adopt an incoming identity).
+pub(crate) fn mark_identity_source_authoritative(room_key: RoomKey) {
+    with_identity_source_ranks(|ranks| {
+        ranks.insert(room_key, crate::room_data::SOURCE_RANK_AUTHORITATIVE);
+    });
+}
+
 // Prefixes for different pending request types
 const SIGNING_KEY_PREFIX: &[u8] = b"__signing_key:";
 const PUBLIC_KEY_PREFIX: &[u8] = b"__public_key:";
@@ -649,6 +713,75 @@ mod tests {
     /// On the native target there is no `localStorage` cfg block, so this
     /// exercises exactly that fallback: repeated calls must return identical
     /// bytes via the in-memory cache.
+    /// freenet/river#527: the whole generation-ranked identity fix rests on
+    /// `LEGACY_DELEGATES` being in AGE order (oldest first), because an entry's
+    /// INDEX is used as its authority. `legacy_delegates.toml` is append-only
+    /// and `freenet-migrate-build` emits it in file order, but nothing else
+    /// enforces that — if a future generator ever sorted or reversed the list,
+    /// the fix would silently INVERT and start preferring the oldest copy,
+    /// which is the exact bug it exists to prevent.
+    #[test]
+    fn legacy_delegate_ranks_run_oldest_to_newest_and_below_the_current_delegate() {
+        assert!(
+            LEGACY_DELEGATES.len() >= 2,
+            "need at least two generations to have an order to check"
+        );
+
+        // Each entry's rank is its index, so ranks strictly increase with age.
+        for (i, (key_bytes, _)) in LEGACY_DELEGATES.iter().enumerate() {
+            assert_eq!(
+                source_rank_for_delegate_key(key_bytes.as_slice()),
+                i as u32,
+                "legacy entry {i} must rank at its index"
+            );
+        }
+
+        let oldest = source_rank_for_delegate_key(LEGACY_DELEGATES[0].0.as_slice());
+        let newest =
+            source_rank_for_delegate_key(LEGACY_DELEGATES[LEGACY_DELEGATES.len() - 1].0.as_slice());
+        assert!(
+            oldest < newest,
+            "the FIRST registry entry must be the OLDEST generation (lowest authority) — \
+             if this fails, legacy_delegates.toml or its codegen changed order and the \
+             #527 identity ordering is now inverted"
+        );
+        assert!(
+            newest < current_delegate_source_rank(),
+            "the current delegate must outrank every legacy generation"
+        );
+    }
+
+    /// An unrecognised key is the current delegate — the only non-legacy
+    /// delegate River talks to — so it must get the top delegate rank rather
+    /// than accidentally ranking as the oldest generation (index 0).
+    #[test]
+    fn an_unknown_delegate_key_ranks_as_the_current_delegate() {
+        let unknown = [0xABu8; 32];
+        assert!(
+            !is_legacy_delegate_key(&unknown),
+            "fixture must not collide with a real legacy key"
+        );
+        assert_eq!(
+            source_rank_for_delegate_key(&unknown),
+            current_delegate_source_rank()
+        );
+    }
+
+    /// A deliberate identity choice must outrank every delegate generation, so
+    /// no load — however new — can undo an import (freenet/river#414 + #527).
+    #[test]
+    fn an_authoritative_identity_source_outranks_every_delegate() {
+        // A room key no other test uses: the registry is a process-global.
+        let room_key = [0x5Au8; 32];
+        mark_identity_source_authoritative(room_key);
+        let rank = with_identity_source_ranks(|ranks| ranks.get(&room_key).copied());
+        assert_eq!(rank, Some(crate::room_data::SOURCE_RANK_AUTHORITATIVE));
+        assert!(
+            rank.unwrap() > current_delegate_source_rank(),
+            "an explicit choice must outrank the current delegate too"
+        );
+    }
+
     #[test]
     fn cipher_material_is_stable_within_process() {
         let a = chat_delegate_cipher_material();
@@ -5550,6 +5683,51 @@ pub(crate) fn on_load_worker_settled() {
             None if room_count_zero => schedule_idle_resolution(armed_gen, armed_attempt),
             None => {} // rooms present → List renders, leave the state
         }
+        // A legacy migration that completed this session seals only after the
+        // fan-out is quiescent (freenet/river#527), so every generation that
+        // was going to answer has been merged first. Armed here rather than at
+        // the re-save because this is the point where "no load work is
+        // outstanding" is known. Runs for the rooms-present case too, which
+        // `settle_terminal` deliberately leaves alone.
+        if LEGACY_SEAL_PENDING.load(Ordering::Relaxed) {
+            schedule_legacy_seal(armed_gen, armed_attempt);
+        }
+    });
+}
+
+/// A legacy migration re-saved successfully; seal it once the load goes quiet.
+/// See [`schedule_legacy_seal`].
+pub(crate) fn request_legacy_seal_on_quiescence() {
+    LEGACY_SEAL_PENDING.store(true, Ordering::Relaxed);
+    // The re-save runs in its own spawned task, so the load may ALREADY be
+    // quiescent (every worker dropped while the save was in flight) and no
+    // further settle would fire. Drive one now; it no-ops if work is pending.
+    on_load_worker_settled();
+}
+
+/// Set when a legacy migration's re-save succeeds, cleared when the seal is
+/// written. See [`request_legacy_seal_on_quiescence`].
+static LEGACY_SEAL_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Write the legacy-migration seal after [`LOAD_IDLE_MS`] of quiescence, using
+/// the same debounce as the idle load resolution: any new worker (a later
+/// generation answering) bumps the activity gen and cancels this, and the seal
+/// is re-armed when THAT worker settles. So the seal lands only after the last
+/// responding delegate generation has been merged (freenet/river#527).
+fn schedule_legacy_seal(armed_gen: u32, armed_attempt: u32) {
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(std::time::Duration::from_millis(LOAD_IDLE_MS)).await;
+        crate::util::defer(move || {
+            let cur_gen = LOAD_ACTIVITY_GEN.load(Ordering::Relaxed);
+            let cur_attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+            let pending = PENDING_LOADS.load(Ordering::Relaxed);
+            if !idle_should_apply(armed_gen, cur_gen, armed_attempt, cur_attempt, pending) {
+                return; // a later generation is still answering — re-armed on its settle
+            }
+            if LEGACY_SEAL_PENDING.swap(false, Ordering::Relaxed) {
+                mark_legacy_migration_done();
+            }
+        });
     });
 }
 

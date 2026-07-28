@@ -32,6 +32,69 @@ pub enum SendMessageError {
     UserBanned,
 }
 
+/// Rank of an identity the user chose DELIBERATELY (identity import,
+/// invitation-accept) rather than one loaded from a delegate. Outranks every
+/// delegate generation, so no load can overwrite an explicit choice
+/// (freenet/river#414).
+pub const SOURCE_RANK_AUTHORITATIVE: u32 = u32::MAX;
+
+/// What to do with an incoming room copy whose `self_sk` differs from the copy
+/// already in memory.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum IdentityChoice {
+    /// Keep the identity already in memory.
+    KeepLocal,
+    /// The incoming copy comes from a strictly more authoritative source —
+    /// adopt its identity (merging the local state into it, so no messages are
+    /// lost).
+    AdoptIncoming,
+}
+
+/// Decide an identity conflict by SOURCE AUTHORITY rather than arrival order
+/// (freenet/river#527).
+///
+/// Ranks are delegate generations (see
+/// `chat_delegate::source_rank_for_delegate_key`): higher is newer. A strictly
+/// newer source wins; anything else keeps what is already in memory.
+///
+/// Equal ranks deliberately keep local. Two copies from the SAME source that
+/// disagree can't be ordered, and that case is the freenet/river#414 race — a
+/// delegate load issued before an identity overwrite still carrying the old
+/// `self_sk` — where local is the newer one.
+pub fn resolve_identity_conflict(local_rank: u32, incoming_rank: u32) -> IdentityChoice {
+    if incoming_rank > local_rank {
+        IdentityChoice::AdoptIncoming
+    } else {
+        IdentityChoice::KeepLocal
+    }
+}
+
+/// Record which source supplied a room's in-memory identity, so a later copy
+/// can be ranked against it.
+///
+/// Never DOWNGRADES: a room already in memory with no recorded rank was created
+/// or imported in-session (authoritative, see [`SOURCE_RANK_AUTHORITATIVE`]),
+/// and stamping it with a loading source's rank would make an explicit user
+/// choice overwritable by the next delegate response.
+pub fn record_identity_source(
+    identity_ranks: &mut HashMap<RoomKey, u32>,
+    vk: &VerifyingKey,
+    source_rank: u32,
+    was_vacant: bool,
+) {
+    let key = vk.to_bytes();
+    match identity_ranks.get(&key).copied() {
+        Some(existing) if source_rank > existing => {
+            identity_ranks.insert(key, source_rank);
+        }
+        Some(_) => {}
+        None if was_vacant => {
+            identity_ranks.insert(key, source_rank);
+        }
+        None => {}
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoomData {
     pub owner_vk: VerifyingKey,
@@ -1756,6 +1819,29 @@ impl Rooms {
     /// rooms that DID merge in that pass, so a private room can render
     /// "[Encrypted message - secret vN not available]" until a clean reload.
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
+        // Single-source merge: rank the incoming copy equal to whatever is
+        // already in memory, so an identity conflict always keeps local — the
+        // pre-freenet/river#527 behaviour. Multi-source loads (the legacy
+        // delegate fan-out) must call `merge_from_source` so generations can be
+        // ordered.
+        let mut ranks = HashMap::new();
+        self.merge_from_source(other, SOURCE_RANK_AUTHORITATIVE, &mut ranks)
+    }
+
+    /// Merge a copy of the user's rooms that came from a specific source,
+    /// ranked by [`resolve_identity_conflict`] (freenet/river#527).
+    ///
+    /// `identity_ranks` records which source supplied the identity each room in
+    /// `self` currently carries, so a copy arriving later from a NEWER delegate
+    /// generation can correct one that merely arrived FIRST. A room already in
+    /// memory with no recorded rank is treated as authoritative (it was created
+    /// or imported in-session, not loaded), so it is never downgraded.
+    pub fn merge_from_source(
+        &mut self,
+        other: Rooms,
+        source_rank: u32,
+        identity_ranks: &mut HashMap<RoomKey, u32>,
+    ) -> Result<(), String> {
         // Tombstones first: take the union before anything else, so the
         // filter below sees the combined set.
         for vk in other.removed_rooms {
@@ -1798,15 +1884,38 @@ impl Rooms {
             // still abort the whole merge and drop unrelated rooms. This is a
             // genuine robustness guard, NOT scaffolding for the deleted empty
             // room.
+            // Identity conflict: decide by SOURCE AUTHORITY, not arrival order
+            // (freenet/river#527). A strictly newer delegate generation wins;
+            // anything else keeps the local identity.
+            let mut adopt_incoming_identity = false;
             if let Some(existing) = self.map.get(&vk) {
                 if existing.self_sk != room_data.self_sk {
                     use dioxus::logger::tracing::warn;
-                    warn!(
-                        "merge: skipping room with conflicting self_sk (kept local \
-                         identity) — likely a stale in-flight load during an \
-                         identity overwrite (freenet/river#414)"
-                    );
-                    continue;
+                    let local_rank = identity_ranks
+                        .get(&vk.to_bytes())
+                        .copied()
+                        .unwrap_or(SOURCE_RANK_AUTHORITATIVE);
+                    match resolve_identity_conflict(local_rank, source_rank) {
+                        IdentityChoice::KeepLocal => {
+                            warn!(
+                                "merge: keeping local identity for room with conflicting \
+                                 self_sk — incoming source rank {} does not outrank {} \
+                                 (freenet/river#414, #527)",
+                                source_rank, local_rank
+                            );
+                            continue;
+                        }
+                        IdentityChoice::AdoptIncoming => {
+                            warn!(
+                                "merge: adopting identity from a newer source for room \
+                                 with conflicting self_sk — incoming rank {} outranks {}. \
+                                 The local copy came from an older delegate generation \
+                                 that merely answered first (freenet/river#527)",
+                                source_rank, local_rank
+                            );
+                            adopt_incoming_identity = true;
+                        }
+                    }
                 }
             }
 
@@ -1822,19 +1931,46 @@ impl Rooms {
                 self.migrated_rooms.push((vk, old_contract_key));
             }
 
-            // If not already in the map, add the room
-            if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(vk) {
-                e.insert(room_data);
-            } else {
-                // Already present with a matching `self_sk` (the conflict case
-                // was skipped above) — merge in the new state.
-                let self_room_data = self.map.get_mut(&vk).unwrap();
-                self_room_data.room_state.merge(
-                    &self_room_data.room_state.clone(),
+            if adopt_incoming_identity {
+                // Fold the local (older-identity) state INTO the incoming copy
+                // before it replaces it, so adopting the newer identity never
+                // costs messages the older copy had.
+                let existing = self
+                    .map
+                    .remove(&vk)
+                    .expect("AdoptIncoming implies the room is present");
+                room_data.room_state.merge(
+                    &room_data.room_state.clone(),
                     &ChatRoomParametersV1 { owner: vk },
-                    &room_data.room_state,
+                    &existing.room_state,
                 )?;
+                self.map.insert(vk, room_data);
+                record_identity_source(
+                    identity_ranks,
+                    &vk,
+                    source_rank,
+                    /* was_vacant */ true,
+                );
+                continue;
             }
+
+            // If not already in the map, add the room
+            let was_vacant =
+                if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(vk) {
+                    e.insert(room_data);
+                    true
+                } else {
+                    // Already present with a matching `self_sk` (the conflict
+                    // case was resolved above) — merge in the new state.
+                    let self_room_data = self.map.get_mut(&vk).unwrap();
+                    self_room_data.room_state.merge(
+                        &self_room_data.room_state.clone(),
+                        &ChatRoomParametersV1 { owner: vk },
+                        &room_data.room_state,
+                    )?;
+                    false
+                };
+            record_identity_source(identity_ranks, &vk, source_rank, was_vacant);
         }
 
         // Room display order: this device's order is authoritative (a local
@@ -2414,6 +2550,311 @@ mod tests {
             local.map.get(&vk_c).unwrap().self_sk.to_bytes(),
             new_sk_c.to_bytes(),
             "the conflicting room must keep the local (current) identity"
+        );
+    }
+
+    // =====================================================================
+    // freenet/river#527 — identity conflicts resolve by DELEGATE GENERATION,
+    // not by which probe answered first.
+    //
+    // `fire_legacy_migration_request` probes every legacy generation at once
+    // and each hydrates independently, so for a long-time user whose rooms
+    // exist under many generations these merges arrive in a racy order —
+    // dispatched oldest-first, so the oldest copy usually lands first.
+    // =====================================================================
+
+    fn empty_rooms_for_merge() -> Rooms {
+        Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        }
+    }
+
+    fn rooms_holding(vk: VerifyingKey, room: RoomData) -> Rooms {
+        let mut rooms = empty_rooms_for_merge();
+        rooms.map.insert(vk, room);
+        rooms
+    }
+
+    #[test]
+    fn resolve_identity_conflict_prefers_a_strictly_newer_source() {
+        assert_eq!(
+            resolve_identity_conflict(5, 20),
+            IdentityChoice::AdoptIncoming,
+            "a newer delegate generation must win"
+        );
+        assert_eq!(
+            resolve_identity_conflict(20, 5),
+            IdentityChoice::KeepLocal,
+            "an older delegate generation must lose"
+        );
+        assert_eq!(
+            resolve_identity_conflict(7, 7),
+            IdentityChoice::KeepLocal,
+            "same source can't be ordered — keep local (the #414 stale-load race)"
+        );
+        assert_eq!(
+            resolve_identity_conflict(SOURCE_RANK_AUTHORITATIVE, 999),
+            IdentityChoice::KeepLocal,
+            "a deliberate identity choice outranks every delegate generation (#414)"
+        );
+    }
+
+    /// THE #527 REGRESSION. Ivvor's case: an old delegate generation answers
+    /// first and seeds the room with a years-old identity; the current
+    /// generation's copy arrives second carrying the identity the user
+    /// actually uses. Before the fix the second was dropped as "conflicting"
+    /// and the user was rolled back.
+    #[test]
+    fn a_later_arriving_newer_generation_corrects_an_older_one_that_answered_first() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let old_identity = SigningKey::generate(&mut rng);
+        let current_identity = SigningKey::generate(&mut rng);
+        assert_ne!(old_identity.to_bytes(), current_identity.to_bytes());
+
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = HashMap::new();
+
+        // The oldest generation (rank 3) answers first.
+        local
+            .merge_from_source(
+                rooms_holding(vk, make_rejoin_test_room(&owner, &old_identity, true)),
+                3,
+                &mut ranks,
+            )
+            .expect("first merge");
+        assert_eq!(
+            local.map.get(&vk).unwrap().self_sk.to_bytes(),
+            old_identity.to_bytes(),
+            "precondition: the first responder seeds the room"
+        );
+
+        // The current delegate (rank 30) answers second.
+        local
+            .merge_from_source(
+                rooms_holding(vk, make_rejoin_test_room(&owner, &current_identity, true)),
+                30,
+                &mut ranks,
+            )
+            .expect("second merge");
+
+        assert_eq!(
+            local.map.get(&vk).unwrap().self_sk.to_bytes(),
+            current_identity.to_bytes(),
+            "the newer delegate generation must correct the identity the older one \
+             seeded — arrival order must not decide (freenet/river#527)"
+        );
+    }
+
+    /// The same two copies in the opposite arrival order must reach the SAME
+    /// result. Without this, the fix would merely move the race rather than
+    /// remove it.
+    #[test]
+    fn identity_resolution_is_independent_of_arrival_order() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let old_identity = SigningKey::generate(&mut rng);
+        let current_identity = SigningKey::generate(&mut rng);
+
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = HashMap::new();
+
+        // Newest first this time.
+        local
+            .merge_from_source(
+                rooms_holding(vk, make_rejoin_test_room(&owner, &current_identity, true)),
+                30,
+                &mut ranks,
+            )
+            .expect("first merge");
+        local
+            .merge_from_source(
+                rooms_holding(vk, make_rejoin_test_room(&owner, &old_identity, true)),
+                3,
+                &mut ranks,
+            )
+            .expect("second merge");
+
+        assert_eq!(
+            local.map.get(&vk).unwrap().self_sk.to_bytes(),
+            current_identity.to_bytes(),
+            "an older generation arriving later must not overwrite a newer one"
+        );
+    }
+
+    /// A deliberate identity choice (import / invitation-accept) is recorded as
+    /// authoritative and must survive a load from ANY delegate generation —
+    /// this is the freenet/river#414 guarantee, which the #527 fix must not
+    /// weaken now that merge is able to adopt an incoming identity.
+    #[test]
+    fn an_authoritative_identity_is_not_overwritten_by_any_generation() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let imported = SigningKey::generate(&mut rng);
+        let from_delegate = SigningKey::generate(&mut rng);
+
+        let mut local = rooms_holding(vk, make_rejoin_test_room(&owner, &imported, true));
+        let mut ranks = HashMap::new();
+        ranks.insert(vk.to_bytes(), SOURCE_RANK_AUTHORITATIVE);
+
+        local
+            .merge_from_source(
+                rooms_holding(vk, make_rejoin_test_room(&owner, &from_delegate, true)),
+                u32::MAX - 1,
+                &mut ranks,
+            )
+            .expect("merge");
+
+        assert_eq!(
+            local.map.get(&vk).unwrap().self_sk.to_bytes(),
+            imported.to_bytes(),
+            "an explicitly-chosen identity must outrank every delegate generation (#414)"
+        );
+    }
+
+    /// A room already in memory with NO recorded provenance was created or
+    /// imported in-session. It must be treated as authoritative, never
+    /// downgraded to a loading source's rank — otherwise the next delegate
+    /// response could overwrite a room the user just made.
+    #[test]
+    fn unknown_provenance_is_treated_as_authoritative_and_never_downgraded() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let in_session = SigningKey::generate(&mut rng);
+        let from_delegate = SigningKey::generate(&mut rng);
+
+        let mut local = rooms_holding(vk, make_rejoin_test_room(&owner, &in_session, true));
+        // Deliberately EMPTY: nothing recorded this room's source.
+        let mut ranks = HashMap::new();
+
+        local
+            .merge_from_source(
+                rooms_holding(vk, make_rejoin_test_room(&owner, &from_delegate, true)),
+                30,
+                &mut ranks,
+            )
+            .expect("merge");
+
+        assert_eq!(
+            local.map.get(&vk).unwrap().self_sk.to_bytes(),
+            in_session.to_bytes(),
+            "a room with no recorded source must not be overwritten by a load"
+        );
+        assert!(
+            !ranks.contains_key(&vk.to_bytes()),
+            "and it must not be stamped with the loading source's rank, which would \
+             make it overwritable by the next response"
+        );
+    }
+
+    /// Adopting a newer identity must not cost messages the older copy had:
+    /// the local state is folded into the incoming copy before it replaces it.
+    #[test]
+    fn adopting_a_newer_identity_keeps_the_older_copys_messages() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let old_identity = SigningKey::generate(&mut rng);
+        let current_identity = SigningKey::generate(&mut rng);
+
+        // The old-generation copy carries a message the newer copy lacks.
+        let mut old_room = make_rejoin_test_room(&owner, &old_identity, true);
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let msg = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: vk.into(),
+                author: vk.into(),
+                time: get_current_system_time(),
+                content: RoomMessageBody::public("only in the old copy".to_string()),
+            },
+            &owner,
+        );
+        old_room.room_state.recent_messages.messages.push(msg);
+        let expected_messages = old_room.room_state.recent_messages.messages.len();
+        assert_eq!(
+            expected_messages, 1,
+            "precondition: old copy has the message"
+        );
+
+        let mut local = empty_rooms_for_merge();
+        let mut ranks = HashMap::new();
+        local
+            .merge_from_source(rooms_holding(vk, old_room), 3, &mut ranks)
+            .expect("old generation merge");
+        local
+            .merge_from_source(
+                rooms_holding(vk, make_rejoin_test_room(&owner, &current_identity, true)),
+                30,
+                &mut ranks,
+            )
+            .expect("newer generation merge");
+
+        let merged = local.map.get(&vk).unwrap();
+        assert_eq!(
+            merged.self_sk.to_bytes(),
+            current_identity.to_bytes(),
+            "identity comes from the newer generation"
+        );
+        assert_eq!(
+            merged.room_state.recent_messages.messages.len(),
+            expected_messages,
+            "…but the older copy's messages are folded in, not discarded"
+        );
+    }
+
+    /// `merge` (the single-source wrapper) must keep its historical
+    /// keep-local-on-conflict behaviour — several callers rely on it.
+    #[test]
+    fn single_source_merge_still_keeps_local_on_conflict() {
+        let mut rng = rand::thread_rng();
+        let owner = SigningKey::generate(&mut rng);
+        let vk = owner.verifying_key();
+        let local_sk = SigningKey::generate(&mut rng);
+        let incoming_sk = SigningKey::generate(&mut rng);
+
+        let mut local = rooms_holding(vk, make_rejoin_test_room(&owner, &local_sk, true));
+        local
+            .merge(rooms_holding(
+                vk,
+                make_rejoin_test_room(&owner, &incoming_sk, true),
+            ))
+            .expect("merge");
+
+        assert_eq!(
+            local.map.get(&vk).unwrap().self_sk.to_bytes(),
+            local_sk.to_bytes(),
+            "plain merge must be unchanged: local identity wins"
+        );
+    }
+
+    #[test]
+    fn record_identity_source_takes_the_highest_rank_seen() {
+        let vk = vk_from_seed(1);
+        let mut ranks = HashMap::new();
+
+        record_identity_source(&mut ranks, &vk, 5, true);
+        assert_eq!(ranks.get(&vk.to_bytes()), Some(&5));
+
+        // A newer source upgrades it.
+        record_identity_source(&mut ranks, &vk, 12, false);
+        assert_eq!(ranks.get(&vk.to_bytes()), Some(&12));
+
+        // An older source must NOT downgrade it — otherwise a late old-generation
+        // response would re-open the room to being overwritten.
+        record_identity_source(&mut ranks, &vk, 2, false);
+        assert_eq!(
+            ranks.get(&vk.to_bytes()),
+            Some(&12),
+            "an older source must never lower a room's recorded provenance"
         );
     }
 

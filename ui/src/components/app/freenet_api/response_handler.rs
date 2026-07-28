@@ -14,15 +14,16 @@ use crate::components::app::chat_delegate::{
     arm_legacy_migration_recovery, await_delegate_response, cas_store_correlation_key,
     clear_legacy_migration_in_progress, complete_pending_public_key_request,
     complete_pending_request, complete_pending_sign_request, complete_pending_signing_key_request,
-    decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
-    fire_legacy_migration_request, get_versioned_correlation_key, hydrate_hidden_dm_threads,
-    hydrate_outbound_dms_cache, is_legacy_delegate_key, is_legacy_migration_in_progress,
-    legacy_scoped_correlation, load_state_after_probe_legacy, mark_legacy_migration_done,
-    mark_legacy_migration_in_progress, parse_room_storage_key, per_room_terminal,
-    prune_outbound_dms_for_purges, room_storage_key, save_outbound_dms_to_delegate,
-    save_rooms_to_delegate, send_delegate_request, send_delegate_request_to,
-    set_load_state_if_current, LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest,
-    RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    current_delegate_source_rank, decide_legacy_migration_action, decide_per_room_load_action,
+    enqueue_delegate_request, fire_legacy_migration_request, get_versioned_correlation_key,
+    hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
+    is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
+    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
+    per_room_terminal, prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence,
+    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
+    send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
+    LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
+    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -135,6 +136,10 @@ impl ResponseHandler {
             HostResponse::DelegateResponse { key, values } => {
                 // Check if this is a response from any known legacy delegate
                 let is_legacy_delegate = is_legacy_delegate_key(key.bytes());
+                // Which delegate GENERATION answered (freenet/river#527).
+                // Captured here, at the DelegateResponse scope, because the
+                // per-value match below shadows `key` with the storage key.
+                let delegate_source_rank = source_rank_for_delegate_key(key.bytes());
                 if is_legacy_delegate {
                     info!("Received response from LEGACY delegate - checking for migration data");
                 }
@@ -361,6 +366,7 @@ impl ResponseHandler {
                                                         if hydrate_loaded_rooms(
                                                             loaded_rooms,
                                                             is_legacy_delegate,
+                                                            delegate_source_rank,
                                                             worker.attempt(),
                                                         ) {
                                                             flags.subscriptions_initiated = true;
@@ -866,7 +872,12 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             // Capture emptiness BEFORE `loaded` is moved into hydrate, for the
             // authoritative terminal decision below.
             let loaded_map_empty = loaded.map.is_empty();
-            if hydrate_loaded_rooms(loaded, false, worker.attempt()) {
+            if hydrate_loaded_rooms(
+                loaded,
+                false,
+                current_delegate_source_rank(),
+                worker.attempt(),
+            ) {
                 schedule_subscription_timeout_check();
             }
 
@@ -1039,7 +1050,12 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 // live rooms writes `Loaded` — a zero-live-room completion writes
                 // NOTHING so it can't stomp a concurrent legacy probe's `Migrating`
                 // into a false Empty; the universal backstop owns that terminal.
-                let had_rooms = hydrate_loaded_rooms(loaded, false, worker.attempt());
+                let had_rooms = hydrate_loaded_rooms(
+                    loaded,
+                    false,
+                    current_delegate_source_rank(),
+                    worker.attempt(),
+                );
                 if had_rooms {
                     schedule_subscription_timeout_check();
                 }
@@ -1252,7 +1268,12 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // re-save to the CURRENT delegate (which also marks legacy migration done and
     // resolves the load state to `Loaded` on the re-save's success/`Err` arms).
     let loaded = reconstruct_rooms(slots, meta);
-    if hydrate_loaded_rooms(loaded, true, worker.attempt()) {
+    if hydrate_loaded_rooms(
+        loaded,
+        true,
+        source_rank_for_delegate_key(legacy_key.bytes()),
+        worker.attempt(),
+    ) {
         schedule_subscription_timeout_check();
     }
 }
@@ -1305,7 +1326,12 @@ fn schedule_subscription_timeout_check() {
 /// schedule the subscription-timeout backstop (the old
 /// `flags.subscriptions_initiated`). Holds no `self`/`flags`, so it is callable
 /// from a spawned task as well as the synchronous message-loop arm.
-fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool, attempt: u32) -> bool {
+fn hydrate_loaded_rooms(
+    loaded_rooms: Rooms,
+    is_legacy_delegate: bool,
+    source_rank: u32,
+    attempt: u32,
+) -> bool {
     // freenet/river#397: a legacy-delegate response means we found the user's
     // rooms under an OLD delegate key and are about to migrate them (Ivvor's
     // case). Announce `Migrating` BEFORE the ROOMS merge below (which is
@@ -1391,64 +1417,20 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool, attempt: 
         .copied()
         .filter(|k| !tombstoned.contains(k))
         .collect();
-    // Per-room signing-key migration inputs. For
-    // owner-mode rooms we also need to know the
-    // contract id so we can chain
-    // EnsureRoomSubscription onto the migration
-    // task — chained so the delegate is guaranteed
-    // to have the signing key on file before it
-    // sees the subscribe request (Bug #6). The
-    // previous design fired both requests as
-    // independent `safe_spawn_local` tasks and the
-    // race ordering was non-deterministic, so the
-    // delegate's "no signing key on file" reject
-    // path silently aborted the subscription on
-    // every cold load.
-    let signing_keys: Vec<_> = loaded_rooms
-        .map
-        .iter()
-        .filter(|(key, _)| !tombstoned.contains(*key))
-        .map(|(key, room_data)| {
-            let owns_room = room_data.owner_vk == room_data.self_sk.verifying_key();
-            // Derive the contract id from the
-            // CURRENT bundled room-contract WASM,
-            // NOT from `room_data.contract_key`.
-            // `room_data.contract_key` is the
-            // contract id captured at the time
-            // the room was last saved to the
-            // delegate's `rooms_data` blob — if
-            // the bundled WASM has changed since
-            // then, `Rooms::merge()` (called from
-            // the deferred closure below) will
-            // call `regenerate_contract_key()`
-            // and migrate the key to the new
-            // WASM's hash. Using the stale
-            // pre-merge key here would subscribe
-            // the delegate to the OLD contract,
-            // which no longer exists on the
-            // network — defeating the entire
-            // Bug #6 fix on any cold-load that
-            // happens to coincide with a
-            // room-contract WASM rebuild. Codex
-            // P1 finding on PR #276 round 2.
-            let contract_id_for_owner: Option<[u8; 32]> = if owns_room {
-                Some(**crate::util::owner_vk_to_contract_key(&room_data.owner_vk).id())
-            } else {
-                None
-            };
-            (
-                *key,
-                room_data.room_key(),
-                room_data.self_sk.clone(),
-                contract_id_for_owner,
-            )
-        })
-        .collect();
-
     // Merge the loaded rooms with the current rooms
+    let loaded_keys = room_keys.clone();
     crate::util::defer(move || {
         ROOMS.with_mut(|current_rooms| {
-            if let Err(e) = current_rooms.merge(loaded_rooms) {
+            // Ranked by SOURCE, not arrival order (freenet/river#527): the
+            // legacy fan-out hydrates from every delegate generation at once,
+            // so an identity conflict is decided by which generation the copy
+            // came from.
+            let merged = crate::components::app::chat_delegate::with_identity_source_ranks(
+                |identity_ranks| {
+                    current_rooms.merge_from_source(loaded_rooms, source_rank, identity_ranks)
+                },
+            );
+            if let Err(e) = merged {
                 error!("Failed to merge rooms: {}", e);
             } else {
                 info!("Successfully merged rooms from delegate");
@@ -1524,119 +1506,161 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool, attempt: 
         update_document_title();
     });
 
-    // Migrate signing keys to delegate for each loaded room
-    // (uses pre-extracted signing_keys since ROOMS merge is deferred)
-    info!(
-        "Migrating signing keys to delegate for {} rooms",
-        signing_keys.len()
-    );
-    for (room_key, delegate_room_key, signing_key, owner_contract_id) in &signing_keys {
-        {
-            // Spawn async migration task via
-            // `safe_spawn_local`: per AGENTS.md
-            // "Dioxus WASM Signal Safety", direct
-            // `spawn_local` from inside a polled
-            // future causes RefCell re-entrancy
-            // panics on Firefox mobile.
-            let room_key_copy = *room_key;
-            let delegate_room_key = *delegate_room_key;
-            let signing_key = signing_key.clone();
-            let owner_contract_id = *owner_contract_id;
-            crate::util::safe_spawn_local(async move {
-                let result =
+    // Migrate signing keys to delegate for each loaded room.
+    //
+    // DEFERRED so it runs AFTER the merge above — both go through
+    // `crate::util::defer` (setTimeout(0), FIFO), the same ordering
+    // `mark_needs_sync` below already relies on — and reads the identity that
+    // actually WON that merge rather than the one this particular response
+    // happened to carry (freenet/river#527).
+    //
+    // Reading it BEFORE the merge was the second half of the rollback: when the
+    // merge KEPT a different identity for a room, this loop still pushed the
+    // incoming (losing) key to the delegate, and `migrate_signing_key`
+    // overwrites on mismatch ("Delegate has stale key for room") — so the
+    // delegate was left signing with an identity the UI had already rejected,
+    // and every signature it produced was invalid for the room.
+    let loaded_keys_for_signing = loaded_keys;
+    crate::util::defer(move || {
+        let signing_keys: Vec<_> = {
+            let rooms = ROOMS.peek();
+            loaded_keys_for_signing
+                .iter()
+                .filter_map(|vk| {
+                    // Absent => the merge dropped this room (tombstoned, or an
+                    // identity conflict it resolved against this copy). Nothing
+                    // to migrate; pushing a key for it is exactly the bug above.
+                    let room_data = rooms.map.get(vk)?;
+                    let owns_room = room_data.owner_vk == room_data.self_sk.verifying_key();
+                    // Derive the contract id from the CURRENT bundled
+                    // room-contract WASM so an owner-mode subscription can't
+                    // target a contract generation that no longer exists
+                    // (Codex P1 on PR #276 round 2).
+                    let contract_id_for_owner: Option<[u8; 32]> = if owns_room {
+                        Some(**crate::util::owner_vk_to_contract_key(&room_data.owner_vk).id())
+                    } else {
+                        None
+                    };
+                    Some((
+                        *vk,
+                        room_data.room_key(),
+                        room_data.self_sk.clone(),
+                        contract_id_for_owner,
+                    ))
+                })
+                .collect()
+        };
+        info!(
+            "Migrating signing keys to delegate for {} rooms",
+            signing_keys.len()
+        );
+        for (room_key, delegate_room_key, signing_key, owner_contract_id) in &signing_keys {
+            {
+                // Spawn async migration task via
+                // `safe_spawn_local`: per AGENTS.md
+                // "Dioxus WASM Signal Safety", direct
+                // `spawn_local` from inside a polled
+                // future causes RefCell re-entrancy
+                // panics on Firefox mobile.
+                let room_key_copy = *room_key;
+                let delegate_room_key = *delegate_room_key;
+                let signing_key = signing_key.clone();
+                let owner_contract_id = *owner_contract_id;
+                crate::util::safe_spawn_local(async move {
+                    let result =
                     // HYDRATION: startup LoadRooms re-migrating an already-stored
                     // key — NOT a new identity choice, so it must not override the
                     // registry and is discarded if superseded (freenet/river#414 P1).
                     crate::signing::migrate_signing_key(delegate_room_key, &signing_key, false)
                         .await;
 
-                if result != crate::signing::MigrationResult::Failed {
-                    // Must defer signal mutations from spawn_local to
-                    // avoid RefCell already borrowed panics in Dioxus runtime
-                    let migrated_key = signing_key.clone();
-                    crate::util::defer(move || {
-                        let mut sanitized = false;
-                        ROOMS.with_mut(|rooms| {
-                            if let Some(room_data) = rooms.map.get_mut(&room_key_copy) {
-                                // Only mark migrated for the identity that actually
-                                // completed: an overwrite may have replaced `self_sk`
-                                // while this migration ran, and marking the room
-                                // migrated for a superseded key would strand the new
-                                // identity (freenet/river#414).
-                                if room_data.self_sk != migrated_key {
-                                    return;
+                    if result != crate::signing::MigrationResult::Failed {
+                        // Must defer signal mutations from spawn_local to
+                        // avoid RefCell already borrowed panics in Dioxus runtime
+                        let migrated_key = signing_key.clone();
+                        crate::util::defer(move || {
+                            let mut sanitized = false;
+                            ROOMS.with_mut(|rooms| {
+                                if let Some(room_data) = rooms.map.get_mut(&room_key_copy) {
+                                    // Only mark migrated for the identity that actually
+                                    // completed: an overwrite may have replaced `self_sk`
+                                    // while this migration ran, and marking the room
+                                    // migrated for a superseded key would strand the new
+                                    // identity (freenet/river#414).
+                                    if room_data.self_sk != migrated_key {
+                                        return;
+                                    }
+                                    room_data.key_migrated_to_delegate = true;
+                                    let params = river_core::room_state::ChatRoomParametersV1 {
+                                        owner: room_key_copy,
+                                    };
+                                    let removed = crate::signing::remove_unverifiable_messages(
+                                        &mut room_data.room_state,
+                                        &params,
+                                    );
+                                    sanitized = removed > 0;
                                 }
-                                room_data.key_migrated_to_delegate = true;
-                                let params = river_core::room_state::ChatRoomParametersV1 {
-                                    owner: room_key_copy,
-                                };
-                                let removed = crate::signing::remove_unverifiable_messages(
-                                    &mut room_data.room_state,
-                                    &params,
-                                );
-                                sanitized = removed > 0;
+                            });
+                            if sanitized {
+                                crate::components::app::mark_needs_sync(room_key_copy);
                             }
                         });
-                        if sanitized {
-                            crate::components::app::mark_needs_sync(room_key_copy);
-                        }
-                    });
-                }
+                    }
 
-                // For owner-mode rooms, chain
-                // EnsureRoomSubscription onto
-                // the (just-completed) signing
-                // key migration. Sequencing
-                // ensures the delegate's
-                // "no signing key on file"
-                // reject path can't trip on a
-                // race with `StoreSigningKey`
-                // (Bug #6). The
-                // `migrate_signing_key` call
-                // above either confirmed an
-                // existing key or stored a
-                // fresh one, so the delegate's
-                // signing-key probe will
-                // succeed by the time
-                // EnsureRoomSubscription lands.
-                //
-                // Skip on `MigrationResult::Failed`:
-                // a Failed migration means
-                // the delegate refused to
-                // confirm/store the signing
-                // key (transport down,
-                // delegate not registered,
-                // or signature mismatch), so
-                // `EnsureRoomSubscription`
-                // would either be rejected
-                // with the same "no signing
-                // key on file" error or
-                // simply time out. Firing
-                // anyway produced log spam
-                // per cold-load × per
-                // owned-room when the delegate
-                // was persistently
-                // unreachable (PR #276
-                // review feedback). The
-                // trade-off: we lose the
-                // theoretical "stale key
-                // still on file even though
-                // verify failed" recovery
-                // path, but in practice
-                // that's vanishingly rare,
-                // and the next cold-load
-                // after the user reconnects
-                // will retry from scratch
-                // (the per-session dedup
-                // resets across reloads).
-                if let Some(contract_id) = owner_contract_id {
-                    if result == crate::signing::MigrationResult::Failed {
-                        warn!(
+                    // For owner-mode rooms, chain
+                    // EnsureRoomSubscription onto
+                    // the (just-completed) signing
+                    // key migration. Sequencing
+                    // ensures the delegate's
+                    // "no signing key on file"
+                    // reject path can't trip on a
+                    // race with `StoreSigningKey`
+                    // (Bug #6). The
+                    // `migrate_signing_key` call
+                    // above either confirmed an
+                    // existing key or stored a
+                    // fresh one, so the delegate's
+                    // signing-key probe will
+                    // succeed by the time
+                    // EnsureRoomSubscription lands.
+                    //
+                    // Skip on `MigrationResult::Failed`:
+                    // a Failed migration means
+                    // the delegate refused to
+                    // confirm/store the signing
+                    // key (transport down,
+                    // delegate not registered,
+                    // or signature mismatch), so
+                    // `EnsureRoomSubscription`
+                    // would either be rejected
+                    // with the same "no signing
+                    // key on file" error or
+                    // simply time out. Firing
+                    // anyway produced log spam
+                    // per cold-load × per
+                    // owned-room when the delegate
+                    // was persistently
+                    // unreachable (PR #276
+                    // review feedback). The
+                    // trade-off: we lose the
+                    // theoretical "stale key
+                    // still on file even though
+                    // verify failed" recovery
+                    // path, but in practice
+                    // that's vanishingly rare,
+                    // and the next cold-load
+                    // after the user reconnects
+                    // will retry from scratch
+                    // (the per-session dedup
+                    // resets across reloads).
+                    if let Some(contract_id) = owner_contract_id {
+                        if result == crate::signing::MigrationResult::Failed {
+                            warn!(
                                 "Skipping EnsureRoomSubscription for {:?} — signing-key migration failed (delegate likely unreachable). Will retry on next cold load.",
                                 delegate_room_key
                             );
-                    } else {
-                        match crate::components::app::chat_delegate::ensure_room_subscription_once(
+                        } else {
+                            match crate::components::app::chat_delegate::ensure_room_subscription_once(
                                 delegate_room_key,
                                 contract_id,
                             )
@@ -1655,11 +1679,12 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool, attempt: 
                                     e
                                 ),
                             }
+                        }
                     }
-                }
-            });
+                });
+            }
         }
-    }
+    });
 
     // Mark all loaded rooms as having completed initial sync
     // and subscribe to receive updates
@@ -1753,7 +1778,16 @@ fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool, attempt: 
                 Ok(_) => {
                     info!("Successfully migrated room data to new delegate");
                     clear_legacy_migration_in_progress();
-                    mark_legacy_migration_done();
+                    // Seal only once the whole legacy fan-out has gone quiet —
+                    // NOT here (freenet/river#527). Every generation is probed
+                    // at once; sealing on the FIRST one to finish its re-save
+                    // ends the migration for good while newer generations may
+                    // still be answering. If the tab closed in that window, the
+                    // current delegate was left holding the older copy, it is
+                    // now non-empty, and no later session ever re-probes — which
+                    // is what turned a transient identity rollback into a
+                    // permanent one.
+                    request_legacy_seal_on_quiescence();
                     // Review 11: this runs after the save await, so gate on the
                     // captured attempt (a reconnect/retry may have superseded us).
                     if had_loaded_rooms {
@@ -2265,11 +2299,24 @@ mod tests {
             "no bare mark_fetch_failure — all attempt-scoped via worker.mark_fetch_failure"
         );
         // hydrate threads the attempt through, and its legacy writes are gated.
+        // Whitespace-stripped: the signature is long enough that rustfmt splits
+        // it across lines, and a contiguous needle would go vacuously false the
+        // next time a parameter is added.
+        let strip_ws = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let squeezed = strip_ws(production);
+        let signature = strip_ws(concat!(
+            "fn hydrate_loaded_rooms(",
+            " loaded_rooms: Rooms,",
+            " is_legacy_delegate: bool,",
+            " source_rank: u32,",
+            " attempt: u32,",
+            ")"
+        ));
         assert!(
-            production.contains(
-                "fn hydrate_loaded_rooms(loaded_rooms: Rooms, is_legacy_delegate: bool, attempt: u32)"
-            ),
-            "hydrate_loaded_rooms must take an attempt to gate its legacy load-state writes"
+            squeezed.contains(&signature),
+            "hydrate_loaded_rooms must take an attempt to gate its legacy load-state writes, \
+             and a source_rank so identity conflicts are resolved by delegate generation \
+             rather than response arrival order (freenet/river#527)"
         );
         assert!(
             production.contains("set_load_state_if_current(attempt, RoomsLoadState::Migrating)"),
@@ -2937,5 +2984,86 @@ mod tests {
         assert!(recovered.removed_rooms.contains(&left));
         assert_eq!(recovered.current_room_key, Some(present_b));
         assert_eq!(recovered.room_order, vec![present_b, present_a]);
+    }
+
+    /// freenet/river#527 (second cause): the signing key pushed to the delegate
+    /// must be the identity that WON the merge, not the one this particular
+    /// delegate response happened to carry.
+    ///
+    /// The extraction used to run BEFORE the (deferred) merge, straight off
+    /// `loaded_rooms`. So when the merge kept a different identity for a room —
+    /// or dropped it — this still pushed the losing key, and
+    /// `migrate_signing_key` overwrites on mismatch. The delegate was left
+    /// signing with an identity the UI had already rejected, which invalidates
+    /// every signature it produces for that room.
+    #[test]
+    fn signing_key_migration_reads_the_merged_rooms_not_the_loaded_copy() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        let start = production
+            .find("let loaded_keys_for_signing = loaded_keys;")
+            .expect("the signing-key migration block must exist");
+        let end = production[start..]
+            .find("// Mark all loaded rooms as having completed initial sync")
+            .expect("the block's end marker must exist");
+        let block = &production[start..start + end];
+
+        assert!(
+            block.contains("crate::util::defer("),
+            "the signing-key migration must be DEFERRED so it runs after the merge"
+        );
+        assert!(
+            block.contains("ROOMS.peek()"),
+            "it must read the MERGED rooms to learn which identity won"
+        );
+        assert!(
+            !block.contains("loaded_rooms"),
+            "it must NOT read the pre-merge loaded copy — that is the #527 bug: \
+             pushing an identity the merge rejected over the good one"
+        );
+        assert!(
+            block.contains("migrate_signing_key"),
+            "guard against this pin going vacuous if the block is renamed away"
+        );
+    }
+
+    /// freenet/river#527 (third cause): a legacy migration seals only once the
+    /// whole fan-out is quiescent.
+    ///
+    /// Sealing inside the re-save ended the migration as soon as the FIRST
+    /// generation finished, while newer generations could still be answering.
+    /// Close the tab in that window and the current delegate is left holding
+    /// the older copy — non-empty, so no later session re-probes legacy — which
+    /// is what made an identity rollback permanent rather than transient.
+    #[test]
+    fn legacy_resave_defers_the_seal_to_quiescence() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        let ok_arm = production
+            .find("Successfully migrated room data to new delegate")
+            .expect("legacy re-save success marker must exist");
+        // Bounded to the Ok arm itself, before the Err arm's marker.
+        let arm_end = production[ok_arm..]
+            .find("Failed to migrate room data to new delegate")
+            .expect("the Err arm marker must follow the Ok arm");
+        let arm = &production[ok_arm..ok_arm + arm_end];
+
+        assert!(
+            arm.contains("request_legacy_seal_on_quiescence()"),
+            "the legacy re-save must request a quiescence-gated seal"
+        );
+        assert!(
+            !arm.contains("mark_legacy_migration_done("),
+            "it must NOT seal inline — that ends the migration while newer \
+             delegate generations may still be answering (freenet/river#527)"
+        );
     }
 }

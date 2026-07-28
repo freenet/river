@@ -296,6 +296,13 @@ pub async fn migrate_signing_key(
     // discarded and any later stale hydration for a DIFFERENT key is.
     if mark_authoritative {
         set_current_room_identity(room_key, signing_key.verifying_key());
+        // Nothing the delegates hold outranks a deliberate choice. Merge now
+        // ranks identity conflicts by delegate generation (freenet/river#527),
+        // so without this an import/accept would be overwritable by any load
+        // from a newer generation than the one that supplied the room —
+        // re-opening exactly the freenet/river#414 clobber this function's
+        // `CURRENT_ROOM_IDENTITY` guard closes for the in-session case.
+        crate::components::app::chat_delegate::mark_identity_source_authoritative(room_key);
     }
 
     // Serialize concurrent migrations for THIS room so the non-atomic

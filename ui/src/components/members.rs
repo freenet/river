@@ -2108,6 +2108,14 @@ fn complete_identity_import(
     let new_sk = export.signing_key.clone();
     let room_key_bytes = owner_key.to_bytes();
 
+    // Rank this identity above every delegate generation IMMEDIATELY —
+    // synchronously, before the deferred swap below and before the spawned
+    // `migrate_signing_key` (which marks it too). Merge resolves identity
+    // conflicts by source rank (freenet/river#527), and a legacy response can
+    // land in the window between this call and the swap; marking here means
+    // such a response loses the conflict instead of undoing the import.
+    crate::components::app::chat_delegate::mark_identity_source_authoritative(room_key_bytes);
+
     // Defer signal mutations to a clean execution context to prevent RefCell
     // re-entrant borrow panics.
     //
