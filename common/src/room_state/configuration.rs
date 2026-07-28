@@ -85,6 +85,7 @@ impl ComposableState for AuthorizedConfigurationV1 {
                 || delta.configuration.max_members == 0
                 || delta.configuration.max_room_name == 0
                 || delta.configuration.max_room_description == 0
+                || delta.configuration.max_direct_messages == Some(0)
             {
                 return Err("Invalid configuration values".to_string());
             }
@@ -183,6 +184,11 @@ impl Default for Configuration {
             max_members: 200,
             max_room_name: 100,
             max_room_description: 500,
+            // `None`, not `Some(DEFAULT_MAX_DIRECT_MESSAGES)`: the cap is read
+            // through `effective_max_direct_messages`, so leaving it unset
+            // gives new rooms the same bound while keeping the serialized
+            // default configuration byte-identical to pre-#519 bytes.
+            max_direct_messages: None,
         }
     }
 }
@@ -212,6 +218,113 @@ pub struct Configuration {
     pub max_members: usize,
     pub max_room_name: usize,
     pub max_room_description: usize,
+
+    /// Owner-tunable global bound on `direct_messages.messages`, mirroring how
+    /// `max_recent_messages` bounds `recent_messages`. `None` means "this
+    /// configuration was signed before the field existed"; read it through
+    /// [`Configuration::effective_max_direct_messages`], which substitutes
+    /// [`DEFAULT_MAX_DIRECT_MESSAGES`], so pre-existing rooms are bounded
+    /// without the owner having to re-sign anything.
+    ///
+    /// # Why `Option` + `skip_serializing_if`, and why that is NOT optional
+    ///
+    /// [`AuthorizedConfigurationV1::verify_signature`] re-serializes this
+    /// whole struct with ciborium and checks the owner's signature over those
+    /// bytes. A plain `#[serde(default)] usize` deserializes old bytes to `0`
+    /// and then re-serializes them WITH the extra map entry, so the bytes no
+    /// longer match what the owner signed: every room created before this
+    /// field existed would fail `verify`, which also gates the #292 migration
+    /// PUT — i.e. every existing room bricked, unrecoverably.
+    ///
+    /// `Option` + `skip_serializing_if` makes the addition byte-neutral: an
+    /// old configuration decodes to `None`, re-encodes without the key, and
+    /// its signature still verifies. Pinned by
+    /// `legacy_configuration_bytes_still_verify_after_adding_the_field`.
+    ///
+    /// Any future field added to `Configuration` MUST follow this pattern AND
+    /// be appended LAST — inserting an `Option` field mid-struct reorders the
+    /// CBOR map for configurations that set it.
+    ///
+    /// The pattern is one-directional, and deliberately so. It protects OLD
+    /// bytes read by NEW code. The reverse — an old-struct client reading a
+    /// configuration that actually SETS this field — still breaks: serde has no
+    /// `deny_unknown_fields` here, so such a client silently drops the key,
+    /// re-serializes one entry short, and the owner signature fails. That is
+    /// unreachable only because the contract key is `BLAKE3(wasm, params)` and
+    /// both the UI and riverctl `include_bytes!` the WASM they derive the key
+    /// from: a client with the old struct also derives the OLD contract key and
+    /// never sees state carrying this field. Do not weaken that coupling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_direct_messages: Option<usize>,
+}
+
+/// Global cap applied to `direct_messages.messages` when a room's
+/// [`Configuration::max_direct_messages`] is unset.
+///
+/// Stops the DM set — and therefore the DM-pinned member set that
+/// `post_apply_cleanup` refuses to prune — from growing without limit. Owners
+/// who want a tighter or looser bound set `max_direct_messages` explicitly.
+/// See freenet/river#519.
+///
+/// # Why 300
+///
+/// Measured on the live official room when the cap was set: 499 DMs, of which
+/// 377 were already older than 24 hours, occupying ~128 KB of a ~260 KB room
+/// state — about half the state was DMs. 300 sheds roughly 40% of that set and
+/// roughly halves the DM share of state, without being as aggressive as 200.
+///
+/// # What 300 costs, stated plainly
+///
+/// Against the per-pair cap of 100, a global 300 fixes room-wide capacity at
+/// about THREE saturated ordered pairs — and ordered pairs are directional, so
+/// that is one member writing to three correspondents, not three separate
+/// relationships. A busy few conversations can therefore evict every other
+/// conversation in the room to zero. At 500 that took five. This is a real
+/// consequence of a global (rather than per-pair) bound and is accepted for the
+/// same reason as the rest: per-member DM contracts make it moot.
+///
+/// The adversarial form is worth knowing: `verify` cannot check timestamps (a
+/// contract has no wall clock) and [`check_dm_future_skew`] only runs at
+/// signing time on an honest client, so a skewed or hostile client can post 100
+/// future-dated DMs into each of three pairs and evict the room's DM history
+/// for everyone. That property belongs to the global bound itself, not to this
+/// particular number; 300 makes it cheaper than 500 did.
+///
+/// This DOES delete history on rollout, including messages the recipient has
+/// not read yet. That cost is accepted deliberately (Ian, 2026-07-27: "people
+/// are gonna lose direct messages before they've read them, but I think we just
+/// need to accept that for now"). Do NOT add machinery to avoid it — read
+/// tracking, age exemptions, or a grace period would all be wall-clock-
+/// dependent, which `ChatRoomStateV1::post_apply_cleanup` forbids, and would be
+/// thrown away by the successor design below.
+///
+/// # This bound is interim
+///
+/// The intended long-term fix is moving DMs out of the room contract entirely,
+/// into dedicated per-member contracts. This cap exists to bound the damage
+/// until then, so it is deliberately the simplest correct thing: a count, a
+/// deterministic order, and a horizon. The trim lives wholly inside
+/// `direct_messages.rs` and `post_apply_cleanup` was not touched, so the
+/// retention logic is a clean deletion later.
+///
+/// One piece does NOT delete cleanly, and it is worth knowing now:
+/// [`Configuration::max_direct_messages`] is a signed wire field. Once any
+/// owner has set it explicitly, a future struct that removes it re-serializes
+/// one CBOR entry short and that owner's signature fails — see the field's own
+/// note. So the field itself is effectively permanent even after DMs move out;
+/// it would have to be kept and ignored, not dropped.
+pub const DEFAULT_MAX_DIRECT_MESSAGES: usize = 300;
+
+impl Configuration {
+    /// The global DM cap in force for this room: the owner's explicit
+    /// [`Self::max_direct_messages`], or [`DEFAULT_MAX_DIRECT_MESSAGES`] when
+    /// unset. Every retention and horizon decision MUST read the cap through
+    /// here so a legacy (`None`) configuration and an explicitly-defaulted one
+    /// behave identically.
+    pub fn effective_max_direct_messages(&self) -> usize {
+        self.max_direct_messages
+            .unwrap_or(DEFAULT_MAX_DIRECT_MESSAGES)
+    }
 }
 
 #[cfg(test)]

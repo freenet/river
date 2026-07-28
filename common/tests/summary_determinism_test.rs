@@ -20,7 +20,7 @@ use freenet_scaffold::util::FastHash;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{BanId, BansV1};
 use river_core::room_state::direct_messages::{
-    DirectMessagesSummary, DmOrderKey, DmPairHorizon, SignatureBytes,
+    DirectMessagesSummary, DmOrderKey, DmPairHorizon, DmRetentionHorizon, SignatureBytes,
 };
 use river_core::room_state::member::{MemberId, MembersV1};
 use river_core::room_state::member_info::MemberInfoV1;
@@ -218,15 +218,25 @@ fn direct_messages_summary_serialization_is_order_independent() {
         })
         .collect();
 
+    // global_horizon is a single value derived from the held set, so it is
+    // identical on both sides; carried here so the field is covered by the
+    // serialization comparison rather than defaulted away.
+    let global_horizon = DmRetentionHorizon::OldestRetained(DmOrderKey {
+        timestamp: 7,
+        signature: SignatureBytes([7u8; 64]),
+    });
+
     let s_fwd = DirectMessagesSummary {
         message_signatures: sigs_fwd.into_iter().collect(),
         purge_versions: purge_versions.clone(),
         pair_horizons: pair_horizons.clone(),
+        global_horizon: global_horizon.clone(),
     };
     let s_rev = DirectMessagesSummary {
         message_signatures: sigs_rev.into_iter().collect(),
         purge_versions,
         pair_horizons,
+        global_horizon,
     };
 
     assert_eq!(
@@ -287,6 +297,10 @@ fn top_level_summary_serialization_is_order_independent() {
                     },
                 })
                 .collect(),
+            global_horizon: DmRetentionHorizon::OldestRetained(DmOrderKey {
+                timestamp: 1,
+                signature: SignatureBytes([1u8; 64]),
+            }),
         };
 
         ChatRoomStateV1Summary {

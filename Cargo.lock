@@ -591,7 +591,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib 0.8.3",
+ "freenet-stdlib 0.8.5",
  "rand 0.8.6",
  "river-core",
  "serde",
@@ -2321,7 +2321,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib 0.8.3",
+ "freenet-stdlib 0.8.5",
  "serde",
  "serde_with",
 ]
@@ -2419,9 +2419,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.8.3"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ce69f7b87ca5fedb784da0194e26a3315bc23b11e346f7a8413c48abdcac73f"
+checksum = "b62aeba7634d1ae5c2d02f78db33ee40442511858275be5be2099d24a13b2559"
 dependencies = [
  "bincode",
  "blake3",
@@ -4717,7 +4717,7 @@ dependencies = [
  "freenet-migrate-build",
  "freenet-scaffold",
  "freenet-scaffold-macro",
- "freenet-stdlib 0.8.3",
+ "freenet-stdlib 0.8.5",
  "hex",
  "proptest",
  "rand 0.8.6",
@@ -4744,7 +4744,7 @@ dependencies = [
  "freenet-migrate",
  "freenet-migrate-build",
  "freenet-scaffold",
- "freenet-stdlib 0.8.3",
+ "freenet-stdlib 0.8.5",
  "futures",
  "futures-timer",
  "getrandom 0.2.17",
@@ -4766,7 +4766,7 @@ dependencies = [
 
 [[package]]
 name = "riverctl"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4783,7 +4783,7 @@ dependencies = [
  "ed25519-dalek",
  "freenet-migrate",
  "freenet-scaffold",
- "freenet-stdlib 0.8.3",
+ "freenet-stdlib 0.8.5",
  "freenet-test-network",
  "fs2",
  "futures",
@@ -4816,7 +4816,7 @@ dependencies = [
  "ed25519-dalek",
  "freenet",
  "freenet-scaffold",
- "freenet-stdlib 0.8.3",
+ "freenet-stdlib 0.8.5",
  "once_cell",
  "rand 0.8.6",
  "river-core",
@@ -6756,7 +6756,7 @@ dependencies = [
  "byteorder",
  "ciborium",
  "ed25519-dalek",
- "freenet-stdlib 0.8.3",
+ "freenet-stdlib 0.8.5",
  "rand 0.8.6",
  "river-core",
  "tar",

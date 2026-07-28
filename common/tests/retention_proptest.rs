@@ -41,7 +41,7 @@ use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::direct_messages::{
     sign_direct_message, AuthorizedDirectMessage, DirectMessagesDelta, DirectMessagesV1,
-    DmOrderKey, MAX_DM_MESSAGES_PER_PAIR,
+    DmOrderKey, DmRetentionHorizon, MAX_DM_MESSAGES_PER_PAIR,
 };
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersV1};
 use river_core::room_state::message::{
@@ -863,11 +863,14 @@ fn absorbing_two_dm_peers_is_associative() {
 
 /// Self-merge is the identity for DMs too.
 ///
-/// **STRUCTURALLY WEAK — it cannot fail for any mutation of the DM trim or the
-/// pair horizon, and must not be counted as covering them.** A self-merge
-/// produces `delta == None`, and `DirectMessagesV1::apply_delta` early-returns
-/// on `None` after `sort_state`, *before* `trim_pairs_to_cap` — so neither the
-/// trim nor the horizon filter is on this path at all.
+/// **STRUCTURALLY WEAK — it cannot fail for any mutation of the DM horizon, and
+/// must not be counted as covering it.** A self-merge produces `delta == None`,
+/// so the horizon FILTER in `delta` is not on this path at all.
+///
+/// (Since freenet/river#519 the `None` arm of `DirectMessagesV1::apply_delta`
+/// does run the trims, via `enforce_caps_and_sort`, so they are technically on
+/// this path — but only as a no-op, because the state was already normalised
+/// when it was built. The property remains weak.)
 ///
 /// Kept because it is the base case of the monoid and would catch a `delta`
 /// that offered entries the receiver already holds. Labelled explicitly so it
@@ -1048,6 +1051,222 @@ fn whole_room_state_gossip_terminates_across_the_cbor_round_trip() {
             );
             Ok(())
         },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DirectMessagesV1 — the GLOBAL cap (freenet/river#519)
+// ---------------------------------------------------------------------------
+//
+// Every DM property above leaves `max_direct_messages` unset, so it runs at the
+// DEFAULT (300) while `DM_POOL` allows at most 200 retained DMs across the two
+// ordered pairs — the global trim can never fire there and the global horizon
+// is permanently `Open`. These properties supply a cap that BITES, so the third
+// retention rule gets the same generalised treatment as the other two.
+//
+// That headroom is now only 100 (200 held vs a 300 default), where it used to
+// be 300. If `DEFAULT_MAX_DIRECT_MESSAGES` ever drops to 200 or below, the
+// properties above silently START exercising the global trim against an oracle
+// (`newest_dm_keys`) that models only the per-pair rule, and they will fail.
+// That is the correct failure — fix them by threading the cap through, not by
+// raising the pool.
+
+/// The largest global DM cap these properties generate. Kept well below the
+/// ~200 a peer can hold after the per-pair trim, so the global cap genuinely
+/// binds rather than being slack.
+const MAX_DM_CAP: usize = 60;
+
+/// `parent_with_cap`, plus an explicit global DM cap.
+fn parent_with_dm_cap(dm_cap: usize) -> ChatRoomStateV1 {
+    let f = fixture();
+    ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                max_recent_messages: MAX_CAP,
+                max_message_size: 1_000,
+                max_members: 16,
+                max_direct_messages: Some(dm_cap),
+                ..Default::default()
+            },
+            &f.owner_sk,
+        ),
+        members: f.members.clone(),
+        ..Default::default()
+    }
+}
+
+/// The globally-capped DM oracle: the per-pair oracle FIRST, then the newest
+/// `dm_cap` of what survives — matching `enforce_caps_and_sort`'s pinned order.
+/// Applying the global cut first would model a different (and worse) function;
+/// `dm_global_cap_test::pair_trim_runs_before_the_global_trim_…` pins the order
+/// itself.
+fn newest_dm_keys_globally_capped(union: PairKeys, dm_cap: usize) -> PairKeys {
+    let per_pair = newest_dm_keys(union);
+
+    let mut all: Vec<(DmOrderKey, (MemberId, MemberId))> = per_pair
+        .iter()
+        .flat_map(|(pair, keys)| keys.iter().cloned().map(move |k| (k, *pair)))
+        .collect();
+    // Signatures are unique per DM, so ordering by key alone is already a
+    // strict total order; the pair rides along only to rebuild the map.
+    all.sort();
+    let cut = all.len().saturating_sub(dm_cap);
+    let kept = all.split_off(cut);
+
+    let mut out: PairKeys = BTreeMap::new();
+    for (key, pair) in kept {
+        out.entry(pair).or_default().push(key);
+    }
+    for keys in out.values_mut() {
+        keys.sort();
+    }
+    out
+}
+
+/// Retention: a merge keeps EXACTLY the newest `dm_cap` of the union, after the
+/// per-pair trim. Exact equality, so a change that raises or drops the global
+/// cap fails rather than passing vacuously.
+#[test]
+fn a_dm_merge_retains_exactly_the_newest_global_cap_of_the_union() {
+    let f = fixture();
+    check(
+        64,
+        (dm_held_indices(), dm_held_indices(), 1..=MAX_DM_CAP),
+        |(fwd, rev, dm_cap)| {
+            let parent = parent_with_dm_cap(dm_cap);
+            let mut a = dms_from(&parent, &fwd, &[]);
+            let b = dms_from(&parent, &[], &rev);
+
+            let expected = newest_dm_keys_globally_capped(dm_key_union(&a, &b), dm_cap);
+
+            let delta = b.delta(&parent, &f.params, &a.summarize(&parent, &f.params));
+            a.apply_delta(&parent, &f.params, &delta)
+                .expect("apply dm delta");
+
+            prop_assert!(
+                a.messages.len() <= dm_cap,
+                "the merged state exceeds the global cap: {} > {}",
+                a.messages.len(),
+                dm_cap
+            );
+            prop_assert_eq!(
+                dm_keys(&a),
+                expected,
+                "the merge did not retain exactly the newest {} of the union",
+                dm_cap
+            );
+            Ok(())
+        },
+    );
+}
+
+/// Termination on the global axis: after one merge the sender has nothing
+/// further to offer. This is the property the resend loop violated.
+#[test]
+fn merging_a_dm_peer_under_a_global_cap_leaves_it_with_nothing_further_to_offer() {
+    let f = fixture();
+    check(
+        64,
+        (dm_held_indices(), dm_held_indices(), 1..=MAX_DM_CAP),
+        |(fwd, rev, dm_cap)| {
+            let parent = parent_with_dm_cap(dm_cap);
+            let mut a = dms_from(&parent, &fwd, &rev);
+            let b = dms_from(&parent, &rev, &fwd);
+
+            let delta = b.delta(&parent, &f.params, &a.summarize(&parent, &f.params));
+            a.apply_delta(&parent, &f.params, &delta)
+                .expect("apply dm delta");
+
+            prop_assert_eq!(
+                b.delta(&parent, &f.params, &a.summarize(&parent, &f.params)),
+                None,
+                "B still had a DM payload for A after A merged it — the resend loop, \
+                 now on the global axis"
+            );
+            Ok(())
+        },
+    );
+}
+
+/// Absorbing two peers is commutative under the global cap — the strongest
+/// available statement that the trim is a pure function of the union rather
+/// than of arrival order.
+#[test]
+fn absorbing_two_dm_peers_under_a_global_cap_is_commutative() {
+    let f = fixture();
+    check(
+        48,
+        (
+            dm_held_indices(),
+            dm_held_indices(),
+            dm_held_indices(),
+            1..=MAX_DM_CAP,
+        ),
+        |(base, x, y, dm_cap)| {
+            let parent = parent_with_dm_cap(dm_cap);
+            let peer_x = dms_from(&parent, &x, &[]);
+            let peer_y = dms_from(&parent, &[], &y);
+
+            let absorb = |first: &DirectMessagesV1, second: &DirectMessagesV1| {
+                let mut s = dms_from(&parent, &base, &[]);
+                for peer in [first, second] {
+                    let delta = peer.delta(&parent, &f.params, &s.summarize(&parent, &f.params));
+                    s.apply_delta(&parent, &f.params, &delta)
+                        .expect("apply dm delta");
+                }
+                s
+            };
+
+            prop_assert_eq!(
+                absorb(&peer_x, &peer_y),
+                absorb(&peer_y, &peer_x),
+                "absorbing two peers in the opposite order produced a different state"
+            );
+            Ok(())
+        },
+    );
+}
+
+/// Anti-vacuity self-check, mirroring the one the other axes have: the
+/// generators must actually REACH the global cap, or every property above is
+/// decorative. Without this, raising `MAX_DM_CAP` past what the pools can
+/// produce would silently turn the whole block into a no-op.
+#[test]
+fn the_generator_reaches_peers_at_the_global_dm_cap() {
+    let at_cap = Cell::new(0usize);
+    let horizon_published = Cell::new(0usize);
+    let f = fixture();
+
+    check(
+        64,
+        (dm_held_indices(), dm_held_indices(), 1..=MAX_DM_CAP),
+        |(fwd, rev, dm_cap)| {
+            let parent = parent_with_dm_cap(dm_cap);
+            let d = dms_from(&parent, &fwd, &rev);
+            if d.messages.len() >= dm_cap {
+                at_cap.set(at_cap.get() + 1);
+            }
+            if matches!(
+                d.summarize(&parent, &f.params).global_horizon,
+                DmRetentionHorizon::OldestRetained(_)
+            ) {
+                horizon_published.set(horizon_published.get() + 1);
+            }
+            Ok(())
+        },
+    );
+
+    assert!(
+        at_cap.get() > 32,
+        "only {} of 64 generated peers reached the global cap — the properties \
+         above are largely vacuous",
+        at_cap.get()
+    );
+    assert!(
+        horizon_published.get() > 32,
+        "only {} of 64 generated peers published a real global horizon — the \
+         termination property above is largely vacuous",
+        horizon_published.get()
     );
 }
 

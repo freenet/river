@@ -26,9 +26,10 @@ use freenet_stdlib::{
         Parameters, UpdateData, WrappedContract, WrappedState,
     },
 };
+use river_core::room_state::direct_messages::{DirectMessagesSummary, DmRetentionHorizon};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
-use river_core::room_state::message::{AuthorizedMessageV1, RetentionHorizon};
+use river_core::room_state::message::{AuthorizedMessageV1, MessagesSummary, RetentionHorizon};
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::{
     ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta, ChatRoomStateV1Summary,
@@ -130,7 +131,9 @@ fn compute_update_data(
 /// horizon still does its job on the RECEIVE path (`merge_incoming_state`),
 /// which is where the summary genuinely belongs to the applying peer.
 ///
-/// Pinned by `outbound_update_is_not_filtered_by_the_senders_own_horizon`.
+/// Pinned by `outbound_update_is_not_filtered_by_the_senders_own_horizon`,
+/// `outbound_update_is_not_filtered_by_the_senders_own_dm_pair_horizon`, and
+/// `outbound_update_is_not_filtered_by_the_senders_own_dm_global_horizon`.
 fn outbound_summary(
     baseline: &ChatRoomStateV1,
     params: &ChatRoomParametersV1,
@@ -146,31 +149,64 @@ fn outbound_summary(
     //
     // That is not hypothetical. `MembersV1` (`remove_excess_members`) and
     // `BansV1` (`max_user_bans`) have the same non-monotonic defect and are
-    // deferred to a follow-up — see "Not fixed here". The moment that follow-up
-    // adds `MembersSummary.horizon`, a struct-update spread here would compile
-    // clean and silently reintroduce this exact bug on a new field: a device
-    // withholding its own member records from every outgoing update, baseline
-    // advancing anyway, never retried.
+    // deferred to a follow-up — see "Not fixed here".
+    //
+    // Scope of the guard, stated precisely because overstating it is what let
+    // freenet/river#519 through: the top-level destructure catches a new field
+    // on `ChatRoomStateV1Summary` ITSELF, and the two leaf destructures below
+    // catch one added to `MessagesSummary` or `DirectMessagesSummary`. The other
+    // seven leaf summaries — `members`, `bans`, `member_info`, `secrets`,
+    // `configuration`, `upgrade`, `version` — are bound whole and are NOT
+    // guarded. So when the `MembersV1` follow-up adds `MembersSummary.horizon`,
+    // nothing here will fail to compile; whoever writes it must remember to
+    // neutralise it and destructure that leaf too.
     let ChatRoomStateV1Summary {
         configuration,
         bans,
         members,
         member_info,
         secrets,
-        mut recent_messages,
-        mut direct_messages,
+        recent_messages,
+        direct_messages,
         upgrade,
         version,
     } = baseline.summarize(baseline, params);
 
-    // The ONLY two horizon-shaped fields today. "Horizon-shaped" means the
-    // field makes the SENDER withhold something it holds and the receiver
-    // lacks; every other field is a pure have-statement (an id set, a version,
-    // a signature map), which is safe — indeed required — to feed from the
-    // sender's own baseline, because that is what makes the delta "what changed
-    // since I last synced".
-    recent_messages.horizon = RetentionHorizon::Open;
-    direct_messages.pair_horizons.clear();
+    // The LEAF summaries are destructured too, for the same reason and against
+    // a failure that already happened: freenet/river#519 added a THIRD
+    // horizon-shaped field, `DirectMessagesSummary::global_horizon`. Because it
+    // was nested one level below `ChatRoomStateV1Summary`, the top-level
+    // destructure above bound it inside `direct_messages` and this file
+    // compiled clean — silently reintroducing the exact bug the guard exists to
+    // prevent, on the new field. Binding leaf fields by name makes the next
+    // nested horizon a compile error here as well.
+    //
+    // "Horizon-shaped" means the field makes the SENDER withhold something it
+    // holds and the receiver lacks; every other field is a pure have-statement
+    // (an id set, a version, a signature map), which is safe — indeed required —
+    // to feed from the sender's own baseline, because that is what makes the
+    // delta "what changed since I last synced".
+    let MessagesSummary {
+        message_ids,
+        horizon: _drop_message_horizon,
+    } = recent_messages;
+    let recent_messages = MessagesSummary {
+        message_ids,
+        horizon: RetentionHorizon::Open,
+    };
+
+    let DirectMessagesSummary {
+        message_signatures,
+        purge_versions,
+        pair_horizons: _drop_pair_horizons,
+        global_horizon: _drop_global_horizon,
+    } = direct_messages;
+    let direct_messages = DirectMessagesSummary {
+        message_signatures,
+        purge_versions,
+        pair_horizons: Vec::new(),
+        global_horizon: DmRetentionHorizon::Open,
+    };
 
     ChatRoomStateV1Summary {
         configuration,
@@ -2411,6 +2447,141 @@ mod tests {
             populated_delta_fields(&delta),
             vec!["configuration", "recent_messages"],
             "the outgoing update touched fields the baseline already has"
+        );
+    }
+
+    /// The THIRD horizon — `DirectMessagesSummary::global_horizon`, added by
+    /// freenet/river#519's whole-set DM cap.
+    ///
+    /// This one is a regression test for a miss, not a hypothetical. The
+    /// top-level `EXHAUSTIVE DESTRUCTURE` in `outbound_summary` only binds
+    /// `ChatRoomStateV1Summary`'s own fields, so a horizon added one level down
+    /// inside `DirectMessagesSummary` compiled clean and was silently fed to
+    /// `delta` on the SEND path — reintroducing, on a new field, the exact bug
+    /// the guard was written to prevent.
+    ///
+    /// Its blast radius is larger than the pair horizon's: `pair_horizons` needs
+    /// `MAX_DM_MESSAGES_PER_PAIR` (100) DMs in ONE ordered pair before it
+    /// publishes anything, whereas the global horizon fires once the room holds
+    /// `max_direct_messages` DMs in total across every pair — and the default is
+    /// 300 against a live official room already holding 499. So the filter would
+    /// have been active on every sync tick there, permanently.
+    ///
+    /// Every pair here stays far below its own cap, so `pair_horizons` is empty
+    /// and only the global horizon can do the filtering.
+    #[test]
+    fn outbound_update_is_not_filtered_by_the_senders_own_dm_global_horizon() {
+        use river_core::room_state::configuration::AuthorizedConfigurationV1;
+        use river_core::room_state::direct_messages::sign_direct_message;
+
+        let (mut room_state, params, owner_sk) = create_test_room();
+        add_members_and_bans(&mut room_state, &owner_sk);
+
+        let recipient_id = MemberId::from(&owner_sk.verifying_key());
+        let sender_sks: Vec<SigningKey> = (0..3)
+            .map(|_| SigningKey::generate(&mut rand::thread_rng()))
+            .collect();
+        let dm_from = |sk: &SigningKey, ts: u64, tag: u8| {
+            sign_direct_message(
+                sk,
+                MemberId::from(&sk.verifying_key()),
+                recipient_id,
+                &params.owner,
+                ts,
+                vec![tag; 8],
+            )
+            .expect("sign dm")
+        };
+
+        // Six DMs across THREE ordered pairs — two each, so no pair is near its
+        // own cap — against a global cap of six. The baseline is therefore at
+        // the GLOBAL cap and nowhere near any pair cap.
+        let mut capped = room_state.configuration.configuration.clone();
+        capped.max_direct_messages = Some(6);
+        capped.configuration_version += 1;
+        room_state.configuration = AuthorizedConfigurationV1::new(capped, &owner_sk);
+        for (i, sk) in sender_sks.iter().enumerate() {
+            room_state
+                .direct_messages
+                .messages
+                .push(dm_from(sk, 5_000 + i as u64, 1));
+            room_state
+                .direct_messages
+                .messages
+                .push(dm_from(sk, 6_000 + i as u64, 2));
+        }
+
+        let baseline = room_state.clone();
+        let baseline_summary = baseline.direct_messages.summarize(&baseline, &params);
+        assert!(
+            baseline_summary.pair_horizons.is_empty(),
+            "test premise: no pair may be at its own cap, or `pair_horizons` would be \
+             doing this test's work instead of `global_horizon`"
+        );
+        assert!(
+            matches!(
+                baseline_summary.global_horizon,
+                DmRetentionHorizon::OldestRetained(_)
+            ),
+            "test premise: the baseline must be AT the global cap so a horizon is published"
+        );
+
+        // Raise the cap, then back-fill a DM older than the baseline's oldest —
+        // reachable in practice by a clock-skewed device, or by re-learning an
+        // older DM from a peer after the cap was raised. `current` stays below
+        // its own cap, so this state is reachable through `apply_delta`.
+        let mut current = baseline.clone();
+        let mut raised = current.configuration.configuration.clone();
+        raised.max_direct_messages = Some(20);
+        raised.configuration_version += 1;
+        current.configuration = AuthorizedConfigurationV1::new(raised, &owner_sk);
+        let backfilled = dm_from(&sender_sks[0], 1_000, 3);
+        let newer = dm_from(&sender_sks[0], 9_001, 4);
+        current.direct_messages.messages.push(backfilled.clone());
+        current.direct_messages.messages.push(newer.clone());
+        assert!(
+            current.direct_messages.messages.len()
+                <= current
+                    .configuration
+                    .configuration
+                    .effective_max_direct_messages(),
+            "test premise: `current` must be below its own cap, or the state is unreachable"
+        );
+
+        let update = compute_update_data(&current, Some(&baseline), &params)
+            .expect("a locally-retained DM must produce an outgoing update");
+        let bytes = match update {
+            UpdateData::Delta(d) => d.into_bytes(),
+            other => panic!("expected a delta, got {other:?}"),
+        };
+        let delta: ChatRoomStateV1Delta =
+            ciborium::de::from_reader(bytes.as_slice()).expect("decode outgoing delta");
+
+        let sent_dms = delta
+            .direct_messages
+            .as_ref()
+            .map(|d| d.new_messages.clone())
+            .unwrap_or_default();
+        assert!(
+            sent_dms
+                .iter()
+                .any(|m| m.sender_signature == backfilled.sender_signature),
+            "the locally-retained DM was filtered out of the OUTGOING update by this \
+             device's OWN global horizon. `global_horizon` is receiver-published, \
+             exactly like `pair_horizons` and the messages horizon, so it must be \
+             neutralised in `outbound_summary` — otherwise `compute_update_data` \
+             returns None, `process_rooms` advances the baseline anyway, and the DM is \
+             never retried."
+        );
+        // The other direction: neutralising the horizon must not widen the
+        // update into a resend of everything already synced.
+        let mut sent_sigs: Vec<_> = sent_dms.iter().map(|m| m.sender_signature).collect();
+        sent_sigs.sort_by_key(|s| s.to_bytes());
+        let mut expected = vec![backfilled.sender_signature, newer.sender_signature];
+        expected.sort_by_key(|s| s.to_bytes());
+        assert_eq!(
+            sent_sigs, expected,
+            "the outgoing update must be EXACTLY the DMs the baseline lacks"
         );
     }
 
