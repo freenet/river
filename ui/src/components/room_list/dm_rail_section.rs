@@ -181,7 +181,7 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
     let room = entry.room;
     let peer = entry.peer;
     let nickname = entry.peer_nickname.clone();
-    let last_any_ts = entry.last_any_ts;
+    let last_inbound_ts = entry.last_inbound_ts;
     let click = move |_| {
         open_dm_thread(room, peer);
     };
@@ -202,7 +202,7 @@ fn DmRailRow(entry: DmRailEntry) -> Element {
         // container — without it, archiving from such a container
         // would open the thread on the same click.
         evt.stop_propagation();
-        archive_row(room, peer, &nickname, last_any_ts);
+        archive_row(room, peer, &nickname, last_inbound_ts);
     };
 
     let archive_title =
@@ -269,18 +269,108 @@ fn build_archive_toast(
     }
 }
 
+/// Max timestamp of a DM the peer sent US for `(room, peer)`, read from live
+/// `ROOMS` state rather than from a rendered rail row.
+///
+/// Returns `None` when `ROOMS` is contended or the room is absent, so the
+/// caller can fall back to the row's value (issue freenet/river#526 — see
+/// [`archive_row`] property 2 for why the rendered prop alone is not enough).
+///
+/// Pure-ish: the scan itself is exercised through
+/// [`max_inbound_ts_from_triples`], which is unit-tested; this wrapper only
+/// does the signal read.
+fn current_last_inbound_ts(room: &VerifyingKey, peer: MemberId) -> Option<u64> {
+    use dioxus::prelude::ReadableExt;
+    let rooms = ROOMS.try_read().ok()?;
+    let room_data = rooms.map.get(room)?;
+    let self_id = MemberId::from(&room_data.self_sk.verifying_key());
+    Some(max_inbound_ts_from_triples(
+        dm_message_triples(room_data),
+        self_id,
+        peer,
+    ))
+}
+
+/// Pure helper behind [`current_last_inbound_ts`]: max timestamp over DMs
+/// sent BY `peer` TO `self_id`. Zero when the pair has no inbound DMs.
+///
+/// Pinned by the `max_inbound_ts_from_triples_*` tests.
+pub(crate) fn max_inbound_ts_from_triples(
+    messages: impl IntoIterator<Item = (MemberId, MemberId, u64)>,
+    self_id: MemberId,
+    peer: MemberId,
+) -> u64 {
+    messages
+        .into_iter()
+        .filter(|(sender, recipient, _)| *sender == peer && *recipient == self_id)
+        .map(|(_, _, ts)| ts)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The `hidden_at_ts` an Archive click records, from the row's rendered
+/// inbound clock and the live one (`None` when `ROOMS` was contended).
+///
+/// Issue freenet/river#526 turns on two properties, both of them here:
+///
+/// 1. INBOUND-ONLY inputs. `last_any_ts` also covers our own outbound DMs,
+///    whose timestamp is our LOCAL wall clock. A thread where we replied last
+///    would then be archived against OUR clock while
+///    `should_unhide_for_inbound_dm` compares a SENDER's timestamp — so a peer
+///    DM already in flight across the click lands at or below the cutoff and
+///    goes invisible on every surface: no rail row, no unread badge
+///    (`document_title::count_unread_dms_with` applies the same filter), no
+///    notification (DMs never raise one).
+///
+/// 2. MAX of rendered and live. The row prop can lag — `build_view` serves
+///    `LAST_GOOD_RAIL` verbatim on a contended pass, and a DM can land in
+///    `ROOMS` between the memo's last clean pass and the click. The membership
+///    sweep is atomic per pair but the RE-LAND is not, so a peer restoring
+///    only a subset also leaves the row low. A cutoff below the pair's true
+///    inbound max lets the rest re-land looking newer than the archive, which
+///    is #526 itself. Live wins when it is readable, the row is the fallback
+///    when it is not.
+///
+///    Cost, stated precisely: the live read can include an inbound DM that
+///    landed in `ROOMS` after the memo's last pass and so was never RENDERED.
+///    Archiving then covers a message the user never saw, and it stays hidden
+///    until the peer writes again. That is a deliberate trade — swallowing one
+///    message until the next beats destroying the archive outright — but it is
+///    NOT, as an earlier draft of this comment claimed, limited to messages the
+///    user had already seen.
+///
+/// The result is never clamped against wall-clock time, and that is
+/// deliberate. An earlier revision clamped it at `now + MAX_DM_FUTURE_SKEW_SECS`
+/// to blunt a forged-future timestamp, which broke the load-bearing invariant
+/// `every existing inbound DM satisfies ts <= cutoff`: the rail filter compares
+/// the UNCLAMPED observed clock, so the row stayed visible (Archive became a
+/// no-op that still showed an "Archived" toast) AND the next sweep-and-re-offer
+/// saw `ts > cutoff` and destroyed the persisted archive — #526 itself,
+/// narrowed to skew-violating peers. Clamping one side of a comparison is what
+/// created the hole. The forged-timestamp concern is instead handled where it
+/// cannot break this invariant: [`should_unhide_for_inbound_dm`] bounds the
+/// INCOMING timestamp instead. That bound is narrower than it sounds — it
+/// binds only once a forgery has already inflated the cutoff, stopping a peer
+/// escalating to a larger forgery; a first forgery can still revive a
+/// normally-archived thread. It is safe-directional either way: the bounded
+/// value is never above the raw one, so it can only make the gate more
+/// conservative.
+///
+/// Residual, documented rather than clamped: a peer who stamps a DM far in the
+/// future sets a correspondingly far-future cutoff, so their later genuine DMs
+/// stay archived until real time passes it. That hides messages from ONE peer
+/// the user already chose to archive, and never destroys state. The real remedy
+/// for a hostile peer is a block/ignore list, freenet/river#461.
+///
+/// Pinned by the `archive_cutoff_*` tests.
+pub(crate) fn archive_cutoff(row_inbound_ts: u64, live_inbound_ts: Option<u64>) -> u64 {
+    std::cmp::max(row_inbound_ts, live_inbound_ts.unwrap_or(0))
+}
+
 /// Wire up: archive the (room, peer) thread, schedule the toast, and
 /// schedule the auto-dismiss. Called from the ✕ rollover button.
-fn archive_row(room: VerifyingKey, peer: MemberId, peer_nickname: &str, last_any_ts: u64) {
-    // The `hidden_at_ts` follows the same semantics as the modal-driven
-    // hide: capture the most-recent message timestamp (or wall-clock
-    // seconds if the thread is empty) so the rail filter's strict-`<=`
-    // check revives the thread the moment a fresher message lands.
-    let cutoff = if last_any_ts > 0 {
-        last_any_ts
-    } else {
-        unix_now_secs()
-    };
+fn archive_row(room: VerifyingKey, peer: MemberId, peer_nickname: &str, row_last_inbound_ts: u64) {
+    let cutoff = archive_cutoff(row_last_inbound_ts, current_last_inbound_ts(&room, peer));
 
     let now_ms = unix_now_ms();
     let toast = build_archive_toast(room, peer, peer_nickname, now_ms);
@@ -412,6 +502,8 @@ pub(crate) struct DmRailEntry {
     pub(crate) peer_nickname: String,
     pub(crate) room_name: String,
     pub(crate) last_any_ts: u64,
+    /// Newest INBOUND timestamp — what the archive filter compares against.
+    pub(crate) last_inbound_ts: u64,
     pub(crate) unread: usize,
 }
 
@@ -435,9 +527,16 @@ struct ArchivedEntry {
 ///
 /// Rules (matches `chat_delegate::is_thread_hidden` strict `<=`):
 /// - Entry's `(room, peer)` absent from `hidden` → present.
-/// - Entry's `last_any_ts > hidden_at_ts` → present (newer message
+/// - Entry's `last_inbound_ts > hidden_at_ts` → present (newer message
 ///   revived the thread, regardless of direction).
-/// - Entry's `last_any_ts <= hidden_at_ts` → omitted.
+/// The comparison is INBOUND-only (issue freenet/river#526): archive means
+/// "hidden until the peer writes again". Our own outbound sends revive the
+/// thread through the unconditional `unhide_dm_thread` in `do_send` /
+/// `send_structured_dm`, so they need no representation here - and including
+/// them would put a locally-clocked timestamp on one side of the comparison,
+/// which is what made an in-flight inbound DM invisible on every surface.
+///
+/// - Entry's `last_inbound_ts <= hidden_at_ts` → omitted.
 ///
 /// Pinned by `filter_rail_entries_*` tests in this module.
 pub(crate) fn filter_rail_entries(
@@ -446,7 +545,7 @@ pub(crate) fn filter_rail_entries(
 ) -> Vec<DmRailEntry> {
     entries
         .into_iter()
-        .filter(|e| !is_thread_hidden_for(hidden, &e.room, e.peer, e.last_any_ts))
+        .filter(|e| !is_thread_hidden_for(hidden, &e.room, e.peer, e.last_inbound_ts))
         .collect()
 }
 
@@ -501,7 +600,13 @@ pub(crate) fn sort_rail_entries(entries: &mut [DmRailEntry]) {
 /// Per-peer DM activity accumulated from one room's message list.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct PeerDmActivity {
+    /// Newest timestamp in EITHER direction. Drives recency sorting.
     pub(crate) last_any_ts: u64,
+    /// Newest timestamp of a DM the PEER sent to us. Drives the archive
+    /// filter (issue freenet/river#526) — see [`archive_row`] for why the
+    /// archive question is "has the peer written since I archived", and
+    /// never "has anything happened".
+    pub(crate) last_inbound_ts: u64,
     pub(crate) unread: usize,
 }
 
@@ -536,12 +641,16 @@ pub(crate) fn accumulate_peer_activity(
         let peer = if is_self_sender { recipient } else { sender };
         let acc = per_peer.entry(peer).or_insert(PeerDmActivity {
             last_any_ts: 0,
+            last_inbound_ts: 0,
             unread: 0,
         });
         if timestamp > acc.last_any_ts {
             acc.last_any_ts = timestamp;
         }
         if is_self_recipient {
+            if timestamp > acc.last_inbound_ts {
+                acc.last_inbound_ts = timestamp;
+            }
             if let Some(seen) = last_seen {
                 let cutoff = seen.get(&(*room, peer)).copied().unwrap_or(0);
                 if timestamp > cutoff {
@@ -679,7 +788,7 @@ fn schedule_rail_nudge() {
 
 /// Pure helper: project the archived viewer's rows from the in-memory
 /// hide map plus the per-room display data and a per-pair
-/// `last_any_ts` map (the max DM timestamp for each `(room, peer)` in
+/// `last_inbound_ts` map (max INBOUND DM timestamp per `(room, peer)` in
 /// current room state). Entries whose thread has been revived by a
 /// strictly-newer message (`is_thread_hidden_for` returns false) are
 /// SKIPPED so the viewer agrees with the rail filter — without this,
@@ -693,7 +802,7 @@ fn schedule_rail_nudge() {
 fn build_archived_rows(
     hidden: &HashMap<(VerifyingKey, MemberId), HiddenDmThreadEntry>,
     room_meta: &HashMap<VerifyingKey, ArchivedRoomMeta>,
-    last_any_ts: &HashMap<(VerifyingKey, MemberId), u64>,
+    last_inbound_ts: &HashMap<(VerifyingKey, MemberId), u64>,
 ) -> Vec<ArchivedEntry> {
     let mut out: Vec<ArchivedEntry> = hidden
         .iter()
@@ -705,7 +814,7 @@ fn build_archived_rows(
             // loaded — fall back to 0 so the strict-`<=` rule still
             // treats them as hidden (the rail filter would otherwise
             // not surface them either).
-            let ts = last_any_ts.get(&(*room, *peer)).copied().unwrap_or(0);
+            let ts = last_inbound_ts.get(&(*room, *peer)).copied().unwrap_or(0);
             is_thread_hidden_for(hidden, room, *peer, ts)
         })
         .map(|((room, peer), _entry)| {
@@ -740,12 +849,12 @@ fn build_archived_rows(
 /// nickname / room-name decrypt per entry).
 fn count_currently_archived(
     hidden: &HashMap<(VerifyingKey, MemberId), HiddenDmThreadEntry>,
-    last_any_ts: &HashMap<(VerifyingKey, MemberId), u64>,
+    last_inbound_ts: &HashMap<(VerifyingKey, MemberId), u64>,
 ) -> usize {
     hidden
         .iter()
         .filter(|((room, peer), _)| {
-            let ts = last_any_ts.get(&(*room, *peer)).copied().unwrap_or(0);
+            let ts = last_inbound_ts.get(&(*room, *peer)).copied().unwrap_or(0);
             is_thread_hidden_for(hidden, room, *peer, ts)
         })
         .count()
@@ -789,7 +898,7 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
     // revived thread shows on the rail AND in the archived viewer,
     // confusing the user about whether it's archived.
     let mut room_meta: HashMap<VerifyingKey, ArchivedRoomMeta> = HashMap::new();
-    let mut last_any_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
+    let mut last_inbound_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
     for (owner_vk, room_data) in &rooms.map {
         let self_id: MemberId = room_data.self_sk.verifying_key().into();
         let sealed_name = &room_data
@@ -833,11 +942,11 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
         for (peer, activity) in
             accumulate_peer_activity(owner_vk, self_id, dm_message_triples(room_data), None)
         {
-            last_any_ts.insert((*owner_vk, peer), activity.last_any_ts);
+            last_inbound_ts.insert((*owner_vk, peer), activity.last_inbound_ts);
         }
     }
 
-    Some(build_archived_rows(&hidden, &room_meta, &last_any_ts))
+    Some(build_archived_rows(&hidden, &room_meta, &last_inbound_ts))
 }
 
 /// Compute the current archived count (post revival-filter) for the
@@ -866,16 +975,16 @@ fn current_archived_count() -> usize {
         schedule_rail_nudge();
         return last_good_archived_count();
     };
-    let mut last_any_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
+    let mut last_inbound_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
     for (owner_vk, room_data) in &rooms.map {
         let self_id: MemberId = room_data.self_sk.verifying_key().into();
         for (peer, activity) in
             accumulate_peer_activity(owner_vk, self_id, dm_message_triples(room_data), None)
         {
-            last_any_ts.insert((*owner_vk, peer), activity.last_any_ts);
+            last_inbound_ts.insert((*owner_vk, peer), activity.last_inbound_ts);
         }
     }
-    let count = count_currently_archived(&hidden, &last_any_ts);
+    let count = count_currently_archived(&hidden, &last_inbound_ts);
     set_last_good_archived_count(count);
     count
 }
@@ -983,8 +1092,9 @@ fn build_view() -> Vec<DmRailEntry> {
         // step runs once at the end (over all rooms' candidates) so it
         // is pure and unit-testable via `filter_rail_entries`. See
         // that helper's doc-comment for the #261 strict-`<=` semantics
-        // and the `filter_rail_entries_newer_outbound_revives_hidden`
-        // test for the "outbound revives" invariant.
+        // and, since #526, the
+        // `filter_rail_entries_newer_outbound_does_not_revive_hidden`
+        // test for why that clock is inbound-only.
         for (peer, activity) in per_peer {
             entries.push(DmRailEntry {
                 room: *owner_vk,
@@ -995,6 +1105,7 @@ fn build_view() -> Vec<DmRailEntry> {
                     .unwrap_or_else(|| short_member_id(&peer)),
                 room_name: room_name.clone(),
                 last_any_ts: activity.last_any_ts,
+                last_inbound_ts: activity.last_inbound_ts,
                 unread: activity.unread,
             });
         }
@@ -1069,6 +1180,281 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
     }
 
+    // ===== archive_cutoff (issue freenet/river#526) =====
+
+    /// The rendered row wins when it is ahead of live state.
+    #[test]
+    fn archive_cutoff_takes_the_row_when_it_leads() {
+        assert_eq!(archive_cutoff(1_500, Some(1_000)), 1_500);
+    }
+
+    /// Live state wins when it is ahead — the row can lag behind a DM that
+    /// landed in `ROOMS` after the memo's last clean pass.
+    #[test]
+    fn archive_cutoff_takes_live_when_it_leads() {
+        assert_eq!(archive_cutoff(1_000, Some(1_500)), 1_500);
+    }
+
+    /// A contended `ROOMS` read degrades to the rendered row, never to zero.
+    #[test]
+    fn archive_cutoff_falls_back_to_the_row_when_live_is_unreadable() {
+        assert_eq!(archive_cutoff(1_200, None), 1_200);
+    }
+
+    /// A thread the peer has never written to archives at 0, which the
+    /// `<=` filter still treats as hidden.
+    #[test]
+    fn archive_cutoff_is_zero_when_peer_never_wrote() {
+        assert_eq!(archive_cutoff(0, Some(0)), 0);
+    }
+
+    /// The invariant the gate depends on: the cutoff is never BELOW the
+    /// pair's true inbound maximum, so no already-existing inbound DM can
+    /// look newer than the archive when it re-lands.
+    ///
+    /// An earlier revision clamped the cutoff at `now + MAX_DM_FUTURE_SKEW_SECS`,
+    /// which broke exactly this for a peer whose clock leads ours: Archive
+    /// became a visible no-op AND the next sweep-and-re-offer destroyed the
+    /// persisted archive.
+    #[test]
+    fn archive_cutoff_is_never_below_the_true_inbound_max() {
+        let now = 5_000u64;
+        let skew = river_core::room_state::direct_messages::MAX_DM_FUTURE_SKEW_SECS;
+        // A peer stamping well beyond the skew bound.
+        let forged = now + skew + 100_000;
+        let cutoff = archive_cutoff(forged, Some(forged));
+        assert!(
+            cutoff >= forged,
+            "the cutoff must cover every inbound DM that exists, however \
+             implausibly stamped - otherwise the rail keeps showing the row \
+             and a re-land destroys the archive (#526)"
+        );
+    }
+
+    /// Issue freenet/river#526: `archive_row` must feed `archive_cutoff` the
+    /// row's INBOUND clock and the LIVE recompute, and must not reintroduce a
+    /// wall-clock term. `archive_row` needs the Dioxus runtime, so this is a
+    /// source pin.
+    #[test]
+    fn archive_row_uses_inbound_and_live_cutoff() {
+        let src = dm_rail_production_stripped();
+        let marker = "fnarchive_row(";
+        let split_at = src
+            .find(marker)
+            .expect("archive_row must exist - this pin is targeting the wrong path");
+        let rest = &src[split_at + marker.len()..];
+        // `ArchiveToastView` is the next item AFTER `archive_row`; the
+        // previously-used `build_archive_toast` is defined BEFORE it, so that
+        // bound never matched and the "segment" was the rest of the file.
+        let end = rest
+            .find("fnArchiveToastView")
+            .expect("ArchiveToastView must follow archive_row - bound is stale");
+        let seg = &rest[..end];
+
+        assert!(
+            seg.contains("archive_cutoff(row_last_inbound_ts,current_last_inbound_ts(&room,peer))"),
+            "archive_row must build the cutoff from the row's inbound clock \
+             and the LIVE recompute (#526)."
+        );
+        assert!(
+            !seg.contains("unix_now_secs()"),
+            "the cutoff must carry no wall-clock term (#526): clamping one \
+             side of the comparison breaks `every existing inbound DM is <= \
+             cutoff` and both re-opens the bug and makes Archive a no-op."
+        );
+    }
+
+    /// The row must hand `archive_row` its INBOUND clock. `DmRailEntry` still
+    /// carries `last_any_ts` for sorting, so passing the wrong field compiles
+    /// silently and restores the pre-fix cutoff.
+    #[test]
+    fn rail_row_passes_the_inbound_clock_to_archive_row() {
+        let src = dm_rail_production_stripped();
+        assert!(
+            src.contains("archive_row(room,peer,&nickname,last_inbound_ts)"),
+            "DmRailRow must pass last_inbound_ts to archive_row (#526); \
+             last_any_ts includes our own outbound DMs and their local clock."
+        );
+        assert!(
+            src.contains("letlast_inbound_ts=entry.last_inbound_ts;"),
+            "the row must read the inbound clock off the entry (#526)."
+        );
+    }
+
+    /// Both archived-view projections must feed the INBOUND clock, or the
+    /// "Archived (N)" badge and the panel desynchronise from the rail: a
+    /// thread with a newer outbound would drop out of the panel while the rail
+    /// still hides it, leaving it invisible in both places with no un-archive.
+    #[test]
+    fn archived_projections_use_the_inbound_clock() {
+        let src = dm_rail_production_stripped();
+        assert_eq!(
+            src.matches("last_inbound_ts.insert((*owner_vk,peer),activity.last_inbound_ts);")
+                .count(),
+            2,
+            "build_archived_view and current_archived_count must both project \
+             the inbound clock (#526)."
+        );
+        assert!(
+            src.contains("last_inbound_ts:activity.last_inbound_ts,"),
+            "build_view must carry the inbound clock onto each DmRailEntry (#526)."
+        );
+    }
+
+    /// Issue freenet/river#526: `archive_cutoff` must carry NO wall-clock
+    /// term.
+    ///
+    /// This has to be a source pin. `archive_cutoff` takes no injectable
+    /// `now`, so a behavioural test can only feed it fixture timestamps —
+    /// which sit astronomically below real `unix_now_secs()`, making any
+    /// re-introduced `.min(now + skew)` inert and the test green. A clamp
+    /// mutation survived exactly that way in an earlier round.
+    ///
+    /// Why it must stay clamp-free: the rail filter compares the UNCLAMPED
+    /// observed inbound clock against this value. Clamping only this side
+    /// breaks `every existing inbound DM is <= cutoff`, which makes Archive a
+    /// visible no-op that still shows a success toast AND lets the next
+    /// sweep-and-re-offer destroy the persisted archive. The forged-timestamp
+    /// concern belongs on the INCOMING timestamp in
+    /// `should_unhide_for_inbound_dm`, where it cannot break the invariant.
+    #[test]
+    fn archive_cutoff_carries_no_wall_clock_term() {
+        let src = dm_rail_production_stripped();
+        let marker = "fnarchive_cutoff(";
+        let split_at = src
+            .find(marker)
+            .expect("archive_cutoff must exist - this pin targets the wrong path");
+        let rest = &src[split_at + marker.len()..];
+        let end = rest
+            .find("fnarchive_row(")
+            .expect("archive_row must follow archive_cutoff - bound is stale");
+        let seg = &rest[..end];
+
+        assert!(
+            !seg.contains("unix_now_secs()"),
+            "archive_cutoff must not clamp against wall-clock time (#526): \
+             clamping one side of the comparison re-opens the bug and turns \
+             Archive into a no-op that still reports success."
+        );
+        assert!(
+            !seg.contains("MAX_DM_FUTURE_SKEW_SECS"),
+            "the skew bound belongs on the INCOMING timestamp in \
+             should_unhide_for_inbound_dm, not on the cutoff (#526)."
+        );
+        assert!(
+            seg.contains("std::cmp::max(row_inbound_ts,live_inbound_ts.unwrap_or(0))"),
+            "archive_cutoff must be the plain max of the rendered and live \
+             inbound clocks (#526)."
+        );
+    }
+
+    /// Issue freenet/river#526: the Undo toast and the Archived-panel
+    /// Un-archive are explicit USER ACTIONS and must keep calling the
+    /// UNCONDITIONAL `unhide_dm_thread`.
+    ///
+    /// Routing them through `unhide_dm_thread_if_dm_is_newer` for
+    /// "consistency" would make both silent no-ops: at the moment the user
+    /// clicks Undo, the thread's inbound clock is by construction at or below
+    /// the cutoff just written, so the gate returns false and the entry
+    /// survives. The button would appear to do nothing.
+    #[test]
+    fn explicit_user_actions_keep_the_unconditional_unhide() {
+        let src = dm_rail_production_stripped();
+        assert!(
+            !src.contains(&format!("{}{}", "unhide_dm_thread_if_dm_is_newer", "(")),
+            "the rail's user-action unhides must NOT use the cutoff-gated form \
+             (#526) - Undo and Un-archive would become silent no-ops."
+        );
+        assert_eq!(
+            src.matches(&format!("{}{}", "unhide_dm_thread", "("))
+                .count(),
+            2,
+            "exactly two unconditional unhide call sites are expected in the \
+             rail: the Undo toast and the Archived-panel Un-archive."
+        );
+    }
+
+    /// The rail filter must compare the INBOUND clock, never `last_any_ts`.
+    #[test]
+    fn rail_filter_compares_inbound_timestamp() {
+        let src = dm_rail_production_stripped();
+        assert!(
+            src.contains("is_thread_hidden_for(hidden,&e.room,e.peer,e.last_inbound_ts)"),
+            "filter_rail_entries must compare last_inbound_ts (#526). Using \
+             last_any_ts lets our own outbound DM's local-clock timestamp \
+             decide whether a peer's message is visible."
+        );
+    }
+
+    // ===== max_inbound_ts_from_triples =====
+
+    #[test]
+    fn max_inbound_ts_ignores_outbound_and_third_parties() {
+        let me = MemberId(FastHash(1));
+        let peer = MemberId(FastHash(2));
+        let other = MemberId(FastHash(3));
+        let msgs = vec![
+            (peer, me, 100),    // inbound  - counts
+            (me, peer, 900),    // outbound - must NOT count
+            (other, me, 800),   // inbound from someone else - must NOT count
+            (peer, other, 700), // third-party - must NOT count
+            (peer, me, 250),    // inbound  - counts, newest
+        ];
+        assert_eq!(max_inbound_ts_from_triples(msgs, me, peer), 250);
+    }
+
+    #[test]
+    fn max_inbound_ts_is_zero_when_peer_never_wrote() {
+        let me = MemberId(FastHash(1));
+        let peer = MemberId(FastHash(2));
+        // A thread that is entirely our own outbound DMs.
+        let msgs = vec![(me, peer, 500), (me, peer, 900)];
+        assert_eq!(max_inbound_ts_from_triples(msgs, me, peer), 0);
+    }
+
+    /// The reply-then-archive scenario that this revision exists to fix: the
+    /// thread's newest message is OUTBOUND, so `last_any_ts` is our own clock.
+    /// Archiving must not hide a peer DM whose timestamp sits below it.
+    #[test]
+    fn filter_does_not_hide_thread_on_a_newer_outbound_message() {
+        let room = sk(1).verifying_key();
+        // Peer's newest inbound is 1010; our reply at 1012 is newer overall.
+        let e = entry_with_inbound(room, 11, 1_012, 1_010, 1);
+        // Archived at 1000 (the peer's previous DM). Their 1010 must revive it.
+        let mut hidden = HashMap::new();
+        hidden.insert(
+            (room, e.peer),
+            HiddenDmThreadEntry {
+                room_owner_vk: room.to_bytes(),
+                peer: e.peer,
+                hidden_at_ts: 1_000,
+            },
+        );
+        let out = filter_rail_entries(vec![e.clone()], &hidden);
+        assert_eq!(
+            out.len(),
+            1,
+            "the peer's DM at 1010 is past the 1000 cutoff, so the thread must \
+             be visible even though our own reply at 1012 is newer (#526)"
+        );
+
+        // And the inbound clock, not the outbound one, is what decides: with
+        // the cutoff above the peer's newest inbound, it stays archived.
+        let mut hidden2 = HashMap::new();
+        hidden2.insert(
+            (room, e.peer),
+            HiddenDmThreadEntry {
+                room_owner_vk: room.to_bytes(),
+                peer: e.peer,
+                hidden_at_ts: 1_010,
+            },
+        );
+        assert!(
+            filter_rail_entries(vec![e], &hidden2).is_empty(),
+            "our outbound at 1012 must NOT drag the thread back into the rail"
+        );
+    }
+
     fn entry(room: VerifyingKey, peer_seed: i64, last_any_ts: u64, unread: usize) -> DmRailEntry {
         DmRailEntry {
             room,
@@ -1076,7 +1462,28 @@ mod tests {
             peer_nickname: format!("peer-{peer_seed}"),
             room_name: "room".into(),
             last_any_ts,
+            // Default fixture: treat the whole thread as inbound, which is
+            // what these tests meant before the archive filter became
+            // inbound-only (issue freenet/river#526). Cases that need the two
+            // to differ use `entry_with_inbound`.
+            last_inbound_ts: last_any_ts,
             unread,
+        }
+    }
+
+    /// Rail entry whose newest message is OUTBOUND: `last_any_ts` is above
+    /// `last_inbound_ts`. This is the shape that made an in-flight inbound DM
+    /// invisible before the archive filter became inbound-only (#526).
+    fn entry_with_inbound(
+        room: VerifyingKey,
+        peer_seed: i64,
+        last_any_ts: u64,
+        last_inbound_ts: u64,
+        unread: usize,
+    ) -> DmRailEntry {
+        DmRailEntry {
+            last_inbound_ts,
+            ..entry(room, peer_seed, last_any_ts, unread)
         }
     }
 
@@ -1131,26 +1538,29 @@ mod tests {
         );
     }
 
-    /// #261 "outbound revives": an outbound DM (reflected purely
-    /// through `last_any_ts > hidden_at_ts` since outbound messages
-    /// also bump `acc.last_any_ts` in `build_view`) MUST re-surface
-    /// the thread. This is the rail-side mirror of the Codex P1
-    /// explicit `unhide_dm_thread` call in `dm_thread_modal::do_send`.
-    /// Even if the hide map were never cleared, a strictly-newer
-    /// outbound timestamp must override.
+    /// Issue freenet/river#526 INVERTED this test. It previously asserted that
+    /// an outbound DM revives a hidden thread through
+    /// `last_any_ts > hidden_at_ts` — which is precisely the behaviour that
+    /// made an in-flight INBOUND DM invisible, because our own outbound
+    /// timestamp is our LOCAL wall clock and it was deciding whether a peer's
+    /// message showed.
+    ///
+    /// Outbound sends still revive the thread, but through the unconditional
+    /// `unhide_dm_thread` in `do_send` / `send_structured_dm` — i.e. by
+    /// REMOVING the entry, which `filter_rail_entries_unhide_reappears`
+    /// covers. The filter itself must ignore outbound entirely.
     #[test]
-    fn filter_rail_entries_newer_outbound_revives_hidden() {
+    fn filter_rail_entries_newer_outbound_does_not_revive_hidden() {
         let room = sk(1).verifying_key();
-        // Outbound: zero unread (sender's own message), but
-        // last_any_ts moved past the hide cutoff.
-        let entries = vec![entry(room, 11, 1_500, 0)];
+        // Our reply at 1_500 is the newest message; the peer's newest is 900.
+        let entries = vec![entry_with_inbound(room, 11, 1_500, 900, 0)];
         let hidden = HashMap::from([hidden_at(room, 11, 1_000)]);
 
-        let result = filter_rail_entries(entries, &hidden);
-        assert_eq!(
-            result.len(),
-            1,
-            "newer outbound DM must revive thread (last_any_ts > hidden_at_ts)"
+        assert!(
+            filter_rail_entries(entries, &hidden).is_empty(),
+            "our own outbound DM at 1500 must NOT revive the thread: the \
+             archive clock is inbound-only, and the peer's newest (900) is \
+             below the 1000 cutoff (#526)"
         );
     }
 
@@ -1461,6 +1871,7 @@ mod tests {
             (self_id, peer, 100u64),    // outbound: recency only
             (peer, self_id, 150u64),    // inbound, <= cutoff: read
             (peer, self_id, 250u64),    // inbound, > cutoff: unread
+            (self_id, peer, 400u64),    // outbound, NEWEST overall
             (third_a, third_b, 999u64), // not ours: skipped
         ];
         let mut last_seen = HashMap::new();
@@ -1473,7 +1884,18 @@ mod tests {
             "third-party traffic must not create entries"
         );
         assert_eq!(result[&peer].unread, 1);
-        assert_eq!(result[&peer].last_any_ts, 250);
+        // Recency covers BOTH directions, so our own 400 wins.
+        assert_eq!(result[&peer].last_any_ts, 400);
+        // The ARCHIVE clock covers inbound only (issue freenet/river#526).
+        // The outbound-newest fixture above is what makes this assertion able
+        // to fail: hoisting the `last_inbound_ts` bump out of the
+        // `is_self_recipient` branch - a plausible "fold the two maxes
+        // together" simplification - would yield 400 here and silently restore
+        // the bug for the rail, the archived panel and the archived count.
+        assert_eq!(
+            result[&peer].last_inbound_ts, 250,
+            "our own outbound DM must NOT advance the archive clock (#526)"
+        );
     }
 
     /// Clean hide-list read: `resolve_active_entries` applies the #261
@@ -1821,6 +2243,15 @@ mod tests {
         &DM_RAIL_SRC[..DM_RAIL_SRC
             .find("mod tests")
             .expect("dm_rail_section.rs has exactly one `mod tests`")]
+    }
+
+    /// [`dm_rail_production`] with all whitespace removed, so a source pin
+    /// survives a rustfmt pass that re-wraps the code it matches.
+    fn dm_rail_production_stripped() -> String {
+        dm_rail_production()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
     }
 
     /// The archive ✕ must gate its reveal on pointer capability, not the

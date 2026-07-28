@@ -2518,6 +2518,175 @@ mod tests {
         assert_eq!(to_insert[0].1.hidden_at_ts, 5_000);
     }
 
+    // ===== should_unhide_for_inbound_dm (issue freenet/river#526) =====
+    //
+    // The inbound-sync paths in `room_synchronizer` used to call
+    // `unhide_dm_thread` unconditionally for every DM that crossed the
+    // merge dedupe. "Crossed the dedupe" means "was not in LOCAL state a
+    // moment ago", which is a different question from "is new content":
+    // `post_apply_cleanup`'s membership sweep removes DMs whose
+    // counterparty is momentarily absent from `members`, peers re-offer
+    // them, and they re-land. Every such re-landing destroyed the user's
+    // archive — and `unhide_dm_thread` persists the removal, so the loss
+    // survived a reload. These tests pin the replacement decision.
+
+    /// A pair with no archive entry has nothing to revive. This is the
+    /// load-bearing case for the full-state path: when `HIDDEN_DM_THREADS`
+    /// has not hydrated from the delegate yet, EVERY pair looks like this,
+    /// and the pre-merge DM snapshot is simultaneously empty (so every DM
+    /// reads as newly landed). Returning false here is what stops a startup
+    /// race from wiping every archive in the room.
+    #[test]
+    fn should_unhide_for_inbound_dm_is_false_when_not_archived() {
+        assert!(!should_unhide_for_inbound_dm(None, 9_999, 1_000_000));
+        assert!(!should_unhide_for_inbound_dm(None, 0, 1_000_000));
+    }
+
+    /// A DM strictly past the cutoff is a genuine revival.
+    #[test]
+    fn should_unhide_for_inbound_dm_is_true_past_cutoff() {
+        assert!(should_unhide_for_inbound_dm(Some(1_000), 1_001, 1_000_000));
+    }
+
+    /// A DM at or below the cutoff is content the archive already covers.
+    /// The `<=` half is the #526 fix: an old DM that was swept out of local
+    /// state and re-offered by a peer arrives here with its ORIGINAL
+    /// timestamp, which is at or below the cutoff `archive_row` recorded.
+    #[test]
+    fn should_unhide_for_inbound_dm_is_false_at_or_below_cutoff() {
+        assert!(
+            !should_unhide_for_inbound_dm(Some(1_000), 999, 1_000_000),
+            "an older re-landed DM must not un-archive the thread"
+        );
+        assert!(
+            !should_unhide_for_inbound_dm(Some(1_000), 1_000, 1_000_000),
+            "a DM at exactly the cutoff is the newest INBOUND message that \
+             existed when the user archived, so it must not revive the thread. \
+             This is the accepted #267 residual: a genuinely new DM stamped in \
+             the same second as the peer's previous one waits for the next \
+             message."
+        );
+    }
+
+    /// End-to-end shape of the #526 bug, driven through the same decision the
+    /// sync path makes and applying its effect to a real map, so the "the
+    /// archive survived" assertion can actually fail.
+    ///
+    /// Archive a thread holding DMs at ts=800 and ts=1000 (so the cutoff is
+    /// 1000), then have the whole pair swept and re-offered — the sweep is
+    /// all-or-nothing per pair, so BOTH re-land carrying original timestamps.
+    #[test]
+    fn relanded_old_dms_do_not_destroy_the_archive() {
+        use crate::components::direct_messages::is_thread_hidden_for;
+        let room = sk(1).verifying_key();
+        let peer = MemberId(FastHash(11));
+        let key = (room, peer);
+
+        // `archive_row` records the thread's newest MESSAGE timestamp.
+        let thread_ts = [800u64, 1_000u64];
+        let cutoff = *thread_ts.iter().max().unwrap();
+
+        let mut hidden: HashMap<(ed25519_dalek::VerifyingKey, MemberId), HiddenDmThreadEntry> =
+            HashMap::new();
+        hidden.insert(key, make_hidden_entry(room, peer, cutoff));
+
+        // Replay the sync path's decision for each re-landed DM, applying the
+        // real effect (entry removal) so a wrong decision is observable.
+        for ts in thread_ts {
+            if should_unhide_for_inbound_dm(hidden.get(&key).map(|e| e.hidden_at_ts), ts, 1_000_000)
+            {
+                hidden.remove(&key);
+            }
+        }
+
+        assert!(
+            hidden.contains_key(&key),
+            "re-landed DMs must not drop the archive entry (#526) — this is \
+             the assertion that fails if the gate is removed"
+        );
+        assert!(
+            is_thread_hidden_for(&hidden, &room, peer, cutoff),
+            "the thread must stay archived after the re-land (#526)"
+        );
+
+        // A genuinely new DM, sent after the archive click, still revives it.
+        let new_dm_ts = cutoff + 1;
+        if should_unhide_for_inbound_dm(
+            hidden.get(&key).map(|e| e.hidden_at_ts),
+            new_dm_ts,
+            1_000_000,
+        ) {
+            hidden.remove(&key);
+        }
+        assert!(
+            !hidden.contains_key(&key),
+            "a genuinely new DM must still revive the thread (#267)"
+        );
+        assert!(!is_thread_hidden_for(&hidden, &room, peer, new_dm_ts));
+    }
+
+    /// Issue freenet/river#526 BLOCKING gap found in review: the wrapper's
+    /// BODY is what both sync call sites actually invoke, so deleting the
+    /// gate inside it re-opens #526 in full while every other test — which
+    /// calls the pure helper directly — stays green.
+    ///
+    /// The wrapper reads a signal, so it cannot be unit-tested; this is a
+    /// segment-bounded source pin over the production half of the file.
+    #[test]
+    fn gated_unhide_wrapper_consults_the_cutoff() {
+        // NOTE: this file interleaves `#[cfg(test)]` modules with production
+        // code (the first `mod tests {` is at ~line 640, the function under
+        // test at ~4492), so the usual cut-at-`mod tests` trick would discard
+        // the very thing being pinned. Instead the marker is assembled at
+        // runtime — so it cannot match this test's own source — and the
+        // segment is bounded at the next item, which keeps the assertion
+        // literals below out of the searched region.
+        let src: String = include_str!("chat_delegate.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let marker = format!("fn{}{}", "unhide_dm_thread_if_dm_is_newer", "(");
+        let split_at = src
+            .find(&marker)
+            .expect("unhide_dm_thread_if_dm_is_newer must exist in this file");
+        let rest = &src[split_at + marker.len()..];
+        // Bound at the next item. NOT `"pubfn"`: the next item is
+        // `pub async fn save_outbound_dms_to_delegate`, which strips to
+        // `pubasyncfn` and would be skipped, silently widening the segment.
+        let end = rest.find("///Coalescingstate").unwrap_or(rest.len());
+        let seg = &rest[..end];
+
+        assert!(
+            seg.contains(&format!("if{}{}", "should_unhide_for_inbound_dm", "(")),
+            "unhide_dm_thread_if_dm_is_newer must gate on \
+             should_unhide_for_inbound_dm (#526). Without the gate both sync \
+             paths unhide unconditionally again — including the full-state \
+             path, where an empty pre-merge snapshot destroys every archive \
+             in the room at once."
+        );
+        assert!(
+            seg.contains("hidden.get(&(room_owner_vk,peer)).map(|e|e.hidden_at_ts)"),
+            "the gate must be fed the pair's ACTUAL persisted cutoff (#526); \
+             passing a freshly-read `now` would make every re-landed DM look \
+             newer and silently re-regress."
+        );
+        assert!(
+            seg.contains(&format!(
+                "{}{}",
+                "should_unhide_for_inbound_dm", "(cutoff,dm_timestamp,unix_now_secs())"
+            )),
+            "the gate must actually receive the read cutoff AND the DM's \
+             timestamp. `should_unhide_for_inbound_dm(None, ts)` would satisfy \
+             a looser pin while making the wrapper a permanent no-op."
+        );
+        assert!(
+            seg.contains(&format!("{}{}", "unhide_dm_thread", "(room_owner_vk,peer)")),
+            "the guarded branch must still CALL unhide_dm_thread - this is the \
+             only reachable revival from either sync path, so deleting it kills \
+             #267 revival entirely while the gate assertions above still pass."
+        );
+    }
+
     // ===== decide_hide_action + hide-unhide-rehide round-trip =====
     // Tests for the testing-reviewer's BLOCKING gap on PR #265: the
     // "click Hide again should re-hide, not no-op" path through
@@ -4596,9 +4765,15 @@ pub(crate) fn decide_hide_action(
 /// Hide the DM thread for `(room, peer)` from the left rail (issue
 /// freenet/river#261).
 ///
-/// `hidden_at_ts` is the most-recent message timestamp in the thread
-/// at the moment the user clicked "Hide thread"; the filter rule uses
-/// `<=` so any message strictly later revives the thread.
+/// `hidden_at_ts` is the most-recent MESSAGE timestamp in the thread at the
+/// moment the user clicked Archive (wall-clock seconds only when the thread
+/// is empty); the filter rule uses `<=` so any message strictly later revives
+/// the thread.
+///
+/// That it is a message timestamp and not wall-clock `now` is load-bearing
+/// for issue freenet/river#526 — see `dm_rail_section::archive_row`, which is
+/// this function's only caller, for why, and
+/// [`should_unhide_for_inbound_dm`] for the gate that depends on it.
 ///
 /// Delegates to the pure helper [`decide_hide_action`] so the
 /// "advance vs no-op" decision can be unit-tested without the Dioxus
@@ -4675,6 +4850,187 @@ pub fn unhide_dm_thread(room_owner_vk: ed25519_dalek::VerifyingKey, peer: Member
             }
         });
     });
+}
+
+/// Current unix time in SECONDS, matching `DirectMessage::timestamp`'s unit.
+fn unix_now_secs() -> u64 {
+    crate::util::get_current_system_time()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Decide whether an inbound DM that just landed should drop the pair's
+/// archive entry.
+///
+/// `cutoff` is the pair's current `hidden_at_ts`, or `None` when the pair
+/// is not archived (which includes "the archive list hasn't hydrated from
+/// the delegate yet" — see [`unhide_dm_thread_if_dm_is_newer`] for why the
+/// two must be treated identically).
+///
+/// Strictly-greater is the load-bearing comparison (issue
+/// freenet/river#526), and it is safe because of what `archive_row` writes:
+/// the cutoff is the newest timestamp the PEER sent us, recomputed from live
+/// room state at click time. It is deliberately NOT clamped — see below.
+///
+/// `post_apply_cleanup`'s membership sweep retains DMs on
+/// `alive(sender) && alive(recipient)`, and every DM in a pair shares the
+/// same sender/recipient set, so the sweep is all-or-nothing per pair — it
+/// cannot leave a thread partially swept. Combined with the live recompute
+/// (which covers the case where the rendered row lags a DM already in
+/// `ROOMS`), the cutoff is the pair's true inbound maximum in the steady
+/// state, and every inbound DM that already exists satisfies `ts <= cutoff`.
+///
+/// That is a steady-state property, not an absolute one. It assumes local
+/// state holds the pair's complete set at click time. The sweep is atomic per
+/// pair, but the RE-LAND is not: if a peer re-offers only part of a swept pair
+/// and the rail memo refreshes cleanly in between, the row and the live read
+/// agree on a value BELOW the pair's true max, and a later re-offer of the
+/// rest fires the gate and destroys that archive. `max(row, live)` covers a
+/// row that is stale from BEFORE the sweep; it cannot cover a cutoff taken
+/// inside the partial window. Narrow (only an archive clicked inside that
+/// window is lost) but real, and listed as a residual rather than claimed
+/// closed. A DM that left local state and was re-offered therefore
+/// re-lands at or below the cutoff and is inert here, which is the #526 fix.
+/// Only a timestamp strictly past the cutoff is content the user had not
+/// archived.
+///
+/// Accepted residuals, both bounded and neither silent-and-permanent:
+///
+/// * A genuinely new inbound DM stamped in the same unix second as the
+///   peer's previous one waits for their next message. This is the remainder
+///   of issue #267, which bought that second at the price of #526's silent,
+///   permanent archive destruction.
+/// * A peer whose clock moves BACKWARD relative to their own previous
+///   message is likewise deferred.
+/// * A peer who stamps a DM far in the FUTURE sets a correspondingly
+///   far-future cutoff when the user archives, so their later genuine DMs stay
+///   archived until real time passes it. This function clamps the INCOMING
+///   timestamp at `now + MAX_DM_FUTURE_SKEW_SECS` so such a DM can never
+///   trigger an unhide and destroy the archive; the cutoff itself is
+///   deliberately NOT clamped, because clamping one side of the comparison
+///   breaks `every existing inbound DM is <= cutoff` and both re-opens #526
+///   and turns Archive into a no-op (see `dm_rail_section::archive_cutoff`).
+///
+/// * If OUR clock runs more than `MAX_DM_FUTURE_SKEW_SECS` behind real time,
+///   every honest inbound DM clamps to `now + MAX`, below any cutoff derived
+///   from real-clock peer timestamps, so the gate never fires. The rail filter
+///   compares the UNCLAMPED clock, so the thread still shows; only the entry
+///   cleanup is skipped.
+///
+/// These defer messages from one peer the user already chose to archive, and
+/// none destroys state. Two narrow cases CAN still cost an archive entry: a
+/// cutoff taken inside a partial re-land window (above), and a DM that the
+/// live read missed because `ROOMS` was contended AND the rendered row lagged.
+/// Both require an archive clicked inside a specific race; neither is the
+/// systematic churn #526 is about. Irreducible under timestamp gating; the
+/// real remedy for a hostile peer is a block/ignore list, freenet/river#461.
+///
+/// Pinned by the `should_unhide_for_inbound_dm_*` tests, and its use by
+/// [`unhide_dm_thread_if_dm_is_newer`] by
+/// `gated_unhide_wrapper_consults_the_cutoff`.
+pub(crate) fn should_unhide_for_inbound_dm(
+    cutoff: Option<u64>,
+    dm_timestamp: u64,
+    now_secs: u64,
+) -> bool {
+    // Bound the incoming timestamp at `now + MAX_DM_FUTURE_SKEW_SECS`.
+    //
+    // The CUTOFF is deliberately unclamped (`dm_rail_section::archive_cutoff`),
+    // because clamping the side the rail filter does not clamp breaks
+    // `every existing inbound DM is <= cutoff`. Bounding this side instead is
+    // safe in the only direction that matters: `effective <= dm_timestamp`
+    // always, so this can only make the gate MORE conservative and can never
+    // destroy state the unclamped comparison would have kept.
+    //
+    // What it actually buys is narrow, and worth stating precisely: it binds
+    // only when `cutoff >= now + MAX`, i.e. against a peer who has ALREADY
+    // forged a far-future timestamp and inflated the cutoff. It stops them
+    // escalating to a larger forgery to drop the archive. It does NOT stop a
+    // first forgery from reviving a normally-archived thread, because an
+    // ordinary cutoff sits below `now + MAX`. An honest DM is never affected.
+    let effective = dm_timestamp.min(
+        now_secs.saturating_add(river_core::room_state::direct_messages::MAX_DM_FUTURE_SKEW_SECS),
+    );
+    matches!(cutoff, Some(c) if effective > c)
+}
+
+/// Drop the archive entry for `(room, peer)` **only if** `dm_timestamp` is
+/// strictly past the pair's archive cutoff — the inbound-sync counterpart
+/// of [`unhide_dm_thread`] (issue freenet/river#526).
+///
+/// The four explicit-user-action call sites — the Undo toast, the Archived
+/// panel's Un-archive, and the outbound sends in `dm_thread_modal::do_send`
+/// and `direct_messages::send_structured_dm` (invite-via-DM) — keep calling
+/// the unconditional [`unhide_dm_thread`]. Routing any of them through this
+/// gated form would make it a silent no-op: at that moment the thread's
+/// inbound clock is by construction at or below the cutoff.
+///
+/// Scope caveat: that mechanism is per-device. `unhide_dm_thread` removes the
+/// entry locally and saves the blob, but `resolve_hidden_thread_hydration`
+/// only ever INSERTS, so nothing propagates a removal to another device — and
+/// `riverctl dm send` never calls it at all. Archiving on a laptop and then
+/// replying from a phone (or riverctl) therefore leaves the laptop's copy
+/// archived until the peer writes again. Bounded, and strictly better than
+/// #526's permanent destruction, but "our own sends revive the thread" is
+/// true of the SENDING device only. The two
+/// inbound-sync call sites in `room_synchronizer` must NOT, because their
+/// "newly landed" predicate is a diff against **local state**, not against
+/// the archive cutoff:
+///
+/// * `post_apply_cleanup` sweeps every DM whose counterparty is momentarily
+///   absent from `members` (`room_state.rs` ->
+///   `direct_messages::sweep_after_membership_change`). Peers re-offer the
+///   swept DMs and they re-land, which the diff cannot distinguish from a
+///   genuinely new message. Unconditionally unhiding there destroyed the
+///   archive on ordinary sync churn.
+/// * On the full-state path a pre-merge snapshot taken before the room blob
+///   has hydrated is EMPTY, so every DM in the incoming state reads as newly
+///   landed and every archive in the room was destroyed at once.
+///
+/// Both are neutralised here: a pair with no archive entry — whether it was
+/// never archived or `HIDDEN_DM_THREADS` simply hasn't hydrated yet — has
+/// nothing to revive, so we return without touching the signal and, crucially,
+/// **without writing a `RECENTLY_UNHIDDEN` tombstone**. Writing one would
+/// suppress the archive entry when it does hydrate a moment later, turning a
+/// startup race into permanent data loss.
+///
+/// A contended `try_read` skips the unhide. That is safe to lose *visually*:
+/// the rail filter already reveals a thread whose newest DM is past the
+/// cutoff (`is_thread_hidden_for` is `max_message_ts <= hidden_at_ts`), so
+/// the thread still shows. Dropping the entry is durability housekeeping — it
+/// stops a later membership sweep, which drives `last_any_ts` to 0 (and
+/// `0 <= hidden_at_ts` always holds), from re-hiding an already-revived
+/// thread. The same applies to the `cutoff == None` branch when
+/// `HIDDEN_DM_THREADS` has not hydrated yet.
+///
+/// Recovery is by the next inbound or re-offered DM past the cutoff, NOT by a
+/// reload: no save is queued on either skip, so the delegate blob still holds
+/// the entry and a reload re-hydrates it verbatim.
+pub fn unhide_dm_thread_if_dm_is_newer(
+    room_owner_vk: ed25519_dalek::VerifyingKey,
+    peer: MemberId,
+    dm_timestamp: u64,
+) {
+    use crate::components::direct_messages::HIDDEN_DM_THREADS;
+
+    let Ok(hidden) = HIDDEN_DM_THREADS.try_read() else {
+        return;
+    };
+    let cutoff = hidden.get(&(room_owner_vk, peer)).map(|e| e.hidden_at_ts);
+    // Release the read borrow before `unhide_dm_thread` touches the same
+    // signal. This is load-bearing, not belt-and-braces: on non-wasm targets
+    // `crate::util::defer` runs its closure SYNCHRONOUSLY (`util.rs`), which
+    // is how the native test suite executes, so without this drop the
+    // `with_mut` inside `unhide_dm_thread` takes a write borrow while this
+    // read guard is still alive - a re-entrant RefCell panic. On wasm the
+    // setTimeout(0) defer would cover it, which is exactly why a future
+    // reader might think the drop is deletable. It is not.
+    drop(hidden);
+
+    if should_unhide_for_inbound_dm(cutoff, dm_timestamp, unix_now_secs()) {
+        unhide_dm_thread(room_owner_vk, peer);
+    }
 }
 
 /// Coalescing state for [`save_outbound_dms_to_delegate`]. Single-flight

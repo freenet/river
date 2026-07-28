@@ -346,8 +346,9 @@ pub enum CasStoreResult {
 /// thread AND no message in the thread has `timestamp > hidden_at_ts`.
 /// The strict `>` (not `>=`) on `max_message_ts` ensures that the
 /// message used to populate `hidden_at_ts` does not itself revive the
-/// thread. Any newer DM (inbound or outbound) crosses the threshold
-/// and revives.
+/// thread. Any newer INBOUND DM crosses the threshold and revives;
+/// outbound sends revive via the explicit `unhide_dm_thread` instead,
+/// since freenet/river#526 made the archive clock inbound-only.
 ///
 /// `hidden_threads` is the full slice as loaded from the delegate;
 /// the lookup is linear because the list is tiny (bounded by the

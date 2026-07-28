@@ -695,6 +695,38 @@ pub fn seed_dm_last_seen_if_needed() {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue freenet/river#526: the archive clock is INBOUND-only, so an
+    /// outbound send no longer revives an archived thread through the
+    /// timestamp filter. The unconditional `unhide_dm_thread` call in
+    /// `send_structured_dm` is now the ONLY mechanism that does, which makes it
+    /// load-bearing rather than belt-and-braces.
+    ///
+    /// Routing it through the cutoff-gated `unhide_dm_thread_if_dm_is_newer`
+    /// - the "consistency" refactor - would make replying stop reviving
+    /// archived threads entirely, with a green suite: at that moment the
+    /// thread's inbound clock is by construction at or below the cutoff.
+    #[test]
+    fn outbound_send_keeps_the_unconditional_unhide() {
+        let raw = include_str!("direct_messages.rs");
+        let cut = raw
+            .find("mod tests {")
+            .expect("this file must have a `mod tests {`");
+        let src: String = raw[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !src.contains(&format!("{}{}", "unhide_dm_thread_if_dm_is_newer", "(")),
+            "the outbound send must NOT use the cutoff-gated unhide (#526) - \
+             replying would silently stop reviving archived threads."
+        );
+        assert_eq!(
+            src.matches(&format!("{}{}", "unhide_dm_thread", "("))
+                .count(),
+            1,
+            "the outbound send must keep calling the unconditional \
+             unhide_dm_thread (#526); it is the only remaining mechanism that \
+             revives an archived thread on reply."
+        );
+    }
     /// The DM send path in this file must NOT carry a client-side per-pair cap
     /// guard.
     ///
