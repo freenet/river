@@ -205,8 +205,15 @@ pub fn RoomList() -> Element {
         // `try_read() -> Err` registers no subscription (dioxus-signal-safety
         // rules), so with the reads inverted an Err poll would leave this
         // memo with zero subscriptions — permanently frozen room list.
+        //
+        // That ordering alone is not enough (freenet/river#555): a contended pass
+        // still drops the ROOMS subscription, leaving the list stuck until
+        // CURRENT_ROOM happens to change. The anchor plus the deferred nudge make
+        // it re-poll a macrotask later instead.
+        crate::util::signal_guard::anchor();
         let current_room_key = CURRENT_ROOM.read().owner_key;
         let Ok(rooms) = ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
             return Vec::new();
         };
 
@@ -226,11 +233,18 @@ pub fn RoomList() -> Element {
                 // later hits some other transient `Error` should not show the
                 // marker here.
                 let sync_error_msg: Option<String> = if room_data.is_awaiting_initial_sync() {
-                    match SYNC_INFO
-                        .try_read()
-                        .ok()
-                        .and_then(|si| si.get_sync_status(&room_key).cloned())
-                    {
+                    // Second fallible read in this memo, so it nudges too: a
+                    // contended pass drops the SYNC_INFO subscription and the
+                    // room's error marker silently reads as a spinner until an
+                    // unrelated signal moves (freenet/river#555).
+                    let status = match SYNC_INFO.try_read() {
+                        Ok(si) => si.get_sync_status(&room_key).cloned(),
+                        Err(_) => {
+                            crate::util::signal_guard::schedule_nudge();
+                            None
+                        }
+                    };
+                    match status {
                         Some(RoomSyncStatus::Error(msg)) => Some(msg),
                         _ => None,
                     }

@@ -3,6 +3,7 @@
 pub mod confusable;
 pub mod display_name;
 pub mod ecies;
+pub mod signal_guard;
 
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};

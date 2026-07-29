@@ -20,19 +20,24 @@ pub fn EditRoomModal() -> Element {
 
     // Memoize the room being edited
     let editing_room = use_memo(move || {
+        // freenet/river#555: anchor before the fallible ROOMS read so a contended
+        // pass cannot leave this modal (mounted for the whole session) stale.
+        crate::util::signal_guard::anchor();
         EDIT_ROOM_MODAL.read().room.and_then(|editing_room_vk| {
-            ROOMS
-                .try_read()
-                .ok()?
-                .map
-                .iter()
-                .find_map(|(room_vk, room_data)| {
-                    if &editing_room_vk == room_vk {
-                        Some(room_data.clone())
-                    } else {
-                        None
-                    }
-                })
+            let rooms = match ROOMS.try_read() {
+                Ok(rooms) => rooms,
+                Err(_) => {
+                    crate::util::signal_guard::schedule_nudge();
+                    return None;
+                }
+            };
+            rooms.map.iter().find_map(|(room_vk, room_data)| {
+                if &editing_room_vk == room_vk {
+                    Some(room_data.clone())
+                } else {
+                    None
+                }
+            })
         })
     });
 
