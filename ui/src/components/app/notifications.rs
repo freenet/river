@@ -259,8 +259,13 @@ pub fn permission_notice(status: Option<NotificationStatus>) -> PermissionNotice
              browser's site settings — River can't ask again once they're blocked.",
             false,
         ),
+        // Honest about the delay: `dismissed` also covers "inside the gateway's
+        // snooze window from an earlier decline", during which asking again
+        // provably shows nothing. Promising an immediate retry would put the
+        // user back in front of a control that silently does nothing.
         Some(NotificationStatus::Dismissed) => (
-            "You dismissed the notification prompt. You can ask for it again.",
+            "You chose not to enable notifications. You can ask again, though the prompt may not \
+             reappear straight away.",
             true,
         ),
         Some(NotificationStatus::Undecided) => (
@@ -428,30 +433,50 @@ fn record_notification_status(status: NotificationStatus) {
 }
 
 /// The status the UI should display.
-///
-/// In the gateway iframe only the shell can tell us, so this is whatever it last
-/// reported (`None` until it reports anything). Served top-level River has a real
-/// origin and can read the browser's own answer, so an unreported status falls
-/// back to that rather than showing the user nothing.
 pub fn current_notification_status() -> Option<NotificationStatus> {
-    // `try_read`, not `read`: this runs during render and a concurrent write
-    // would otherwise panic (dioxus-signal-safety).
-    if let Ok(stored) = NOTIFICATION_STATUS.try_read() {
-        if stored.is_some() {
-            return *stored;
-        }
+    // Read unconditionally, even on the path that then ignores the value: the
+    // read is what subscribes this render to the signal, so the modal
+    // re-renders when a permission request completes. `try_read`, not `read`,
+    // because a concurrent write would otherwise panic (dioxus-signal-safety).
+    let stored = NOTIFICATION_STATUS.try_read().ok().and_then(|s| *s);
+    let framed = is_in_shell_iframe();
+    resolve_status(framed, stored, (!framed).then(read_browser_permission))
+}
+
+/// Which answer the UI shows: the shell's last report when framed, the
+/// browser's own when not.
+///
+/// Framed, River's origin is opaque and the shell's report is the only source
+/// there is. Served top-level the browser is authoritative and STAYS
+/// authoritative — the user can flip the permission in site settings at any
+/// time, and a remembered answer from an earlier request would then be wrong
+/// for the rest of the session. So `stored` is deliberately ignored there
+/// rather than preferred; its only job on that path is to trigger the re-render.
+///
+/// `live` is `None` exactly when framed, since there is nothing to read.
+fn resolve_status(
+    framed: bool,
+    stored: Option<NotificationStatus>,
+    live: Option<NotificationStatus>,
+) -> Option<NotificationStatus> {
+    if framed {
+        stored
+    } else {
+        live
     }
-    if is_in_shell_iframe() {
-        return None;
-    }
+}
+
+/// The browser's own answer. Top-level only — the framed path must not call
+/// this, since an opaque origin has no meaningful permission to read.
+fn read_browser_permission() -> NotificationStatus {
     if !notification_api_available() {
-        return Some(NotificationStatus::Unsupported);
+        return NotificationStatus::Unsupported;
     }
-    Some(match get_permission() {
+    match get_permission() {
         NotificationPermission::Granted => NotificationStatus::Granted,
         NotificationPermission::Denied => NotificationStatus::Denied,
         _ => NotificationStatus::Undecided,
-    })
+    }
 }
 
 /// Whether this browser exposes the Notifications API at all.
@@ -1381,6 +1406,48 @@ mod notify_gate_tests {
             !status_rearms_auto_prompt(NotificationStatus::Undecided, 3),
             "the automatic ask must stop re-arming; otherwise the shell shows \
              its bar again on every message the user sends"
+        );
+    }
+
+    /// Served top-level, the browser's live answer wins over anything River
+    /// remembered. A user who flips the permission in site settings would
+    /// otherwise be told "your browser is blocking notifications" for the rest
+    /// of the session, with the Enable button withheld — a stale silent failure
+    /// of the same shape #510 removes.
+    #[test]
+    fn the_browser_answer_wins_over_a_remembered_one_when_unframed() {
+        assert_eq!(
+            resolve_status(
+                false,
+                Some(NotificationStatus::Denied),
+                Some(NotificationStatus::Granted)
+            ),
+            Some(NotificationStatus::Granted),
+            "a remembered Denied must not survive the user allowing notifications"
+        );
+        assert_eq!(
+            resolve_status(
+                false,
+                Some(NotificationStatus::Granted),
+                Some(NotificationStatus::Denied)
+            ),
+            Some(NotificationStatus::Denied),
+            "a remembered Granted must not survive the user blocking notifications"
+        );
+    }
+
+    /// Framed, the shell's report is the only source there is: River's origin is
+    /// opaque, so there is no browser answer to read.
+    #[test]
+    fn the_shell_report_is_the_only_source_when_framed() {
+        assert_eq!(
+            resolve_status(true, Some(NotificationStatus::Denied), None),
+            Some(NotificationStatus::Denied)
+        );
+        assert_eq!(
+            resolve_status(true, None, None),
+            None,
+            "nothing reported yet is its own state, not a guess"
         );
     }
 
