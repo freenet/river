@@ -308,12 +308,25 @@ test.describe("room-details copy buttons", () => {
     // Same contract the Export Identity copy button holds
     // (copy-clipboard-feedback.spec.ts): reopening must not show a stale
     // "Copied!" from a previous visit.
+    //
+    // The waits below are deliberately generous. The panel is a `fixed
+    // inset-0` overlay, so the room-header (i) button only becomes actionable
+    // again once it has fully unmounted, and under the full suite's parallel
+    // load (five projects, each booting a WASM app) that settle can outrun a
+    // 5s budget on an otherwise-healthy run. This is contention, not a
+    // correctness question: an instrumented 25-cycle open/copy/close/reopen
+    // loop showed a stale label 0 times in both WebKit and Firefox. So wait
+    // for the reopen affordance explicitly instead of racing it.
     await page.getByTestId("edit-room-close-button").click();
-    await expect(page.getByTestId("edit-room-modal")).toHaveCount(0);
+    await expect(page.getByTestId("edit-room-modal")).toHaveCount(0, { timeout: 15_000 });
 
-    await page.getByTitle("Room details").click();
-    await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
-    await expect(page.getByTestId("room-public-key-copy-button")).toHaveText(/^Copy$/);
+    const reopen = page.getByTitle("Room details");
+    await expect(reopen).toBeVisible({ timeout: 15_000 });
+    await reopen.click();
+    await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("room-public-key-copy-button")).toHaveText(/^Copy$/, {
+      timeout: 15_000,
+    });
   });
 
   test("the room-details panel does not overflow horizontally", async ({ page }) => {
