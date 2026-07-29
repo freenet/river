@@ -4,6 +4,9 @@ use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use ed25519_dalek::VerifyingKey;
+use river_core::room_state::ban::BansV1;
+use river_core::room_state::member::MemberId;
+use river_core::room_state::ChatRoomStateV1;
 use serde::Serialize;
 
 #[derive(Subcommand)]
@@ -42,6 +45,99 @@ struct BanInfo {
     banned_user_id: String,
     banned_by_id: String,
     banned_at_secs: u64,
+    /// Whether the contract currently ENFORCES this ban, as opposed to it being
+    /// present in state but inert. Since deputy ban authority (freenet/river#410)
+    /// a ban can stop enforcing without being removed — e.g. the banner's deputy
+    /// authority was revoked, the banner left or was pruned, or the target has
+    /// since deputized the banner. Computed from `BansV1::ban_is_enforcing`, the
+    /// same predicate the contract uses when it decides whether a ban's target
+    /// is actually excluded.
+    enforcing: bool,
+}
+
+/// Classify every ban in `room_state` as enforcing or inert, projecting each to
+/// a `BanInfo`. Kept as a pure helper (no I/O) so the enforcement wiring is unit
+/// testable without a live node — see the tests at the bottom of this file.
+fn collect_ban_infos(room_state: &ChatRoomStateV1, owner_vk: &VerifyingKey) -> Vec<BanInfo> {
+    let owner_id = MemberId::from(owner_vk);
+    let members_by_id = room_state.members.members_by_member_id();
+    room_state
+        .bans
+        .0
+        .iter()
+        .map(|ban| {
+            let banned_at_secs = ban
+                .ban
+                .banned_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let enforcing = BansV1::ban_is_enforcing(
+                ban,
+                &members_by_id,
+                &room_state.member_info,
+                owner_id,
+                owner_vk,
+            );
+            BanInfo {
+                banned_user_id: ban.ban.banned_user.to_string(),
+                banned_by_id: ban.banned_by.to_string(),
+                banned_at_secs,
+                enforcing,
+            }
+        })
+        .collect()
+}
+
+/// Render the human-readable `debug bans` output as lines. Pure so the
+/// non-enforcing call-out is unit testable: this listing is the surface a
+/// moderator reads to decide whether someone is still kept out, so a ban that
+/// no longer enforces has to be visibly distinct rather than silently blending
+/// in with the live ones.
+fn ban_list_lines(bans: &[BanInfo]) -> Vec<String> {
+    let enforcing_count = bans.iter().filter(|b| b.enforcing).count();
+    let inert_count = bans.len() - enforcing_count;
+
+    let mut lines = vec![
+        format!(
+            "Ban List ({} bans, {} enforcing)",
+            bans.len(),
+            enforcing_count
+        ),
+        "=========".to_string(),
+    ];
+
+    if bans.is_empty() {
+        lines.push("No bans.".to_string());
+        return lines;
+    }
+
+    for ban in bans {
+        lines.push(format!(
+            "  {} banned by {} at {}{}",
+            ban.banned_user_id,
+            ban.banned_by_id,
+            ban.banned_at_secs,
+            if ban.enforcing {
+                ""
+            } else {
+                "  [NOT ENFORCING]"
+            }
+        ));
+    }
+
+    if inert_count > 0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "Note: {} ban(s) are stored in room state but NOT enforced, so those \
+             users are not kept out. A ban stops enforcing when its banner leaves \
+             the room or loses the deputy authority it banned under. Check the \
+             banner with `riverctl member deputized-by <room> <banned_by_id>`.",
+            inert_count
+        ));
+    }
+
+    lines
 }
 
 #[derive(Serialize)]
@@ -338,38 +434,12 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
             let owner_vk = parse_owner_key(&room_owner_key)?;
             let room_state = api.get_room(&owner_vk, false).await?;
 
-            let bans: Vec<BanInfo> = room_state
-                .bans
-                .0
-                .iter()
-                .map(|ban| {
-                    let banned_at_secs = ban
-                        .ban
-                        .banned_at
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    BanInfo {
-                        banned_user_id: ban.ban.banned_user.to_string(),
-                        banned_by_id: ban.banned_by.to_string(),
-                        banned_at_secs,
-                    }
-                })
-                .collect();
+            let bans = collect_ban_infos(&room_state, &owner_vk);
 
             match format {
                 OutputFormat::Human => {
-                    println!("Ban List ({} bans)", bans.len());
-                    println!("=========");
-                    if bans.is_empty() {
-                        println!("No bans.");
-                    } else {
-                        for ban in &bans {
-                            println!(
-                                "  {} banned by {} at {}",
-                                ban.banned_user_id, ban.banned_by_id, ban.banned_at_secs
-                            );
-                        }
+                    for line in ban_list_lines(&bans) {
+                        println!("{}", line);
                     }
                 }
                 OutputFormat::Json => {
@@ -503,5 +573,279 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed["status"], "error");
         assert_eq!(parsed["message"], raw);
+    }
+
+    // --- `debug bans` enforcement reporting (#472) ------------------------
+    //
+    // A ban can sit in room state while the contract no longer enforces it
+    // (deputy ban authority, #410). These pin that `debug bans` distinguishes
+    // the two, since a moderator reads this list to decide whether someone is
+    // actually kept out.
+
+    use ed25519_dalek::SigningKey;
+    use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+    use river_core::room_state::member::{AuthorizedMember, Member};
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+
+    /// The cli crate's dalek build does not enable the `rand` `generate`
+    /// helper, so keys come from fixed seeds (mirrors `deputies.rs`'s tests).
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn id(sk: &SigningKey) -> MemberId {
+        sk.verifying_key().into()
+    }
+
+    /// Add `sk` as a member invited by `inviter`, signed by the inviter as
+    /// `AuthorizedMember::new` asserts.
+    fn push_member(
+        state: &mut ChatRoomStateV1,
+        owner: &SigningKey,
+        inviter: &SigningKey,
+        sk: &SigningKey,
+    ) {
+        let member = Member {
+            owner_member_id: id(owner),
+            invited_by: id(inviter),
+            member_vk: sk.verifying_key(),
+        };
+        state
+            .members
+            .members
+            .push(AuthorizedMember::new(member, inviter));
+    }
+
+    /// Push a signed `member_info` record for `sk` at `version` granting
+    /// `deputies`. A later version supersedes an earlier one via `canonical`,
+    /// which is how a revocation is represented.
+    fn push_info(
+        state: &mut ChatRoomStateV1,
+        sk: &SigningKey,
+        version: u32,
+        deputies: Vec<MemberId>,
+    ) {
+        let mut info = MemberInfo::new_public(id(sk), version, "member".to_string());
+        info.deputies = deputies;
+        state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(info, sk));
+    }
+
+    /// A ban of `target` issued and signed by `banner`.
+    fn push_ban(
+        state: &mut ChatRoomStateV1,
+        owner: &SigningKey,
+        banner: &SigningKey,
+        target: &SigningKey,
+    ) {
+        let ban = UserBan {
+            owner_member_id: id(owner),
+            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            banned_user: id(target),
+        };
+        state
+            .bans
+            .0
+            .push(AuthorizedUserBan::new(ban, id(banner), banner));
+    }
+
+    #[test]
+    fn owner_ban_of_a_present_member_reports_enforcing() {
+        // Baseline for the negative cases below: without this, a test asserting
+        // `!enforcing` would pass even if `enforcing` were hardcoded to false.
+        let owner = key(1);
+        let alice = key(2);
+
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_ban(&mut state, &owner, &owner, &alice);
+
+        let bans = collect_ban_infos(&state, &owner.verifying_key());
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].banned_user_id, id(&alice).to_string());
+        assert_eq!(bans[0].banned_by_id, id(&owner).to_string());
+        assert!(
+            bans[0].enforcing,
+            "an owner's ban of a current member is authorized, so it must report as enforcing"
+        );
+    }
+
+    #[test]
+    fn deputy_ban_reports_enforcing_while_the_grant_stands() {
+        // The other half of the revocation pair below: the SAME ban, differing
+        // only in whether the owner's deputy grant is still present.
+        let owner = key(1);
+        let alice = key(2);
+        let bob = key(3);
+
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &owner, &bob);
+        push_info(&mut state, &owner, 0, vec![id(&bob)]);
+        push_ban(&mut state, &owner, &bob, &alice);
+
+        let bans = collect_ban_infos(&state, &owner.verifying_key());
+        assert!(
+            bans[0].enforcing,
+            "bob is a current owner-appointed deputy, so his ban enforces"
+        );
+    }
+
+    #[test]
+    fn deputy_ban_reports_not_enforcing_after_the_grant_is_revoked() {
+        // The issue's headline case (#472): the owner revokes bob's deputy
+        // authority by publishing a later `member_info` record without him.
+        // The ban stays in state but the contract stops excluding alice, and
+        // `debug bans` used to present it identically to a live ban.
+        let owner = key(1);
+        let alice = key(2);
+        let bob = key(3);
+
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &owner, &bob);
+        push_info(&mut state, &owner, 0, vec![id(&bob)]);
+        push_ban(&mut state, &owner, &bob, &alice);
+        // Revocation: a higher-version record wins in `canonical`.
+        push_info(&mut state, &owner, 1, vec![]);
+
+        let bans = collect_ban_infos(&state, &owner.verifying_key());
+        assert_eq!(bans.len(), 1, "the ban is still stored in state");
+        assert!(
+            !bans[0].enforcing,
+            "bob's authority was revoked, so his ban no longer keeps alice out"
+        );
+    }
+
+    #[test]
+    fn ban_reports_not_enforcing_once_its_banner_is_no_longer_a_member() {
+        // Second inert path from #472: the banner left or was pruned, so the
+        // deputy-derived grants no longer apply. Alice must remain a member,
+        // otherwise `ban_is_enforcing` short-circuits to true on an absent
+        // target and the test would pass for the wrong reason.
+        let owner = key(1);
+        let alice = key(2);
+        let carol = key(4);
+
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &owner, &carol);
+        push_info(&mut state, &owner, 0, vec![id(&carol)]);
+        push_ban(&mut state, &owner, &carol, &alice);
+
+        // Sanity: enforcing while carol is present.
+        assert!(collect_ban_infos(&state, &owner.verifying_key())[0].enforcing);
+
+        // Carol leaves / is pruned.
+        state
+            .members
+            .members
+            .retain(|m| m.member.id() != id(&carol));
+
+        let bans = collect_ban_infos(&state, &owner.verifying_key());
+        assert!(
+            !bans[0].enforcing,
+            "a ban whose banner is gone is inert and must not read as active"
+        );
+    }
+
+    #[test]
+    fn ban_json_carries_the_enforcing_flag_alongside_the_pre_existing_shape() {
+        // `banned_user_id` / `banned_by_id` / `banned_at_secs` are the published
+        // shape; `enforcing` is additive. Renaming or dropping any of them
+        // breaks consumers of `debug bans -f json`.
+        let owner = key(1);
+        let alice = key(2);
+
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_ban(&mut state, &owner, &owner, &alice);
+
+        let bans = collect_ban_infos(&state, &owner.verifying_key());
+        let json = serde_json::to_value(&bans).unwrap();
+        let entry = &json[0];
+
+        assert_eq!(entry["banned_user_id"], id(&alice).to_string());
+        assert_eq!(entry["banned_by_id"], id(&owner).to_string());
+        assert_eq!(entry["banned_at_secs"], 1_700_000_000u64);
+        assert_eq!(
+            entry["enforcing"], true,
+            "`enforcing` must be present and boolean in the JSON output"
+        );
+    }
+
+    #[test]
+    fn human_output_marks_only_the_non_enforcing_bans() {
+        // The human branch is the surface the issue is about: an inert ban that
+        // renders identically to a live one is the whole bug.
+        let enforcing = BanInfo {
+            banned_user_id: "LIVEUSER".to_string(),
+            banned_by_id: "BANNERA".to_string(),
+            banned_at_secs: 100,
+            enforcing: true,
+        };
+        let inert = BanInfo {
+            banned_user_id: "INERTUSER".to_string(),
+            banned_by_id: "BANNERB".to_string(),
+            banned_at_secs: 200,
+            enforcing: false,
+        };
+
+        let lines = ban_list_lines(&[enforcing, inert]);
+        let live_line = lines
+            .iter()
+            .find(|l| l.contains("LIVEUSER"))
+            .expect("the enforcing ban must still be listed");
+        let inert_line = lines
+            .iter()
+            .find(|l| l.contains("INERTUSER"))
+            .expect("the inert ban must still be listed");
+
+        assert!(
+            !live_line.contains("NOT ENFORCING"),
+            "an enforcing ban must not be flagged: {live_line}"
+        );
+        assert!(
+            inert_line.contains("NOT ENFORCING"),
+            "an inert ban must be visibly flagged: {inert_line}"
+        );
+
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("2 bans, 1 enforcing"),
+            "the header must report how many bans actually enforce: {rendered}"
+        );
+        assert!(
+            rendered.contains("member deputized-by"),
+            "the note must point at the command that explains why a ban went inert"
+        );
+    }
+
+    #[test]
+    fn human_output_stays_quiet_when_every_ban_enforces() {
+        // No false alarm: a room whose bans are all live must not carry the
+        // inert-ban note, or moderators learn to ignore it.
+        let lines = ban_list_lines(&[BanInfo {
+            banned_user_id: "LIVEUSER".to_string(),
+            banned_by_id: "BANNERA".to_string(),
+            banned_at_secs: 100,
+            enforcing: true,
+        }]);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("1 bans, 1 enforcing"));
+        assert!(!rendered.contains("NOT ENFORCING"));
+        assert!(!rendered.contains("Note:"));
+    }
+
+    #[test]
+    fn human_output_handles_an_empty_ban_list() {
+        let lines = ban_list_lines(&[]);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("0 bans, 0 enforcing"));
+        assert!(rendered.contains("No bans."));
+        assert!(!rendered.contains("Note:"));
     }
 }
