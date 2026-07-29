@@ -12,7 +12,7 @@ pub mod secret;
 pub mod upgrade;
 pub mod version;
 
-use crate::room_state::ban::BansV1;
+use crate::room_state::ban::{BanSignatureCache, BansV1};
 use crate::room_state::configuration::AuthorizedConfigurationV1;
 use crate::room_state::direct_messages::DirectMessagesV1;
 use crate::room_state::member::{MemberId, MembersV1};
@@ -101,6 +101,30 @@ impl ChatRoomStateV1 {
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
 
+        // One Ed25519 verification per (ban, banner key) for the WHOLE cleanup.
+        // Steps 0, 2 and 5 all ask `ban_signature_matches_current_key` about
+        // every stored ban, plus step 0-cap when the set is OVER the cap (a room
+        // sitting exactly AT it skips that pass). Without this each pass re-ran
+        // the verification.
+        //
+        // Measured on the live Freenet Official room's shape (496 members, 200
+        // bans, 2000 messages, 2026-07-29) by counting calls into
+        // `verify_struct`: one `update_state` carrying a single new message did
+        // 800 ban-signature verifications before this change and 400 after —
+        // 338 ms -> 169 ms at 0.4224 ms per verification under wasmtime with
+        // Cranelift at `OptLevel::None`. Real, but NOT the 5s-budget breach in
+        // freenet/river#422; see that PR for what is and is not explained.
+        //
+        // 400 rather than 200 because `MembersV1::apply_delta` runs its own ban
+        // enforcement earlier in the field order, through a separate cache. That
+        // pass cannot share this one without threading a cache through
+        // `ComposableState::apply_delta`, which is a trait-level change.
+        //
+        // Sharing the cache is safe across the member-set mutations these steps
+        // perform because the cache is keyed on the resolved banner KEY, not on
+        // the member set; see [`BanSignatureCache`].
+        let mut ban_sigs = BanSignatureCache::new();
+
         // 0-cap. Enforce `max_user_bans` FIRST — BEFORE ban enforcement (step 0)
         //     and the banner inactivity-prune exemption (step 2) — so both read
         //     the FINAL surviving (post-cap) ban set (#411 round 7 / Codex P1
@@ -158,7 +182,8 @@ impl ChatRoomStateV1 {
             // ban (not O(n log n) times inside a comparator) — #411 round 3 C.
             self.bans.0.sort_by_cached_key(|ban| {
                 (
-                    BansV1::ban_is_enforcing(
+                    BansV1::ban_is_enforcing_cached(
+                        &mut ban_sigs,
                         ban,
                         &members_by_id,
                         &self.member_info,
@@ -195,9 +220,12 @@ impl ChatRoomStateV1 {
         // converges to the same member set regardless of delta order. Kept in
         // post_apply_cleanup (NOT verify) so verify stays stable across
         // ban/deputy changes — mirrors the DM ban-sweep precedent.
-        let enforced_banned_ids =
-            self.members
-                .banned_member_ids(&self.bans, &self.member_info, parameters);
+        let enforced_banned_ids = self.members.banned_member_ids_cached(
+            &mut ban_sigs,
+            &self.bans,
+            &self.member_info,
+            parameters,
+        );
         self.members
             .members
             .retain(|m| !enforced_banned_ids.contains(&m.member.id()));
@@ -296,7 +324,7 @@ impl ChatRoomStateV1 {
             for ban in &self.bans.0 {
                 let banner = ban.banned_by;
                 if banner != owner_id
-                    && BansV1::ban_signature_matches_current_key(
+                    && ban_sigs.ban_signature_matches_current_key(
                         ban,
                         &members_by_id,
                         owner_id,
@@ -393,7 +421,7 @@ impl ChatRoomStateV1 {
         //    rebuilt here because the sweep needs each banner's `member_vk`.
         let members_by_id_for_ban_sweep = self.members.members_by_member_id();
         self.bans.0.retain(|ban| {
-            BansV1::ban_signature_matches_current_key(
+            ban_sigs.ban_signature_matches_current_key(
                 ban,
                 &members_by_id_for_ban_sweep,
                 owner_id,
