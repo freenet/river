@@ -57,6 +57,43 @@ async function openRoomDetails(page: Page) {
   await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
 }
 
+/**
+ * Capture what the app actually writes to the clipboard.
+ *
+ * `crate::util::copy_to_clipboard` goes through `document.execCommand('copy')`
+ * on a throwaway off-screen textarea (so it works inside the gateway's
+ * sandboxed iframe), which is not readable via the Clipboard API. Patching
+ * `execCommand` lets us assert the COPIED TEXT rather than just the button's
+ * label — a button wired to the wrong field would still say "Copied!".
+ */
+async function captureClipboardWrites(page: Page) {
+  await page.evaluate(() => {
+    const w = window as unknown as { __clip: string[] };
+    w.__clip = [];
+    const orig = document.execCommand.bind(document);
+    document.execCommand = function (cmd: string, ...rest: unknown[]) {
+      if (cmd === "copy") {
+        const active = document.activeElement as HTMLTextAreaElement | null;
+        let copied = active && "value" in active ? active.value : "";
+        if (!copied) {
+          // `select()` is not guaranteed to focus, so fall back to the
+          // helper's signature: an off-screen fixed-position textarea.
+          const ta = Array.from(document.querySelectorAll("textarea")).find(
+            (t) => t.style.left === "-9999px"
+          );
+          copied = ta?.value ?? "";
+        }
+        w.__clip.push(copied);
+      }
+      return (orig as (c: string, ...r: unknown[]) => boolean)(cmd, ...rest);
+    } as typeof document.execCommand;
+  });
+}
+
+function clipboardWrites(page: Page) {
+  return page.evaluate(() => (window as unknown as { __clip: string[] }).__clip);
+}
+
 /** Text the browser would put on the clipboard for `Ctrl+C` on this input. */
 function selectedText(input: Locator) {
   return input.evaluate((el: HTMLInputElement) =>
@@ -213,8 +250,16 @@ test.describe("room-details copy buttons", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   for (const field of [
-    { input: "room-public-key-input", button: "room-public-key-copy-button" },
-    { input: "contract-id-input", button: "contract-id-copy-button" },
+    {
+      input: "room-public-key-input",
+      button: "room-public-key-copy-button",
+      other: "contract-id-input",
+    },
+    {
+      input: "contract-id-input",
+      button: "contract-id-copy-button",
+      other: "room-public-key-input",
+    },
   ]) {
     test(`${field.button} confirms the copy`, async ({ page }) => {
       await page.goto("/");
@@ -231,7 +276,45 @@ test.describe("room-details copy buttons", () => {
       await button.click();
       await expect(button).toHaveText(/Copied!/, { timeout: 2_000 });
     });
+
+    test(`${field.button} copies THAT field's value, not another`, async ({ page }) => {
+      await page.goto("/");
+      await waitForApp(page);
+      await openRoomDetails(page);
+
+      const mine = await page.getByTestId(field.input).inputValue();
+      const other = await page.getByTestId(field.other).inputValue();
+      expect(mine.length).toBeGreaterThan(0);
+      expect(mine).not.toBe(other);
+
+      await captureClipboardWrites(page);
+      await page.getByTestId(field.button).click();
+
+      // Asserting the button says "Copied!" is NOT enough: it would say that
+      // just the same if the two buttons' values were swapped.
+      await expect.poll(() => clipboardWrites(page), { timeout: 2_000 }).toEqual([mine]);
+    });
   }
+
+  test("the copy feedback resets when the panel is closed and reopened", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomDetails(page);
+
+    const button = page.getByTestId("room-public-key-copy-button");
+    await button.click();
+    await expect(button).toHaveText(/Copied!/, { timeout: 2_000 });
+
+    // Same contract the Export Identity copy button holds
+    // (copy-clipboard-feedback.spec.ts): reopening must not show a stale
+    // "Copied!" from a previous visit.
+    await page.getByTestId("edit-room-close-button").click();
+    await expect(page.getByTestId("edit-room-modal")).toHaveCount(0);
+
+    await page.getByTitle("Room details").click();
+    await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByTestId("room-public-key-copy-button")).toHaveText(/^Copy$/);
+  });
 
   test("the room-details panel does not overflow horizontally", async ({ page }) => {
     await page.goto("/");
@@ -245,5 +328,32 @@ test.describe("room-details copy buttons", () => {
       (el) => el.scrollWidth - el.clientWidth
     );
     expect(overflow).toBeLessThanOrEqual(1);
+  });
+
+  test("the panel still fits, with both copy buttons, at 320px", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomDetails(page);
+
+    // The narrow viewport is the whole point of this check: adding a button
+    // beside each value is exactly what could overflow a small screen, and
+    // `openRoomDetails` widens to desktop, so the other tests never see it.
+    // 320px is the smallest width responsive-layout.spec.ts covers.
+    await page.setViewportSize({ width: 320, height: 800 });
+    const modal = page.getByTestId("edit-room-modal");
+    await expect(modal).toBeVisible();
+
+    for (const testid of ["room-public-key-copy-button", "contract-id-copy-button"]) {
+      await expect(page.getByTestId(testid)).toBeVisible();
+    }
+
+    const overflow = await modal.evaluate((el) => el.scrollWidth - el.clientWidth);
+    expect(overflow).toBeLessThanOrEqual(1);
+
+    // The modal itself must not be pushed outside the viewport either.
+    const docOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+    );
+    expect(docOverflow).toBeLessThanOrEqual(1);
   });
 });
