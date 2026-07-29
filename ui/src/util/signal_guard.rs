@@ -260,11 +260,21 @@ mod tests {
                      Err path the anchor is never reached, so it registers \
                      nothing (freenet/river#555)."
                 );
+                // One nudge per fallible read, not one per memo. The anchor keeps
+                // the memo alive, but a contended read still drops THAT signal's
+                // subscription, so each fallible read needs its own retry. A
+                // per-body `contains` check passed happily while two secondary
+                // reads (OUTBOUND_DMS, SYNC_INFO) had no nudge at all -- human
+                // review caught those, which is precisely what this pin is for.
+                let reads = body.matches("try_read(").count();
+                let nudges = body.matches("signal_guard::schedule_nudge").count();
                 assert!(
-                    body.contains("signal_guard::schedule_nudge"),
-                    "{name}: use_memo at line {line} degrades on a contended \
-                     read without calling signal_guard::schedule_nudge(), so \
-                     nothing ever wakes it to retry (freenet/river#555)."
+                    nudges >= reads,
+                    "{name}: use_memo at line {line} has {reads} fallible \
+                     read(s) but only {nudges} schedule_nudge() call(s). Every \
+                     read that can fail needs a nudge on its own failure \
+                     branch, or that signal's subscription is dropped with \
+                     nothing to restore it (freenet/river#555)."
                 );
             }
             assert!(

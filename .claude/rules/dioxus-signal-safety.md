@@ -6,10 +6,17 @@ globs:
 
 # Dioxus WASM Signal Safety Rules
 
-The UI runs as single-threaded WASM. Firefox mobile runs Dioxus signal
-subscriber notifications synchronously during Drop, causing
-`RefCell already borrowed` panics. These rules prevent re-entrant borrow
-crashes.
+The UI runs as single-threaded WASM, where a re-entrant signal borrow is a
+`RefCell already borrowed` panic rather than a benign contention. These rules
+prevent that, and prevent the subscription latch below.
+
+Note on the mechanism: earlier revisions of this file said Dioxus fires
+subscriber notifications synchronously during a write guard's Drop, with the
+borrow still held. That is not what dioxus 0.7.9 does — `WriteLock`'s borrow
+field drops before its `SignalSubscriberDrop` (`write.rs:164`),
+`update_subscribers` takes a fresh read (`signal.rs:260`), and `mark_dirty` on
+a memo only sets a flag and sends on a channel (`memo.rs:53`). The rules still
+hold, but for the reasons stated at each rule, not that one.
 
 ## Always use `try_read()` for reactive signal reads
 
@@ -33,7 +40,9 @@ if that is nothing, to nothing at all. It then never re-evaluates.
 ### Required: anchor + nudge for every fallible read (freenet/river#555)
 
 The two mitigations previously listed here are **not sufficient**, and
-relying on them is what produced #397, #499 and #555:
+relying on them is what produced #499 and #555 (#397 is the same *blank
+render* family but a different cause — a missing loading state — so it is
+not evidence for this one):
 
 - `defer()`-ing mutations does not prevent contention. It was already used
   throughout when all three bugs happened.
@@ -98,11 +107,15 @@ Signal mutations (`ROOMS.with_mut()`, `ROOMS.write()`,
 synchronous event handlers (`onclick`, etc.). This is required for TWO
 reasons:
 
-1. **RefCell re-entrancy**: Signal write Drop handlers fire subscriber
-   notifications synchronously. Those notifications poll memos that call
-   `try_read()` on the same signal — panics if the write guard's
-   RefCell borrow is still held. `setTimeout(0)` breaks the call stack
-   so no borrows are active.
+1. **RefCell re-entrancy**: a mutation run from a handler or a polled
+   future can be re-entered while an outer borrow of the same signal is
+   still live — `mark_dirty` explicitly "can run user code"
+   (`signal.rs:262`), and this repo has an observed instance
+   (`process_rooms()` being driven during a write-guard drop, see
+   `sync_info.rs::rooms_awaiting_subscription`). A re-entrant borrow is a
+   panic here, not a soft failure. `setTimeout(0)` breaks the call stack so
+   no borrows are active. (This is NOT the debunked "Drop notifies
+   synchronously while holding the borrow" story — see the note at the top.)
 
 2. **Missing Dioxus scope**: `wasm_bindgen_futures::spawn_local` tasks
    run without a Dioxus scope on the `scope_stack`. Signal subscriber
