@@ -7,7 +7,7 @@
 //! - Permission has been granted
 
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
-use crate::room_data::CurrentRoom;
+use crate::room_data::{CurrentRoom, NotificationMode};
 use crate::util::ecies::{decrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{debug, info, warn};
 use dioxus::prelude::*;
@@ -287,6 +287,31 @@ pub fn permission_notice(status: Option<NotificationStatus>) -> PermissionNotice
         message,
         offer_enable,
     }
+}
+
+/// Whether the bell should carry a "these preferences aren't reaching you"
+/// marker.
+///
+/// The per-room modes decide only WHEN River wants to notify. If the browser
+/// won't deliver, every one of them is inert — and until now the only place
+/// that said so was inside the modal, so a user with a blocked permission saw an
+/// ordinary bell reading "Notifications: All messages" and learned nothing
+/// unless they went looking. For an issue titled "fails silently", that is the
+/// last place the silence lives.
+///
+/// Deliberately NOT flagged:
+/// - [`NotificationMode::Muted`] — the user asked for no notifications, so
+///   warning that they won't get any is noise.
+/// - [`NotificationStatus::Unsupported`] — the platform has no Notifications API
+///   at all (mobile Safari), so the marker could never be cleared by anything
+///   the user does. A permanent badge is nagging, not informing; the modal still
+///   explains it.
+pub fn delivery_is_blocked(mode: NotificationMode, status: Option<NotificationStatus>) -> bool {
+    !matches!(mode, NotificationMode::Muted)
+        && matches!(
+            status,
+            Some(NotificationStatus::Denied | NotificationStatus::Undeliverable)
+        )
 }
 
 /// Whether a reported status should re-arm the automatic enable prompt.
@@ -1517,6 +1542,45 @@ mod notify_gate_tests {
             production.contains("Some(status)=>record_notification_status(status)"),
             "a parsed status is no longer recorded"
         );
+    }
+
+    /// The bell marker fires exactly where the user's own setting says they want
+    /// notifications and the browser will not deliver them.
+    #[test]
+    fn the_bell_is_marked_only_when_a_wanted_notification_cannot_arrive() {
+        use crate::room_data::NotificationMode::*;
+
+        for mode in [All, MentionsAndReplies] {
+            for (status, blocked) in [
+                (Some(NotificationStatus::Denied), true),
+                (Some(NotificationStatus::Undeliverable), true),
+                (Some(NotificationStatus::Granted), false),
+                (Some(NotificationStatus::Dismissed), false),
+                (Some(NotificationStatus::Undecided), false),
+                // Unsupported is excluded on purpose: nothing the user does can
+                // clear it, so the marker would be permanent nagging.
+                (Some(NotificationStatus::Unsupported), false),
+                (None, false),
+            ] {
+                assert_eq!(
+                    delivery_is_blocked(mode, status),
+                    blocked,
+                    "mode {mode:?} with status {status:?}"
+                );
+            }
+        }
+    }
+
+    /// A muted room is never marked: the user asked for no notifications, so
+    /// telling them they won't get any is noise, not information.
+    #[test]
+    fn a_muted_room_is_never_marked_as_blocked() {
+        for status in ALL_STATUSES {
+            assert!(
+                !delivery_is_blocked(crate::room_data::NotificationMode::Muted, Some(status)),
+                "muted room marked for status {status:?}"
+            );
+        }
     }
 
     /// The re-arm itself — the "reset the flag" half of #510 — is two statements
