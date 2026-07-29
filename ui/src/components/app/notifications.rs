@@ -1544,6 +1544,25 @@ mod notify_gate_tests {
         );
     }
 
+    /// The unrecognised-status log must stay at `warn!`. `release_max_level_info`
+    /// compiles `debug!` out of the build users run, and this line fires exactly
+    /// when the cross-repo status contract has drifted — the failure that reverts
+    /// #510 wholesale — so at `debug!` the one diagnostic for it is gone.
+    ///
+    /// The framed Playwright test asserts the same thing behaviourally, by
+    /// waiting for the line in the console. This pin is kept alongside it because
+    /// it fails in a second in the fast native job rather than sixteen minutes
+    /// into the browser job, and because it does not depend on Dioxus continuing
+    /// to spell the level "WARN" in the message text.
+    #[test]
+    fn an_unknown_status_is_logged_at_a_level_release_builds_keep() {
+        assert!(
+            production_source().contains("None=>warn!(\"Ignoringunrecognised"),
+            "the unrecognised-status log is no longer warn!; at debug! it is \
+             compiled out of release and the contract drift becomes invisible"
+        );
+    }
+
     /// The bell marker fires exactly where the user's own setting says they want
     /// notifications and the browser will not deliver them.
     #[test]

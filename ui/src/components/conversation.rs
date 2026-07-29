@@ -3851,6 +3851,12 @@ pub fn Conversation() -> Element {
                                                 span {
                                                     "data-testid": "notification-blocked-badge",
                                                     "aria-hidden": "true",
+                                                    // `ring-panel` needs the hand-written
+                                                    // `@utility` in tailwind.css: `--color-panel` is
+                                                    // declared on `:root`, outside `@theme`, so
+                                                    // Tailwind v4 generates no colour utility for it
+                                                    // and `ring-1` would fall back to `currentColor`
+                                                    // — a grey ring that turns blue on hover.
                                                     class: "absolute top-0.5 right-0.5 h-2 w-2 rounded-full bg-red-500 ring-1 ring-panel",
                                                 }
                                             }

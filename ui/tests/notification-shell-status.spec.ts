@@ -77,6 +77,11 @@ const SHELL_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// The line the listener logs when it ignores a status it does not recognise.
+// Dioxus's logger writes EVERY level to console.log with the level in the text,
+// so the level is matched here rather than via `ConsoleMessage.type()`.
+const IGNORED_STATUS_WARNING = /WARN.*unrecognised notification_status/i;
+
 const message = (frame: FrameLocator) =>
   frame.getByTestId("notification-permission-message");
 const enableButton = (frame: FrameLocator) =>
@@ -88,6 +93,12 @@ test.describe("Shell notification_status handling (#510)", () => {
   test("the shell's permission outcome reaches the UI, and the retry reaches the shell", async ({
     page,
   }) => {
+    // Attached before load so nothing is missed. Playwright's page-level
+    // console event covers messages from child frames, which is where the app
+    // actually runs here.
+    const consoleLines: string[] = [];
+    page.on("console", (msg) => consoleLines.push(msg.text()));
+
     await page.setContent(SHELL_HTML);
     const frame = page.frameLocator("#river-frame");
     await frame.locator(".app-root").waitFor({ timeout: 30_000 });
@@ -117,14 +128,30 @@ test.describe("Shell notification_status handling (#510)", () => {
     // A status River doesn't recognise must be IGNORED, not guessed at: it must
     // not overwrite the state River already has.
     //
-    // This is a NON-event, so it needs a window rather than a wait. An earlier
-    // version asserted `toContainText(/blocking/i)` immediately after posting,
-    // which passed on its first poll before the message could possibly have
-    // been processed — it would have passed just as well if the junk DID
-    // clobber. The write path is a single `setTimeout(0)`, so a clobber renders
-    // well inside this window.
+    // An earlier version asserted `toContainText(/blocking/i)` immediately after
+    // posting, which passed on its first poll before the message could possibly
+    // have been processed — it would have passed equally had the junk clobbered.
+    // The version after that slept 500ms, which is better but still only
+    // APPROXIMATES "the junk has been handled": a slow clobber slips past a
+    // fixed sleep as a false pass rather than surfacing as a flake.
+    //
+    // So wait for the listener's own log line instead. That is a positive signal
+    // that the junk went through the listener, and it pins the log LEVEL as a
+    // side effect: `release_max_level_info` (ui/Cargo.toml) compiles `debug!` out
+    // of the release build these tests run against, so a revert to `debug!`
+    // produces no line at all, and an `info!` would print "INFO" where this
+    // wants "WARN". Dioxus writes every level to console.log with the level in
+    // the TEXT, so this matches text rather than `msg.type()`.
     await page.evaluate(() => window.__postStatus("not-a-real-status"));
-    await page.waitForTimeout(500);
+    await expect
+      .poll(
+        () => consoleLines.filter((line) => IGNORED_STATUS_WARNING.test(line)).length,
+        { timeout: 10_000 }
+      )
+      .toBeGreaterThan(0);
+
+    // Only now, with the junk demonstrably handled, check the state it must not
+    // have touched.
     await expect(message(frame)).toContainText(/blocking/i);
     await expect(enableButton(frame)).toHaveCount(0);
 
