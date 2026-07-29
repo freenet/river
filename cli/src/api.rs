@@ -641,6 +641,65 @@ pub(crate) fn author_member_id(signing_key: &SigningKey) -> MemberId {
     MemberId::from(&signing_key.verifying_key())
 }
 
+/// Whether `candidate` is currently in the room: the room owner, **or** listed
+/// in `members.members`.
+///
+/// The owner clause is not a convenience — it is required for correctness. The
+/// contract REFUSES a members list containing the owner (`MembersV1::verify`:
+/// "Owner should not be included in the members list"), so owner membership
+/// rides on `ChatRoomParametersV1::owner` instead, and a bare scan of
+/// `members.members` reports the room's own owner as a non-member. That is
+/// freenet/river#441. Pinned by `contract_rejects_an_owner_entry_in_members`.
+///
+/// The owner comparison is on the full 32-byte `VerifyingKey`, deliberately NOT
+/// on `MemberId` (a non-cryptographic `fast_hash` of the key), and the room's
+/// owner key is the one the contract key commits to — see
+/// [`ApiClient::owner_vk_to_contract_key`]. So this grants nothing to a caller
+/// who cannot sign with the owner's private key.
+pub(crate) fn room_has_member_key(
+    room_state: &ChatRoomStateV1,
+    room_owner_key: &VerifyingKey,
+    candidate: &VerifyingKey,
+) -> bool {
+    candidate == room_owner_key
+        || room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == *candidate)
+}
+
+/// Send-authorization pre-flight for a signer on the explicit-signing-key path
+/// (`riverctl message send --signing-key` / `RIVER_SIGNING_KEY`).
+///
+/// Allows the send when the signer is already in the room, or when
+/// `build_rejoin_delta` produced credentials that re-add them atomically with
+/// the message (the inactivity-prune rejoin path).
+///
+/// This is a client-side pre-flight for a clear error message, NOT the
+/// authorization boundary: the contract independently verifies every message's
+/// signature against the owner key or the author's member key
+/// (`MessagesV1::verify`), so a signer this lets through still cannot post
+/// without the matching private key.
+pub(crate) fn authorize_send(
+    room_state: &ChatRoomStateV1,
+    room_owner_key: &VerifyingKey,
+    sender_vk: &VerifyingKey,
+    rejoin_members_delta: Option<&MembersDelta>,
+) -> Result<()> {
+    if room_has_member_key(room_state, room_owner_key, sender_vk) {
+        return Ok(());
+    }
+    if rejoin_members_delta.is_some() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Signing key is not a current member of this room and no stored membership \
+         credentials were found for automatic rejoin. If you were pruned for inactivity, \
+         ensure you first accepted an invitation via `riverctl invite accept`."
+    ))
+}
+
 pub(crate) fn unseal_nickname_display(
     nickname: &river_core::room_state::privacy::SealedBytes,
     secrets: &HashMap<u32, [u8; 32]>,
@@ -3380,21 +3439,15 @@ impl ApiClient {
             river_core::room_state::message::AuthorizedMessageV1::new(message, signing_key);
 
         // Check if we need to re-add ourselves (pruned for inactivity)
-        let is_member = room_state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.member_vk == sender_vk);
         let (members_delta, member_info_delta) =
             self.build_rejoin_delta(&room_state, room_owner_key, signing_key);
 
-        if !is_member && members_delta.is_none() {
-            return Err(anyhow!(
-                "Signing key is not a current member of this room and no stored membership \
-                 credentials were found for automatic rejoin. If you were pruned for inactivity, \
-                 ensure you first accepted an invitation via `riverctl invite accept`."
-            ));
-        }
+        authorize_send(
+            &room_state,
+            room_owner_key,
+            &sender_vk,
+            members_delta.as_ref(),
+        )?;
 
         // Create a delta with the new message
         let delta = ChatRoomStateV1Delta {
@@ -8991,5 +9044,423 @@ mod mention_cli_tests {
 
         assert_eq!(reply_prefix_display(&ReplyContextDisplay::NotAReply), "");
         assert_eq!(reply_to_json(&ReplyContextDisplay::NotAReply), None);
+    }
+}
+
+#[cfg(test)]
+mod authorize_send_tests {
+    use super::{authorize_send, room_has_member_key};
+    use ed25519_dalek::SigningKey;
+    use freenet_scaffold::ComposableState;
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use river_core::room_state::member::{
+        AuthorizedMember, Member, MemberId, MembersDelta, MembersV1,
+    };
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// A room owned by `owner_sk`, with every key in `members` added as a
+    /// regular member. The owner is deliberately NOT pushed into
+    /// `members.members` — see `contract_rejects_an_owner_entry_in_members`.
+    fn room(owner_sk: &SigningKey, members: &[&SigningKey]) -> ChatRoomStateV1 {
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                owner_sk,
+            ),
+            ..Default::default()
+        };
+        for member_sk in members {
+            state.members.members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: member_sk.verifying_key(),
+                },
+                owner_sk,
+            ));
+        }
+        state
+    }
+
+    /// A non-empty rejoin delta, standing in for what `build_rejoin_delta`
+    /// returns when it finds stored membership credentials.
+    fn rejoin(owner_sk: &SigningKey, member_sk: &SigningKey) -> MembersDelta {
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        MembersDelta::new(vec![AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member_sk.verifying_key(),
+            },
+            owner_sk,
+        )])
+    }
+
+    /// freenet/river#441: `riverctl message send --signing-key <owner-key>`
+    /// rejected the room's OWN owner with "not a current member", telling them
+    /// to go accept an invitation to their own room.
+    ///
+    /// This is the reproduction. It is not a contrived state: the owner is
+    /// STRUCTURALLY absent from `members.members` (pinned by
+    /// `contract_rejects_an_owner_entry_in_members` below), and
+    /// `build_rejoin_delta` early-returns `None` for the owner ("Owner doesn't
+    /// need to re-add"), so BOTH halves of the old guard were satisfied and the
+    /// owner was rejected on every send.
+    #[test]
+    fn owner_may_send_although_members_list_never_lists_them() {
+        let owner = key(1);
+        let member = key(2);
+        let state = room(&owner, &[&member]);
+        let owner_vk = owner.verifying_key();
+
+        assert!(
+            !state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == owner_vk),
+            "fixture precondition: the owner must NOT be in members.members — \
+             that absence is the bug's cause, so a fixture that listed the \
+             owner would make this test vacuous"
+        );
+
+        // `None` rejoin delta: exactly what `build_rejoin_delta` returns for
+        // the owner. Before the fix this combination was the rejection.
+        assert!(
+            authorize_send(&state, &owner_vk, &owner_vk, None).is_ok(),
+            "the room owner must be allowed to send with their own key"
+        );
+    }
+
+    /// End-to-end companion to the reproduction above: passing the guard is
+    /// only half the fix — the owner's delta must also SURVIVE the contract.
+    ///
+    /// This builds the delta exactly as `send_message_with_key` does for an
+    /// owner (`members: None`, `member_info: None`, because `build_rejoin_delta`
+    /// returns `(None, None)` for them) and applies it, asserting the message
+    /// actually lands in `recent_messages`. `MessagesV1::apply_delta` retains a
+    /// message only when its author is a listed member OR the owner, so without
+    /// that owner arm this would silently drop the message and the guard fix
+    /// alone would have shipped a send that reports success and delivers
+    /// nothing.
+    #[test]
+    fn owners_message_survives_apply_delta_with_no_membership_delta() {
+        use freenet_scaffold::ComposableState as _;
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1};
+        use river_core::room_state::ChatRoomStateV1Delta;
+
+        let owner = key(1);
+        let owner_vk = owner.verifying_key();
+        let mut state = room(&owner, &[&key(2)]);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let content = crate::private_room::build_message_body(
+            &state,
+            &owner,
+            &std::collections::HashMap::new(),
+            "hello from the owner".to_string(),
+        )
+        .expect("a public room needs no secret");
+
+        let auth_message = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(owner_vk),
+                author: super::author_member_id(&owner),
+                content,
+                time: std::time::SystemTime::now(),
+            },
+            &owner,
+        );
+        let message_id = auth_message.id();
+
+        // Exactly the shape `send_message_with_key` sends for the owner.
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth_message]),
+            members: None,
+            member_info: None,
+            ..Default::default()
+        };
+
+        state
+            .apply_delta(&state.clone(), &params, &Some(delta))
+            .expect("the owner's message delta must apply cleanly");
+
+        assert!(
+            state
+                .recent_messages
+                .messages
+                .iter()
+                .any(|m| m.id() == message_id),
+            "the owner's message must survive apply_delta's author retain — \
+             the guard fix is worthless if the contract then drops the message"
+        );
+    }
+
+    /// The invariant that makes #441 structural rather than incidental: the
+    /// contract REFUSES a members list containing the owner, so "scan
+    /// members.members" can never be a complete membership test. If this ever
+    /// starts passing, the owner could be listed and the special case above
+    /// would deserve a rethink.
+    #[test]
+    fn contract_rejects_an_owner_entry_in_members() {
+        let owner = key(1);
+        let owner_vk = owner.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let state = room(&owner, &[]);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let with_owner = MembersV1 {
+            members: vec![AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: owner_vk,
+                },
+                &owner,
+            )],
+        };
+
+        let err = with_owner
+            .verify(&state, &params)
+            .expect_err("the contract must refuse an owner entry in members.members");
+        assert!(
+            err.contains("Owner should not be included"),
+            "unexpected rejection reason: {err}"
+        );
+    }
+
+    /// The ordinary case must keep working: a listed member sends with no
+    /// rejoin delta.
+    #[test]
+    fn listed_member_may_send() {
+        let owner = key(1);
+        let member = key(2);
+        let state = room(&owner, &[&member]);
+        assert!(authorize_send(
+            &state,
+            &owner.verifying_key(),
+            &member.verifying_key(),
+            None
+        )
+        .is_ok());
+    }
+
+    /// The guard still does its job: a key that is neither the owner nor a
+    /// listed member, with no stored rejoin credentials, is refused.
+    #[test]
+    fn stranger_without_rejoin_credentials_is_rejected() {
+        let owner = key(1);
+        let member = key(2);
+        let stranger = key(3);
+        let state = room(&owner, &[&member]);
+
+        let err = authorize_send(
+            &state,
+            &owner.verifying_key(),
+            &stranger.verifying_key(),
+            None,
+        )
+        .expect_err("a non-member with no rejoin credentials must be refused");
+        assert!(
+            err.to_string().contains("not a current member"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The pruned-member rejoin path (the guard's original purpose) is
+    /// untouched: a non-listed sender WITH stored credentials may send, because
+    /// the delta re-adds them atomically.
+    #[test]
+    fn pruned_member_with_rejoin_credentials_may_send() {
+        let owner = key(1);
+        let pruned = key(4);
+        let state = room(&owner, &[]);
+        let delta = rejoin(&owner, &pruned);
+
+        assert!(authorize_send(
+            &state,
+            &owner.verifying_key(),
+            &pruned.verifying_key(),
+            Some(&delta)
+        )
+        .is_ok());
+    }
+
+    /// SECURITY. The owner exemption is granted ONLY on full 32-byte
+    /// `VerifyingKey` equality against the room's own owner key — which the
+    /// contract key commits to (`owner_vk_to_contract_key` hashes
+    /// `ChatRoomParametersV1 { owner }`), and which the caller can only match by
+    /// holding the corresponding private key.
+    ///
+    /// It must NOT be reachable through anything an attacker can put in the
+    /// room STATE, which arrives from the network and is therefore untrusted:
+    /// no member entry, member_info record, or forged entry claiming the
+    /// owner's key may promote a non-owner signer. This test stuffs the state
+    /// with exactly those and asserts every non-owner key is still refused.
+    #[test]
+    fn owner_exemption_is_not_reachable_from_attacker_controlled_state() {
+        let owner = key(1);
+        let attacker = key(5);
+        let owner_vk = owner.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let attacker_vk = attacker.verifying_key();
+
+        let mut state = room(&owner, &[]);
+
+        // A members entry carrying the OWNER's key, put there by the attacker.
+        // `MembersV1::verify` rejects such an entry, but the CLI applies its
+        // guard to network state BEFORE any such check, so the guard must not
+        // depend on the state having been validated.
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: MemberId::from(&attacker_vk),
+                member_vk: owner_vk,
+            },
+            &attacker,
+        ));
+        // A forged member_info claiming the owner's member id.
+        state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo::new_public(owner_id, 99, "owner".to_string()),
+                &attacker,
+            ));
+
+        assert!(
+            authorize_send(&state, &owner_vk, &attacker_vk, None).is_err(),
+            "state contents must never promote a non-owner signer to owner"
+        );
+
+        // Nor may any other key: only the exact owner key passes the exemption.
+        for seed in 6u8..40 {
+            let other = key(seed);
+            let other_vk = other.verifying_key();
+            assert_ne!(other_vk, owner_vk, "seed {seed} collided with the owner");
+            assert!(
+                authorize_send(&state, &owner_vk, &other_vk, None).is_err(),
+                "seed {seed} must not be treated as the owner"
+            );
+            assert!(
+                !room_has_member_key(&state, &owner_vk, &other_vk),
+                "seed {seed} is neither owner nor a listed member"
+            );
+        }
+    }
+
+    /// The predicate itself, independent of the rejoin-delta escape hatch.
+    #[test]
+    fn room_has_member_key_counts_the_owner_and_listed_members_only() {
+        let owner = key(1);
+        let member = key(2);
+        let stranger = key(3);
+        let state = room(&owner, &[&member]);
+        let owner_vk = owner.verifying_key();
+
+        assert!(room_has_member_key(&state, &owner_vk, &owner_vk));
+        assert!(room_has_member_key(
+            &state,
+            &owner_vk,
+            &member.verifying_key()
+        ));
+        assert!(!room_has_member_key(
+            &state,
+            &owner_vk,
+            &stranger.verifying_key()
+        ));
+    }
+
+    /// Call-site pin. The unit tests above exercise `authorize_send`; this
+    /// pins that `send_message_with_key` actually DELEGATES to it rather than
+    /// re-inlining the owner-blind scan that caused #441 — without this, the
+    /// call site could be reverted with the suite still green.
+    ///
+    /// It also covers the sibling explicit-key paths (edit / delete / react /
+    /// unreact / reply): those have no membership guard at all today and are
+    /// therefore not affected by #441, but if one ever grows a guard it must
+    /// use the shared helper, not a fresh copy of the buggy expression.
+    #[test]
+    fn send_paths_delegate_the_membership_guard_to_authorize_send() {
+        let src = include_str!("api.rs");
+        // This module lives at the END of the file precisely so the split
+        // leaves ALL production code in `production`. Splitting at a mid-file
+        // `#[cfg(test)]` would silently cut the `send_message_with_key` call
+        // site out of the scraped text and leave this pin permanently green.
+        let (production, own_source) = src
+            .split_once("mod authorize_send_tests")
+            .expect("this test module must exist");
+        assert!(
+            own_source.contains("send_paths_delegate_the_membership_guard_to_authorize_send"),
+            "the split must leave this module's own source on the RHS"
+        );
+        assert!(
+            production.contains("pub async fn send_message_with_key("),
+            "the split must leave the send path on the LHS; if this fires, the \
+             test module has moved back above the code it is meant to pin"
+        );
+
+        // Compare with whitespace stripped so rustfmt's line breaking (which
+        // differs between a 4-arg call kept on one line and one split across
+        // lines) cannot silently disarm the pin.
+        let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            squashed.contains("authorize_send(&room_state,room_owner_key,&sender_vk,"),
+            "`send_message_with_key` must call `authorize_send`; the membership \
+             decision has been re-inlined at the call site (freenet/river#441)."
+        );
+
+        // Pin the COUNT of raw members-list scans rather than banning specific
+        // spellings: a new guard written with a differently-named variable
+        // (`self_vk`, `signer`, ...) would slip straight past a spelling ban,
+        // which is the whole failure mode this test exists to stop.
+        //
+        // The two sanctioned sites are:
+        //   1. `room_has_member_key` — owner-aware by construction.
+        //   2. `build_rejoin_delta`'s "already in members list" check, which is
+        //      owner-safe only because the owner early-return above it fires
+        //      first (asserted separately below).
+        let scans = squashed.matches(".any(|m|m.member.member_vk==").count();
+        assert_eq!(
+            scans, 2,
+            "expected exactly 2 raw `members.members` scans in api.rs \
+             (`room_has_member_key` and `build_rejoin_delta`), found {scans}. \
+             The room owner is NEVER in `members.members`, so a raw scan \
+             reports the room's own owner as a non-member — that is \
+             freenet/river#441. If you added one, route it through \
+             `room_has_member_key` instead; if you removed one, update this pin."
+        );
+
+        // What makes `build_rejoin_delta`'s scan safe: the owner never reaches
+        // it. If this early return is deleted, that scan becomes owner-blind.
+        let rejoin = squashed
+            .split_once("fnbuild_rejoin_delta(")
+            .expect("build_rejoin_delta must exist")
+            .1;
+        let owner_early_return = rejoin
+            .find("ifself_vk==*room_owner_key{return(None,None);}")
+            .expect(
+                "`build_rejoin_delta` must still early-return for the owner — \
+                 without it, its `members.members` scan becomes owner-blind",
+            );
+        let members_scan = rejoin
+            .find(".any(|m|m.member.member_vk==")
+            .expect("build_rejoin_delta must still scan the members list");
+        assert!(
+            owner_early_return < members_scan,
+            "the owner early-return must come BEFORE `build_rejoin_delta`'s \
+             members scan; reordered, the owner reaches an owner-blind scan."
+        );
     }
 }
