@@ -75,8 +75,17 @@ enum BanEnforcement {
     /// The target is not in the room, but the banner's authority came from their
     /// POSITION relative to the target (strict ancestor, or deputy of a non-owner
     /// ancestor) or from no grant at all. An absent member has no invite chain to
-    /// walk, so that authority cannot be re-derived now and re-derives differently
-    /// depending on who re-invites them. Not a promise either way.
+    /// walk, so that authority cannot be re-derived now. Not a promise either way.
+    ///
+    /// Why "no grant at all" belongs in the SAME state as a lapsed positional one,
+    /// rather than being split off as a definitive no: with the target absent
+    /// those two are genuinely the same case, not two. Say bob was the target's
+    /// inviter and rando never had any authority over them. Neither is decided
+    /// now — the ban applies if the target is re-invited under bob, and does not
+    /// if they are re-invited under rando. Bob's grant is not REVOKED, it is
+    /// CONTINGENT, and rando's is contingent on the mirror-image event. Splitting
+    /// them would claim knowledge of who re-invites the target, which nobody has.
+    /// This is deliberate, not a distinction lost in review.
     Undetermined,
 }
 
@@ -948,6 +957,47 @@ mod tests {
             verdict(&by_gmod, &owner),
             BanEnforcement::Enforcing,
             "an owner-appointed global moderator's grant is absolute too"
+        );
+    }
+
+    #[test]
+    fn ban_by_a_member_with_no_grant_is_undetermined_once_the_target_is_absent() {
+        // The fourth corner of the absent-target matrix, and the one that shows
+        // why "no grant at all" shares a state with a lapsed positional grant
+        // instead of being a definitive no.
+        //
+        // Rando has never had authority over alice. While she is PRESENT that is
+        // decided — Inert, she is in the room and the ban is not stopping her.
+        // Once she is gone it stops being decided: re-invited under rando he
+        // becomes her strict ancestor and the ban applies, re-invited under
+        // anyone else it does not. Same shape as the ancestor case in
+        // `legitimate_ancestor_ban_becomes_undetermined_once_its_target_is_removed`,
+        // which is why they share a verdict.
+        let owner = key(1);
+        let alice = key(2);
+        let rando = key(5);
+
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &alice);
+        push_member(&mut state, &owner, &owner, &rando);
+        push_ban(&mut state, &owner, &rando, &alice);
+
+        assert_eq!(
+            verdict(&state, &owner),
+            BanEnforcement::Inert,
+            "while alice is present, an unauthorized ban is definitively dead"
+        );
+
+        state
+            .members
+            .members
+            .retain(|m| m.member.id() != id(&alice));
+
+        assert_eq!(
+            verdict(&state, &owner),
+            BanEnforcement::Undetermined,
+            "with alice gone, rando's authority is contingent on who re-invites \
+             her, not settled"
         );
     }
 
