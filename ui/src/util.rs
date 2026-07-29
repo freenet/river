@@ -717,7 +717,89 @@ mod tests {
                     }
                 }
             }
+
+            // Handlers passed by NAME (`onclick: handle_close,`) rather than
+            // inline. There are 20+ of these and the loop above cannot see
+            // them, so without this the guard would have a hole big enough to
+            // drive the next violation through. For each such name, find its
+            // `let <name> = move |…| { … }` binding in the same file and scan
+            // that body instead.
+            for marker in [
+                "onclick:",
+                "onmousedown:",
+                "onkeydown:",
+                "onchange:",
+                "oninput:",
+                "onsubmit:",
+            ] {
+                let mut from = 0usize;
+                while let Some(idx) = source[from..].find(marker) {
+                    let abs = from + idx;
+                    from = abs + marker.len();
+
+                    let tail = &source[from..];
+                    let name: String = tail
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    // Lowercase identifier only; an inline closure starts with
+                    // `move`/`|` and is already covered above.
+                    if name.is_empty()
+                        || name == "move"
+                        || !name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                    {
+                        continue;
+                    }
+                    let after = tail.trim_start()[name.len()..].trim_start();
+                    if !after.starts_with(',')
+                        && !after.starts_with('}')
+                        && !after.starts_with('\n')
+                    {
+                        continue;
+                    }
+
+                    // Locate `let <name> = ... |` and brace-match its body.
+                    let Some(decl) = source
+                        .find(&format!("let {name} = "))
+                        .or_else(|| source.find(&format!("let mut {name} = ")))
+                    else {
+                        continue;
+                    };
+                    let Some(bar) = source[decl..].find('|') else {
+                        continue;
+                    };
+                    let Some(open) = source[decl + bar..].find('{') else {
+                        continue;
+                    };
+                    let open = decl + bar + open;
+                    let mut depth = 0usize;
+                    let mut end = open;
+                    for (off, ch) in source[open..].char_indices() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = open + off;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let body = &source[open..=end];
+                    if writes_global_signal(body) && !body.contains("defer(") {
+                        let line = source[..decl].matches('\n').count() + 1;
+                        offenders.push(format!("{rel}:{line} (handler `{name}`)"));
+                    }
+                }
+            }
         }
+
+        // A named handler used at several call sites is one defect, not N.
+        offenders.sort();
+        offenders.dedup();
 
         assert!(
             offenders.is_empty(),
