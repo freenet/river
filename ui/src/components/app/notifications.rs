@@ -1363,13 +1363,24 @@ mod notify_gate_tests {
     /// isn't shown the shell's bar again on every message they send.
     #[test]
     fn the_automatic_rearm_is_bounded() {
+        // Concrete numbers, NOT `MAX_ENABLE_PROMPT_REARMS` itself: phrased
+        // against the constant this test passes for ANY cap, including no cap
+        // at all — it stayed green under a mutation that raised the cap to
+        // `usize::MAX`.
         assert!(
-            status_rearms_auto_prompt(NotificationStatus::Undecided, MAX_ENABLE_PROMPT_REARMS - 1),
-            "the last permitted re-arm must still be allowed"
+            MAX_ENABLE_PROMPT_REARMS <= 2,
+            "more than a couple of automatic re-asks per session is a nag; the \
+             manual button is the unbounded path"
         );
         assert!(
-            !status_rearms_auto_prompt(NotificationStatus::Undecided, MAX_ENABLE_PROMPT_REARMS),
-            "re-arming past the cap would re-prompt on every message"
+            status_rearms_auto_prompt(NotificationStatus::Undecided, 0),
+            "the first re-arm must be allowed, or an unanswered prompt is final \
+             and #510's no-retry complaint stands"
+        );
+        assert!(
+            !status_rearms_auto_prompt(NotificationStatus::Undecided, 3),
+            "the automatic ask must stop re-arming; otherwise the shell shows \
+             its bar again on every message the user sends"
         );
     }
 
