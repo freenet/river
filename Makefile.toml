@@ -250,7 +250,11 @@ target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign 
 description = "Build the Dioxus UI with example data"
 env = { UI_FEATURES = "example-data" }
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
-dependencies = ["build-chat-delegate"]
+# build-tailwind is required because ui/assets/styles.css is gitignored (it is a
+# build product). Without it `dx build` fails on a clean tree with
+# "Asset at /assets/styles.css doesn't exist" — CI only gets away with omitting
+# it here because build.yml runs `npm run build:css` as an explicit step.
+dependencies = ["build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -259,7 +263,8 @@ cwd = "./ui"
 description = "Build the Dioxus UI without Freenet sync"
 env = { UI_FEATURES = "no-sync" }
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
-dependencies = ["build-chat-delegate"]
+# build-tailwind is required — see the note on build-ui-example.
+dependencies = ["build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -268,7 +273,10 @@ cwd = "./ui"
 description = "Build the Dioxus UI with example data and no Freenet sync"
 env = { UI_FEATURES = "example-data,no-sync" }
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
-dependencies = ["build-chat-delegate"]
+# build-tailwind is required — see the note on build-ui-example. This is the
+# task AGENTS.md tells you to run before the Playwright suite, so it has to
+# work from a clean checkout.
+dependencies = ["build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["build", "--${BUILD_PROFILE}", "--features", "${UI_FEATURES}"]
 cwd = "./ui"
@@ -787,7 +795,9 @@ dependencies = ["build-ui"]
 description = "Development build"
 env = { UI_FEATURES = "" }
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
-dependencies = ["build-chat-delegate"]
+# build-tailwind is required — see the note on build-ui-example. (dev-example
+# already had it; this task was the odd one out.)
+dependencies = ["build-chat-delegate", "build-tailwind"]
 command = "dx"
 args = ["serve"]
 cwd = "./ui"

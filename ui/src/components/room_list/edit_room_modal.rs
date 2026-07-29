@@ -4,6 +4,8 @@ use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::util::ecies::{seal_for_room, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
+use dioxus_free_icons::icons::fa_solid_icons::FaCopy;
+use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata};
@@ -150,12 +152,24 @@ pub fn EditRoomModal() -> Element {
                                     title: "Ed25519 public key (Curve25519 elliptic curve)",
                                     "Room Public Key"
                                 }
-                                input {
-                                    r#type: "text",
-                                    readonly: true,
-                                    title: "Ed25519 public key (Curve25519 elliptic curve)",
-                                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-all",
-                                    value: "{bs58::encode(room_data.owner_vk.as_bytes()).into_string()}"
+                                div {
+                                    class: "flex items-center gap-2",
+                                    input {
+                                        r#type: "text",
+                                        readonly: true,
+                                        "data-testid": "room-public-key-input",
+                                        title: "Ed25519 public key (Curve25519 elliptic curve)",
+                                        // `select-text`, NOT `select-all` — see the note on
+                                        // `CopyButton` below. `user-select: all` makes this
+                                        // field completely unselectable in Firefox.
+                                        class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-text",
+                                        value: "{bs58::encode(room_data.owner_vk.as_bytes()).into_string()}"
+                                    }
+                                    CopyButton {
+                                        value: bs58::encode(room_data.owner_vk.as_bytes()).into_string(),
+                                        testid: "room-public-key-copy-button",
+                                        label: "Copy room public key",
+                                    }
                                 }
                             }
                             // Contract ID
@@ -165,11 +179,21 @@ pub fn EditRoomModal() -> Element {
                                     class: "block text-sm font-medium text-text-muted mb-1",
                                     "Contract ID"
                                 }
-                                input {
-                                    r#type: "text",
-                                    readonly: true,
-                                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-all",
-                                    value: "{room_data.contract_key.id()}"
+                                div {
+                                    class: "flex items-center gap-2",
+                                    input {
+                                        r#type: "text",
+                                        readonly: true,
+                                        "data-testid": "contract-id-input",
+                                        // `select-text`, NOT `select-all` — see `CopyButton`.
+                                        class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-text",
+                                        value: "{room_data.contract_key.id()}"
+                                    }
+                                    CopyButton {
+                                        value: room_data.contract_key.id().to_string(),
+                                        testid: "contract-id-copy-button",
+                                        label: "Copy contract ID",
+                                    }
                                 }
                             }
 
@@ -193,7 +217,9 @@ pub fn EditRoomModal() -> Element {
                                                 input {
                                                     r#type: "text",
                                                     readonly: true,
-                                                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-all",
+                                                    "data-testid": "secret-version-input",
+                                                    // `select-text`, NOT `select-all` — see `CopyButton`.
+                                                    class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-lg text-text-muted text-sm font-mono cursor-text select-text",
                                                     value: "{secret_version}"
                                                 }
                                                 if is_owner {
@@ -355,6 +381,56 @@ pub fn EditRoomModal() -> Element {
         }
     } else {
         rsx! {}
+    }
+}
+
+/// Copy-to-clipboard button for the read-only key fields above.
+///
+/// # Why those inputs are `select-text` and must never be `select-all`
+///
+/// The Room Public Key / Contract ID / Secret Version inputs used Tailwind's
+/// `select-all` (`user-select: all`), which made them impossible to select or
+/// copy by hand in Firefox: click-drag selected nothing, double-click selected
+/// nothing (freenet/river#537). Firefox parses the declaration — the computed
+/// value really is `all` — but selecting inside an `<input>` under it yields a
+/// zero-length selection, so `Ctrl+C` copies nothing. Chromium and WebKit
+/// instead select the whole value, which is why this looked Firefox-specific.
+///
+/// Measured with a standalone repro driven by Playwright (characters selected
+/// by a click-drag across the field, then by a double-click):
+///
+/// | input rule                | Firefox | Chromium | WebKit |
+/// |---------------------------|---------|----------|--------|
+/// | `user-select: all`        |   **0** |       44 |     44 |
+/// | `user-select: text`       |      44 |       44 |     44 |
+///
+/// So the fields declare `select-text` explicitly rather than relying on the
+/// `auto` default. Do NOT "restore" `select-all` — it re-breaks Firefox.
+/// Pinned by `ui/tests/room-info-key-selection.spec.ts`, which runs against
+/// Firefox in CI.
+///
+/// This is a child component rather than inline markup because the "Copied!"
+/// feedback needs `use_signal`, and the fields render inside an `if let`
+/// branch where a hook call would be conditional.
+#[component]
+fn CopyButton(value: String, testid: String, label: String) -> Element {
+    let mut copied = use_signal(|| false);
+    let value_for_clipboard = value.clone();
+
+    rsx! {
+        button {
+            r#type: "button",
+            "data-testid": "{testid}",
+            "aria-label": "{label}",
+            title: "{label}",
+            class: "flex-shrink-0 px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text-muted hover:text-text text-sm transition-colors flex items-center gap-1.5",
+            onclick: move |_| {
+                crate::util::copy_to_clipboard(&value_for_clipboard);
+                copied.set(true);
+            },
+            Icon { icon: FaCopy, width: 12, height: 12 }
+            span { if *copied.read() { "Copied!" } else { "Copy" } }
+        }
     }
 }
 
