@@ -676,11 +676,23 @@ pub(crate) fn room_has_member_key(
 /// `build_rejoin_delta` produced credentials that re-add them atomically with
 /// the message (the inactivity-prune rejoin path).
 ///
-/// This is a client-side pre-flight for a clear error message, NOT the
-/// authorization boundary: the contract independently verifies every message's
-/// signature against the owner key or the author's member key
-/// (`MessagesV1::verify`), so a signer this lets through still cannot post
-/// without the matching private key.
+/// This is a client-side pre-flight for a clear error message, not a security
+/// boundary — but be precise about what backs it, because an earlier version of
+/// this comment overstated it.
+///
+/// On the UPDATE path the contract runs `apply_delta`, never `verify`
+/// (`contracts/room-contract/src/lib.rs::update_state`). What actually screens
+/// a message there is `MessagesV1::apply_delta`'s author retain
+/// (`common/src/room_state/message.rs`), which keeps a message only when its
+/// author is a listed member or the owner — a `MemberId` comparison with NO
+/// signature check. Signature verification lives in `MessagesV1::verify`, which
+/// runs from `validate_state`, i.e. when a peer validates state, not as the
+/// gate on an update.
+///
+/// None of that weakens the owner branch here, which is self-enforcing: it
+/// requires the caller to hold the owner's private key (see
+/// [`room_has_member_key`]), so it grants nothing the caller could not already
+/// do.
 pub(crate) fn authorize_send(
     room_state: &ChatRoomStateV1,
     room_owner_key: &VerifyingKey,
@@ -9381,86 +9393,313 @@ mod authorize_send_tests {
         ));
     }
 
-    /// Call-site pin. The unit tests above exercise `authorize_send`; this
-    /// pins that `send_message_with_key` actually DELEGATES to it rather than
-    /// re-inlining the owner-blind scan that caused #441 — without this, the
-    /// call site could be reverted with the suite still green.
+    // ---------------------------------------------------------------
+    // Source pins for the #441 guard.
+    //
+    // Expressed as pure functions over source text, NOT as inline asserts,
+    // so the pins themselves can be TESTED: `pin_catches_*` below feed
+    // deliberately-mutated source through `membership_guard_violations` and
+    // assert it objects. A pin nobody has watched fail is not a pin, and the
+    // first version of this pin had exactly that problem — it matched a needle
+    // that stopped at a comma, so `let _ = authorize_send(...)` (authorization
+    // discarded outright) and `authorize_send(..., None)` (rejoin path
+    // silently broken) both sailed through a green suite.
+    // ---------------------------------------------------------------
+
+    /// `src` with every top-level `#[cfg(test)]` module removed, so a source
+    /// pin scans production code only.
     ///
-    /// It also covers the sibling explicit-key paths (edit / delete / react /
-    /// unreact / reply): those have no membership guard at all today and are
-    /// therefore not affected by #441, but if one ever grows a guard it must
-    /// use the shared helper, not a fresh copy of the buggy expression.
-    #[test]
-    fn send_paths_delegate_the_membership_guard_to_authorize_send() {
-        let src = include_str!("api.rs");
-        // This module lives at the END of the file precisely so the split
-        // leaves ALL production code in `production`. Splitting at a mid-file
-        // `#[cfg(test)]` would silently cut the `send_message_with_key` call
-        // site out of the scraped text and leave this pin permanently green.
-        let (production, own_source) = src
-            .split_once("mod authorize_send_tests")
-            .expect("this test module must exist");
-        assert!(
-            own_source.contains("send_paths_delegate_the_membership_guard_to_authorize_send"),
-            "the split must leave this module's own source on the RHS"
-        );
-        assert!(
-            production.contains("pub async fn send_message_with_key("),
-            "the split must leave the send path on the LHS; if this fires, the \
-             test module has moved back above the code it is meant to pin"
-        );
+    /// Line-based on purpose. `api.rs` holds 15 `#[cfg(test)]` modules
+    /// scattered mid-file, and the two obvious alternatives are both wrong
+    /// here: splitting at the first test module silently drops all production
+    /// code after it (which is how the original pin missed the call site), and
+    /// brace-matching would have to lex 43 raw strings correctly to avoid
+    /// desynchronising. Every test module in this file starts with
+    /// `#[cfg(test)]` at column 0 and ends with `}` at column 0, so skipping
+    /// between those markers needs no lexer and cannot be confused by a brace
+    /// inside a string or comment.
+    fn production_source(src: &str) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        let mut lines = src.lines();
+        while let Some(line) = lines.next() {
+            if line == "#[cfg(test)]" {
+                for skipped in lines.by_ref() {
+                    if skipped == "}" {
+                        break;
+                    }
+                }
+            } else {
+                out.push(line);
+            }
+        }
+        out.join("\n")
+    }
 
-        // Compare with whitespace stripped so rustfmt's line breaking (which
-        // differs between a 4-arg call kept on one line and one split across
-        // lines) cannot silently disarm the pin.
-        let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+    /// Every #441 invariant `src` violates, empty when it is clean.
+    ///
+    /// Returns reasons rather than asserting so the pin can be exercised
+    /// against mutated source without tripping over its own assertions.
+    fn membership_guard_violations(src: &str) -> Vec<String> {
+        let production = production_source(src);
+        let mut problems = Vec::new();
 
-        assert!(
-            squashed.contains("authorize_send(&room_state,room_owner_key,&sender_vk,"),
-            "`send_message_with_key` must call `authorize_send`; the membership \
-             decision has been re-inlined at the call site (freenet/river#441)."
-        );
-
-        // Pin the COUNT of raw members-list scans rather than banning specific
-        // spellings: a new guard written with a differently-named variable
-        // (`self_vk`, `signer`, ...) would slip straight past a spelling ban,
-        // which is the whole failure mode this test exists to stop.
-        //
-        // The two sanctioned sites are:
-        //   1. `room_has_member_key` — owner-aware by construction.
-        //   2. `build_rejoin_delta`'s "already in members list" check, which is
-        //      owner-safe only because the owner early-return above it fires
-        //      first (asserted separately below).
-        let scans = squashed.matches(".any(|m|m.member.member_vk==").count();
-        assert_eq!(
-            scans, 2,
-            "expected exactly 2 raw `members.members` scans in api.rs \
-             (`room_has_member_key` and `build_rejoin_delta`), found {scans}. \
-             The room owner is NEVER in `members.members`, so a raw scan \
-             reports the room's own owner as a non-member — that is \
-             freenet/river#441. If you added one, route it through \
-             `room_has_member_key` instead; if you removed one, update this pin."
-        );
-
-        // What makes `build_rejoin_delta`'s scan safe: the owner never reaches
-        // it. If this early return is deleted, that scan becomes owner-blind.
-        let rejoin = squashed
-            .split_once("fnbuild_rejoin_delta(")
-            .expect("build_rejoin_delta must exist")
-            .1;
-        let owner_early_return = rejoin
-            .find("ifself_vk==*room_owner_key{return(None,None);}")
-            .expect(
-                "`build_rejoin_delta` must still early-return for the owner — \
-                 without it, its `members.members` scan becomes owner-blind",
+        // Guard against the stripper eating production code: if this fires,
+        // every check below would pass vacuously.
+        if !production.contains("pub async fn send_message_with_key(") {
+            problems.push(
+                "production_source() removed the send path itself — the pin \
+                 would pass vacuously"
+                    .to_string(),
             );
-        let members_scan = rejoin
-            .find(".any(|m|m.member.member_vk==")
-            .expect("build_rejoin_delta must still scan the members list");
+            return problems;
+        }
+
+        // Whitespace-stripped so rustfmt's line breaking cannot disarm a pin.
+        let sq: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // 1. The send path must call `authorize_send` with the REAL rejoin
+        //    delta AND propagate its Result.
+        //
+        //    The needle deliberately runs through the `?;`. Stopping at the
+        //    final comma (the original bug) accepts `let _ = authorize_send(..);`,
+        //    which discards the authorization decision entirely — and `let _ =`
+        //    also silences `unused_must_use`, with no `-D warnings` in CI to
+        //    catch it. Requiring `members_delta.as_ref()` by name likewise
+        //    rejects a hardcoded `None`, which compiles fine via inference but
+        //    silently breaks the inactivity-rejoin path.
+        //
+        //    Both trailing-comma spellings are accepted so a future rustfmt
+        //    that collapses the call onto one line does not false-fail.
+        let prefix = "authorize_send(&room_state,room_owner_key,&sender_vk,members_delta.as_ref()";
+        let propagated = match sq.find(prefix) {
+            Some(at) => {
+                let tail = &sq[at + prefix.len()..];
+                tail.starts_with(",)?;") || tail.starts_with(")?;")
+            }
+            None => false,
+        };
+        if !propagated {
+            problems.push(
+                "`send_message_with_key` must call \
+                 `authorize_send(&room_state, room_owner_key, &sender_vk, \
+                 members_delta.as_ref())?` and PROPAGATE the result. Either the \
+                 decision has been re-inlined, its Result is being discarded \
+                 (`let _ = ...`), or the rejoin delta argument was replaced \
+                 (freenet/river#441)."
+                    .to_string(),
+            );
+        }
+
+        // 2. Raw `members.members` scans, counted across BOTH house idioms.
+        //
+        //    Counting rather than banning spellings: a guard written with a
+        //    differently-named variable slips past a spelling ban. Counting
+        //    BOTH idioms because `.id() == <MemberId>` is equally owner-blind
+        //    and is the more common style in this codebase (dm.rs, debug.rs),
+        //    with `sender_member_id` already in scope at the call site.
+        //
+        //    The two sanctioned sites are `room_has_member_key` (owner-aware by
+        //    construction) and `build_rejoin_delta`'s already-a-member check
+        //    (owner-safe only via the early return checked in 3).
+        let scans = sq.matches(".any(|m|m.member.member_vk==").count()
+            + sq.matches(".any(|m|m.member.id()==").count();
+        if scans != 2 {
+            problems.push(format!(
+                "expected exactly 2 raw `members.members` scans in production \
+                 api.rs (`room_has_member_key` and `build_rejoin_delta`), found \
+                 {scans}. The room owner is NEVER in `members.members`, so a raw \
+                 scan reports the room's own owner as a non-member — that is \
+                 freenet/river#441. Route a new membership test through \
+                 `room_has_member_key`; if you deliberately removed one, update \
+                 this pin."
+            ));
+        }
+
+        // 3. `build_rejoin_delta`'s scan is owner-safe ONLY because the owner
+        //    early-return fires first. Order, not mere presence.
+        match sq.split_once("fnbuild_rejoin_delta(") {
+            Some((_, body)) => {
+                let early = body.find("ifself_vk==*room_owner_key{return(None,None);}");
+                let scan = body.find(".any(|m|m.member.member_vk==");
+                match (early, scan) {
+                    (Some(e), Some(s)) if e < s => {}
+                    (None, _) => problems.push(
+                        "`build_rejoin_delta` must still early-return for the \
+                         owner — without it, its `members.members` scan is \
+                         owner-blind."
+                            .to_string(),
+                    ),
+                    (_, None) => problems.push(
+                        "`build_rejoin_delta` no longer scans the members list; \
+                         re-check this pin against its new shape."
+                            .to_string(),
+                    ),
+                    _ => problems.push(
+                        "the owner early-return must come BEFORE \
+                         `build_rejoin_delta`'s members scan; reordered, the \
+                         owner reaches an owner-blind scan."
+                            .to_string(),
+                    ),
+                }
+            }
+            None => problems.push("`build_rejoin_delta` must exist".to_string()),
+        }
+
+        problems
+    }
+
+    /// The live pin: production `api.rs` satisfies every #441 invariant.
+    #[test]
+    fn api_source_satisfies_the_membership_guard_invariants() {
+        let problems = membership_guard_violations(include_str!("api.rs"));
+        assert!(problems.is_empty(), "{}", problems.join("\n\n"));
+    }
+
+    /// `production_source` must actually strip test modules — otherwise the
+    /// scan count picks up this module's own fixtures and the pin is noise.
+    #[test]
+    fn production_source_strips_test_modules_but_keeps_production() {
+        let stripped = production_source(include_str!("api.rs"));
+        assert!(stripped.contains("pub async fn send_message_with_key("));
+        assert!(stripped.contains("pub(crate) fn room_has_member_key("));
         assert!(
-            owner_early_return < members_scan,
-            "the owner early-return must come BEFORE `build_rejoin_delta`'s \
-             members scan; reordered, the owner reaches an owner-blind scan."
+            !stripped.contains("mod authorize_send_tests"),
+            "this test module must not survive the strip"
         );
+        assert!(
+            !stripped.contains("fn owner_may_send_although"),
+            "no test fn may survive the strip"
+        );
+    }
+
+    /// Apply `mutation` to the real source, failing loudly if it does not
+    /// apply — a mutation that silently no-ops looks like a working pin.
+    fn mutate(from: &str, to: &str) -> String {
+        let src = include_str!("api.rs");
+        assert!(
+            src.contains(from),
+            "mutation target not found; this meta-test is stale:\n{from}"
+        );
+        src.replace(from, to)
+    }
+
+    const REAL_CALL: &str = "        authorize_send(
+            &room_state,
+            room_owner_key,
+            &sender_vk,
+            members_delta.as_ref(),
+        )?;";
+
+    /// The mutation that defeated the ORIGINAL pin: discard the authorization
+    /// decision outright. `let _ =` also silences `unused_must_use`, and CI has
+    /// no `-D warnings`, so nothing else would catch this.
+    #[test]
+    fn pin_catches_discarded_authorization_result() {
+        let mutated = mutate(
+            REAL_CALL,
+            "        let _ = authorize_send(
+            &room_state,
+            room_owner_key,
+            &sender_vk,
+            members_delta.as_ref(),
+        );",
+        );
+        let problems = membership_guard_violations(&mutated);
+        assert!(
+            problems.iter().any(|p| p.contains("PROPAGATE")),
+            "discarding authorize_send's Result must be caught, got: {problems:?}"
+        );
+    }
+
+    /// The second mutation that defeated the original pin: pass `None` instead
+    /// of the real rejoin delta. Compiles via inference; silently breaks the
+    /// inactivity-rejoin path so a pruned member with valid stored credentials
+    /// can no longer send.
+    #[test]
+    fn pin_catches_rejoin_delta_replaced_by_none() {
+        let mutated = mutate(
+            REAL_CALL,
+            "        authorize_send(
+            &room_state,
+            room_owner_key,
+            &sender_vk,
+            None,
+        )?;",
+        );
+        let problems = membership_guard_violations(&mutated);
+        assert!(
+            problems.iter().any(|p| p.contains("PROPAGATE")),
+            "replacing the rejoin delta with None must be caught, got: {problems:?}"
+        );
+    }
+
+    /// The scan-count pin must catch the `MemberId` idiom, not just
+    /// `member_vk`. `sender_member_id` is already in scope at the call site and
+    /// `.id() ==` is the more common style in this codebase, so this is the
+    /// likelier way a future owner-blind guard gets written.
+    #[test]
+    fn pin_catches_owner_blind_scan_written_with_the_memberid_idiom() {
+        let mutated = mutate(
+            "        // Check if we need to re-add ourselves (pruned for inactivity)",
+            "        let _blind = room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.id() == sender_member_id);
+        // Check if we need to re-add ourselves (pruned for inactivity)",
+        );
+        let problems = membership_guard_violations(&mutated);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("raw `members.members` scans")),
+            "an owner-blind MemberId scan must be caught, got: {problems:?}"
+        );
+    }
+
+    /// And the `member_vk` idiom under a fresh variable name.
+    #[test]
+    fn pin_catches_owner_blind_scan_under_a_new_variable_name() {
+        let mutated = mutate(
+            "        // Check if we need to re-add ourselves (pruned for inactivity)",
+            "        let _blind = room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == some_other_key);
+        // Check if we need to re-add ourselves (pruned for inactivity)",
+        );
+        let problems = membership_guard_violations(&mutated);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("raw `members.members` scans")),
+            "a renamed owner-blind scan must be caught, got: {problems:?}"
+        );
+    }
+
+    /// Deleting `build_rejoin_delta`'s owner early-return turns its scan
+    /// owner-blind.
+    #[test]
+    fn pin_catches_deleted_owner_early_return_in_build_rejoin_delta() {
+        let mutated = mutate(
+            "        // Owner doesn't need to re-add
+        if self_vk == *room_owner_key {
+            return (None, None);
+        }
+",
+            "",
+        );
+        let problems = membership_guard_violations(&mutated);
+        assert!(
+            problems.iter().any(|p| p.contains("early-return")),
+            "deleting the owner early-return must be caught, got: {problems:?}"
+        );
+    }
+
+    /// Sanity: the pin is not simply objecting to everything.
+    #[test]
+    fn pin_accepts_the_unmutated_source() {
+        assert!(membership_guard_violations(include_str!("api.rs")).is_empty());
     }
 }
