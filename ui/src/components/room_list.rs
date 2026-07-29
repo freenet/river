@@ -389,8 +389,13 @@ pub fn RoomList() -> Element {
                         "data-testid": "create-room-button",
                         class: "p-1.5 rounded-md text-text-muted hover:text-accent hover:bg-surface transition-colors",
                         title: "Create Room",
+                        // Signal mutation from an event handler must be deferred
+                        // (dioxus-signal-safety: direct writes here are the
+                        // Firefox mobile RefCell re-entrancy crash path).
                         onclick: move |_| {
-                            CREATE_ROOM_MODAL.write().show = true;
+                            crate::util::defer(move || {
+                                CREATE_ROOM_MODAL.write().show = true;
+                            });
                         },
                         Icon { width: 14, height: 14, icon: FaPlus }
                     }

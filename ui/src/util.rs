@@ -560,6 +560,257 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
     }
 
+    /// Every event handler that writes a global signal must go through
+    /// [`defer`] (freenet/river#539).
+    ///
+    /// A signal write's Drop fires subscriber notifications synchronously, and
+    /// Firefox mobile runs them during Drop, so a memo doing `try_read()` on
+    /// the same signal can hit a re-entrant `RefCell already borrowed` panic.
+    /// `defer` also supplies the Dioxus runtime + root scope that a bare
+    /// handler lacks. `.claude/rules/dioxus-signal-safety.md` spells this out
+    /// and names `onclick: move |_| { ROOMS.write()... }` as the wrong shape.
+    ///
+    /// This is a source scan rather than a behavioural test because both
+    /// shapes look identical from the outside — the modal closes either way.
+    /// It replaced seven hand-written violations across four files; pinning
+    /// them individually would not have stopped the eighth.
+    #[test]
+    fn event_handlers_never_write_a_global_signal_without_defer() {
+        use std::path::{Path, PathBuf};
+
+        fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable source dir") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        /// `IDENT.write(` / `IDENT.with_mut(` where IDENT is SCREAMING_CASE,
+        /// i.e. a `GlobalSignal`. Local `use_signal` handles are lowercase and
+        /// are deliberately NOT matched — they have no external subscribers,
+        /// and the existing copy buttons set them directly in `onclick`.
+        fn writes_global_signal(body: &str) -> bool {
+            for marker in [".write(", ".with_mut("] {
+                let mut from = 0usize;
+                while let Some(idx) = body[from..].find(marker) {
+                    let abs = from + idx;
+                    let ident: String = body[..abs]
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    // Reversed, but case/length checks are order-independent.
+                    if ident.len() >= 3
+                        && ident
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                        && ident.chars().any(|c| c.is_ascii_uppercase())
+                    {
+                        return true;
+                    }
+                    from = abs + marker.len();
+                }
+            }
+            false
+        }
+
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        assert!(files.len() > 20, "source walk found suspiciously few files");
+
+        let mut offenders: Vec<String> = Vec::new();
+        for path in files {
+            // Skip this module: its own source contains the handler markers
+            // below as string literals, which would match itself.
+            if path.ends_with("util.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("readable source file");
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+
+            for marker in ["onclick:", "onmousedown:", "onkeydown:"] {
+                let mut from = 0usize;
+                while let Some(idx) = source[from..].find(marker) {
+                    let abs = from + idx;
+                    from = abs + marker.len();
+
+                    // Parse the closure precisely. Finding "the next `{`" is
+                    // NOT good enough: a brace-less handler like
+                    // `onclick: move |_| show_confirm.set(true),` would then
+                    // swallow the next unrelated block and report it as this
+                    // handler's body — a false positive that cost a debugging
+                    // round when this test was written.
+                    let rest = &source[from..];
+                    let Some(bar) = rest.find('|') else { continue };
+                    // Between `onclick:` and the params there may only be
+                    // whitespace and `move`; anything else means this is not
+                    // an inline closure (e.g. `onclick: some_handler,`).
+                    if !rest[..bar].trim().is_empty() && rest[..bar].trim() != "move" {
+                        continue;
+                    }
+                    let Some(close_bar) = rest[bar + 1..].find('|') else {
+                        continue;
+                    };
+                    let after_params = from + bar + 1 + close_bar + 1;
+                    let body_start = after_params + source[after_params..].len()
+                        - source[after_params..].trim_start().len();
+                    if body_start >= source.len() {
+                        continue;
+                    }
+
+                    let body = if source[body_start..].starts_with('{') {
+                        // Braced body: brace-match it.
+                        let mut depth = 0usize;
+                        let mut end = body_start;
+                        for (off, ch) in source[body_start..].char_indices() {
+                            match ch {
+                                '{' => depth += 1,
+                                '}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        end = body_start + off;
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        &source[body_start..=end]
+                    } else {
+                        // Expression body: runs to the first `,` at depth 0.
+                        // These write signals too (`onclick: move |_|
+                        // MODAL.write().show = true,`), so they must be scanned.
+                        let mut depth = 0i32;
+                        let mut end = source.len();
+                        for (off, ch) in source[body_start..].char_indices() {
+                            match ch {
+                                '(' | '[' | '{' => depth += 1,
+                                ')' | ']' | '}' => {
+                                    if depth == 0 {
+                                        end = body_start + off;
+                                        break;
+                                    }
+                                    depth -= 1;
+                                }
+                                ',' if depth == 0 => {
+                                    end = body_start + off;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        &source[body_start..end]
+                    };
+
+                    if writes_global_signal(body) && !body.contains("defer(") {
+                        let line = source[..abs].matches('\n').count() + 1;
+                        offenders.push(format!("{rel}:{line} ({marker})"));
+                    }
+                }
+            }
+
+            // Handlers passed by NAME (`onclick: handle_close,`) rather than
+            // inline. There are 20+ of these and the loop above cannot see
+            // them, so without this the guard would have a hole big enough to
+            // drive the next violation through. For each such name, find its
+            // `let <name> = move |…| { … }` binding in the same file and scan
+            // that body instead.
+            for marker in [
+                "onclick:",
+                "onmousedown:",
+                "onkeydown:",
+                "onchange:",
+                "oninput:",
+                "onsubmit:",
+            ] {
+                let mut from = 0usize;
+                while let Some(idx) = source[from..].find(marker) {
+                    let abs = from + idx;
+                    from = abs + marker.len();
+
+                    let tail = &source[from..];
+                    let name: String = tail
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    // Lowercase identifier only; an inline closure starts with
+                    // `move`/`|` and is already covered above.
+                    if name.is_empty()
+                        || name == "move"
+                        || !name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                    {
+                        continue;
+                    }
+                    let after = tail.trim_start()[name.len()..].trim_start();
+                    if !after.starts_with(',')
+                        && !after.starts_with('}')
+                        && !after.starts_with('\n')
+                    {
+                        continue;
+                    }
+
+                    // Locate `let <name> = ... |` and brace-match its body.
+                    let Some(decl) = source
+                        .find(&format!("let {name} = "))
+                        .or_else(|| source.find(&format!("let mut {name} = ")))
+                    else {
+                        continue;
+                    };
+                    let Some(bar) = source[decl..].find('|') else {
+                        continue;
+                    };
+                    let Some(open) = source[decl + bar..].find('{') else {
+                        continue;
+                    };
+                    let open = decl + bar + open;
+                    let mut depth = 0usize;
+                    let mut end = open;
+                    for (off, ch) in source[open..].char_indices() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = open + off;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let body = &source[open..=end];
+                    if writes_global_signal(body) && !body.contains("defer(") {
+                        let line = source[..decl].matches('\n').count() + 1;
+                        offenders.push(format!("{rel}:{line} (handler `{name}`)"));
+                    }
+                }
+            }
+        }
+
+        // A named handler used at several call sites is one defect, not N.
+        offenders.sort();
+        offenders.dedup();
+
+        assert!(
+            offenders.is_empty(),
+            "event handler(s) write a GlobalSignal without crate::util::defer(), \
+             which is the Firefox-mobile RefCell re-entrancy crash path \
+             (freenet/river#539, .claude/rules/dioxus-signal-safety.md). \
+             Wrap the write in `crate::util::defer(move || {{ ... }})`:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     #[test]
     fn date_separator_today() {
         let today = ymd(2026, 6, 1);
