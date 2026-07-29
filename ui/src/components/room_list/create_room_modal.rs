@@ -136,9 +136,14 @@ pub fn CreateRoomModal() -> Element {
         // Backdrop
         div {
             class: "fixed inset-0 bg-black/50 z-40",
+            // Signal mutation from an event handler must be deferred
+            // (dioxus-signal-safety: direct writes here are the Firefox
+            // mobile RefCell re-entrancy crash path).
             onclick: move |_| {
-                CREATE_ROOM_MODAL.with_mut(|modal| {
-                    modal.show = false;
+                crate::util::defer(move || {
+                    CREATE_ROOM_MODAL.with_mut(|modal| {
+                        modal.show = false;
+                    });
                 });
             }
         }
@@ -211,9 +216,13 @@ pub fn CreateRoomModal() -> Element {
                     button {
                         "data-testid": "create-room-cancel-button",
                         class: "px-4 py-2 text-sm text-text-muted hover:text-text hover:bg-surface rounded-lg transition-colors",
+                        // Deferred close — same signal-safety rule as the
+                        // backdrop handler above.
                         onclick: move |_| {
-                            CREATE_ROOM_MODAL.with_mut(|modal| {
-                                modal.show = false;
+                            crate::util::defer(move || {
+                                CREATE_ROOM_MODAL.with_mut(|modal| {
+                                    modal.show = false;
+                                });
                             });
                         },
                         "Cancel"

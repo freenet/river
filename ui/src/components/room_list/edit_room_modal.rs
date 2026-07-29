@@ -62,8 +62,13 @@ pub fn EditRoomModal() -> Element {
                 // Overlay
                 div {
                     class: "absolute inset-0 bg-black/50",
+                    // Signal mutation from an event handler must be deferred
+                    // (dioxus-signal-safety: direct writes here are the Firefox
+                    // mobile RefCell re-entrancy crash path).
                     onclick: move |_| {
-                        EDIT_ROOM_MODAL.write().room = None;
+                        crate::util::defer(move || {
+                            EDIT_ROOM_MODAL.write().room = None;
+                        });
                     }
                 }
                 // Modal content
@@ -371,8 +376,12 @@ pub fn EditRoomModal() -> Element {
                     button {
                         "data-testid": "edit-room-close-button",
                         class: "absolute top-3 right-3 p-1 text-text-muted hover:text-text transition-colors",
+                        // Deferred close — same signal-safety rule as the
+                        // backdrop handler above.
                         onclick: move |_| {
-                            EDIT_ROOM_MODAL.write().room = None;
+                            crate::util::defer(move || {
+                                EDIT_ROOM_MODAL.write().room = None;
+                            });
                         },
                         "✕"
                     }

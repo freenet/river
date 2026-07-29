@@ -592,21 +592,37 @@ fn render_error_state(
                             let _ = element.set_focus(true).await;
                         });
                     },
+                    // Signal mutation from an event handler must be deferred
+                    // (dioxus-signal-safety: direct writes here are the Firefox
+                    // mobile RefCell re-entrancy crash path).
                     onclick: move |_| {
-                        // Reset to PendingSubscription so the synchronizer retries
-                        PENDING_INVITES.with_mut(|pending| {
-                            if let Some(join) = pending.map.get_mut(&room_key) {
-                                join.status = PendingRoomStatus::PendingSubscription;
-                            }
+                        crate::util::defer(move || {
+                            // Reset to PendingSubscription so the synchronizer retries
+                            PENDING_INVITES.with_mut(|pending| {
+                                if let Some(join) = pending.map.get_mut(&room_key) {
+                                    join.status = PendingRoomStatus::PendingSubscription;
+                                }
+                            });
                         });
                     },
                     "Retry"
                 }
                 button {
                     class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                    // Deferred — same signal-safety rule as the Retry handler
+                    // above. BOTH statements go inside the defer so their
+                    // relative order is preserved (code after a `defer()` runs
+                    // BEFORE the deferred closure), and because
+                    // `dismiss_invitation_persistently` itself writes a signal
+                    // via `invitation.set(None)`. The clone is needed because
+                    // an `onclick` is `FnMut`, so the non-`Copy` invitation
+                    // cannot be moved out of the captured environment.
                     onclick: move |_| {
-                        PENDING_INVITES.write().map.remove(&room_key);
-                        dismiss_invitation_persistently(&inv_for_dismiss, invitation);
+                        let inv = inv_for_dismiss.clone();
+                        crate::util::defer(move || {
+                            PENDING_INVITES.write().map.remove(&room_key);
+                            dismiss_invitation_persistently(&inv, invitation);
+                        });
                     },
                     "Dismiss"
                 }
