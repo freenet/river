@@ -29,16 +29,65 @@ fn measure_draft(text: &str, reply: Option<&ReplyContext>, is_private: bool) -> 
     }
 }
 
+/// Height ceiling for the composer, in px (~7 lines). Kept in step with the
+/// textarea's `max-height`: this clamp is what stops the growth, the CSS is
+/// what leaves the overflow scrollable.
+const MAX_COMPOSER_HEIGHT: i32 = 168;
+
+/// Size the composer to its content, clamped to [`MAX_COMPOSER_HEIGHT`].
+///
+/// This runs on every keystroke, so the DOM access pattern is the whole cost.
+/// Collapsing to `height: auto` before every measurement — the obvious
+/// implementation — puts a style write immediately before a `scrollHeight`
+/// read, which forces a synchronous layout, and then writes again; measured at
+/// ~3 layouts per keystroke and ~6.6 ms of layout + style per keystroke under a
+/// 6x CPU throttle (freenet/river#468). The measuring read is unavoidable. Both
+/// writes usually are not:
+///
+/// `scrollHeight` reports `max(content height, clientHeight)`, so it is exactly
+/// the content height while the content OVERFLOWS the box, and saturates at the
+/// box height once it fits. We set `height` to the content's padding-box height
+/// while `box-sizing: border-box` counts the textarea's borders inside that
+/// number, so a correctly-sized composer sits its border-width short of its own
+/// content and keeps reporting `scrollHeight > clientHeight`. Typing therefore
+/// measures in place: no collapse, and no write at all while the height is
+/// unchanged.
+///
+/// `scrollHeight == clientHeight` means the content stopped overflowing, i.e.
+/// it shrank below the box. That is the one case where the measurement carries
+/// no information and the collapse has to be paid for.
+///
+/// Note the asymmetry that makes the fast path safe: it is taken only when the
+/// content overflows, i.e. only when the box is too SHORT, so it can never
+/// leave a stale too-tall composer behind.
+///
+/// The "no writes while typing within a line" property is pinned by a Playwright
+/// test (`Composer auto-resize cost (#468)`). If the textarea's border or
+/// box-sizing ever changes such that the box fits its content exactly, the fast
+/// path stops firing — that test goes red rather than the cost silently
+/// returning.
 fn auto_resize_message_input() {
     let Some(el) = get_message_textarea() else {
         return;
     };
-    // Reset height to auto to measure scrollHeight correctly, then clamp to ~7 lines.
-    el.style().set_property("height", "auto").ok();
-    let new_height = el.scroll_height().min(168);
-    el.style()
-        .set_property("height", &format!("{}px", new_height))
-        .ok();
+    let style = el.style();
+
+    // Both reads come off one layout; no write separates them.
+    let scroll_height = el.scroll_height();
+    let content_height = if scroll_height > el.client_height() {
+        scroll_height
+    } else {
+        style.set_property("height", "auto").ok();
+        el.scroll_height()
+    };
+
+    let target = format!("{}px", content_height.min(MAX_COMPOSER_HEIGHT));
+    // Skip a no-op write: its style invalidation is the bulk of the
+    // per-keystroke cost. After a collapse the inline value is `auto`, so that
+    // branch always writes.
+    if style.get_property_value("height").unwrap_or_default() != target {
+        style.set_property("height", &target).ok();
+    }
 }
 
 fn get_message_textarea() -> Option<web_sys::HtmlTextAreaElement> {
@@ -189,7 +238,7 @@ pub fn MessageInput(
                             id: "message-input",
                             "data-testid": "message-input",
                             class: "w-full px-4 py-2.5 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] overflow-y-auto",
-                            style: "max-height: 168px;",
+                            style: "max-height: {MAX_COMPOSER_HEIGHT}px;",
                             placeholder: "Type your message...",
                             value: "{message_text}",
                             rows: "1",

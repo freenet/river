@@ -442,6 +442,109 @@ test.describe("Message input auto-resize (#221)", () => {
   });
 });
 
+// #468: the composer resize runs on every keystroke, and the original
+// implementation always did collapse-to-`auto` → read `scrollHeight` → write
+// the result. The write immediately before the read forces a synchronous
+// layout, and both writes invalidate style, measured on the issue at ~3 layouts
+// per keystroke (79 layouts over 26 keystrokes) and ~6.6 ms of layout + style
+// per keystroke under a 6x CPU throttle.
+//
+// The fix measures in place and writes only when the height actually changes,
+// so typing inside a line must not touch the inline style at all. Recording
+// style writes rather than timing anything keeps this deterministic: it asserts
+// the DOM access pattern, which is what the issue is about, not a duration.
+const RECORD_COMPOSER_HEIGHT_WRITES = `
+(() => {
+  window.__heightWrites = [];
+  const setProperty = CSSStyleDeclaration.prototype.setProperty;
+  CSSStyleDeclaration.prototype.setProperty = function (name, value, priority) {
+    // element.style returns the same CSSStyleDeclaration for the element's
+    // lifetime, so identity distinguishes the composer's inline declaration
+    // from every other element's.
+    const composer = document.getElementById("message-input");
+    if (composer && this === composer.style && name === "height") {
+      window.__heightWrites.push(String(value));
+    }
+    return setProperty.call(this, name, value, priority);
+  };
+})();
+`;
+
+test.describe("Composer auto-resize cost (#468)", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("typing within a line writes no height; growth and shrink still resize", async ({
+    page,
+  }) => {
+    await page.addInitScript(RECORD_COMPOSER_HEIGHT_WRITES);
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const textarea = page.locator("#message-input");
+    await expect(textarea).toBeVisible({ timeout: 10_000 });
+    await textarea.focus();
+
+    const height = () =>
+      textarea.evaluate((el) => el.getBoundingClientRect().height);
+    // Collect the height writes made while `body` runs.
+    const writesDuring = async (body: () => Promise<void>) => {
+      await page.evaluate(() => ((window as any).__heightWrites = []));
+      await body();
+      return (await page.evaluate(
+        () => (window as any).__heightWrites
+      )) as string[];
+    };
+
+    // Prime with one character: the composer starts with no inline height, so
+    // the first resize has nothing to compare against and legitimately writes.
+    await page.keyboard.type("a");
+    const oneLine = await height();
+    expect(oneLine).toBeGreaterThan(0);
+
+    // The property the fix buys. Adding characters to a line that still fits
+    // cannot change the height, so the whole burst must produce zero writes.
+    // Before the fix each keystroke wrote twice: `auto`, then the same px value
+    // straight back.
+    const typingWrites = await writesDuring(async () => {
+      await page.keyboard.type("bcdefghijklmnopqrst");
+    });
+    expect(typingWrites).toEqual([]);
+    expect(await height()).toBe(oneLine);
+
+    // Growth must still resize, and must do it without the `height: auto`
+    // collapse — the collapse is the forced-synchronous-layout half of the cost.
+    const growWrites = await writesDuring(async () => {
+      await page.keyboard.press("Shift+Enter");
+      await page.keyboard.type("second line");
+    });
+    const twoLines = await height();
+    expect(twoLines).toBeGreaterThan(oneLine + 10);
+    expect(growWrites).not.toContain("auto");
+    // One write for the added line, none for the characters typed onto it.
+    expect(growWrites).toHaveLength(1);
+
+    // Shrinking is the case an in-place measurement genuinely cannot see (the
+    // box no longer overflows, so `scrollHeight` only reports the box height),
+    // so it may still collapse — but it must land back at the right height.
+    // `fill` replaces the whole value, which is also the paste path.
+    await textarea.fill("one\ntwo\nthree\nfour");
+    const fourLines = await height();
+    expect(fourLines).toBeGreaterThan(twoLines);
+
+    await textarea.fill("a");
+    expect(await height()).toBe(oneLine);
+
+    // And a shrink straight from the clamped maximum, which exercises the
+    // ceiling rather than the intermediate sizes.
+    await textarea.fill(Array.from({ length: 30 }, (_, i) => i).join("\n"));
+    const clamped = await height();
+    expect(clamped).toBeGreaterThan(fourLines);
+    await textarea.fill("a");
+    expect(await height()).toBe(oneLine);
+  });
+});
+
 // On page refresh, the chat scroll container must land at the bottom of the
 // message list, not partway down. The previous code called scrollIntoView on
 // the last bubble's MountedData, which aligns the bubble's TOP to the
