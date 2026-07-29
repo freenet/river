@@ -138,9 +138,22 @@ fn classify_ban(
     owner_vk: &VerifyingKey,
 ) -> BanEnforcement {
     // A ban whose signature does not verify against the banner's CURRENT key
-    // never excludes anyone: `banned_member_ids` skips it, and cleanup step 5
-    // sweeps it. Settled before the authority question, which would otherwise
-    // report a forged ban as enforcing.
+    // never excludes anyone: `banned_member_ids` skips it before asking about
+    // authority, and cleanup step 5 sweeps it.
+    //
+    // LOAD-BEARING, not defensive, and NOT redundant — do not delete it on the
+    // reasoning that cleanup step 5 makes it unconditionally true. That holds
+    // only on the CLEANED path, and a full-state PUT reaches a client without
+    // cleanup having run (`verify` accepts it, and `verify` deliberately skips a
+    // ban's signature when the banner was absent at bans-apply time, since bans
+    // apply before members). So a fetched state really can carry a ban attributed
+    // to a current, fully-authorized member but signed by somebody else.
+    //
+    // It must also come FIRST. The authority check knows nothing about who
+    // actually signed, so for a forged ban attributed to, say, an owner-appointed
+    // global moderator it answers yes — and this would report a forgery as
+    // Enforcing. Pinned by
+    // `ban_signed_by_someone_other_than_its_attributed_banner_is_inert`.
     if !BansV1::ban_signature_matches_current_key(ban, members_by_id, owner_id, owner_vk) {
         return BanEnforcement::Inert;
     }
