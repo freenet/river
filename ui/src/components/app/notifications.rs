@@ -561,7 +561,11 @@ pub fn install_shell_notification_listener() {
                 .and_then(NotificationStatus::from_shell_status)
             {
                 Some(status) => record_notification_status(status),
-                None => debug!("Ignoring unrecognised notification_status from shell"),
+                // `warn!`, not `debug!`: `release_max_level_info` compiles
+                // `debug!` out, and this fires exactly when the cross-repo
+                // status contract has drifted — the failure that reverts #510
+                // wholesale. It has to be diagnosable in the build users run.
+                None => warn!("Ignoring unrecognised notification_status from shell"),
             }
             return;
         }
@@ -1512,6 +1516,51 @@ mod notify_gate_tests {
         assert!(
             production.contains("Some(status)=>record_notification_status(status)"),
             "a parsed status is no longer recorded"
+        );
+    }
+
+    /// The re-arm itself — the "reset the flag" half of #510 — is two statements
+    /// against process-global atomics, which no behavioural test in this crate
+    /// can drive (native tests run in parallel threads and would corrupt each
+    /// other's view of the statics). Mutation testing showed BOTH lines could be
+    /// deleted with the whole suite still green, so each shipped a silent
+    /// regression:
+    ///
+    /// - Without `ENABLE_PROMPT_SENT.store(false, ...)` an unanswered prompt
+    ///   never re-arms, which is precisely the "no way to retry" complaint.
+    /// - Without `ENABLE_PROMPT_REARMS.fetch_add(1, ...)` the counter stays at
+    ///   0, so `rearms_used < MAX` is always true and the re-arm becomes
+    ///   UNBOUNDED — the shell's affordance bar returns on every message the
+    ///   user sends, the exact nag the cap exists to prevent.
+    ///
+    /// `the_automatic_rearm_is_bounded` does NOT cover the second one: it feeds
+    /// the predicate a caller-supplied count, so it passes with the increment
+    /// deleted. A source pin has no parallelism problem, so it is the right
+    /// instrument here.
+    #[test]
+    fn an_unanswered_prompt_actually_rearms_the_flag_it_bounds() {
+        let production = production_source();
+
+        assert!(
+            production.contains("ENABLE_PROMPT_SENT.store(false,Ordering::SeqCst);"),
+            "nothing clears ENABLE_PROMPT_SENT, so an unanswered prompt can \
+             never be re-offered — #510's 'no way to retry' is back"
+        );
+        assert!(
+            production.contains("ENABLE_PROMPT_REARMS.fetch_add(1,Ordering::SeqCst);"),
+            "nothing advances ENABLE_PROMPT_REARMS, so the cap never binds and \
+             the shell's bar returns on every message sent"
+        );
+        // Both statements, in order, behind the bounded predicate: the pin is
+        // about the wiring, not merely about the two lines existing somewhere.
+        assert!(
+            production.contains(
+                "ifstatus_rearms_auto_prompt(status,ENABLE_PROMPT_REARMS.load(Ordering::SeqCst)){\
+                 ENABLE_PROMPT_REARMS.fetch_add(1,Ordering::SeqCst);\
+                 ENABLE_PROMPT_SENT.store(false,Ordering::SeqCst);}"
+            ),
+            "the re-arm is no longer gated by status_rearms_auto_prompt, or the \
+             two statements it guards have moved apart"
         );
     }
 
