@@ -9420,17 +9420,47 @@ mod authorize_send_tests {
             "`send_message_with_key` must call `authorize_send`; the membership \
              decision has been re-inlined at the call site (freenet/river#441)."
         );
-        for banned in [
-            ".any(|m|m.member.member_vk==sender_vk)",
-            ".any(|m|m.member.id()==sender_member_id)",
-        ] {
-            assert!(
-                !squashed.contains(banned),
-                "a send path is re-inlining an owner-blind membership scan \
-                 (`{banned}`). The room owner is never in `members.members`, so \
-                 such a scan rejects the room's own owner — that is #441. Use \
-                 `room_has_member_key` / `authorize_send` instead."
+
+        // Pin the COUNT of raw members-list scans rather than banning specific
+        // spellings: a new guard written with a differently-named variable
+        // (`self_vk`, `signer`, ...) would slip straight past a spelling ban,
+        // which is the whole failure mode this test exists to stop.
+        //
+        // The two sanctioned sites are:
+        //   1. `room_has_member_key` — owner-aware by construction.
+        //   2. `build_rejoin_delta`'s "already in members list" check, which is
+        //      owner-safe only because the owner early-return above it fires
+        //      first (asserted separately below).
+        let scans = squashed.matches(".any(|m|m.member.member_vk==").count();
+        assert_eq!(
+            scans, 2,
+            "expected exactly 2 raw `members.members` scans in api.rs \
+             (`room_has_member_key` and `build_rejoin_delta`), found {scans}. \
+             The room owner is NEVER in `members.members`, so a raw scan \
+             reports the room's own owner as a non-member — that is \
+             freenet/river#441. If you added one, route it through \
+             `room_has_member_key` instead; if you removed one, update this pin."
+        );
+
+        // What makes `build_rejoin_delta`'s scan safe: the owner never reaches
+        // it. If this early return is deleted, that scan becomes owner-blind.
+        let rejoin = squashed
+            .split_once("fnbuild_rejoin_delta(")
+            .expect("build_rejoin_delta must exist")
+            .1;
+        let owner_early_return = rejoin
+            .find("ifself_vk==*room_owner_key{return(None,None);}")
+            .expect(
+                "`build_rejoin_delta` must still early-return for the owner — \
+                 without it, its `members.members` scan becomes owner-blind",
             );
-        }
+        let members_scan = rejoin
+            .find(".any(|m|m.member.member_vk==")
+            .expect("build_rejoin_delta must still scan the members list");
+        assert!(
+            owner_early_return < members_scan,
+            "the owner early-return must come BEFORE `build_rejoin_delta`'s \
+             members scan; reordered, the owner reaches an owner-blind scan."
+        );
     }
 }
