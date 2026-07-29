@@ -61,11 +61,34 @@ const MAX_COMPOSER_HEIGHT: i32 = 168;
 /// content overflows, i.e. only when the box is too SHORT, so it can never
 /// leave a stale too-tall composer behind.
 ///
-/// The "no writes while typing within a line" property is pinned by a Playwright
-/// test (`Composer auto-resize cost (#468)`). If the textarea's border or
-/// box-sizing ever changes such that the box fits its content exactly, the fast
-/// path stops firing — that test goes red rather than the cost silently
-/// returning.
+/// # This is a trade, not a free win
+///
+/// When the fast path applies the cost is one forced layout and no writes; when
+/// it does not, the probing read is wasted and the collapse forces a SECOND
+/// layout, which is worse than collapsing unconditionally. So the fast path has
+/// to be the common case, and that depends on the textarea's CSS, not on this
+/// function. Four properties are load-bearing:
+///
+/// - `box-sizing: border-box` and a non-zero `border`, which together create the
+///   slack that makes a content-sized box report `scrollHeight > clientHeight`;
+/// - `min-height` and `line-height`, which must not conflict — one line of text
+///   plus the vertical padding has to EXCEED `min-h-[44px]`, or min-height owns
+///   the box, the two metrics come out equal, and the fast path never applies.
+///
+/// The `min-height` half is not hypothetical. `tailwind.css` clamps the body
+/// font to 13px below 768px; at the default `line-height: 1.5` that is a 19.5px
+/// line box, so a phone-width composer measured 41.5px natural against a 44px
+/// minimum, and every keystroke on a phone paid two forced layouts instead of
+/// one — the opposite of this function's purpose, on the weakest hardware. The
+/// explicit `leading-6` on the textarea is what keeps one line above the
+/// minimum at every body font size. Do not remove it as "cosmetic".
+///
+/// Pinned by the Playwright test `Composer auto-resize cost (#468)`, which runs
+/// at BOTH a desktop and a phone viewport and asserts `scrollHeight >
+/// clientHeight` before relying on it — pinning one viewport is what let the
+/// mobile regression through, since `test.use({viewport})` overrides the
+/// project's device viewport and so varies the engine without varying the
+/// layout regime.
 fn auto_resize_message_input() {
     let Some(el) = get_message_textarea() else {
         return;
@@ -237,7 +260,16 @@ pub fn MessageInput(
                         textarea {
                             id: "message-input",
                             "data-testid": "message-input",
-                            class: "w-full px-4 py-2.5 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] overflow-y-auto",
+                            // `leading-6` is load-bearing, not cosmetic: see
+                            // `auto_resize_message_input`. It pins the line box to
+                            // 24px so one line of text plus `py-2.5` always exceeds
+                            // `min-h-[44px]`, at every body font size. Without it the
+                            // mobile font clamp (`tailwind.css`: 13px below 768px)
+                            // leaves the natural height under the minimum, min-height
+                            // takes over the box, and the in-place measurement stops
+                            // working — costing an EXTRA forced layout per keystroke
+                            // instead of saving one.
+                            class: "w-full px-4 py-2.5 leading-6 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] overflow-y-auto",
                             style: "max-height: {MAX_COMPOSER_HEIGHT}px;",
                             placeholder: "Type your message...",
                             value: "{message_text}",
