@@ -470,9 +470,18 @@ const RECORD_COMPOSER_HEIGHT_WRITES = `
 })();
 `;
 
-test.describe("Composer auto-resize cost (#468)", () => {
-  test.use({ viewport: { width: 1280, height: 800 } });
-
+// The cost property has to hold in BOTH layout regimes, so this body runs at a
+// desktop width and again at a phone width. Pinning only 1280x800 (as the first
+// version of this test did) leaves the mobile regime uncovered even when the
+// suite runs under mobile-chrome / mobile-safari, because `test.use({viewport})`
+// overrides the project's device viewport — those projects then vary the ENGINE
+// but not the layout regime. That gap hid a real regression: below 768px
+// `tailwind.css` clamps the body font to 13px, which (before `leading-6` was
+// added to the textarea) put one line of text UNDER `min-h-[44px]`. min-height
+// then owned the box, `scrollHeight` and `clientHeight` were equal on every
+// keystroke, the in-place measurement never applied, and the composer paid an
+// EXTRA forced layout per keystroke rather than saving one.
+function composerAutosizeCostTest() {
   test("typing within a line writes no height; growth and shrink still resize", async ({
     page,
   }) => {
@@ -501,6 +510,29 @@ test.describe("Composer auto-resize cost (#468)", () => {
     await page.keyboard.type("a");
     const oneLine = await height();
     expect(oneLine).toBeGreaterThan(0);
+
+    // Guard the premise the rest of this test rests on, and state it in terms
+    // of the thing the code actually reads rather than re-deriving the box
+    // model. A composer sized to its own content reports
+    // `scrollHeight > clientHeight`, because the value written is a padding-box
+    // measure while `box-sizing: border-box` counts the borders inside it. If
+    // some other rule owns the box instead — `min-h-[44px]` winning over a
+    // too-small natural height was the real #468 mobile regression — the two
+    // are equal, the in-place measurement can never apply, and the assertions
+    // below would pass or fail for reasons unrelated to what they name.
+    const probe = await textarea.evaluate((el) => ({
+      scroll: el.scrollHeight,
+      client: el.clientHeight,
+      font: getComputedStyle(el).fontSize,
+      lineHeight: getComputedStyle(el).lineHeight,
+      minHeight: getComputedStyle(el).minHeight,
+    }));
+    expect(
+      probe.scroll,
+      `the composer must be sized by its content, not by min-height ` +
+        `(scrollHeight ${probe.scroll}, clientHeight ${probe.client}, ` +
+        `font ${probe.font}, line-height ${probe.lineHeight}, min-height ${probe.minHeight})`
+    ).toBeGreaterThan(probe.client);
 
     // The property the fix buys. Adding characters to a line that still fits
     // cannot change the height, so the whole burst must produce zero writes.
@@ -543,6 +575,19 @@ test.describe("Composer auto-resize cost (#468)", () => {
     await textarea.fill("a");
     expect(await height()).toBe(oneLine);
   });
+}
+
+test.describe("Composer auto-resize cost (#468) @ desktop", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+  composerAutosizeCostTest();
+});
+
+// 390x844 is an iPhone-class viewport, comfortably inside the <768px branch
+// where the body font clamps to 13px. This is the regime the desktop-only pin
+// could not see.
+test.describe("Composer auto-resize cost (#468) @ phone", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+  composerAutosizeCostTest();
 });
 
 // On page refresh, the chat scroll container must land at the bottom of the
