@@ -311,12 +311,20 @@ jobs:
       run: npx playwright test
       working-directory: ./ui/tests
 
+    # `always()`, not `failure()`: with `retries: 2` an intermittent test is
+    # reported as "flaky" and the job still succeeds, so a `failure()` guard
+    # threw away the one artifact that could explain it (see freenet/river#538,
+    # where the trace was gone and the attached hypothesis turned out to be
+    # wrong). The playwright config keeps a trace `on-first-retry`, so this
+    # uploads the flake evidence too. On a clean run the directory is empty and
+    # this is a no-op.
     - name: Upload test results
-      if: failure()
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: playwright-report
         path: ui/tests/test-results/
+        if-no-files-found: ignore
 
   claude-ci-analysis:
     name: Claude CI Analysis
