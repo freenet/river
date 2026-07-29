@@ -641,8 +641,8 @@ pub(crate) fn author_member_id(signing_key: &SigningKey) -> MemberId {
     MemberId::from(&signing_key.verifying_key())
 }
 
-/// Whether `key` is currently in the room: the room owner, **or** listed in
-/// `members.members`.
+/// Whether `candidate` is currently in the room: the room owner, **or** listed
+/// in `members.members`.
 ///
 /// The owner clause is not a convenience — it is required for correctness. The
 /// contract REFUSES a members list containing the owner (`MembersV1::verify`:
