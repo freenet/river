@@ -47,18 +47,38 @@ pub enum DebugCommands {
 /// state without excluding anyone, and the CLI used to render that identically
 /// to a live ban.
 ///
-/// Three states rather than a boolean because the honest answer genuinely has
-/// three cases: a ban can be provably dead, provably live, or contingent on
-/// something that has not happened yet. Collapsing the third into either
-/// neighbour is a lie in one direction or the other.
+/// Three states rather than a boolean because a boolean could not carry the
+/// authority information at all: it collapsed to `!members.contains(target)`
+/// on every state a client can fetch.
+///
+/// The split is **target present vs absent**, and it is worth being exact about
+/// that rather than claiming cleaner epistemics than the code has. It is
+/// tempting to describe it as "definitive vs contingent"; that is not true.
+/// `Inert` for a present-but-unauthorized target is ALSO contingent — re-granting
+/// the banner's deputy authority re-arms the ban (see `ban_list_lines`), which is
+/// arguably likelier than the target being re-invited under some particular
+/// member. What the states really report is what is knowable NOW: with the target
+/// present, the answer is a fact about the current room, and with the target
+/// absent, the inputs that would decide it no longer exist.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum BanEnforcement {
-    /// Definitive: this ban is not keeping its target out. Either the target is
+    /// This ban is not keeping its target out. Reached three ways: the target is
     /// a current member the ban fails to exclude (so that person is in the room
-    /// right now), or the ban can never apply at all — its signature does not
-    /// verify against the banner's current key, or it names the room OWNER, who
-    /// `is_ban_authorized` refuses as a target unconditionally.
+    /// right now); the signature does not verify against the banner's current
+    /// key; or it names the room OWNER, whom `is_ban_authorized` refuses as a
+    /// target unconditionally.
+    ///
+    /// Only the owner case is permanently dead. The other two can revive, so do
+    /// NOT read this as "this row can be ignored forever":
+    /// - `ban_signature_matches_current_key` fails for TWO reasons, and the more
+    ///   common one is benign — the banner is not a current member, so their key
+    ///   is simply unavailable to check against. A pruned moderator who rejoins
+    ///   with the same key makes every such ban verify again. Genuine
+    ///   mis-signature is the rarer, adversarial case.
+    /// - a present-but-unauthorized target re-arms if the banner's authority is
+    ///   restored, because bans are add-only and every stored ban is re-evaluated
+    ///   on every cleanup. See the operator warning in `ban_list_lines`.
     Inert,
     /// The ban currently excludes its target: the banner's authority over them
     /// holds against the state as it stands.
@@ -77,15 +97,20 @@ enum BanEnforcement {
     /// ancestor) or from no grant at all. An absent member has no invite chain to
     /// walk, so that authority cannot be re-derived now. Not a promise either way.
     ///
-    /// Why "no grant at all" belongs in the SAME state as a lapsed positional one,
-    /// rather than being split off as a definitive no: with the target absent
-    /// those two are genuinely the same case, not two. Say bob was the target's
-    /// inviter and rando never had any authority over them. Neither is decided
-    /// now — the ban applies if the target is re-invited under bob, and does not
-    /// if they are re-invited under rando. Bob's grant is not REVOKED, it is
-    /// CONTINGENT, and rando's is contingent on the mirror-image event. Splitting
-    /// them would claim knowledge of who re-invites the target, which nobody has.
-    /// This is deliberate, not a distinction lost in review.
+    /// This state deliberately does NOT say which of those applies, because the
+    /// classifier cannot tell and neither can any function with these inputs.
+    /// Given `(ban, members_by_id, member_info, owner_id, owner_vk)` and an absent
+    /// target, "the banner was their inviter", "the banner was an owner-appointed
+    /// moderator whose grant was revoked", and "the banner never had authority"
+    /// are the SAME input: the `invited_by` edge died with the target's
+    /// `AuthorizedMember`, and the superseded `member_info` record was collapsed by
+    /// `dedup_to_canonical`. Distinguishing them would require tracking grant
+    /// history, which River does not keep and this command should not add.
+    ///
+    /// So the honest content is contingency alone: the ban applies if the target
+    /// returns under someone whose grant covers them, and not otherwise. Any
+    /// message here that names a CAUSE is asserting something unknowable — that
+    /// was the bug fixed alongside this comment.
     Undetermined,
 }
 
@@ -154,6 +179,14 @@ fn classify_ban(
     // global moderator it answers yes — and this would report a forgery as
     // Enforcing. Pinned by
     // `ban_signed_by_someone_other_than_its_attributed_banner_is_inert`.
+    //
+    // Note this gate fails for TWO reasons, and forgery is the rarer one: it also
+    // returns false whenever the banner is not a current member, because their key
+    // is then unavailable to check against (`ban_signature_matches_current_key`).
+    // Most rows reaching it are that benign case — a pruned or departed moderator
+    // — which is reversible: if they rejoin with the same key, their bans verify
+    // again. Both belong in `Inert` (neither is excluding anyone now), so do not
+    // read this branch as "forgery detected".
     if !BansV1::ban_signature_matches_current_key(ban, members_by_id, owner_id, owner_vk) {
         return BanEnforcement::Inert;
     }
@@ -250,27 +283,44 @@ fn ban_list_lines(bans: &[BanInfo]) -> Vec<String> {
     // not explain a case this room does not have. Neither claims where the target
     // is: a state fetched before cleanup (a full-state PUT bypasses it via
     // `verify`) can hold an inert ban whose target is already gone.
+    //
+    // Neither may name a CAUSE for an UNDETERMINED ban either. With the target
+    // absent, "banner was their inviter", "banner's grant was revoked" and
+    // "banner never had authority" are the same input to `classify_ban`, so any
+    // specific cause here would be invented. The inert note may list causes
+    // because a present target still carries the evidence that separates them.
     if inert > 0 {
         lines.push(String::new());
         lines.push(format!(
             "Note: {} ban(s) marked NOT ENFORCING are not keeping their target \
              out. A ban lands here when its banner is no longer a member, when \
-             the deputy authority it was issued under was revoked, or when the \
-             banned user had themselves deputized the banner. Run `riverctl \
+             the deputy authority it was issued under was revoked, when the \
+             banned user had themselves deputized the banner, or when the ban \
+             names the room owner (who can never be banned). Run `riverctl \
              member deputized-by <room> <banned_by_id>` to see whether the \
              banner still holds a grant, and from whom.",
             inert
         ));
+        lines.push(String::new());
+        lines.push(
+            "WARNING: a NOT ENFORCING ban is dormant, not deleted. Bans are \
+             never removed once stored, and every one of them is re-checked \
+             each time room state is cleaned up. Restoring a moderator's \
+             authority therefore re-arms every ban they ever issued, ejecting \
+             those users AND everyone they invited at the next cleanup. Read \
+             this list before re-granting anyone."
+                .to_string(),
+        );
     }
 
     if undetermined > 0 {
         lines.push(String::new());
         lines.push(format!(
             "Note: {} ban(s) marked UNDETERMINED target someone who is not \
-             currently in the room. Their banner's authority came from a \
-             position in the invite tree relative to that target, which cannot \
-             be re-derived while the target is absent, so whether the ban \
-             applies on their return depends on who re-invites them.",
+             currently in the room, and the room no longer holds what would \
+             decide them: whether the ban applies on that person's return \
+             depends on who re-invites them. Run `riverctl member deputized-by \
+             <room> <banned_by_id>` to see what authority the banner holds now.",
             undetermined
         ));
     }
@@ -1320,16 +1370,38 @@ mod tests {
         assert!(!rendered.contains("NOT ENFORCING"));
         assert!(!rendered.contains("Note:"));
 
+        assert!(
+            !rendered.contains("dormant, not deleted"),
+            "the re-arming warning is about inert rows and must not fire without one"
+        );
+
         // A room with only contingent bans gets the undetermined note and NOT
-        // the inert one, which would otherwise send the reader chasing a
-        // revoked grant that does not exist.
+        // the inert one. The discriminator is the inert note's own claims, not
+        // the `deputized-by` hint: that hint is deliberately carried by BOTH
+        // notes, because checking the banner's current authority is the useful
+        // next step either way.
         let only_maybe =
             ban_list_lines(&[info("MAYBEUSER", BanEnforcement::Undetermined)]).join("\n");
         assert!(only_maybe.contains("UNDETERMINED"));
         assert!(only_maybe.contains("depends on who re-invites them"));
         assert!(
-            !only_maybe.contains("member deputized-by"),
-            "the inert remediation must not appear when no ban is inert"
+            only_maybe.contains("member deputized-by <room> <banned_by_id>"),
+            "the undetermined note must carry the remediation hint too: the \
+             revoked-global-moderator case lands here whenever its target has \
+             already left, and that is #472's headline scenario"
+        );
+        assert!(
+            !only_maybe.contains("are not keeping their target out")
+                && !only_maybe.contains("dormant, not deleted"),
+            "the inert note and its re-arming warning must not appear when no \
+             ban is inert"
+        );
+        // The one thing this note must never do is name a cause: with the target
+        // absent the classifier cannot tell a revoked grant from a lapsed
+        // positional one from no grant at all.
+        assert!(
+            !only_maybe.contains("invite tree"),
+            "the undetermined note must not assert a cause it cannot know"
         );
     }
 
