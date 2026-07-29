@@ -3802,13 +3802,31 @@ pub fn Conversation() -> Element {
                                         // bell = notifying, bell-slash = muted; the tooltip names
                                         // the exact mode. Opens the compact NotificationModal.
                                         // Sized to 16px to pair with the adjacent (i) icon.
-                                        button {
-                                            "data-testid": "notification-bell-button",
-                                            class: "flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                                            title: match *current_notification_mode.read() {
+                                        {
+                                            let mode = *current_notification_mode.read();
+                                            let mode_title = match mode {
                                                 NotificationMode::All => "Notifications: All messages",
                                                 NotificationMode::MentionsAndReplies => "Notifications: Mentions & replies only",
                                                 NotificationMode::Muted => "Notifications: Muted",
+                                            };
+                                            // The browser may be refusing to deliver, which makes
+                                            // every mode above inert (freenet/river#510).
+                                            let blocked = crate::components::app::notifications::delivery_is_blocked(
+                                                mode,
+                                                crate::components::app::notifications::current_notification_status(),
+                                            );
+                                            rsx! {
+                                        button {
+                                            "data-testid": "notification-bell-button",
+                                            class: "relative flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                            // `title` stays the MODE alone. The blocked state rides
+                                            // on `aria-label` and the dot instead, so the tooltip
+                                            // keeps naming exactly one thing.
+                                            title: mode_title,
+                                            "aria-label": if blocked {
+                                                format!("{mode_title} (your browser is not delivering notifications)")
+                                            } else {
+                                                mode_title.to_string()
                                             },
                                             onclick: move |_| {
                                                 crate::util::defer(move || {
@@ -3819,10 +3837,30 @@ pub fn Conversation() -> Element {
                                                     }
                                                 });
                                             },
-                                            if *current_notification_mode.read() == NotificationMode::Muted {
+                                            if mode == NotificationMode::Muted {
                                                 Icon { icon: FaBellSlash, width: 16, height: 16 }
                                             } else {
                                                 Icon { icon: FaBell, width: 16, height: 16 }
+                                            }
+                                            if blocked {
+                                                // Decorative: `aria-hidden` keeps it out of the
+                                                // button's accessible name, which the `aria-label`
+                                                // above already carries in full. A badge that
+                                                // announced itself separately would append to the
+                                                // button's name instead of replacing it.
+                                                span {
+                                                    "data-testid": "notification-blocked-badge",
+                                                    "aria-hidden": "true",
+                                                    // `ring-panel` needs the hand-written
+                                                    // `@utility` in tailwind.css: `--color-panel` is
+                                                    // declared on `:root`, outside `@theme`, so
+                                                    // Tailwind v4 generates no colour utility for it
+                                                    // and `ring-1` would fall back to `currentColor`
+                                                    // — a grey ring that turns blue on hover.
+                                                    class: "absolute top-0.5 right-0.5 h-2 w-2 rounded-full bg-red-500 ring-1 ring-panel",
+                                                }
+                                            }
+                                        }
                                             }
                                         }
                                     }

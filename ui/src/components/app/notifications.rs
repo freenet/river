@@ -7,7 +7,7 @@
 //! - Permission has been granted
 
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
-use crate::room_data::CurrentRoom;
+use crate::room_data::{CurrentRoom, NotificationMode};
 use crate::util::ecies::{decrypt_with_symmetric_key, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{debug, info, warn};
 use dioxus::prelude::*;
@@ -289,6 +289,31 @@ pub fn permission_notice(status: Option<NotificationStatus>) -> PermissionNotice
     }
 }
 
+/// Whether the bell should carry a "these preferences aren't reaching you"
+/// marker.
+///
+/// The per-room modes decide only WHEN River wants to notify. If the browser
+/// won't deliver, every one of them is inert — and until now the only place
+/// that said so was inside the modal, so a user with a blocked permission saw an
+/// ordinary bell reading "Notifications: All messages" and learned nothing
+/// unless they went looking. For an issue titled "fails silently", that is the
+/// last place the silence lives.
+///
+/// Deliberately NOT flagged:
+/// - [`NotificationMode::Muted`] — the user asked for no notifications, so
+///   warning that they won't get any is noise.
+/// - [`NotificationStatus::Unsupported`] — the platform has no Notifications API
+///   at all (mobile Safari), so the marker could never be cleared by anything
+///   the user does. A permanent badge is nagging, not informing; the modal still
+///   explains it.
+pub fn delivery_is_blocked(mode: NotificationMode, status: Option<NotificationStatus>) -> bool {
+    !matches!(mode, NotificationMode::Muted)
+        && matches!(
+            status,
+            Some(NotificationStatus::Denied | NotificationStatus::Undeliverable)
+        )
+}
+
 /// Whether a reported status should re-arm the automatic enable prompt.
 ///
 /// Only [`NotificationStatus::Undecided`] does: every other outcome is either
@@ -561,7 +586,11 @@ pub fn install_shell_notification_listener() {
                 .and_then(NotificationStatus::from_shell_status)
             {
                 Some(status) => record_notification_status(status),
-                None => debug!("Ignoring unrecognised notification_status from shell"),
+                // `warn!`, not `debug!`: `release_max_level_info` compiles
+                // `debug!` out, and this fires exactly when the cross-repo
+                // status contract has drifted — the failure that reverts #510
+                // wholesale. It has to be diagnosable in the build users run.
+                None => warn!("Ignoring unrecognised notification_status from shell"),
             }
             return;
         }
@@ -1512,6 +1541,109 @@ mod notify_gate_tests {
         assert!(
             production.contains("Some(status)=>record_notification_status(status)"),
             "a parsed status is no longer recorded"
+        );
+    }
+
+    /// The unrecognised-status log must stay at `warn!`. `release_max_level_info`
+    /// compiles `debug!` out of the build users run, and this line fires exactly
+    /// when the cross-repo status contract has drifted — the failure that reverts
+    /// #510 wholesale — so at `debug!` the one diagnostic for it is gone.
+    ///
+    /// The framed Playwright test asserts the same thing behaviourally, by
+    /// waiting for the line in the console. This pin is kept alongside it because
+    /// it fails in a second in the fast native job rather than sixteen minutes
+    /// into the browser job, and because it does not depend on Dioxus continuing
+    /// to spell the level "WARN" in the message text.
+    #[test]
+    fn an_unknown_status_is_logged_at_a_level_release_builds_keep() {
+        assert!(
+            production_source().contains("None=>warn!(\"Ignoringunrecognised"),
+            "the unrecognised-status log is no longer warn!; at debug! it is \
+             compiled out of release and the contract drift becomes invisible"
+        );
+    }
+
+    /// The bell marker fires exactly where the user's own setting says they want
+    /// notifications and the browser will not deliver them.
+    #[test]
+    fn the_bell_is_marked_only_when_a_wanted_notification_cannot_arrive() {
+        use crate::room_data::NotificationMode::*;
+
+        for mode in [All, MentionsAndReplies] {
+            for (status, blocked) in [
+                (Some(NotificationStatus::Denied), true),
+                (Some(NotificationStatus::Undeliverable), true),
+                (Some(NotificationStatus::Granted), false),
+                (Some(NotificationStatus::Dismissed), false),
+                (Some(NotificationStatus::Undecided), false),
+                // Unsupported is excluded on purpose: nothing the user does can
+                // clear it, so the marker would be permanent nagging.
+                (Some(NotificationStatus::Unsupported), false),
+                (None, false),
+            ] {
+                assert_eq!(
+                    delivery_is_blocked(mode, status),
+                    blocked,
+                    "mode {mode:?} with status {status:?}"
+                );
+            }
+        }
+    }
+
+    /// A muted room is never marked: the user asked for no notifications, so
+    /// telling them they won't get any is noise, not information.
+    #[test]
+    fn a_muted_room_is_never_marked_as_blocked() {
+        for status in ALL_STATUSES {
+            assert!(
+                !delivery_is_blocked(crate::room_data::NotificationMode::Muted, Some(status)),
+                "muted room marked for status {status:?}"
+            );
+        }
+    }
+
+    /// The re-arm itself — the "reset the flag" half of #510 — is two statements
+    /// against process-global atomics, which no behavioural test in this crate
+    /// can drive (native tests run in parallel threads and would corrupt each
+    /// other's view of the statics). Mutation testing showed BOTH lines could be
+    /// deleted with the whole suite still green, so each shipped a silent
+    /// regression:
+    ///
+    /// - Without `ENABLE_PROMPT_SENT.store(false, ...)` an unanswered prompt
+    ///   never re-arms, which is precisely the "no way to retry" complaint.
+    /// - Without `ENABLE_PROMPT_REARMS.fetch_add(1, ...)` the counter stays at
+    ///   0, so `rearms_used < MAX` is always true and the re-arm becomes
+    ///   UNBOUNDED — the shell's affordance bar returns on every message the
+    ///   user sends, the exact nag the cap exists to prevent.
+    ///
+    /// `the_automatic_rearm_is_bounded` does NOT cover the second one: it feeds
+    /// the predicate a caller-supplied count, so it passes with the increment
+    /// deleted. A source pin has no parallelism problem, so it is the right
+    /// instrument here.
+    #[test]
+    fn an_unanswered_prompt_actually_rearms_the_flag_it_bounds() {
+        let production = production_source();
+
+        assert!(
+            production.contains("ENABLE_PROMPT_SENT.store(false,Ordering::SeqCst);"),
+            "nothing clears ENABLE_PROMPT_SENT, so an unanswered prompt can \
+             never be re-offered — #510's 'no way to retry' is back"
+        );
+        assert!(
+            production.contains("ENABLE_PROMPT_REARMS.fetch_add(1,Ordering::SeqCst);"),
+            "nothing advances ENABLE_PROMPT_REARMS, so the cap never binds and \
+             the shell's bar returns on every message sent"
+        );
+        // Both statements, in order, behind the bounded predicate: the pin is
+        // about the wiring, not merely about the two lines existing somewhere.
+        assert!(
+            production.contains(
+                "ifstatus_rearms_auto_prompt(status,ENABLE_PROMPT_REARMS.load(Ordering::SeqCst)){\
+                 ENABLE_PROMPT_REARMS.fetch_add(1,Ordering::SeqCst);\
+                 ENABLE_PROMPT_SENT.store(false,Ordering::SeqCst);}"
+            ),
+            "the re-arm is no longer gated by status_rearms_auto_prompt, or the \
+             two statements it guards have moved apart"
         );
     }
 

@@ -78,6 +78,12 @@
 @utility border-border { border-color: var(--color-border); }
 @utility border-border-hover { border-color: var(--color-border-hover); }
 
+/* `--color-panel` lives on `:root`, not in `@theme`, so Tailwind generates no
+   colour utilities for it automatically — every panel/surface/text utility above
+   is hand-written for the same reason. Without this, `ring-panel` is a silent
+   no-op and `ring-1` falls back to `currentColor`. */
+@utility ring-panel { --tw-ring-color: var(--color-panel); }
+
 @utility placeholder-text-muted {
   &::placeholder { color: var(--color-text-muted); }
 }

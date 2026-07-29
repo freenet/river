@@ -160,6 +160,36 @@ test.describe("Per-room notification bell", () => {
     }
   });
 
+  // Top-level counterpart of the framed badge test in
+  // notification-shell-status.spec.ts: served with a real origin, River reads
+  // the browser's own permission, so the marker must track that.
+  test("the bell is marked when the browser itself is blocking notifications", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, ROOM);
+
+    const state = await page.evaluate(() =>
+      typeof Notification === "undefined" ? "unsupported" : Notification.permission
+    );
+    const badge = page.getByTestId("notification-blocked-badge");
+
+    if (state === "denied") {
+      // Playwright's Chromium denies notifications by default, so this branch
+      // is genuinely exercised rather than hypothetical.
+      await expect(badge).toBeVisible();
+      await expect(
+        page.getByTestId("notification-bell-button")
+      ).toHaveAttribute("aria-label", /not delivering/i);
+    } else {
+      // "default" (Firefox, desktop WebKit) and "unsupported" (mobile Safari)
+      // are not blocked states: nothing is being withheld that the user asked
+      // for, so marking the bell would be noise.
+      await expect(badge).toHaveCount(0);
+    }
+  });
+
   test("room-details modal no longer carries the notification setting", async ({
     page,
   }) => {
