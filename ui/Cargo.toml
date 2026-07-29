@@ -28,7 +28,7 @@ rand.workspace = true
 getrandom = { version = "0.2.15", features = ["js", "wasm-bindgen", "js-sys"], default-features = false }
 
 # UI Framework
-dioxus = { version = "0.7.3", features = ["web"] }
+dioxus = { version = "0.7.9", features = ["web"] }
 # Only `fa_solid_icons` are referenced in the UI (verified by grep). Dropping
 # the brands/regular feature sets trims their icon modules from the build.
 dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-solid"] }
