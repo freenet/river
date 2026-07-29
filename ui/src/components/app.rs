@@ -108,7 +108,9 @@ pub fn App() -> Element {
 
     // In the gateway iframe, notifications are shown by the shell page; listen
     // for its `notification_click` replies to route to the clicked room
-    // (freenet/river#408). No-op when served as a top-level page. Installs once.
+    // (freenet/river#408) and its `notification_status` replies to learn whether
+    // the browser will show anything at all (freenet/river#510). No-op when
+    // served as a top-level page. Installs once.
     crate::components::app::notifications::install_shell_notification_listener();
 
     // Install the document-level click interceptor that catches

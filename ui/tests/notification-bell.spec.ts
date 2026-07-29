@@ -114,6 +114,52 @@ test.describe("Per-room notification bell", () => {
     ).toHaveAttribute("title", "Notifications: All messages");
   });
 
+  // freenet/river#510: the modes above only decide WHEN River wants to notify.
+  // If the browser is blocking notifications none of them can fire, and River
+  // used to discard every status the shell reported — so that failure was
+  // invisible and there was no way to ask again.
+  test("the modal explains browser permission and offers a way to enable it", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, ROOM);
+
+    await page.getByTestId("notification-bell-button").click();
+    const modal = page.getByTestId("notification-modal");
+    await expect(modal).toBeVisible({ timeout: 5_000 });
+
+    // Whatever the browser's state, the user is told something about it.
+    const message = modal.getByTestId("notification-permission-message");
+    await expect(message).toBeVisible();
+    await expect(message).not.toHaveText(/^\s*$/);
+
+    // The projects cover all three real states, so this branches on the
+    // browser's actual answer rather than assuming one: Playwright's Chromium
+    // reports "denied", Firefox and desktop WebKit "default", and mobile Safari
+    // has no Notifications API at all.
+    const state = await page.evaluate(() =>
+      typeof Notification === "undefined" ? "unsupported" : Notification.permission
+    );
+    const enable = modal.getByTestId("notification-enable-button");
+
+    if (state === "default") {
+      // Nothing is blocked, so the retry #510 asks for must be there.
+      await expect(enable).toBeVisible();
+      await expect(enable).toBeEnabled();
+    } else {
+      // Blocked at the browser level, already granted, or no API at all —
+      // asking again cannot change the answer, so River must not offer a
+      // button that silently does nothing.
+      await expect(enable).toHaveCount(0);
+      if (state === "denied") {
+        await expect(message).toContainText(/blocking/i);
+      } else if (state === "unsupported") {
+        await expect(message).toContainText(/support/i);
+      }
+    }
+  });
+
   test("room-details modal no longer carries the notification setting", async ({
     page,
   }) => {

@@ -13,6 +13,9 @@
 //! so the help text says "your devices", not "this device only".
 
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
+use crate::components::app::notifications::{
+    current_notification_status, permission_notice, request_enable_now,
+};
 use crate::components::app::{NOTIFICATION_MODAL, ROOMS};
 use crate::room_data::NotificationMode;
 use dioxus::logger::tracing::error;
@@ -157,6 +160,40 @@ pub fn NotificationModal() -> Element {
                     p { class: "text-xs text-text-muted mt-4",
                         "Applies to this room and syncs across your devices."
                     }
+                    // Browser-level permission. The modes above only decide
+                    // WHEN River wants to notify; if the browser is blocking
+                    // notifications none of them can fire, and before #510
+                    // that failure was invisible with no way to retry.
+                    {
+                        let notice = permission_notice(current_notification_status());
+                        rsx! {
+                            div { class: "mt-4 pt-4 border-t border-border",
+                                div { class: "text-xs font-medium text-text mb-1", "Browser permission" }
+                                p {
+                                    "data-testid": "notification-permission-message",
+                                    class: "text-xs text-text-muted",
+                                    "{notice.message}"
+                                }
+                                if notice.offer_enable {
+                                    button {
+                                        "data-testid": "notification-enable-button",
+                                        class: "mt-2 px-3 py-1.5 rounded-lg bg-accent text-white text-xs font-medium hover:opacity-90 transition-opacity",
+                                        // NOT deferred, and that is load-bearing:
+                                        // the browser only honours a permission
+                                        // request made inside the click's transient
+                                        // user activation, which a `defer` (a
+                                        // `setTimeout(0)`) would have already lost.
+                                        // Safe because `request_enable_now` writes
+                                        // no signal synchronously.
+                                        onclick: move |_| {
+                                            request_enable_now();
+                                        },
+                                        "Enable notifications"
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -169,5 +206,32 @@ fn mode_icon(mode: NotificationMode) -> Element {
         NotificationMode::All => rsx! { Icon { icon: FaBell, width: 16, height: 16 } },
         NotificationMode::MentionsAndReplies => rsx! { Icon { icon: FaAt, width: 16, height: 16 } },
         NotificationMode::Muted => rsx! { Icon { icon: FaBellSlash, width: 16, height: 16 } },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The permission request must run inside the click's transient user
+    /// activation. Wrapping the call in `crate::util::defer` — which every OTHER
+    /// handler in this file correctly does, so the wrapping looks like a
+    /// consistency fix — is a `setTimeout(0)`: the activation is gone by the
+    /// time it runs, and Firefox and Safari reject the request with
+    /// `NotAllowedError`. The button would then silently do nothing, which is
+    /// the failure mode freenet/river#510 exists to remove. The button is rsx,
+    /// so no native test can click it; pinned by source.
+    #[test]
+    fn the_enable_click_is_not_deferred() {
+        let source = include_str!("notification_modal.rs");
+        let (production, _) = source
+            .split_once("mod tests")
+            .expect("this test module's own declaration marks the end of production code");
+        // Whitespace-stripped so the pin survives `cargo fmt` re-wrapping.
+        let production: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            production.contains("onclick:move|_|{request_enable_now();}"),
+            "the Enable-notifications click must call request_enable_now() \
+             directly, with no defer between the click and the request"
+        );
     }
 }
