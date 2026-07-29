@@ -19,17 +19,33 @@ use river_core::room_state::ChatRoomParametersV1;
 #[component]
 pub fn MemberInfoModal() -> Element {
     // Memos
+    // Both memos below read ROOMS fallibly, and this modal is mounted for the
+    // whole app session (app.rs renders it unconditionally), so a contended pass
+    // that dropped their ROOMS subscription would strand them for good. The
+    // anchor keeps a dependency the nudge can wake. See
+    // `crate::util::signal_guard` and freenet/river#555.
     let current_room_data_signal = use_memo(move || {
+        crate::util::signal_guard::anchor();
+        let Ok(rooms) = ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return None;
+        };
         CURRENT_ROOM
             .read()
             .owner_key
             .as_ref()
-            .and_then(|key| ROOMS.try_read().ok()?.map.get(key).cloned())
+            .and_then(|key| rooms.map.get(key).cloned())
     });
     let self_member_id: Memo<Option<MemberId>> = use_memo(move || {
-        ROOMS
-            .try_read()
-            .ok()?
+        // `self_member_id` was the worse of the two: `ROOMS.try_read().ok()?` was
+        // the FIRST read, so a contended pass returned before `CURRENT_ROOM` was
+        // ever read and left the memo with ZERO subscriptions.
+        crate::util::signal_guard::anchor();
+        let Ok(rooms) = ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return None;
+        };
+        rooms
             .map
             .get(&CURRENT_ROOM.read().owner_key?)
             .map(|r| MemberId::from(&r.self_sk.verifying_key()))

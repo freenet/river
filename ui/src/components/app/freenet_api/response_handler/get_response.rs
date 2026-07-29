@@ -763,8 +763,30 @@ pub async fn handle_get_response(
                             );
                         }
                     });
+                    // Focus the newly-joined room only if the reader is not
+                    // already looking at something. This used to be
+                    // unconditional, which let a background accept steal the
+                    // view minutes after the fact: #218 silently re-issues a
+                    // stored accept at startup (no click, no prompt), so a slow
+                    // accept against a large room could land long after the
+                    // reader had settled elsewhere and yank them to a different
+                    // room. Their original room kept receiving messages
+                    // off-screen, which reads exactly as "the chat stopped and
+                    // no new messages loaded". freenet/river#557.
+                    //
+                    // Mirrors the `SkipUserAlreadySelected` discipline the
+                    // delegate-restore path already applies
+                    // (`response_handler.rs::decide_current_room_restore`).
                     CURRENT_ROOM.with_mut(|current_room| {
-                        current_room.owner_key = Some(owner_vk);
+                        if current_room.owner_key.is_none() {
+                            current_room.owner_key = Some(owner_vk);
+                        } else if current_room.owner_key != Some(owner_vk) {
+                            info!(
+                                "Invitation for {:?} completed while the reader was in \
+                                 another room; joining without stealing focus",
+                                MemberId::from(owner_vk)
+                            );
+                        }
                     });
                 });
 

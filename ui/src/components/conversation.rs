@@ -2483,9 +2483,13 @@ pub fn Conversation() -> Element {
 
     let current_room_label = use_memo({
         move || {
+            // freenet/river#555: anchor before the fallible ROOMS read, so a
+            // contended pass cannot strand the room title on a stale value.
+            crate::util::signal_guard::anchor();
             let current_room = CURRENT_ROOM.read();
             if let Some(key) = current_room.owner_key {
                 let Ok(rooms) = ROOMS.try_read() else {
+                    crate::util::signal_guard::schedule_nudge();
                     return "No Room Selected".to_string();
                 };
                 if let Some(room_data) = rooms.map.get(&key) {
@@ -2516,23 +2520,34 @@ pub fn Conversation() -> Element {
     // The current room's notification mode, for the header bell icon + tooltip.
     // Absent entry means the default (`All`).
     let current_notification_mode = use_memo(move || {
+        // freenet/river#555: anchor before the fallible ROOMS read.
+        crate::util::signal_guard::anchor();
         let current_room = CURRENT_ROOM.read();
         let Some(key) = current_room.owner_key else {
             return NotificationMode::All;
         };
-        ROOMS
-            .try_read()
-            .ok()
-            .and_then(|rooms| rooms.notification_modes.get(&key).copied())
-            .unwrap_or_default()
+        match ROOMS.try_read() {
+            Ok(rooms) => rooms
+                .notification_modes
+                .get(&key)
+                .copied()
+                .unwrap_or_default(),
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                NotificationMode::default()
+            }
+        }
     });
 
     // Memoize room description as rendered HTML (markdown)
     let current_room_description_html = use_memo({
         move || {
+            // freenet/river#555: anchor before the fallible ROOMS read.
+            crate::util::signal_guard::anchor();
             let current_room = CURRENT_ROOM.read();
             if let Some(key) = current_room.owner_key {
                 let Ok(rooms) = ROOMS.try_read() else {
+                    crate::util::signal_guard::schedule_nudge();
                     return None;
                 };
                 if let Some(room_data) = rooms.map.get(&key) {
@@ -2561,9 +2576,19 @@ pub fn Conversation() -> Element {
     // This prevents re-computing on every render/keystroke
     // Returns (groups, self_member_id, member_names) so we can highlight user's reactions and show names in tooltips
     let message_groups = use_memo(move || {
+        // Anchor FIRST: a contended `ROOMS.try_read()` below registers no
+        // subscription (dioxus-signals `signal.rs:409` returns before
+        // `subscribe`), and a memo clears its dependency set on every pass
+        // (dioxus-core `reactive_context.rs:196`). Without the anchor this memo
+        // came out of a contended pass subscribed only to CURRENT_ROOM, so it
+        // stopped reacting to new messages until the reader switched rooms or
+        // reloaded -- while rendering "No messages yet. Start the conversation!"
+        // into a room full of history. freenet/river#555.
+        crate::util::signal_guard::anchor();
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key {
             let Ok(rooms) = ROOMS.try_read() else {
+                crate::util::signal_guard::schedule_nudge();
                 return None;
             };
             if let Some(room_data) = rooms.map.get(&key) {

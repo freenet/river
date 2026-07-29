@@ -129,6 +129,45 @@ impl SyncInfo {
         }
     }
 
+    /// Mark every room this page believes is `Subscribed` as `Disconnected`, so
+    /// the existing `process_rooms()` path re-subscribes it. Returns how many
+    /// rooms were flipped (for logging).
+    ///
+    /// **Call this on a genuinely NEW WebSocket only.** A client subscription
+    /// lives on the node against a `ClientId`, and the node tears down every
+    /// subscription for that client on each socket exit path
+    /// (`websocket.rs::notify_disconnect` -> `remove_client_from_all_subscriptions`).
+    /// A reconnect gets a fresh `ClientId`, so after it the node holds NO client
+    /// subscription for any room — while `SYNC_INFO` is a page-lifetime signal
+    /// that still says `Subscribed`. Since `rooms_awaiting_subscription` only
+    /// returns `Disconnected` (or timed-out `Subscribing`) rooms, nothing ever
+    /// re-subscribed: the tab reconnected, showed "Connected", and then received
+    /// no further updates for the rest of the session. A reload cured it only
+    /// because it started with an empty `SYNC_INFO`.
+    ///
+    /// Deliberately NOT called from the `PageBecameVisible` / `RefreshAllRooms`
+    /// path: that path runs on an apparently-live socket, where the node's client
+    /// subscriptions are still intact, and re-subscribing there would ship full
+    /// room state for every room on every tab focus.
+    ///
+    /// Only `Subscribed` is flipped. `Subscribing` is left alone so its timeout
+    /// bookkeeping is not disturbed, and terminal `Error` is left alone so a room
+    /// that has exhausted its #290 retry budget is not silently revived. Flipping
+    /// to `Disconnected` costs no retry budget: `update_sync_status` only clears
+    /// `failed_sync_attempts` on `Subscribed`.
+    pub fn mark_subscribed_rooms_disconnected(&mut self) -> usize {
+        let stale: Vec<VerifyingKey> = self
+            .map
+            .iter()
+            .filter(|(_, info)| info.sync_status == RoomSyncStatus::Subscribed)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &stale {
+            self.update_sync_status(key, RoomSyncStatus::Disconnected);
+        }
+        stale.len()
+    }
+
     /// Record a failed sync attempt for a room and decide whether to keep
     /// retrying or give up (freenet/river#290).
     ///
@@ -426,6 +465,92 @@ mod tests {
 
     fn test_owner(seed: u8) -> VerifyingKey {
         SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    /// freenet/river#556: a `Subscribed` room must be re-armed for
+    /// re-subscription after a reconnect, because the node dropped that
+    /// subscription with the old socket. Without this the tab reconnects,
+    /// reports "Connected", and silently receives nothing thereafter.
+    #[test]
+    fn reconnect_restales_subscribed_rooms_so_they_are_resubscribed() {
+        let mut si = SyncInfo::new();
+        let subscribed = test_owner(1);
+        si.register_new_room(subscribed);
+        si.update_sync_status(&subscribed, RoomSyncStatus::Subscribed);
+
+        // Before: a Subscribed room is invisible to the re-subscribe sweep.
+        assert_eq!(
+            si.get_sync_status(&subscribed),
+            Some(&RoomSyncStatus::Subscribed)
+        );
+
+        assert_eq!(si.mark_subscribed_rooms_disconnected(), 1);
+        assert_eq!(
+            si.get_sync_status(&subscribed),
+            Some(&RoomSyncStatus::Disconnected),
+            "a Subscribed room must be re-armed after a reconnect, or nothing \
+             ever re-subscribes it"
+        );
+    }
+
+    /// Only `Subscribed` is flipped. `Subscribing` keeps its timeout bookkeeping,
+    /// and terminal `Error` (a room that exhausted its #290 retry budget) must not
+    /// be silently revived by an unrelated reconnect.
+    #[test]
+    fn reconnect_restale_leaves_other_statuses_alone() {
+        let mut si = SyncInfo::new();
+        let (subscribing, errored, disconnected) = (test_owner(2), test_owner(3), test_owner(4));
+        for k in [&subscribing, &errored, &disconnected] {
+            si.register_new_room(*k);
+        }
+        si.update_sync_status(&subscribing, RoomSyncStatus::Subscribing);
+        si.update_sync_status(&errored, RoomSyncStatus::Error("gave up".into()));
+        si.update_sync_status(&disconnected, RoomSyncStatus::Disconnected);
+
+        assert_eq!(
+            si.mark_subscribed_rooms_disconnected(),
+            0,
+            "nothing was Subscribed, so nothing should have been flipped"
+        );
+        assert_eq!(
+            si.get_sync_status(&subscribing),
+            Some(&RoomSyncStatus::Subscribing)
+        );
+        assert!(
+            si.map
+                .get(&subscribing)
+                .unwrap()
+                .subscribing_since
+                .is_some(),
+            "flipping must not clear a Subscribing room's timeout stamp"
+        );
+        assert_eq!(
+            si.get_sync_status(&errored),
+            Some(&RoomSyncStatus::Error("gave up".into())),
+            "a terminal Error room must not be revived by a reconnect"
+        );
+    }
+
+    /// Re-arming must not consume the #290 retry budget: `update_sync_status`
+    /// clears `failed_sync_attempts` only on `Subscribed`, so a room that has
+    /// been flipped keeps whatever budget it had.
+    #[test]
+    fn reconnect_restale_does_not_spend_retry_budget() {
+        let mut si = SyncInfo::new();
+        let owner = test_owner(5);
+        si.register_new_room(owner);
+        si.update_sync_status(&owner, RoomSyncStatus::Subscribed);
+        // A successful subscribe zeroes the counter; set a streak afterwards to
+        // prove the flip preserves it rather than incrementing it.
+        si.map.get_mut(&owner).unwrap().failed_sync_attempts = 2;
+
+        si.mark_subscribed_rooms_disconnected();
+
+        assert_eq!(
+            si.map.get(&owner).unwrap().failed_sync_attempts,
+            2,
+            "re-arming after a reconnect is not a failed attempt"
+        );
     }
 
     /// `touch_subscribing_since` refreshes the timestamp for a `Subscribing`

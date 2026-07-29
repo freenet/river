@@ -205,8 +205,15 @@ pub fn RoomList() -> Element {
         // `try_read() -> Err` registers no subscription (dioxus-signal-safety
         // rules), so with the reads inverted an Err poll would leave this
         // memo with zero subscriptions — permanently frozen room list.
+        //
+        // That ordering alone is not enough (freenet/river#555): a contended pass
+        // still drops the ROOMS subscription, leaving the list stuck until
+        // CURRENT_ROOM happens to change. The anchor plus the deferred nudge make
+        // it re-poll a macrotask later instead.
+        crate::util::signal_guard::anchor();
         let current_room_key = CURRENT_ROOM.read().owner_key;
         let Ok(rooms) = ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
             return Vec::new();
         };
 

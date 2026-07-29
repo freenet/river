@@ -13,11 +13,19 @@ use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> Element {
     // Memos
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
+        // freenet/river#555: anchor before the fallible ROOMS read below.
+        crate::util::signal_guard::anchor();
         CURRENT_ROOM
             .read()
             .owner_key
             .as_ref()
-            .and_then(|key| ROOMS.try_read().ok()?.map.get(key).cloned())
+            .and_then(|key| match ROOMS.try_read() {
+                Ok(rooms) => rooms.map.get(key).cloned(),
+                Err(_) => {
+                    crate::util::signal_guard::schedule_nudge();
+                    None
+                }
+            })
     });
 
     let mut show_confirmation = use_signal(|| false);

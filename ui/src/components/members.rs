@@ -1372,9 +1372,16 @@ pub fn MemberList() -> Element {
     let mut export_modal_active = use_signal(|| false);
 
     let members = use_memo(move || {
+        // freenet/river#555: keep a dependency the nudge can wake, so a contended
+        // ROOMS pass cannot leave the member list stuck until the reader changes
+        // rooms.
+        crate::util::signal_guard::anchor();
         let room_owner = CURRENT_ROOM.read().owner_key?;
 
-        let rooms_read = ROOMS.try_read().ok()?;
+        let Ok(rooms_read) = ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return None;
+        };
         let room_data = rooms_read.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
         let self_member_id: MemberId = room_data.self_sk.verifying_key().into();

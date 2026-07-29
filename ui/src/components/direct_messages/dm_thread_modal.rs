@@ -142,7 +142,16 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     // hold a ROOMS borrow across spawn_local.
     let view = use_memo({
         move || {
-            let rooms = ROOMS.try_read().ok()?;
+            // `room` and `peer` are plain captured props, not signals, so ROOMS
+            // was this memo's ONLY possible dependency: one contended pass left
+            // it with zero subscriptions and the thread never updated again.
+            // This modal is always mounted, so nothing remounted it either.
+            // freenet/river#555.
+            crate::util::signal_guard::anchor();
+            let Ok(rooms) = ROOMS.try_read() else {
+                crate::util::signal_guard::schedule_nudge();
+                return None;
+            };
             let room_data = rooms.map.get(&room)?;
 
             let self_sk = room_data.self_sk.clone();
