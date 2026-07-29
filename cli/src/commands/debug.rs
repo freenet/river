@@ -77,8 +77,11 @@ enum BanEnforcement {
     ///   with the same key makes every such ban verify again. Genuine
     ///   mis-signature is the rarer, adversarial case.
     /// - a present-but-unauthorized target re-arms if the banner's authority is
-    ///   restored, because bans are add-only and every stored ban is re-evaluated
-    ///   on every cleanup. See the operator warning in `ban_list_lines`.
+    ///   restored. Losing enforcement does not drop a ban: cleanup only sweeps
+    ///   bans whose signature no longer matches a current banner's key, and
+    ///   evicts under the `max_user_bans` cap, so a revoked deputy who stays a
+    ///   member keeps their bans stored — and `banned_member_ids` re-evaluates
+    ///   every stored ban on every cleanup. See the warning in `ban_list_lines`.
     Inert,
     /// The ban currently excludes its target: the banner's authority over them
     /// holds against the state as it stands.
@@ -103,9 +106,12 @@ enum BanEnforcement {
     /// target, "the banner was their inviter", "the banner was an owner-appointed
     /// moderator whose grant was revoked", and "the banner never had authority"
     /// are the SAME input: the `invited_by` edge died with the target's
-    /// `AuthorizedMember`, and the superseded `member_info` record was collapsed by
-    /// `dedup_to_canonical`. Distinguishing them would require tracking grant
-    /// history, which River does not keep and this command should not add.
+    /// `AuthorizedMember`, and a revoked grant is invisible because `deputies_of`
+    /// reads only `MemberInfoV1::canonical`, the highest-ranked record — so the
+    /// superseded one carrying the grant is never exposed, whether or not
+    /// `dedup_to_canonical` has since collapsed it. Distinguishing them would
+    /// require tracking grant history, which River does not keep and this command
+    /// should not add.
     ///
     /// So the honest content is contingency alone: the ban applies if the target
     /// returns under someone whose grant covers them, and not otherwise. Any
@@ -303,12 +309,13 @@ fn ban_list_lines(bans: &[BanInfo]) -> Vec<String> {
         ));
         lines.push(String::new());
         lines.push(
-            "WARNING: a NOT ENFORCING ban is dormant, not deleted. Bans are \
-             never removed once stored, and every one of them is re-checked \
-             each time room state is cleaned up. Restoring a moderator's \
-             authority therefore re-arms every ban they ever issued, ejecting \
-             those users AND everyone they invited at the next cleanup. Read \
-             this list before re-granting anyone."
+            "WARNING: a NOT ENFORCING ban is dormant, not deleted. A ban is not \
+             dropped for having stopped enforcing — while its banner remains a \
+             member it stays stored, and every stored ban is re-checked each \
+             time room state is cleaned up. Restoring a moderator's authority \
+             therefore re-arms every ban they ever issued, ejecting those users \
+             AND everyone they invited at the next cleanup. Read this list \
+             before re-granting anyone."
                 .to_string(),
         );
     }
