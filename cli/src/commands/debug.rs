@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::ban::BansV1;
-use river_core::room_state::member::MemberId;
+use river_core::room_state::member::{MemberId, MembersV1};
 use river_core::room_state::ChatRoomStateV1;
 use serde::Serialize;
 
@@ -45,13 +45,23 @@ struct BanInfo {
     banned_user_id: String,
     banned_by_id: String,
     banned_at_secs: u64,
-    /// Whether the contract currently ENFORCES this ban, as opposed to it being
-    /// present in state but inert. Since deputy ban authority (freenet/river#410)
-    /// a ban can stop enforcing without being removed — e.g. the banner's deputy
-    /// authority was revoked, the banner left or was pruned, or the target has
-    /// since deputized the banner. Computed from `BansV1::ban_is_enforcing`, the
-    /// same predicate the contract uses when it decides whether a ban's target
-    /// is actually excluded.
+    /// Whether the contract currently EXCLUDES this ban's target, as opposed to
+    /// the ban being present in state but inert. Since deputy ban authority
+    /// (freenet/river#410) a ban can stop enforcing without being removed: the
+    /// banner left or was pruned, their deputy authority was revoked, or (once
+    /// no absolute grant applies) the target has since deputized the banner.
+    ///
+    /// This mirrors the test `MembersV1::banned_member_ids` applies when it
+    /// builds the excluded set in `post_apply_cleanup`, so it answers the
+    /// question a moderator is actually asking: is this person kept out?
+    ///
+    /// Deliberately NOT `BansV1::ban_is_enforcing`, despite the name. That
+    /// predicate answers a different question — whether a ban is worth KEEPING
+    /// under `max_user_bans` eviction pressure — and to do so it returns `true`
+    /// for any signature-verified member's ban of an ABSENT target without ever
+    /// consulting `is_ban_authorized`. Reporting that as "enforcing" would tell a
+    /// moderator an unauthorized ban keeps someone out when rejoining would in
+    /// fact readmit them, which is the very confusion #472 exists to remove.
     enforcing: bool,
 }
 
@@ -72,13 +82,18 @@ fn collect_ban_infos(room_state: &ChatRoomStateV1, owner_vk: &VerifyingKey) -> V
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let enforcing = BansV1::ban_is_enforcing(
-                ban,
-                &members_by_id,
-                &room_state.member_info,
-                owner_id,
-                owner_vk,
-            );
+            // The same two gates, in the same order, that `banned_member_ids`
+            // applies per ban. `ban_excludes_its_target_matches_banned_member_ids`
+            // pins the agreement so this cannot drift from the contract.
+            let enforcing =
+                BansV1::ban_signature_matches_current_key(ban, &members_by_id, owner_id, owner_vk)
+                    && MembersV1::is_ban_authorized(
+                        ban.banned_by,
+                        ban.ban.banned_user,
+                        &members_by_id,
+                        &room_state.member_info,
+                        owner_id,
+                    );
             BanInfo {
                 banned_user_id: ban.ban.banned_user.to_string(),
                 banned_by_id: ban.banned_by.to_string(),
@@ -586,6 +601,7 @@ mod tests {
     use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
     use river_core::room_state::member::{AuthorizedMember, Member};
     use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use river_core::room_state::ChatRoomParametersV1;
 
     /// The cli crate's dalek build does not enable the `rand` `generate`
     /// helper, so keys come from fixed seeds (mirrors `deputies.rs`'s tests).
@@ -749,6 +765,120 @@ mod tests {
             !bans[0].enforcing,
             "a ban whose banner is gone is inert and must not read as active"
         );
+    }
+
+    #[test]
+    fn unauthorized_ban_of_an_absent_target_reports_not_enforcing() {
+        // `BansV1::ban_is_enforcing` answers "is this ban worth keeping under
+        // `max_user_bans` pressure?", and for an ABSENT target it returns true
+        // for any signature-verified member's ban WITHOUT consulting
+        // `is_ban_authorized`. Reporting that as enforcing would recreate #472's
+        // bug: bob has no authority over alice, so if alice rejoins she is NOT
+        // removed, yet the moderator would have been told the ban holds.
+        let owner = key(1);
+        let alice = key(2);
+        let bob = key(3);
+
+        let mut state = ChatRoomStateV1::default();
+        // bob is a plain member with no deputy grant; alice is absent.
+        push_member(&mut state, &owner, &owner, &bob);
+        push_ban(&mut state, &owner, &bob, &alice);
+
+        let members_by_id = state.members.members_by_member_id();
+        let owner_id = MemberId::from(&owner.verifying_key());
+        assert!(
+            BansV1::ban_is_enforcing(
+                &state.bans.0[0],
+                &members_by_id,
+                &state.member_info,
+                owner_id,
+                &owner.verifying_key(),
+            ),
+            "guard: this test is only meaningful while `ban_is_enforcing` still \
+             returns true here; if that changes, the divergence it protects \
+             against is gone and this test should be revisited"
+        );
+
+        let bans = collect_ban_infos(&state, &owner.verifying_key());
+        assert!(
+            !bans[0].enforcing,
+            "bob is not authorized to ban alice, so the ban does not keep her out"
+        );
+    }
+
+    #[test]
+    fn ban_excludes_its_target_matches_banned_member_ids() {
+        // Ties the reported flag to the contract's own excluded set rather than
+        // to a predicate that merely looks related. Each state carries exactly
+        // one ban, so `banned_member_ids` containing the target is precisely
+        // "this ban excludes its target".
+        let owner = key(1);
+        let alice = key(2);
+        let bob = key(3);
+
+        // Covers both target-present and target-absent, and both authorized and
+        // unauthorized banners.
+        let mut cases: Vec<(&str, ChatRoomStateV1)> = Vec::new();
+
+        let mut owner_bans_present = ChatRoomStateV1::default();
+        push_member(&mut owner_bans_present, &owner, &owner, &alice);
+        push_ban(&mut owner_bans_present, &owner, &owner, &alice);
+        cases.push(("owner bans a present member", owner_bans_present));
+
+        let mut deputy_bans_present = ChatRoomStateV1::default();
+        push_member(&mut deputy_bans_present, &owner, &owner, &alice);
+        push_member(&mut deputy_bans_present, &owner, &owner, &bob);
+        push_info(&mut deputy_bans_present, &owner, 0, vec![id(&bob)]);
+        push_ban(&mut deputy_bans_present, &owner, &bob, &alice);
+        cases.push(("current deputy bans a present member", deputy_bans_present));
+
+        let mut revoked_bans_present = ChatRoomStateV1::default();
+        push_member(&mut revoked_bans_present, &owner, &owner, &alice);
+        push_member(&mut revoked_bans_present, &owner, &owner, &bob);
+        push_info(&mut revoked_bans_present, &owner, 0, vec![id(&bob)]);
+        push_ban(&mut revoked_bans_present, &owner, &bob, &alice);
+        push_info(&mut revoked_bans_present, &owner, 1, vec![]);
+        cases.push(("revoked deputy bans a present member", revoked_bans_present));
+
+        let mut stranger_bans_absent = ChatRoomStateV1::default();
+        push_member(&mut stranger_bans_absent, &owner, &owner, &bob);
+        push_ban(&mut stranger_bans_absent, &owner, &bob, &alice);
+        cases.push((
+            "unauthorized member bans an absent target",
+            stranger_bans_absent,
+        ));
+
+        let mut owner_bans_absent = ChatRoomStateV1::default();
+        push_member(&mut owner_bans_absent, &owner, &owner, &bob);
+        push_ban(&mut owner_bans_absent, &owner, &owner, &alice);
+        cases.push(("owner bans an absent target", owner_bans_absent));
+
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+
+        let mut saw_enforcing = false;
+        let mut saw_inert = false;
+
+        for (label, state) in &cases {
+            let reported = collect_ban_infos(state, &owner.verifying_key())[0].enforcing;
+            let target = state.bans.0[0].ban.banned_user;
+            let actually_excluded = state
+                .members
+                .banned_member_ids(&state.bans, &state.member_info, &params)
+                .contains(&target);
+
+            assert_eq!(
+                reported, actually_excluded,
+                "`debug bans` disagrees with the contract's excluded set for: {label}"
+            );
+
+            saw_enforcing |= reported;
+            saw_inert |= !reported;
+        }
+
+        // Guard against a vacuous pass if every case landed on one side.
+        assert!(saw_enforcing && saw_inert, "cases must cover both outcomes");
     }
 
     #[test]
