@@ -22,16 +22,61 @@ let Ok(rooms) = ROOMS.try_read() else { return; };
 ```
 
 **IMPORTANT:** In Dioxus 0.7.x, `try_read()` does NOT register signal
-subscriptions when it returns `Err`. The subscription is registered only
-on the success path (after the borrow succeeds). This means a `use_memo`
-that hits `try_read() -> Err` will NOT be notified of future signal
-changes — it permanently stops re-evaluating.
+subscriptions when it returns `Err` — `Signal::try_read_unchecked`
+propagates the borrow error with `?` (`signal.rs:409`) before reaching
+`reactive_context.subscribe(...)` (`:413`). And a memo/effect REBUILDS its
+dependency set on every pass: `reset_and_run_in` is `clear_subscribers()`
+then `run_in(f)` (`dioxus-core` `reactive_context.rs:195`). So a pass that
+early-returns on `Err` ends subscribed only to what it actually read — and
+if that is nothing, to nothing at all. It then never re-evaluates.
 
-To mitigate: ensure signal mutations happen in clean execution contexts
-(via `crate::util::defer()`) so `try_read()` never encounters a
-concurrent borrow. Also, memos that read multiple signals (e.g.,
-`CURRENT_ROOM.read()` + `ROOMS.try_read()`) get a backup subscription
-from the non-try signal.
+### Required: anchor + nudge for every fallible read (freenet/river#555)
+
+The two mitigations previously listed here are **not sufficient**, and
+relying on them is what produced #397, #499 and #555:
+
+- `defer()`-ing mutations does not prevent contention. It was already used
+  throughout when all three bugs happened.
+- The "backup subscription from the non-try signal" only downgrades the
+  failure from *permanent* to *stuck until that other signal changes*. For
+  `message_groups` the backup was `CURRENT_ROOM`, so the conversation froze
+  until the reader switched rooms or reloaded.
+
+Use `crate::util::signal_guard` instead. Read the anchor FIRST, before any
+fallible read, and nudge on every degraded branch:
+
+```rust
+let thing = use_memo(move || {
+    crate::util::signal_guard::anchor();          // before any try_read
+    let Ok(rooms) = ROOMS.try_read() else {
+        crate::util::signal_guard::schedule_nudge();
+        return None;
+    };
+    ...
+});
+```
+
+This applies to **`use_effect` as well as `use_memo`** — `use_effect` uses
+the same `reset_and_run_in` primitive (`dioxus-hooks` `use_effect.rs:34`),
+so an effect whose only read is a contended `try_read` is dead for the
+session. A memo/effect with a SECOND fallible read needs a nudge on that
+branch too; the anchor keeps the memo alive but does not re-subscribe the
+signal that failed.
+
+Still read an infallible signal before the fallible one where you can. It
+costs nothing and leaves a backup if the nudge channel is ever broken.
+
+`signal_guard`'s pin test enforces the ordering for the memos it lists, but
+it only scans `use_memo(` bodies in an explicit file list — it cannot see
+effects, helper functions, or unlisted files. Do not treat a green pin as
+proof your new site is covered.
+
+What actually holds a borrow across a recompute is **not diagnosed**. The
+explanation this file used to give (a write's Drop firing notifications that
+synchronously poll memos) does not hold in 0.7.9: the borrow is released
+before subscribers are marked, and `mark_dirty` on a memo only sets a flag
+and sends on a channel. Contention is nonetheless observed, and one `Err` is
+enough to latch, so the guard is required regardless.
 
 ## Never call `spawn_local` inside a polled future
 

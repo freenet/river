@@ -21,12 +21,28 @@
 //! whatever it *did* read successfully — and if that is nothing, to nothing at
 //! all. The memo is then permanently stuck: no write to the signal can wake it.
 //!
-//! Contention is routine rather than exotic. A signal write's Drop handler fires
+//! What actually holds the borrow across a recompute is NOT established, and the
+//! explanation in `.claude/rules/dioxus-signal-safety.md` ("a write's Drop fires
 //! subscriber notifications synchronously, and those notifications poll memos
-//! that `try_read()` the signal still being written — the hazard documented in
-//! `.claude/rules/dioxus-signal-safety.md`, and the cause of river#499 (DM rail
-//! collapsed to empty) and river#555 (conversation showed "No messages yet" in a
-//! full room until reload).
+//! that `try_read()` the signal still being written") does not hold in 0.7.9:
+//! `WriteLock`'s borrow field drops before its `SignalSubscriberDrop`
+//! (`write.rs:164`), `update_subscribers` takes a fresh read
+//! (`signal.rs:260`, which would panic on every write otherwise), and
+//! `mark_dirty` for a memo only sets a flag and sends on a channel
+//! (`memo.rs:53`) — the recompute happens later in a task. So the notification
+//! path is not the contending writer.
+//!
+//! Contention is nonetheless real and observed: `signal.rs:262` notes outright
+//! that "mark_dirty can run user code", and this repo has a recorded instance
+//! (`sync_info.rs`'s `rooms_awaiting_subscription` bails on a contended `ROOMS`
+//! because `process_rooms()` gets driven during a write-guard drop). river#499
+//! (DM rail collapsed to empty) and river#555 (conversation showed "No messages
+//! yet" in a full room until reload) are the two user-visible instances.
+//!
+//! Treat the trigger as INFERRED, not diagnosed. A single `Err` is enough to
+//! latch a memo permanently, so this guard is worth having either way — but
+//! naming the contending writer is still open work, and until it is named the
+//! nudge frequency in the field is unknown.
 //!
 //! ## The pattern
 //!
@@ -257,11 +273,39 @@ mod tests {
                  fallibly. Remove the entry rather than leaving a vacuous pin."
             );
         }
+        // EXACT count, not a floor. There are 12 fallible memos across the 8
+        // files (conversation.rs alone has 4, member_info_modal.rs 2). A floor of
+        // 8 left exactly the slack this assertion exists to remove: the matcher
+        // could stop finding all four conversation.rs bodies -- the file that
+        // caused #555 -- and still pass.
+        assert_eq!(
+            checked, 12,
+            "expected to check exactly the 12 known fallible memos, checked \
+             {checked}. If you added or removed a fallible memo, update this \
+             number deliberately; if you did not, the matcher has stopped \
+             finding memo bodies and this pin has gone vacuous."
+        );
+    }
+
+    /// The anchor and the nudge must reference the SAME signal, or the guard is
+    /// decorative: every anchored memo keeps a subscription that nothing ever
+    /// writes, which is exactly the permanent latch of #555. Deleting the
+    /// `with_mut` line left the whole suite green before this test existed.
+    #[test]
+    fn schedule_nudge_writes_the_signal_anchor_reads() {
+        let src = production_only(include_str!("signal_guard.rs"));
+        let nudge = src
+            .split("pub fn schedule_nudge()")
+            .nth(1)
+            .expect("schedule_nudge() should be defined");
+        // Body of the fn: up to the start of the next item.
+        let body = &nudge[..nudge.find("\n}").unwrap_or(nudge.len())];
         assert!(
-            checked >= 8,
-            "expected to check at least the 8 known fallible memos, checked \
-             {checked} — the matcher probably stopped finding memo bodies, which \
-             would make this pin silently vacuous."
+            body.contains("REBUILD_TICK.with_mut"),
+            "schedule_nudge() must write REBUILD_TICK -- the very signal \
+             anchor() subscribes to. Without that write the anchor keeps a \
+             subscription nothing ever fires, so a contended memo stays latched \
+             forever (freenet/river#555)."
         );
     }
 

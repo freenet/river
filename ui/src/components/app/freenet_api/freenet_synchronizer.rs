@@ -607,6 +607,40 @@ impl FreenetSynchronizer {
                                              subscription the node dropped with the old socket",
                                             restaled
                                         );
+                                        // The flip alone is not enough. Only
+                                        // `process_rooms()` acts on it, and its
+                                        // `rooms_awaiting_subscription()` returns an EMPTY
+                                        // map when `ROOMS.try_read()` is contended, on the
+                                        // assumption that "we'll be called again on the
+                                        // next ProcessRooms". On the reconnect path there
+                                        // is no next one: the `process_rooms()` call below
+                                        // discards its result, and every other
+                                        // `ProcessRooms` sender is driven by a user edit or
+                                        // by a response — and with nothing subscribed, no
+                                        // response arrives. The watchdog cannot rescue it
+                                        // either, because its probe GET succeeds on a
+                                        // healthy socket so it never declares death.
+                                        //
+                                        // Losing that one read would leave the tab
+                                        // connected and subscribed to nothing: the exact
+                                        // bug this fix is for, wearing a different status
+                                        // label. So arm an independent retry.
+                                        let retry_tx = message_tx.clone();
+                                        crate::util::safe_spawn_local(async move {
+                                            crate::util::sleep(std::time::Duration::from_millis(
+                                                super::constants::REPUT_DELAY_MS + 1000,
+                                            ))
+                                            .await;
+                                            if let Err(e) = retry_tx
+                                                .unbounded_send(SynchronizerMessage::ProcessRooms)
+                                            {
+                                                warn!(
+                                                    "Failed to arm post-reconnect \
+                                                     re-subscribe retry: {}",
+                                                    e
+                                                );
+                                            }
+                                        });
                                     }
 
                                     // Set up the chat delegate to load rooms from storage

@@ -233,11 +233,18 @@ pub fn RoomList() -> Element {
                 // later hits some other transient `Error` should not show the
                 // marker here.
                 let sync_error_msg: Option<String> = if room_data.is_awaiting_initial_sync() {
-                    match SYNC_INFO
-                        .try_read()
-                        .ok()
-                        .and_then(|si| si.get_sync_status(&room_key).cloned())
-                    {
+                    // Second fallible read in this memo, so it nudges too: a
+                    // contended pass drops the SYNC_INFO subscription and the
+                    // room's error marker silently reads as a spinner until an
+                    // unrelated signal moves (freenet/river#555).
+                    let status = match SYNC_INFO.try_read() {
+                        Ok(si) => si.get_sync_status(&room_key).cloned(),
+                        Err(_) => {
+                            crate::util::signal_guard::schedule_nudge();
+                            None
+                        }
+                    };
+                    match status {
                         Some(RoomSyncStatus::Error(msg)) => Some(msg),
                         _ => None,
                     }

@@ -24,30 +24,35 @@ pub fn MemberInfoModal() -> Element {
     // that dropped their ROOMS subscription would strand them for good. The
     // anchor keeps a dependency the nudge can wake. See
     // `crate::util::signal_guard` and freenet/river#555.
+    // Read CURRENT_ROOM (infallible) BEFORE the fallible ROOMS read in both memos
+    // below. That ordering is load-bearing on its own -- it leaves a backup
+    // subscription if the anchor/nudge channel is ever broken -- and the anchor
+    // then covers the case the ordering cannot: a contended pass still drops the
+    // ROOMS subscription, so without a nudge the memo waits for an unrelated
+    // CURRENT_ROOM change. See `crate::util::signal_guard` and freenet/river#555.
     let current_room_data_signal = use_memo(move || {
         crate::util::signal_guard::anchor();
+        let key = CURRENT_ROOM.read().owner_key?;
         let Ok(rooms) = ROOMS.try_read() else {
             crate::util::signal_guard::schedule_nudge();
             return None;
         };
-        CURRENT_ROOM
-            .read()
-            .owner_key
-            .as_ref()
-            .and_then(|key| rooms.map.get(key).cloned())
+        rooms.map.get(&key).cloned()
     });
     let self_member_id: Memo<Option<MemberId>> = use_memo(move || {
-        // `self_member_id` was the worse of the two: `ROOMS.try_read().ok()?` was
-        // the FIRST read, so a contended pass returned before `CURRENT_ROOM` was
-        // ever read and left the memo with ZERO subscriptions.
+        // This was the worse of the two before the fix: `ROOMS.try_read().ok()?`
+        // came FIRST, so a contended pass returned before CURRENT_ROOM was read
+        // and left the memo with ZERO subscriptions, in a modal that never
+        // unmounts.
         crate::util::signal_guard::anchor();
+        let key = CURRENT_ROOM.read().owner_key?;
         let Ok(rooms) = ROOMS.try_read() else {
             crate::util::signal_guard::schedule_nudge();
             return None;
         };
         rooms
             .map
-            .get(&CURRENT_ROOM.read().owner_key?)
+            .get(&key)
             .map(|r| MemberId::from(&r.self_sk.verifying_key()))
     });
 

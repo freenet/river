@@ -142,11 +142,11 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     // hold a ROOMS borrow across spawn_local.
     let view = use_memo({
         move || {
-            // `room` and `peer` are plain captured props, not signals, so ROOMS
-            // was this memo's ONLY possible dependency: one contended pass left
-            // it with zero subscriptions and the thread never updated again.
-            // This modal is always mounted, so nothing remounted it either.
-            // freenet/river#555.
+            // `room` and `peer` are plain captured props, not signals. This memo
+            // does read OUTBOUND_DMS further down, but ROOMS is read FIRST, so a
+            // contended ROOMS pass returns before reaching it and ends with zero
+            // subscriptions -- and this modal is always mounted, so nothing
+            // remounts it. freenet/river#555.
             crate::util::signal_guard::anchor();
             let Ok(rooms) = ROOMS.try_read() else {
                 crate::util::signal_guard::schedule_nudge();
@@ -199,7 +199,17 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // placeholder to plaintext (see AGENTS.md "Dioxus WASM
             // Signal Safety": the subscription is registered ONLY on
             // the success path).
-            let outbound_cache = OUTBOUND_DMS.try_read().ok().map(|g| g.clone());
+            // Second fallible read in this memo, so it needs its own nudge: the
+            // anchor above keeps the memo alive, but a contended OUTBOUND_DMS
+            // read still drops THAT subscription, and without a retry the bubble
+            // stays on the placeholder until some other subscribed signal moves.
+            let outbound_cache = match OUTBOUND_DMS.try_read() {
+                Ok(g) => Some(g.clone()),
+                Err(_) => {
+                    crate::util::signal_guard::schedule_nudge();
+                    None
+                }
+            };
 
             let mut latest_inbound_ts: u64 = 0;
             let mut rendered: Vec<RenderedDm> = Vec::new();
