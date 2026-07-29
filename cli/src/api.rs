@@ -9396,128 +9396,364 @@ mod authorize_send_tests {
     // ---------------------------------------------------------------
     // Source pins for the #441 guard.
     //
-    // Expressed as pure functions over source text, NOT as inline asserts,
-    // so the pins themselves can be TESTED: `pin_catches_*` below feed
-    // deliberately-mutated source through `membership_guard_violations` and
-    // assert it objects. A pin nobody has watched fail is not a pin, and the
-    // first version of this pin had exactly that problem — it matched a needle
-    // that stopped at a comma, so `let _ = authorize_send(...)` (authorization
-    // discarded outright) and `authorize_send(..., None)` (rejoin path
-    // silently broken) both sailed through a green suite.
+    // Expressed as pure functions over source text so the pins can themselves
+    // be TESTED: the `pin_catches_*` cases below feed deliberately-mutated
+    // source through `membership_guard_violations` and assert it objects.
+    //
+    // Every check here is a TRIPWIRE for the shapes we have actually seen, not
+    // a proof of absence. Three rounds of review have each found a way past an
+    // earlier version, so treat a green pin as "no known-bad shape present",
+    // never as "the guard is definitely intact":
+    //   round 1: needle stopped at a comma, so `let _ = authorize_send(..)`
+    //            (authorization discarded) and `authorize_send(.., None)`
+    //            (rejoin path broken) both passed.
+    //   round 2: count matched only `member_vk ==`, missing the equally
+    //            owner-blind `.id() ==` idiom.
+    //   round 3: a COMMENTED-OUT call still satisfied the needle; the needle
+    //            searched the whole file rather than the send path; and a
+    //            `#[cfg(test)]` on a non-braced item made the stripper eat
+    //            live code, silently ending production coverage.
     // ---------------------------------------------------------------
 
-    /// `src` with every top-level `#[cfg(test)]` module removed, so a source
-    /// pin scans production code only.
+    /// Production source, plus any structural problems found while separating
+    /// it from test code.
+    struct Production {
+        source: String,
+        problems: Vec<String>,
+    }
+
+    /// `src` with every `#[cfg(test)]` item removed, so a source pin scans
+    /// production code only.
     ///
-    /// Line-based on purpose. `api.rs` holds 15 `#[cfg(test)]` modules
-    /// scattered mid-file, and the two obvious alternatives are both wrong
-    /// here: splitting at the first test module silently drops all production
-    /// code after it (which is how the original pin missed the call site), and
-    /// brace-matching would have to lex 43 raw strings correctly to avoid
-    /// desynchronising. Every test module in this file starts with
-    /// `#[cfg(test)]` at column 0 and ends with `}` at column 0, so skipping
-    /// between those markers needs no lexer and cannot be confused by a brace
-    /// inside a string or comment.
-    fn production_source(src: &str) -> String {
-        let mut out: Vec<&str> = Vec::new();
-        let mut lines = src.lines();
-        while let Some(line) = lines.next() {
-            if line == "#[cfg(test)]" {
-                for skipped in lines.by_ref() {
-                    if skipped == "}" {
+    /// Two things this has to get right, both learned the hard way:
+    ///
+    /// 1. **The item kind must be determined, not assumed.** `#[cfg(test)]`
+    ///    guards braced items (`mod x {`, `fn x() {`) and non-braced ones
+    ///    (`use ...;`, `const ...;`, `mod x;`) alike. An earlier version
+    ///    skipped unconditionally to the next column-0 `}`, which swallowed
+    ///    every line between a `#[cfg(test)] use ...;` and the end of the NEXT
+    ///    braced item. A whole owner-blind helper planted in that window went
+    ///    undetected with the full suite green.
+    ///
+    /// 2. **String literals and comments must be skipped.** The same earlier
+    ///    version scanned line-wise for a `}` at column 0, and its stated
+    ///    justification — that brace matching would desynchronise on this
+    ///    file's 43 raw strings — was disproved by review, which produced a
+    ///    raw-string-aware matcher with byte-identical output. It was then
+    ///    disproved the other way too: a test in this very module embeds Rust
+    ///    source containing a column-0 `}` inside a string literal, and the
+    ///    line-wise scan read it as the module's closing brace and stopped
+    ///    stripping there, spilling test code into the production scan. Line
+    ///    scanning was never the safer option; it just had a different bug.
+    ///
+    /// So: lex past comments, normal strings, raw strings and char literals,
+    /// tracking `{}`/`[]`/`()` depth, and end the item at its matching `}` or
+    /// its top-level `;`.
+    fn production_source(src: &str) -> Production {
+        let mut out = String::new();
+        let mut problems = Vec::new();
+        let mut rest = src;
+        while let Some(at) = rest.find("#[cfg(test)]") {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + "#[cfg(test)]".len()..];
+            match end_of_item(after) {
+                Some(end) => rest = &after[end..],
+                None => {
+                    problems.push(
+                        "a `#[cfg(test)]` item has no discernible end (unbalanced \
+                         braces, or an unterminated string); the stripper cannot \
+                         tell where it stops, so production code may be silently \
+                         dropped from this pin."
+                            .to_string(),
+                    );
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        Production {
+            source: out,
+            problems,
+        }
+    }
+
+    /// Byte offset just past the item beginning at the start of `s`: after its
+    /// matching `}` for a braced item, or after its top-level `;` for a
+    /// statement. `None` if neither terminator is found.
+    fn end_of_item(s: &str) -> Option<usize> {
+        let b = s.as_bytes();
+        let (mut i, mut curly, mut square, mut round) = (0usize, 0usize, 0usize, 0usize);
+        while i < b.len() {
+            // Line comment.
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // Block comment.
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                continue;
+            }
+            // Raw string: r"..." / r#"..."# / r##"..."## ...
+            if b[i] == b'r' && i + 1 < b.len() && (b[i + 1] == b'"' || b[i + 1] == b'#') {
+                let mut j = i + 1;
+                let mut hashes = 0usize;
+                while j < b.len() && b[j] == b'#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b'"' {
+                    j += 1;
+                    loop {
+                        if j >= b.len() {
+                            return None;
+                        }
+                        if b[j] == b'"' {
+                            let mut k = j + 1;
+                            let mut n = 0usize;
+                            while k < b.len() && n < hashes && b[k] == b'#' {
+                                n += 1;
+                                k += 1;
+                            }
+                            if n == hashes {
+                                j = k;
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            // Normal string.
+            if b[i] == b'"' {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'"' {
+                        i += 1;
                         break;
                     }
+                    i += 1;
                 }
-            } else {
-                out.push(line);
+                continue;
             }
+            // Char literal, or a lifetime (which has no closing quote).
+            if b[i] == b'\'' {
+                if i + 1 < b.len() && b[i + 1] == b'\\' {
+                    let mut j = i + 2;
+                    while j < b.len() && b[j] != b'\'' {
+                        j += 1;
+                    }
+                    i = (j + 1).min(b.len());
+                    continue;
+                }
+                if i + 2 < b.len() && b[i + 2] == b'\'' {
+                    i += 3;
+                    continue;
+                }
+                i += 1; // lifetime
+                continue;
+            }
+            match b[i] {
+                b'{' => curly += 1,
+                b'[' => square += 1,
+                b'(' => round += 1,
+                b'}' => {
+                    curly = curly.checked_sub(1)?;
+                    if curly == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                b']' => square = square.checked_sub(1)?,
+                b')' => round = round.checked_sub(1)?,
+                // A statement item (`use ...;`) ends at its top-level `;`.
+                b';' if curly == 0 && square == 0 && round == 0 => return Some(i + 1),
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// `src` with commented-out lines removed.
+    ///
+    /// Without this, commenting the guard out IN PLACE satisfies the call-site
+    /// needle: the commented text still contains the call verbatim, so the pin
+    /// reports a guard that no longer executes.
+    ///
+    /// Whole-line only (trimmed form starts with `//`, or a `/* ... */` block
+    /// that starts its own line). Deliberately does NOT strip trailing `//`
+    /// from a line of code, because that requires knowing whether the `//` sits
+    /// inside a string literal — `"https://..."` would be truncated — and a
+    /// trailing comment cannot manufacture a fake call site anyway, since the
+    /// code preceding it is real.
+    ///
+    /// Residual gap, stated rather than papered over: a call commented out with
+    /// an INLINE block comment (`/* authorize_send(..)?; */` mid-line) would
+    /// still match. Scoping the search to the send path (below) is what makes
+    /// that a narrow gap rather than an open door.
+    fn strip_comment_lines(src: &str) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        let mut in_block = false;
+        for line in src.lines() {
+            let t = line.trim_start();
+            if in_block {
+                if t.contains("*/") {
+                    in_block = false;
+                }
+                continue;
+            }
+            if t.starts_with("/*") {
+                if !t.contains("*/") {
+                    in_block = true;
+                }
+                continue;
+            }
+            if t.starts_with("//") {
+                continue;
+            }
+            out.push(line);
         }
         out.join("\n")
     }
 
-    /// Every #441 invariant `src` violates, empty when it is clean.
+    /// The body of the method whose signature line is `signature`, ending at
+    /// the first column-4 `}` (these are `impl ApiClient` methods).
     ///
-    /// Returns reasons rather than asserting so the pin can be exercised
-    /// against mutated source without tripping over its own assertions.
+    /// Scoping matters: an unscoped whole-file search is satisfied by ANY
+    /// occurrence of the call, so lifting the guard out of the send path into
+    /// an unrelated sibling left the pin green while `send_message_with_key`
+    /// ran unguarded.
+    fn method_body<'a>(src: &'a str, signature: &str) -> Option<&'a str> {
+        let start = src.find(signature)?;
+        let rest = &src[start..];
+        let end = rest.find("\n    }")?;
+        Some(&rest[..end])
+    }
+
+    fn squash(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Every #441 invariant `src` violates, empty when it is clean.
     fn membership_guard_violations(src: &str) -> Vec<String> {
         let production = production_source(src);
-        let mut problems = Vec::new();
+        let mut problems = production.problems;
+        let code = strip_comment_lines(&production.source);
 
-        // Guard against the stripper eating production code: if this fires,
-        // every check below would pass vacuously.
-        if !production.contains("pub async fn send_message_with_key(") {
+        // If the stripper ever eats the send path, every check below would
+        // pass vacuously. Fail loudly instead.
+        if !code.contains("pub async fn send_message_with_key(") {
             problems.push(
-                "production_source() removed the send path itself — the pin \
-                 would pass vacuously"
+                "the send path is missing from the scanned production source — \
+                 the pin would pass vacuously"
                     .to_string(),
             );
             return problems;
         }
 
-        // Whitespace-stripped so rustfmt's line breaking cannot disarm a pin.
-        let sq: String = production.chars().filter(|c| !c.is_whitespace()).collect();
-
-        // 1. The send path must call `authorize_send` with the REAL rejoin
-        //    delta AND propagate its Result.
+        // 1. `send_message_with_key` must call `authorize_send` with the REAL
+        //    rejoin delta AND propagate the Result.
         //
-        //    The needle deliberately runs through the `?;`. Stopping at the
-        //    final comma (the original bug) accepts `let _ = authorize_send(..);`,
-        //    which discards the authorization decision entirely — and `let _ =`
-        //    also silences `unused_must_use`, with no `-D warnings` in CI to
-        //    catch it. Requiring `members_delta.as_ref()` by name likewise
-        //    rejects a hardcoded `None`, which compiles fine via inference but
-        //    silently breaks the inactivity-rejoin path.
-        //
-        //    Both trailing-comma spellings are accepted so a future rustfmt
-        //    that collapses the call onto one line does not false-fail.
-        let prefix = "authorize_send(&room_state,room_owner_key,&sender_vk,members_delta.as_ref()";
-        let propagated = match sq.find(prefix) {
-            Some(at) => {
-                let tail = &sq[at + prefix.len()..];
-                tail.starts_with(",)?;") || tail.starts_with(")?;")
+        //    Searched in the SEND PATH's body only, with comments stripped.
+        //    The needle runs through the `?;`: stopping at the final comma
+        //    accepts `let _ = authorize_send(..);`, which discards the decision
+        //    outright (and silences `unused_must_use`, with no `-D warnings` in
+        //    CI to catch it). Naming `members_delta.as_ref()` rejects a
+        //    hardcoded `None`, which compiles via inference while silently
+        //    breaking the inactivity-rejoin path.
+        match method_body(&code, "pub async fn send_message_with_key(") {
+            Some(body) => {
+                let sq = squash(body);
+                let prefix =
+                    "authorize_send(&room_state,room_owner_key,&sender_vk,members_delta.as_ref()";
+                let ok = match sq.find(prefix) {
+                    // Accept both trailing-comma spellings so a future rustfmt
+                    // collapsing the call onto one line cannot false-fail.
+                    Some(at) => {
+                        let tail = &sq[at + prefix.len()..];
+                        tail.starts_with(",)?;") || tail.starts_with(")?;")
+                    }
+                    None => false,
+                };
+                if !ok {
+                    problems.push(
+                        "`send_message_with_key` must itself call \
+                         `authorize_send(&room_state, room_owner_key, \
+                         &sender_vk, members_delta.as_ref())?` and PROPAGATE \
+                         the result. Either the decision was re-inlined, \
+                         commented out, moved out of this function, its Result \
+                         is being discarded (`let _ = ...`), or the rejoin \
+                         delta argument was replaced (freenet/river#441)."
+                            .to_string(),
+                    );
+                }
             }
-            None => false,
-        };
-        if !propagated {
-            problems.push(
-                "`send_message_with_key` must call \
-                 `authorize_send(&room_state, room_owner_key, &sender_vk, \
-                 members_delta.as_ref())?` and PROPAGATE the result. Either the \
-                 decision has been re-inlined, its Result is being discarded \
-                 (`let _ = ...`), or the rejoin delta argument was replaced \
-                 (freenet/river#441)."
+            None => problems.push(
+                "could not isolate `send_message_with_key`'s body; re-check \
+                 this pin against the function's new shape."
                     .to_string(),
-            );
+            ),
         }
 
-        // 2. Raw `members.members` scans, counted across BOTH house idioms.
+        // 2. Raw `members.members` sender-membership scans.
         //
-        //    Counting rather than banning spellings: a guard written with a
-        //    differently-named variable slips past a spelling ban. Counting
-        //    BOTH idioms because `.id() == <MemberId>` is equally owner-blind
-        //    and is the more common style in this codebase (dm.rs, debug.rs),
-        //    with `sender_member_id` already in scope at the call site.
+        //    Counted, not spelling-banned: a guard written with a renamed
+        //    variable slips past a spelling ban. Several idioms are covered
+        //    because `.id() ==` is equally owner-blind and is the more common
+        //    style in this codebase (dm.rs, debug.rs).
+        //
+        //    NOT exhaustive, and must not be described as such. A determined
+        //    rewrite (`.filter(..).next()`, a helper indirection, an iterator
+        //    bound to a local first) evades it. Deliberately excluded:
+        //    `HashSet<MemberId>::contains` and `members_by_member_id()`, which
+        //    appear in this file but express DIFFERENT questions — e.g.
+        //    `build_rejoin_delta`'s invite-chain filter at :3339 asks which
+        //    members to ADD, not whether the sender may send. Counting those
+        //    would trip on unrelated code and train people to bump the number.
         //
         //    The two sanctioned sites are `room_has_member_key` (owner-aware by
         //    construction) and `build_rejoin_delta`'s already-a-member check
         //    (owner-safe only via the early return checked in 3).
-        let scans = sq.matches(".any(|m|m.member.member_vk==").count()
-            + sq.matches(".any(|m|m.member.id()==").count();
+        let sq_all = squash(&code);
+        let scans: usize = [
+            ".any(|m|m.member.member_vk==",
+            ".any(|m|m.member.id()==",
+            ".find(|m|m.member.member_vk==",
+            ".find(|m|m.member.id()==",
+            ".position(|m|m.member.member_vk==",
+            ".position(|m|m.member.id()==",
+        ]
+        .iter()
+        .map(|needle| sq_all.matches(needle).count())
+        .sum();
         if scans != 2 {
             problems.push(format!(
-                "expected exactly 2 raw `members.members` scans in production \
-                 api.rs (`room_has_member_key` and `build_rejoin_delta`), found \
-                 {scans}. The room owner is NEVER in `members.members`, so a raw \
-                 scan reports the room's own owner as a non-member — that is \
-                 freenet/river#441. Route a new membership test through \
-                 `room_has_member_key`; if you deliberately removed one, update \
-                 this pin."
+                "expected exactly 2 raw `members.members` membership scans in \
+                 production api.rs (`room_has_member_key` and \
+                 `build_rejoin_delta`), found {scans}. The room owner is NEVER \
+                 in `members.members`, so a raw scan reports the room's own \
+                 owner as a non-member — that is freenet/river#441. Route a new \
+                 membership test through `room_has_member_key`; if you \
+                 deliberately removed one, update this pin."
             ));
         }
 
         // 3. `build_rejoin_delta`'s scan is owner-safe ONLY because the owner
         //    early-return fires first. Order, not mere presence.
-        match sq.split_once("fnbuild_rejoin_delta(") {
+        match sq_all.split_once("fnbuild_rejoin_delta(") {
             Some((_, body)) => {
                 let early = body.find("ifself_vk==*room_owner_key{return(None,None);}");
                 let scan = body.find(".any(|m|m.member.member_vk==");
@@ -9555,21 +9791,18 @@ mod authorize_send_tests {
         assert!(problems.is_empty(), "{}", problems.join("\n\n"));
     }
 
-    /// `production_source` must actually strip test modules — otherwise the
-    /// scan count picks up this module's own fixtures and the pin is noise.
     #[test]
-    fn production_source_strips_test_modules_but_keeps_production() {
-        let stripped = production_source(include_str!("api.rs"));
-        assert!(stripped.contains("pub async fn send_message_with_key("));
-        assert!(stripped.contains("pub(crate) fn room_has_member_key("));
-        assert!(
-            !stripped.contains("mod authorize_send_tests"),
-            "this test module must not survive the strip"
-        );
-        assert!(
-            !stripped.contains("fn owner_may_send_although"),
-            "no test fn may survive the strip"
-        );
+    fn production_source_strips_test_code_but_keeps_production() {
+        let p = production_source(include_str!("api.rs"));
+        assert!(p.problems.is_empty(), "{:?}", p.problems);
+        assert!(p.source.contains("pub async fn send_message_with_key("));
+        assert!(p.source.contains("pub(crate) fn room_has_member_key("));
+        assert!(!p.source.contains("mod authorize_send_tests"));
+        assert!(!p.source.contains("fn owner_may_send_although"));
+        // The three `#[cfg(test)]` fns with multi-line signatures must be
+        // stripped too, without taking the production code after them.
+        assert!(!p.source.contains("fn message_display_text("));
+        assert!(p.source.contains("pub(crate) fn unseal_nickname_display("));
     }
 
     /// Apply `mutation` to the real source, failing loudly if it does not
@@ -9583,6 +9816,14 @@ mod authorize_send_tests {
         src.replace(from, to)
     }
 
+    fn assert_caught(mutated: &str, needle: &str, what: &str) {
+        let problems = membership_guard_violations(mutated);
+        assert!(
+            problems.iter().any(|p| p.contains(needle)),
+            "{what} must be caught, got: {problems:?}"
+        );
+    }
+
     const REAL_CALL: &str = "        authorize_send(
             &room_state,
             room_owner_key,
@@ -9590,12 +9831,35 @@ mod authorize_send_tests {
             members_delta.as_ref(),
         )?;";
 
-    /// The mutation that defeated the ORIGINAL pin: discard the authorization
-    /// decision outright. `let _ =` also silences `unused_must_use`, and CI has
-    /// no `-D warnings`, so nothing else would catch this.
+    /// Plant `code` immediately before the guard call, i.e. inside
+    /// `send_message_with_key`.
+    ///
+    /// Anchored on `REAL_CALL` because it is genuinely unique. An earlier
+    /// version anchored on the comment above the rejoin destructuring, which
+    /// looked send-path-specific but is shared verbatim by all seven send /
+    /// edit / delete / react / unreact / reply paths — so `str::replace`
+    /// planted SEVEN copies while reading as though it planted one. The
+    /// assertions still held, but the tests were far blunter than they looked.
+    fn plant_in_send_path(code: &str) -> String {
+        mutate(REAL_CALL, &format!("{code}\n{REAL_CALL}"))
+    }
+
+    #[test]
+    fn guard_call_anchor_is_unique_in_production() {
+        assert_eq!(
+            production_source(include_str!("api.rs"))
+                .source
+                .matches(REAL_CALL)
+                .count(),
+            1,
+            "the mutation anchor must be unique in production, or the \
+             meta-tests plant more code than they appear to"
+        );
+    }
+
     #[test]
     fn pin_catches_discarded_authorization_result() {
-        let mutated = mutate(
+        let m = mutate(
             REAL_CALL,
             "        let _ = authorize_send(
             &room_state,
@@ -9604,20 +9868,12 @@ mod authorize_send_tests {
             members_delta.as_ref(),
         );",
         );
-        let problems = membership_guard_violations(&mutated);
-        assert!(
-            problems.iter().any(|p| p.contains("PROPAGATE")),
-            "discarding authorize_send's Result must be caught, got: {problems:?}"
-        );
+        assert_caught(&m, "PROPAGATE", "discarding authorize_send's Result");
     }
 
-    /// The second mutation that defeated the original pin: pass `None` instead
-    /// of the real rejoin delta. Compiles via inference; silently breaks the
-    /// inactivity-rejoin path so a pruned member with valid stored credentials
-    /// can no longer send.
     #[test]
     fn pin_catches_rejoin_delta_replaced_by_none() {
-        let mutated = mutate(
+        let m = mutate(
             REAL_CALL,
             "        authorize_send(
             &room_state,
@@ -9626,63 +9882,115 @@ mod authorize_send_tests {
             None,
         )?;",
         );
-        let problems = membership_guard_violations(&mutated);
-        assert!(
-            problems.iter().any(|p| p.contains("PROPAGATE")),
-            "replacing the rejoin delta with None must be caught, got: {problems:?}"
+        assert_caught(&m, "PROPAGATE", "replacing the rejoin delta with None");
+    }
+
+    /// Round 3, F1: commenting the guard out IN PLACE. The commented text still
+    /// contains the call verbatim, so before comment-stripping the pin proper
+    /// stayed green and only the meta-tests failed — and they failed merely
+    /// because their mutation target had gone stale, which is protection by
+    /// accident that any later edit to `REAL_CALL` would remove.
+    #[test]
+    fn pin_catches_the_guard_commented_out_in_place() {
+        let m = mutate(
+            REAL_CALL,
+            "        // was: authorize_send(&room_state, room_owner_key, \
+             &sender_vk, members_delta.as_ref())?;",
+        );
+        assert_caught(&m, "PROPAGATE", "a commented-out guard");
+    }
+
+    /// Round 3, F2: the guard lifted OUT of the send path into a sibling. An
+    /// unscoped whole-file search is satisfied by the sibling's copy while
+    /// `send_message_with_key` runs unguarded.
+    #[test]
+    fn pin_catches_the_guard_moved_out_of_the_send_path() {
+        let moved = mutate(REAL_CALL, "");
+        let with_sibling = moved.replace(
+            "pub(crate) fn unseal_nickname_display(",
+            "#[allow(dead_code)]
+fn unrelated_sibling(
+    room_state: &ChatRoomStateV1,
+    room_owner_key: &VerifyingKey,
+    sender_vk: &VerifyingKey,
+    members_delta: Option<MembersDelta>,
+) -> Result<()> {
+    authorize_send(
+        &room_state,
+        room_owner_key,
+        &sender_vk,
+        members_delta.as_ref(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn unseal_nickname_display(",
+        );
+        assert_caught(
+            &with_sibling,
+            "PROPAGATE",
+            "the guard moved out of the send path",
         );
     }
 
-    /// The scan-count pin must catch the `MemberId` idiom, not just
-    /// `member_vk`. `sender_member_id` is already in scope at the call site and
-    /// `.id() ==` is the more common style in this codebase, so this is the
-    /// likelier way a future owner-blind guard gets written.
+    /// Round 3, Q2: a `#[cfg(test)]` on a NON-braced item used to make the
+    /// stripper skip to the next column-0 `}`, eating the production code in
+    /// between. A whole owner-blind helper planted in that window went
+    /// undetected with the full suite green.
+    #[test]
+    fn stripper_does_not_eat_production_after_a_non_braced_cfg_test_item() {
+        let m = mutate(
+            "pub(crate) fn unseal_nickname_display(",
+            "#[cfg(test)]
+use std::fmt::Debug;
+
+pub(crate) fn sneaky_owner_blind_guard(
+    state: &ChatRoomStateV1,
+    vk: &VerifyingKey,
+) -> bool {
+    state.members.members.iter().any(|m| m.member.member_vk == *vk)
+}
+
+pub(crate) fn unseal_nickname_display(",
+        );
+        // The planted helper must SURVIVE the strip (it is production code)...
+        let p = production_source(&m);
+        assert!(
+            p.source.contains("fn sneaky_owner_blind_guard("),
+            "a non-braced `#[cfg(test)]` item must not swallow the production \
+             code that follows it"
+        );
+        // ...and therefore be counted as a third owner-blind scan.
+        assert_caught(
+            &m,
+            "membership scans",
+            "a scan hidden behind a `#[cfg(test)] use`",
+        );
+    }
+
     #[test]
     fn pin_catches_owner_blind_scan_written_with_the_memberid_idiom() {
-        let mutated = mutate(
-            "        // Check if we need to re-add ourselves (pruned for inactivity)",
-            "        let _blind = room_state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.id() == sender_member_id);
-        // Check if we need to re-add ourselves (pruned for inactivity)",
-        );
-        let problems = membership_guard_violations(&mutated);
-        assert!(
-            problems
-                .iter()
-                .any(|p| p.contains("raw `members.members` scans")),
-            "an owner-blind MemberId scan must be caught, got: {problems:?}"
-        );
+        let m = plant_in_send_path("        let _blind = room_state\n            .members\n            .members\n            .iter()\n            .any(|m| m.member.id() == sender_member_id);");
+        assert_caught(&m, "membership scans", "an owner-blind scan");
     }
 
-    /// And the `member_vk` idiom under a fresh variable name.
     #[test]
     fn pin_catches_owner_blind_scan_under_a_new_variable_name() {
-        let mutated = mutate(
-            "        // Check if we need to re-add ourselves (pruned for inactivity)",
-            "        let _blind = room_state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.member_vk == some_other_key);
-        // Check if we need to re-add ourselves (pruned for inactivity)",
-        );
-        let problems = membership_guard_violations(&mutated);
-        assert!(
-            problems
-                .iter()
-                .any(|p| p.contains("raw `members.members` scans")),
-            "a renamed owner-blind scan must be caught, got: {problems:?}"
-        );
+        let m = plant_in_send_path("        let _blind = room_state\n            .members\n            .members\n            .iter()\n            .any(|m| m.member.member_vk == some_other_key);");
+        assert_caught(&m, "membership scans", "an owner-blind scan");
     }
 
-    /// Deleting `build_rejoin_delta`'s owner early-return turns its scan
-    /// owner-blind.
+    /// `.find(..)` is as owner-blind as `.any(..)`; `identity.rs` already uses
+    /// it, so it is a realistic spelling for a future guard here.
+    #[test]
+    fn pin_catches_owner_blind_scan_written_with_find() {
+        let m = plant_in_send_path("        let _blind = room_state\n            .members\n            .members\n            .iter()\n            .find(|m| m.member.member_vk == sender_vk)\n            .is_some();");
+        assert_caught(&m, "membership scans", "an owner-blind scan");
+    }
+
     #[test]
     fn pin_catches_deleted_owner_early_return_in_build_rejoin_delta() {
-        let mutated = mutate(
+        let m = mutate(
             "        // Owner doesn't need to re-add
         if self_vk == *room_owner_key {
             return (None, None);
@@ -9690,11 +9998,7 @@ mod authorize_send_tests {
 ",
             "",
         );
-        let problems = membership_guard_violations(&mutated);
-        assert!(
-            problems.iter().any(|p| p.contains("early-return")),
-            "deleting the owner early-return must be caught, got: {problems:?}"
-        );
+        assert_caught(&m, "early-return", "deleting the owner early-return");
     }
 
     /// Sanity: the pin is not simply objecting to everything.
