@@ -144,9 +144,12 @@ impl ResponseHandler {
                     info!("Received response from LEGACY delegate - checking for migration data");
                 }
 
+                // Log a short key fingerprint, not the full `DelegateKey` Debug: that
+                // prints the 32-byte key as a decimal byte array (~450 B a line, on
+                // every delegate response). freenet/river#569.
                 info!(
-                    "Received delegate response from API with key: {:?} containing {} values",
-                    key,
+                    "Received delegate response from API with key: {} containing {} values",
+                    delegate_key_fp(&key),
                     values.len()
                 );
                 for (i, v) in values.iter().enumerate() {
@@ -158,13 +161,14 @@ impl ResponseHandler {
                                 app_msg.processed
                             );
 
-                            // Log the raw payload for debugging
-                            let payload_str = if app_msg.payload.len() < 100 {
-                                format!("{:?}", app_msg.payload)
-                            } else {
-                                format!("{:?}... (truncated)", &app_msg.payload[..100])
-                            };
-                            info!("ApplicationMessage payload: {}", payload_str);
+                            // Size only. This used to format up to 100 payload bytes as a
+                            // decimal array on every delegate response; the byte values
+                            // were never actually used for triage, the size and the
+                            // decoded variant below are. freenet/river#569.
+                            info!(
+                                "ApplicationMessage payload: {} bytes",
+                                app_msg.payload.len()
+                            );
 
                             // Try to deserialize as a response
                             let deserialization_result = from_reader::<ChatDelegateResponseMsg, _>(
@@ -181,9 +185,14 @@ impl ResponseHandler {
                             );
 
                             if let Ok(response) = deserialization_result {
+                                // Summary, NOT the full Debug. This single line was 98.5%
+                                // of all console bytes River emits during startup: a
+                                // `ListResponse` Debug-prints every key as a decimal byte
+                                // array, measured at ~401 KB per line across 39 lines
+                                // (14.93 MB of 15.15 MB total). freenet/river#569.
                                 info!(
-                                    "Successfully deserialized as ChatDelegateResponseMsg: {:?}",
-                                    response
+                                    "Successfully deserialized as ChatDelegateResponseMsg: {}",
+                                    describe_delegate_response(&response)
                                 );
 
                                 // For a response from a LEGACY delegate, the awaiting request
@@ -1966,8 +1975,244 @@ pub(crate) fn decide_current_room_restore(
     CurrentRoomRestore::Restore
 }
 
+/// Short, cheap fingerprint of a `DelegateKey` for logs.
+///
+/// `DelegateKey`'s `Debug` prints the 32-byte key as a decimal byte array, which
+/// is ~450 bytes of console text per line and is emitted on every delegate
+/// response. Nobody triages from the raw bytes; a stable prefix is enough to
+/// tell one delegate from another. freenet/river#569.
+fn delegate_key_fp(key: &freenet_stdlib::prelude::DelegateKey) -> String {
+    let b = key.bytes();
+    let head: String = b.iter().take(4).map(|x| format!("{x:02x}")).collect();
+    format!("{}..({}B)", head, b.len())
+}
+
+/// A delegate storage key rendered for humans.
+///
+/// These keys are byte strings that are almost always UTF-8 names
+/// (`outbound_dms`, `rooms_meta`, `room:<base58 vk>`), so printing the text is
+/// both far cheaper than the byte array AND more useful for triage. Falls back
+/// to a length for genuinely binary keys.
+fn delegate_storage_key_str(key: &ChatDelegateKey) -> String {
+    match std::str::from_utf8(key.as_bytes()) {
+        Ok(s) if s.chars().all(|c| !c.is_control()) => s.to_string(),
+        _ => format!("<{} bytes>", key.as_bytes().len()),
+    }
+}
+
+/// One-line summary of a delegate response, replacing its full `Debug`.
+///
+/// The `Debug` of a `ListResponse` prints every key as a decimal byte array. On a
+/// real account that measured **~401 KB per line across 39 lines, 98.5% of all
+/// console bytes River emits during startup** (freenet/river#569), and the
+/// per-key bytes were never what anyone read. This keeps the variant, the key
+/// names and the sizes -- everything the logs were actually used for.
+fn describe_delegate_response(r: &ChatDelegateResponseMsg) -> String {
+    use ChatDelegateResponseMsg as R;
+    match r {
+        R::GetResponse { key, value } => format!(
+            "GetResponse {{ key: {}, value: {} }}",
+            delegate_storage_key_str(key),
+            value
+                .as_ref()
+                .map_or("none".into(), |v| format!("{} bytes", v.len()))
+        ),
+        R::ListResponse { keys } => {
+            // Name every key but never their bytes: the key set is the point of a
+            // ListResponse, and there are tens of them, not thousands.
+            let names: Vec<String> = keys.iter().map(delegate_storage_key_str).collect();
+            format!(
+                "ListResponse {{ {} keys: [{}] }}",
+                names.len(),
+                names.join(", ")
+            )
+        }
+        R::StoreResponse {
+            key,
+            value_size,
+            result,
+        } => format!(
+            "StoreResponse {{ key: {}, value_size: {}, ok: {} }}",
+            delegate_storage_key_str(key),
+            value_size,
+            result.is_ok()
+        ),
+        R::DeleteResponse { key, result } => format!(
+            "DeleteResponse {{ key: {}, ok: {} }}",
+            delegate_storage_key_str(key),
+            result.is_ok()
+        ),
+        R::GetVersionedResponse {
+            key,
+            value,
+            generation,
+        } => format!(
+            "GetVersionedResponse {{ key: {}, value: {}, generation: {} }}",
+            delegate_storage_key_str(key),
+            value
+                .as_ref()
+                .map_or("none".into(), |v| format!("{} bytes", v.len())),
+            generation
+        ),
+        R::CasStoreResponse { key, result } => format!(
+            "CasStoreResponse {{ key: {}, result: {:?} }}",
+            delegate_storage_key_str(key),
+            result
+        ),
+        R::StoreSigningKeyResponse { room_key, result } => format!(
+            "StoreSigningKeyResponse {{ room: {}, ok: {} }}",
+            room_key_fp(room_key),
+            result.is_ok()
+        ),
+        R::GetPublicKeyResponse {
+            room_key,
+            public_key,
+        } => format!(
+            "GetPublicKeyResponse {{ room: {}, public_key: {} }}",
+            room_key_fp(room_key),
+            if public_key.is_some() {
+                "present"
+            } else {
+                "absent"
+            }
+        ),
+        R::SignResponse {
+            room_key,
+            request_id,
+            signature,
+        } => format!(
+            "SignResponse {{ room: {}, request_id: {:?}, ok: {} }}",
+            room_key_fp(room_key),
+            request_id,
+            signature.is_ok()
+        ),
+        // Any variant added later logs its discriminant rather than silently
+        // reintroducing a full Debug dump.
+        other => {
+            let d = format!("{other:?}");
+            let name = d
+                .split_once(|c: char| c == ' ' || c == '{' || c == '(')
+                .map_or(d.as_str(), |(n, _)| n);
+            format!("{name} {{ .. }}")
+        }
+    }
+}
+
+/// Short fingerprint of a room key (a 32-byte verifying key) for logs.
+fn room_key_fp(room_key: &river_core::chat_delegate::RoomKey) -> String {
+    let head: String = room_key
+        .iter()
+        .take(4)
+        .map(|x| format!("{x:02x}"))
+        .collect();
+    format!("{head}..")
+}
+
 #[cfg(test)]
 mod tests {
+    // --- startup console volume (freenet/river#569) ---
+
+    /// A `ListResponse` summary must name its keys and stay small. Its `Debug`
+    /// printed every key as a decimal byte array, measured at ~401 KB per line
+    /// across 39 lines during startup: 98.5% of all console bytes River emits.
+    #[test]
+    fn list_response_summary_names_keys_without_dumping_bytes() {
+        use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateResponseMsg};
+        let keys: Vec<ChatDelegateKey> = ["outbound_dms", "rooms_meta", "room:AbCdEf"]
+            .iter()
+            .map(|k| ChatDelegateKey::new(k.as_bytes().to_vec()))
+            .collect();
+        let out = describe_delegate_response(&ChatDelegateResponseMsg::ListResponse { keys });
+
+        assert!(
+            out.contains("outbound_dms"),
+            "key names are the useful part: {out}"
+        );
+        assert!(out.contains("rooms_meta"), "{out}");
+        assert!(out.contains("3 keys"), "count should be present: {out}");
+        // The failure mode is a decimal byte array. "111, 117, 116" is
+        // "out" as bytes -- if that appears, the Debug dump is back.
+        assert!(
+            !out.contains("111, 117, 116"),
+            "must not print key bytes: {out}"
+        );
+        assert!(
+            out.len() < 200,
+            "summary should stay small, got {}: {out}",
+            out.len()
+        );
+    }
+
+    /// The same summary on a realistically large key set must stay bounded in the
+    /// per-key cost, since that is what made the original line 401 KB.
+    #[test]
+    fn list_response_summary_scales_with_names_not_bytes() {
+        use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateResponseMsg};
+        // 40 per-room keys, the shape a real account produces.
+        let keys: Vec<ChatDelegateKey> = (0..40)
+            .map(|i| ChatDelegateKey::new(format!("room:key{i:034}").into_bytes()))
+            .collect();
+        let out = describe_delegate_response(&ChatDelegateResponseMsg::ListResponse { keys });
+        // Each key is 39 chars; the Debug form would be ~4x that in decimal bytes
+        // plus brackets and separators.
+        assert!(
+            out.len() < 40 * 60,
+            "summary grew faster than the key names themselves: {} chars",
+            out.len()
+        );
+    }
+
+    /// Values are reported as sizes, never contents.
+    #[test]
+    fn get_response_summary_reports_size_not_contents() {
+        use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateResponseMsg};
+        let out = describe_delegate_response(&ChatDelegateResponseMsg::GetResponse {
+            key: ChatDelegateKey::new(b"rooms_meta".to_vec()),
+            value: Some(vec![7u8; 4096]),
+        });
+        assert!(out.contains("rooms_meta"), "{out}");
+        assert!(out.contains("4096 bytes"), "size is the useful part: {out}");
+        assert!(!out.contains("7, 7, 7"), "must not print the value: {out}");
+    }
+
+    /// A binary (non-UTF-8) key must not be printed as bytes either.
+    #[test]
+    fn binary_storage_key_falls_back_to_a_length() {
+        use river_core::chat_delegate::ChatDelegateKey;
+        let out = delegate_storage_key_str(&ChatDelegateKey::new(vec![0xff, 0xfe, 0x00]));
+        assert_eq!(out, "<3 bytes>", "got {out}");
+    }
+
+    /// Regression pin: the delegate-response log sites must not Debug-format the
+    /// whole decoded response or the raw payload. Both were reintroduced easily
+    /// (they are the obvious thing to write) and together they were essentially
+    /// all of River's startup console output.
+    #[test]
+    fn delegate_response_logs_do_not_debug_dump_payloads() {
+        let src = include_str!("response_handler.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            !prod.contains("as ChatDelegateResponseMsg: {:?}"),
+            "the decoded response must be summarised via describe_delegate_response, \
+             not Debug-dumped: a ListResponse Debug is ~401 KB per line (river#569)"
+        );
+        assert!(
+            prod.contains("describe_delegate_response(&response)"),
+            "the summary helper must be wired into the log site"
+        );
+        assert!(
+            !prod.contains("ApplicationMessage payload: {}\", payload_str"),
+            "the payload must be logged as a size, not a byte array (river#569)"
+        );
+        assert!(
+            prod.contains("ApplicationMessage payload: {} bytes"),
+            "payload log should report a size"
+        );
+    }
+
     use super::*;
 
     /// Baseline: current delegate, no prior selection, saved key not
