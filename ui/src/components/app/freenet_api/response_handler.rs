@@ -32,7 +32,7 @@ use crate::room_data::CurrentRoom;
 use crate::room_data::{RoomSlot, Rooms, RoomsMeta};
 use crate::util::ecies::decrypt_with_symmetric_key;
 use ciborium::de::from_reader;
-use dioxus::logger::tracing::{error, info, warn};
+use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::ReadableExt;
 
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
@@ -153,10 +153,13 @@ impl ResponseHandler {
                     values.len()
                 );
                 for (i, v) in values.iter().enumerate() {
-                    info!("Processing delegate response value #{}", i);
+                    // Per-response developer tracing, not operator-facing: `debug!`
+                    // compiles out in release (`release_max_level_info`), which removes
+                    // the per-CALL cost as well as the per-byte cost. freenet/river#569.
+                    debug!("Processing delegate response value #{}", i);
                     match v {
                         OutboundDelegateMsg::ApplicationMessage(app_msg) => {
-                            info!(
+                            debug!(
                                 "Delegate response is an ApplicationMessage, processed flag: {}",
                                 app_msg.processed
                             );
@@ -179,17 +182,24 @@ impl ResponseHandler {
                             let request_deser_result = from_reader::<ChatDelegateRequestMsg, _>(
                                 app_msg.payload.as_slice(),
                             );
-                            info!(
+                            debug!(
                                 "Deserialization as request result: {:?}",
                                 request_deser_result.is_ok()
                             );
 
                             if let Ok(response) = deserialization_result {
-                                // Summary, NOT the full Debug. This single line was 98.5%
-                                // of all console bytes River emits during startup: a
-                                // `ListResponse` Debug-prints every key as a decimal byte
-                                // array, measured at ~401 KB per line across 39 lines
-                                // (14.93 MB of 15.15 MB total). freenet/river#569.
+                                // Summary, NOT the full Debug. This single call site was
+                                // 98.5% of all console bytes River emits during startup:
+                                // 39 lines averaging ~383 KB (14.93 MB of 15.15 MB total).
+                                //
+                                // EVERY response variant logs here, and the big ones are
+                                // whichever carry a blob: startup issues one GetRequest per
+                                // room, so ~39 `GetResponse`s each Debug-printing a
+                                // per-room blob (~343 KB in memory, ~4x that as a decimal
+                                // array) is the best fit for the line count and size.
+                                // `ListResponse` key arrays land here too. Do not read the
+                                // count as attributed to one variant -- the census grouped
+                                // by source line, not by variant. freenet/river#569.
                                 info!(
                                     "Successfully deserialized as ChatDelegateResponseMsg: {}",
                                     describe_delegate_response(&response)
@@ -614,7 +624,28 @@ impl ResponseHandler {
                                     },
                                 }
                             } else {
-                                warn!("Failed to deserialize chat delegate response");
+                                // The ONLY path where raw bytes still earn their
+                                // keep: the payload did not decode, so no variant
+                                // summary exists and the size alone cannot tell a
+                                // wire-format break from a corrupt frame. A short
+                                // HEX head is enough to identify the CBOR shape from
+                                // a user's console paste, and costs nothing on the
+                                // happy path because this branch is the failure
+                                // branch. See bug-prevention-patterns.md, "new enum
+                                // variants cause deserialization failures in old
+                                // clients" (the v0.2.11 incident).
+                                let head: String = app_msg
+                                    .payload
+                                    .iter()
+                                    .take(24)
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect();
+                                warn!(
+                                    "Failed to deserialize chat delegate response \
+                                     ({} bytes, head {})",
+                                    app_msg.payload.len(),
+                                    head
+                                );
                             }
                         }
                         _ => {
@@ -1981,10 +2012,18 @@ pub(crate) fn decide_current_room_restore(
 /// is ~450 bytes of console text per line and is emitted on every delegate
 /// response. Nobody triages from the raw bytes; a stable prefix is enough to
 /// tell one delegate from another. freenet/river#569.
-fn delegate_key_fp(key: &freenet_stdlib::prelude::DelegateKey) -> String {
-    let b = key.bytes();
-    let head: String = b.iter().take(4).map(|x| format!("{x:02x}")).collect();
-    format!("{}..({}B)", head, b.len())
+pub(crate) fn delegate_key_fp(key: &freenet_stdlib::prelude::DelegateKey) -> String {
+    // Hex, not base58: `legacy_delegates.toml` records `delegate_key` in hex, so a
+    // fingerprint from a log greps directly against that registry. (`DelegateKey`'s
+    // own Display is base58 and would not.) No length suffix: `bytes()` is always
+    // the 32-byte hash.
+    let head: String = key
+        .bytes()
+        .iter()
+        .take(4)
+        .map(|x| format!("{x:02x}"))
+        .collect();
+    format!("{head}..")
 }
 
 /// A delegate storage key rendered for humans.
@@ -1994,8 +2033,20 @@ fn delegate_key_fp(key: &freenet_stdlib::prelude::DelegateKey) -> String {
 /// both far cheaper than the byte array AND more useful for triage. Falls back
 /// to a length for genuinely binary keys.
 fn delegate_storage_key_str(key: &ChatDelegateKey) -> String {
+    /// Longest key text rendered. Every key today is a fixed constant or
+    /// `"room:" + bs58(vk)` (~49 chars), so this never truncates in practice; it
+    /// is here so the worst case is bounded by construction rather than by
+    /// assumption about who builds keys later.
+    const MAX: usize = 128;
     match std::str::from_utf8(key.as_bytes()) {
-        Ok(s) if s.chars().all(|c| !c.is_control()) => s.to_string(),
+        // `is_control` also blocks \n and \r, so a key cannot inject a log line.
+        Ok(s) if s.chars().all(|c| !c.is_control()) => {
+            if s.len() <= MAX {
+                s.to_string()
+            } else {
+                format!("{}...({} chars)", &s[..MAX], s.len())
+            }
+        }
         _ => format!("<{} bytes>", key.as_bytes().len()),
     }
 }
@@ -2054,11 +2105,33 @@ fn describe_delegate_response(r: &ChatDelegateResponseMsg) -> String {
                 .map_or("none".into(), |v| format!("{} bytes", v.len())),
             generation
         ),
-        R::CasStoreResponse { key, result } => format!(
-            "CasStoreResponse {{ key: {}, result: {:?} }}",
-            delegate_storage_key_str(key),
-            result
-        ),
+        R::CasStoreResponse { key, result } => {
+            // `CasStoreResult::Conflict` carries `current_value: Option<Vec<u8>>` --
+            // the FULL stored blob. Debug-dumping it is a BIGGER line than the one
+            // this whole change removes (a per-room blob is ~343 KB in memory, so
+            // ~4x that as a decimal array), and `cas_write_delegate_key` retries, so
+            // one contended save emits several. The adjacent processing code already
+            // destructures this correctly; match it. freenet/river#569.
+            let r = match result {
+                CasStoreResult::Stored { generation } => format!("Stored {{ gen: {generation} }}"),
+                CasStoreResult::Conflict {
+                    current_generation,
+                    current_value,
+                } => format!(
+                    "Conflict {{ gen: {}, current: {} }}",
+                    current_generation,
+                    current_value
+                        .as_ref()
+                        .map_or("none".to_string(), |v| format!("{} bytes", v.len()))
+                ),
+                CasStoreResult::Failed(e) => format!("Failed({e})"),
+            };
+            format!(
+                "CasStoreResponse {{ key: {}, result: {} }}",
+                delegate_storage_key_str(key),
+                r
+            )
+        }
         R::StoreSigningKeyResponse { room_key, result } => format!(
             "StoreSigningKeyResponse {{ room: {}, ok: {} }}",
             room_key_fp(room_key),
@@ -2086,15 +2159,22 @@ fn describe_delegate_response(r: &ChatDelegateResponseMsg) -> String {
             request_id,
             signature.is_ok()
         ),
-        // Any variant added later logs its discriminant rather than silently
-        // reintroducing a full Debug dump.
-        other => {
-            let d = format!("{other:?}");
-            let name = d
-                .split_once(|c: char| c == ' ' || c == '{' || c == '(')
-                .map_or(d.as_str(), |(n, _)| n);
-            format!("{name} {{ .. }}")
-        }
+        R::EnsureRoomSubscriptionResponse {
+            room_owner_vk,
+            request_id,
+            result,
+        } => format!(
+            "EnsureRoomSubscriptionResponse {{ room: {}, request_id: {:?}, ok: {} }}",
+            room_key_fp(room_owner_vk),
+            request_id,
+            result.is_ok()
+        ),
+        // Deliberately NO catch-all arm. An exhaustive match makes a newly added
+        // variant a COMPILE error here, which is the only thing that reliably stops
+        // the next blob-carrying variant from being Debug-dumped -- a source pin
+        // cannot see a variant that does not exist yet. It also avoids
+        // `format!("{other:?}")`, which builds the entire Debug string in WASM
+        // before discarding all but the variant name.
     }
 }
 
@@ -2152,13 +2232,22 @@ mod tests {
         let keys: Vec<ChatDelegateKey> = (0..40)
             .map(|i| ChatDelegateKey::new(format!("room:key{i:034}").into_bytes()))
             .collect();
-        let out = describe_delegate_response(&ChatDelegateResponseMsg::ListResponse { keys });
-        // Each key is 39 chars; the Debug form would be ~4x that in decimal bytes
-        // plus brackets and separators.
+        let msg = ChatDelegateResponseMsg::ListResponse { keys };
+        let out = describe_delegate_response(&msg);
+        // Compare against the Debug form directly, not an absolute bound: an
+        // absolute bound also passes for a helper that drops the names entirely,
+        // and the claim being tested is relative. Each key is 42 chars of text vs
+        // ~192 chars as a decimal byte array.
+        let debug_len = format!("{msg:?}").len();
         assert!(
-            out.len() < 40 * 60,
-            "summary grew faster than the key names themselves: {} chars",
-            out.len()
+            out.len() < debug_len / 3,
+            "summary ({} chars) should be far smaller than Debug ({} chars)",
+            out.len(),
+            debug_len
+        );
+        assert!(
+            out.contains("room:key"),
+            "names must still be present: {out}"
         );
     }
 
@@ -2173,6 +2262,30 @@ mod tests {
         assert!(out.contains("rooms_meta"), "{out}");
         assert!(out.contains("4096 bytes"), "size is the useful part: {out}");
         assert!(!out.contains("7, 7, 7"), "must not print the value: {out}");
+    }
+
+    /// `CasStoreResult::Conflict` carries the FULL stored blob. Debug-dumping it
+    /// is a bigger line than the one this change removes, and a contended save
+    /// retries several times. Found in review of PR #570, after the first version
+    /// of this fix reintroduced the defect it was removing.
+    #[test]
+    fn cas_conflict_summary_reports_blob_size_not_contents() {
+        use river_core::chat_delegate::{CasStoreResult, ChatDelegateKey, ChatDelegateResponseMsg};
+        let out = describe_delegate_response(&ChatDelegateResponseMsg::CasStoreResponse {
+            key: ChatDelegateKey::new(b"room:AbCdEf".to_vec()),
+            result: CasStoreResult::Conflict {
+                current_generation: 7,
+                current_value: Some(vec![9u8; 8192]),
+            },
+        });
+        assert!(out.contains("room:AbCdEf"), "{out}");
+        assert!(
+            out.contains("gen: 7"),
+            "generation is the actionable part: {out}"
+        );
+        assert!(out.contains("8192 bytes"), "blob reported as a size: {out}");
+        assert!(!out.contains("9, 9, 9"), "must not print the blob: {out}");
+        assert!(out.len() < 120, "stayed small: {out}");
     }
 
     /// A binary (non-UTF-8) key must not be printed as bytes either.
@@ -2190,10 +2303,9 @@ mod tests {
     #[test]
     fn delegate_response_logs_do_not_debug_dump_payloads() {
         let src = include_str!("response_handler.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        // `mod tests {` is this file's idiom for the cut (20 other pins use it);
+        // `#[cfg(test)]` also decorates non-test items and can truncate early.
+        let prod = src.split("mod tests {").next().unwrap_or(src);
         assert!(
             !prod.contains("as ChatDelegateResponseMsg: {:?}"),
             "the decoded response must be summarised via describe_delegate_response, \
@@ -2204,12 +2316,20 @@ mod tests {
             "the summary helper must be wired into the log site"
         );
         assert!(
-            !prod.contains("ApplicationMessage payload: {}\", payload_str"),
-            "the payload must be logged as a size, not a byte array (river#569)"
+            !prod.contains("payload_str"),
+            "the payload must be logged as a size, not a formatted byte array \
+             (river#569). Pinned on the variable rather than the format string so \
+             a reformat or a longer expression cannot evade it."
         );
         assert!(
             prod.contains("ApplicationMessage payload: {} bytes"),
             "payload log should report a size"
+        );
+        // The failure branch keeps a short hex head: without it a wire-format
+        // break is indistinguishable from a corrupt frame in a user's console.
+        assert!(
+            prod.contains("Failed to deserialize chat delegate response \\\n"),
+            "the deser-failure log should carry a hex head"
         );
     }
 
