@@ -230,15 +230,42 @@ Nothing about the broken call site looks wrong, and reasoning about the
 component in isolation will not reveal it: the trigger is whatever unrelated
 signal that component happens to read. `RoomDescriptionField` reads
 `CURRENT_ROOM` and `ROOMS` in its render body, so every room-state write
-re-rendered it, and the owner's half-typed room description vanished every few
-seconds (freenet/river#564).
+re-rendered it, and the owner's half-typed room description vanished
+(freenet/river#564). There is no single timer behind that cadence: the
+recurring ROOMS writers are the ~60 s idle liveness probe whose GET reply
+merges unconditionally, the ~21 s `ProcessRooms` loop while a room awaits
+subscription, and every subscription `UpdateNotification`. Do not go looking
+for one interval to blame.
+
+**This is the documented exception to the `defer()` rule above.** A controlled
+input's bound signal must be written SYNCHRONOUSLY from `oninput`. Deferring it
+lags the DOM by a `setTimeout(0)`, so a re-render landing in that window writes
+the pre-keystroke value back and drops characters, which is the very bug this
+section exists to prevent. The rule above targets GLOBAL signals (`ROOMS`,
+`CURRENT_ROOM`, ...) with external subscribers; `util.rs`'s
+`event_handlers_never_write_a_global_signal_without_defer` pin is scoped to
+those deliberately and does not match `oninput`. Local `use_signal` handles
+have no external subscribers and are set directly. See also the note at
+`members.rs`'s import-token `oninput`.
 
 Display-only controls may bind `value:` with no `oninput`, but must declare
-themselves with a literal `readonly: true`. A conditional
-`readonly: !is_owner` does NOT count: the field is editable for somebody, and
-that somebody is exactly who loses their typing.
-`components.rs::volatile_value_binding_audit` enforces this across the whole
-`ui/src` tree, so a new field cannot reintroduce the class.
+themselves with a literal `readonly: true` (or `readonly: "true"`). A
+conditional `readonly: !is_owner` does NOT count: the field is editable for
+somebody, and that somebody is exactly who loses their typing.
+`type="checkbox"` and `type="radio"` are exempt too, for the opposite reason:
+dioxus reports their `evt.value()` as `"true"`/`"false"`, never the DOM's
+`"on"`, so tracking a `value:` binding there would CAUSE a rewrite every
+render. Bind `checked:`, which is not volatile.
+
+`components.rs::volatile_value_binding_audit` scans every `.rs` file under
+`ui/src` for this and pins the exact set of bindings it finds, so a field that
+drops out of the scan fails loudly rather than quietly losing coverage. Two
+limits worth knowing: it proves `oninput` is present and not a no-op, but not
+that the handler writes the signal the `value:` binding reads; and it says
+nothing about the OTHER route to the same symptom, where a parent unmounts the
+field (a contended `try_read` memo returning `None`) and the remount re-seeds
+`use_signal`. That second route is the #499/#555 contention family and
+`oninput` does not help there.
 
 ## Don't `use_memo` against non-signal values in an always-mounted component
 

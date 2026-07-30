@@ -89,9 +89,11 @@ test.describe("Room Details: in-progress typing survives room-state updates", ()
     // Read the current cap so the write we trigger is guaranteed to change it
     // (`update_max_members` early-returns when the value is unchanged, which
     // would leave nothing to re-render and make this test vacuous).
+    // `Number("")` is 0 and finite, so assert a real positive cap rather than
+    // just finiteness, or an empty read would silently change what we assert.
     const maxMembers = page.getByTestId("max-members-input");
     const currentCap = Number(await maxMembers.inputValue());
-    expect(Number.isFinite(currentCap)).toBe(true);
+    expect(currentCap).toBeGreaterThan(0);
     const newCap = currentCap + 7;
 
     await commitMaxMembersWithoutBlurring(page, newCap);
@@ -109,6 +111,41 @@ test.describe("Room Details: in-progress typing survives room-state updates", ()
     // (empty, for this fixture room).
     await expect(description).toHaveValue(DRAFT);
     await expect(description).toBeFocused();
+  });
+
+  test("the max-members field also survives a room-state write", async ({ page }) => {
+    // MaxMembersField re-renders on its `member_count` prop as well as on
+    // `config`, so a member joining while the owner edited the cap was enough
+    // to wipe it. Covered separately because test 1 drives the room-state write
+    // THROUGH this field, so it can never observe this field being clobbered.
+    await openRoomDetails(page);
+
+    const maxMembers = page.getByTestId("max-members-input");
+    const typedCap = String(Number(await maxMembers.inputValue()) + 42);
+    await maxMembers.click();
+    await maxMembers.fill("");
+    await maxMembers.pressSequentially(typedCap, { delay: 10 });
+    await expect(maxMembers).toHaveValue(typedCap);
+    await expect(maxMembers).toBeFocused();
+
+    // Symmetric trick: commit a description change without moving focus, which
+    // signs a config delta and writes ROOMS exactly as a remote update would.
+    const newDescription = "description set from elsewhere";
+    await page.getByTestId("room-description-input").evaluate((el, value) => {
+      const ta = el as HTMLTextAreaElement;
+      ta.value = value;
+      ta.dispatchEvent(new Event("change", { bubbles: true }));
+    }, newDescription);
+
+    // Anti-vacuity: the write only shows up here once the delta has been
+    // applied and the dialog re-rendered from the new room state.
+    await expect(page.getByTestId("room-description-input")).toHaveValue(newDescription, {
+      timeout: 15_000,
+    });
+
+    // The cap being typed must still be there, and still uncommitted.
+    await expect(maxMembers).toHaveValue(typedCap);
+    await expect(maxMembers).toBeFocused();
   });
 
   test("the draft still commits normally on blur after a room-state write", async ({ page }) => {
@@ -133,6 +170,17 @@ test.describe("Room Details: in-progress typing survives room-state updates", ()
     // back if the save actually landed.
     await page.getByTestId("room-name-input").click();
     await expect(description).not.toBeFocused();
+
+    // Wait for the save to actually land before closing. The description save
+    // is async (sign -> defer -> ROOMS write) and each config delta must beat
+    // the next `configuration_version`, so a reopen that wins this race would
+    // reseed the remounted field from the OLD config and never recover —
+    // a permanent failure that the retry below could not rescue. Reopening the
+    // Members label is the observable proof the config round-tripped.
+    await expect(
+      page.getByTestId("edit-room-modal").getByText(new RegExp(`Members \\(\\d+/${newCap}\\)`)),
+    ).toBeVisible({ timeout: 15_000 });
+
     await page.getByTestId("edit-room-close-button").click();
     await expect(page.getByTestId("edit-room-modal")).toBeHidden({ timeout: 5_000 });
 

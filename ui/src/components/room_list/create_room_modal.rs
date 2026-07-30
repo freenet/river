@@ -169,13 +169,23 @@ pub fn CreateRoomModal() -> Element {
                             class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent",
                             value: "{room_name}",
                             placeholder: "Enter room name",
-                            // `oninput`, not `onchange`, so the signal tracks
-                            // the live value (freenet/river#564). `value` is a
-                            // volatile attribute, so any re-render re-writes it
-                            // to the DOM; with `onchange` alone the signal still
-                            // held the pre-typing text and the re-write reset
-                            // the field. Matches the nickname input below.
-                            oninput: move |evt| room_name.set(evt.value().to_string())
+                            // `oninput` tracks the live value so a re-render
+                            // cannot re-write this volatile `value` attribute
+                            // with stale text (freenet/river#564). Defensive
+                            // here rather than a reproduced bug: this component
+                            // reads no room-state signal and takes no props, so
+                            // nothing but the user's own typing re-renders it.
+                            // It matches the nickname input below and removes
+                            // the field from the class entirely.
+                            //
+                            // `onchange` is KEPT alongside it, unlike the
+                            // nickname input: dropping it would lose the value
+                            // from anything that sets `.value` and fires only
+                            // `change` (some password managers, and synthetic
+                            // events), and the failure is silent — `create_room`
+                            // returns on an empty name with only a log line.
+                            oninput: move |evt| room_name.set(evt.value().to_string()),
+                            onchange: move |evt| room_name.set(evt.value().to_string())
                         }
                     }
 
