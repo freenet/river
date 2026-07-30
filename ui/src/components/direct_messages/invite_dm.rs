@@ -124,3 +124,66 @@ pub(super) async fn compose_and_send_invite_dm(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Whitespace-squashed so rustfmt's line-wrapping choices can't disarm
+    /// the pins below.
+    fn squashed(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Production slice of a picker module — everything before its test
+    /// module, so test prose can neither disarm nor trip a pin.
+    fn prod(source: &str) -> String {
+        let end = source.find("#[cfg(test)]").unwrap_or(source.len());
+        squashed(&source[..end])
+    }
+
+    /// The two pickers pass the SAME two rooms to
+    /// [`super::compose_and_send_invite_dm`] in OPPOSITE positions, and
+    /// swapping them at either call site compiles cleanly.
+    ///
+    /// What a swap does: the invitation gets signed against the room the DM
+    /// is merely travelling through, and the DM gets sent inside the room
+    /// the invitation was meant to grant — where the recipient is, by
+    /// construction, not yet a member. So the user is told
+    /// "The recipient is no longer a member of this room", for a room they
+    /// can see the recipient in, and no invitation is delivered.
+    ///
+    /// Nothing else catches it. Both arguments are the right types, every
+    /// unit test here is on pure helpers, and the browser specs cannot
+    /// reach a send (no chat delegate under `no-sync`). A source pin on the
+    /// argument NAMES is the available gate, and the mutation it guards is
+    /// the most damaging one this change admits.
+    #[test]
+    fn each_picker_passes_the_carrier_room_first_and_the_target_room_third() {
+        let contact = prod(include_str!("invite_contact_picker_modal.rs"));
+        assert!(
+            contact.contains(
+                "compose_and_send_invite_dm(carrier_room, peer, target_data, pmessage_opt)"
+            ),
+            "the contact picker must sign the invitation against the room \
+             being VIEWED (`target_data`) and send the DM inside the room it \
+             shares with the recipient (`carrier_room`). Passing \
+             `target_room` as the carrier sends the DM into a room the \
+             recipient is not in yet, which fails with a message naming the \
+             wrong room"
+        );
+
+        let by_room = prod(include_str!("invite_via_dm_picker_modal.rs"));
+        assert!(
+            by_room.contains(
+                "compose_and_send_invite_dm( current_room, target_peer, candidate_data, \
+                 pmessage_opt, )"
+            ) || by_room.contains(
+                "compose_and_send_invite_dm(current_room, target_peer, candidate_data, \
+                 pmessage_opt)"
+            ),
+            "the member-card picker must sign against the room the user \
+             PICKED (`candidate_data`) and send the DM inside the room being \
+             viewed (`current_room`) — the mirror image of the contact \
+             picker, and the reason both go through one helper"
+        );
+    }
+}

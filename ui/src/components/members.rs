@@ -7268,5 +7268,67 @@ mod tests {
             "the member-info modal no longer renders the warning's explanation \
              element"
         );
+
+        // --- Share-Invite contact picker ---------------------------------
+        //
+        // The FOURTH surface (freenet/river#566), and it is here because
+        // promoting it created a route that BYPASSES the other three. Until
+        // #566 the only way to reach the DM-invite flow was through the member
+        // list, so a user had already been shown the ⚠ before picking anyone.
+        // The picker lists members of rooms the user may not have opened, so
+        // without this the primary invite action is the one surface where an
+        // imitator's name renders clean.
+        let picker_src =
+            include_str!("../components/direct_messages/invite_contact_picker_modal.rs");
+        let picker = &picker_src[..picker_src
+            .find("#[cfg(test)]")
+            .expect("the contact picker should have a `#[cfg(test)]` block")];
+        assert!(
+            picker.contains("impersonation_warning_for_display("),
+            "the Share-Invite contact picker no longer computes an \
+             impersonation warning. It is the PRIMARY invite action, and it \
+             lists members of rooms the user need never have opened, so \
+             dropping the badge here means picking an imitator looks \
+             identical to picking the real member"
+        );
+        // Same argument trap as the other three: `self_id` compiles here and
+        // flags the genuine owner and every genuine moderator instead.
+        assert!(
+            squashed(picker).contains(
+                "impersonation_warning_for_display( &impersonation, peer, &peer_label, \
+                 privilege_in_view(peer, owner_id, &deputy_badges), )"
+            ),
+            "the contact picker no longer passes `peer` (and that peer's own \
+             privilege) to `impersonation_warning_for_display`"
+        );
+        // Built once per ROOM, before the per-peer loop. This picker sweeps
+        // every other room the user is in, so building per peer multiplies
+        // the refold by the whole candidate set rather than one room's.
+        assert!(
+            between(
+                picker,
+                "fn build_contact_candidates(",
+                "for peer in peers",
+                "contact-candidate per-peer loop",
+            )
+            .contains("impersonation_checker_for_viewer("),
+            "the contact picker must build the impersonation checker BEFORE \
+             its per-peer loop, not inside it"
+        );
+        assert!(
+            picker.contains("\"data-testid\": \"invite-contact-impersonation-warning\""),
+            "the contact-picker row's warning lost its `data-testid`, leaving \
+             a spec only glyph-matching to reach it"
+        );
+        assert!(
+            between(
+                picker,
+                "\"data-testid\": \"invite-contact-impersonation-warning\"",
+                "if is_selected",
+                "contact-row warning element",
+            )
+            .contains("WARNING_GLYPH"),
+            "the contact-picker warning element no longer renders the glyph"
+        );
     }
 }

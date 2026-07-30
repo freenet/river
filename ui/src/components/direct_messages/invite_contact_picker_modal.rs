@@ -35,6 +35,11 @@ use crate::components::direct_messages::invite_dm::compose_and_send_invite_dm;
 use crate::components::direct_messages::{
     ContactPickInflight, INVITE_CONTACT_PICKER, INVITE_CONTACT_PICKER_INFLIGHT,
 };
+use crate::components::members::{
+    deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
+    privilege_in_view,
+};
+use crate::util::confusable::WARNING_GLYPH;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
@@ -58,6 +63,16 @@ pub(crate) struct ContactCandidate {
     /// actually talked to is far more likely to be who you meant than a
     /// stranger who happens to share a large room, so these sort first.
     pub has_dm_history: bool,
+    /// Tooltip for the ⚠ badge when this person's display name is visually
+    /// identical to a privileged member's in `carrier_room`; `None` when
+    /// there is nothing to warn about.
+    ///
+    /// The member list carries this badge, and before this picker existed
+    /// the only route to a DM invite went THROUGH the member list — so the
+    /// user had seen the badge before choosing anyone. Picking from here
+    /// skips that list entirely, so the warning has to travel with the row
+    /// or promoting this surface would quietly remove a protection.
+    pub warning_tooltip: Option<String>,
 }
 
 /// Watchdog timeout, matching the sibling picker. `sign_member_with_fallback`
@@ -532,8 +547,22 @@ fn ContactRow(
     let peer_label = candidate.peer_label.clone();
     let room_label = candidate.room_label.clone();
     let has_dm_history = candidate.has_dm_history;
+    let warning_tooltip = candidate.warning_tooltip.clone();
 
-    let aria = format!("Send the invitation to {peer_label}, in a DM inside {room_label}");
+    // The accessible name must carry the warning too. The glyph is a child
+    // of a button with an explicit `aria-label`, and an explicit label
+    // REPLACES the element's content for naming purposes — so a badge
+    // rendered inside is invisible to a screen reader unless it is said
+    // here. Tests read `data-person` / `data-room` instead of parsing this
+    // string, so the copy is free to grow without breaking them.
+    let aria = match warning_tooltip.as_deref() {
+        Some(_) => format!(
+            "Send the invitation to {peer_label}, in a DM inside {room_label}. \
+             Warning: this name is visually identical to a privileged \
+             member's — check the member ID before inviting"
+        ),
+        None => format!("Send the invitation to {peer_label}, in a DM inside {room_label}"),
+    };
     let select_class = if is_selected {
         "border-accent bg-accent/10"
     } else if any_pending {
@@ -543,6 +572,12 @@ fn ContactRow(
     };
     rsx! {
         button {
+            "data-testid": "invite-contact-row",
+            // Addressing hooks for automation, so a spec never has to
+            // parse the accessible name (which carries prose that is
+            // expected to change).
+            "data-person": "{peer_label}",
+            "data-room": "{room_label}",
             class: format!(
                 "w-full text-left px-3 py-2 rounded-lg border text-sm text-text flex items-center gap-2 transition-colors {}",
                 select_class
@@ -550,6 +585,10 @@ fn ContactRow(
             disabled: any_pending,
             "aria-label": "{aria}",
             "aria-pressed": "{is_selected}",
+            // Member ID on hover — the remedy the warning tooltip tells
+            // the reader to use, and the only way to tell two members with
+            // the same display name apart.
+            title: "Member ID: {candidate.peer}",
             onclick: move |_| on_select.call(()),
             div { class: "flex-1 min-w-0",
                 div { class: "truncate", "{peer_label}" }
@@ -559,6 +598,14 @@ fn ContactRow(
                     } else {
                         "via {room_label}"
                     }
+                }
+            }
+            if let Some(tooltip) = warning_tooltip {
+                span {
+                    "data-testid": "invite-contact-impersonation-warning",
+                    class: "member-icon flex-shrink-0",
+                    title: "{tooltip}",
+                    " {WARNING_GLYPH}"
                 }
             }
             if is_selected {
@@ -604,6 +651,23 @@ fn build_contact_candidates(target_room: VerifyingKey) -> Vec<ContactCandidate> 
         let room_label = room_display_label(room_data);
         let self_id: MemberId = room_data.self_sk.verifying_key().into();
         let owner_id = MemberId::from(owner_vk);
+        // Both built ONCE per room, BEFORE the per-peer loop. Rebuilding
+        // either per peer re-folds every protected name and, in a private
+        // room, re-unseals every protected nickname, once per row — the
+        // same cost rule `MemberList` follows.
+        let deputy_badges = deputy_badges_for_viewer(
+            &room_data.room_state.members,
+            &room_data.room_state.member_info,
+            &room_data.secrets,
+            owner_id,
+            self_id,
+        );
+        let impersonation = impersonation_checker_for_viewer(
+            &room_data.room_state.member_info,
+            &room_data.secrets,
+            owner_id,
+            &deputy_badges,
+        );
         // The owner is not in `members.members` (membership is implicit
         // for them) but IS a valid DM recipient — `send_structured_dm`
         // special-cases them — so add them explicitly or the one person
@@ -641,12 +705,23 @@ fn build_contact_candidates(target_room: VerifyingKey) -> Vec<ContactCandidate> 
                     (sender == self_id && recipient == peer)
                         || (sender == peer && recipient == self_id)
                 });
+            // `peer`, not `self_id` — passing any other id flags the
+            // genuine owner and every genuine moderator instead of the
+            // imitator. Same argument trap the member list is pinned for.
+            let warning_tooltip = impersonation_warning_for_display(
+                &impersonation,
+                peer,
+                &peer_label,
+                privilege_in_view(peer, owner_id, &deputy_badges),
+            )
+            .map(|w| w.tooltip());
             out.push(ContactCandidate {
                 carrier_room: *owner_vk,
                 room_label: room_label.clone(),
                 peer,
                 peer_label,
                 has_dm_history,
+                warning_tooltip,
             });
         }
     }
@@ -730,6 +805,7 @@ mod tests {
             peer: member(peer_seed),
             peer_label: peer_label.to_string(),
             has_dm_history: dm,
+            warning_tooltip: None,
         }
     }
 
@@ -771,6 +847,7 @@ mod tests {
             peer: member(1),
             peer_label: "Ian".into(),
             has_dm_history: false,
+            warning_tooltip: None,
         };
         let b = ContactCandidate {
             carrier_room: vk(9),
@@ -778,6 +855,7 @@ mod tests {
             peer: member(2),
             peer_label: "Ian".into(),
             has_dm_history: false,
+            warning_tooltip: None,
         };
         let mut forward = vec![a.clone(), b.clone()];
         let mut reverse = vec![b, a];

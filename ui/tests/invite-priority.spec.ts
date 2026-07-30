@@ -43,19 +43,20 @@ async function openRoom(page: Page, name: string = ROOM_NAME) {
   });
 }
 
-// Read the "via <room>" sub-labels off the picker's contact rows. Each row
-// is a button whose aria-label is
-// "Send the invitation to <person>, in a DM inside <room>".
+// Read the picker's contact rows. The row carries `data-person` /
+// `data-room` precisely so this does not have to parse the accessible name:
+// that string also carries the impersonation warning when there is one, and
+// prose is expected to change.
 async function readContactRows(
   page: Page,
 ): Promise<{ person: string; room: string }[]> {
-  const rows = page.locator('button[aria-label^="Send the invitation to"]');
+  const rows = page.getByTestId("invite-contact-row");
   const count = await rows.count();
   const out: { person: string; room: string }[] = [];
   for (let i = 0; i < count; i++) {
-    const aria = (await rows.nth(i).getAttribute("aria-label")) || "";
-    const m = aria.match(/^Send the invitation to (.+), in a DM inside (.+)$/);
-    if (m) out.push({ person: m[1], room: m[2] });
+    const person = (await rows.nth(i).getAttribute("data-person")) || "";
+    const room = (await rows.nth(i).getAttribute("data-room")) || "";
+    out.push({ person, room });
   }
   return out;
 }
@@ -133,9 +134,7 @@ test.describe("Invite priority: DM route primary, link route secondary", () => {
     const send = page.getByTestId("invite-contact-picker-send-button");
     await expect(send).toBeDisabled();
 
-    const firstRow = page
-      .locator('button[aria-label^="Send the invitation to"]')
-      .first();
+    const firstRow = page.getByTestId("invite-contact-row").first();
     await expect(firstRow).toHaveAttribute("aria-pressed", "false");
     await firstRow.click();
     await expect(firstRow).toHaveAttribute("aria-pressed", "true");
@@ -183,6 +182,45 @@ test.describe("Invite priority: DM route primary, link route secondary", () => {
       page.getByTestId("invite-contact-picker-no-matches"),
     ).toBeVisible();
     expect(await readContactRows(page)).toHaveLength(0);
+  });
+
+  // The picker is now the primary invite action, and it lists members of
+  // rooms the user may never have opened — so it is the one surface where a
+  // name-imitation could otherwise render clean. The example fixture seeds
+  // two confusable names (#494), which is what makes this reachable.
+  test("a confusable name carries the impersonation warning in the picker", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoom(page);
+
+    await page.getByTestId("share-invite-button").click();
+    await expect(page.getByTestId("invite-contact-picker-modal")).toBeVisible({
+      timeout: 5_000,
+    });
+
+    const warned = page.getByTestId("invite-contact-impersonation-warning");
+    expect(await warned.count()).toBeGreaterThan(0);
+    // The badge must explain itself. `title=` does not fire on touch, but it
+    // is the same affordance the member list uses, and the row's accessible
+    // name repeats the warning for screen readers (asserted below).
+    const tip = await warned.first().getAttribute("title");
+    expect(tip).toBeTruthy();
+
+    // An explicit aria-label on the button REPLACES its content for naming,
+    // so a badge rendered inside is invisible to a screen reader unless the
+    // label says it too.
+    const warnedRow = page
+      .getByTestId("invite-contact-row")
+      .filter({ has: page.getByTestId("invite-contact-impersonation-warning") })
+      .first();
+    await expect(warnedRow).toHaveAttribute(
+      "aria-label",
+      /visually identical/i,
+    );
+    // The remedy the tooltip names — the member ID — must be reachable.
+    await expect(warnedRow).toHaveAttribute("title", /^Member ID: /);
   });
 
   test("closing the picker leaves no picker behind", async ({ page }) => {
