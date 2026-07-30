@@ -190,6 +190,56 @@ Signal clears that the effect subscribes to must be synchronous.
 Deferring causes an infinite loop (set remains non-empty → effect
 re-runs → defers clear → effect re-runs...).
 
+## Bind `oninput` on every EDITABLE `value:` field
+
+`value` on `input` / `textarea` / `select` is a **volatile** attribute in
+dioxus-html (`elements.rs:1488,1571,1594`). dioxus-core re-writes volatile
+attributes to the DOM on every re-render, even when the rendered string has
+not changed:
+
+```text
+// dioxus-core-0.7.9/src/diff/node.rs:463
+if volatile || attribute_changed { self.write_attribute(...) }
+```
+
+and the interpreter then assigns the value whenever the LIVE DOM value differs
+from the VDOM value:
+
+```text
+// dioxus-interpreter-js-0.7.9/src/ts/set_attribute.ts:31-33
+case "value": ... else if (node.value !== value) node.value = value;
+```
+
+`onchange` fires on blur, not per keystroke. So a field bound only through
+`onchange` still holds the PRE-TYPING text for as long as the user is typing,
+and the next re-render resets the control and discards the edit.
+
+```rust
+// WRONG — any re-render wipes what the user has typed so far
+textarea { value: "{description}", onchange: save }
+
+// RIGHT — the signal tracks the DOM, so the re-write is a no-op
+textarea {
+    value: "{description}",
+    oninput: move |evt| description.set(evt.value().to_string()),
+    onchange: save,
+}
+```
+
+Nothing about the broken call site looks wrong, and reasoning about the
+component in isolation will not reveal it: the trigger is whatever unrelated
+signal that component happens to read. `RoomDescriptionField` reads
+`CURRENT_ROOM` and `ROOMS` in its render body, so every room-state write
+re-rendered it, and the owner's half-typed room description vanished every few
+seconds (freenet/river#564).
+
+Display-only controls may bind `value:` with no `oninput`, but must declare
+themselves with a literal `readonly: true`. A conditional
+`readonly: !is_owner` does NOT count: the field is editable for somebody, and
+that somebody is exactly who loses their typing.
+`components.rs::volatile_value_binding_audit` enforces this across the whole
+`ui/src` tree, so a new field cannot reintroduce the class.
+
 ## Don't `use_memo` against non-signal values in an always-mounted component
 
 The modals in `app.rs` (`MemberInfoModal`, `DmThreadModal`,

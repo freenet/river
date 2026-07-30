@@ -169,7 +169,13 @@ pub fn CreateRoomModal() -> Element {
                             class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent",
                             value: "{room_name}",
                             placeholder: "Enter room name",
-                            onchange: move |evt| room_name.set(evt.value().to_string())
+                            // `oninput`, not `onchange`, so the signal tracks
+                            // the live value (freenet/river#564). `value` is a
+                            // volatile attribute, so any re-render re-writes it
+                            // to the DOM; with `onchange` alone the signal still
+                            // held the pre-typing text and the re-write reset
+                            // the field. Matches the nickname input below.
+                            oninput: move |evt| room_name.set(evt.value().to_string())
                         }
                     }
 
