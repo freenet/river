@@ -121,12 +121,17 @@ fn member_ids(state: &ChatRoomStateV1) -> HashSet<MemberId> {
 ///
 /// Recomputed here from blake3 rather than calling into river-core,
 /// deliberately: an oracle that reuses the implementation under test only
-/// proves self-consistency. If production changes the digest function or its
-/// byte order, this picks a different winner and the asserting test fails,
+/// proves self-consistency. If production changes the digest function or which
+/// bytes it keeps, this picks a different winner and the asserting test fails,
 /// which is the point.
-fn sig_digest(sig: &ed25519_dalek::Signature) -> u64 {
+///
+/// This is a RANDOMLY-keyed oracle, so on its own it only detects a change that
+/// alters the winner for the keys a given run happened to draw. The FIXED-input
+/// pin is `sig_digest_golden_vector` in `river_core::room_state::member_info`;
+/// the two are complementary and neither replaces the other.
+fn sig_digest(sig: &ed25519_dalek::Signature) -> [u8; 16] {
     let hash = blake3::hash(&sig.to_bytes());
-    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+    hash.as_bytes()[..16].try_into().unwrap()
 }
 
 /// Deputize A->B (B may be anyone), B bans T where T is in A's subtree -> T

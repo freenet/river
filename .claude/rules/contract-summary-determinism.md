@@ -53,6 +53,40 @@ changes → follow the room-contract + delegate migration ritual
 (`.claude/rules/delegate-migration.md`) before publishing, and bump the
 `river-core` / `riverctl` versions if a WASM changed.
 
+## Summary VALUES are a wire-format commitment too
+
+Determinism is about the collection type; this section is about what goes in it.
+A summary value that is only ever compared (never verified, never decoded back
+into anything) should be a fixed-width digest, not the thing it fingerprints —
+the summary is re-sent to every interested peer on every state change, so a
+64-byte signature per entry is paid over and over.
+
+When a summary carries a digest, four properties become wire format, and none of
+them may change without re-keying the contract:
+
+- which hash function (and it must be cryptographic if an attacker can choose
+  the input — a base-31 polynomial like `freenet_scaffold::util::fast_hash` is
+  fine for accidental collisions only);
+- how wide, judged against who controls the colliding inputs. If a party can
+  grind BOTH sides of the comparison, 64 bits is a ~2^32 birthday search, i.e.
+  hours; use 128.
+- which bytes are kept, and in what order;
+- how the value serializes — a `[u8; 16]` through the serde derive emits a
+  16-element CBOR array (32 bytes), not a byte string (17). Write `Serialize`
+  by hand with `serialize_bytes`.
+
+Pin all four with a **golden vector**: ONE fixed input, ONE fixed expected
+digest, ONE fixed expected encoding. Oracles that compare digests of randomly
+generated keys are NOT sufficient — a byte-order change leaves them agreeing
+about half the time, so they detect it only intermittently (measured on this
+codebase: 11 of 30 runs missed a reversed-byte-order change). See
+`sig_digest_golden_vector` in `common/src/room_state/member_info.rs`.
+
+Also assert bytes-per-entry for the summary, built by calling the real
+`summarize()` with realistic key values — `MemberId(FastHash(i))` for small `i`
+encodes in 1-3 bytes against a real key's ~9 and understates the entry by ~30%.
+See `member_info_summary_stays_small_per_entry`.
+
 ## History
 
 - **freenet/river** (2026-07): `MemberInfoV1::Summary` was
@@ -62,4 +96,12 @@ changes → follow the room-contract + delegate migration ritual
   `BTreeMap`/`BTreeSet`. `bincode` (the old wire path) doesn't care about key
   order, so this survived undetected until freenet-core added the
   summary-byte-compare staleness check.
+- **freenet/river#571** (2026-07): the same summary's VALUE then shrank,
+  `(u32, Signature)` → `(u32, SigDigest)`, where `SigDigest` is a 128-bit BLAKE3
+  digest of the signature serialized as a CBOR byte string. The raw signature was
+  66 of ~78 CBOR bytes per entry; measured 78 → 28.0 bytes/entry at 470 records.
+  The collection type was already `BTreeMap` and did not change, so this is the
+  value-side rule above rather than the determinism rule.
+  `DirectMessagesSummary.message_signatures: BTreeSet<SignatureBytes>` still
+  carries raw 64-byte signatures and has the same fix available.
 - **freenet/freenet-core#4857** — the update-drop divergence this feeds.

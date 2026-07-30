@@ -15,6 +15,7 @@
 //!
 //! See `.claude/rules/contract-summary-determinism.md`.
 
+use ed25519_dalek::SigningKey;
 use freenet_scaffold::util::FastHash;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{BanId, BansV1};
@@ -22,12 +23,14 @@ use river_core::room_state::direct_messages::{
     DirectMessagesSummary, DmOrderKey, DmPairHorizon, DmRetentionHorizon, SignatureBytes,
 };
 use river_core::room_state::member::{MemberId, MembersV1};
-use river_core::room_state::member_info::MemberInfoV1;
+use river_core::room_state::member_info::{
+    AuthorizedMemberInfo, MemberInfo, MemberInfoV1, SigDigest,
+};
 use river_core::room_state::message::{
     MessageId, MessageOrderKey, MessagesSummary, MessagesV1, RetentionHorizon,
 };
 use river_core::room_state::secret::SecretsSummary;
-use river_core::room_state::ChatRoomStateV1Summary;
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Summary};
 use std::time::{Duration, SystemTime};
 
 // Reference the ACTUAL associated `Summary` types (not a hard-coded `BTreeSet`),
@@ -55,14 +58,21 @@ fn ban_id(i: i64) -> BanId {
 fn member_id(i: i64) -> MemberId {
     MemberId(FastHash(i))
 }
-/// A distinct signature-digest per index, matching the `(u32, u64)` shape the
-/// member_info summary carries since freenet/river#571. The test exercises
-/// ORDER-independence of the serialized summary, so only distinctness matters
-/// here, not that these equal any real `blake3` digest.
-fn sig_rank(i: i64) -> u64 {
+/// A distinct signature digest per index, matching the `(u32, SigDigest)` shape
+/// the member_info summary carries since freenet/river#571. The tests using this
+/// exercise ORDER-independence of the serialized summary, so only distinctness
+/// matters here, not that these equal any real `blake3` digest. (The real
+/// digest's value and encoding are pinned separately by `sig_digest_golden_vector`
+/// in `river_core::room_state::member_info`.)
+fn sig_rank(i: i64) -> SigDigest {
     // Spread the bits so a byte-order bug in the summary encoding shows up as a
     // difference rather than cancelling out across entries.
-    (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    let a = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let b = (i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&a.to_le_bytes());
+    out[8..].copy_from_slice(&b.to_le_bytes());
+    SigDigest(out)
 }
 
 #[test]
@@ -92,12 +102,12 @@ fn members_summary_serialization_is_order_independent() {
 
 #[test]
 fn member_info_summary_serialization_is_order_independent() {
-    // MemberInfoV1::Summary = BTreeMap<MemberId, (u32, u64)> — the u64 is the
-    // signature digest (freenet/river#571; was a raw 64-byte Signature).
-    let fwd: Vec<(MemberId, (u32, u64))> = (0..N)
+    // MemberInfoV1::Summary = BTreeMap<MemberId, (u32, SigDigest)> — the digest
+    // replaced a raw 64-byte Signature in freenet/river#571.
+    let fwd: Vec<(MemberId, (u32, SigDigest))> = (0..N)
         .map(|i| (member_id(i), (i as u32, sig_rank(i))))
         .collect();
-    let rev: Vec<(MemberId, (u32, u64))> = fwd.iter().rev().cloned().collect();
+    let rev: Vec<(MemberId, (u32, SigDigest))> = fwd.iter().rev().cloned().collect();
 
     let s_fwd: MemberInfoSummary = fwd.into_iter().collect();
     let s_rev: MemberInfoSummary = rev.into_iter().collect();
@@ -334,27 +344,83 @@ fn top_level_summary_serialization_is_order_independent() {
 /// freenet/river#571 — the member_info summary must stay SMALL.
 ///
 /// This is the whole point of that change and it has no other guard: the summary
-/// is re-sent to every interested peer on every state change, and was measured as
-/// the largest single consumer of outbound bytes on the Freenet network. The
-/// entry previously carried a raw 64-byte `Signature` (~84% of its bytes),
-/// putting a 470-member room's summary around 29 KB.
+/// is re-sent to every interested peer on every state change, and
+/// `interest_sync_summaries` was measured as the largest single consumer of
+/// outbound bytes on the Freenet network. The entry previously carried a raw
+/// 64-byte `Signature`, 66 of ~78 CBOR bytes (84%).
+///
+/// REALISM MATTERS HERE, because the number this test reports is quoted as the
+/// production figure:
+///
+/// - `MemberId`s come from REAL `VerifyingKey`s, so their `FastHash` values span
+///   the `i64` range and CBOR-encode in the ~9 bytes production sees. The obvious
+///   shortcut, `MemberId(FastHash(i))` for small `i`, encodes in 1-3 bytes and
+///   understates the entry by ~30%.
+/// - The summary is produced by calling the REAL `summarize()` on built state,
+///   not by hand-constructing `MemberInfoV1::Summary`. Hand-construction can only
+///   catch a change to the type's SHAPE, which would be a compile error anyway;
+///   it cannot catch `summarize` starting to populate the map differently.
+/// - Versions are small (1-3), matching production: a member's `version`
+///   increments only when they edit their nickname or deputies, so it is a
+///   single CBOR byte for nearly every real record.
+///
+/// Keys are derived from fixed seeds, so the measurement is exactly reproducible
+/// and the assertion cannot flake.
 ///
 /// Asserted as bytes-per-entry rather than a total, so the bound does not need
-/// revising when a test constant changes. The pre-#571 encoding cannot pass:
-/// a 64-byte signature alone serializes to 66 CBOR bytes.
+/// revising when the member count changes. The pre-#571 encoding cannot pass: a
+/// 64-byte signature alone serializes to 66 CBOR bytes.
 #[test]
 fn member_info_summary_stays_small_per_entry() {
-    const MEMBERS: i64 = 470; // the official room's rough membership
-    let summary: MemberInfoSummary = (0..MEMBERS)
-        .map(|i| (member_id(i), (i as u32, sig_rank(i))))
+    const MEMBERS: u64 = 470; // the official room's rough membership
+
+    // Deterministic but REAL keys: blake3 of the index seeds the signing key, so
+    // the derived MemberId is a full-width FastHash exactly as in production.
+    let signing_keys: Vec<SigningKey> = (0..MEMBERS)
+        .map(|i| SigningKey::from_bytes(blake3::hash(&i.to_le_bytes()).as_bytes()))
         .collect();
+
+    let member_info: Vec<AuthorizedMemberInfo> = signing_keys
+        .iter()
+        .enumerate()
+        .map(|(i, sk)| {
+            let info = MemberInfo::new_public(
+                MemberId::from(&sk.verifying_key()),
+                1 + (i % 3) as u32,
+                format!("member{i}"),
+            );
+            AuthorizedMemberInfo::new_with_member_key(info, sk)
+        })
+        .collect();
+
+    let state = MemberInfoV1 { member_info };
+    let parent = ChatRoomStateV1::default();
+    let parameters = ChatRoomParametersV1 {
+        owner: signing_keys[0].verifying_key(),
+    };
+
+    // The REAL summarize(), so a change in how it populates the map is caught.
+    let summary: MemberInfoSummary = state.summarize(&parent, &parameters);
+    assert_eq!(
+        summary.len() as u64,
+        MEMBERS,
+        "precondition: one summary entry per member"
+    );
 
     let bytes = cbor(&summary).len();
     let per_entry = bytes as f64 / MEMBERS as f64;
+    println!("member_info summary: {bytes} bytes for {MEMBERS} members = {per_entry:.2} B/entry");
 
+    // Measured at 28.01 B/entry with the 128-bit digest, against ~78 with the
+    // raw signature. A 64-bit digest would be exactly 8 B/entry cheaper (a CBOR
+    // byte string is 1 header byte either way, and a random u64 always takes the
+    // 8-byte form) — see `SigDigest` for why those 8 bytes are bought
+    // deliberately. The bound leaves headroom above 28.01 without approaching
+    // the 78 it exists to catch; the measurement itself is deterministic, so it
+    // is headroom for future entry-shape changes, not for run-to-run variance.
     assert!(
         per_entry < 32.0,
-        "member_info summary must stay under 32 bytes/entry (got {per_entry:.1}, \
+        "member_info summary must stay under 32 bytes/entry (got {per_entry:.2}, \
          {bytes} bytes for {MEMBERS} members). A raw 64-byte Signature encodes to \
          66 CBOR bytes on its own, so this failing likely means the summary \
          regressed to carrying signatures rather than digests (freenet/river#571)."

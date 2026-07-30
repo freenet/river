@@ -874,7 +874,7 @@ impl RoomData {
         // version and the cached `self_member_info` version — not from
         // room_state alone. On a stale/reset client the room_state max can
         // collide at the SAME version as a still-propagating grant/revoke
-        // and lose the signature tiebreak, silently no-op'ing the change
+        // and lose the digest tiebreak, silently no-op'ing the change
         // (freenet/river#411 round 8).
         let cached_version = self
             .self_member_info
@@ -6272,11 +6272,11 @@ mod tests {
         // river-core (`member_info_rank`/`sig_digest` are private anyway):
         // a fixture that picked its key via the implementation under test
         // would make the `canonical` sanity assertion below tautological.
-        // Computed independently, a change to the digest function or its byte
-        // order makes this pick the wrong key and that assertion fails.
-        let sig_digest = |sig: &ed25519_dalek::Signature| -> u64 {
+        // Computed independently, a change to the digest function or to which
+        // bytes it keeps makes this pick the wrong key and that assertion fails.
+        let sig_digest = |sig: &ed25519_dalek::Signature| -> [u8; 16] {
             let hash = blake3::hash(&sig.to_bytes());
-            u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+            hash.as_bytes()[..16].try_into().unwrap()
         };
         let (d_sk, clean_authorized, stale_grant_authorized) = 'retry: {
             for _ in 0..500 {
@@ -6332,20 +6332,28 @@ mod tests {
                 .push(AuthorizedMember::new(member, &owner_sk));
         }
 
-        // Push the CANONICAL winner (clean) FIRST and the loser (stale_grant)
-        // LAST. A version-only `max_by_key` ties on version=1 and — per
-        // `Iterator::max_by_key`'s documented "last element wins" tie-break —
-        // returns whichever is LAST in the Vec (stale_grant, the wrong one),
-        // while `canonical` (ranked by `(version, signature)`) returns the
-        // true winner (clean) regardless of position.
-        room_state
-            .member_info
-            .member_info
-            .push(clean_authorized.clone());
+        // Push the LOSER (stale_grant) FIRST and the canonical winner (clean)
+        // LAST, so vector position and rank disagree. Both records tie on
+        // version=1, so any selector that ignores the signature digest returns
+        // stale_grant — the wrong one — whether it is a first-match `.find()` or
+        // a version-only comparison that keeps the first on a tie. Only a
+        // selector ranking by `(version, signature-digest)` returns clean, which
+        // the retry loop above guaranteed outranks stale_grant.
+        //
+        // The order matters and was flipped deliberately: it used to be
+        // clean-first, which caught a version-only `max_by_key` (whose documented
+        // tie-break returns the LAST element). `canonical` now keeps the FIRST
+        // maximum, to agree with `dedup_to_canonical` and `apply_delta`, so
+        // clean-first would let a version-only selector return the right answer
+        // by accident and the test would prove nothing.
         room_state
             .member_info
             .member_info
             .push(stale_grant_authorized.clone());
+        room_state
+            .member_info
+            .member_info
+            .push(clean_authorized.clone());
         assert_eq!(
             room_state
                 .member_info
@@ -6383,11 +6391,12 @@ mod tests {
         };
 
         // Deputize T. Since the CANONICAL base (clean) does not yet list T,
-        // this is a genuine change that must publish. A version-only
-        // `max_by_key` would instead select `stale_grant` (last in the Vec,
-        // tied on version) — which ALREADY lists T — so the buggy code
-        // short-circuits on "already a deputy, nothing to publish" and
-        // returns `false` without publishing anything.
+        // this is a genuine change that must publish. A selector that ignores
+        // the signature digest — a first-match `.find()`, or a version-only
+        // comparison — instead selects `stale_grant` (first in the Vec, tied on
+        // version), which ALREADY lists T, so the buggy code short-circuits on
+        // "already a deputy, nothing to publish" and returns `false` without
+        // publishing anything.
         assert!(
             room.apply_deputy_change(t_id, true),
             "must publish a change: canonical base (clean) does not yet list T"
@@ -6413,7 +6422,7 @@ mod tests {
         // a prior edit was cached locally but the client's own room_state
         // view has not caught up. Deriving the next version from room_state
         // alone would collide with a still-propagating record at the SAME
-        // version, risking losing the signature tiebreak and silently
+        // version, risking losing the digest tiebreak and silently
         // no-op'ing the change. The next version must be derived from the
         // HIGHER of the two sources.
         let mut rng = rand::thread_rng();

@@ -37,10 +37,34 @@ impl MemberInfoV1 {
     /// [`Self::dedup_to_canonical`] once cleanup runs, but reads must not depend
     /// on that having happened yet.)
     pub fn canonical(&self, member_id: MemberId) -> Option<&AuthorizedMemberInfo> {
-        self.member_info
+        // The FIRST maximum wins, matching [`Self::dedup_to_canonical`] and
+        // `apply_delta` (both replace only on strict `>`). `Iterator::max_by_key`
+        // is deliberately NOT used here: it returns the LAST maximum, so with
+        // three selectors of "the canonical record" a tie would resolve one way
+        // on a freshly-GET'd full state and the other way after the next
+        // `apply_delta` ran dedup — a silent flip in `deputies_of`, i.e. in ban
+        // authority. A tie needs two records with the same version AND the same
+        // 128-bit signature digest, which [`SigDigest`] makes infeasible to mint,
+        // so this is closing a latent trap rather than a reachable bug.
+        //
+        // The rank is computed once per candidate rather than once per
+        // comparison, because `member_info_rank` hashes (see [`SigDigest`]).
+        let mut best: Option<(&AuthorizedMemberInfo, (u32, SigDigest))> = None;
+        for info in self
+            .member_info
             .iter()
             .filter(|info| info.member_info.member_id == member_id)
-            .max_by_key(|info| member_info_rank(info.member_info.version, &info.signature))
+        {
+            let rank = member_info_rank(info.member_info.version, &info.signature);
+            let better = match &best {
+                Some((_, best_rank)) => rank > *best_rank,
+                None => true,
+            };
+            if better {
+                best = Some((info, rank));
+            }
+        }
+        best.map(|(info, _)| info)
     }
 
     /// The deputies currently listed by `member_id`'s CANONICAL signed
@@ -69,31 +93,35 @@ impl MemberInfoV1 {
         if self.member_info.len() < 2 {
             return;
         }
-        let mut best: HashMap<MemberId, AuthorizedMemberInfo> = HashMap::new();
+        // Carry each incumbent's rank in the map rather than re-deriving it: a
+        // rank costs a blake3 hash (see [`SigDigest`]), and recomputing the
+        // incumbent's on every collision doubles that cost for no benefit.
+        // Ties keep the INCUMBENT (strict `>`), i.e. the first record in vector
+        // order, matching [`Self::canonical`] and `apply_delta`.
+        let mut best: HashMap<MemberId, ((u32, SigDigest), AuthorizedMemberInfo)> = HashMap::new();
         for info in self.member_info.drain(..) {
             let id = info.member_info.member_id;
+            let rank = member_info_rank(info.member_info.version, &info.signature);
             match best.entry(id) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if member_info_rank(info.member_info.version, &info.signature)
-                        > member_info_rank(e.get().member_info.version, &e.get().signature)
-                    {
-                        e.insert(info);
+                    if rank > e.get().0 {
+                        e.insert((rank, info));
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(info);
+                    e.insert((rank, info));
                 }
             }
         }
-        self.member_info = best.into_values().collect();
+        self.member_info = best.into_values().map(|(_, info)| info).collect();
         // Deterministic order (HashMap iteration order is not stable).
         self.member_info
             .sort_by_key(|info| info.member_info.member_id);
     }
 }
 
-/// Total, deterministic ordering used to pick the canonical `MemberInfo` when
-/// two signed records for the SAME member collide (#411 round 4 item B).
+/// Deterministic ordering used to pick the canonical `MemberInfo` when two
+/// signed records for the SAME member collide (#411 round 4 item B).
 ///
 /// Rule: **higher `version` wins; at equal version, the greater SIGNATURE DIGEST
 /// wins.** Two records with the same member and version but different content
@@ -102,7 +130,18 @@ impl MemberInfoV1 {
 /// deterministically. (Before freenet/river#571 the tiebreak compared raw
 /// signature bytes; the winner in a tie therefore changed with that PR, which is
 /// safe because every peer applies the same rule and the change re-keys the
-/// contract. See [`sig_digest`].)
+/// contract. See [`SigDigest`].)
+///
+/// This is a total ORDER on the returned `(version, digest)` pair, but only a
+/// total PREORDER on records: two distinct records rank equal exactly when their
+/// signatures collide under [`SigDigest`]. That tie is the dangerous case, not a
+/// benign one — see [`SigDigest`] for what a tie does to anti-entropy and for the
+/// 128-bit bound that is what actually keeps ties out of reach. "Records never
+/// tie" is a cryptographic property here, not a structural guarantee, so the
+/// three selectors that consume this order ([`MemberInfoV1::canonical`],
+/// [`MemberInfoV1::dedup_to_canonical`], and `apply_delta`) are nevertheless
+/// written to break a tie the SAME way (keep the first, i.e. replace only on
+/// strict `>`).
 ///
 /// It is applied IDENTICALLY in [`ComposableState::apply_delta`] (conflict
 /// resolution), [`ComposableState::delta`], and [`ComposableState::summarize`]
@@ -111,43 +150,109 @@ impl MemberInfoV1 {
 /// Without it, equal-version resolution was order-dependent AND the summary
 /// carried only the version, so anti-entropy saw "same version", sent no
 /// correction, and peers disagreed on ban authority permanently.
-fn member_info_rank(version: u32, signature: &Signature) -> (u32, u64) {
+fn member_info_rank(version: u32, signature: &Signature) -> (u32, SigDigest) {
     (version, sig_digest(signature))
 }
 
-/// Collision-resistant 64-bit digest of a signature, used as the equal-version
-/// tiebreak discriminator in [`member_info_rank`] and stored in the summary.
+/// 16-byte BLAKE3 digest of a signature: the equal-version tiebreak
+/// discriminator in [`member_info_rank`], and the value [`MemberInfoV1`]'s
+/// summary carries per member.
 ///
-/// WHY A DIGEST AND NOT THE SIGNATURE (freenet/river#571): the summary carried
-/// the raw 64-byte `Signature` per member, which at ~470 members was ~84% of
-/// the summary's bytes and made the whole room summary ~29 KB. That summary is
-/// re-sent on every state change to every interested peer, and measured as the
-/// largest single consumer of outbound bytes on the Freenet network (49.8%).
-/// The signature is never verified here — it is only ever compared for equality
-/// and ordering — so a digest serves the identical purpose at 1/8 the size.
+/// WHY A DIGEST AND NOT THE SIGNATURE (freenet/river#571, landed as PR #572;
+/// every "#571" elsewhere in this file is that ISSUE, not the PR): the summary carried
+/// the raw 64-byte `Signature` per member — 66 of ~78 CBOR bytes per entry, 84%
+/// of it. That summary is re-sent on every state change to every interested
+/// peer, and `interest_sync_summaries` was measured as the largest single
+/// consumer of outbound bytes on the Freenet network (49.8%). The signature is
+/// never verified here — it is only ever compared for equality and ordering — so
+/// a digest serves the identical purpose. Measured through the real `summarize()`
+/// on 470 entries with realistic `MemberId`s: ~78 → 28.0 CBOR bytes per entry. A
+/// 64-bit digest would be exactly 8 bytes per entry cheaper; the next paragraph
+/// is why those 8 bytes are bought deliberately. Pinned by
+/// `member_info_summary_stays_small_per_entry`.
+///
+/// The 29.1 KB mean `interest_sync_summaries` message that motivated #571 is a
+/// FLEET-WIDE mean across all rooms, so it is not this room's own summary size
+/// and the two figures must not be multiplied together: at the Official room's
+/// ~470 records the member_info term ALONE came to ~37 KB, which is larger than
+/// the fleet mean because that mean also averages in many far smaller rooms. No
+/// per-room summary measurement is on record, so no claim is made about what any
+/// single room's total summary weighed before this change.
+///
+/// WHY 128 BITS AND NOT 64: a collision here is not cosmetic, and it is not
+/// self-correcting. Two same-version records whose discriminators tie are
+/// INDISTINGUISHABLE to anti-entropy — `summarize` advertises an identical
+/// `(version, digest)` on both peers, `delta` filters on strict `>` so neither
+/// peer ever offers its record to the other, `apply_delta` replaces only on
+/// strict `>` so each keeps whichever arrived first, and full-state merge does
+/// not rescue it either (freenet-scaffold implements `merge` as summarize →
+/// delta → apply_delta). The two halves of the network then disagree
+/// permanently and SILENTLY on that member's `deputies`, i.e. on who may ban
+/// whom (#411 round 4 B is the bug that added this discriminator in the first
+/// place). A member SELF-SIGNS their own record and has unlimited grinding
+/// entropy for it — `preferred_nickname` is free-form and `deputies` entries
+/// are never validated for membership — so the attacker controls BOTH sides of
+/// the comparison: at 64 bits that is a ~2^32 birthday search, which is hours on
+/// commodity hardware. 128 bits puts it at ~2^64.
+///
+/// This mirrors [`crate::room_state::direct_messages::PurgeToken`], which
+/// derives a 16-byte BLAKE3 value from a signature for the same reason under a
+/// strictly WEAKER threat model (there the attacker cannot influence the other
+/// side of the comparison, and it still chose 128 bits). The two are
+/// deliberately NOT factored into a shared helper: each is an independent
+/// wire-format commitment — `PurgeToken`'s bytes live in stored state, these
+/// live in the summary — and they must stay free to evolve separately.
 ///
 /// WHY BLAKE3 AND NOT `freenet_scaffold::util::fast_hash`: `fast_hash` is a
-/// base-31 polynomial, which is fine for the accidental collisions `MessageId`
-/// and `BanId` care about but is trivially collidable by construction. A
-/// collision here is not cosmetic — two same-version records whose discriminators
-/// tie are indistinguishable to anti-entropy, so peers would silently and
-/// permanently disagree on that member's `deputies`, i.e. on ban authority
-/// (#411 round 4 B is the bug that added the discriminator in the first place).
-/// A member self-signs their own record, so they could otherwise mint colliding
-/// pairs at will. blake3 removes that.
+/// base-31 polynomial, fine for the accidental collisions `MessageId` and
+/// `BanId` care about but trivially collidable by construction, which would
+/// price the attack above at roughly nothing regardless of its width.
 ///
-/// Determinism is load-bearing: freenet-core byte-compares `summarize_state`
-/// output for staleness, so this must be a fixed, endianness-explicit function
-/// of the signature bytes and must never change without re-keying the contract.
-/// `from_le_bytes` pins the byte order. See
+/// WIRE FORMAT, load-bearing in two ways. freenet-core byte-compares
+/// `summarize_state` output for staleness, so this must be a fixed function of
+/// the signature bytes; and the digest orders the records, so every peer must
+/// derive the same bytes and compare them the same way. Both are pinned by
+/// `sig_digest_golden_vector`:
+///
+/// - the digest is the FIRST 16 bytes of `blake3(signature.to_bytes())`, kept in
+///   their natural order — there is no integer conversion, hence no endianness
+///   decision to get wrong (the 64-bit form needed `from_le_bytes` for this);
+/// - ordering is plain lexicographic over those bytes (the derived `Ord`);
+/// - it serializes as a CBOR byte string (17 bytes), via the hand-written
+///   `Serialize` below rather than the derive, which would emit a 16-element
+///   CBOR array at 32 bytes and undo most of the saving.
+///
+/// None of the three may change without re-keying the contract. See
 /// `.claude/rules/contract-summary-determinism.md` and freenet/freenet-core#4857.
-fn sig_digest(signature: &Signature) -> u64 {
-    let hash = blake3::hash(&signature.to_bytes());
-    u64::from_le_bytes(
-        hash.as_bytes()[..8]
-            .try_into()
-            .expect("blake3 digest is 32 bytes, so the first 8 always exist"),
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SigDigest(pub [u8; 16]);
+
+impl Serialize for SigDigest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SigDigest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = <Vec<u8>>::deserialize(deserializer)?;
+        let arr: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+            serde::de::Error::custom(format!(
+                "expected 16-byte SigDigest, got {} bytes",
+                bytes.len()
+            ))
+        })?;
+        Ok(SigDigest(arr))
+    }
+}
+
+/// The [`SigDigest`] of `signature`. See that type for the threat model, why the
+/// width is 128 bits, and the wire-format commitments this function makes.
+fn sig_digest(signature: &Signature) -> SigDigest {
+    let digest = blake3::hash(signature.to_bytes().as_ref());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    SigDigest(out)
 }
 
 impl ComposableState for MemberInfoV1 {
@@ -158,9 +263,10 @@ impl ComposableState for MemberInfoV1 {
     /// at the SAME version (#411 B).
     ///
     /// This was `(u32, Signature)` until freenet/river#571. The raw 64-byte
-    /// signature was ~84% of each entry and made the room summary ~29 KB, which
-    /// is re-sent to every interested peer on every state change. See
-    /// [`sig_digest`] for why a digest is sufficient and why it is blake3.
+    /// signature was 66 of ~78 CBOR bytes per entry (84%), and this summary is
+    /// re-sent to every interested peer on every state change. See [`SigDigest`]
+    /// for why a digest is sufficient, why it is 128-bit blake3 rather than 64,
+    /// and why it serializes as a CBOR byte string.
     ///
     /// BTreeMap (not HashMap) so the ciborium-serialized summary bytes are
     /// deterministic: freenet-core byte-compares `summarize_state` output for
@@ -168,7 +274,7 @@ impl ComposableState for MemberInfoV1 {
     /// two identical member_info sets summarize to different bytes → spurious
     /// anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
     /// and freenet/freenet-core#4857.
-    type Summary = BTreeMap<MemberId, (u32, u64)>;
+    type Summary = BTreeMap<MemberId, (u32, SigDigest)>;
     type Delta = Vec<AuthorizedMemberInfo>;
     type Parameters = ChatRoomParametersV1;
 
@@ -227,13 +333,14 @@ impl ComposableState for MemberInfoV1 {
         _parent_state: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        // Carry the signature alongside the version so anti-entropy can detect a
-        // SAME-version content difference and correct it (#411 round 4 B).
+        // Carry the signature DIGEST alongside the version so anti-entropy can
+        // detect a SAME-version content difference and correct it (#411 round
+        // 4 B).
         //
         // Fold keeping the HIGHEST-`member_info_rank` record per member (#411
         // round 7 / Codex P1 #3), NOT a plain `.collect()` (which keeps whichever
         // duplicate was iterated LAST). If a state holds two records for one
-        // member, the advertised `(version, signature)` MUST match the record
+        // member, the advertised `(version, digest)` MUST match the record
         // `deputies_of` enforces on, or a peer with a different duplicate set
         // would advertise a different summary and anti-entropy would never
         // reconcile. Migration-safe: `verify` still accepts duplicates.
@@ -506,6 +613,169 @@ mod tests {
 
     fn create_test_member_info(member_id: MemberId) -> MemberInfo {
         MemberInfo::new_public(member_id, 1, "TestUser".to_string())
+    }
+
+    /// GOLDEN VECTOR for [`SigDigest`] — ONE fixed signature, ONE fixed expected
+    /// digest, ONE fixed expected CBOR encoding.
+    ///
+    /// This pins the four things a peer must agree with every other peer on, and
+    /// which cannot change without re-keying the contract: that the hash is
+    /// blake3 over `signature.to_bytes()`, that the digest is the FIRST 16 bytes
+    /// of it, that those bytes are kept in their natural order, and that the
+    /// value serializes as a 17-byte CBOR byte string rather than a 32-byte CBOR
+    /// array.
+    ///
+    /// WHY A FIXED VECTOR AND NOT ONLY THE EXISTING ORACLES: every other check
+    /// on the digest — `deputy_ban_test`'s winner oracles and `room_data`'s
+    /// key-search fixture — compares digests of RANDOMLY-keyed signatures. A
+    /// change to the byte order leaves those comparisons agreeing about half the
+    /// time, i.e. an INTERMITTENT detector, which this project treats as a broken
+    /// one. Measured: with the digest bytes reversed, those oracles passed 11 of
+    /// 30 runs. A fixed input makes the detection deterministic. (Byte order was
+    /// a live risk while the digest was a `u64` built with `from_le_bytes`; the
+    /// `[u8; 16]` form removes the conversion, but "which 16 bytes, in what
+    /// order" still has to be pinned, and the encoding certainly does.)
+    ///
+    /// The expected bytes were produced with the `b3sum` 1.8.3 CLI, outside this
+    /// crate, rather than by running the code under test:
+    ///   `printf '%b' "\x00\x01...\x3f" | b3sum` →
+    ///   `4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98`.
+    /// That is a separate binary but the same reference BLAKE3 implementation
+    /// the `blake3` crate wraps, so this pins OUR choices (which hash, which
+    /// bytes, what order, what encoding) — it is not an independent check that
+    /// BLAKE3 itself is correct, and is not claimed to be.
+    #[test]
+    fn sig_digest_golden_vector() {
+        // Bytes 0x00..=0x3f. `Signature::from_bytes` is infallible and does not
+        // validate the encoded point, and `to_bytes` returns these bytes back
+        // unchanged, so the digest input is exactly this fixed array.
+        let mut raw = [0u8; 64];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let signature = Signature::from_bytes(&raw);
+        assert_eq!(
+            signature.to_bytes(),
+            raw,
+            "precondition: the fixture signature must round-trip to the bytes hashed"
+        );
+
+        const EXPECTED: [u8; 16] = [
+            0x4e, 0xed, 0x71, 0x41, 0xea, 0x4a, 0x5c, 0xd4, 0xb7, 0x88, 0x60, 0x6b, 0xd2, 0x3f,
+            0x46, 0xe2,
+        ];
+
+        let digest = sig_digest(&signature);
+        assert_eq!(
+            digest.0, EXPECTED,
+            "sig_digest changed. This is a WIRE-FORMAT and ORDERING change: every \
+             peer derives the tiebreak discriminator with this exact function, and \
+             freenet-core byte-compares summarize_state output for staleness. If \
+             the change is intended it re-keys the room contract — follow the \
+             migration ritual and update this vector deliberately."
+        );
+
+        // Reversing the digest bytes must be observably different, so the vector
+        // genuinely constrains ORDER and not merely the multiset of bytes.
+        let mut reversed = EXPECTED;
+        reversed.reverse();
+        assert_ne!(
+            digest.0, reversed,
+            "the golden vector must distinguish byte order"
+        );
+
+        // The encoding is the other half of the commitment: a CBOR byte string
+        // (major type 2, length 16 => header 0x50) at 17 bytes total. The derived
+        // Serialize would emit a 16-element CBOR array at 32 bytes, undoing most
+        // of the saving freenet/river#571 exists for.
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&digest, &mut encoded).expect("serialize SigDigest");
+        let mut want = vec![0x50u8];
+        want.extend_from_slice(&EXPECTED);
+        assert_eq!(
+            encoded, want,
+            "SigDigest must serialize as a 17-byte CBOR byte string"
+        );
+
+        // And it must survive the round-trip the contract actually performs
+        // (summarize_state serializes; get_state_delta deserializes).
+        let decoded: SigDigest =
+            ciborium::de::from_reader(encoded.as_slice()).expect("deserialize SigDigest");
+        assert_eq!(
+            decoded, digest,
+            "SigDigest must round-trip through ciborium"
+        );
+    }
+
+    /// The three selectors of "the canonical record" must break a rank TIE the
+    /// same way. [`SigDigest`] makes a tie between DISTINCT records infeasible to
+    /// mint, but two byte-identical duplicates of the SAME record tie trivially,
+    /// and `Iterator::max_by_key` (which `canonical` used before) returns the
+    /// LAST maximum while `dedup_to_canonical` and `apply_delta` keep the FIRST.
+    /// Left disagreeing, a state holding duplicates would answer `deputies_of`
+    /// one way on a freshly-GET'd full state and the other way after the next
+    /// `apply_delta` ran dedup.
+    /// The two records are built with `with_signature` so they share a signature
+    /// while carrying DIFFERENT `deputies`. That is exactly what a [`SigDigest`]
+    /// collision would look like to these two functions, which are pure
+    /// orderings and never verify a signature — and it is the only way to reach
+    /// the tie branch without actually finding a 128-bit collision. Records built
+    /// the normal way cannot be used here: ed25519 signing is deterministic and
+    /// covers the whole `MemberInfo`, so two records that tie on rank are
+    /// byte-identical, and the assertion would hold under either tie direction.
+    #[test]
+    fn canonical_and_dedup_break_rank_ties_identically() {
+        let mut csprng = OsRng;
+        let member_sk = SigningKey::generate(&mut csprng);
+        let member_id = MemberId::from(&member_sk.verifying_key());
+        let other_id = MemberId::from(&SigningKey::generate(&mut csprng).verifying_key());
+
+        let signed = AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(member_id, 1, "Tie".to_string()),
+            &member_sk,
+        );
+        let shared_signature = signed.signature;
+
+        let mut with_deputy = MemberInfo::new_public(member_id, 1, "Tie".to_string());
+        with_deputy.deputies = vec![other_id];
+
+        let first = AuthorizedMemberInfo::with_signature(
+            MemberInfo::new_public(member_id, 1, "Tie".to_string()),
+            shared_signature,
+        );
+        let second = AuthorizedMemberInfo::with_signature(with_deputy, shared_signature);
+
+        assert_ne!(first, second, "precondition: the records must differ");
+        assert_eq!(
+            member_info_rank(first.member_info.version, &first.signature),
+            member_info_rank(second.member_info.version, &second.signature),
+            "precondition: the records must nevertheless tie on rank"
+        );
+
+        let mut state = MemberInfoV1 {
+            member_info: vec![first.clone(), second],
+        };
+        let picked = state.canonical(member_id).cloned();
+        state.dedup_to_canonical();
+
+        assert_eq!(
+            state.member_info.len(),
+            1,
+            "dedup must collapse the tied duplicate"
+        );
+        assert_eq!(
+            picked.as_ref(),
+            state.member_info.first(),
+            "canonical() and dedup_to_canonical() must keep the SAME record on a tie \
+             (`max_by_key` keeps the LAST maximum, dedup keeps the FIRST — using both \
+              makes deputies_of flip after an unrelated apply_delta)"
+        );
+        // Both keep the FIRST record in vector order (replace only on strict `>`).
+        assert_eq!(
+            picked.as_ref(),
+            Some(&first),
+            "the tie must keep the first record"
+        );
     }
 
     /// LOAD-BEARING regression test (issue #410).
@@ -928,9 +1198,9 @@ mod tests {
         let delta = member_info_v1.delta(&parent_state, &parameters, &BTreeMap::new());
         assert_eq!(delta.unwrap().len(), 5);
 
-        // Test when all members are old with the same (version, signature) —
+        // Test when all members are old with the same (version, digest) —
         // nothing outranks the summary, so the delta is empty (#411 round 4 B).
-        let old_summary: BTreeMap<MemberId, (u32, u64)> = member_infos
+        let old_summary: BTreeMap<MemberId, (u32, SigDigest)> = member_infos
             .iter()
             .map(|info| {
                 (
@@ -1283,12 +1553,12 @@ mod tests {
                 "deputies_of must return the v2 (revoke) result ({label})"
             );
 
-            // Anti-entropy advertises the highest-rank (version, signature).
+            // Anti-entropy advertises the highest-rank (version, digest).
             let summary = state.summarize(&parent_state, &parameters);
             assert_eq!(
                 summary.get(&member_id).copied(),
                 Some(revoke_summary_value),
-                "summarize must advertise the v2 (revoke) (version, signature) ({label})"
+                "summarize must advertise the v2 (revoke) (version, digest) ({label})"
             );
         }
     }
