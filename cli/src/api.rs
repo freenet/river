@@ -3399,7 +3399,7 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         message_content: String,
         signing_key: &SigningKey,
-    ) -> Result<()> {
+    ) -> Result<river_core::room_state::message::MessageId> {
         info!(
             "Sending message (with explicit key) to room owned by: {}",
             bs58::encode(room_owner_key.as_bytes()).into_string()
@@ -3449,6 +3449,8 @@ impl ApiClient {
         // Sign the message
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, signing_key);
+        // Captured before `auth_message` moves into the delta below.
+        let sent_message_id = auth_message.id();
 
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, member_info_delta) =
@@ -3514,7 +3516,9 @@ impl ApiClient {
         match response {
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
                 info!("Message sent successfully to contract: {}", key.id());
-                Ok(())
+                // Hand back the new message's ID so callers can act on their own
+                // message later -- editing, deleting, or checking it is still there.
+                Ok(sent_message_id)
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }
@@ -3524,7 +3528,7 @@ impl ApiClient {
         &self,
         room_owner_key: &VerifyingKey,
         message_content: String,
-    ) -> Result<()> {
+    ) -> Result<river_core::room_state::message::MessageId> {
         info!(
             "Sending message to room owned by: {}",
             bs58::encode(room_owner_key.as_bytes()).into_string()
@@ -3569,6 +3573,8 @@ impl ApiClient {
         // Sign the message
         let auth_message =
             river_core::room_state::message::AuthorizedMessageV1::new(message, &signing_key);
+        // Captured before `auth_message` moves into the delta below.
+        let sent_message_id = auth_message.id();
 
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, member_info_delta) =
@@ -3633,7 +3639,9 @@ impl ApiClient {
         match response {
             HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
                 info!("Message sent successfully to contract: {}", key.id());
-                Ok(())
+                // Hand back the new message's ID so callers can act on their own
+                // message later -- editing, deleting, or checking it is still there.
+                Ok(sent_message_id)
             }
             _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }

@@ -136,7 +136,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                     .map_err(|e| anyhow::anyhow!("Invalid room ID: {}", e))?;
 
             // Send the message - use explicit signing key if provided, otherwise use storage
-            if let Some(signing_key_str) = signing_key {
+            let sent_message_id = if let Some(signing_key_str) = signing_key {
                 // Parse signing key (base64-encoded)
                 let signing_key_bytes = base64::engine::general_purpose::STANDARD
                     .decode(&signing_key_str)
@@ -159,15 +159,23 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
 
                 // Send using the provided signing key (fetches room state from network)
                 api.send_message_with_key(&room_owner_key, message.clone(), &signing_key)
-                    .await?;
+                    .await?
             } else {
                 // Send using signing key from local storage
-                api.send_message(&room_owner_key, message.clone()).await?;
-            }
+                api.send_message(&room_owner_key, message.clone()).await?
+            };
 
             match format {
-                OutputFormat::Human => println!("Message sent successfully"),
-                OutputFormat::Json => println!(r#"{{"status":"success","message":"sent"}}"#),
+                OutputFormat::Human => {
+                    println!("Message sent successfully (id: {})", sent_message_id.0 .0)
+                }
+                // Same inner-i64 form `message list` prints and `message delete`
+                // accepts, so a caller can retract its own message without a
+                // round trip to find it.
+                OutputFormat::Json => println!(
+                    r#"{{"status":"success","message":"sent","message_id":"{}"}}"#,
+                    sent_message_id.0 .0
+                ),
             }
             Ok(())
         }
@@ -617,6 +625,31 @@ mod tests {
         assert!(
             squashed.contains(r#""reactors":reactors,"#),
             "message list must expose who reacted, not only a count"
+        );
+    }
+
+    /// `message send` must return the new message's ID for the same reason
+    /// `message reply` does: a caller that posts a notice needs to retract it
+    /// once it stops being relevant, and only the author may delete a message.
+    #[test]
+    fn send_json_returns_the_new_message_id() {
+        let source = include_str!("message.rs");
+        let production = source
+            .split_once("mod tests")
+            .map(|(before, _)| before)
+            .expect("test module marker missing; the cut would scan everything");
+        let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squashed.contains(r#""status":"success","message":"sent""#),
+            "send JSON arm not found; the pin would pass vacuously"
+        );
+        assert!(
+            squashed.contains(r#""message":"sent","message_id":"{}""#),
+            "send must return message_id"
+        );
+        assert!(
+            squashed.contains("sent_message_id.0.0"),
+            "send must emit the inner i64, matching what `message delete` accepts"
         );
     }
 
