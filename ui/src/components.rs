@@ -97,6 +97,8 @@ mod volatile_value_binding_audit {
         r#"components/conversation.rs <textarea> "{edit_text}""#,
         r#"components/conversation/message_input.rs <textarea> "{message_text}""#,
         r#"components/direct_messages/dm_thread_modal.rs <textarea> "{draft.read()}""#,
+        r#"components/direct_messages/invite_contact_picker_modal.rs <input> "{query_value}""#,
+        r#"components/direct_messages/invite_contact_picker_modal.rs <textarea> "{personal_message_value}""#,
         r#"components/direct_messages/invite_via_dm_picker_modal.rs <textarea> "{personal_message_value}""#,
         r#"components/members.rs <textarea> "{token_input}""#,
         r#"components/members/member_info_modal/nickname_field.rs <input> "{temp_nickname}""#,
