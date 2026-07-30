@@ -456,6 +456,9 @@ fn CopyButton(value: String, testid: String, label: String) -> Element {
 /// every keystroke (freenet/river#564) that would be per-character work on the
 /// typing path. It is only ever needed twice: to seed the editing signal when
 /// the field mounts, and to revert a save the privacy guard refuses.
+///
+/// Must not call any hook: it runs inside `use_signal`'s initializer, which
+/// evaluates while the scope's hook list is mutably borrowed.
 fn stored_description(config: &Configuration) -> String {
     let owner_key = CURRENT_ROOM.read().owner_key;
     let secrets = ROOMS
@@ -613,13 +616,20 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                 // rendered string is unchanged (dioxus-core
                 // `diff/node.rs:463`), and the interpreter then assigns
                 // `node.value = value` whenever the live DOM value differs
-                // (`set_attribute.ts:31`). This component reads CURRENT_ROOM
-                // and ROOMS in its body, so it re-renders on EVERY room-state
-                // write. With `onchange` alone the signal still held the
-                // pre-typing text, so each of those re-renders reset the
+                // (`set_attribute.ts:31`). With `onchange` alone the signal
+                // still held the pre-typing text, so each re-render reset the
                 // textarea and the owner lost whatever they had typed but not
                 // yet committed. Tracking the live value makes the re-write a
                 // no-op, which is why the sibling name field never had this.
+                //
+                // As shipped, the re-render came on every room-state write:
+                // this component read CURRENT_ROOM and ROOMS in its render
+                // body. It no longer does (that moved into
+                // `stored_description`, called from the `use_signal` seed), so
+                // today the trigger is a `config`/`is_owner` prop change. The
+                // handler is required either way: `oninput` makes the field
+                // correct under ANY re-render, which is the point, since the
+                // trigger is never local to the component.
                 // Guarded like `update_description` below. The field is
                 // `disabled` for non-owners so this cannot fire from real
                 // input, but leaving the signal un-tracked for them is the

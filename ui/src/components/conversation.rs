@@ -3891,6 +3891,7 @@ pub fn Conversation() -> Element {
                                     }
                                     if let Some(desc_html) = current_room_description_html.read().as_ref() {
                                         div {
+                                            "data-testid": "room-header-description",
                                             class: "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted truncate [&>p]:m-0 [&>p]:inline",
                                             dangerous_inner_html: "{desc_html}"
                                         }

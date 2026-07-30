@@ -228,25 +228,34 @@ textarea {
 
 Nothing about the broken call site looks wrong, and reasoning about the
 component in isolation will not reveal it: the trigger is whatever unrelated
-signal that component happens to read. `RoomDescriptionField` reads
+signal that component happens to read. `RoomDescriptionField` read
 `CURRENT_ROOM` and `ROOMS` in its render body, so every room-state write
 re-rendered it, and the owner's half-typed room description vanished
-(freenet/river#564). There is no single timer behind that cadence: the
+(freenet/river#564). It no longer reads them there, so today the trigger is a
+prop change instead. That is exactly why the handler is the fix rather than
+removing the subscription: `oninput` makes a field correct under ANY
+re-render, and the trigger is never local to the component. There is no single
+timer behind that cadence either: the
 recurring ROOMS writers are the ~60 s idle liveness probe whose GET reply
 merges unconditionally, the ~21 s `ProcessRooms` loop while a room awaits
 subscription, and every subscription `UpdateNotification`. Do not go looking
 for one interval to blame.
 
-**This is the documented exception to the `defer()` rule above.** A controlled
-input's bound signal must be written SYNCHRONOUSLY from `oninput`. Deferring it
-lags the DOM by a `setTimeout(0)`, so a re-render landing in that window writes
-the pre-keystroke value back and drops characters, which is the very bug this
-section exists to prevent. The rule above targets GLOBAL signals (`ROOMS`,
-`CURRENT_ROOM`, ...) with external subscribers; `util.rs`'s
-`event_handlers_never_write_a_global_signal_without_defer` pin is scoped to
-those deliberately and does not match `oninput`. Local `use_signal` handles
-have no external subscribers and are set directly. See also the note at
-`members.rs`'s import-token `oninput`.
+**This is the documented exception to the `defer()` rule above, and it is
+narrow.** A controlled input's bound LOCAL signal must be written
+SYNCHRONOUSLY from `oninput`. Deferring it lags the DOM by a `setTimeout(0)`,
+so a re-render landing in that window writes the pre-keystroke value back and
+drops characters, which is the very bug this section exists to prevent.
+
+The exception covers local `use_signal` handles only. They have no external
+subscribers, which is why `util.rs`'s
+`event_handlers_never_write_a_global_signal_without_defer` does not object to
+them. It is NOT a blanket `oninput` exemption: that pin does scan `oninput:`
+(both inline closures and named handlers) and still requires `defer()` around a
+write to a GLOBAL signal such as `ROOMS` or `CURRENT_ROOM`. If you need a
+keystroke to reach global state, track the local signal synchronously and
+defer the global write. See also the note at `members.rs`'s import-token
+`oninput`.
 
 Display-only controls may bind `value:` with no `oninput`, but must declare
 themselves with a literal `readonly: true` (or `readonly: "true"`). A

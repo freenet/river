@@ -77,21 +77,23 @@ mod volatile_value_binding_audit {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    /// Elements whose `value` (or `option`'s `selected`) dioxus marks volatile.
+    /// Elements carrying a volatile attribute. Which attribute differs:
+    /// `input`/`select`/`textarea` mark `value`, `option` marks `selected`
+    /// (its `value` is NOT volatile) - dioxus-html `elements.rs:1488,1536,1571,1594`.
     const VOLATILE_ELEMENTS: [&str; 4] = ["input", "textarea", "select", "option"];
 
     /// Every editable volatile binding in `ui/src`, as
-    /// `path <element> value-expression`.
+    /// `path <element> bound-expression`.
     ///
-    /// This is pinned as an EXACT SET, not a count with slack. A loose
-    /// threshold is how a scanner rots silently: if a future edit makes a file
-    /// (or a whole region of one) invisible to the scan, its entries simply
-    /// disappear and a `>=` floor keeps passing with the fields it was written
-    /// to protect no longer covered. An exact set turns that into a loud diff.
+    /// Pinned as an EXACT SET, not a count with slack. A loose threshold is how
+    /// a scanner rots silently: if a future edit makes a file (or a region of
+    /// one) invisible to the scan, its entries simply disappear and a `>=`
+    /// floor keeps passing with the fields it was written to protect no longer
+    /// covered. An exact set turns that into a loud diff.
     ///
-    /// Adding a form control to the UI is expected to fail this test. Add the
-    /// line, having first confirmed the control handles `oninput`.
-    const EXPECTED_EDITABLE: [&str; 14] = [
+    /// Adding a form control is EXPECTED to fail this test. Add the line, once
+    /// you have confirmed the control handles `oninput`.
+    const EXPECTED_EDITABLE: &[&str] = &[
         r#"components/conversation.rs <textarea> "{edit_text}""#,
         r#"components/conversation/message_input.rs <textarea> "{message_text}""#,
         r#"components/direct_messages/dm_thread_modal.rs <textarea> "{draft.read()}""#,
@@ -108,18 +110,32 @@ mod volatile_value_binding_audit {
         r#"components/room_list/room_name_field.rs <input> "{room_name}""#,
     ];
 
-    /// Read-only display controls, same pinning rationale.
-    const EXPECTED_DISPLAY_ONLY: usize = 8;
+    /// Read-only display controls, pinned exactly for the same reason: a bare
+    /// count cannot say WHICH one changed.
+    const EXPECTED_DISPLAY_ONLY: &[&str] = &[
+        r#"components/conversation/not_member_notification.rs <input> "{encoded_key}""#,
+        r#"components/members.rs <textarea> "{token_text}""#,
+        r#"components/members/invite_member_modal.rs <input> invitation_code"#,
+        r#"components/members/invite_member_modal.rs <input> invitation_url"#,
+        r#"components/members/member_info_modal.rs <input> "{member_id_str}""#,
+        r#"components/room_list/edit_room_modal.rs <input> "{bs58::encode(room_data.owner_vk.as_bytes()).into_string()}""#,
+        r#"components/room_list/edit_room_modal.rs <input> "{room_data.contract_key.id()}""#,
+        r#"components/room_list/edit_room_modal.rs <input> "{secret_version}""#,
+    ];
 
     // ---------------------------------------------------------------- lexing
 
     /// Per-character classification of a Rust source file.
     ///
-    /// Brace depth must be tracked outside comments AND string literals, or a
-    /// `{` in a class string or a `//` in a URL corrupts every block boundary
-    /// after it. Attribute TEXT keeps string literals (they are the values)
-    /// but drops comments, or a doc comment sitting above an attribute is
-    /// glued onto the front of it and the attribute name no longer parses.
+    /// Brace depth must be tracked outside comments, string literals AND char
+    /// literals, or a `{` in a class string, a `//` in a URL, or a `'"'` in a
+    /// match arm corrupts every block boundary after it. A missing char-literal
+    /// arm is not hypothetical: `conversation.rs` matches on `'"'`, which flips
+    /// string/code polarity for the rest of the file and silently un-audits it.
+    ///
+    /// Attribute TEXT keeps string literals (they are the values) but drops
+    /// comments, or a doc comment above an attribute is glued onto the front of
+    /// it and the attribute name no longer parses.
     struct Lexed {
         chars: Vec<char>,
         in_comment: Vec<bool>,
@@ -143,18 +159,36 @@ mod volatile_value_binding_audit {
                     }
                     i = j;
                 } else if c == '/' && i + 1 < n && chars[i + 1] == '*' {
+                    // Rust block comments nest.
+                    let mut depth = 0usize;
                     let mut j = i;
                     while j < n {
-                        in_comment[j] = true;
-                        if j > i && chars[j - 1] == '*' && chars[j] == '/' {
-                            j += 1;
-                            break;
+                        if chars[j] == '/' && j + 1 < n && chars[j + 1] == '*' {
+                            depth += 1;
+                            in_comment[j] = true;
+                            in_comment[j + 1] = true;
+                            j += 2;
+                            continue;
                         }
+                        if chars[j] == '*' && j + 1 < n && chars[j + 1] == '/' {
+                            in_comment[j] = true;
+                            in_comment[j + 1] = true;
+                            j += 2;
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        in_comment[j] = true;
                         j += 1;
                     }
                     i = j;
-                } else if c == 'r' && i + 1 < n && (chars[i + 1] == '"' || chars[i + 1] == '#') {
-                    // Raw string: r"..." / r#"..."# / r##"..."##
+                } else if (c == 'r' || c == 'b')
+                    && i + 1 < n
+                    && (chars[i + 1] == '"' || chars[i + 1] == '#')
+                {
+                    // Raw / byte string: r"..", r#".."#, b"..".
                     let mut hashes = 0;
                     let mut k = i + 1;
                     while k < n && chars[k] == '#' {
@@ -163,16 +197,12 @@ mod volatile_value_binding_audit {
                     }
                     if k < n && chars[k] == '"' {
                         let mut j = k + 1;
-                        loop {
-                            if j >= n {
+                        while j < n {
+                            if chars[j] == '"'
+                                && (1..=hashes).all(|h| chars.get(j + h) == Some(&'#'))
+                            {
+                                j += hashes + 1;
                                 break;
-                            }
-                            if chars[j] == '"' {
-                                let closed = (1..=hashes).all(|h| chars.get(j + h) == Some(&'#'));
-                                if closed {
-                                    j += hashes + 1;
-                                    break;
-                                }
                             }
                             j += 1;
                         }
@@ -200,6 +230,33 @@ mod volatile_value_binding_audit {
                         *s = true;
                     }
                     i = j;
+                } else if c == '\'' {
+                    // Char literal, or a lifetime (`&'static str`), which is
+                    // ordinary code. An escape always means a literal;
+                    // otherwise it is only a literal if a quote closes it
+                    // immediately.
+                    let escaped = chars.get(i + 1) == Some(&'\\');
+                    let single = chars.get(i + 2) == Some(&'\'');
+                    if escaped || single {
+                        let mut j = i + 1;
+                        while j < n {
+                            if chars[j] == '\\' {
+                                j += 2;
+                                continue;
+                            }
+                            if chars[j] == '\'' {
+                                j += 1;
+                                break;
+                            }
+                            j += 1;
+                        }
+                        for s in in_string.iter_mut().take(j.min(n)).skip(i) {
+                            *s = true;
+                        }
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
                 } else {
                     i += 1;
                 }
@@ -221,28 +278,57 @@ mod volatile_value_binding_audit {
                 .enumerate()
                 .all(|(k, c)| self.chars.get(i + k) == Some(&c))
         }
+
+        /// The identifier immediately preceding `i` in CODE (comments and
+        /// strings skipped), used to tell rsx `input {` from `match input {`.
+        fn prev_code_ident(&self, i: usize) -> String {
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                if self.is_code(j) && !self.chars[j].is_whitespace() {
+                    break;
+                }
+                if j == 0 {
+                    return String::new();
+                }
+            }
+            let mut ident: Vec<char> = Vec::new();
+            let mut k = j as isize;
+            while k >= 0 {
+                let idx = k as usize;
+                let ch = self.chars[idx];
+                if self.is_code(idx) && (ch.is_alphanumeric() || ch == '_') {
+                    ident.push(ch);
+                    k -= 1;
+                } else {
+                    break;
+                }
+            }
+            ident.reverse();
+            ident.into_iter().collect()
+        }
     }
 
     // -------------------------------------------------------- cfg(test) cull
 
-    /// Remove `#[cfg(test)]` ITEMS, wherever they appear.
+    /// Blank out `#[cfg(test)]` ITEMS wherever they appear, PRESERVING LINE
+    /// NUMBERS so reported positions match the real file.
     ///
     /// Deliberately not `src.find("#[cfg(test)]")` and not
     /// `find("#[cfg(test)]\nmod tests {")`. The first is the trap
     /// `conversation.rs` and `members.rs` both document: the first occurrence
-    /// there is a test-only HELPER function a thousand lines up, so cutting at
-    /// it discards most of the file. Those pins assert a needle is PRESENT, so
-    /// an over-short slice fails loudly for them; this audit asserts a needle
-    /// is ABSENT, so an over-short slice passes SILENTLY. The polarity is
-    /// reversed and the heuristic does not carry over.
+    /// there is a test-only HELPER a thousand lines up, so cutting at it
+    /// discards most of the file. Those pins survive it because they assert a
+    /// needle is PRESENT, so an over-short slice fails loudly; this audit
+    /// asserts a needle is ABSENT, where an over-short slice passes SILENTLY.
+    /// The polarity is reversed and the heuristic does not carry over.
     ///
-    /// The `mod tests {` variant is also wrong here: this repo has at least
-    /// one mid-file `mod tests` (`chat_delegate.rs`), so cutting there would
-    /// discard production code below it.
+    /// The `mod tests {` variant is wrong here too: this repo has a mid-file
+    /// `mod tests` (`chat_delegate.rs`) whose production code would be lost.
     ///
-    /// Removing each annotated item individually is exact, and keeps
-    /// production rsx that lives after a test module. It also removes THIS
-    /// module, so the fixtures below cannot satisfy the audit's own needles.
+    /// Removing each annotated item individually is exact, and keeps production
+    /// rsx that follows a test module. It also removes THIS module, so the
+    /// fixtures below cannot satisfy the audit's own needles.
     fn strip_cfg_test_items(src: &str) -> String {
         const NEEDLE: &str = "#[cfg(test)]";
         let lx = Lexed::new(src);
@@ -251,26 +337,36 @@ mod volatile_value_binding_audit {
         let mut i = 0;
         while i < n {
             if lx.is_code(i) && lx.starts_with_at(i, NEEDLE) {
-                // Skip forward past the annotated item: either a brace-delimited
-                // body, or a `;`-terminated one (`#[cfg(test)] use foo::Bar;`).
                 let mut j = i + NEEDLE.chars().count();
-                let mut depth = 0usize;
+                let mut braces = 0usize;
+                let mut brackets = 0usize;
                 let mut opened = false;
                 while j < n {
                     if lx.is_code(j) {
                         match lx.chars[j] {
                             '{' => {
-                                depth += 1;
+                                braces += 1;
                                 opened = true;
                             }
                             '}' => {
-                                depth -= 1;
-                                if opened && depth == 0 {
+                                // A `}` before any `{` means the annotation sat
+                                // on a struct field / enum variant / match arm,
+                                // and we have run into the enclosing block's
+                                // close. Stop rather than underflow.
+                                if braces == 0 {
+                                    break;
+                                }
+                                braces -= 1;
+                                if opened && braces == 0 {
                                     j += 1;
                                     break;
                                 }
                             }
-                            ';' if !opened => {
+                            '[' | '(' => brackets += 1,
+                            ']' | ')' => brackets = brackets.saturating_sub(1),
+                            // Only a `;` at top level ends the item: one inside
+                            // brackets is part of a type like `[u8; 4]`.
+                            ';' if !opened && brackets == 0 => {
                                 j += 1;
                                 break;
                             }
@@ -278,6 +374,12 @@ mod volatile_value_binding_audit {
                         }
                     }
                     j += 1;
+                }
+                // Preserve newlines so line numbers stay truthful.
+                for k in i..j.min(n) {
+                    if lx.chars[k] == '\n' {
+                        out.push('\n');
+                    }
                 }
                 i = j;
                 continue;
@@ -312,34 +414,38 @@ mod volatile_value_binding_audit {
     ///
     /// Character-based rather than line-based: a line-based split cannot see
     /// the opening line's attributes, silently skips single-line elements, and
-    /// mis-reads two attributes written on one line.
+    /// mis-reads two attributes written on one line. Commas inside `(...)` or
+    /// `[...]` do not separate attributes.
     fn parse_attrs(lx: &Lexed, open: usize, close: usize) -> Vec<(String, String)> {
         let mut segments: Vec<String> = Vec::new();
         let mut cur = String::new();
-        let mut depth = 0usize;
+        let mut braces = 0usize;
+        let mut brackets = 0usize;
         for (i, ch) in lx.chars.iter().enumerate().take(close + 1).skip(open) {
             if lx.is_code(i) {
                 match ch {
                     '{' => {
-                        depth += 1;
-                        if depth == 1 {
+                        braces += 1;
+                        if braces == 1 {
                             continue;
                         }
                     }
                     '}' => {
-                        depth -= 1;
-                        if depth == 0 {
+                        braces -= 1;
+                        if braces == 0 {
                             break;
                         }
                     }
-                    ',' if depth == 1 => {
+                    '(' | '[' => brackets += 1,
+                    ')' | ']' => brackets = brackets.saturating_sub(1),
+                    ',' if braces == 1 && brackets == 0 => {
                         segments.push(std::mem::take(&mut cur));
                         continue;
                     }
                     _ => {}
                 }
             }
-            if depth >= 1 && !lx.in_comment[i] {
+            if braces >= 1 && !lx.in_comment[i] {
                 cur.push(*ch);
             }
         }
@@ -386,7 +492,6 @@ mod volatile_value_binding_audit {
                     i += 1;
                     continue;
                 }
-                // Token boundary before the name.
                 let prev = if i == 0 { ' ' } else { lx.chars[i - 1] };
                 if prev.is_alphanumeric()
                     || prev == '_'
@@ -397,7 +502,6 @@ mod volatile_value_binding_audit {
                     i += 1;
                     continue;
                 }
-                // `{` after optional whitespace (including newlines).
                 let mut j = i + len;
                 while j < n && lx.chars[j].is_whitespace() {
                     j += 1;
@@ -407,17 +511,16 @@ mod volatile_value_binding_audit {
                     continue;
                 }
                 // Reject `match input {`, `if input {`, ... which are not rsx.
-                let head: String = lx.chars[..i].iter().rev().take(24).collect::<String>();
-                let head: String = head.chars().rev().collect();
-                let head = head.trim_end();
-                if ["match", "if", "while", "for", "let", "in"]
-                    .iter()
-                    .any(|kw| head.ends_with(kw))
+                // Matched as a whole preceding CODE identifier: a substring
+                // test over raw text would also fire on a comment ending in
+                // "...for" and silently drop a real element.
+                let prev_ident = lx.prev_code_ident(i);
+                if ["match", "if", "while", "for", "let", "in", "else"]
+                    .contains(&prev_ident.as_str())
                 {
                     i += 1;
                     continue;
                 }
-                // Balanced block.
                 let mut depth = 0usize;
                 let mut k = j;
                 let mut close = j;
@@ -453,7 +556,7 @@ mod volatile_value_binding_audit {
         el.attr("readonly")
             .map(|v| {
                 let v = v.trim();
-                v.starts_with("true") || v.starts_with("\"true\"")
+                v == "true" || v == "\"true\""
             })
             .unwrap_or(false)
     }
@@ -468,22 +571,25 @@ mod volatile_value_binding_audit {
             .unwrap_or(false)
     }
 
-    /// The volatile binding this element carries, if any.
+    /// The VOLATILE binding this element carries, if any.
+    ///
+    /// `option` is the odd one out: dioxus marks its `selected` volatile and
+    /// its `value` NOT volatile (`elements.rs:1536`). Consulting `value` first
+    /// for every element both flagged ordinary `option { value: "us" }` as a
+    /// violation and hid the one attribute on `option` that actually is.
     fn volatile_binding(el: &Element) -> Option<&str> {
-        el.attr("value").or_else(|| {
-            if el.name == "option" {
-                el.attr("selected")
-            } else {
-                None
-            }
-        })
+        if el.name == "option" {
+            el.attr("selected")
+        } else {
+            el.attr("value")
+        }
     }
 
     /// An `oninput` that provably does nothing is worse than none: it satisfies
     /// a presence check while the field keeps losing keystrokes.
     fn is_noop_handler(body: &str) -> bool {
         let squished: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-        squished.ends_with("{}") && squished.contains('|')
+        squished.contains('|') && (squished.ends_with("{}") || squished.ends_with("|()"))
     }
 
     // ----------------------------------------------------------------- files
@@ -505,8 +611,8 @@ mod volatile_value_binding_audit {
 
     struct Audit {
         editable: BTreeSet<String>,
+        display_only: BTreeSet<String>,
         violations: Vec<String>,
-        display_only: usize,
     }
 
     fn run_audit() -> Audit {
@@ -522,8 +628,8 @@ mod volatile_value_binding_audit {
 
         let mut audit = Audit {
             editable: BTreeSet::new(),
+            display_only: BTreeSet::new(),
             violations: Vec::new(),
-            display_only: 0,
         };
 
         for path in &files {
@@ -542,12 +648,12 @@ mod volatile_value_binding_audit {
                 if is_toggle(&el) {
                     continue;
                 }
+                let id = format!("{rel} <{}> {binding}", el.name);
                 if is_display_only(&el) {
-                    audit.display_only += 1;
+                    audit.display_only.insert(id);
                     continue;
                 }
-                let id = format!("{rel} <{}> {binding}", el.name);
-                audit.editable.insert(id.clone());
+                audit.editable.insert(id);
 
                 match el.attr("oninput") {
                     None => audit
@@ -559,10 +665,17 @@ mod volatile_value_binding_audit {
                     )),
                     Some(_) => {}
                 }
-                let _ = el.has("oninput");
             }
         }
         audit
+    }
+
+    fn diff_sets(expected: &[&str], actual: &BTreeSet<String>) -> (Vec<String>, Vec<String>) {
+        let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
+        (
+            expected.difference(actual).cloned().collect(),
+            actual.difference(&expected).cloned().collect(),
+        )
     }
 
     // ----------------------------------------------------------------- tests
@@ -570,10 +683,9 @@ mod volatile_value_binding_audit {
     #[test]
     fn every_editable_value_binding_tracks_input() {
         let audit = run_audit();
-
         assert!(
             audit.violations.is_empty(),
-            "freenet/river#564: these editable controls bind a volatile `value:` \
+            "freenet/river#564: these editable controls bind a volatile attribute \
              without tracking it in `oninput`, so any unrelated re-render will \
              re-write the attribute and wipe whatever the user has typed but not \
              yet committed:\n  {}\n\nAdd `oninput` so the bound signal tracks the \
@@ -584,72 +696,119 @@ mod volatile_value_binding_audit {
         );
     }
 
-    /// Anti-vacuity. Pinned as an exact set so a scan that stops seeing a file
+    /// Anti-vacuity. Pinned as exact sets so a scan that stops seeing a file
     /// fails loudly instead of quietly auditing less.
     #[test]
     fn the_audit_still_sees_every_known_binding() {
         let audit = run_audit();
-        let expected: BTreeSet<String> = EXPECTED_EDITABLE.iter().map(|s| s.to_string()).collect();
 
-        let missing: Vec<_> = expected.difference(&audit.editable).collect();
-        let unexpected: Vec<_> = audit.editable.difference(&expected).collect();
-
+        let (missing, unexpected) = diff_sets(EXPECTED_EDITABLE, &audit.editable);
         assert!(
             missing.is_empty(),
             "the audit STOPPED SEEING these bindings, so they are no longer \
              protected against freenet/river#564. Either they were removed (drop \
              them from EXPECTED_EDITABLE) or, far more likely, the scanner no \
-             longer matches this tree:\n  {:?}",
-            missing
+             longer matches this tree:\n  {}",
+            missing.join("\n  ")
         );
         assert!(
             unexpected.is_empty(),
-            "new editable volatile bindings found. Confirm each one handles \
+            "new editable volatile bindings found. Confirm each handles \
              `oninput` (see the module docs), then add it to \
-             EXPECTED_EDITABLE:\n  {:?}",
-            unexpected
+             EXPECTED_EDITABLE:\n  {}",
+            unexpected.join("\n  ")
         );
-        assert_eq!(
-            audit.display_only, EXPECTED_DISPLAY_ONLY,
-            "the number of readonly display bindings changed; update \
-             EXPECTED_DISPLAY_ONLY deliberately"
+
+        let (missing_ro, unexpected_ro) = diff_sets(EXPECTED_DISPLAY_ONLY, &audit.display_only);
+        assert!(
+            missing_ro.is_empty() && unexpected_ro.is_empty(),
+            "the set of readonly display bindings changed; update \
+             EXPECTED_DISPLAY_ONLY deliberately.\n  no longer seen: {}\n  newly \
+             seen: {}",
+            missing_ro.join(", "),
+            unexpected_ro.join(", ")
         );
     }
 
-    /// The cull must remove test items WHEREVER they appear, and must not
-    /// discard production code that follows one. Cutting at the first
-    /// `#[cfg(test)]` (the trap documented in `conversation.rs`) would drop
-    /// `KEEP_ME` here; cutting at `#[cfg(test)]\nmod tests {` would drop it too.
+    /// A char literal must not flip string/code polarity. `conversation.rs`
+    /// matches on `'"'`, which without a char-literal arm silently un-audits
+    /// the rest of the file - the same blindness class as the naive cfg(test)
+    /// cut, reached a different way.
     #[test]
-    fn cfg_test_cull_keeps_production_code_after_a_test_item() {
-        let src = r#"
-fn before() {}
-#[cfg(test)]
-fn helper() { let x = 1; }
-#[cfg(test)]
-mod tests { fn t() {} }
-fn KEEP_ME() { textarea { value: "{v}" } }
-"#;
+    fn char_literals_do_not_blind_the_scanner() {
+        let src = "fn esc(c: char) -> &'static str {\n    match c {\n        '\"' => \"&quot;\",\n        '{' => \"brace\",\n        _ => \"\",\n    }\n}\nfn later() { textarea { value: \"{draft}\" } }\n";
+        let els = scan_elements(src);
+        let ta = els.iter().find(|e| e.name == "textarea");
+        assert!(
+            ta.is_some(),
+            "an element after a `'\"'` / `'{{'` char literal must still be found"
+        );
+        assert_eq!(volatile_binding(ta.unwrap()), Some("\"{draft}\""));
+        assert!(!ta.unwrap().has("oninput"), "and must be flagged");
+    }
+
+    /// Lifetimes are not char literals and must stay ordinary code.
+    #[test]
+    fn lifetimes_are_not_char_literals() {
+        let src = "fn f(s: &'static str) -> &'a str { textarea { value: \"{d}\" } }";
+        let els = scan_elements(src);
+        assert_eq!(els.len(), 1, "the lifetime must not swallow the element");
+        assert_eq!(volatile_binding(&els[0]), Some("\"{d}\""));
+    }
+
+    /// The cull must remove test items WHEREVER they appear, must not discard
+    /// production code that follows one, and must keep line numbers truthful.
+    #[test]
+    fn cfg_test_cull_keeps_production_code_and_line_numbers() {
+        let src = "fn before() {}\n#[cfg(test)]\nfn helper() { let x = 1; }\n#[cfg(test)]\nmod tests { fn t() {} }\nfn keep_me() { textarea { value: \"{v}\" } }\n";
         let out = strip_cfg_test_items(src);
         assert!(
-            out.contains("KEEP_ME"),
-            "production code after a test item must survive: {out}"
+            out.contains("keep_me"),
+            "production code must survive: {out}"
         );
-        assert!(
-            !out.contains("helper"),
-            "test-only helper must be removed: {out}"
+        assert!(!out.contains("helper"), "test helper must go: {out}");
+        assert!(!out.contains("fn t()"), "test module must go: {out}");
+        assert_eq!(
+            out.matches('\n').count(),
+            src.matches('\n').count(),
+            "line numbering must be preserved so reported positions are real"
         );
-        assert!(
-            !out.contains("fn t()"),
-            "test module must be removed: {out}"
-        );
+        let el = &scan_elements(&out)[0];
+        assert_eq!(el.line, 6, "the textarea is on line 6 of the ORIGINAL file");
 
-        // And the naive heuristics really would have lost it, so this test is
-        // guarding something real.
-        let naive = &src[..src.find("#[cfg(test)]").unwrap()];
-        assert!(!naive.contains("KEEP_ME"));
-        let mod_needle = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
-        assert!(!mod_needle.contains("KEEP_ME"));
+        // The naive heuristics really would have lost it.
+        assert!(!src[..src.find("#[cfg(test)]").unwrap()].contains("keep_me"));
+        assert!(!src[..src.find("#[cfg(test)]\nmod tests {").unwrap()].contains("keep_me"));
+    }
+
+    /// `#[cfg(test)]` on a struct field, enum variant or match arm reaches the
+    /// enclosing block's `}` before any `{`. That must not underflow.
+    #[test]
+    fn cfg_test_on_a_field_does_not_underflow() {
+        for src in [
+            "struct S {\n    #[cfg(test)]\n    probe: u8,\n}\nfn f() { input { value: \"{v}\" } }",
+            "enum E {\n    #[cfg(test)]\n    Probe,\n}\nfn f() { input { value: \"{v}\" } }",
+            "fn m(x: u8) { match x {\n    #[cfg(test)]\n    0 => {}\n    _ => {}\n} }\nfn f() { input { value: \"{v}\" } }",
+        ] {
+            let out = strip_cfg_test_items(src);
+            assert!(
+                scan_elements(&out).iter().any(|e| e.name == "input"),
+                "must not lose the element after a field-level cfg(test): {out}"
+            );
+        }
+    }
+
+    /// A `;` inside a type like `[u8; 4]` must not end the item early and leak
+    /// test-only rsx into the audited source.
+    #[test]
+    fn cfg_test_item_with_a_semicolon_in_its_signature_is_fully_removed() {
+        let src = "#[cfg(test)]\nfn fixture() -> [u8; 4] { let _ = input { value: \"{leaked}\" }; [0; 4] }\nfn keep() {}";
+        let out = strip_cfg_test_items(src);
+        assert!(
+            !out.contains("leaked"),
+            "test-only rsx must not leak: {out}"
+        );
+        assert!(out.contains("keep"));
     }
 
     /// The audit must detect the shape #564 actually shipped.
@@ -682,16 +841,15 @@ fn KEEP_ME() { textarea { value: "{v}" } }
             "onchange: update_description,",
             "oninput: move |e| description.set(e.value()), onchange: update_description,",
         );
-        let fixed_els = scan_elements(&fixed);
-        let fixed_el = fixed_els.iter().find(|e| e.name == "textarea").unwrap();
+        let fixed_el = scan_elements(&fixed)
+            .into_iter()
+            .find(|e| e.name == "textarea")
+            .unwrap();
         assert!(fixed_el.has("oninput"), "the fixed field must pass");
         assert!(!is_noop_handler(fixed_el.attr("oninput").unwrap()));
     }
 
-    /// Shapes the previous line-based scanner got wrong: attributes on the
-    /// element's opening line, a whole element on one line, and two attributes
-    /// sharing a line. Each was silently skipped (a missed violation) or
-    /// mis-read as readonly (a false alarm).
+    /// Shapes the previous line-based scanner got wrong.
     #[test]
     fn attributes_are_parsed_regardless_of_line_layout() {
         let one_line = r#"input { r#type: "text", value: "{n}" }"#;
@@ -712,9 +870,8 @@ fn KEEP_ME() { textarea { value: "{v}" } }
         );
 
         let readonly_below = "input {\n    readonly: true,\n    value: \"{link}\",\n}";
-        let el = &scan_elements(readonly_below)[0];
         assert!(
-            is_display_only(el),
+            is_display_only(&scan_elements(readonly_below)[0]),
             "readonly must be seen wherever it sits"
         );
     }
@@ -724,18 +881,55 @@ fn KEEP_ME() { textarea { value: "{v}" } }
     #[test]
     fn strings_and_comments_do_not_corrupt_parsing() {
         let tricky = "input {\n    onclick: move |_| { open(\"https://freenet.org\") },\n    value: \"{room_name}\",\n}";
-        let el = &scan_elements(tricky)[0];
         assert_eq!(
-            volatile_binding(el),
+            volatile_binding(&scan_elements(tricky)[0]),
             Some("\"{room_name}\""),
             "a `//` inside a string literal must not unbalance the block"
         );
 
         let commented = "input {\n    value: \"{n}\",\n    // Track the live value so Enter can commit it.\n    oninput: move |e| n.set(e.value()),\n}";
-        let el = &scan_elements(commented)[0];
         assert!(
-            el.has("oninput"),
+            scan_elements(commented)[0].has("oninput"),
             "a comment above an attribute must not be glued onto its name"
+        );
+    }
+
+    /// The keyword guard must key on the preceding CODE identifier. Matching
+    /// raw text would let a comment ending in "...for" / "...in" delete a real
+    /// element from the audit, silently.
+    #[test]
+    fn a_comment_above_an_element_does_not_suppress_it() {
+        let src = "// Only visible to the room admin\ninput { value: \"{secret_draft}\" }";
+        let els = scan_elements(src);
+        assert_eq!(
+            els.len(),
+            1,
+            "comment ending in `in` must not hide the input"
+        );
+        assert_eq!(volatile_binding(&els[0]), Some("\"{secret_draft}\""));
+
+        let real_match = "match input {\n    _ => {}\n}";
+        assert!(
+            scan_elements(real_match).is_empty(),
+            "`match input {{` is still not an rsx element"
+        );
+    }
+
+    /// `option`'s VALUE is not volatile; its `selected` is.
+    #[test]
+    fn option_is_audited_on_selected_not_value() {
+        let plain = r#"option { value: "us", "United States" }"#;
+        assert_eq!(
+            volatile_binding(&scan_elements(plain)[0]),
+            None,
+            "an ordinary option value must not be reported as a #564 violation"
+        );
+
+        let bound = r#"option { value: "uk", selected: "{is_uk}" }"#;
+        assert_eq!(
+            volatile_binding(&scan_elements(bound)[0]),
+            Some("\"{is_uk}\""),
+            "option's volatile `selected` must be audited even when `value` is present"
         );
     }
 
@@ -764,6 +958,7 @@ fn KEEP_ME() { textarea { value: "{v}" } }
     fn noop_handlers_are_rejected() {
         assert!(is_noop_handler("move |_| {}"));
         assert!(is_noop_handler("move |evt| { }"));
+        assert!(is_noop_handler("move |_| ()"));
         assert!(!is_noop_handler("move |e| n.set(e.value())"));
         assert!(!is_noop_handler("on_input"));
     }
@@ -774,11 +969,31 @@ fn KEEP_ME() { textarea { value: "{v}" } }
     /// the rewrite it is meant to prevent.
     #[test]
     fn checkbox_and_radio_are_exempt() {
-        let cb = r#"input { r#type: "checkbox", value: "{flag}" }"#;
-        assert!(is_toggle(&scan_elements(cb)[0]));
-        let radio = r#"input { r#type: "radio", value: "{choice}" }"#;
-        assert!(is_toggle(&scan_elements(radio)[0]));
-        let text = r#"input { r#type: "text", value: "{name}" }"#;
-        assert!(!is_toggle(&scan_elements(text)[0]));
+        assert!(is_toggle(
+            &scan_elements(r#"input { r#type: "checkbox", value: "{flag}" }"#)[0]
+        ));
+        assert!(is_toggle(
+            &scan_elements(r#"input { r#type: "radio", value: "{choice}" }"#)[0]
+        ));
+        assert!(!is_toggle(
+            &scan_elements(r#"input { r#type: "text", value: "{name}" }"#)[0]
+        ));
+    }
+
+    /// `readonly:` must be an exemption only when it is literally true.
+    #[test]
+    fn conditional_readonly_is_not_an_exemption() {
+        for src in [
+            r#"input { readonly: !is_owner, value: "{n}" }"#,
+            r#"input { readonly: true_when_locked, value: "{n}" }"#,
+        ] {
+            assert!(
+                !is_display_only(&scan_elements(src)[0]),
+                "only a literal `true` exempts a field: {src}"
+            );
+        }
+        assert!(is_display_only(
+            &scan_elements(r#"input { readonly: true, value: "{n}" }"#)[0]
+        ));
     }
 }

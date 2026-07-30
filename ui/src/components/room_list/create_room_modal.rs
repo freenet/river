@@ -172,18 +172,19 @@ pub fn CreateRoomModal() -> Element {
                             // `oninput` tracks the live value so a re-render
                             // cannot re-write this volatile `value` attribute
                             // with stale text (freenet/river#564). Defensive
-                            // here rather than a reproduced bug: this component
-                            // reads no room-state signal and takes no props, so
-                            // nothing but the user's own typing re-renders it.
-                            // It matches the nickname input below and removes
-                            // the field from the class entirely.
+                            // here rather than a reproduced bug: this modal does
+                            // re-render (it reads CREATE_ROOM_MODAL, and the
+                            // private-room checkbox re-renders it), but every
+                            // route to that blurs this input first, firing
+                            // `onchange` before the render. `oninput` removes
+                            // the field from the class regardless.
                             //
-                            // `onchange` is KEPT alongside it, unlike the
-                            // nickname input: dropping it would lose the value
-                            // from anything that sets `.value` and fires only
-                            // `change` (some password managers, and synthetic
-                            // events), and the failure is silent — `create_room`
-                            // returns on an empty name with only a log line.
+                            // `onchange` is KEPT alongside it: dropping it would
+                            // lose the value from anything that sets `.value`
+                            // and fires only `change` (some password managers,
+                            // and synthetic events), and the failure is silent,
+                            // since `create_room` returns on an empty name with
+                            // only a log line.
                             oninput: move |evt| room_name.set(evt.value().to_string()),
                             onchange: move |evt| room_name.set(evt.value().to_string())
                         }
@@ -201,7 +202,12 @@ pub fn CreateRoomModal() -> Element {
                             "aria-invalid": if nickname_has_emoji { "true" } else { "false" },
                             value: "{nickname}",
                             placeholder: "Enter your nickname",
-                            oninput: move |evt| nickname.set(evt.value().to_string())
+                            // Both handlers, for the same reason as the room
+                            // name above: an empty nickname is accepted
+                            // silently, so a `change`-only writer must not be
+                            // able to drop the value.
+                            oninput: move |evt| nickname.set(evt.value().to_string()),
+                            onchange: move |evt| nickname.set(evt.value().to_string())
                         }
                         if nickname_has_emoji {
                             p {

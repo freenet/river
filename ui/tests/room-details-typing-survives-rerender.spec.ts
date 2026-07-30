@@ -12,10 +12,12 @@ import { test, expect, Page } from "@playwright/test";
 //
 // The Room Description textarea updated its bound signal only in `onchange`,
 // which fires on blur. So while the owner typed, the signal still held the
-// pre-typing text, and the next re-render reset the textarea to it.
-// `RoomDescriptionField` reads CURRENT_ROOM and ROOMS in its render body, so
-// ANY room-state write re-rendered it — which is what supplied the periodic
-// trigger in the bug report.
+// pre-typing text, and the next re-render reset the textarea to it. As
+// reported, `RoomDescriptionField` read CURRENT_ROOM and ROOMS in its render
+// body, so ANY room-state write re-rendered it, which is what supplied the
+// periodic trigger. (It no longer reads them there, so the trigger is now a
+// prop change; the fix is the handler either way, because it makes the field
+// correct under any re-render.)
 //
 // The test drives a real room-state write from inside the open dialog and
 // asserts the in-progress edit survives it.
@@ -173,15 +175,19 @@ test.describe("Room Details: in-progress typing survives room-state updates", ()
     await page.getByTestId("room-name-input").click();
     await expect(description).not.toBeFocused();
 
-    // Wait for the save to actually land before closing. The description save
-    // is async (sign -> defer -> ROOMS write) and each config delta must beat
-    // the next `configuration_version`, so a reopen that wins this race would
-    // reseed the remounted field from the OLD config and never recover —
-    // a permanent failure that the retry below could not rescue. Reopening the
-    // Members label is the observable proof the config round-tripped.
-    await expect(
-      page.getByTestId("edit-room-modal").getByText(new RegExp(`Members \\(\\d+/${newCap}\\)`)),
-    ).toBeVisible({ timeout: 15_000 });
+    // Wait for the DESCRIPTION save specifically to land before closing. It is
+    // async (sign -> defer -> ROOMS write), and a reopen that won that race
+    // would reseed the remounted field from the OLD config and never recover,
+    // since `use_signal` seeds once: a permanent failure the retry below could
+    // not rescue.
+    //
+    // The room header renders the description from room state, and this test
+    // never writes there, so it is real proof the save round-tripped. (Gating
+    // on the Members label instead would be a no-op: it already reached
+    // `newCap` above and the description save cannot move it.)
+    await expect(page.getByTestId("room-header-description")).toContainText(DRAFT, {
+      timeout: 15_000,
+    });
 
     await page.getByTestId("edit-room-close-button").click();
     await expect(page.getByTestId("edit-room-modal")).toBeHidden({ timeout: 5_000 });

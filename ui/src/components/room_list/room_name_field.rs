@@ -20,27 +20,39 @@ fn enter_commits_and_closes(key: &Key) -> bool {
     key == &Key::Enter
 }
 
+/// The room's stored name, decrypted with whatever room secrets are available
+/// locally.
+///
+/// Kept out of the render body deliberately, for the same reason as
+/// `edit_room_modal::stored_description`: it clones the room's whole secret set
+/// and runs an ECIES unseal, and `oninput` re-renders this field on every
+/// keystroke, so in the render body that is per-character work on the typing
+/// path. It is needed only to seed the editing signal at mount and to revert a
+/// save the privacy guard refuses.
+///
+/// Must not call any hook: it runs inside `use_signal`'s initializer, which
+/// evaluates while the scope's hook list is mutably borrowed.
+fn stored_room_name(config: &Configuration) -> String {
+    let owner_key = CURRENT_ROOM.read().owner_key;
+    let secrets = ROOMS
+        .try_read()
+        .ok()
+        .and_then(|rooms| {
+            owner_key
+                .and_then(|key| rooms.map.get(&key))
+                .map(|room_data| room_data.secrets.clone())
+        })
+        .unwrap_or_default();
+    match unseal_bytes_with_secrets(&config.display.name, &secrets) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(_) => config.display.name.to_string_lossy(),
+    }
+}
+
 #[component]
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
-    // Extract and decrypt the room name using version-aware decryption
-    let initial_name = {
-        let owner_key = CURRENT_ROOM.read().owner_key;
-        let secrets = ROOMS
-            .try_read()
-            .ok()
-            .and_then(|rooms| {
-                owner_key
-                    .and_then(|key| rooms.map.get(&key))
-                    .map(|room_data| room_data.secrets.clone())
-            })
-            .unwrap_or_default();
-        match unseal_bytes_with_secrets(&config.display.name, &secrets) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-            Err(_) => config.display.name.to_string_lossy(),
-        }
-    };
-    let initial_name_for_revert = initial_name.clone();
-    let mut room_name = use_signal(|| initial_name);
+    let seed_config = config.clone();
+    let mut room_name = use_signal(move || stored_room_name(&seed_config));
 
     // Save the room name. Takes the value as a `String` (rather than a raw
     // form event) so the same logic can be driven from both `onchange` (commit
@@ -97,7 +109,7 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                      room name edit deferred to avoid leaking a plaintext \
                      configuration delta (freenet/river#299)."
                 );
-                room_name.set(initial_name_for_revert.clone());
+                room_name.set(stored_room_name(&config));
                 return;
             };
 
