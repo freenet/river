@@ -15,7 +15,6 @@
 //!
 //! See `.claude/rules/contract-summary-determinism.md`.
 
-use ed25519_dalek::Signature;
 use freenet_scaffold::util::FastHash;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{BanId, BansV1};
@@ -56,8 +55,14 @@ fn ban_id(i: i64) -> BanId {
 fn member_id(i: i64) -> MemberId {
     MemberId(FastHash(i))
 }
-fn sig(i: i64) -> Signature {
-    Signature::from_bytes(&[i as u8; 64])
+/// A distinct signature-digest per index, matching the `(u32, u64)` shape the
+/// member_info summary carries since freenet/river#571. The test exercises
+/// ORDER-independence of the serialized summary, so only distinctness matters
+/// here, not that these equal any real `blake3` digest.
+fn sig_rank(i: i64) -> u64 {
+    // Spread the bits so a byte-order bug in the summary encoding shows up as a
+    // difference rather than cancelling out across entries.
+    (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 #[test]
@@ -87,10 +92,12 @@ fn members_summary_serialization_is_order_independent() {
 
 #[test]
 fn member_info_summary_serialization_is_order_independent() {
-    // MemberInfoV1::Summary = BTreeMap<MemberId, (u32, Signature)>.
-    let fwd: Vec<(MemberId, (u32, Signature))> =
-        (0..N).map(|i| (member_id(i), (i as u32, sig(i)))).collect();
-    let rev: Vec<(MemberId, (u32, Signature))> = fwd.iter().rev().cloned().collect();
+    // MemberInfoV1::Summary = BTreeMap<MemberId, (u32, u64)> — the u64 is the
+    // signature digest (freenet/river#571; was a raw 64-byte Signature).
+    let fwd: Vec<(MemberId, (u32, u64))> = (0..N)
+        .map(|i| (member_id(i), (i as u32, sig_rank(i))))
+        .collect();
+    let rev: Vec<(MemberId, (u32, u64))> = fwd.iter().rev().cloned().collect();
 
     let s_fwd: MemberInfoSummary = fwd.into_iter().collect();
     let s_rev: MemberInfoSummary = rev.into_iter().collect();
@@ -258,7 +265,7 @@ fn top_level_summary_serialization_is_order_independent() {
         let member_info = (0..N)
             .map(|i| {
                 let j = order(i);
-                (member_id(j), (j as u32, sig(j)))
+                (member_id(j), (j as u32, sig_rank(j)))
             })
             .collect();
         let secrets = SecretsSummary {
@@ -321,5 +328,35 @@ fn top_level_summary_serialization_is_order_independent() {
         cbor(&build(true)),
         "top-level ChatRoomStateV1Summary must serialize identically regardless of \
          the order its elements were inserted"
+    );
+}
+
+/// freenet/river#571 — the member_info summary must stay SMALL.
+///
+/// This is the whole point of that change and it has no other guard: the summary
+/// is re-sent to every interested peer on every state change, and was measured as
+/// the largest single consumer of outbound bytes on the Freenet network. The
+/// entry previously carried a raw 64-byte `Signature` (~84% of its bytes),
+/// putting a 470-member room's summary around 29 KB.
+///
+/// Asserted as bytes-per-entry rather than a total, so the bound does not need
+/// revising when a test constant changes. The pre-#571 encoding cannot pass:
+/// a 64-byte signature alone serializes to 66 CBOR bytes.
+#[test]
+fn member_info_summary_stays_small_per_entry() {
+    const MEMBERS: i64 = 470; // the official room's rough membership
+    let summary: MemberInfoSummary = (0..MEMBERS)
+        .map(|i| (member_id(i), (i as u32, sig_rank(i))))
+        .collect();
+
+    let bytes = cbor(&summary).len();
+    let per_entry = bytes as f64 / MEMBERS as f64;
+
+    assert!(
+        per_entry < 32.0,
+        "member_info summary must stay under 32 bytes/entry (got {per_entry:.1}, \
+         {bytes} bytes for {MEMBERS} members). A raw 64-byte Signature encodes to \
+         66 CBOR bytes on its own, so this failing likely means the summary \
+         regressed to carrying signatures rather than digests (freenet/river#571)."
     );
 }

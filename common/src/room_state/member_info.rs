@@ -95,27 +95,72 @@ impl MemberInfoV1 {
 /// Total, deterministic ordering used to pick the canonical `MemberInfo` when
 /// two signed records for the SAME member collide (#411 round 4 item B).
 ///
-/// Rule: **higher `version` wins; at equal version, the lexicographically-greater
-/// SIGNATURE wins.** Two records with the same member and version but different
-/// content (e.g. different `deputies`) have different signatures — the signature
-/// is over the whole `MemberInfo` — so this breaks the tie deterministically.
+/// Rule: **higher `version` wins; at equal version, the greater SIGNATURE DIGEST
+/// wins.** Two records with the same member and version but different content
+/// (e.g. different `deputies`) have different signatures — the signature is over
+/// the whole `MemberInfo` — so their digests differ and this breaks the tie
+/// deterministically. (Before freenet/river#571 the tiebreak compared raw
+/// signature bytes; the winner in a tie therefore changed with that PR, which is
+/// safe because every peer applies the same rule and the change re-keys the
+/// contract. See [`sig_digest`].)
 ///
 /// It is applied IDENTICALLY in [`ComposableState::apply_delta`] (conflict
 /// resolution), [`ComposableState::delta`], and [`ComposableState::summarize`]
-/// (via the `(version, signature)` summary value), so anti-entropy can DETECT a
+/// — the summary value IS this tuple — so anti-entropy can DETECT a
 /// same-version content difference and both peers converge on the same record.
 /// Without it, equal-version resolution was order-dependent AND the summary
 /// carried only the version, so anti-entropy saw "same version", sent no
 /// correction, and peers disagreed on ban authority permanently.
-fn member_info_rank(version: u32, signature: &Signature) -> (u32, [u8; 64]) {
-    (version, signature.to_bytes())
+fn member_info_rank(version: u32, signature: &Signature) -> (u32, u64) {
+    (version, sig_digest(signature))
+}
+
+/// Collision-resistant 64-bit digest of a signature, used as the equal-version
+/// tiebreak discriminator in [`member_info_rank`] and stored in the summary.
+///
+/// WHY A DIGEST AND NOT THE SIGNATURE (freenet/river#571): the summary carried
+/// the raw 64-byte `Signature` per member, which at ~470 members was ~84% of
+/// the summary's bytes and made the whole room summary ~29 KB. That summary is
+/// re-sent on every state change to every interested peer, and measured as the
+/// largest single consumer of outbound bytes on the Freenet network (49.8%).
+/// The signature is never verified here — it is only ever compared for equality
+/// and ordering — so a digest serves the identical purpose at 1/8 the size.
+///
+/// WHY BLAKE3 AND NOT `freenet_scaffold::util::fast_hash`: `fast_hash` is a
+/// base-31 polynomial, which is fine for the accidental collisions `MessageId`
+/// and `BanId` care about but is trivially collidable by construction. A
+/// collision here is not cosmetic — two same-version records whose discriminators
+/// tie are indistinguishable to anti-entropy, so peers would silently and
+/// permanently disagree on that member's `deputies`, i.e. on ban authority
+/// (#411 round 4 B is the bug that added the discriminator in the first place).
+/// A member self-signs their own record, so they could otherwise mint colliding
+/// pairs at will. blake3 removes that.
+///
+/// Determinism is load-bearing: freenet-core byte-compares `summarize_state`
+/// output for staleness, so this must be a fixed, endianness-explicit function
+/// of the signature bytes and must never change without re-keying the contract.
+/// `from_le_bytes` pins the byte order. See
+/// `.claude/rules/contract-summary-determinism.md` and freenet/freenet-core#4857.
+fn sig_digest(signature: &Signature) -> u64 {
+    let hash = blake3::hash(&signature.to_bytes());
+    u64::from_le_bytes(
+        hash.as_bytes()[..8]
+            .try_into()
+            .expect("blake3 digest is 32 bytes, so the first 8 always exist"),
+    )
 }
 
 impl ComposableState for MemberInfoV1 {
     type ParentState = ChatRoomStateV1;
-    /// `(version, signature)` per member. The signature is the equal-version
-    /// tiebreak discriminator (see [`member_info_rank`]); carrying it lets
-    /// anti-entropy detect a content difference at the SAME version (#411 B).
+    /// `(version, signature-digest)` per member — i.e. exactly the value
+    /// [`member_info_rank`] returns. The digest is the equal-version tiebreak
+    /// discriminator; carrying it lets anti-entropy detect a content difference
+    /// at the SAME version (#411 B).
+    ///
+    /// This was `(u32, Signature)` until freenet/river#571. The raw 64-byte
+    /// signature was ~84% of each entry and made the room summary ~29 KB, which
+    /// is re-sent to every interested peer on every state change. See
+    /// [`sig_digest`] for why a digest is sufficient and why it is blake3.
     ///
     /// BTreeMap (not HashMap) so the ciborium-serialized summary bytes are
     /// deterministic: freenet-core byte-compares `summarize_state` output for
@@ -123,7 +168,7 @@ impl ComposableState for MemberInfoV1 {
     /// two identical member_info sets summarize to different bytes → spurious
     /// anti-entropy heals. See `.claude/rules/contract-summary-determinism.md`
     /// and freenet/freenet-core#4857.
-    type Summary = BTreeMap<MemberId, (u32, Signature)>;
+    type Summary = BTreeMap<MemberId, (u32, u64)>;
     type Delta = Vec<AuthorizedMemberInfo>;
     type Parameters = ChatRoomParametersV1;
 
@@ -194,13 +239,13 @@ impl ComposableState for MemberInfoV1 {
         // reconcile. Migration-safe: `verify` still accepts duplicates.
         let mut summary: Self::Summary = BTreeMap::new();
         for info in &self.member_info {
-            let candidate = (info.member_info.version, info.signature);
+            // The summary value IS the rank, so the fold compares tuples
+            // directly rather than re-deriving a rank from a stored signature.
+            let candidate = member_info_rank(info.member_info.version, &info.signature);
             summary
                 .entry(info.member_info.member_id)
                 .and_modify(|existing| {
-                    if member_info_rank(candidate.0, &candidate.1)
-                        > member_info_rank(existing.0, &existing.1)
-                    {
+                    if candidate > *existing {
                         *existing = candidate;
                     }
                 })
@@ -227,9 +272,10 @@ impl ComposableState for MemberInfoV1 {
                 // correction and peers would disagree on deputies forever.
                 match old_state_summary.get(&info.member_info.member_id) {
                     None => true,
-                    Some((old_version, old_signature)) => {
-                        member_info_rank(info.member_info.version, &info.signature)
-                            > member_info_rank(*old_version, old_signature)
+                    // The summary value IS the rank (version, signature digest),
+                    // so compare against it directly.
+                    Some(old_rank) => {
+                        member_info_rank(info.member_info.version, &info.signature) > *old_rank
                     }
                 }
             })
@@ -678,7 +724,7 @@ mod tests {
         // Summary says the peer already holds member1 at (version 1, sig1), so
         // member1 does not outrank it and only member2 appears in the delta.
         let mut old_summary = BTreeMap::new();
-        old_summary.insert(member_id1, (1, sig1));
+        old_summary.insert(member_id1, member_info_rank(1, &sig1));
 
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
 
@@ -884,12 +930,12 @@ mod tests {
 
         // Test when all members are old with the same (version, signature) —
         // nothing outranks the summary, so the delta is empty (#411 round 4 B).
-        let old_summary: BTreeMap<MemberId, (u32, Signature)> = member_infos
+        let old_summary: BTreeMap<MemberId, (u32, u64)> = member_infos
             .iter()
             .map(|info| {
                 (
                     info.member_info.member_id,
-                    (info.member_info.version, info.signature),
+                    member_info_rank(info.member_info.version, &info.signature),
                 )
             })
             .collect();
@@ -900,11 +946,11 @@ mod tests {
         let mut old_summary = BTreeMap::new();
         old_summary.insert(
             member_infos[0].member_info.member_id,
-            (1, member_infos[0].signature),
+            member_info_rank(1, &member_infos[0].signature),
         );
         old_summary.insert(
             member_infos[1].member_info.member_id,
-            (1, member_infos[1].signature),
+            member_info_rank(1, &member_infos[1].signature),
         );
         let delta = member_info_v1.delta(&parent_state, &parameters, &old_summary);
         assert_eq!(delta.unwrap().len(), 3);
@@ -1201,7 +1247,7 @@ mod tests {
         let mut revoke_mi = MemberInfo::new_public(member_id, 2, "nick".to_string());
         revoke_mi.deputies = vec![];
         let revoke = AuthorizedMemberInfo::new_with_member_key(revoke_mi, &member_signing_key);
-        let revoke_summary_value = (2u32, revoke.signature);
+        let revoke_summary_value = member_info_rank(2u32, &revoke.signature);
 
         let mut parent_state = ChatRoomStateV1::default();
         parent_state.members.members.push(AuthorizedMember::new(
