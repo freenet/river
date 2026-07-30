@@ -294,6 +294,16 @@ test.describe("Sandboxed iframe embedding", () => {
   const sandboxAttrs =
     "allow-scripts allow-forms allow-popups allow-same-origin";
 
+  // These two tests build their own page with `setContent`, so the iframe
+  // src cannot come from the config's `baseURL` implicitly — it has to be
+  // read here. It used to be the literal "http://localhost:8082", which
+  // silently ignored PLAYWRIGHT_BASE_URL: running the suite on any other
+  // port (what AGENTS.md tells you to do, since 8082 is shared between
+  // worktrees) pointed the iframe at whatever build happened to be on
+  // 8082, or at nothing, and these two failed for a reason that had
+  // nothing to do with the change under test.
+  const BASE = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:8082";
+
   test("app renders inside a sandboxed iframe", async ({ page }) => {
     await page.setContent(`
       <!DOCTYPE html>
@@ -301,7 +311,7 @@ test.describe("Sandboxed iframe embedding", () => {
       <body style="margin:0;padding:0;height:100vh;">
         <iframe
           sandbox="${sandboxAttrs}"
-          src="http://localhost:8082"
+          src="${BASE}"
           style="width:100%;height:100%;border:none;"
         ></iframe>
       </body>
@@ -325,7 +335,7 @@ test.describe("Sandboxed iframe embedding", () => {
       <body style="margin:0;padding:0;height:100vh;">
         <iframe
           sandbox="${sandboxAttrs}"
-          src="http://localhost:8082"
+          src="${BASE}"
           style="width:100%;height:100%;border:none;"
         ></iframe>
       </body>

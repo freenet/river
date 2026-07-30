@@ -1,12 +1,13 @@
 import { test, expect, Page } from "@playwright/test";
 
-// Copy test for the invite-member modal's guidance blocks.
+// Copy test for the invite-by-link modal's guidance blocks.
 //
 // The modal used to warn ONLY about the link being single-use, never
 // mentioning that River can send an invitation directly in a DM (#252,
-// #457) — which is the recommended flow: ask the person first, then use
-// "Share invite" from their member card in a room you already share, so
-// no bearer credential travels through an outside channel.
+// #457) — which is the recommended flow, because no bearer credential
+// travels through an outside channel. Since #566 that flow has a primary
+// button of its own ("Share Invite", under the member list), and this
+// modal's job is to point at it and to be blunt about what the link is.
 //
 // These assertions pin BOTH blocks and their order, so a future refactor
 // of this modal can't silently drop the recommendation and leave
@@ -17,7 +18,7 @@ async function waitForApp(page: Page) {
   await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
 }
 
-// A room where the test user is a member, so "Invite Member" can generate
+// A room where the test user is a member, so "Invite by link" can generate
 // an invitation (matches the portable-invite-code spec).
 const ROOM_NAME = "Public Discussion Room";
 
@@ -47,7 +48,7 @@ async function openInviteModal(page: Page) {
 test.describe("Invite-member modal guidance copy", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("recommends sending the invitation via DM, naming Share invite", async ({
+  test("recommends sending the invitation via DM, naming Share Invite", async ({
     page,
   }) => {
     await page.goto("/");
@@ -57,7 +58,9 @@ test.describe("Invite-member modal guidance copy", () => {
     const rec = page.getByTestId("invite-dm-recommendation");
     await expect(rec).toBeVisible();
     await expect(rec).toContainText(/in a DM/i);
-    await expect(rec).toContainText(/Share invite/);
+    // Must name the button by the label it actually carries — a pointer to
+    // a control the reader can't find is worse than no pointer.
+    await expect(rec).toContainText(/Share Invite/);
   });
 
   test("still warns that the link or code is for one person only", async ({

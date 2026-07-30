@@ -10,7 +10,9 @@ use crate::components::app::document_title::DocumentTitleUpdater;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
-use crate::components::direct_messages::{DmThreadModal, InviteViaDmPickerModal};
+use crate::components::direct_messages::{
+    DmThreadModal, InviteContactPickerModal, InviteViaDmPickerModal,
+};
 use crate::components::members::member_info_modal::MemberInfoModal;
 use crate::components::members::Invitation;
 use crate::components::room_list::create_room_modal::CreateRoomModal;
@@ -506,6 +508,7 @@ pub fn App() -> Element {
         CreateRoomModal {}
         DmThreadModal {}
         InviteViaDmPickerModal {}
+        InviteContactPickerModal {}
         ReceiveInvitationModal {
             invitation: receive_invitation
         }
