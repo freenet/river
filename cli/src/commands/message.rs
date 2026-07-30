@@ -347,6 +347,24 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                                 .reactions(&msg_id)
                                 .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
                                 .unwrap_or_default();
+                            // Who reacted, alongside the counts. See
+                            // `output_reaction_change` for why a count alone is
+                            // not enough to act on a reaction.
+                            let reactors: std::collections::HashMap<String, Vec<String>> =
+                                room_state
+                                    .recent_messages
+                                    .reactions(&msg_id)
+                                    .map(|r| {
+                                        r.iter()
+                                            .map(|(emoji, ids)| {
+                                                (
+                                                    emoji.clone(),
+                                                    ids.iter().map(|id| id.to_string()).collect(),
+                                                )
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
 
                             // Encode message ID for use in edit/delete/react commands
                             let message_id_str = msg_id.0 .0.to_string();
@@ -372,6 +390,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                                 "edited": edited,
                                 "reply_to": reply_to,
                                 "reactions": reactions,
+                                "reactors": reactors,
                             })
                         })
                         .collect();
@@ -572,6 +591,35 @@ mod tests {
     /// Source-scrape rather than a live round trip, because sending a reply
     /// requires a node and a room. Whitespace is squashed so rustfmt cannot
     /// silently disarm the pin.
+
+    /// Reactions must be attributable. Room state has always held
+    /// `HashMap<String, Vec<MemberId>>`, but both JSON boundaries collapsed it
+    /// to a count via `v.len()`, so nothing downstream could tell WHO reacted --
+    /// which made reactions impossible to moderate rather than merely awkward.
+    ///
+    /// `reactions` (counts) is retained unchanged so existing consumers keep
+    /// working; `reactors` is additive.
+    #[test]
+    fn reaction_json_exposes_who_reacted_not_just_how_many() {
+        let source = include_str!("message.rs");
+        // Scan production only: without this cut the needles below match their
+        // own literals in this test and the pin passes vacuously.
+        let production = source
+            .split_once("mod tests")
+            .map(|(before, _)| before)
+            .expect("test module marker missing; the cut would scan everything");
+        let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            squashed.contains(r#""reactions":reactions,"#),
+            "count field not found; the pin would pass vacuously"
+        );
+        assert!(
+            squashed.contains(r#""reactors":reactors,"#),
+            "message list must expose who reacted, not only a count"
+        );
+    }
+
     #[test]
     fn reply_json_returns_the_new_message_id() {
         let source = include_str!("message.rs");

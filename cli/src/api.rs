@@ -4450,11 +4450,19 @@ impl ApiClient {
         Ok(())
     }
 
-    /// Emit a `reaction` event carrying the message's *current* reactions map
-    /// (`emoji -> count`), so a downstream relay can reconcile the new state
-    /// without tracking per-reactor deltas. JSON `type: "reaction"`; the human
-    /// line is `[reaction]`-prefixed. The map is empty when the last reaction was
-    /// removed. freenet/river#325.
+    /// Emit a `reaction` event carrying the message's *current* reactions, so a
+    /// downstream relay can reconcile the new state without tracking per-reactor
+    /// deltas. JSON `type: "reaction"`; the human line is `[reaction]`-prefixed.
+    /// Both maps are empty when the last reaction was removed. freenet/river#325.
+    ///
+    /// Two fields describe the reactions:
+    /// * `reactions` — `emoji -> count`, unchanged for existing consumers.
+    /// * `reactors`  — `emoji -> [member_id]`, who actually reacted.
+    ///
+    /// CAUTION: `author` is the author of the message that was REACTED TO, not
+    /// the person who reacted. A reaction event is emitted against the target
+    /// message, so anything attributing the reaction itself must read
+    /// `reactors`; `author` will name an innocent party.
     fn output_reaction_change(
         room_state: &ChatRoomStateV1,
         msg: &river_core::room_state::message::AuthorizedMessageV1,
@@ -4501,8 +4509,27 @@ impl ApiClient {
                 let reactions_map: std::collections::HashMap<String, usize> = reactions
                     .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
                     .unwrap_or_default();
+                // WHO reacted, not just how many. `reactions` reports counts and
+                // is kept unchanged for existing consumers, but a count cannot
+                // attribute a reaction to anyone, which made reactions
+                // unmoderatable: nothing downstream could tell who to act on.
+                // The room state has always held this (`reactions()` returns
+                // `HashMap<String, Vec<MemberId>>`); only this boundary dropped it.
+                let reactors_map: std::collections::HashMap<String, Vec<String>> = reactions
+                    .map(|r| {
+                        r.iter()
+                            .map(|(emoji, reactors)| {
+                                (
+                                    emoji.clone(),
+                                    reactors.iter().map(|id| id.to_string()).collect(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let json_msg = json!({
                     "type": "reaction",
+                    "reactors": reactors_map,
                     "message_id": msg_id.0 .0.to_string(),
                     "room": bs58::encode(room_owner_key.as_bytes()).into_string(),
                     "author": author_str,
