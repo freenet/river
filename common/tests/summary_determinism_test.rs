@@ -15,7 +15,7 @@
 //!
 //! See `.claude/rules/contract-summary-determinism.md`.
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, SigningKey};
 use freenet_scaffold::util::FastHash;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{BanId, BansV1};
@@ -31,6 +31,7 @@ use river_core::room_state::message::{
 };
 use river_core::room_state::secret::SecretsSummary;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Summary};
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 // Reference the ACTUAL associated `Summary` types (not a hard-coded `BTreeSet`),
@@ -347,7 +348,17 @@ fn top_level_summary_serialization_is_order_independent() {
 /// is re-sent to every interested peer on every state change, and
 /// `interest_sync_summaries` was measured as the largest single consumer of
 /// outbound bytes on the Freenet network. The entry previously carried a raw
-/// 64-byte `Signature`, 66 of ~78 CBOR bytes (84%).
+/// ed25519 `Signature`, which is ~92% of it.
+///
+/// THE BASELINE IS MEASURED HERE, NOT ASSERTED IN PROSE. Both the issue and the
+/// first draft of this change quoted 66 bytes for the signature, which is the
+/// encoding of River's OWN `SignatureBytes` newtype (a CBOR byte string). It is
+/// NOT what `ed25519::Signature` does: `ed25519`'s `Serialize` calls
+/// `serialize_tuple(64)`, ciborium maps that to a CBOR ARRAY, and a random byte
+/// costs 2 bytes there whenever it is >= 24 — so the real figure is ~124. The
+/// wrong number survived an issue, a PR body, a review, and a round of review
+/// fixes, so the old shape is now rebuilt from the SAME records and measured
+/// alongside the new one. A derived figure is not evidence.
 ///
 /// REALISM MATTERS HERE, because the number this test reports is quoted as the
 /// production figure:
@@ -368,8 +379,7 @@ fn top_level_summary_serialization_is_order_independent() {
 /// and the assertion cannot flake.
 ///
 /// Asserted as bytes-per-entry rather than a total, so the bound does not need
-/// revising when the member count changes. The pre-#571 encoding cannot pass: a
-/// 64-byte signature alone serializes to 66 CBOR bytes.
+/// revising when the member count changes.
 #[test]
 fn member_info_summary_stays_small_per_entry() {
     const MEMBERS: u64 = 470; // the official room's rough membership
@@ -409,20 +419,60 @@ fn member_info_summary_stays_small_per_entry() {
 
     let bytes = cbor(&summary).len();
     let per_entry = bytes as f64 / MEMBERS as f64;
-    println!("member_info summary: {bytes} bytes for {MEMBERS} members = {per_entry:.2} B/entry");
 
-    // Measured at 28.01 B/entry with the 128-bit digest, against ~78 with the
-    // raw signature. A 64-bit digest would be exactly 8 B/entry cheaper (a CBOR
-    // byte string is 1 header byte either way, and a random u64 always takes the
-    // 8-byte form) — see `SigDigest` for why those 8 bytes are bought
-    // deliberately. The bound leaves headroom above 28.01 without approaching
-    // the 78 it exists to catch; the measurement itself is deterministic, so it
-    // is headroom for future entry-shape changes, not for run-to-run variance.
+    // The PRE-CHANGE shape, rebuilt from the same records: the summary value was
+    // the raw `Signature` rather than a digest of it. Everything else about the
+    // entry is identical, so the difference is exactly what this change bought.
+    let before: BTreeMap<MemberId, (u32, Signature)> = state
+        .member_info
+        .iter()
+        .map(|r| {
+            (
+                r.member_info.member_id,
+                (r.member_info.version, r.signature),
+            )
+        })
+        .collect();
+    let before_bytes = cbor(&before).len();
+    let before_per_entry = before_bytes as f64 / MEMBERS as f64;
+
+    println!(
+        "member_info summary over {MEMBERS} members:\n  \
+         before (u32, Signature): {before_bytes} B = {before_per_entry:.2} B/entry\n  \
+         after  (u32, SigDigest): {bytes} B = {per_entry:.2} B/entry\n  \
+         reduction: {:.1}x",
+        before_per_entry / per_entry
+    );
+
+    // Measured 134.08 → 28.01 B/entry, a 4.8x reduction. A 64-bit digest would
+    // be exactly 8 B/entry cheaper than the 128-bit one (a CBOR byte string
+    // costs 1 header byte either way, and a random u64 always takes the 8-byte
+    // form) — see `SigDigest` for why those 8 bytes are bought deliberately.
+    //
+    // The bound leaves headroom above 28.01 without approaching the 134 it
+    // exists to catch. The measurement is deterministic, so that headroom is for
+    // future entry-shape changes, not for run-to-run variance.
     assert!(
         per_entry < 32.0,
         "member_info summary must stay under 32 bytes/entry (got {per_entry:.2}, \
-         {bytes} bytes for {MEMBERS} members). A raw 64-byte Signature encodes to \
-         66 CBOR bytes on its own, so this failing likely means the summary \
-         regressed to carrying signatures rather than digests (freenet/river#571)."
+         {bytes} bytes for {MEMBERS} members). This failing likely means the \
+         summary regressed to carrying signatures rather than digests \
+         (freenet/river#571), or that `SigDigest` lost its hand-written \
+         `Serialize` — the serde derive emits a 16-element CBOR array (32 bytes) \
+         instead of a byte string (17), which measures 42.53 B/entry."
+    );
+
+    // Pin the baseline too. If this ever drops near the bound above, the
+    // reduction being claimed for this change has stopped being real — most
+    // likely because someone "fixed" the comparison to use a byte-string
+    // encoding that `ed25519::Signature` does not actually use.
+    assert!(
+        before_per_entry > 100.0,
+        "the pre-change encoding measured {before_per_entry:.2} B/entry, but \
+         `ed25519::Signature` serializes as a 64-element CBOR array (~124 bytes), \
+         so this should be ~134. A much lower figure means the baseline is being \
+         measured against the wrong encoding — River's `SignatureBytes` newtype \
+         uses `serialize_bytes` and costs 66, but the member_info summary never \
+         used that type."
     );
 }

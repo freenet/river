@@ -85,7 +85,11 @@ codebase: 11 of 30 runs missed a reversed-byte-order change). See
 Also assert bytes-per-entry for the summary, built by calling the real
 `summarize()` with realistic key values — `MemberId(FastHash(i))` for small `i`
 encodes in 1-3 bytes against a real key's ~9 and understates the entry by ~30%.
-See `member_info_summary_stays_small_per_entry`.
+**Measure the OLD shape in the same test, rebuilt from the same records**, rather
+than quoting a per-entry figure in prose. A size claim is the whole justification
+for a summary change, and a derived byte count is exactly the kind of number that
+survives review while being wrong (see the encoding trap in History below). See
+`member_info_summary_stays_small_per_entry`.
 
 ## History
 
@@ -98,10 +102,22 @@ See `member_info_summary_stays_small_per_entry`.
   summary-byte-compare staleness check.
 - **freenet/river#571** (2026-07): the same summary's VALUE then shrank,
   `(u32, Signature)` → `(u32, SigDigest)`, where `SigDigest` is a 128-bit BLAKE3
-  digest of the signature serialized as a CBOR byte string. The raw signature was
-  66 of ~78 CBOR bytes per entry; measured 78 → 28.0 bytes/entry at 470 records.
-  The collection type was already `BTreeMap` and did not change, so this is the
-  value-side rule above rather than the determinism rule.
+  digest of the signature serialized as a CBOR byte string. Measured 134.08 →
+  28.01 bytes/entry at 470 records, a 4.8x reduction. The collection type was
+  already `BTreeMap` and did not change, so this is the value-side rule above
+  rather than the determinism rule.
   `DirectMessagesSummary.message_signatures: BTreeSet<SignatureBytes>` still
-  carries raw 64-byte signatures and has the same fix available.
+  carries raw signatures and has the same fix available — but at 66 bytes each,
+  not 134, because it uses River's `SignatureBytes` newtype rather than
+  `ed25519::Signature` (see the next bullet).
+- **The same 64 bytes have two very different CBOR encodings, and the wrong one
+  was quoted for months.** `ed25519::Signature::serialize` calls
+  `serialize_tuple(64)`; ciborium maps a tuple to a CBOR ARRAY, where each
+  uniformly random byte costs 2 bytes whenever it is >= 24 — so ~124 bytes.
+  River's own `SignatureBytes` newtype calls `serialize_bytes`, giving a CBOR
+  byte string at 66. The 66 figure was carried through issue #571, PR #572's
+  body, and a review, applied to a summary that used `ed25519::Signature`. It
+  produced an arithmetic that could not close (470 x 66 exceeded the stated
+  total) and it understated the win by nearly half. **Measure the encoding in a
+  test against the real type; do not derive it from the byte count.**
 - **freenet/freenet-core#4857** — the update-drop divergence this feeds.

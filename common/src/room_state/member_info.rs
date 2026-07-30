@@ -160,24 +160,39 @@ fn member_info_rank(version: u32, signature: &Signature) -> (u32, SigDigest) {
 ///
 /// WHY A DIGEST AND NOT THE SIGNATURE (freenet/river#571, landed as PR #572;
 /// every "#571" elsewhere in this file is that ISSUE, not the PR): the summary carried
-/// the raw 64-byte `Signature` per member — 66 of ~78 CBOR bytes per entry, 84%
-/// of it. That summary is re-sent on every state change to every interested
-/// peer, and `interest_sync_summaries` was measured as the largest single
-/// consumer of outbound bytes on the Freenet network (49.8%). The signature is
-/// never verified here — it is only ever compared for equality and ordering — so
-/// a digest serves the identical purpose. Measured through the real `summarize()`
-/// on 470 entries with realistic `MemberId`s: ~78 → 28.0 CBOR bytes per entry. A
-/// 64-bit digest would be exactly 8 bytes per entry cheaper; the next paragraph
-/// is why those 8 bytes are bought deliberately. Pinned by
-/// `member_info_summary_stays_small_per_entry`.
+/// the raw ed25519 `Signature` per member — ~124 of ~134 CBOR bytes per entry,
+/// about 92% of it. That summary is re-sent on every state change to every
+/// interested peer, and `interest_sync_summaries` was measured as the largest
+/// single consumer of outbound bytes on the Freenet network (49.8%). The
+/// signature is never verified here — it is only ever compared for equality and
+/// ordering — so a digest serves the identical purpose. Measured through the real
+/// `summarize()` on 470 entries with realistic `MemberId`s: **134.08 → 28.01 CBOR
+/// bytes per entry, a 4.8x reduction**. A 64-bit digest would be exactly 8 bytes
+/// per entry cheaper; the next paragraph is why those 8 bytes are bought
+/// deliberately. Both figures are measured, not derived, by
+/// `member_info_summary_stays_small_per_entry`, which rebuilds the old shape from
+/// the same records.
+///
+/// WHY 124 AND NOT 66, since 66 is the number the issue and the first draft of
+/// this change both used: `ed25519::Signature`'s `Serialize` calls
+/// `serialize_tuple(64)`, which ciborium encodes as a CBOR ARRAY of 64 integers,
+/// and a uniformly random byte costs 2 bytes there whenever it is >= 24. 66 is
+/// the CBOR BYTE STRING encoding — what River's own
+/// [`crate::room_state::direct_messages::SignatureBytes`] newtype produces via
+/// `serialize_bytes`, and what the deferred `DirectMessagesSummary` follow-up
+/// will actually be saving. The member_info summary never used that type. Two
+/// different encodings of the same 64 bytes; do not reason about both with one
+/// number.
 ///
 /// The 29.1 KB mean `interest_sync_summaries` message that motivated #571 is a
 /// FLEET-WIDE mean across all rooms, so it is not this room's own summary size
 /// and the two figures must not be multiplied together: at the Official room's
-/// ~470 records the member_info term ALONE came to ~37 KB, which is larger than
-/// the fleet mean because that mean also averages in many far smaller rooms. No
-/// per-room summary measurement is on record, so no claim is made about what any
-/// single room's total summary weighed before this change.
+/// ~470 records the member_info term ALONE measures ~63 KB, well above the fleet
+/// mean, because that mean also averages in many far smaller rooms. No per-room
+/// summary measurement is on record, so no claim is made about what any single
+/// room's total summary weighed before this change. (The issue's own arithmetic
+/// did not close for the same reason this doc's did not: it used 66 rather than
+/// ~124 for the signature.)
 ///
 /// WHY 128 BITS AND NOT 64: a collision here is not cosmetic, and it is not
 /// self-correcting. Two same-version records whose discriminators tie are
@@ -263,8 +278,8 @@ impl ComposableState for MemberInfoV1 {
     /// at the SAME version (#411 B).
     ///
     /// This was `(u32, Signature)` until freenet/river#571. The raw 64-byte
-    /// signature was 66 of ~78 CBOR bytes per entry (84%), and this summary is
-    /// re-sent to every interested peer on every state change. See [`SigDigest`]
+    /// signature was ~124 of ~134 CBOR bytes per entry (~92%), and this summary
+    /// is re-sent to every interested peer on every state change. See [`SigDigest`]
     /// for why a digest is sufficient, why it is 128-bit blake3 rather than 64,
     /// and why it serializes as a CBOR byte string.
     ///
