@@ -3984,7 +3984,7 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         target_message_id: river_core::room_state::message::MessageId,
         reply_text: String,
-    ) -> Result<()> {
+    ) -> Result<river_core::room_state::message::MessageId> {
         info!(
             "Sending reply in room owned by: {}",
             bs58::encode(room_owner_key.as_bytes()).into_string()
@@ -4074,6 +4074,11 @@ impl ApiClient {
         let (members_delta, member_info_delta) =
             self.build_rejoin_delta(&room_state, room_owner_key, &signing_key);
 
+        // Capture the ID before `auth_message` moves into the delta below.
+        // Callers need it to act on their own reply afterwards -- editing it,
+        // deleting it, or tracking whether it is still present.
+        let reply_message_id = auth_message.id();
+
         // Create a delta with the reply message
         let delta = ChatRoomStateV1Delta {
             recent_messages: Some(vec![auth_message]),
@@ -4093,8 +4098,9 @@ impl ApiClient {
         // Update the stored state
         self.storage.update_room_state(room_owner_key, room_state)?;
 
-        // Send the delta to the network
-        self.send_delta(room_owner_key, delta).await
+        // Send the delta to the network, then hand back the new message's ID.
+        self.send_delta(room_owner_key, delta).await?;
+        Ok(reply_message_id)
     }
 
     /// Helper to send a delta to the network.
