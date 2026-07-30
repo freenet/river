@@ -128,20 +128,22 @@ test.describe("Room Details: in-progress typing survives room-state updates", ()
     await expect(maxMembers).toHaveValue(typedCap);
     await expect(maxMembers).toBeFocused();
 
-    // Symmetric trick: commit a description change without moving focus, which
-    // signs a config delta and writes ROOMS exactly as a remote update would.
-    const newDescription = "description set from elsewhere";
-    await page.getByTestId("room-description-input").evaluate((el, value) => {
-      const ta = el as HTMLTextAreaElement;
-      ta.value = value;
-      ta.dispatchEvent(new Event("change", { bubbles: true }));
-    }, newDescription);
+    // Same trick as test 1, but driven through the ROOM NAME field, so the
+    // write is observable somewhere this test did not write to itself.
+    // Committing the description here instead would be a vacuous gate: the
+    // synthetic event sets the textarea's DOM value directly, so asserting
+    // that value proves only that the test wrote it.
+    const renamed = "Renamed While Editing";
+    await page.getByTestId("room-name-input").evaluate((el, value) => {
+      const input = el as HTMLInputElement;
+      input.value = value;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    }, renamed);
 
-    // Anti-vacuity: the write only shows up here once the delta has been
-    // applied and the dialog re-rendered from the new room state.
-    await expect(page.getByTestId("room-description-input")).toHaveValue(newDescription, {
-      timeout: 15_000,
-    });
+    // ANTI-VACUITY GATE: the room heading renders from room state, so it can
+    // only show the new name once the delta was signed, applied to ROOMS and
+    // re-rendered through the tree.
+    await expect(page.getByRole("heading", { name: renamed })).toBeVisible({ timeout: 15_000 });
 
     // The cap being typed must still be there, and still uncommitted.
     await expect(maxMembers).toHaveValue(typedCap);
