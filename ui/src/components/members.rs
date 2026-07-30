@@ -1704,7 +1704,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
 
                         // Look up member_info from cached or current state.
                         // Routed through `canonical` (highest member_info_rank:
-                        // version, then signature bytes), not a version-only
+                        // version, then signature digest), not a version-only
                         // `max_by_key`, so a same-version duplicate can't export
                         // the losing record (freenet/river#411 round 8).
                         let member_info = room_data.self_member_info.clone().or_else(|| {

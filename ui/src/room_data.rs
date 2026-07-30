@@ -740,7 +740,7 @@ impl RoomData {
         // and nickname edit. A stale `self_nickname` can never override a
         // newer `self_member_info`.
         // Route through `canonical` (highest member_info_rank: version, then
-        // signature bytes) rather than a version-only `max_by_key` — `verify`
+        // signature digest) rather than a version-only `max_by_key` — `verify`
         // accepts duplicate member_info records per member_id (migration
         // safety), and a version-only tiebreak can seed this cache from a
         // LOSING record on a same-version collision (freenet/river#411
@@ -840,7 +840,7 @@ impl RoomData {
         let self_id = MemberId::from(&self.self_sk.verifying_key());
 
         // The viewer's CANONICAL signed member_info (highest member_info_rank:
-        // version, then signature bytes) — NOT a bare first-match. `verify`
+        // version, then signature digest) — NOT a bare first-match. `verify`
         // accepts duplicate member_info records per member_id (migration
         // safety), and a client can hold such a duplicate-containing full
         // state before cleanup runs. A first-match `.find()` can seed this
@@ -6239,7 +6239,7 @@ mod tests {
     // ------------------------------------------------------------------
     // #411 round 8 (Fix E): `apply_deputy_change` must route through the
     // CANONICAL member_info record (highest member_info_rank: version, then
-    // signature bytes), not a first-match `.find()`, and must derive the
+    // signature digest), not a first-match `.find()`, and must derive the
     // republished version from the higher of the canonical room_state
     // version and the cached `self_member_info` version. `verify` accepts
     // duplicate member_info records per member_id (migration safety), so a
@@ -6261,11 +6261,23 @@ mod tests {
         // "clean" (no deputies) and one "stale_grant" that already lists T
         // as a deputy. `verify` accepts duplicate member_info records at the
         // same version (a genuine concurrent-edit collision). Which one is
-        // CANONICAL is decided by `member_info_rank`'s signature-bytes
-        // tiebreak, not Vec position — retry with fresh D keys until "clean"
-        // outranks "stale_grant" by signature, so the test's expectations
+        // CANONICAL is decided by `member_info_rank`'s signature-DIGEST
+        // tiebreak (freenet/river#571; before that it compared raw signature
+        // bytes), not Vec position — retry with fresh D keys until "clean"
+        // outranks "stale_grant" by that digest, so the test's expectations
         // don't depend on how ed25519 happens to sign one particular key's
         // bytes.
+        //
+        // The digest is recomputed here from blake3 rather than calling into
+        // river-core (`member_info_rank`/`sig_digest` are private anyway):
+        // a fixture that picked its key via the implementation under test
+        // would make the `canonical` sanity assertion below tautological.
+        // Computed independently, a change to the digest function or its byte
+        // order makes this pick the wrong key and that assertion fails.
+        let sig_digest = |sig: &ed25519_dalek::Signature| -> u64 {
+            let hash = blake3::hash(&sig.to_bytes());
+            u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+        };
         let (d_sk, clean_authorized, stale_grant_authorized) = 'retry: {
             for _ in 0..500 {
                 let d_sk = SigningKey::generate(&mut rng);
@@ -6285,13 +6297,15 @@ mod tests {
                 };
                 let stale_grant_authorized =
                     AuthorizedMemberInfo::new_with_member_key(stale_grant, &d_sk);
-                if clean_authorized.signature.to_bytes()
-                    > stale_grant_authorized.signature.to_bytes()
+                if sig_digest(&clean_authorized.signature)
+                    > sig_digest(&stale_grant_authorized.signature)
                 {
                     break 'retry (d_sk, clean_authorized, stale_grant_authorized);
                 }
             }
-            panic!("failed to find a D key where 'clean' outranks 'stale_grant' by signature");
+            panic!(
+                "failed to find a D key where 'clean' outranks 'stale_grant' by signature digest"
+            );
         };
         let d_id = MemberId::from(&d_sk.verifying_key());
 

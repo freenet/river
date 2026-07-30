@@ -20,8 +20,8 @@ pub struct MemberInfoV1 {
 
 impl MemberInfoV1 {
     /// The CANONICAL `member_info` record for `member_id`: the highest-
-    /// `member_info_rank` (higher `version`, else lexicographically-greater
-    /// signature) among ALL records present for that member, or `None` if there
+    /// `member_info_rank` (higher `version`, else greater signature DIGEST)
+    /// among ALL records present for that member, or `None` if there
     /// is none.
     ///
     /// LOAD-BEARING (#411 round 8 item A). `verify` deliberately ACCEPTS a state
@@ -266,7 +266,7 @@ impl ComposableState for MemberInfoV1 {
             .filter(|info| {
                 // Include if the member is absent from the old summary, OR this
                 // record OUTRANKS what the old summary has (higher version, or
-                // equal version with a greater signature). The equal-version arm
+                // equal version with a greater signature digest). The equal-version arm
                 // is what lets a same-version content difference propagate (#411
                 // round 4 B) — without it, anti-entropy would never send the
                 // correction and peers would disagree on deputies forever.
@@ -342,7 +342,7 @@ impl ComposableState for MemberInfoV1 {
 
                 // Update or add the member info. Conflict resolution uses the
                 // total, deterministic `member_info_rank` order (higher version,
-                // else greater signature) so that two DIFFERENT records for the
+                // else greater signature digest) so that two DIFFERENT records for the
                 // same member at the SAME version resolve identically regardless
                 // of delta arrival order (#411 round 4 B). Using only
                 // `version >` (as before) left equal-version conflicts
@@ -1295,7 +1295,7 @@ mod tests {
 
     /// #411 round 7 / Codex P1 #3: when two records for one member are present,
     /// `deputies_of` must return the HIGHEST-rank record's deputies (higher
-    /// version, else greater signature) — the same winner `apply_delta` /
+    /// version, else greater signature digest) — the same winner `apply_delta` /
     /// `summarize` converge on — regardless of vector order. A bare `.find()`
     /// (first) could disagree with the converged state.
     #[test]

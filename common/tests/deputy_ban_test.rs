@@ -115,6 +115,20 @@ fn member_ids(state: &ChatRoomStateV1) -> HashSet<MemberId> {
         .collect()
 }
 
+/// The equal-version `member_info` tiebreak discriminator: higher `version`
+/// wins, and at equal version the greater signature DIGEST wins
+/// (freenet/river#571; before that the tiebreak compared raw signature bytes).
+///
+/// Recomputed here from blake3 rather than calling into river-core,
+/// deliberately: an oracle that reuses the implementation under test only
+/// proves self-consistency. If production changes the digest function or its
+/// byte order, this picks a different winner and the asserting test fails,
+/// which is the point.
+fn sig_digest(sig: &ed25519_dalek::Signature) -> u64 {
+    let hash = blake3::hash(&sig.to_bytes());
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+}
+
 /// Deputize A->B (B may be anyone), B bans T where T is in A's subtree -> T
 /// (and their downstream) are removed.
 #[test]
@@ -1560,17 +1574,8 @@ fn equal_version_member_info_resolves_deterministically_across_apply_order() {
         "equal-version conflict must resolve identically regardless of apply order"
     );
     // Canonical winner: higher version (equal here), else greater signature
-    // DIGEST (freenet/river#571; was raw signature bytes).
-    //
-    // The digest is recomputed here from blake3 rather than calling into
-    // river-core, deliberately: an oracle that reuses the implementation under
-    // test only proves self-consistency. If production changes the digest
-    // function or its byte order, this picks a different winner and the
-    // assertion below fails, which is the point.
-    let sig_digest = |sig: &ed25519_dalek::Signature| -> u64 {
-        let hash = blake3::hash(&sig.to_bytes());
-        u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
-    };
+    // DIGEST (freenet/river#571; was raw signature bytes). See `sig_digest`
+    // for why the oracle recomputes the digest instead of calling river-core.
     let winner = if sig_digest(&ra.signature) > sig_digest(&rb.signature) {
         &ra
     } else {
@@ -1592,7 +1597,8 @@ fn equal_version_member_info_resolves_deterministically_across_apply_order() {
 /// #411 round 4 B — a same-version content difference is DETECTED and corrected
 /// by anti-entropy (the `summarize` discriminator half of the fix). Each peer has
 /// only ONE of the two equal-version records; because the summary now carries the
-/// signature, the merge transfers the canonical winner and both converge. If
+/// signature DIGEST (freenet/river#571; originally the raw signature), the merge
+/// transfers the canonical winner and both converge. If
 /// `summarize` regressed to version-only, the delta would be empty and the peers
 /// would disagree on ban authority forever.
 #[test]
@@ -1649,7 +1655,10 @@ fn equal_version_member_info_diff_detected_by_anti_entropy() {
         peer1.member_info, peer2.member_info,
         "peers converge on the SAME MemberInfo record after anti-entropy"
     );
-    let winner = if ra.signature.to_bytes() > rb.signature.to_bytes() {
+    // Same tiebreak as `equal_version_member_info_resolves_deterministically_across_apply_order`:
+    // greater signature DIGEST wins at equal version (freenet/river#571; was
+    // raw signature bytes). See `sig_digest`.
+    let winner = if sig_digest(&ra.signature) > sig_digest(&rb.signature) {
         &ra
     } else {
         &rb
@@ -1660,7 +1669,10 @@ fn equal_version_member_info_diff_detected_by_anti_entropy() {
         .iter()
         .find(|i| i.member_info.member_id == m.id)
         .unwrap();
-    assert_eq!(got, winner, "both converge to the greater-signature record");
+    assert_eq!(
+        got, winner,
+        "both converge to the greater signature-digest record"
+    );
     peer1.verify(&peer1, &p).expect("peer1 verifies");
     peer2.verify(&peer2, &p).expect("peer2 verifies");
 }
