@@ -511,12 +511,22 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
             let room_owner_key = parse_room_id(&room_id)?;
             let target_message_id = parse_message_id(&message_id)?;
 
-            api.send_reply(&room_owner_key, target_message_id, message.clone())
+            let reply_message_id = api
+                .send_reply(&room_owner_key, target_message_id, message.clone())
                 .await?;
 
             match format {
-                OutputFormat::Human => println!("Reply sent successfully"),
-                OutputFormat::Json => println!(r#"{{"status":"success","action":"reply"}}"#),
+                OutputFormat::Human => {
+                    println!("Reply sent successfully (id: {})", reply_message_id.0 .0)
+                }
+                // Emit the ID in the SAME form `message list` prints and
+                // `message delete` accepts (the inner i64), so a caller can act
+                // on its own reply without a second round trip to find it.
+                // Automated moderation needs this to delete a reply it sent.
+                OutputFormat::Json => println!(
+                    r#"{{"status":"success","action":"reply","message_id":"{}"}}"#,
+                    reply_message_id.0 .0
+                ),
             }
             Ok(())
         }
@@ -547,4 +557,51 @@ fn parse_message_id(message_id: &str) -> Result<MessageId> {
         .map_err(|e| anyhow::anyhow!("Invalid message ID (expected integer): {}", e))?;
 
     Ok(MessageId(freenet_scaffold::util::FastHash(hash_value)))
+}
+
+#[cfg(test)]
+mod tests {
+    /// `message reply --format json` must return the new message's ID, and in
+    /// the SAME form `message list` prints and `message delete` accepts.
+    ///
+    /// Without it a caller cannot act on a reply it just sent: the response was
+    /// `{"status":"success","action":"reply"}` and nothing else, so identifying
+    /// your own reply meant scanning the room and guessing. Automated moderation
+    /// needs to delete a reply it posted, which is what motivated this.
+    ///
+    /// Source-scrape rather than a live round trip, because sending a reply
+    /// requires a node and a room. Whitespace is squashed so rustfmt cannot
+    /// silently disarm the pin.
+    #[test]
+    fn reply_json_returns_the_new_message_id() {
+        let source = include_str!("message.rs");
+        // Scan ONLY production code. Without this cut the assertions below match
+        // their OWN string literals in this test, so the pin passes no matter
+        // what the reply arm actually prints -- verified by mutation.
+        let production = source
+            .split_once("mod tests")
+            .map(|(before, _)| before)
+            .expect("test module marker missing; the cut would scan everything");
+        let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Vacuity guard: if the reply arm is ever renamed or moved out of this
+        // file, every assertion below would pass without checking anything.
+        assert!(
+            squashed.contains(r#""status":"success","action":"reply""#),
+            "reply JSON arm not found in this file; the pin would pass vacuously"
+        );
+
+        assert!(
+            squashed.contains(r#""action":"reply","message_id":"{}""#),
+            "reply JSON must carry message_id"
+        );
+
+        // `message list` emits the inner i64 (`msg_id.0 .0`) and `message
+        // delete` parses that same form, so the reply must not print the
+        // Display form of MessageId, which is the debug-formatted FastHash.
+        assert!(
+            squashed.contains("reply_message_id.0.0"),
+            "reply must emit the inner i64, matching what `message delete` accepts"
+        );
+    }
 }
