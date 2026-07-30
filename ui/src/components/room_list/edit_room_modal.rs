@@ -448,31 +448,43 @@ fn CopyButton(value: String, testid: String, label: String) -> Element {
     }
 }
 
+/// The room's stored description, decrypted with whatever room secrets are
+/// available locally.
+///
+/// Kept out of the render body deliberately. It clones the room's whole secret
+/// set and runs an ECIES unseal, and now that `oninput` re-renders the field on
+/// every keystroke (freenet/river#564) that would be per-character work on the
+/// typing path. It is only ever needed twice: to seed the editing signal when
+/// the field mounts, and to revert a save the privacy guard refuses.
+///
+/// Must not call any hook: it runs inside `use_signal`'s initializer, which
+/// evaluates while the scope's hook list is mutably borrowed.
+fn stored_description(config: &Configuration) -> String {
+    let owner_key = CURRENT_ROOM.read().owner_key;
+    let secrets = ROOMS
+        .try_read()
+        .ok()
+        .and_then(|rooms| {
+            owner_key
+                .and_then(|key| rooms.map.get(&key))
+                .map(|room_data| room_data.secrets.clone())
+        })
+        .unwrap_or_default();
+    config
+        .display
+        .description
+        .as_ref()
+        .map(|sealed| match unseal_bytes_with_secrets(sealed, &secrets) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(_) => sealed.to_string_lossy(),
+        })
+        .unwrap_or_default()
+}
+
 #[component]
 fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
-    let initial_desc = {
-        let owner_key = CURRENT_ROOM.read().owner_key;
-        let secrets = ROOMS
-            .try_read()
-            .ok()
-            .and_then(|rooms| {
-                owner_key
-                    .and_then(|key| rooms.map.get(&key))
-                    .map(|room_data| room_data.secrets.clone())
-            })
-            .unwrap_or_default();
-        config
-            .display
-            .description
-            .as_ref()
-            .map(|sealed| match unseal_bytes_with_secrets(sealed, &secrets) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                Err(_) => sealed.to_string_lossy(),
-            })
-            .unwrap_or_default()
-    };
-    let initial_desc_for_revert = initial_desc.clone();
-    let mut description = use_signal(|| initial_desc);
+    let seed_config = config.clone();
+    let mut description = use_signal(move || stored_description(&seed_config));
 
     let update_description = move |evt: Event<FormData>| {
         if !is_owner {
@@ -520,7 +532,7 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
                      room description edit deferred to avoid leaking a \
                      plaintext configuration delta (freenet/river#299)."
                 );
-                description.set(initial_desc_for_revert.clone());
+                description.set(stored_description(&config));
                 return;
             };
             Some(sealed)
@@ -591,12 +603,44 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
         div { class: "mb-4",
             label { class: "block text-sm font-medium text-text-muted mb-2", "Room Description" }
             textarea {
+                "data-testid": "room-description-input",
                 class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed resize-y",
                 rows: "3",
                 placeholder: "Optional room description",
                 value: "{description}",
                 readonly: !is_owner,
                 disabled: !is_owner,
+                // Track the live value on every keystroke (freenet/river#564).
+                // `value` is a VOLATILE attribute in dioxus-html, so dioxus
+                // re-writes it to the DOM on every re-render even when the
+                // rendered string is unchanged (dioxus-core
+                // `diff/node.rs:463`), and the interpreter then assigns
+                // `node.value = value` whenever the live DOM value differs
+                // (`set_attribute.ts:31`). With `onchange` alone the signal
+                // still held the pre-typing text, so each re-render reset the
+                // textarea and the owner lost whatever they had typed but not
+                // yet committed. Tracking the live value makes the re-write a
+                // no-op, which is why the sibling name field never had this.
+                //
+                // As shipped, the re-render came on every room-state write:
+                // this component read CURRENT_ROOM and ROOMS in its render
+                // body. It no longer does (that moved into
+                // `stored_description`, called from the `use_signal` seed), so
+                // today the trigger is a `config`/`is_owner` prop change. The
+                // handler is required either way: `oninput` makes the field
+                // correct under ANY re-render, which is the point, since the
+                // trigger is never local to the component.
+                // Guarded like `update_description` below. The field is
+                // `disabled` for non-owners so this cannot fire from real
+                // input, but leaving the signal un-tracked for them is the
+                // correct behaviour: the volatile re-write then restores the
+                // stored value rather than letting a synthetic event drift the
+                // display away from what is actually saved.
+                oninput: move |evt: Event<FormData>| {
+                    if is_owner {
+                        description.set(evt.value().to_string());
+                    }
+                },
                 onchange: update_description,
             }
         }
@@ -742,6 +786,12 @@ fn NumericConfigField(
                 min: "1",
                 class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
                 value: "{input_value}",
+                // Track the live value so a re-render cannot reset the field
+                // mid-typing (freenet/river#564). See the RoomDescriptionField
+                // textarea above for the full mechanism: `value` is volatile,
+                // so it is re-written to the DOM on every re-render, and this
+                // field re-renders whenever its `config` prop changes.
+                oninput: move |evt: Event<FormData>| input_value.set(evt.value().to_string()),
                 onchange: update_value,
             }
         }
@@ -860,10 +910,16 @@ fn MaxMembersField(
             }
             if is_owner {
                 input {
+                    "data-testid": "max-members-input",
                     r#type: "number",
                     min: "1",
                     class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text focus:outline-none focus:ring-2 focus:ring-accent focus:border-transparent",
                     value: "{max_members_input}",
+                    // Track the live value so a re-render cannot reset the
+                    // field mid-typing (freenet/river#564). This one re-renders
+                    // on its `member_count` prop too, so a member joining while
+                    // the owner was editing the cap was enough to wipe it.
+                    oninput: move |evt: Event<FormData>| max_members_input.set(evt.value().to_string()),
                     onchange: update_max_members,
                 }
             }

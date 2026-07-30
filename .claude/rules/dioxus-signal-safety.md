@@ -190,6 +190,92 @@ Signal clears that the effect subscribes to must be synchronous.
 Deferring causes an infinite loop (set remains non-empty → effect
 re-runs → defers clear → effect re-runs...).
 
+## Bind `oninput` on every EDITABLE `value:` field
+
+`value` on `input` / `textarea` / `select` is a **volatile** attribute in
+dioxus-html (`elements.rs:1488,1571,1594`). dioxus-core re-writes volatile
+attributes to the DOM on every re-render, even when the rendered string has
+not changed:
+
+```text
+// dioxus-core-0.7.9/src/diff/node.rs:463
+if volatile || attribute_changed { self.write_attribute(...) }
+```
+
+and the interpreter then assigns the value whenever the LIVE DOM value differs
+from the VDOM value:
+
+```text
+// dioxus-interpreter-js-0.7.9/src/ts/set_attribute.ts:31-33
+case "value": ... else if (node.value !== value) node.value = value;
+```
+
+`onchange` fires on blur, not per keystroke. So a field bound only through
+`onchange` still holds the PRE-TYPING text for as long as the user is typing,
+and the next re-render resets the control and discards the edit.
+
+```rust
+// WRONG — any re-render wipes what the user has typed so far
+textarea { value: "{description}", onchange: save }
+
+// RIGHT — the signal tracks the DOM, so the re-write is a no-op
+textarea {
+    value: "{description}",
+    oninput: move |evt| description.set(evt.value().to_string()),
+    onchange: save,
+}
+```
+
+Nothing about the broken call site looks wrong, and reasoning about the
+component in isolation will not reveal it: the trigger is whatever unrelated
+signal that component happens to read. `RoomDescriptionField` read
+`CURRENT_ROOM` and `ROOMS` in its render body, so every room-state write
+re-rendered it, and the owner's half-typed room description vanished
+(freenet/river#564). It no longer reads them there, so today the trigger is a
+prop change instead. That is exactly why the handler is the fix rather than
+removing the subscription: `oninput` makes a field correct under ANY
+re-render, and the trigger is never local to the component. There is no single
+timer behind that cadence either: the
+recurring ROOMS writers are the ~60 s idle liveness probe whose GET reply
+merges unconditionally, the ~21 s `ProcessRooms` loop while a room awaits
+subscription, and every subscription `UpdateNotification`. Do not go looking
+for one interval to blame.
+
+**This is the documented exception to the `defer()` rule above, and it is
+narrow.** A controlled input's bound LOCAL signal must be written
+SYNCHRONOUSLY from `oninput`. Deferring it lags the DOM by a `setTimeout(0)`,
+so a re-render landing in that window writes the pre-keystroke value back and
+drops characters, which is the very bug this section exists to prevent.
+
+The exception covers local `use_signal` handles only. They have no external
+subscribers, which is why `util.rs`'s
+`event_handlers_never_write_a_global_signal_without_defer` does not object to
+them. It is NOT a blanket `oninput` exemption: that pin does scan `oninput:`
+(both inline closures and named handlers) and still requires `defer()` around a
+write to a GLOBAL signal such as `ROOMS` or `CURRENT_ROOM`. If you need a
+keystroke to reach global state, track the local signal synchronously and
+defer the global write. See also the note at `members.rs`'s import-token
+`oninput`.
+
+Display-only controls may bind `value:` with no `oninput`, but must declare
+themselves with a literal `readonly: true` (or `readonly: "true"`). A
+conditional `readonly: !is_owner` does NOT count: the field is editable for
+somebody, and that somebody is exactly who loses their typing.
+`type="checkbox"` and `type="radio"` are exempt too, for the opposite reason:
+dioxus reports their `evt.value()` as `"true"`/`"false"`, never the DOM's
+`"on"`, so tracking a `value:` binding there would CAUSE a rewrite every
+render. Bind `checked:`, which is not volatile.
+
+`components.rs::volatile_value_binding_audit` scans every `.rs` file under
+`ui/src` for this and pins the exact set of bindings it finds, so a field that
+drops out of the scan fails loudly rather than quietly losing coverage. Two
+limits worth knowing: it proves `oninput` is present and not a no-op, but not
+that the handler writes the signal the `value:` binding reads; and it says
+nothing about the OTHER route to the same symptom, where a parent unmounts the
+field (a contended `try_read` memo returning `None`) and the remount re-seeds
+`use_signal`. That second route is the #499/#555 contention family and
+`oninput` does not help there.
+
 ## Don't `use_memo` against non-signal values in an always-mounted component
 
 The modals in `app.rs` (`MemberInfoModal`, `DmThreadModal`,
