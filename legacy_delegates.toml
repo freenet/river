@@ -216,3 +216,10 @@ description = "Before the global direct-message retention cap (freenet/river#519
 date = "2026-07-27"
 delegate_key = "d46b5363858c82ed91f0709d179c620c74c1ab84483b114181594c08a3d4b915"
 code_hash = "2f8c5f1d5c517e57208538fb2a7ec819e882eafa29bc43047eb6c025b37eba8e"
+
+[[entry]]
+version = "V30"
+description = "Before the member_info summary digest (freenet/river#571): last chat-delegate generation built against river-core 0.1.18 and the raw-signature member_info summary"
+date = "2026-07-30"
+delegate_key = "c3624f29fdfdb1ca3473a3d4b11c83b635cb98bf6d89e1b5114c003e1d1c485a"
+code_hash = "6f65e45cd8b903374b4ac7c9c916e4fe9f9403660e7391c9192ea8378933a1b4"

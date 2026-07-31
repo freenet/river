@@ -53,6 +53,47 @@ changes → follow the room-contract + delegate migration ritual
 (`.claude/rules/delegate-migration.md`) before publishing, and bump the
 `river-core` / `riverctl` versions if a WASM changed.
 
+## Summary VALUES are a wire-format commitment too
+
+Determinism is about the collection type; this section is about what goes in it.
+A summary value that is only ever compared (never verified, never decoded back
+into anything) should be a fixed-width digest, not the thing it fingerprints —
+the summary is re-sent to every interested peer on every state change, so a
+64-byte signature per entry is paid over and over.
+
+When a summary carries a digest, four properties become wire format, and none of
+them may change without re-keying the contract:
+
+- which hash function (and it must be cryptographic if an attacker can choose
+  the input — a base-31 polynomial like `freenet_scaffold::util::fast_hash` is
+  fine for accidental collisions only);
+- how wide, judged against who controls the colliding inputs. If a party can
+  grind BOTH sides of the comparison, 64 bits is a ~2^32 birthday search, i.e.
+  hours; use 128.
+- which bytes are kept, and in what order;
+- how the value serializes — a `[u8; 16]` through the serde derive emits a
+  16-element CBOR array (~32 bytes for random content, since each byte >= 24
+  costs two), not a byte string (17). Write `Serialize` by hand with
+  `serialize_bytes`.
+
+Pin all four with a **golden vector**: ONE fixed input, ONE fixed expected
+digest, ONE fixed expected encoding. Oracles that compare digests of randomly
+generated keys are NOT sufficient — a byte-order change leaves them agreeing
+some of the time, so they detect it only intermittently. Measured twice on this
+codebase with the digest reversed: 11 of 30 runs missed it in one sample, 1 of 12
+in an independent reproduction. The exact rate depends on the keys drawn and is
+not the point; a non-zero miss rate makes it a coin flip rather than a check. See
+`sig_digest_golden_vector` in `common/src/room_state/member_info.rs`.
+
+Also assert bytes-per-entry for the summary, built by calling the real
+`summarize()` with realistic key values — `MemberId(FastHash(i))` for small `i`
+encodes in 1-3 bytes against a real key's ~9 and understates the entry by ~30%.
+**Measure the OLD shape in the same test, rebuilt from the same records**, rather
+than quoting a per-entry figure in prose. A size claim is the whole justification
+for a summary change, and a derived byte count is exactly the kind of number that
+survives review while being wrong (see the encoding trap in History below). See
+`member_info_summary_stays_small_per_entry`.
+
 ## History
 
 - **freenet/river** (2026-07): `MemberInfoV1::Summary` was
@@ -62,4 +103,24 @@ changes → follow the room-contract + delegate migration ritual
   `BTreeMap`/`BTreeSet`. `bincode` (the old wire path) doesn't care about key
   order, so this survived undetected until freenet-core added the
   summary-byte-compare staleness check.
+- **freenet/river#571** (2026-07): the same summary's VALUE then shrank,
+  `(u32, Signature)` → `(u32, SigDigest)`, where `SigDigest` is a 128-bit BLAKE3
+  digest of the signature serialized as a CBOR byte string. Measured 134.08 →
+  28.01 bytes/entry at 470 records, a 4.8x reduction. The collection type was
+  already `BTreeMap` and did not change, so this is the value-side rule above
+  rather than the determinism rule.
+  `DirectMessagesSummary.message_signatures: BTreeSet<SignatureBytes>` still
+  carries raw signatures and has the same fix available — but at 66 bytes each,
+  not 134, because it uses River's `SignatureBytes` newtype rather than
+  `ed25519::Signature` (see the next bullet).
+- **The same 64 bytes have two very different CBOR encodings, and the wrong one
+  was quoted for months.** `ed25519::Signature::serialize` calls
+  `serialize_tuple(64)`; ciborium maps a tuple to a CBOR ARRAY, where each
+  uniformly random byte costs 2 bytes whenever it is >= 24 — so ~124 bytes.
+  River's own `SignatureBytes` newtype calls `serialize_bytes`, giving a CBOR
+  byte string at 66. The 66 figure was carried through issue #571, PR #572's
+  body, and a review, applied to a summary that used `ed25519::Signature`. It
+  produced an arithmetic that could not close (470 x 66 exceeded the stated
+  total) and it understated the win by nearly half. **Measure the encoding in a
+  test against the real type; do not derive it from the byte count.**
 - **freenet/freenet-core#4857** — the update-drop divergence this feeds.

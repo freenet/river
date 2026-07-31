@@ -108,7 +108,7 @@ pub fn MemberInfoModal() -> Element {
 
     let modal_content = if let Some(member_id) = MEMBER_INFO_MODAL.read().member {
         // Find the CANONICAL AuthorizedMemberInfo for the given member_id
-        // (highest member_info_rank: version, then signature bytes) — not a
+        // (highest member_info_rank: version, then signature digest) — not a
         // bare first-match. `verify` accepts duplicate member_info records
         // per member_id (migration safety), so a first-match `.find()` can
         // read a losing (e.g. revoked) record (freenet/river#411 round 8).

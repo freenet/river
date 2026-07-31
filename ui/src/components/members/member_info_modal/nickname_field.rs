@@ -190,7 +190,7 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                     // `self_member_info` version — not from the canonical
                     // base alone. On a stale/reset client the room_state max
                     // can collide at the SAME version as a still-propagating
-                    // record and lose the signature tiebreak, silently
+                    // record and lose the digest tiebreak, silently
                     // no-op'ing the edit (freenet/river#411 round 8).
                     let cached_version = room_data
                         .self_member_info

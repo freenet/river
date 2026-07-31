@@ -217,3 +217,9 @@ version = "V30"
 description = "Before the global direct-message retention cap (freenet/river#519): last generation whose DirectMessagesV1 had no whole-set bound, so every DM participant was pinned as a room member forever"
 date = "2026-07-27"
 code_hash = "f8cca7600a63dac16de1974e08211e3eb6e530713a8cfe78caed3a66372a3e50"
+
+[[entry]]
+version = "V31"
+description = "Before the member_info summary digest (freenet/river#571): last generation whose MemberInfoV1::Summary carried a raw ed25519 Signature per member and broke equal-version ties on raw signature bytes"
+date = "2026-07-30"
+code_hash = "dd63bcc974a6e4ab9aed2fa05e8a1085713ff69d0a160f4a487551c51c1a9d0f"

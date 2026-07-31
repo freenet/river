@@ -106,10 +106,11 @@ mod tests {
         for hash in LEGACY_ROOM_CONTRACT_CODE_HASHES {
             hasher.update(hash);
         }
-        // V30 registers the pre-global-DM-cap generation (freenet/river#519,
-        // the whole-set bound on `direct_messages`), which re-keys the contract.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 30);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "fc9e2622d9fa7d6f");
+        // V31 registers the pre-summary-digest generation (freenet/river#571,
+        // `MemberInfoV1::Summary` carrying a raw `Signature` per member), which
+        // re-keys the contract.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 31);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "b5f02d45b6370b4d");
     }
 
     #[test]

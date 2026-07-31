@@ -15,7 +15,7 @@
 //!
 //! See `.claude/rules/contract-summary-determinism.md`.
 
-use ed25519_dalek::Signature;
+use ed25519_dalek::{Signature, SigningKey};
 use freenet_scaffold::util::FastHash;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::ban::{BanId, BansV1};
@@ -23,12 +23,15 @@ use river_core::room_state::direct_messages::{
     DirectMessagesSummary, DmOrderKey, DmPairHorizon, DmRetentionHorizon, SignatureBytes,
 };
 use river_core::room_state::member::{MemberId, MembersV1};
-use river_core::room_state::member_info::MemberInfoV1;
+use river_core::room_state::member_info::{
+    AuthorizedMemberInfo, MemberInfo, MemberInfoV1, SigDigest,
+};
 use river_core::room_state::message::{
     MessageId, MessageOrderKey, MessagesSummary, MessagesV1, RetentionHorizon,
 };
 use river_core::room_state::secret::SecretsSummary;
-use river_core::room_state::ChatRoomStateV1Summary;
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Summary};
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 // Reference the ACTUAL associated `Summary` types (not a hard-coded `BTreeSet`),
@@ -56,8 +59,21 @@ fn ban_id(i: i64) -> BanId {
 fn member_id(i: i64) -> MemberId {
     MemberId(FastHash(i))
 }
-fn sig(i: i64) -> Signature {
-    Signature::from_bytes(&[i as u8; 64])
+/// A distinct signature digest per index, matching the `(u32, SigDigest)` shape
+/// the member_info summary carries since freenet/river#571. The tests using this
+/// exercise ORDER-independence of the serialized summary, so only distinctness
+/// matters here, not that these equal any real `blake3` digest. (The real
+/// digest's value and encoding are pinned separately by `sig_digest_golden_vector`
+/// in `river_core::room_state::member_info`.)
+fn sig_rank(i: i64) -> SigDigest {
+    // Spread the bits so a byte-order bug in the summary encoding shows up as a
+    // difference rather than cancelling out across entries.
+    let a = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let b = (i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&a.to_le_bytes());
+    out[8..].copy_from_slice(&b.to_le_bytes());
+    SigDigest(out)
 }
 
 #[test]
@@ -87,10 +103,12 @@ fn members_summary_serialization_is_order_independent() {
 
 #[test]
 fn member_info_summary_serialization_is_order_independent() {
-    // MemberInfoV1::Summary = BTreeMap<MemberId, (u32, Signature)>.
-    let fwd: Vec<(MemberId, (u32, Signature))> =
-        (0..N).map(|i| (member_id(i), (i as u32, sig(i)))).collect();
-    let rev: Vec<(MemberId, (u32, Signature))> = fwd.iter().rev().cloned().collect();
+    // MemberInfoV1::Summary = BTreeMap<MemberId, (u32, SigDigest)> — the digest
+    // replaced a raw 64-byte Signature in freenet/river#571.
+    let fwd: Vec<(MemberId, (u32, SigDigest))> = (0..N)
+        .map(|i| (member_id(i), (i as u32, sig_rank(i))))
+        .collect();
+    let rev: Vec<(MemberId, (u32, SigDigest))> = fwd.iter().rev().cloned().collect();
 
     let s_fwd: MemberInfoSummary = fwd.into_iter().collect();
     let s_rev: MemberInfoSummary = rev.into_iter().collect();
@@ -258,7 +276,7 @@ fn top_level_summary_serialization_is_order_independent() {
         let member_info = (0..N)
             .map(|i| {
                 let j = order(i);
-                (member_id(j), (j as u32, sig(j)))
+                (member_id(j), (j as u32, sig_rank(j)))
             })
             .collect();
         let secrets = SecretsSummary {
@@ -321,5 +339,140 @@ fn top_level_summary_serialization_is_order_independent() {
         cbor(&build(true)),
         "top-level ChatRoomStateV1Summary must serialize identically regardless of \
          the order its elements were inserted"
+    );
+}
+
+/// freenet/river#571 — the member_info summary must stay SMALL.
+///
+/// This is the whole point of that change and it has no other guard: the summary
+/// is re-sent to every interested peer on every state change, and
+/// `interest_sync_summaries` was measured as the largest single consumer of
+/// outbound bytes on the Freenet network. The entry previously carried a raw
+/// ed25519 `Signature`, which is ~92% of it.
+///
+/// THE BASELINE IS MEASURED HERE, NOT ASSERTED IN PROSE. Both the issue and the
+/// first draft of this change quoted 66 bytes for the signature, which is the
+/// encoding of River's OWN `SignatureBytes` newtype (a CBOR byte string). It is
+/// NOT what `ed25519::Signature` does: `ed25519`'s `Serialize` calls
+/// `serialize_tuple(64)`, ciborium maps that to a CBOR ARRAY, and a random byte
+/// costs 2 bytes there whenever it is >= 24 — so the real figure is ~124. The
+/// wrong number survived an issue, a PR body, a review, and a round of review
+/// fixes, so the old shape is now rebuilt from the SAME records and measured
+/// alongside the new one. A derived figure is not evidence.
+///
+/// REALISM MATTERS HERE, because the number this test reports is quoted as the
+/// production figure:
+///
+/// - `MemberId`s come from REAL `VerifyingKey`s, so their `FastHash` values span
+///   the `i64` range and CBOR-encode in the ~9 bytes production sees. The obvious
+///   shortcut, `MemberId(FastHash(i))` for small `i`, encodes in 1-3 bytes and
+///   understates the entry by ~30%.
+/// - The summary is produced by calling the REAL `summarize()` on built state,
+///   not by hand-constructing `MemberInfoV1::Summary`. Hand-construction can only
+///   catch a change to the type's SHAPE, which would be a compile error anyway;
+///   it cannot catch `summarize` starting to populate the map differently.
+/// - Versions are small (1-3), matching production: a member's `version`
+///   increments only when they edit their nickname or deputies, so it is a
+///   single CBOR byte for nearly every real record.
+///
+/// Keys are derived from fixed seeds, so the measurement is exactly reproducible
+/// and the assertion cannot flake.
+///
+/// Asserted as bytes-per-entry rather than a total, so the bound does not need
+/// revising when the member count changes.
+#[test]
+fn member_info_summary_stays_small_per_entry() {
+    const MEMBERS: u64 = 470; // the official room's rough membership
+
+    // Deterministic but REAL keys: blake3 of the index seeds the signing key, so
+    // the derived MemberId is a full-width FastHash exactly as in production.
+    let signing_keys: Vec<SigningKey> = (0..MEMBERS)
+        .map(|i| SigningKey::from_bytes(blake3::hash(&i.to_le_bytes()).as_bytes()))
+        .collect();
+
+    let member_info: Vec<AuthorizedMemberInfo> = signing_keys
+        .iter()
+        .enumerate()
+        .map(|(i, sk)| {
+            let info = MemberInfo::new_public(
+                MemberId::from(&sk.verifying_key()),
+                1 + (i % 3) as u32,
+                format!("member{i}"),
+            );
+            AuthorizedMemberInfo::new_with_member_key(info, sk)
+        })
+        .collect();
+
+    let state = MemberInfoV1 { member_info };
+    let parent = ChatRoomStateV1::default();
+    let parameters = ChatRoomParametersV1 {
+        owner: signing_keys[0].verifying_key(),
+    };
+
+    // The REAL summarize(), so a change in how it populates the map is caught.
+    let summary: MemberInfoSummary = state.summarize(&parent, &parameters);
+    assert_eq!(
+        summary.len() as u64,
+        MEMBERS,
+        "precondition: one summary entry per member"
+    );
+
+    let bytes = cbor(&summary).len();
+    let per_entry = bytes as f64 / MEMBERS as f64;
+
+    // The PRE-CHANGE shape, rebuilt from the same records: the summary value was
+    // the raw `Signature` rather than a digest of it. Everything else about the
+    // entry is identical, so the difference is exactly what this change bought.
+    let before: BTreeMap<MemberId, (u32, Signature)> = state
+        .member_info
+        .iter()
+        .map(|r| {
+            (
+                r.member_info.member_id,
+                (r.member_info.version, r.signature),
+            )
+        })
+        .collect();
+    let before_bytes = cbor(&before).len();
+    let before_per_entry = before_bytes as f64 / MEMBERS as f64;
+
+    println!(
+        "member_info summary over {MEMBERS} members:\n  \
+         before (u32, Signature): {before_bytes} B = {before_per_entry:.2} B/entry\n  \
+         after  (u32, SigDigest): {bytes} B = {per_entry:.2} B/entry\n  \
+         reduction: {:.1}x",
+        before_per_entry / per_entry
+    );
+
+    // Measured 134.08 → 28.01 B/entry, a 4.8x reduction. A 64-bit digest would
+    // be exactly 8 B/entry cheaper than the 128-bit one (a CBOR byte string
+    // costs 1 header byte either way, and a random u64 always takes the 8-byte
+    // form) — see `SigDigest` for why those 8 bytes are bought deliberately.
+    //
+    // The bound leaves headroom above 28.01 without approaching the 134 it
+    // exists to catch. The measurement is deterministic, so that headroom is for
+    // future entry-shape changes, not for run-to-run variance.
+    assert!(
+        per_entry < 32.0,
+        "member_info summary must stay under 32 bytes/entry (got {per_entry:.2}, \
+         {bytes} bytes for {MEMBERS} members). This failing likely means the \
+         summary regressed to carrying signatures rather than digests \
+         (freenet/river#571), or that `SigDigest` lost its hand-written \
+         `Serialize` — the serde derive emits a 16-element CBOR array (32 bytes) \
+         instead of a byte string (17), which measures 42.53 B/entry."
+    );
+
+    // Pin the baseline too. If this ever drops near the bound above, the
+    // reduction being claimed for this change has stopped being real — most
+    // likely because someone "fixed" the comparison to use a byte-string
+    // encoding that `ed25519::Signature` does not actually use.
+    assert!(
+        before_per_entry > 100.0,
+        "the pre-change encoding measured {before_per_entry:.2} B/entry, but \
+         `ed25519::Signature` serializes as a 64-element CBOR array (~124 bytes), \
+         so this should be ~134. A much lower figure means the baseline is being \
+         measured against the wrong encoding — River's `SignatureBytes` newtype \
+         uses `serialize_bytes` and costs 66, but the member_info summary never \
+         used that type."
     );
 }

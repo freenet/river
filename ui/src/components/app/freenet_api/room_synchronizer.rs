@@ -183,7 +183,7 @@ fn outbound_summary(
     //
     // "Horizon-shaped" means the field makes the SENDER withhold something it
     // holds and the receiver lacks; every other field is a pure have-statement
-    // (an id set, a version, a signature map), which is safe — indeed required —
+    // (an id set, a version, a digest map), which is safe — indeed required —
     // to feed from the sender's own baseline, because that is what makes the
     // delta "what changed since I last synced".
     let MessagesSummary {
