@@ -349,8 +349,10 @@ fn all_cases() -> Vec<Case> {
             configuration: &'a Configuration,
             signature: &'a Signature,
         }
-        let mut config = Configuration::default();
-        config.owner_member_id = MemberId::from(&vk(1));
+        let config = Configuration {
+            owner_member_id: MemberId::from(&vk(1)),
+            ..Default::default()
+        };
         let v = AuthorizedConfigurationV1::new(config, &owner);
         cases.push(Case {
             name: "AuthorizedConfigurationV1",
