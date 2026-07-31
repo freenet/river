@@ -2468,18 +2468,24 @@ mod tests {
     /// (freenet/river#398 moved codegen to `freenet-migrate-build`) must
     /// reproduce it byte-identically, or every user silently re-runs legacy
     /// migration once. Pinned to the value computed from the current
-    /// `legacy_delegates.toml` (26 entries spanning V1..V29 — V4–V6 removed —
+    /// `legacy_delegates.toml` (27 entries spanning V1..V30 — V4–V6 removed —
     /// in file order). This value
     /// SHOULD change when a genuinely new legacy entry is added — update the
     /// constant then — but must NEVER change from a codegen/tooling swap.
     ///
-    /// Updated for V29 (freenet/river#519, the global DM cap): the change moves
-    /// the delegate WASM, so the added entry legitimately re-fingerprints the
-    /// set and every user re-probes the legacy delegates once. That is the
-    /// intended behaviour for a real new generation, not a codegen artefact.
+    /// Updated for V30 (freenet/river#571, the member_info summary digest).
+    /// Note WHY the delegate moves here, because it is not the obvious reason:
+    /// the summary change itself is dead-code-eliminated from the delegate
+    /// (verified — rebuilding with it left chat_delegate.wasm byte-identical).
+    /// What moves the delegate is the river-core version bump 0.1.18 -> 0.1.19,
+    /// which is itself mandatory: the V31 room-contract registry is compiled
+    /// into river-core, riverctl pins it as `=<version>`, and 0.1.18 is already
+    /// published, so without the bump `cargo install riverctl` would resolve a
+    /// river-core WITHOUT the new entry. So a version bump alone re-keys the
+    /// delegate, and that is enough to require an entry.
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
-        assert_eq!(legacy_set_fingerprint(), "323a2f640bfd7a7f");
+        assert_eq!(legacy_set_fingerprint(), "c43e66ee147e3739");
     }
 
     /// The "migration in progress" and "migration done" localStorage keys MUST
