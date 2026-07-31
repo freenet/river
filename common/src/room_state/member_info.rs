@@ -57,7 +57,7 @@ impl MemberInfoV1 {
         {
             let rank = member_info_rank(info.member_info.version, &info.signature);
             let better = match &best {
-                Some((_, best_rank)) => rank > *best_rank,
+                Some((_, best_rank)) => outranks(rank, *best_rank),
                 None => true,
             };
             if better {
@@ -104,7 +104,7 @@ impl MemberInfoV1 {
             let rank = member_info_rank(info.member_info.version, &info.signature);
             match best.entry(id) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if rank > e.get().0 {
+                    if outranks(rank, e.get().0) {
                         e.insert((rank, info));
                     }
                 }
@@ -152,6 +152,26 @@ impl MemberInfoV1 {
 /// correction, and peers disagreed on ban authority permanently.
 fn member_info_rank(version: u32, signature: &Signature) -> (u32, SigDigest) {
     (version, sig_digest(signature))
+}
+
+/// Whether `candidate` beats `incumbent` under [`member_info_rank`]'s order.
+///
+/// THE SINGLE IMPLEMENTATION OF THE TIE RULE. Five sites choose between two
+/// ranked records — [`MemberInfoV1::canonical`],
+/// [`MemberInfoV1::dedup_to_canonical`], `summarize`, `delta`, and `apply_delta`
+/// — and every one of them must break a tie the SAME way, keeping the incumbent.
+/// They previously each spelled `>` inline, which is one edit away from silent
+/// disagreement: relaxing any one of them to `>=` flips that site to last-wins
+/// while the others stay first-wins, and `deputies_of` then answers differently
+/// depending on which code path last touched the record — i.e. ban authority
+/// flips. That mutation left the whole suite green, because reaching the tie
+/// branch behaviorally needs a genuine [`SigDigest`] collision.
+///
+/// Routing all five through here means the rule has one definition and one test
+/// (`outranks_keeps_the_incumbent_on_a_tie`) rather than five prose assertions.
+/// Strict `>` is the rule: **ties keep the incumbent.**
+fn outranks(candidate: (u32, SigDigest), incumbent: (u32, SigDigest)) -> bool {
+    candidate > incumbent
 }
 
 /// 16-byte BLAKE3 digest of a signature: the equal-version tiebreak
@@ -235,7 +255,8 @@ fn member_info_rank(version: u32, signature: &Signature) -> (u32, SigDigest) {
 /// - ordering is plain lexicographic over those bytes (the derived `Ord`);
 /// - it serializes as a CBOR byte string (17 bytes), via the hand-written
 ///   `Serialize` below rather than the derive, which would emit a 16-element
-///   CBOR array at 32 bytes and undo most of the saving.
+///   CBOR array — ~32 bytes for random digest content, since each byte >= 24
+///   costs two — and undo most of the saving.
 ///
 /// None of the three may change without re-keying the contract. See
 /// `.claude/rules/contract-summary-determinism.md` and freenet/freenet-core#4857.
@@ -367,7 +388,7 @@ impl ComposableState for MemberInfoV1 {
             summary
                 .entry(info.member_info.member_id)
                 .and_modify(|existing| {
-                    if candidate > *existing {
+                    if outranks(candidate, *existing) {
                         *existing = candidate;
                     }
                 })
@@ -396,9 +417,10 @@ impl ComposableState for MemberInfoV1 {
                     None => true,
                     // The summary value IS the rank (version, signature digest),
                     // so compare against it directly.
-                    Some(old_rank) => {
-                        member_info_rank(info.member_info.version, &info.signature) > *old_rank
-                    }
+                    Some(old_rank) => outranks(
+                        member_info_rank(info.member_info.version, &info.signature),
+                        *old_rank,
+                    ),
                 }
             })
             .cloned()
@@ -475,12 +497,13 @@ impl ComposableState for MemberInfoV1 {
                     .iter_mut()
                     .find(|info| info.member_info.member_id == *member_id)
                 {
-                    if member_info_rank(member_info.member_info.version, &member_info.signature)
-                        > member_info_rank(
+                    if outranks(
+                        member_info_rank(member_info.member_info.version, &member_info.signature),
+                        member_info_rank(
                             existing_info.member_info.version,
                             &existing_info.signature,
-                        )
-                    {
+                        ),
+                    ) {
                         *existing_info = member_info.clone();
                     }
                 } else {
@@ -645,8 +668,12 @@ mod tests {
     /// key-search fixture — compares digests of RANDOMLY-keyed signatures. A
     /// change to the byte order leaves those comparisons agreeing about half the
     /// time, i.e. an INTERMITTENT detector, which this project treats as a broken
-    /// one. Measured: with the digest bytes reversed, those oracles passed 11 of
-    /// 30 runs. A fixed input makes the detection deterministic. (Byte order was
+    /// one. Measured twice with the digest bytes reversed: those oracles let the
+    /// change through in 11 of 30 runs in one sample and 1 of 12 in an
+    /// independent reproduction. The rate depends on the keys a run happens to
+    /// draw and is not worth pinning down; what matters is that it is not 0, so
+    /// the detector is a coin flip rather than a check. A fixed input makes the
+    /// detection deterministic. (Byte order was
     /// a live risk while the digest was a `u64` built with `from_le_bytes`; the
     /// `[u8; 16]` form removes the conversion, but "which 16 bytes, in what
     /// order" still has to be pinned, and the encoding certainly does.)
@@ -730,6 +757,91 @@ mod tests {
     /// Left disagreeing, a state holding duplicates would answer `deputies_of`
     /// one way on a freshly-GET'd full state and the other way after the next
     /// `apply_delta` ran dedup.
+    /// [`outranks`] is the single definition of the tie rule that all five rank
+    /// consumers share, so this is the one place it is pinned.
+    ///
+    /// Relaxing `>` to `>=` at any individual call site used to leave the entire
+    /// suite green: reaching the tie branch behaviorally needs a genuine
+    /// [`SigDigest`] collision, since `verify` checks every stored record's
+    /// signature. That made the tie direction prose-only, which is exactly the
+    /// state that let `canonical` (last-wins) and `dedup_to_canonical`
+    /// (first-wins) disagree for as long as they did.
+    #[test]
+    fn outranks_keeps_the_incumbent_on_a_tie() {
+        let lo = SigDigest([0x11; 16]);
+        let hi = SigDigest([0x22; 16]);
+
+        // The load-bearing case: equal rank must NOT outrank. `>=` fails here.
+        assert!(
+            !outranks((1, lo), (1, lo)),
+            "a tie must keep the INCUMBENT — all five consumers depend on this"
+        );
+
+        // Version dominates the digest in both directions.
+        assert!(outranks((2, lo), (1, hi)), "higher version wins");
+        assert!(!outranks((1, hi), (2, lo)), "lower version loses");
+
+        // At equal version the digest decides, lexicographically over its bytes.
+        assert!(
+            outranks((1, hi), (1, lo)),
+            "greater digest wins at equal version"
+        );
+        assert!(
+            !outranks((1, lo), (1, hi)),
+            "lesser digest loses at equal version"
+        );
+    }
+
+    /// `canonical` must select on the DIGEST, not merely on the version.
+    ///
+    /// Without this, a mutation that compares only `version` (keeping the first
+    /// on a tie, matching the real tie direction) passes every river-core test;
+    /// only a river-ui test catches it. Deterministic by construction: two fixed
+    /// signatures whose digests are known to differ, so there is no retry loop
+    /// and no randomness.
+    #[test]
+    fn canonical_selects_by_digest_not_just_version() {
+        let mut csprng = OsRng;
+        let member_sk = SigningKey::generate(&mut csprng);
+        let member_id = MemberId::from(&member_sk.verifying_key());
+
+        // blake3([1; 64]) = 29c04cc4...  blake3([2; 64]) = fe969aba...
+        // so the [2; 64] record has the greater digest and MUST win. (Computed
+        // with the `b3sum` CLI, not by calling `sig_digest`.)
+        let low_sig = Signature::from_bytes(&[1u8; 64]);
+        let high_sig = Signature::from_bytes(&[2u8; 64]);
+        assert!(
+            sig_digest(&high_sig) > sig_digest(&low_sig),
+            "fixture precondition: [2; 64] must digest greater than [1; 64]"
+        );
+
+        let mut winner_info = MemberInfo::new_public(member_id, 1, "Same".to_string());
+        winner_info.deputies = vec![member_id];
+        let winner = AuthorizedMemberInfo::with_signature(winner_info, high_sig);
+        let loser = AuthorizedMemberInfo::with_signature(
+            MemberInfo::new_public(member_id, 1, "Same".to_string()),
+            low_sig,
+        );
+
+        // Loser FIRST, so a version-only comparison that keeps the first (the
+        // real tie direction) returns the wrong record.
+        let state = MemberInfoV1 {
+            member_info: vec![loser, winner.clone()],
+        };
+
+        assert_eq!(
+            state.canonical(member_id),
+            Some(&winner),
+            "canonical must break the equal-version tie on the digest, not fall \
+             back to vector position"
+        );
+        assert_eq!(
+            state.deputies_of(member_id),
+            &[member_id],
+            "deputies_of must follow canonical's choice — this is the ban-authority path"
+        );
+    }
+
     /// The two records are built with `with_signature` so they share a signature
     /// while carrying DIFFERENT `deputies`. That is exactly what a [`SigDigest`]
     /// collision would look like to these two functions, which are pure

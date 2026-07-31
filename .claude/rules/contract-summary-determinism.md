@@ -72,14 +72,17 @@ them may change without re-keying the contract:
   hours; use 128.
 - which bytes are kept, and in what order;
 - how the value serializes — a `[u8; 16]` through the serde derive emits a
-  16-element CBOR array (32 bytes), not a byte string (17). Write `Serialize`
-  by hand with `serialize_bytes`.
+  16-element CBOR array (~32 bytes for random content, since each byte >= 24
+  costs two), not a byte string (17). Write `Serialize` by hand with
+  `serialize_bytes`.
 
 Pin all four with a **golden vector**: ONE fixed input, ONE fixed expected
 digest, ONE fixed expected encoding. Oracles that compare digests of randomly
 generated keys are NOT sufficient — a byte-order change leaves them agreeing
-about half the time, so they detect it only intermittently (measured on this
-codebase: 11 of 30 runs missed a reversed-byte-order change). See
+some of the time, so they detect it only intermittently. Measured twice on this
+codebase with the digest reversed: 11 of 30 runs missed it in one sample, 1 of 12
+in an independent reproduction. The exact rate depends on the keys drawn and is
+not the point; a non-zero miss rate makes it a coin flip rather than a check. See
 `sig_digest_golden_vector` in `common/src/room_state/member_info.rs`.
 
 Also assert bytes-per-entry for the summary, built by calling the real
