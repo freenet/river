@@ -19,9 +19,14 @@
 //! back as unread on every page load.
 
 mod dm_thread_modal;
+mod invite_contact_picker_modal;
+mod invite_dm;
 mod invite_via_dm_picker_modal;
 
 pub use dm_thread_modal::DmThreadModal;
+pub use invite_contact_picker_modal::{
+    has_invitable_contacts, open_invite_contact_picker_for_current_room, InviteContactPickerModal,
+};
 pub use invite_via_dm_picker_modal::InviteViaDmPickerModal;
 
 use dioxus::prelude::*;
@@ -126,6 +131,33 @@ pub struct InvitePickInflight {
 }
 
 pub static INVITE_VIA_DM_PICKER_INFLIGHT: GlobalSignal<Option<InvitePickInflight>> =
+    Global::new(|| None);
+
+/// "Share Invite" contact-picker state (#566). `Some(room)` means the
+/// [`InviteContactPickerModal`] is open and offers to DM an invitation for
+/// `room` to somebody the local user already shares a DIFFERENT room with.
+///
+/// The mirror of [`INVITE_VIA_DM_PICKER`]: that one fixes the person and
+/// picks the room, this one fixes the room and picks the person. Two
+/// signals rather than one two-mode signal so neither picker can be
+/// rendered into a state the other's invariants assume.
+pub static INVITE_CONTACT_PICKER: GlobalSignal<Option<VerifyingKey>> = Global::new(|| None);
+
+/// Currently in-flight pick from [`InviteContactPickerModal`]. Module-scope
+/// for the same reason as [`InvitePickInflight`]: a watchdog task can
+/// outlive the picker's close.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ContactPickInflight {
+    /// Monotonic counter — every fresh send bumps it. Watchdogs capture it
+    /// at scheduling time and no-op once it has moved on.
+    pub generation: u64,
+    /// Room whose DM channel is carrying the invitation.
+    pub carrier_room: VerifyingKey,
+    /// Recipient of the invitation DM.
+    pub peer: MemberId,
+}
+
+pub static INVITE_CONTACT_PICKER_INFLIGHT: GlobalSignal<Option<ContactPickInflight>> =
     Global::new(|| None);
 
 /// Body to pre-fill into the DM composer the next time

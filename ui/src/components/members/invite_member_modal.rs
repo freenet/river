@@ -196,19 +196,19 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                             rsx! {
                                 // Recommended path first: ask, then send the
                                 // invitation as a DM via the built-in
-                                // "Share invite" flow (#252, #457). It hands
-                                // the recipient a one-click Accept card and
-                                // never puts a bearer credential through an
-                                // outside channel, so it belongs ABOVE the
+                                // "Share Invite" flow (#252, #457, #566). It
+                                // hands the recipient a one-click Accept card
+                                // and never puts a bearer credential through
+                                // an outside channel, so it belongs ABOVE the
                                 // link/code it is meant to displace.
                                 div {
                                     "data-testid": "invite-dm-recommendation",
                                     class: "mb-4 p-3 bg-accent-soft border-l-4 border-accent rounded-r-lg",
                                     p { class: "text-sm text-text",
-                                        span { class: "font-medium", "Best way to invite someone: send the invitation in a DM. " }
-                                        "Ask whether they'd like to join first. Then, in any room you already share with them, click their name in the member list, choose "
-                                        span { class: "font-medium", "Share invite" }
-                                        ", and pick this room. River drops an invitation card into your DM thread that they accept in one click — nothing to copy, paste, or leak."
+                                        span { class: "font-medium", "Already on River? Send the invitation in a DM instead. " }
+                                        "Close this and click "
+                                        span { class: "font-medium", "Share Invite" }
+                                        " under the member list: pick anyone you already share a room with and River drops an invitation card into a DM that they accept in one click — nothing to copy, paste, or leak."
                                     }
                                 }
 
@@ -220,8 +220,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                                     "data-testid": "invite-share-warning",
                                     class: "mb-4 p-3 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
                                     p { class: "text-sm text-text",
-                                        span { class: "font-medium", "No DM yet? Share the link or code below privately, with one person only. " }
-                                        "Each invitation creates a unique identity and is good for exactly one person. If two people use the same link or code, they share one identity and neither works correctly. Click "
+                                        span { class: "font-medium", "Not on River yet? Share the link or code below privately, with one person only. " }
+                                        "Each invitation contains a private key and is good for exactly one person. If two people use the same link or code, they share one identity and neither works correctly — this is the most common way invites go wrong. Click "
                                         span { class: "font-medium", "New Invitation" }
                                         " for every additional person."
                                     }

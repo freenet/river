@@ -2,13 +2,18 @@ use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatu
 use crate::components::app::{
     MobileView, CURRENT_ROOM, MEMBER_INFO_MODAL, MOBILE_VIEW, ROOMS, SYNC_STATUS,
 };
+use crate::components::direct_messages::{
+    has_invitable_contacts, open_invite_contact_picker_for_current_room,
+};
 use crate::util::confusable::{
     ConfusableTier, ImpersonationChecker, ImpersonationWarning, ProtectedName, ProtectedRole,
 };
 use crate::util::display_name::display_nickname;
 use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{FaArrowLeft, FaFileExport, FaUserPlus, FaUsers};
+use dioxus_free_icons::icons::fa_solid_icons::{
+    FaArrowLeft, FaFileExport, FaLink, FaUserPlus, FaUsers,
+};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use river_core::room_state::identity::IdentityExport;
@@ -1587,26 +1592,97 @@ pub fn MemberList() -> Element {
                 }
             }
 
-            // Action buttons - fixed at bottom
+            // Action buttons - fixed at bottom.
+            //
+            // "Share Invite" is the PRIMARY action and the link flow is
+            // deliberately secondary (Ian, 2026-07-29). An invite link is a
+            // bearer credential good for exactly ONE person, and in the
+            // field people share one link with several people: everyone who
+            // used it then holds the same identity and none of them work.
+            // The DM route cannot fail that way — the recipient gets an
+            // Accept button inside a DM thread and no credential travels
+            // through an outside channel — but it used to be three clicks
+            // deep behind a member's card in a DIFFERENT room, so nobody
+            // found it. Promoting it here is the fix. The link stays
+            // reachable because it is still the only way to invite somebody
+            // who is not on River yet. Do NOT restore the link flow to
+            // primary without a better answer to the shared-link failure.
             div { class: "p-3 border-t border-border flex-shrink-0 space-y-2",
-                button {
-                    "data-testid": "invite-member-button",
-                    class: "w-full flex items-center justify-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm font-medium rounded-lg transition-colors",
-                    onclick: move |_| invite_modal_active.set(true),
-                    Icon { icon: FaUserPlus, width: 14, height: 14 }
-                    span { "Invite Member" }
+                {
+                    // `None` from `has_invitable_contacts` means ROOMS was
+                    // contended for this render. Treat "don't know" as
+                    // enabled: a contended read must never hide a working
+                    // action, and the picker's own empty state covers the
+                    // case where there really is nobody to invite.
+                    let has_contacts = CURRENT_ROOM
+                        .read()
+                        .owner_key
+                        .and_then(has_invitable_contacts)
+                        .unwrap_or(true);
+                    rsx! {
+                        button {
+                            "data-testid": "share-invite-button",
+                            class: format!(
+                                "w-full flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium rounded-lg transition-colors {}",
+                                if has_contacts {
+                                    "bg-accent hover:bg-accent-hover text-white"
+                                } else {
+                                    "bg-surface text-text-muted opacity-60 cursor-not-allowed border border-border"
+                                }
+                            ),
+                            disabled: !has_contacts,
+                            title: if has_contacts {
+                                "Send an invitation card in a DM to someone you already share a room with — they accept in one click"
+                            } else {
+                                "You aren't a member of any other rooms yet, so there's nobody to DM — use Invite by link"
+                            },
+                            // Accessible name deliberately leads with the
+                            // visible label ("Label in Name") but must NOT
+                            // contain the phrase "share an invite": that is
+                            // how `invite-via-dm-picker.spec.ts` addresses
+                            // the member-card button, and this panel button
+                            // renders earlier in the DOM, so an overlapping
+                            // name silently retargets that whole spec file
+                            // at this button instead.
+                            "aria-label": if has_contacts {
+                                "Share Invite — invite someone to this room by direct message"
+                            } else {
+                                "Share Invite is disabled — you are not a member of any other rooms"
+                            },
+                            onclick: move |_| {
+                                if has_contacts {
+                                    open_invite_contact_picker_for_current_room();
+                                }
+                            },
+                            Icon { icon: FaUserPlus, width: 14, height: 14 }
+                            span { "Share Invite" }
+                        }
+                    }
                 }
                 // The "Direct Messages" button used to live here, but
                 // zorolin (#244 feedback, 2026-05-16) and Ian agreed it
                 // belonged in the left rail next to Rooms — that's where
                 // it now lives via `DmRailSection`. Per-room and
                 // cross-room DM discovery are both surfaced there.
-                button {
-                    "data-testid": "export-id-button",
-                    class: "w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
-                    onclick: move |_| export_modal_active.set(true),
-                    Icon { icon: FaFileExport, width: 12, height: 12 }
-                    span { "Export ID" }
+                div { class: "flex gap-2",
+                    button {
+                        // Testid kept from when this was the primary
+                        // "Invite Member" button so existing specs keep
+                        // pointing at the link flow they were written for.
+                        "data-testid": "invite-member-button",
+                        class: "flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
+                        title: "Generate a one-person invite link — for someone not on River yet",
+                        onclick: move |_| invite_modal_active.set(true),
+                        Icon { icon: FaLink, width: 12, height: 12 }
+                        span { "Invite by link" }
+                    }
+                    button {
+                        "data-testid": "export-id-button",
+                        class: "flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface hover:bg-surface-hover text-text-muted text-xs font-medium rounded-lg transition-colors border border-border",
+                        onclick: move |_| export_modal_active.set(true),
+                        Icon { icon: FaFileExport, width: 12, height: 12 }
+                        span { "Export ID" }
+                    }
                 }
             }
 
@@ -4914,6 +4990,82 @@ mod tests {
         }
     }
 
+    /// Source-scrape pin: the members panel's PRIMARY invite action is the
+    /// DM route ("Share Invite"), and the link route is secondary.
+    ///
+    /// Why pin it. An invite link carries a private key and is good for
+    /// exactly ONE person; in the field people share one link with several
+    /// people, and everyone who used it then holds the same identity, so
+    /// none of them work. For a long time the link was the only
+    /// *discoverable* way to invite anyone — the DM route existed but sat
+    /// three clicks deep behind a member's card in a DIFFERENT room. A
+    /// refactor that gives the link button the accent fill back, or drops
+    /// the Share Invite button, silently restores that state; nothing else
+    /// in the suite would notice.
+    ///
+    /// Source-scrape because the property is visual weight (which button
+    /// carries `bg-accent`, this codebase's primary-button marker) plus
+    /// wiring (which flow each button opens), in a Dioxus tree with no
+    /// headless harness. `invite-priority.spec.ts` checks the rendered
+    /// result in a browser; this catches it at `cargo test` time.
+    #[test]
+    fn share_invite_is_the_primary_invite_action_and_the_link_flow_is_secondary() {
+        let prod = production_source();
+        assert_prod_only(prod, "members.rs action buttons");
+        let start = prod
+            .find("// Action buttons")
+            .expect("MemberList should have an action-button block");
+        let end = prod[start..]
+            .find("// Connection status indicator")
+            .expect("action-button block should end before the connection-status note")
+            + start;
+        let block = &prod[start..end];
+
+        let share_at = block.find("\"share-invite-button\"").expect(
+            "the members panel must offer a Share Invite button — the DM route \
+             is the only invite path that cannot be broken by being shared \
+             with more than one person",
+        );
+        let link_at = block.find("\"invite-member-button\"").expect(
+            "the invite-link flow must stay reachable: it is still the only \
+             way to invite somebody who is not on River yet",
+        );
+        assert!(
+            share_at < link_at,
+            "Share Invite must come FIRST in the action block. Order is the \
+             cheap half of the demotion — a user reads the top button as the \
+             thing to do"
+        );
+
+        // Each button must open the flow it claims to. Swapping these
+        // compiles, renders, and passes every other test in this file.
+        let share_block = &block[share_at..link_at];
+        assert!(
+            share_block.contains("open_invite_contact_picker_for_current_room("),
+            "the Share Invite button no longer opens the contact picker, so \
+             the promoted action does not do the promoted thing"
+        );
+        let link_block = &block[link_at..];
+        assert!(
+            link_block.contains("invite_modal_active.set(true)"),
+            "the Invite-by-link button no longer opens the link modal"
+        );
+
+        // Visual weight. This is the assertion that actually pins the
+        // deprioritisation, and the one a well-meaning restyle undoes.
+        assert!(
+            share_block.contains("bg-accent hover:bg-accent-hover"),
+            "the Share Invite button lost its accent fill, so it no longer \
+             reads as the primary action"
+        );
+        assert!(
+            !link_block.contains("bg-accent"),
+            "the invite-link button is accent-filled again — that makes \
+             minting a one-person bearer credential look like the default \
+             way to invite people, which is the failure this pin exists for"
+        );
+    }
+
     /// **SHOULD-FIX E — the warning must not be clippable.**
     ///
     /// `truncate` used to sit on the member-row BUTTON, which clipped the badge
@@ -7115,6 +7267,68 @@ mod tests {
             modal.contains("\"data-testid\": \"member-info-impersonation-explanation\""),
             "the member-info modal no longer renders the warning's explanation \
              element"
+        );
+
+        // --- Share-Invite contact picker ---------------------------------
+        //
+        // The FOURTH surface (freenet/river#566), and it is here because
+        // promoting it created a route that BYPASSES the other three. Until
+        // #566 the only way to reach the DM-invite flow was through the member
+        // list, so a user had already been shown the ⚠ before picking anyone.
+        // The picker lists members of rooms the user may not have opened, so
+        // without this the primary invite action is the one surface where an
+        // imitator's name renders clean.
+        let picker_src =
+            include_str!("../components/direct_messages/invite_contact_picker_modal.rs");
+        let picker = &picker_src[..picker_src
+            .find("#[cfg(test)]")
+            .expect("the contact picker should have a `#[cfg(test)]` block")];
+        assert!(
+            picker.contains("impersonation_warning_for_display("),
+            "the Share-Invite contact picker no longer computes an \
+             impersonation warning. It is the PRIMARY invite action, and it \
+             lists members of rooms the user need never have opened, so \
+             dropping the badge here means picking an imitator looks \
+             identical to picking the real member"
+        );
+        // Same argument trap as the other three: `self_id` compiles here and
+        // flags the genuine owner and every genuine moderator instead.
+        assert!(
+            squashed(picker).contains(
+                "impersonation_warning_for_display( &impersonation, peer, &peer_label, \
+                 privilege_in_view(peer, owner_id, &deputy_badges), )"
+            ),
+            "the contact picker no longer passes `peer` (and that peer's own \
+             privilege) to `impersonation_warning_for_display`"
+        );
+        // Built once per ROOM, before the per-peer loop. This picker sweeps
+        // every other room the user is in, so building per peer multiplies
+        // the refold by the whole candidate set rather than one room's.
+        assert!(
+            between(
+                picker,
+                "fn build_contact_candidates(",
+                "for peer in peers",
+                "contact-candidate per-peer loop",
+            )
+            .contains("impersonation_checker_for_viewer("),
+            "the contact picker must build the impersonation checker BEFORE \
+             its per-peer loop, not inside it"
+        );
+        assert!(
+            picker.contains("\"data-testid\": \"invite-contact-impersonation-warning\""),
+            "the contact-picker row's warning lost its `data-testid`, leaving \
+             a spec only glyph-matching to reach it"
+        );
+        assert!(
+            between(
+                picker,
+                "\"data-testid\": \"invite-contact-impersonation-warning\"",
+                "if is_selected",
+                "contact-row warning element",
+            )
+            .contains("WARNING_GLYPH"),
+            "the contact-picker warning element no longer renders the glyph"
         );
     }
 }
