@@ -40,10 +40,11 @@ async function openMemberInfo(page: Page) {
     .catch(() => undefined);
 
   // Member rows are buttons with `title="Member ID: …"`
-  // (members.rs:341). Example-data populates them with random names
-  // each app load and the local-user "You" entry can appear at any
-  // position, so we can't rely on a fixed index. Pick the first row
-  // that isn't the local user (see `isSelfRowText`).
+  // (members.rs:341). Example-data populates them with random names each
+  // app load, so we can't rely on a fixed index for anyone but the local
+  // user — who is pinned to index 0 since freenet/river#584, though this
+  // helper deliberately does not depend on that. Pick the first row that
+  // isn't the local user (see `isSelfRowText`).
   const memberButtons = page.locator('button[title^="Member ID"]');
   const count = await memberButtons.count();
   for (let i = 0; i < count; i++) {

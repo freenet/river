@@ -331,6 +331,35 @@ fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
     }
 }
 
+/// Lift the viewer's own row to the top of the member list (freenet/river#584).
+///
+/// The rest of the list is a viewer-scoped invite/deputy tree
+/// (`deputy_display_order`, #410), so self is HOISTED out of it rather than
+/// the tree being re-sorted: every other row keeps its relative position, and
+/// `rotate_right` on the prefix is the stable form of "move this element to
+/// the front".
+///
+/// What the hoist DOES cost, stated plainly so nobody re-derives it as a bug:
+/// rows render as a FLAT list with no indentation (see `MemberList`'s `ul`),
+/// so a member's parent is conveyed only by adjacency — and self's own
+/// invitees/deputies are now adjacent to self's former neighbour instead of to
+/// self. That is acceptable precisely BECAUSE nothing renders depth: with no
+/// indentation the ordering never communicated parentage to begin with, and
+/// the relationship badges (🔑 🌐 🎪 🔭, plus 🛡 whose tooltip names the
+/// appointer) are what actually tell the viewer who invited or deputized whom.
+/// Do not restate this as "the tree order is preserved" — it is preserved for
+/// every row EXCEPT self's children.
+///
+/// No-op when the viewer isn't in the list at all (they may have joined and
+/// not yet been ingested — the freenet/river#167 shape), or is the owner
+/// (already at index 0). The ⭐ tag from `member_display_parts` is what makes
+/// the pinned row visually distinct; no extra styling is needed here.
+fn pin_self_to_top<T>(rows: &mut [(T, MemberId)], self_id: MemberId) {
+    if let Some(pos) = rows.iter().position(|(_, id)| *id == self_id) {
+        rows[..=pos].rotate_right(1);
+    }
+}
+
 /// Order member IDs by DFS pre-order traversal of the invite tree.
 /// Owner is the root; within siblings, order matches `members.members`
 /// (sorted by MemberId after CRDT convergence).
@@ -1490,6 +1519,11 @@ pub fn MemberList() -> Element {
 
             all_members.push((member_display_parts(&member_display), member_id));
         }
+
+        // freenet/river#584: your own row goes to the top, so finding yourself
+        // isn't a scroll-and-hunt in a large room. Everything below keeps its
+        // tree order.
+        pin_self_to_top(&mut all_members, self_member_id);
 
         Some(all_members)
     })()
@@ -3540,6 +3574,84 @@ mod tests {
         assert!(icons.contains(&"⭐"));
     }
 
+    fn mid(n: i64) -> MemberId {
+        MemberId(freenet_scaffold::util::FastHash(n))
+    }
+
+    fn ids(rows: &[((), MemberId)]) -> Vec<MemberId> {
+        rows.iter().map(|(_, id)| *id).collect()
+    }
+
+    /// freenet/river#584: self moves to index 0, and every other row keeps its
+    /// relative tree order (this is a hoist, not a re-sort).
+    #[test]
+    fn pin_self_to_top_hoists_self_and_preserves_the_rest() {
+        let mut rows: Vec<((), MemberId)> = (0..5).map(|n| ((), mid(n))).collect();
+        pin_self_to_top(&mut rows, mid(3));
+        assert_eq!(ids(&rows), vec![mid(3), mid(0), mid(1), mid(2), mid(4)]);
+
+        // Self LAST is the maximal rotation — every other row moves. What this
+        // adds over the interior case is the out-of-bounds direction: `..=pos`
+        // widened to `..=pos + 1` PANICS here and merely permutes there.
+        let mut rows: Vec<((), MemberId)> = (0..5).map(|n| ((), mid(n))).collect();
+        pin_self_to_top(&mut rows, mid(4));
+        assert_eq!(ids(&rows), vec![mid(4), mid(0), mid(1), mid(2), mid(3)]);
+    }
+
+    /// The owner viewing their own room is already at index 0 (tree root), and
+    /// a viewer not yet present in the list must not reorder anything.
+    #[test]
+    fn pin_self_to_top_is_a_noop_when_self_is_first_or_absent() {
+        let mut rows: Vec<((), MemberId)> = (0..3).map(|n| ((), mid(n))).collect();
+        let before = ids(&rows);
+
+        pin_self_to_top(&mut rows, mid(0));
+        assert_eq!(ids(&rows), before);
+
+        pin_self_to_top(&mut rows, mid(99));
+        assert_eq!(ids(&rows), before);
+    }
+
+    /// The hoist is only reachable through `MemberList`'s memo, which no unit
+    /// test can drive — so deleting the call leaves both tests above green.
+    /// Pin the call site (freenet/river#584).
+    ///
+    /// Scoped to `MemberList`'s memo, and NEVER a raw
+    /// `include_str!("members.rs")` — three distinct ways this pin can go
+    /// vacuous, each closed by a different part of the slice:
+    ///
+    /// - the needle also occurs in this test's own string literal, so a
+    ///   whole-FILE search matches ITSELF and stays green with the call site
+    ///   deleted (this pin shipped that way; `prod_source`'s `#[cfg(test)]`
+    ///   cut closes it);
+    /// - a call left behind as `// pin_self_to_top(...)` while debugging would
+    ///   satisfy a `contains` (`prod_source` strips line comments);
+    /// - a refactor that moves the call into a helper `MemberList` no longer
+    ///   reaches would satisfy a whole-PRODUCTION search (the anchors close
+    ///   it). "Scoping is the entire point" —
+    ///   `impersonation_warning_is_wired_into_every_render_surface`, which
+    ///   uses this same anchor pair.
+    ///
+    /// Verified by deleting the call and watching this fail.
+    #[test]
+    fn pin_self_to_top_is_wired_into_the_member_list() {
+        let prod = prod_source(include_str!("members.rs"));
+        assert_prod_only(&prod, "members.rs");
+
+        let start = prod
+            .find("pub fn MemberList()")
+            .expect("anchor `pub fn MemberList()` not found");
+        let end = prod[start..]
+            .find("let handle_member_click")
+            .expect("anchor `let handle_member_click` not found after `pub fn MemberList()`")
+            + start;
+
+        assert!(
+            prod[start..end].contains("pin_self_to_top(&mut all_members, self_member_id)"),
+            "MemberList stopped pinning the viewer's own row to the top"
+        );
+    }
+
     /// The 🛡 deputy shield renders exactly when `deputized_by` is non-empty,
     /// and its tooltip names the appointer(s). The member-info modal legend
     /// mirrors this (freenet/river#451) via the shared
@@ -4864,10 +4976,13 @@ mod tests {
     }
 
     /// Production-code slice of this file (everything before the
-    /// `#[cfg(test)]` test module). Used by the two source-grep pins
-    /// below so that prose / examples in the test module — which may
+    /// `#[cfg(test)]` test module). Used by the source-grep pins in this
+    /// module so that prose / examples in the test module — which may
     /// legitimately *mention* the attribute name or attack pattern —
     /// can't either disarm or accidentally trip the assertions.
+    ///
+    /// Unlike [`prod_source`] this does NOT strip line comments, so a pin
+    /// whose needle could survive as a commented-out call wants that one.
     fn production_source() -> &'static str {
         let source = include_str!("members.rs");
         let marker = "#[cfg(test)]";
