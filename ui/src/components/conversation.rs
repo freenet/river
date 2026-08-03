@@ -6724,33 +6724,52 @@ mod tests {
         const TAILWIND_CSS: &str = include_str!("../../assets/tailwind.css");
         let body = css_rule_body(TAILWIND_CSS, ".bg-accent .prose blockquote");
 
-        assert!(
-            body.contains("color: inherit"),
-            "`.bg-accent .prose blockquote` must take the sent bubble's own \
-             text colour (`color: inherit`); a hardcoded colour is what made \
-             quoted text render black-on-blue beside white text. Found: {body}"
+        // Check the LAST `color:` declaration, not merely that `inherit`
+        // appears somewhere in the body. CSS is last-one-wins within a rule,
+        // so `color: inherit; color: #111;` reintroduces the bug in full while
+        // a `contains("color: inherit")` check happily passes — a substring
+        // search cannot model the cascade. Take the final declaration, which
+        // is the one that actually paints.
+        //
+        // `border-left-color:` also ends in `color:`, hence the `-` guard.
+        let last_color = body
+            .split(';')
+            .map(str::trim)
+            .filter(|d| d.starts_with("color:"))
+            .next_back()
+            .unwrap_or_else(|| {
+                panic!("`.bg-accent .prose blockquote` should declare a colour. Found: {body}")
+            });
+
+        assert_eq!(
+            last_color, "color: inherit",
+            "the winning `color` declaration in `.bg-accent .prose blockquote` \
+             must be `inherit` so the quote takes the sent bubble's own text \
+             colour; a hardcoded colour is what made quoted text render \
+             black-on-blue beside white text. Full rule: {body}"
         );
-        // The specific regression: any near-black literal here reproduces it.
-        for banned in ["rgba(0, 0, 0", "rgba(0,0,0", "#000"] {
-            assert!(
-                !body.contains(banned),
-                "`.bg-accent .prose blockquote` must not hardcode a dark text \
-                 colour (`{banned}`): the bubble is brand blue with white text \
-                 in BOTH light and dark mode. Found: {body}"
-            );
-        }
     }
 
     /// Quotes outside the sent bubble use a dedicated `--color-text-quote`
     /// token rather than the app-wide `--color-text-muted`.
     ///
     /// The muted token is tuned for glanceable metadata (timestamps, field
-    /// labels) and lands just under 4.5:1 on two of the backgrounds a quote
-    /// actually appears over: light-mode `--color-surface` (4.47:1) and a
-    /// dark-mode `bg-accent/20` DM bubble (4.40:1). The token must be declared
-    /// in BOTH colour schemes — a missing dark-mode value makes the `var()`
-    /// invalid at computed-value time, which silently falls back to the
-    /// inherited body colour and loses the muted look entirely.
+    /// labels) and falls under 4.5:1 on two of the backgrounds a quote
+    /// actually appears over, both in LIGHT mode: `--color-surface` (4.47:1)
+    /// and the `bg-accent/20` outgoing DM bubble (3.96:1, the worst quote
+    /// surface in the app). The dark-mode equivalents were already fine.
+    ///
+    /// The token must be declared in BOTH colour schemes, and the two ways to
+    /// break that fail DIFFERENTLY — which is why this counts declarations
+    /// instead of asserting either symptom:
+    ///
+    /// - Drop the DARK value and `:root`'s light value still resolves, so
+    ///   every dark-mode quote silently paints the light colour (2.49:1 on a
+    ///   dark received bubble — worse than the bug this PR fixes).
+    /// - Drop the LIGHT value and the token is undefined everywhere `:root`
+    ///   would have supplied it, so `var()` is invalid at computed-value time,
+    ///   `color` inherits the body text colour, and the muted look vanishes
+    ///   entirely while contrast stays high enough that no AA floor notices.
     #[test]
     fn blockquote_uses_dedicated_quote_colour_token_in_both_schemes() {
         const TAILWIND_CSS: &str = include_str!("../../assets/tailwind.css");

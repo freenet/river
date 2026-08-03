@@ -187,14 +187,25 @@ html, body {
  *
  * `--color-text-quote` rather than `--color-text-muted`: a quote must stay
  * READABLE while reading as secondary, and the muted token — which is tuned
- * for timestamps and field labels, i.e. glanceable metadata — lands just under
- * the 4.5:1 WCAG AA floor on two of the backgrounds a quote actually appears
- * over (4.47:1 on light-mode `--color-surface`, 4.40:1 on a dark-mode
- * `bg-accent/20` DM bubble). The quote token is one step further from the
- * background in each mode, which clears AA on every quote surface while
- * staying well clear of `--color-text` so the muted look survives. It is
- * deliberately a SEPARATE token: nudging `--color-text-muted` itself would
- * repaint every timestamp, placeholder and label in the app. */
+ * for timestamps and field labels, i.e. glanceable metadata — falls under the
+ * 4.5:1 WCAG AA floor on two of the backgrounds a quote actually appears over,
+ * BOTH of them in light mode: 4.47:1 on `--color-surface` (a received bubble)
+ * and 3.96:1 on the `bg-accent/20` outgoing DM bubble, which is the worst
+ * quote surface in the app. The dark-mode equivalents were already fine
+ * (5.93:1 and 5.56:1). The quote token is one step further from the background
+ * in each mode, which clears AA on every quote surface (5.61:1 / 4.97:1 light,
+ * 8.05:1 / 7.55:1 dark) while staying well clear of `--color-text` so the
+ * muted look survives. It is deliberately a SEPARATE token: nudging
+ * `--color-text-muted` itself would repaint every timestamp, placeholder and
+ * label in the app.
+ *
+ * Those numbers are measured against the REAL DM modal, not a stand-in. An
+ * earlier revision of this comment claimed "4.40:1 on a dark-mode DM bubble",
+ * which was wrong in both the scheme and the value: it came from a synthetic
+ * page that put the bubble on `--color-bg` instead of the modal's panel, read
+ * through a colour helper that un-premultiplied an already-straight-alpha
+ * canvas readback. Both errors inflated a translucent background. Measure a
+ * translucent surface where it actually renders. */
 .prose blockquote {
   border-left: 3px solid var(--color-accent);
   padding-left: 1rem;
