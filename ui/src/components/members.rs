@@ -333,11 +333,22 @@ fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
 
 /// Lift the viewer's own row to the top of the member list (freenet/river#584).
 ///
-/// The rest of the list is a viewer-scoped invite/deputy tree whose order is
-/// load-bearing — it shows who invited and who deputized whom — so self is
-/// HOISTED out of it rather than the tree being re-sorted: every other row
-/// keeps its relative position. A `rotate_right` on the prefix is the stable
-/// form of "move this element to the front".
+/// The rest of the list is a viewer-scoped invite/deputy tree
+/// (`deputy_display_order`, #410), so self is HOISTED out of it rather than
+/// the tree being re-sorted: every other row keeps its relative position, and
+/// `rotate_right` on the prefix is the stable form of "move this element to
+/// the front".
+///
+/// What the hoist DOES cost, stated plainly so nobody re-derives it as a bug:
+/// rows render as a FLAT list with no indentation (see `MemberList`'s `ul`),
+/// so a member's parent is conveyed only by adjacency — and self's own
+/// invitees/deputies are now adjacent to self's former neighbour instead of to
+/// self. That is acceptable precisely BECAUSE nothing renders depth: with no
+/// indentation the ordering never communicated parentage to begin with, and
+/// the relationship badges (🔑 🌐 🎪 🔭, plus 🛡 whose tooltip names the
+/// appointer) are what actually tell the viewer who invited or deputized whom.
+/// Do not restate this as "the tree order is preserved" — it is preserved for
+/// every row EXCEPT self's children.
 ///
 /// No-op when the viewer isn't in the list at all (they may have joined and
 /// not yet been ingested — the freenet/river#167 shape), or is the owner
@@ -3578,6 +3589,13 @@ mod tests {
         let mut rows: Vec<((), MemberId)> = (0..5).map(|n| ((), mid(n))).collect();
         pin_self_to_top(&mut rows, mid(3));
         assert_eq!(ids(&rows), vec![mid(3), mid(0), mid(1), mid(2), mid(4)]);
+
+        // Self LAST is the maximal rotation — every other row moves. An
+        // off-by-one in the `..=pos` slice bound is invisible at an interior
+        // index and shows up here.
+        let mut rows: Vec<((), MemberId)> = (0..5).map(|n| ((), mid(n))).collect();
+        pin_self_to_top(&mut rows, mid(4));
+        assert_eq!(ids(&rows), vec![mid(4), mid(0), mid(1), mid(2), mid(3)]);
     }
 
     /// The owner viewing their own room is already at index 0 (tree root), and
@@ -3597,11 +3615,16 @@ mod tests {
     /// The hoist is only reachable through `MemberList`'s memo, which no unit
     /// test can drive — so deleting the call leaves both tests above green.
     /// Pin the call site (freenet/river#584).
+    ///
+    /// Greps `production_source()`, NEVER a raw `include_str!("members.rs")`:
+    /// the needle also occurs in this test's own string literal, so a
+    /// whole-file search matches ITSELF and stays green with the call site
+    /// deleted — which is exactly the mutation this test exists to catch.
+    /// Verified by deleting the call and watching this fail.
     #[test]
     fn pin_self_to_top_is_wired_into_the_member_list() {
         assert!(
-            include_str!("members.rs")
-                .contains("pin_self_to_top(&mut all_members, self_member_id)"),
+            production_source().contains("pin_self_to_top(&mut all_members, self_member_id)"),
             "MemberList stopped pinning the viewer's own row to the top"
         );
     }
