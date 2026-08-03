@@ -331,6 +331,24 @@ fn member_display_parts(member: &MemberDisplay) -> MemberDisplayParts {
     }
 }
 
+/// Lift the viewer's own row to the top of the member list (freenet/river#584).
+///
+/// The rest of the list is a viewer-scoped invite/deputy tree whose order is
+/// load-bearing — it shows who invited and who deputized whom — so self is
+/// HOISTED out of it rather than the tree being re-sorted: every other row
+/// keeps its relative position. A `rotate_right` on the prefix is the stable
+/// form of "move this element to the front".
+///
+/// No-op when the viewer isn't in the list at all (they may have joined and
+/// not yet been ingested — the freenet/river#167 shape), or is the owner
+/// (already at index 0). The ⭐ tag from `member_display_parts` is what makes
+/// the pinned row visually distinct; no extra styling is needed here.
+fn pin_self_to_top<T>(rows: &mut [(T, MemberId)], self_id: MemberId) {
+    if let Some(pos) = rows.iter().position(|(_, id)| *id == self_id) {
+        rows[..=pos].rotate_right(1);
+    }
+}
+
 /// Order member IDs by DFS pre-order traversal of the invite tree.
 /// Owner is the root; within siblings, order matches `members.members`
 /// (sorted by MemberId after CRDT convergence).
@@ -1490,6 +1508,11 @@ pub fn MemberList() -> Element {
 
             all_members.push((member_display_parts(&member_display), member_id));
         }
+
+        // freenet/river#584: your own row goes to the top, so finding yourself
+        // isn't a scroll-and-hunt in a large room. Everything below keeps its
+        // tree order.
+        pin_self_to_top(&mut all_members, self_member_id);
 
         Some(all_members)
     })()
@@ -3538,6 +3561,37 @@ mod tests {
         let icons: Vec<&str> = parts.tags.iter().map(|t| t.glyph).collect();
         assert!(icons.contains(&"👑"));
         assert!(icons.contains(&"⭐"));
+    }
+
+    fn mid(n: i64) -> MemberId {
+        MemberId(freenet_scaffold::util::FastHash(n))
+    }
+
+    fn ids(rows: &[((), MemberId)]) -> Vec<MemberId> {
+        rows.iter().map(|(_, id)| *id).collect()
+    }
+
+    /// freenet/river#584: self moves to index 0, and every other row keeps its
+    /// relative tree order (this is a hoist, not a re-sort).
+    #[test]
+    fn pin_self_to_top_hoists_self_and_preserves_the_rest() {
+        let mut rows: Vec<((), MemberId)> = (0..5).map(|n| ((), mid(n))).collect();
+        pin_self_to_top(&mut rows, mid(3));
+        assert_eq!(ids(&rows), vec![mid(3), mid(0), mid(1), mid(2), mid(4)]);
+    }
+
+    /// The owner viewing their own room is already at index 0 (tree root), and
+    /// a viewer not yet present in the list must not reorder anything.
+    #[test]
+    fn pin_self_to_top_is_a_noop_when_self_is_first_or_absent() {
+        let mut rows: Vec<((), MemberId)> = (0..3).map(|n| ((), mid(n))).collect();
+        let before = ids(&rows);
+
+        pin_self_to_top(&mut rows, mid(0));
+        assert_eq!(ids(&rows), before);
+
+        pin_self_to_top(&mut rows, mid(99));
+        assert_eq!(ids(&rows), before);
     }
 
     /// The 🛡 deputy shield renders exactly when `deputized_by` is non-empty,
