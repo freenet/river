@@ -182,12 +182,31 @@ where stale legacy data overwrites newer state on the current delegate
      (non-destructive — the blob is left as a rollback fallback).
    - **Nothing** → `fire_legacy_migration_request()`.
 
-   The **interrupted-migration flag** is a per-legacy-set localStorage marker
-   (`river_legacy_migration_in_progress:<fingerprint>`, parallel to the
-   `…_done:` flag): set BEFORE any migration re-save (`hydrate_loaded_rooms`'s
+   The **interrupted-migration flag** is a per-legacy-set marker stored in the
+   CURRENT delegate under `__legacy_migration_in_progress:<fingerprint>`
+   (freenet/river#586): set BEFORE any migration re-save (`hydrate_loaded_rooms`'s
    legacy branch and the current-blob explosion alike) and cleared ONLY on a
    FULL successful re-save. A partial/aborted re-save therefore leaves it set,
-   which is what drives the recovery above.
+   which is what drives the recovery above. It is read back from the current
+   delegate's startup `ListResponse`, so it costs no extra round trip.
+
+   **It used to be a localStorage key and that never worked in the deployed
+   app.** The gateway serves the webapp in a `sandbox="allow-scripts …"` iframe
+   with no `allow-same-origin`, so the document has an opaque origin and every
+   `localStorage` access throws `SecurityError`. `window.local_storage()` maps
+   that to `Err`, which the reader treated as "flag absent" — so the marker was
+   never written, the reader was permanently `false`, and the recovery above was
+   dead code from the day it shipped until #586. localStorage is still written
+   and read as a best-effort mirror (present-wins) for same-origin builds such as
+   `dx serve`; it is never relied upon.
+
+   The `…_done:` SEAL is a separate flag and is deliberately still
+   localStorage-only, i.e. still inert in the deployed app. Making it durable is
+   unsafe: the fixed probes and `ListRequest`s in `fire_legacy_migration_request`
+   are raw sends holding no `LoadWorkerGuard`, so `PENDING_LOADS == 0` does not
+   prove the fan-out finished, and `freenet_synchronizer.rs` sets the pending-seal
+   flag on ANY "delegate not found" error — which the fan-out itself provokes.
+   A durable seal is permanent with no unseal path. See freenet/river#588.
 4. `fire_legacy_migration_request` probes each legacy delegate TWO ways:
    (a) fixed `GetRequest` for `[ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY]`
    (the pre-#345 single-blob format + DM cache), and (b) a `ListRequest` to

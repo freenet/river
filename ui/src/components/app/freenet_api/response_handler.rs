@@ -11,19 +11,21 @@ mod update_response;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    arm_legacy_migration_recovery, await_delegate_response, cas_store_correlation_key,
-    clear_legacy_migration_in_progress, complete_pending_public_key_request,
-    complete_pending_request, complete_pending_sign_request, complete_pending_signing_key_request,
-    current_delegate_source_rank, decide_legacy_migration_action, decide_per_room_load_action,
-    enqueue_delegate_request, fire_legacy_migration_request, get_versioned_correlation_key,
-    hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
-    is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
-    per_room_terminal, prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence,
-    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
-    send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
-    LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
-    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    arm_legacy_migration_recovery, await_delegate_response, begin_recovery_window,
+    cas_store_correlation_key, clear_legacy_migration_in_progress,
+    complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
+    complete_pending_signing_key_request, current_delegate_source_rank,
+    decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
+    fire_legacy_migration_request, get_versioned_correlation_key, hydrate_hidden_dm_threads,
+    hydrate_outbound_dms_cache, is_legacy_delegate_key, is_legacy_migration_in_progress,
+    legacy_scoped_correlation, load_state_after_probe_legacy, mark_legacy_migration_done,
+    mark_legacy_migration_in_progress, parse_room_storage_key, per_room_terminal,
+    prune_outbound_dms_for_purges, recovery_is_safe_to_run, request_legacy_seal_on_quiescence,
+    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate,
+    seed_migration_marker_from_current_keys, send_delegate_request, send_delegate_request_to,
+    set_load_state_if_current, source_rank_for_delegate_key, LegacyMigrationAction,
+    LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY,
+    ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -689,6 +691,13 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
     // (superseded by a Retry) can neither pollute the new attempt's
     // `SAW_FETCH_FAILURE` nor write its display state.
     let worker = LoadWorkerGuard::new();
+    // freenet/river#586: the interrupted-migration marker is delegate-persisted,
+    // and THIS `ListResponse` is the response that carries it. Seed the cache
+    // BEFORE the plan is classified, so `decide_per_room_load_action` reads the
+    // persisted truth instead of a localStorage read that always fails in the
+    // sandboxed gateway iframe — which is why the freenet/river#345 recovery has
+    // never run in production. Costs no extra round trip: we already fetched this.
+    seed_migration_marker_from_current_keys(&keys);
     match plan_load_from_keys(&keys) {
         LoadPlan::ProbeLegacy => {
             info!("Current delegate has no room data — firing legacy migration probe");
@@ -706,11 +715,12 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                  migrating it to per-room keys"
             );
             // Initial load: owns the display state (recovery = false).
-            migrate_current_blob_to_per_room(false).await;
+            migrate_current_blob_to_per_room(false, true).await;
         }
         LoadPlan::PerRoom {
             mut room_vks,
             has_meta,
+            has_blob,
         } => {
             // Was a prior legacy migration interrupted before it finished writing
             // every per-room key? If so, the set we're about to load may be
@@ -883,6 +893,9 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
                 None
             };
 
+            // Captured before `slots` moves into `reconstruct_rooms`: how many of
+            // the LISTED rooms actually materialised (see the recovery gate below).
+            let slots_len = slots.len();
             let loaded = reconstruct_rooms(slots, meta);
             // Capture emptiness BEFORE `loaded` is moved into hydrate, for the
             // authoritative terminal decision below.
@@ -938,12 +951,18 @@ async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
             //   — the SAME bounded, harmless cost the existing empty-legacy path
             //   already pays (see the `is_legacy_delegate` no-`rooms_data` branch
             //   above). No data loss, no spam loop.
-            if action.recover && arm_legacy_migration_recovery() {
-                info!("Prior migration was interrupted — re-running to recover any stranded rooms");
-                // Background re-fill: the initial per-room load already resolved
-                // the display state to `Loaded` above, so recovery must NOT write
-                // the load state (recovery = true) — see freenet/river#397 review.
-                migrate_current_blob_to_per_room(true).await;
+            // freenet/river#586: the recovery must only run when the per-room
+            // load was COMPLETE — see `recovery_is_safe_to_run`.
+            if action.recover {
+                if !recovery_is_safe_to_run(listed_count, slots_len, had_fetch_error) {
+                    warn!("Deferring recovery: incomplete per-room load");
+                } else if arm_legacy_migration_recovery() {
+                    info!("Prior migration was interrupted — re-running to recover any stranded rooms");
+                    // #414 import gate, held only for the live window (see
+                    // `RECOVERY_PENDING`).
+                    begin_recovery_window();
+                    migrate_current_blob_to_per_room(true, has_blob).await;
+                }
             }
         }
     }
@@ -957,6 +976,13 @@ enum LoadPlan {
     PerRoom {
         room_vks: Vec<ed25519_dalek::VerifyingKey>,
         has_meta: bool,
+        /// Did the index ALSO list a legacy `rooms_data` blob? A blob-explosion
+        /// leaves the blob in place as a rollback fallback, so per-room keys and
+        /// a blob routinely coexist. The interrupted-migration recovery needs
+        /// this: it re-reads `rooms_data`, and whether a read failure there is
+        /// known-stored-data or a key that never existed depends on it
+        /// (freenet/river#586).
+        has_blob: bool,
     },
     /// No per-room keys, but a single legacy `rooms_data` blob under the current
     /// delegate — read it and explode it into per-room keys.
@@ -984,7 +1010,11 @@ fn plan_load_from_keys(keys: &[ChatDelegateKey]) -> LoadPlan {
         }
     }
     if !room_vks.is_empty() {
-        LoadPlan::PerRoom { room_vks, has_meta }
+        LoadPlan::PerRoom {
+            room_vks,
+            has_meta,
+            has_blob: has_legacy_blob,
+        }
     } else if has_legacy_blob {
         LoadPlan::MigrateCurrentBlob
     } else {
@@ -1035,7 +1065,7 @@ fn reconstruct_rooms(
 /// because `arm_legacy_migration_recovery` reset the attempt guard so the probe
 /// re-fires). Any real migration the recovery triggers still shows `Migrating`
 /// via the legacy `hydrate_loaded_rooms` path, which is not gated here.
-async fn migrate_current_blob_to_per_room(recovery: bool) {
+async fn migrate_current_blob_to_per_room(recovery: bool, blob_was_listed: bool) {
     // Progress-tracked termination (freenet/river#397 review 6); attempt-scoped
     // writes (review 7): a stale worker's `worker.*` calls no-op.
     let worker = LoadWorkerGuard::new();
@@ -1109,8 +1139,11 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                         }
                         Err(e) => {
                             error!("Failed to explode single blob into per-room keys: {}", e);
-                            // Leave the in-progress flag set so the next load
-                            // re-runs the fill. Same had_rooms gate as the Ok arm.
+                            // RE-ASSERT, don't assume it is still set
+                            // (freenet/river#586): a SIBLING generation's success
+                            // can have cleared the marker between our mark above
+                            // and this failure. Same had_rooms gate as the Ok arm.
+                            mark_legacy_migration_in_progress();
                             if had_rooms {
                                 set_load_state_if_current(attempt, RoomsLoadState::Loaded);
                             }
@@ -1149,15 +1182,28 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             }
         }
         Err(e) => {
-            // freenet/river#397 Codex review 5 (audit): we only reach this fn from
-            // `LoadPlan::MigrateCurrentBlob`, i.e. the current delegate's index
-            // LISTED a `rooms_data` key, so the blob exists — a SEND failure
-            // reading it is known-stored-data that failed to load. Mark the failure
-            // (attempt-scoped, review 7) so the worker's settlement resolves to
-            // LoadFailed rather than a silent Empty. (Display is masked by `List`
-            // if rooms are concurrently present.)
+            // freenet/river#397 Codex review 5 (audit): on the INITIAL load we
+            // reach this fn only from `LoadPlan::MigrateCurrentBlob`, i.e. the
+            // current delegate's index LISTED a `rooms_data` key, so the blob
+            // exists — a SEND failure reading it is known-stored-data that failed
+            // to load. Mark the failure (attempt-scoped, review 7) so the worker's
+            // settlement resolves to LoadFailed rather than a silent Empty.
+            // (Display is masked by `List` if rooms are concurrently present.)
+            //
+            // freenet/river#586: under `recovery` that precondition depends on
+            // whether the index actually LISTED `rooms_data`, which is NOT implied
+            // by taking the recovery branch — `plan_load_from_keys` prefers
+            // `PerRoom` whenever any per-room key exists, and a blob-explosion
+            // deliberately leaves the blob in place as a rollback fallback, so
+            // per-room keys and a blob routinely coexist. Gate on the fact itself
+            // rather than on the caller: when the blob WAS listed a send failure is
+            // still known-stored-data that failed to load; when it was not, the key
+            // never existed and marking would resolve an already-`Loaded` display
+            // to LoadFailed off the back of a read for something that isn't there.
             warn!("Failed to read current-delegate rooms blob: {}", e);
-            worker.mark_fetch_failure();
+            if blob_was_listed {
+                worker.mark_fetch_failure();
+            }
         }
     }
 }
@@ -1185,7 +1231,9 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     // (review 7): `worker.*` calls no-op for a stale worker.
     let worker = LoadWorkerGuard::new();
     let (room_vks, has_meta) = match plan_load_from_keys(&keys) {
-        LoadPlan::PerRoom { room_vks, has_meta } => (room_vks, has_meta),
+        LoadPlan::PerRoom {
+            room_vks, has_meta, ..
+        } => (room_vks, has_meta),
         // No per-room keys on this legacy delegate — its single blob (if any) is
         // handled by the fixed rooms_data probe. Nothing per-room to migrate, so
         // do NOT touch the load state here (freenet/river#397 Codex review 2: an
@@ -1927,7 +1975,10 @@ fn hydrate_loaded_rooms_with_authority(
                 }
                 Err(e) => {
                     error!("Failed to migrate room data to new delegate: {}", e);
-                    // Leave the in-progress flag set so the next load re-fills.
+                    // RE-ASSERT, don't assume it is still set (freenet/river#586):
+                    // a SIBLING generation's success can have cleared the marker
+                    // between our mark and this failure.
+                    mark_legacy_migration_in_progress();
                     if had_loaded_rooms {
                         set_load_state_if_current(attempt, RoomsLoadState::Loaded);
                     }
@@ -2227,6 +2278,101 @@ mod tests {
         );
     }
 
+    /// freenet/river#586: the blob-read failure arm must judge "was this
+    /// known-stored data?" from whether the index LISTED `rooms_data`, never from
+    /// whether this is the recovery caller.
+    ///
+    /// `plan_load_from_keys` prefers `PerRoom` whenever any per-room key exists,
+    /// and a blob-explosion deliberately leaves the blob in place as a rollback
+    /// fallback — so per-room keys and a blob routinely coexist and the recovery
+    /// caller CAN have a real blob. Gating on `recovery` would suppress a genuine
+    /// known-stored-data failure for that cohort, opening the freenet/river#414
+    /// import gate while the room set is both incomplete and known to have failed
+    /// a read.
+    #[test]
+    fn the_blob_read_failure_arm_gates_on_whether_the_blob_was_listed() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let idx = production
+            .find("Failed to read current-delegate rooms blob")
+            .expect("the blob send-failure marker must exist");
+        let arm = &production[idx..(idx + 300).min(production.len())];
+        assert!(
+            arm.contains("if blob_was_listed {"),
+            "the mark must be gated on the blob having been LISTED"
+        );
+        assert!(
+            !arm.contains("if !recovery {"),
+            "gating on the caller instead of the fact suppresses a real failure \
+             for users whose per-room keys coexist with a leftover blob"
+        );
+    }
+
+    /// freenet/river#586: a generation whose re-save FAILS must RE-ASSERT the
+    /// interrupted-migration marker, not assume it is still set.
+    ///
+    /// The fan-out hydrates every surviving generation independently, each
+    /// running mark → save → clear, so a sibling generation's success can clear
+    /// the marker between this one's mark and its failure. Two tabs share the
+    /// delegate store but not the process globals, so the coalesced save does not
+    /// exclude it either. Leaving it clear lets the next session conclude the
+    /// per-room set is authoritative while this generation's rooms were never
+    /// written — the exact freenet/river#345 strand.
+    #[test]
+    fn a_failed_legacy_resave_reasserts_the_migration_marker() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let idx = production
+            .find("Failed to migrate room data to new delegate")
+            .expect("legacy re-save-error marker must exist");
+        let arm = &production[idx..(idx + 700).min(production.len())];
+        assert!(
+            arm.contains("mark_legacy_migration_in_progress();"),
+            "the failing re-save must re-assert the marker — a sibling generation \
+             may have cleared it"
+        );
+    }
+
+    /// freenet/river#586 wiring pin: the delegate-persisted interrupted-migration
+    /// marker must be seeded from the current delegate's `ListResponse` BEFORE the
+    /// load plan is classified.
+    ///
+    /// Ordering is the whole fix. `decide_per_room_load_action` (in the `PerRoom`
+    /// arm) reads that marker, and in the deployed app the localStorage fallback
+    /// ALWAYS reports "absent" — so a seed that lands after the match leaves the
+    /// freenet/river#345 recovery decision on the broken path, silently, with
+    /// every other test still green.
+    #[test]
+    fn the_migration_marker_is_seeded_before_the_load_plan_is_classified() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let body = production
+            .find("async fn load_rooms_per_room(")
+            .map(|i| &production[i..])
+            .expect("load_rooms_per_room must exist");
+        let seed = body
+            .find("seed_migration_marker_from_current_keys(&keys)")
+            .expect("the current delegate's ListResponse must seed the marker");
+        let plan = body
+            .find("match plan_load_from_keys(&keys)")
+            .expect("the load plan must be classified");
+        assert!(
+            seed < plan,
+            "the marker must be seeded BEFORE the load plan is classified, or the \
+             interrupted-migration decision reads a flag that is permanently unset \
+             in the sandboxed app (freenet/river#586)"
+        );
+    }
+
     /// Regression pin (freenet/river#345 follow-up — Nacho's "Freenet Devs"
     /// disappeared-after-update): an interrupted migration must be recoverable.
     /// (1) The legacy re-save marks migration IN PROGRESS before saving and only
@@ -2272,7 +2418,7 @@ mod tests {
             .expect("per-room load must have an `if action.recover` recovery branch");
         let recover_block = &production[recover_idx..(recover_idx + 700).min(production.len())];
         assert!(
-            recover_block.contains("migrate_current_blob_to_per_room(true).await;"),
+            recover_block.contains("migrate_current_blob_to_per_room(true, has_blob).await;"),
             "the recovery branch must re-run the migration (as a background re-fill, \
              recovery = true) to recover stranded rooms — see freenet/river#397 review"
         );
@@ -2510,7 +2656,9 @@ mod tests {
             .expect("production code before `mod tests`");
 
         assert!(
-            production.contains("async fn migrate_current_blob_to_per_room(recovery: bool)"),
+            production.contains(
+                "async fn migrate_current_blob_to_per_room(recovery: bool, blob_was_listed: bool)"
+            ),
             "migrate_current_blob_to_per_room must thread a `recovery` flag so a \
              background re-fill can suppress only its DOWNGRADE write"
         );
@@ -2518,7 +2666,7 @@ mod tests {
         // passes true (the latter is also pinned by
         // `interrupted_migration_is_recovered_on_next_load`).
         assert!(
-            production.contains("migrate_current_blob_to_per_room(false).await;"),
+            production.contains("migrate_current_blob_to_per_room(false, true).await;"),
             "the initial LoadPlan::MigrateCurrentBlob caller must own the load state (recovery = false)"
         );
         // Slice just the `migrate_current_blob_to_per_room` body (from its
@@ -2526,7 +2674,9 @@ mod tests {
         // accidentally match the identically-named write in `load_rooms_per_room`'s
         // `ProbeLegacy` arm (which is correctly ungated — it OWNS the load).
         let fn_start = production
-            .find("async fn migrate_current_blob_to_per_room(recovery: bool)")
+            .find(
+                "async fn migrate_current_blob_to_per_room(recovery: bool, blob_was_listed: bool)",
+            )
             .expect("migrate_current_blob_to_per_room signature must exist");
         let body_after_sig = &production[fn_start + 1..];
         let fn_end = body_after_sig
@@ -2957,8 +3107,12 @@ mod tests {
     }
 
     /// Per-room keys present → fetch every slot; `rooms_meta` toggles `has_meta`.
-    /// A stray legacy `rooms_data` blob alongside per-room keys is ignored (it's
-    /// only a rollback fallback once the per-room keys exist).
+    /// A stray legacy `rooms_data` blob alongside per-room keys does not change
+    /// the PLAN (it's only a rollback fallback once the per-room keys exist) —
+    /// but it IS recorded in `has_blob`, because the interrupted-migration
+    /// recovery re-reads `rooms_data` and needs to know whether a read failure
+    /// there is known-stored-data or a key that never existed
+    /// (freenet/river#586). This fixture is exactly that coexistence case.
     #[test]
     fn plan_picks_per_room_when_room_keys_present() {
         let a = vk(1);
@@ -2971,8 +3125,17 @@ mod tests {
             dk(OUTBOUND_DMS_STORAGE_KEY.to_vec()),
         ];
         match plan_load_from_keys(&keys) {
-            LoadPlan::PerRoom { room_vks, has_meta } => {
+            LoadPlan::PerRoom {
+                room_vks,
+                has_meta,
+                has_blob,
+            } => {
                 assert!(has_meta);
+                assert!(
+                    has_blob,
+                    "a leftover blob alongside per-room keys must be RECORDED, \
+                     not discarded — the recovery's error handling depends on it"
+                );
                 let set: std::collections::HashSet<_> = room_vks.into_iter().collect();
                 assert_eq!(set, std::collections::HashSet::from([a, b]));
             }
@@ -2988,6 +3151,7 @@ mod tests {
             LoadPlan::PerRoom {
                 room_vks: vec![vk(9)],
                 has_meta: false,
+                has_blob: false,
             }
         );
     }
