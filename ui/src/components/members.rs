@@ -3590,9 +3590,9 @@ mod tests {
         pin_self_to_top(&mut rows, mid(3));
         assert_eq!(ids(&rows), vec![mid(3), mid(0), mid(1), mid(2), mid(4)]);
 
-        // Self LAST is the maximal rotation — every other row moves. An
-        // off-by-one in the `..=pos` slice bound is invisible at an interior
-        // index and shows up here.
+        // Self LAST is the maximal rotation — every other row moves. What this
+        // adds over the interior case is the out-of-bounds direction: `..=pos`
+        // widened to `..=pos + 1` PANICS here and merely permutes there.
         let mut rows: Vec<((), MemberId)> = (0..5).map(|n| ((), mid(n))).collect();
         pin_self_to_top(&mut rows, mid(4));
         assert_eq!(ids(&rows), vec![mid(4), mid(0), mid(1), mid(2), mid(3)]);
@@ -3616,15 +3616,38 @@ mod tests {
     /// test can drive — so deleting the call leaves both tests above green.
     /// Pin the call site (freenet/river#584).
     ///
-    /// Greps `production_source()`, NEVER a raw `include_str!("members.rs")`:
-    /// the needle also occurs in this test's own string literal, so a
-    /// whole-file search matches ITSELF and stays green with the call site
-    /// deleted — which is exactly the mutation this test exists to catch.
+    /// Scoped to `MemberList`'s memo, and NEVER a raw
+    /// `include_str!("members.rs")` — three distinct ways this pin can go
+    /// vacuous, each closed by a different part of the slice:
+    ///
+    /// - the needle also occurs in this test's own string literal, so a
+    ///   whole-FILE search matches ITSELF and stays green with the call site
+    ///   deleted (this pin shipped that way; `prod_source`'s `#[cfg(test)]`
+    ///   cut closes it);
+    /// - a call left behind as `// pin_self_to_top(...)` while debugging would
+    ///   satisfy a `contains` (`prod_source` strips line comments);
+    /// - a refactor that moves the call into a helper `MemberList` no longer
+    ///   reaches would satisfy a whole-PRODUCTION search (the anchors close
+    ///   it). "Scoping is the entire point" —
+    ///   `impersonation_warning_is_wired_into_every_render_surface`, which
+    ///   uses this same anchor pair.
+    ///
     /// Verified by deleting the call and watching this fail.
     #[test]
     fn pin_self_to_top_is_wired_into_the_member_list() {
+        let prod = prod_source(include_str!("members.rs"));
+        assert_prod_only(&prod, "members.rs");
+
+        let start = prod
+            .find("pub fn MemberList()")
+            .expect("anchor `pub fn MemberList()` not found");
+        let end = prod[start..]
+            .find("let handle_member_click")
+            .expect("anchor `let handle_member_click` not found after `pub fn MemberList()`")
+            + start;
+
         assert!(
-            production_source().contains("pin_self_to_top(&mut all_members, self_member_id)"),
+            prod[start..end].contains("pin_self_to_top(&mut all_members, self_member_id)"),
             "MemberList stopped pinning the viewer's own row to the top"
         );
     }
@@ -4953,10 +4976,13 @@ mod tests {
     }
 
     /// Production-code slice of this file (everything before the
-    /// `#[cfg(test)]` test module). Used by the two source-grep pins
-    /// below so that prose / examples in the test module — which may
+    /// `#[cfg(test)]` test module). Used by the source-grep pins in this
+    /// module so that prose / examples in the test module — which may
     /// legitimately *mention* the attribute name or attack pattern —
     /// can't either disarm or accidentally trip the assertions.
+    ///
+    /// Unlike [`prod_source`] this does NOT strip line comments, so a pin
+    /// whose needle could survive as a commented-out call wants that one.
     fn production_source() -> &'static str {
         let source = include_str!("members.rs");
         let marker = "#[cfg(test)]";

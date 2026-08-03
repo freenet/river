@@ -28,14 +28,22 @@ test.describe("Member list pins the viewer's own row (#584)", () => {
     await page.goto("/");
     await page.waitForSelector(".app-root", { timeout: 30_000 });
     await page.getByText("Team Chat Room").first().click();
+    // Confirm the click actually landed, so a miss fails saying so rather than
+    // timing out on an empty member list further down.
+    await expect(
+      page.getByRole("heading", { name: "Team Chat Room" }),
+    ).toBeVisible({ timeout: 15_000 });
 
     const rows = page.locator('[data-testid="member-list"] li');
     await rows.first().waitFor({ state: "visible", timeout: 15_000 });
 
     // PREMISE, asserted first so a broken fixture fails as a broken fixture:
     // there is more than one row, and the owner is on one of them. In a
-    // single-row list every assertion below would hold trivially.
-    expect(await rows.count()).toBeGreaterThan(1);
+    // single-row list every assertion below would hold trivially. Both are
+    // retrying assertions — a bare `expect(await rows.count())` races the
+    // second row's paint, which is a flake this list has produced before
+    // (see impersonation-warning.spec.ts).
+    await expect(rows.nth(1)).toBeVisible();
     await expect(page.locator(OWNER_TAG)).toHaveCount(1);
 
     // THE PROPERTY: row 0 is the viewer's own row.
