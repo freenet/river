@@ -294,6 +294,16 @@ test.describe("Sandboxed iframe embedding", () => {
   const sandboxAttrs =
     "allow-scripts allow-forms allow-popups allow-same-origin";
 
+  // These two tests build their own page with `setContent`, so the iframe
+  // `src` is the only thing pointing at the app — `baseURL` does not apply to
+  // it automatically. Hardcoding `http://localhost:8082` made them test
+  // whatever happened to be on the suite's DEFAULT port rather than the build
+  // under test, which is exactly the shared-port trap AGENTS.md warns about:
+  // run the suite against a second checkout on another port (or with 8082
+  // already taken by someone else's server) and these two silently measured a
+  // different build. Read the same env var the other specs use.
+  const APP_URL = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:8082";
+
   test("app renders inside a sandboxed iframe", async ({ page }) => {
     await page.setContent(`
       <!DOCTYPE html>
@@ -301,7 +311,7 @@ test.describe("Sandboxed iframe embedding", () => {
       <body style="margin:0;padding:0;height:100vh;">
         <iframe
           sandbox="${sandboxAttrs}"
-          src="http://localhost:8082"
+          src="${APP_URL}"
           style="width:100%;height:100%;border:none;"
         ></iframe>
       </body>
@@ -325,7 +335,7 @@ test.describe("Sandboxed iframe embedding", () => {
       <body style="margin:0;padding:0;height:100vh;">
         <iframe
           sandbox="${sandboxAttrs}"
-          src="http://localhost:8082"
+          src="${APP_URL}"
           style="width:100%;height:100%;border:none;"
         ></iframe>
       </body>
