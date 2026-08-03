@@ -6671,6 +6671,110 @@ mod tests {
         );
     }
 
+    /// The `> quoted` Markdown a reader types has to reach the stylesheet as a
+    /// `<blockquote>` for any of the blockquote rules below to apply at all.
+    /// `message_to_html` rewrites every single newline to a hard break
+    /// (`"  \n"`) before Markdown runs, so pin that the block construct still
+    /// parses through that rewrite.
+    #[test]
+    fn markdown_quote_renders_as_blockquote() {
+        let html = message_to_html("> quoted line\n\nnormal line");
+        assert!(
+            html.contains("<blockquote>"),
+            "`> …` must render as a <blockquote> for the blockquote CSS to \
+             apply: {html}"
+        );
+    }
+
+    /// Extract the declaration body of a CSS rule by its exact selector text.
+    ///
+    /// Anchored on a LINE START (`"\n{selector} {{"`), not a bare substring:
+    /// `.prose blockquote {` is a suffix of `.bg-accent .prose blockquote {`,
+    /// so a substring search would silently return the wrong rule's body if
+    /// the two were ever reordered in the file.
+    fn css_rule_body<'a>(css: &'a str, selector: &str) -> &'a str {
+        let needle = format!("\n{selector} {{");
+        let start = css
+            .find(&needle)
+            .unwrap_or_else(|| panic!("tailwind.css should contain a `{selector}` rule"))
+            + needle.len();
+        let end = start
+            + css[start..]
+                .find('}')
+                .unwrap_or_else(|| panic!("`{selector}` rule should be closed"));
+        &css[start..end]
+    }
+
+    /// A quote inside the local user's own bubble must take the bubble's own
+    /// text colour, not a hardcoded one.
+    ///
+    /// `.bg-accent` is the solid brand-blue sent-message bubble, whose text is
+    /// `text-white`, and it is the SAME blue in light and dark mode. The rule
+    /// used to paint the quote `rgba(0, 0, 0, 0.8)`, so quoted text rendered
+    /// near-black inside a bubble of white text — 3.52:1 against the bubble,
+    /// under the 4.5:1 WCAG AA floor, in BOTH colour schemes. Pinning
+    /// `color: inherit` is what keeps the quote tied to the bubble's palette
+    /// instead of drifting from it again.
+    ///
+    /// The browser-side counterpart, which measures the real composited
+    /// contrast in both colour schemes rather than the declaration text, is
+    /// `ui/tests/blockquote-contrast.spec.ts`.
+    #[test]
+    fn sent_bubble_blockquote_inherits_bubble_text_colour() {
+        const TAILWIND_CSS: &str = include_str!("../../assets/tailwind.css");
+        let body = css_rule_body(TAILWIND_CSS, ".bg-accent .prose blockquote");
+
+        assert!(
+            body.contains("color: inherit"),
+            "`.bg-accent .prose blockquote` must take the sent bubble's own \
+             text colour (`color: inherit`); a hardcoded colour is what made \
+             quoted text render black-on-blue beside white text. Found: {body}"
+        );
+        // The specific regression: any near-black literal here reproduces it.
+        for banned in ["rgba(0, 0, 0", "rgba(0,0,0", "#000"] {
+            assert!(
+                !body.contains(banned),
+                "`.bg-accent .prose blockquote` must not hardcode a dark text \
+                 colour (`{banned}`): the bubble is brand blue with white text \
+                 in BOTH light and dark mode. Found: {body}"
+            );
+        }
+    }
+
+    /// Quotes outside the sent bubble use a dedicated `--color-text-quote`
+    /// token rather than the app-wide `--color-text-muted`.
+    ///
+    /// The muted token is tuned for glanceable metadata (timestamps, field
+    /// labels) and lands just under 4.5:1 on two of the backgrounds a quote
+    /// actually appears over: light-mode `--color-surface` (4.47:1) and a
+    /// dark-mode `bg-accent/20` DM bubble (4.40:1). The token must be declared
+    /// in BOTH colour schemes — a missing dark-mode value makes the `var()`
+    /// invalid at computed-value time, which silently falls back to the
+    /// inherited body colour and loses the muted look entirely.
+    #[test]
+    fn blockquote_uses_dedicated_quote_colour_token_in_both_schemes() {
+        const TAILWIND_CSS: &str = include_str!("../../assets/tailwind.css");
+
+        let body = css_rule_body(TAILWIND_CSS, ".prose blockquote");
+        assert!(
+            body.contains("color: var(--color-text-quote)"),
+            "`.prose blockquote` must use `--color-text-quote`, not the \
+             app-wide muted token, so a quote stays above the WCAG AA floor \
+             without repainting every timestamp and label. Found: {body}"
+        );
+
+        // `:root` carries the light-mode values; the dark-mode overrides live
+        // in the `prefers-color-scheme: dark` block. Both must define the
+        // token, so count declarations rather than merely finding one.
+        let declarations = TAILWIND_CSS.matches("--color-text-quote:").count();
+        assert_eq!(
+            declarations, 2,
+            "`--color-text-quote` must be declared exactly twice — once in \
+             `:root` (light) and once under `prefers-color-scheme: dark` — \
+             found {declarations}"
+        );
+    }
+
     const SAMPLE_ID: &str = "UDzGbcWrKN748tYbhvbPCCCQrZc9r9xkN3tUuun5Rts";
     /// Real-shape 44-char base58 ID for tests that need a second distinct ID.
     const SAMPLE_ID_2: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
