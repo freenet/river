@@ -3594,6 +3594,18 @@ mod tests {
         assert_eq!(ids(&rows), before);
     }
 
+    /// The hoist is only reachable through `MemberList`'s memo, which no unit
+    /// test can drive — so deleting the call leaves both tests above green.
+    /// Pin the call site (freenet/river#584).
+    #[test]
+    fn pin_self_to_top_is_wired_into_the_member_list() {
+        assert!(
+            include_str!("members.rs")
+                .contains("pin_self_to_top(&mut all_members, self_member_id)"),
+            "MemberList stopped pinning the viewer's own row to the top"
+        );
+    }
+
     /// The 🛡 deputy shield renders exactly when `deputized_by` is non-empty,
     /// and its tooltip names the appointer(s). The member-info modal legend
     /// mirrors this (freenet/river#451) via the shared
