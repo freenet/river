@@ -38,6 +38,100 @@ pub enum SendMessageError {
 /// (freenet/river#414).
 pub const SOURCE_RANK_AUTHORITATIVE: u32 = u32::MAX;
 
+/// Which delegate generation supplied each room's identity, and each tombstone.
+///
+/// Runtime-only (never persisted): it describes where the in-memory view came
+/// from THIS session. Both halves are needed because a legacy generation's
+/// ABSENCES are older evidence exactly as its presences are (freenet/river#590).
+#[derive(Default, Debug)]
+pub struct MergeRanks {
+    /// Rank of the source that supplied each present room's identity.
+    pub identity: HashMap<RoomKey, u32>,
+    /// Rank of the source that contributed each tombstone.
+    pub tombstone: HashMap<RoomKey, u32>,
+    /// Rooms this merge brought back OUT of `removed_rooms` because a strictly
+    /// newer source held them.
+    ///
+    /// The ranked model stops at the session boundary: `MergeRanks` is never
+    /// persisted and `RoomSlot::Tombstone` is a unit variant that cannot carry a
+    /// rank. So the SAVE path is necessarily rank-blind, and its one
+    /// tombstone-vs-present decision — `reconcile_room_present`'s
+    /// `explicitly_rejoined` flag — would answer `AbortAdoptLeave` and write
+    /// nothing, leaving the room alive in memory for exactly one session and
+    /// tombstoned on the delegate for good.
+    ///
+    /// Drained by `hydrate_loaded_rooms` into `mark_room_rejoined`, which both
+    /// sets that flag and clears the `ROOM_SLOT_STATE` cache entry so the
+    /// content-hash skip cannot suppress the write.
+    pub resurrected: std::collections::HashSet<RoomKey>,
+}
+
+impl MergeRanks {
+    /// Will a `Present` observation at `incoming_rank` survive whatever tombstone
+    /// is currently recorded for `vk`?
+    ///
+    /// This is the merge's own rule, exposed because `hydrate_loaded_rooms` has
+    /// to decide which rooms a response contributed BEFORE the (deferred) merge
+    /// runs. Re-deriving that predicate at the call site is how the read side
+    /// drifts from the write side, so there is exactly one implementation.
+    ///
+    /// An unranked tombstone defaults to `SOURCE_RANK_AUTHORITATIVE`, i.e.
+    /// maximally protected: the only way to be tombstoned without a rank is
+    /// `leave_room` in THIS session, and nothing loaded may undo a leave the user
+    /// just performed.
+    pub fn presence_survives_tombstone(&self, vk: &RoomKey, incoming_rank: u32) -> bool {
+        let tomb = self
+            .tombstone
+            .get(vk)
+            .copied()
+            .unwrap_or(SOURCE_RANK_AUTHORITATIVE);
+        incoming_rank > tomb
+    }
+}
+
+/// What a merge source is permitted to do to the live room set.
+///
+/// freenet/river#590: `merge_from_source` used to treat every source as a peer —
+/// it unioned the incoming `removed_rooms` and then evicted the map against the
+/// combined set. That is right for the current delegate and for an explicit
+/// in-session action, and wrong for a LEGACY delegate generation, which is a
+/// strictly OLDER snapshot: its tombstone for a room the user has since rejoined
+/// would delete the live room, and the migration's re-save would then write that
+/// tombstone over the current delegate's `Present` slot. A room's `self_sk`
+/// cannot be re-derived from the network, so that loss is permanent.
+///
+/// The asymmetry is deliberate and one-directional: an older snapshot may ADD a
+/// room the live set lacks, never remove or replace one it has. Worst case a
+/// room the user left reappears, which they can leave again; the alternative is
+/// unrecoverable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MergeAuthority {
+    /// The current delegate, or a deliberate in-session action. Fully
+    /// authoritative: its tombstones remove rooms.
+    Authoritative,
+    /// A legacy delegate generation — a strictly older snapshot. Additive only.
+    OlderSnapshot,
+}
+
+impl MergeAuthority {
+    /// The rank an observation from this source carries.
+    ///
+    /// Note the two scales meet deliberately at the current delegate's number: an
+    /// `Authoritative` source ranks `SOURCE_RANK_AUTHORITATIVE`, while
+    /// `record_identity_source` stores the raw generation number, so a
+    /// current-delegate room sits at `current_delegate_source_rank()` and a
+    /// snapshot merged at that same rank TIES with it — and a tie does not evict.
+    /// That is what makes the `rooms_data` blob safe to merge as an
+    /// `OlderSnapshot` at the current delegate's rank. Do not "tidy" either scale
+    /// without re-checking that tie.
+    pub fn rank_for(self, source_rank: u32) -> u32 {
+        match self {
+            MergeAuthority::Authoritative => SOURCE_RANK_AUTHORITATIVE,
+            MergeAuthority::OlderSnapshot => source_rank,
+        }
+    }
+}
+
 /// What to do with an incoming room copy whose `self_sk` differs from the copy
 /// already in memory.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1797,28 +1891,33 @@ impl Rooms {
 
     /// Merge the other Rooms into this Rooms (eg. when Rooms are loaded from storage)
     ///
-    /// Union of `removed_rooms` tombstones: any room key the user has
-    /// explicitly left on either side stays left. Rooms in `removed_rooms`
-    /// are filtered out of the merge — that prevents a legacy delegate's
-    /// stale `rooms_data` from re-adding a room the user has already
-    /// removed (see freenet/river#247).
+    /// Tombstones are RANKED, not unioned (freenet/river#590): a room the user has
+    /// explicitly left stays left, but only against evidence that is not NEWER.
+    /// A legacy delegate's stale `rooms_data` still cannot re-add a room the user
+    /// removed (freenet/river#247), while a strictly newer generation's `Present`
+    /// can override an older generation's tombstone — which is what stops an
+    /// ancient "you left this" from deleting a room you have since rejoined. This
+    /// entry point is fully `Authoritative`; see [`MergeAuthority`].
     ///
-    /// Known limitation (skeptical review, freenet/river#345): the per-room loop
-    /// below `return`s `Err` on the first room whose `room_state.merge` fails,
-    /// so rooms not yet iterated are dropped from THIS merge (they survive only
-    /// if already present). A DIVERGING `self_sk` is not such a case — it is
-    /// resolved per-room by source authority and never returns `Err`. The per-room SAVE path got
-    /// the M1 scoping fix (`reconcile_room_present` keeps local for the one
-    /// diverged room without wedging the others); the load-side merge did not.
-    /// The trigger is rare (it requires the SAME room to already be in memory
-    /// with a different identity than the loaded copy — not the cold-start case,
-    /// where memory is empty), and a re-load recovers the rest, so per-room
-    /// scoping here is left as follow-up rather than risking this broadly-used
-    /// path. Note the consequence is slightly broader than just dropping the
-    /// un-iterated rooms: when this returns `Err`, the caller
-    /// (`hydrate_loaded_rooms`) skips `repopulate_secrets_from_state` for the
-    /// rooms that DID merge in that pass, so a private room can render
-    /// "[Encrypted message - secret vN not available]" until a clean reload.
+    /// The per-room loop is failure-ISOLATED (freenet/river#591): a room whose
+    /// `room_state.merge` fails is logged, skipped, and the loop continues, with
+    /// the accumulated failures returned as one aggregate at the end. It used to
+    /// `return Err` on the first failure, dropping every room later in
+    /// `other.map`'s arbitrary `HashMap` order — and a room absent from the map is
+    /// exactly where the freenet/river#527 rank check does not run, so the next
+    /// legacy generation's copy was then adopted unranked.
+    ///
+    /// Because an `Err` now means "one or more rooms failed" rather than "nothing
+    /// merged", `hydrate_loaded_rooms` runs `repopulate_secrets_from_state` and
+    /// the actions_state rebuild REGARDLESS of the result; skipping them would
+    /// leave the rooms that merged cleanly rendering
+    /// "[Encrypted message - secret vN not available]" until a reload.
+    ///
+    /// Caveat worth knowing: `ChatRoomStateV1::merge` is `apply_delta`, which the
+    /// `#[composable]` macro generates as sequential per-field `?`, so it is not
+    /// atomic — the already-present branch merges through `get_mut`, and a
+    /// failure can leave that one room half-merged. Unchanged by the isolation
+    /// work, and confined to the failing room.
     pub fn merge(&mut self, other: Rooms) -> Result<(), String> {
         // Single-source merge: rank the incoming copy equal to whatever is
         // already in memory, so an identity conflict always keeps local — the
@@ -1831,14 +1930,19 @@ impl Rooms {
         // u32::MAX and permanently disable generation ranking for that session.
         // If you need a caller that records provenance, call `merge_from_source`
         // directly rather than widening this one.
-        let mut ranks = HashMap::new();
-        self.merge_from_source(other, SOURCE_RANK_AUTHORITATIVE, &mut ranks)
+        let mut ranks = MergeRanks::default();
+        self.merge_from_source(
+            other,
+            SOURCE_RANK_AUTHORITATIVE,
+            MergeAuthority::Authoritative,
+            &mut ranks,
+        )
     }
 
     /// Merge a copy of the user's rooms that came from a specific source,
     /// ranked by [`resolve_identity_conflict`] (freenet/river#527).
     ///
-    /// `identity_ranks` records which source supplied the identity each room in
+    /// `ranks` records which source supplied the identity each room in
     /// `self` currently carries, so a copy arriving later from a NEWER delegate
     /// generation can correct one that merely arrived FIRST. A room already in
     /// memory with no recorded rank is treated as authoritative (it was created
@@ -1847,16 +1951,82 @@ impl Rooms {
         &mut self,
         other: Rooms,
         source_rank: u32,
-        identity_ranks: &mut HashMap<RoomKey, u32>,
+        authority: MergeAuthority,
+        ranks: &mut MergeRanks,
     ) -> Result<(), String> {
-        // Tombstones first: take the union before anything else, so the
-        // filter below sees the combined set.
+        // Tombstones are RANKED OBSERVATIONS, not a union (freenet/river#590).
+        //
+        // The fan-out probes every delegate generation at once and each answers
+        // independently, so for one room we may see `Present` from one generation
+        // and `Tombstone` from another. The correct answer is simply whichever
+        // observation came from the NEWEST generation — a legacy generation's
+        // absences are older evidence exactly as its presences are.
+        //
+        // The old code unioned every incoming tombstone and then evicted the map
+        // against the combined set, which lost that ordering entirely: an ancient
+        // "you left this room" deleted a room you had since rejoined, and the
+        // migration's re-save wrote the tombstone to the current delegate, taking
+        // `self_sk` with it. Probes dispatch oldest-first, so the oldest
+        // generation usually answers while the map is still empty — which is why
+        // guarding only "is it in the map right now" is not enough.
+        //
+        // An `Authoritative` source (the current delegate, or a deliberate
+        // in-session action) outranks every generation and is recorded as such.
+        let incoming_rank = authority.rank_for(source_rank);
         for vk in other.removed_rooms {
+            // A room present in the map is held by whichever source supplied it;
+            // an older tombstone must not evict it.
+            if let Some(live_rank) = ranks.identity.get(&vk.to_bytes()).copied() {
+                if self.map.contains_key(&vk) && incoming_rank <= live_rank {
+                    use dioxus::logger::tracing::warn;
+                    warn!(
+                        "Ignoring a tombstone for room {:?} from source rank {} — the \
+                         copy held came from rank {} (freenet/river#590)",
+                        MemberId::from(&vk),
+                        incoming_rank,
+                        live_rank
+                    );
+                    continue;
+                }
+            } else if self.map.contains_key(&vk) && authority == MergeAuthority::OlderSnapshot {
+                // Present with no recorded rank means it was created or imported
+                // in-session, which nothing loaded may override.
+                use dioxus::logger::tracing::warn;
+                warn!(
+                    "Ignoring a legacy tombstone (source rank {}) for room {:?}, which \
+                     was created or imported in-session (freenet/river#590)",
+                    incoming_rank,
+                    MemberId::from(&vk)
+                );
+                continue;
+            }
+            // Record the tombstone at its own rank so a strictly NEWER generation
+            // answering later can still bring the room back.
+            //
+            // An existing UNRANKED tombstone is an in-session `leave_room`, which
+            // `presence_survives_tombstone` reads as `SOURCE_RANK_AUTHORITATIVE`.
+            // Stamping `incoming_rank` over it would DOWNGRADE that leave to some
+            // generation's number, after which a higher-ranked `Present` from the
+            // fan-out resurrects the room and the re-save persists it. The
+            // inversion is the point: it takes a source that AGREES with the
+            // leave to unlock it. `clear_room_rejoined` stamps the rank
+            // explicitly at the leave site; this keeps the invariant true even if
+            // a future leave path forgets to.
+            let implicit_authoritative =
+                self.removed_rooms.contains(&vk) && !ranks.tombstone.contains_key(&vk.to_bytes());
+            let recorded = if implicit_authoritative {
+                SOURCE_RANK_AUTHORITATIVE
+            } else {
+                incoming_rank
+            };
+            let entry = ranks.tombstone.entry(vk.to_bytes()).or_insert(recorded);
+            *entry = (*entry).max(recorded);
             self.removed_rooms.insert(vk);
         }
         // Defensive: if a room ended up in both `map` and `removed_rooms`
         // (shouldn't happen — leave path adds to removed and removes from
-        // map atomically), the tombstone wins.
+        // map atomically), the tombstone wins. After the ranking above this can
+        // only evict on a tombstone that outranks the copy held.
         self.map.retain(|vk, _| !self.removed_rooms.contains(vk));
 
         // Notification preferences: keep this device's choice on conflict (a
@@ -1866,10 +2036,27 @@ impl Rooms {
             self.notification_modes.entry(vk).or_insert(mode);
         }
 
+        // Per-room failures are accumulated rather than propagated, so one bad
+        // room cannot drop the others (freenet/river#591). Still surfaced as an
+        // aggregate at the end, so a failure is not silent.
+        let mut errors: Vec<String> = Vec::new();
         for (vk, mut room_data) in other.map {
-            // Honour tombstones — never re-add a room the user has left.
+            // Honour tombstones — never re-add a room the user has left — UNLESS
+            // this observation comes from a strictly NEWER source than the one
+            // that tombstoned it (freenet/river#590). Probes are dispatched
+            // oldest-first, so without this a stale "you left" from the oldest
+            // generation suppresses the newest generation's `Present` and the
+            // re-save then tombstones the room on the current delegate.
             if self.removed_rooms.contains(&vk) {
-                continue;
+                if !ranks.presence_survives_tombstone(&vk.to_bytes(), incoming_rank) {
+                    continue;
+                }
+                // Strictly newer: the room is back. Record it so the SAVE path
+                // learns about the resurrection — it cannot work it out for
+                // itself, having no ranks (see `MergeRanks::resurrected`).
+                self.removed_rooms.remove(&vk);
+                ranks.tombstone.remove(&vk.to_bytes());
+                ranks.resurrected.insert(vk.to_bytes());
             }
 
             // Identity-conflict guard, BEFORE any contract-key bookkeeping: if
@@ -1900,7 +2087,8 @@ impl Rooms {
             if let Some(existing) = self.map.get(&vk) {
                 if existing.self_sk != room_data.self_sk {
                     use dioxus::logger::tracing::warn;
-                    let local_rank = identity_ranks
+                    let local_rank = ranks
+                        .identity
                         .get(&vk.to_bytes())
                         .copied()
                         .unwrap_or(SOURCE_RANK_AUTHORITATIVE);
@@ -1963,11 +2151,22 @@ impl Rooms {
                         )
                     })
                     .expect("AdoptIncoming implies the room is present");
-                room_data.room_state.merge(
+                // freenet/river#591: isolate the failure to THIS room. A bare
+                // `?` here returned from the whole function, so every room later
+                // in `other.map`'s (arbitrary, unstable) iteration order was
+                // silently never inserted — and a room absent from the map is
+                // exactly where the freenet/river#527 rank check does not run, so
+                // the next legacy generation's copy would be adopted unranked.
+                // Same shape as `do_save_rooms_to_delegate`, which accumulates
+                // per-key errors and keeps going for the same reason.
+                if let Err(e) = room_data.room_state.merge(
                     &room_data.room_state.clone(),
                     &ChatRoomParametersV1 { owner: vk },
                     &existing_state.0,
-                )?;
+                ) {
+                    errors.push(format!("merge adopted room {vk:?}: {e}"));
+                    continue;
+                }
                 // Union the invitation-carried secrets, same rule as the save-side
                 // reconcile (`chat_delegate::reconcile_room_present`): these are
                 // DECRYPTED per-version room secrets, so they are identity-
@@ -1993,7 +2192,7 @@ impl Rooms {
                 // Only now is the map mutated; `insert` replaces the old entry.
                 self.map.insert(vk, room_data);
                 record_identity_source(
-                    identity_ranks,
+                    &mut ranks.identity,
                     &vk,
                     source_rank,
                     /* was_vacant */ true,
@@ -2008,7 +2207,7 @@ impl Rooms {
             // its identity — the very rollback this ordering exists to stop.
             let already_present = self.map.contains_key(&vk);
             if already_present {
-                record_identity_source(identity_ranks, &vk, source_rank, false);
+                record_identity_source(&mut ranks.identity, &vk, source_rank, false);
             }
 
             // If not already in the map, add the room
@@ -2020,14 +2219,53 @@ impl Rooms {
                     // Already present with a matching `self_sk` (the conflict
                     // case was resolved above) — merge in the new state.
                     let self_room_data = self.map.get_mut(&vk).unwrap();
-                    self_room_data.room_state.merge(
+                    // freenet/river#591: per-room isolation, as above.
+                    if let Err(e) = self_room_data.room_state.merge(
                         &self_room_data.room_state.clone(),
                         &ChatRoomParametersV1 { owner: vk },
                         &room_data.room_state,
-                    )?;
+                    ) {
+                        errors.push(format!("merge room {vk:?}: {e}"));
+                        continue;
+                    }
+                    // freenet/river#590: merging ONLY `room_state` made every other
+                    // field first-writer-wins regardless of rank — and probes are
+                    // dispatched oldest-generation-first, so the systematic winner
+                    // was the OLDEST copy. This is the most-travelled of the three
+                    // merge paths (identities usually agree), and it was the only
+                    // one of the three not unioning the secrets: the adopt branch
+                    // above does, and so does the save-side
+                    // `reconcile_room_present`, both calling them
+                    // identity-INDEPENDENT recovery state.
+                    //
+                    // `invitation_secrets` is the one that loses DATA. It is the
+                    // fallback for exactly the case where the owner-signed
+                    // `encrypted_secrets` blob is unavailable — a private-room
+                    // invitee reading history before the owner delegate back-fills
+                    // — so dropping a version leaves those messages undecryptable
+                    // for good. `repopulate_secrets_from_state` cannot recover it:
+                    // it reads the contract blob, which is what is missing.
+                    // Local wins collisions, matching both sibling paths.
+                    for (version, secret) in room_data.invitation_secrets {
+                        self_room_data
+                            .invitation_secrets
+                            .entry(version)
+                            .or_insert(secret);
+                    }
+                    // Same rule as the adopt branch: a nickname the local copy
+                    // lacks is worth taking, or the member-info heal falls back to
+                    // a generated handle.
+                    if self_room_data.self_nickname.is_none() {
+                        self_room_data.self_nickname = room_data.self_nickname;
+                    }
+                    // Deliberately NOT merged: `notification_modes` and
+                    // `room_order` are handled outside this loop as local user
+                    // preferences ("this device wins"), and `last_read_message_id`
+                    // is cosmetic (the unread badge). Those are first-writer-wins
+                    // by design, not by omission.
                     false
                 };
-            record_identity_source(identity_ranks, &vk, source_rank, was_vacant);
+            record_identity_source(&mut ranks.identity, &vk, source_rank, was_vacant);
         }
 
         // Room display order: this device's order is authoritative (a local
@@ -2041,7 +2279,14 @@ impl Rooms {
         }
         self.room_order.retain(|vk| self.map.contains_key(vk));
 
-        Ok(())
+        // Surface accumulated per-room failures as one aggregate: every OTHER
+        // room has still been merged, but the caller must not be told this went
+        // cleanly (freenet/river#591).
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     /// Mark a room as explicitly left. Removes from `map`, drops any
@@ -2637,6 +2882,485 @@ mod tests {
         rooms
     }
 
+    /// freenet/river#591 — one room's merge failure must not drop the others.
+    ///
+    /// A bare `?` on the fallible per-room merge returned from the WHOLE
+    /// function, so every room later in `other.map`'s arbitrary, unstable
+    /// iteration order was silently never inserted. A room absent from the map is
+    /// precisely where the freenet/river#527 rank check does not run, so the next
+    /// legacy generation's copy would then be adopted unranked.
+    ///
+    /// This drives REAL merge failures rather than scanning the source: each
+    /// failing room carries a configuration signed by somebody who is not its
+    /// owner, so `ChatRoomStateV1::merge` rejects it.
+    ///
+    /// Two rooms fail deliberately, and the assertion is that BOTH are reported.
+    /// That is what makes this deterministic: `other.map` is a `HashMap`, so any
+    /// assertion of the form "a good room later in the order survived" is a coin
+    /// flip on iteration order. An abort can only ever report the FIRST failure,
+    /// whichever one that is, so counting them is order-independent.
+    #[test]
+    fn a_failing_room_does_not_prevent_the_others_from_merging() {
+        fn forged(owner: VerifyingKey, version: u32) -> RoomData {
+            let mut room = test_minimal_room_data(owner);
+            let mut config = river_core::room_state::configuration::Configuration::default();
+            config.configuration_version = version;
+            room.room_state.configuration =
+                river_core::room_state::configuration::AuthorizedConfigurationV1::new(
+                    config,
+                    &SigningKey::from_bytes(&[99u8; 32]),
+                );
+            room
+        }
+
+        let bad_a = SigningKey::from_bytes(&[21u8; 32]).verifying_key();
+        let bad_b = SigningKey::from_bytes(&[22u8; 32]).verifying_key();
+
+        // Present already, so the merge takes the fallible already-present branch
+        // rather than a vacant insert.
+        let mut live = empty_rooms_for_merge();
+        live.map.insert(bad_a, test_minimal_room_data(bad_a));
+        live.map.insert(bad_b, test_minimal_room_data(bad_b));
+
+        let mut incoming = empty_rooms_for_merge();
+        incoming.map.insert(bad_a, forged(bad_a, 98));
+        incoming.map.insert(bad_b, forged(bad_b, 99));
+
+        let mut ranks = MergeRanks::default();
+        let err = live
+            .merge_from_source(incoming, 5, MergeAuthority::OlderSnapshot, &mut ranks)
+            .expect_err("both rooms must fail to merge");
+
+        assert_eq!(
+            err.matches("merge room").count(),
+            2,
+            "the loop must continue past the first failure and report BOTH — an \
+             abort reports only the first and silently drops every room later in \
+             an arbitrary HashMap order (freenet/river#591). Got: {err}"
+        );
+        assert!(
+            live.map.contains_key(&bad_a) && live.map.contains_key(&bad_b),
+            "a room whose merge failed keeps its previous copy rather than vanishing"
+        );
+    }
+
+    /// freenet/river#590 — a matching-identity merge must not discard the
+    /// incoming copy's `invitation_secrets`.
+    ///
+    /// The non-adopt branch merged only `room_state`, so every other field was
+    /// first-writer-wins regardless of rank — and probes dispatch
+    /// oldest-generation-first, making the systematic winner the OLDEST copy.
+    /// `invitation_secrets` is the field that loses DATA: it is the fallback for
+    /// exactly the case where the owner-signed `encrypted_secrets` blob is
+    /// unavailable, so a dropped version leaves those messages undecryptable for
+    /// good, and `repopulate_secrets_from_state` cannot recover it (it reads the
+    /// contract blob, which is what is missing).
+    ///
+    /// This was the only one of the three merge paths not unioning them — the
+    /// adopt branch and the save-side `reconcile_room_present` both do, and both
+    /// call them identity-INDEPENDENT recovery state.
+    #[test]
+    fn a_matching_identity_merge_unions_invitation_secrets() {
+        let vk = SigningKey::from_bytes(&[41u8; 32]).verifying_key();
+
+        // Oldest generation answers first, carrying no secrets.
+        let mut live = rooms_holding(vk, test_minimal_room_data(vk));
+        let mut ranks = MergeRanks::default();
+        live.merge_from_source(
+            rooms_holding(vk, test_minimal_room_data(vk)),
+            5,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+        assert!(live.map[&vk].invitation_secrets.is_empty());
+
+        // A newer generation holds the invitation-carried secret for v3. Same
+        // `self_sk`, so this takes the non-adopt branch.
+        let mut newer = test_minimal_room_data(vk);
+        newer.invitation_secrets.insert(3, [7u8; 32]);
+        live.merge_from_source(
+            rooms_holding(vk, newer),
+            20,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+
+        assert_eq!(
+            live.map[&vk].invitation_secrets.get(&3),
+            Some(&[7u8; 32]),
+            "a secret version only the newer copy holds must survive — without it \
+             a private-room member cannot decrypt messages sealed under it, and no \
+             later path can recover it"
+        );
+    }
+
+    /// The `self_nickname` half of the same fix, in both directions.
+    ///
+    /// The inversion here is not merely a lost improvement, it is destructive:
+    /// `if room_data.self_nickname.is_none() { self_room_data.self_nickname =
+    /// room_data.self_nickname; }` fires exactly when the incoming copy has NO
+    /// nickname and assigns that `None` over the local one — so an older
+    /// generation answering without a nickname would wipe the user's chosen name
+    /// and drop them to a generated handle, which is the outcome the line exists
+    /// to prevent. And it is the plausible edit: it is what copying the adopt
+    /// branch's condition verbatim produces, nine lines up, reading almost
+    /// identically.
+    #[test]
+    fn a_matching_identity_merge_takes_a_nickname_only_when_local_lacks_one() {
+        let vk = SigningKey::from_bytes(&[43u8; 32]).verifying_key();
+
+        // Local HAS a nickname, incoming has none → local must survive.
+        let mut named = test_minimal_room_data(vk);
+        named.self_nickname = Some("mine".to_string());
+        let mut live = rooms_holding(vk, named);
+        let mut ranks = MergeRanks::default();
+        live.merge_from_source(
+            rooms_holding(vk, test_minimal_room_data(vk)),
+            5,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+        assert_eq!(
+            live.map[&vk].self_nickname.as_deref(),
+            Some("mine"),
+            "an incoming copy without a nickname must not wipe the local one"
+        );
+
+        // Local has NONE, incoming has one → take it.
+        let mut live2 = rooms_holding(vk, test_minimal_room_data(vk));
+        let mut theirs = test_minimal_room_data(vk);
+        theirs.self_nickname = Some("theirs".to_string());
+        let mut ranks2 = MergeRanks::default();
+        live2
+            .merge_from_source(
+                rooms_holding(vk, theirs),
+                5,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks2,
+            )
+            .expect("merge must succeed");
+        assert_eq!(
+            live2.map[&vk].self_nickname.as_deref(),
+            Some("theirs"),
+            "a nickname the local copy lacks must be taken, or the member-info \
+             heal falls back to a generated handle"
+        );
+    }
+
+    /// The collision rule matches both sibling paths: the LOCAL copy wins, so an
+    /// older generation answering later cannot overwrite a secret already held.
+    #[test]
+    fn a_matching_identity_merge_keeps_the_local_secret_on_collision() {
+        let vk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        let mut held = test_minimal_room_data(vk);
+        held.invitation_secrets.insert(3, [1u8; 32]);
+        let mut live = rooms_holding(vk, held);
+
+        let mut other = test_minimal_room_data(vk);
+        other.invitation_secrets.insert(3, [2u8; 32]);
+
+        let mut ranks = MergeRanks::default();
+        live.merge_from_source(
+            rooms_holding(vk, other),
+            5,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+
+        assert_eq!(live.map[&vk].invitation_secrets.get(&3), Some(&[1u8; 32]));
+    }
+
+    /// freenet/river#590 — the merge must RECORD a resurrection, because the save
+    /// path cannot infer one.
+    ///
+    /// `MergeRanks` is never persisted and `RoomSlot::Tombstone` carries no rank,
+    /// so the ranked model stops at the session boundary. Without this record
+    /// `reconcile_room_present` sees a delegate tombstone, answers
+    /// `AbortAdoptLeave` and writes nothing — the room lives in memory for one
+    /// session and stays tombstoned on the delegate for good, which is #590's
+    /// symptom with an extra session in front of it.
+    #[test]
+    fn a_resurrection_is_recorded_for_the_save_path() {
+        let vk = SigningKey::from_bytes(&[51u8; 32]).verifying_key();
+        let mut live = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+
+        // An older generation tombstones it while the map is empty.
+        let mut older = empty_rooms_for_merge();
+        older.removed_rooms.insert(vk);
+        live.merge_from_source(older, 3, MergeAuthority::OlderSnapshot, &mut ranks)
+            .expect("merge must succeed");
+        assert!(
+            ranks.resurrected.is_empty(),
+            "a plain tombstone is not a resurrection"
+        );
+
+        // A newer generation still holds it.
+        live.merge_from_source(
+            rooms_holding(vk, test_minimal_room_data(vk)),
+            20,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+
+        assert!(live.map.contains_key(&vk));
+        assert!(
+            ranks.resurrected.contains(&vk.to_bytes()),
+            "the merge must record the resurrection, or the save path aborts on \
+             the delegate's tombstone and the room is lost after this session"
+        );
+    }
+
+    /// A room that was never tombstoned is not a resurrection — the record must
+    /// not fire for an ordinary insert, or every load would mark every room
+    /// rejoined and defeat the round-9 remote-leave guard entirely.
+    #[test]
+    fn an_ordinary_insert_is_not_recorded_as_a_resurrection() {
+        let vk = SigningKey::from_bytes(&[52u8; 32]).verifying_key();
+        let mut live = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+        live.merge_from_source(
+            rooms_holding(vk, test_minimal_room_data(vk)),
+            20,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+        assert!(live.map.contains_key(&vk));
+        assert!(ranks.resurrected.is_empty());
+    }
+
+    /// freenet/river#590 — the rank an authority carries.
+    ///
+    /// `Authoritative` must map to `SOURCE_RANK_AUTHORITATIVE`, NOT to the raw
+    /// `source_rank`. `rank_for`'s own doc warns against "tidying" the two scales
+    /// together; this is what makes that warning enforceable. Collapsing it is
+    /// observable — an authoritative tombstone at a low `source_rank` stops
+    /// evicting a live room whose identity rank is higher.
+    #[test]
+    fn an_authoritative_source_ranks_above_every_generation() {
+        assert_eq!(
+            MergeAuthority::Authoritative.rank_for(3),
+            SOURCE_RANK_AUTHORITATIVE,
+            "an authoritative source must not carry the raw generation number"
+        );
+        assert_eq!(
+            MergeAuthority::Authoritative.rank_for(SOURCE_RANK_AUTHORITATIVE),
+            SOURCE_RANK_AUTHORITATIVE
+        );
+        assert_eq!(
+            MergeAuthority::OlderSnapshot.rank_for(3),
+            3,
+            "an older snapshot carries its own generation number"
+        );
+        assert_eq!(MergeAuthority::OlderSnapshot.rank_for(0), 0);
+    }
+
+    /// freenet/river#590 — an in-session leave must not be DOWNGRADED by a
+    /// source that agrees with it.
+    ///
+    /// `leave_room` records a tombstone with no rank, which
+    /// `presence_survives_tombstone` reads as `SOURCE_RANK_AUTHORITATIVE`. If a
+    /// legacy generation then answers with a tombstone for the same room —
+    /// AGREEING with the leave — a naive `or_insert(incoming_rank)` stamps that
+    /// generation's number over the unranked entry, and a higher-ranked `Present`
+    /// from a later generation resurrects the room, which the re-save persists.
+    ///
+    /// The inversion is the point: it takes a source that CONFIRMS the leave to
+    /// unlock it.
+    #[test]
+    fn an_in_session_leave_is_not_downgraded_by_a_legacy_tombstone() {
+        let vk = SigningKey::from_bytes(&[31u8; 32]).verifying_key();
+        let mut live = rooms_holding(vk, test_minimal_room_data(vk));
+        let mut ranks = MergeRanks::default();
+
+        // The user leaves. No tombstone rank recorded — implicitly authoritative.
+        live.leave_room(vk);
+        assert!(live.removed_rooms.contains(&vk));
+        assert!(!ranks.tombstone.contains_key(&vk.to_bytes()));
+
+        // A legacy generation AGREES the room is gone.
+        let mut agreeing = empty_rooms_for_merge();
+        agreeing.removed_rooms.insert(vk);
+        live.merge_from_source(agreeing, 3, MergeAuthority::OlderSnapshot, &mut ranks)
+            .expect("merge must succeed");
+
+        // A newer generation still holds it. It must NOT come back.
+        live.merge_from_source(
+            rooms_holding(vk, test_minimal_room_data(vk)),
+            20,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+
+        assert!(
+            !live.map.contains_key(&vk),
+            "a leave the user just performed must survive the whole fan-out, even \
+             when an older generation confirms it first"
+        );
+        assert!(live.removed_rooms.contains(&vk));
+    }
+
+    /// freenet/river#590, PROBE-B — the interleaving that probe order makes the
+    /// LIKELY one, and that a "is it in the map right now" guard cannot see.
+    ///
+    /// `fire_legacy_migration_request` dispatches `LEGACY_DELEGATES.iter()` in
+    /// file order, oldest generation first, so the OLDEST generation usually
+    /// answers while the map is still empty. Its stale tombstone lands
+    /// unopposed; the newest generation's `Present` then arrives and is skipped
+    /// by the tombstone check; and the re-save writes `room:R = Tombstone` to the
+    /// current delegate, taking `self_sk` with it.
+    ///
+    /// Ranking the tombstone is what fixes it: a strictly newer generation's
+    /// `Present` overrides an older generation's absence.
+    #[test]
+    fn a_newer_generations_presence_overrides_an_older_generations_tombstone() {
+        let vk = SigningKey::from_bytes(&[11u8; 32]).verifying_key();
+        let mut live = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+
+        // Oldest generation answers first, map still empty.
+        let mut oldest = empty_rooms_for_merge();
+        oldest.removed_rooms.insert(vk);
+        live.merge_from_source(oldest, 0, MergeAuthority::OlderSnapshot, &mut ranks)
+            .expect("merge must succeed");
+        assert!(
+            live.removed_rooms.contains(&vk),
+            "the stale leave is recorded"
+        );
+
+        // A strictly newer generation says the room is present.
+        live.merge_from_source(
+            rooms_holding(vk, test_minimal_room_data(vk)),
+            20,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+
+        assert!(
+            live.map.contains_key(&vk),
+            "a newer generation's Present must override an older one's tombstone"
+        );
+        assert!(
+            !live.removed_rooms.contains(&vk),
+            "and clear the tombstone, or the re-save writes it to the current delegate"
+        );
+    }
+
+    /// freenet/river#590, PROBE-A — the mirror image. An OLDER generation's
+    /// tombstone must not undo a room a NEWER generation already supplied.
+    ///
+    /// Both sources are legacy, so an authority check alone cannot separate
+    /// them; the ranks must.
+    #[test]
+    fn an_older_generations_tombstone_cannot_evict_a_newer_generations_room() {
+        let vk = SigningKey::from_bytes(&[12u8; 32]).verifying_key();
+        let mut live = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+
+        live.merge_from_source(
+            rooms_holding(vk, test_minimal_room_data(vk)),
+            20,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+
+        let mut older = empty_rooms_for_merge();
+        older.removed_rooms.insert(vk);
+        live.merge_from_source(older, 5, MergeAuthority::OlderSnapshot, &mut ranks)
+            .expect("merge must succeed");
+
+        assert!(
+            live.map.contains_key(&vk),
+            "an older generation's tombstone must not evict a newer copy"
+        );
+        assert!(!live.removed_rooms.contains(&vk));
+    }
+
+    /// ...but a NEWER generation's tombstone still removes an older generation's
+    /// room. The ranking is symmetric; only the direction of time decides.
+    #[test]
+    fn a_newer_generations_tombstone_still_removes_an_older_generations_room() {
+        let vk = SigningKey::from_bytes(&[13u8; 32]).verifying_key();
+        let mut live = empty_rooms_for_merge();
+        let mut ranks = MergeRanks::default();
+
+        live.merge_from_source(
+            rooms_holding(vk, test_minimal_room_data(vk)),
+            5,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        )
+        .expect("merge must succeed");
+
+        let mut newer = empty_rooms_for_merge();
+        newer.removed_rooms.insert(vk);
+        live.merge_from_source(newer, 20, MergeAuthority::OlderSnapshot, &mut ranks)
+            .expect("merge must succeed");
+
+        assert!(
+            !live.map.contains_key(&vk),
+            "a newer generation's leave must still take effect"
+        );
+        assert!(live.removed_rooms.contains(&vk));
+    }
+
+    /// The other half of #590: the guard is scoped to rooms the live set HOLDS.
+    /// A legacy tombstone for a room nobody has an opinion about is still
+    /// honoured, so "a room the user left stays left" survives.
+    #[test]
+    fn a_legacy_tombstone_still_applies_to_a_room_the_live_set_lacks() {
+        let vk = SigningKey::from_bytes(&[8u8; 32]).verifying_key();
+        let mut live = empty_rooms_for_merge();
+
+        let mut stale = empty_rooms_for_merge();
+        stale.removed_rooms.insert(vk);
+
+        let mut ranks = MergeRanks::default();
+        live.merge_from_source(stale, 3, MergeAuthority::OlderSnapshot, &mut ranks)
+            .expect("merge must succeed");
+
+        assert!(
+            live.removed_rooms.contains(&vk),
+            "with nothing live to protect, the leave is still recorded"
+        );
+    }
+
+    /// An AUTHORITATIVE source — the current delegate, or an explicit in-session
+    /// action — keeps its removal power. The fix is one-directional.
+    #[test]
+    fn an_authoritative_tombstone_still_removes_a_live_room() {
+        let vk = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let mut live = rooms_holding(vk, test_minimal_room_data(vk));
+
+        let mut current = empty_rooms_for_merge();
+        current.removed_rooms.insert(vk);
+
+        let mut ranks = MergeRanks::default();
+        // Seed an identity rank ABOVE the source_rank we pass. Without this the
+        // live room has no recorded rank, the comparison never happens, and the
+        // test cannot prove what it claims: that the AUTHORITY, not the number,
+        // grants removal power. With `ranks.identity[R] = 5` and `source_rank =
+        // 3`, a `rank_for` that returned the raw number would give `3 <= 5` and
+        // skip the tombstone.
+        ranks.identity.insert(vk.to_bytes(), 5);
+        live.merge_from_source(current, 3, MergeAuthority::Authoritative, &mut ranks)
+            .expect("merge must succeed");
+
+        assert!(
+            !live.map.contains_key(&vk),
+            "the current delegate's tombstone must still remove the room"
+        );
+    }
+
     #[test]
     fn resolve_identity_conflict_prefers_a_strictly_newer_source() {
         assert_eq!(
@@ -2676,13 +3400,14 @@ mod tests {
         assert_ne!(old_identity.to_bytes(), current_identity.to_bytes());
 
         let mut local = empty_rooms_for_merge();
-        let mut ranks = HashMap::new();
+        let mut ranks = MergeRanks::default();
 
         // The oldest generation (rank 3) answers first.
         local
             .merge_from_source(
                 rooms_holding(vk, make_rejoin_test_room(&owner, &old_identity, true)),
                 3,
+                MergeAuthority::OlderSnapshot,
                 &mut ranks,
             )
             .expect("first merge");
@@ -2697,6 +3422,7 @@ mod tests {
             .merge_from_source(
                 rooms_holding(vk, make_rejoin_test_room(&owner, &current_identity, true)),
                 30,
+                MergeAuthority::OlderSnapshot,
                 &mut ranks,
             )
             .expect("second merge");
@@ -2730,13 +3456,14 @@ mod tests {
         let current_identity = SigningKey::generate(&mut rng);
 
         let mut local = empty_rooms_for_merge();
-        let mut ranks = HashMap::new();
+        let mut ranks = MergeRanks::default();
 
         // Newest first this time.
         local
             .merge_from_source(
                 rooms_holding(vk, make_rejoin_test_room(&owner, &current_identity, true)),
                 30,
+                MergeAuthority::OlderSnapshot,
                 &mut ranks,
             )
             .expect("first merge");
@@ -2744,6 +3471,7 @@ mod tests {
             .merge_from_source(
                 rooms_holding(vk, make_rejoin_test_room(&owner, &old_identity, true)),
                 3,
+                MergeAuthority::OlderSnapshot,
                 &mut ranks,
             )
             .expect("second merge");
@@ -2768,13 +3496,16 @@ mod tests {
         let from_delegate = SigningKey::generate(&mut rng);
 
         let mut local = rooms_holding(vk, make_rejoin_test_room(&owner, &imported, true));
-        let mut ranks = HashMap::new();
-        ranks.insert(vk.to_bytes(), SOURCE_RANK_AUTHORITATIVE);
+        let mut ranks = MergeRanks::default();
+        ranks
+            .identity
+            .insert(vk.to_bytes(), SOURCE_RANK_AUTHORITATIVE);
 
         local
             .merge_from_source(
                 rooms_holding(vk, make_rejoin_test_room(&owner, &from_delegate, true)),
                 u32::MAX - 1,
+                MergeAuthority::Authoritative,
                 &mut ranks,
             )
             .expect("merge");
@@ -2800,12 +3531,13 @@ mod tests {
 
         let mut local = rooms_holding(vk, make_rejoin_test_room(&owner, &in_session, true));
         // Deliberately EMPTY: nothing recorded this room's source.
-        let mut ranks = HashMap::new();
+        let mut ranks = MergeRanks::default();
 
         local
             .merge_from_source(
                 rooms_holding(vk, make_rejoin_test_room(&owner, &from_delegate, true)),
                 30,
+                MergeAuthority::OlderSnapshot,
                 &mut ranks,
             )
             .expect("merge");
@@ -2816,7 +3548,7 @@ mod tests {
             "a room with no recorded source must not be overwritten by a load"
         );
         assert!(
-            !ranks.contains_key(&vk.to_bytes()),
+            !ranks.identity.contains_key(&vk.to_bytes()),
             "and it must not be stamped with the loading source's rank, which would \
              make it overwritable by the next response"
         );
@@ -2852,14 +3584,20 @@ mod tests {
         );
 
         let mut local = empty_rooms_for_merge();
-        let mut ranks = HashMap::new();
+        let mut ranks = MergeRanks::default();
         local
-            .merge_from_source(rooms_holding(vk, old_room), 3, &mut ranks)
+            .merge_from_source(
+                rooms_holding(vk, old_room),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
             .expect("old generation merge");
         local
             .merge_from_source(
                 rooms_holding(vk, make_rejoin_test_room(&owner, &current_identity, true)),
                 30,
+                MergeAuthority::OlderSnapshot,
                 &mut ranks,
             )
             .expect("newer generation merge");
@@ -2900,12 +3638,22 @@ mod tests {
         new_room.invitation_secrets.insert(2, [22u8; 32]);
 
         let mut local = empty_rooms_for_merge();
-        let mut ranks = HashMap::new();
+        let mut ranks = MergeRanks::default();
         local
-            .merge_from_source(rooms_holding(vk, old_room), 3, &mut ranks)
+            .merge_from_source(
+                rooms_holding(vk, old_room),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
             .expect("old generation merge");
         local
-            .merge_from_source(rooms_holding(vk, new_room), 30, &mut ranks)
+            .merge_from_source(
+                rooms_holding(vk, new_room),
+                30,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
             .expect("newer generation merge");
 
         let merged = local.map.get(&vk).unwrap();
@@ -3016,9 +3764,14 @@ mod tests {
         old_room.room_state.recent_messages.messages.push(msg);
 
         let mut local = empty_rooms_for_merge();
-        let mut ranks = HashMap::new();
+        let mut ranks = MergeRanks::default();
         local
-            .merge_from_source(rooms_holding(vk, old_room), 3, &mut ranks)
+            .merge_from_source(
+                rooms_holding(vk, old_room),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
             .expect("seeding the local copy must succeed");
         assert!(local.map.contains_key(&vk), "precondition: room is present");
 
@@ -3039,7 +3792,12 @@ mod tests {
             },
             &owner,
         );
-        let result = local.merge_from_source(rooms_holding(vk, newer), 30, &mut ranks);
+        let result = local.merge_from_source(
+            rooms_holding(vk, newer),
+            30,
+            MergeAuthority::OlderSnapshot,
+            &mut ranks,
+        );
 
         // PREMISE CHECK: if this ever stops erroring the assertions below go
         // vacuous, so fail loudly rather than silently guarding nothing.
@@ -3077,12 +3835,13 @@ mod tests {
         let arrivals = [(12u32, &id_mid), (30u32, &id_new), (3u32, &id_old)];
 
         let mut local = empty_rooms_for_merge();
-        let mut ranks = HashMap::new();
+        let mut ranks = MergeRanks::default();
         for (rank, sk) in arrivals {
             local
                 .merge_from_source(
                     rooms_holding(vk, make_rejoin_test_room(&owner, sk, true)),
                     rank,
+                    MergeAuthority::Authoritative,
                     &mut ranks,
                 )
                 .expect("merge");
@@ -3094,7 +3853,7 @@ mod tests {
             "the newest generation must win across three sources in any order"
         );
         assert_eq!(
-            ranks.get(&vk.to_bytes()),
+            ranks.identity.get(&vk.to_bytes()),
             Some(&30),
             "and the recorded provenance must be the highest rank seen, so a \
              later older response still loses"
@@ -3125,12 +3884,22 @@ mod tests {
         newer.self_nickname = None;
 
         let mut local = empty_rooms_for_merge();
-        let mut ranks = HashMap::new();
+        let mut ranks = MergeRanks::default();
         local
-            .merge_from_source(rooms_holding(vk, old_room), 3, &mut ranks)
+            .merge_from_source(
+                rooms_holding(vk, old_room),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
             .expect("seed");
         local
-            .merge_from_source(rooms_holding(vk, newer), 30, &mut ranks)
+            .merge_from_source(
+                rooms_holding(vk, newer),
+                30,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks,
+            )
             .expect("adopt");
         assert_eq!(
             local.map.get(&vk).unwrap().self_nickname.as_deref(),
@@ -3145,12 +3914,22 @@ mod tests {
         newer2.self_nickname = Some("Current".to_string());
 
         let mut local2 = empty_rooms_for_merge();
-        let mut ranks2 = HashMap::new();
+        let mut ranks2 = MergeRanks::default();
         local2
-            .merge_from_source(rooms_holding(vk, old_room2), 3, &mut ranks2)
+            .merge_from_source(
+                rooms_holding(vk, old_room2),
+                3,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks2,
+            )
             .expect("seed");
         local2
-            .merge_from_source(rooms_holding(vk, newer2), 30, &mut ranks2)
+            .merge_from_source(
+                rooms_holding(vk, newer2),
+                30,
+                MergeAuthority::OlderSnapshot,
+                &mut ranks2,
+            )
             .expect("adopt");
         assert_eq!(
             local2.map.get(&vk).unwrap().self_nickname.as_deref(),
@@ -3189,20 +3968,20 @@ mod tests {
     #[test]
     fn record_identity_source_takes_the_highest_rank_seen() {
         let vk = vk_from_seed(1);
-        let mut ranks = HashMap::new();
+        let mut ranks = MergeRanks::default();
 
-        record_identity_source(&mut ranks, &vk, 5, true);
-        assert_eq!(ranks.get(&vk.to_bytes()), Some(&5));
+        record_identity_source(&mut ranks.identity, &vk, 5, true);
+        assert_eq!(ranks.identity.get(&vk.to_bytes()), Some(&5));
 
         // A newer source upgrades it.
-        record_identity_source(&mut ranks, &vk, 12, false);
-        assert_eq!(ranks.get(&vk.to_bytes()), Some(&12));
+        record_identity_source(&mut ranks.identity, &vk, 12, false);
+        assert_eq!(ranks.identity.get(&vk.to_bytes()), Some(&12));
 
         // An older source must NOT downgrade it — otherwise a late old-generation
         // response would re-open the room to being overwritten.
-        record_identity_source(&mut ranks, &vk, 2, false);
+        record_identity_source(&mut ranks.identity, &vk, 2, false);
         assert_eq!(
-            ranks.get(&vk.to_bytes()),
+            ranks.identity.get(&vk.to_bytes()),
             Some(&12),
             "an older source must never lower a room's recorded provenance"
         );
