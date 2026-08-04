@@ -3165,22 +3165,6 @@ mod tests {
         );
     }
 
-    /// freenet/river#527 — THE WIRING PIN.
-    ///
-    /// Every behavioural test for the fix lives at the `Rooms::merge_from_source`
-    /// layer and supplies its own ranks map, so they all keep passing if the
-    /// production CALL SITE stops feeding that layer real inputs. Two one-line
-    /// edits revert the entire fix with green CI:
-    ///
-    ///   1. `with_identity_source_ranks(...)` -> `&mut HashMap::new()`. Every
-    ///      conflict then reads `unwrap_or(SOURCE_RANK_AUTHORITATIVE)` for the
-    ///      local rank, so nothing ever outranks it and merge keeps local
-    ///      always — exactly the pre-fix behaviour.
-    ///   2. the threaded `source_rank` -> a constant. Every generation then
-    ///      ranks equal, equal ranks keep local, and first-responder-wins (the
-    ///      original bug) is back.
-    ///
-    /// So pin the wiring itself: the shared registry, the threaded rank, and
     /// freenet/river#590: a ranked resurrection must be drained into
     /// `mark_room_rejoined`, or the save path never learns of it.
     ///
@@ -3202,19 +3186,49 @@ mod tests {
             .map(|i| &production[i..])
             .expect("hydrate must exist");
         let body = &body[..body.find("\n}\n").expect("terminates")];
+        // The drain must COLLECT OUT of the ranks closure, and the marking must
+        // happen after that closure has closed. Textual `drain < mark` ordering
+        // is NOT enough: calling `mark_room_rejoined` inside the closure also
+        // satisfies it, and `mark_room_rejoined` takes the same non-reentrant
+        // `Mutex` — which on single-threaded WASM deadlocks the tab rather than
+        // failing a test.
+        assert!(
+            body.contains("let resurrected: Vec<[u8; 32]> ="),
+            "the drain must collect OUT of the ranks closure into a local"
+        );
         let drain = body
             .find("ranks.resurrected.drain()")
             .expect("the resurrection set must be drained after the merge");
+        let closure_end = body[drain..]
+            .find("});")
+            .map(|i| drain + i + 3)
+            .expect("the ranks closure must close");
         let mark = body
             .find("mark_room_rejoined(vk)")
             .expect("and fed to mark_room_rejoined, which also clears ROOM_SLOT_STATE");
         assert!(
-            drain < mark,
-            "drain before marking — and the drain must be OUTSIDE the ranks lock, \
-             since mark_room_rejoined takes it too and the mutex is not reentrant"
+            mark > closure_end,
+            "mark_room_rejoined must be called AFTER the ranks lock is released — \
+             inside the closure it re-locks a non-reentrant Mutex and hangs the tab"
         );
     }
 
+    /// freenet/river#527 — THE WIRING PIN.
+    ///
+    /// Every behavioural test for the fix lives at the `Rooms::merge_from_source`
+    /// layer and supplies its own ranks map, so they all keep passing if the
+    /// production CALL SITE stops feeding that layer real inputs. Two one-line
+    /// edits revert the entire fix with green CI:
+    ///
+    ///   1. `with_identity_source_ranks(...)` -> `&mut HashMap::new()`. Every
+    ///      conflict then reads `unwrap_or(SOURCE_RANK_AUTHORITATIVE)` for the
+    ///      local rank, so nothing ever outranks it and merge keeps local
+    ///      always — exactly the pre-fix behaviour.
+    ///   2. the threaded `source_rank` -> a constant. Every generation then
+    ///      ranks equal, equal ranks keep local, and first-responder-wins (the
+    ///      original bug) is back.
+    ///
+    /// So pin the wiring itself: the shared registry, the threaded rank, and
     /// the per-generation rank at the legacy call site.
     #[test]
     fn hydrate_wires_the_shared_registry_and_a_per_generation_rank() {

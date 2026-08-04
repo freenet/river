@@ -1445,6 +1445,105 @@ mod tests {
         );
     }
 
+    /// freenet/river#590 — THE SESSION BOUNDARY, end to end.
+    ///
+    /// Every other test for this fix stops at one side of the boundary: the
+    /// merge tests prove the room comes back in memory, and the
+    /// `reconcile_room_present` tests prove an explicit rejoin overwrites a
+    /// tombstone. Neither exercises the seam BETWEEN them, and the seam is where
+    /// the bug lived — the merge restored the room, nothing carried that across
+    /// to the save path, and `reconcile_room_present` read the delegate's
+    /// tombstone and wrote nothing. The room then survived exactly one session.
+    ///
+    /// So drive the whole path: merge an older generation's tombstone and a
+    /// newer generation's `Present` through ONE shared `MergeRanks`, drain the
+    /// resurrections the way `hydrate_loaded_rooms` does, and check that the
+    /// delegate write actually happens against a stored `Tombstone`.
+    #[test]
+    fn a_ranked_resurrection_survives_into_the_delegate_write() {
+        use crate::room_data::{MergeAuthority, MergeRanks, Rooms};
+
+        let vk = SigningKey::from_bytes(&[23u8; 32]).verifying_key();
+        let local = crate::room_data::test_minimal_room_data(vk);
+        // NB: do NOT "reset" with `clear_room_rejoined` here. It stamps
+        // SOURCE_RANK_AUTHORITATIVE on the tombstone rank, which is exactly what
+        // makes an in-session leave unresurrectable — it would defeat the
+        // scenario under test. The key is unique to this test, so there is
+        // nothing to reset.
+
+        let mut live = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        };
+
+        // Merge through the SHARED registry, as `hydrate_loaded_rooms` does — the
+        // resurrection has to survive in the same place the drain reads from, and
+        // a locally-owned `MergeRanks` would prove nothing about that wiring.
+        //
+        // G3 (older) says the user left.
+        let mut g3 = live.clone();
+        g3.removed_rooms.insert(vk);
+        with_identity_source_ranks(|r| {
+            live.merge_from_source(g3, 3, MergeAuthority::OlderSnapshot, r)
+        })
+        .expect("merge must succeed");
+
+        // G20 (newer) says the room is present — a ranked resurrection.
+        let mut g20 = live.clone();
+        g20.removed_rooms.clear();
+        g20.map.insert(vk, local.clone());
+        with_identity_source_ranks(|r| {
+            live.merge_from_source(g20, 20, MergeAuthority::OlderSnapshot, r)
+        })
+        .expect("merge must succeed");
+        assert!(live.map.contains_key(&vk), "restored in memory");
+
+        // The drain, exactly as the production call site does it: COLLECT OUT of
+        // the ranks closure first. `mark_room_rejoined` takes the same
+        // non-reentrant mutex, so marking inside the closure deadlocks — on
+        // single-threaded WASM that hangs the tab rather than failing here.
+        //
+        // The registry is a process-wide static, so assert about THIS room's key
+        // rather than the set's total size; a concurrently-running test may hold
+        // resurrections of its own.
+        let resurrected: Vec<[u8; 32]> =
+            with_identity_source_ranks(|r| r.resurrected.drain().collect());
+        assert!(
+            resurrected.contains(&vk.to_bytes()),
+            "the resurrection must be recorded where the drain can find it"
+        );
+        for k in resurrected {
+            mark_room_rejoined(VerifyingKey::from_bytes(&k).expect("valid key"));
+        }
+        // A second drain must not see it again: `drain()` EMPTIES the set, where a
+        // plain iteration would re-mark every past resurrection on every later
+        // response — the over-broad marking arriving by the back door.
+        assert!(
+            !with_identity_source_ranks(|r| r.resurrected.contains(&vk.to_bytes())),
+            "the drain must REMOVE the key, not merely read it"
+        );
+
+        // The save path is rank-blind: all it has is this flag.
+        let rejoined = REJOINED_THIS_SESSION.with(|s| s.borrow().contains(&vk));
+        assert!(rejoined, "the drain must reach REJOINED_THIS_SESSION");
+
+        let out = reconcile_room_present(Some(&tombstone_slot_bytes()), &vk, &local, rejoined)
+            .expect("reconcile must succeed");
+        let bytes = out.expect(
+            "a ranked resurrection MUST overwrite the delegate's tombstone — \
+             without it the room lives one session and is then gone for good",
+        );
+        match ciborium::de::from_reader::<RoomSlot, _>(&bytes[..]).expect("slot must decode") {
+            RoomSlot::Present(r) => assert_eq!(r.owner_vk, vk),
+            RoomSlot::Tombstone => panic!("wrote a tombstone over a resurrected room"),
+        }
+        clear_room_rejoined(&vk);
+    }
+
     fn present_slot_bytes(room: &RoomData) -> Vec<u8> {
         let mut b = Vec::new();
         ciborium::ser::into_writer(&RoomSlot::Present(Box::new(room.clone())), &mut b).unwrap();
