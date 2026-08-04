@@ -861,10 +861,11 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
         p { class: "text-text-muted mb-4",
             "Choose "
             span { class: "text-text font-medium", "your own display name" }
-            " (not the room's name). It's what other members will see when you post:"
+            " (not the room's name). It's what other members will see when you send messages:"
         }
 
         div { class: "mb-4",
+            label { class: "block text-sm font-medium text-text mb-1", "Your display name" }
             input {
                 "data-testid": "receive-invitation-nickname-input",
                 class: if nickname_has_emoji {
