@@ -1672,6 +1672,38 @@ mod tests {
         );
     }
 
+    /// freenet/river#588 — the WRITER and the READER of the identity registry
+    /// must agree on how a room is keyed.
+    ///
+    /// This is a dependency between two functions in different modules, so it
+    /// gets driven end to end rather than asserted by inspection. Nothing else
+    /// can catch a mismatch: every other test both inserts and reads through the
+    /// same call, so a key-derivation change would keep them all green while the
+    /// production lookup missed every time — returning the AUTHORITATIVE default
+    /// and silently disabling the guard entirely.
+    #[test]
+    fn the_save_path_reads_the_rank_the_merge_path_recorded() {
+        let vk = SigningKey::from_bytes(&[35u8; 32]).verifying_key();
+        let legacy_rank = 5u32;
+
+        // Record through the PRODUCTION writer the merge path uses...
+        with_identity_source_ranks(|r| {
+            crate::room_data::record_identity_source(&mut r.identity, &vk, legacy_rank, true);
+        });
+
+        // ...and read through the production reader the save path uses.
+        assert_eq!(
+            identity_rank_for_save(&vk.to_bytes()),
+            legacy_rank,
+            "the save path must find what the merge path recorded — a key-space \
+             mismatch returns the AUTHORITATIVE default and disables the guard"
+        );
+
+        with_identity_source_ranks(|r| {
+            r.identity.remove(&vk.to_bytes());
+        });
+    }
+
     /// freenet/river#588 — the absent-entry default is load-bearing.
     ///
     /// `identity_rank_for_save` is the ONLY place the save path decides what an
