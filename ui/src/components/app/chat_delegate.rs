@@ -1461,7 +1461,7 @@ mod tests {
     /// delegate write actually happens against a stored `Tombstone`.
     #[test]
     fn a_ranked_resurrection_survives_into_the_delegate_write() {
-        use crate::room_data::{MergeAuthority, MergeRanks, Rooms};
+        use crate::room_data::{MergeAuthority, Rooms};
 
         let vk = SigningKey::from_bytes(&[23u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);
@@ -1531,8 +1531,14 @@ mod tests {
         let rejoined = REJOINED_THIS_SESSION.with(|s| s.borrow().contains(&vk));
         assert!(rejoined, "the drain must reach REJOINED_THIS_SESSION");
 
-        let out = reconcile_room_present(Some(&tombstone_slot_bytes()), &vk, &local, rejoined)
-            .expect("reconcile must succeed");
+        let out = reconcile_room_present(
+            Some(&tombstone_slot_bytes()),
+            &vk,
+            &local,
+            rejoined,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .expect("reconcile must succeed");
         let bytes = out.expect(
             "a ranked resurrection MUST overwrite the delegate's tombstone — \
              without it the room lives one session and is then gone for good",
@@ -1542,6 +1548,163 @@ mod tests {
             RoomSlot::Tombstone => panic!("wrote a tombstone over a resurrected room"),
         }
         clear_room_rejoined(&vk);
+    }
+
+    /// freenet/river#588 route 2 — a LEGACY-sourced local copy must not
+    /// overwrite the current delegate's stored identity.
+    ///
+    /// The matrix is the whole fix. Three of these four cases exist to stop the
+    /// guard being over-broad: only a legacy-ranked copy with a DIFFERING
+    /// identity may be refused, and refusing anything else silently stops
+    /// persisting rooms.
+    #[test]
+    fn a_legacy_sourced_identity_never_overwrites_the_stored_one() {
+        use crate::room_data::SOURCE_RANK_AUTHORITATIVE;
+
+        let vk = SigningKey::from_bytes(&[31u8; 32]).verifying_key();
+        let mut local = crate::room_data::test_minimal_room_data(vk);
+        local.self_sk = SigningKey::from_bytes(&[41u8; 32]);
+        let mut stored = crate::room_data::test_minimal_room_data(vk);
+        stored.self_sk = SigningKey::from_bytes(&[42u8; 32]);
+        let stored_bytes = present_slot_bytes(&stored);
+        let legacy_rank = 5u32;
+        assert!(
+            legacy_rank < current_delegate_source_rank(),
+            "fixture must actually be legacy-ranked"
+        );
+
+        // 1. legacy rank + differing identity -> refuse, stored survives.
+        let out =
+            reconcile_room_present(Some(&stored_bytes), &vk, &local, false, legacy_rank).unwrap();
+        assert!(
+            out.is_none(),
+            "a legacy-sourced copy must not be written over the stored identity"
+        );
+        match ciborium::de::from_reader::<RoomSlot, _>(&stored_bytes[..]).unwrap() {
+            RoomSlot::Present(r) => assert_eq!(
+                r.self_sk.to_bytes(),
+                stored.self_sk.to_bytes(),
+                "the stored self_sk must be intact — it is unrecoverable"
+            ),
+            RoomSlot::Tombstone => panic!("fixture is Present"),
+        }
+
+        // 2. current-delegate rank + differing identity -> writes local.
+        //    This is #420's documented multi-tab last-writer-wins; the fix must
+        //    not silently change it.
+        let out = reconcile_room_present(
+            Some(&stored_bytes),
+            &vk,
+            &local,
+            false,
+            current_delegate_source_rank(),
+        )
+        .unwrap();
+        assert!(
+            out.is_some(),
+            "a current-delegate-ranked copy still wins (#420 unchanged)"
+        );
+
+        // 3. absent rank -> the caller substitutes AUTHORITATIVE, meaning the
+        //    room was created or imported IN-SESSION. #414 requires it to win.
+        let out = reconcile_room_present(
+            Some(&stored_bytes),
+            &vk,
+            &local,
+            false,
+            SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap();
+        assert!(
+            out.is_some(),
+            "an in-session identity must win over any delegate copy (#414)"
+        );
+
+        // 4. legacy rank + MATCHING identity -> ordinary merge. Without this the
+        //    guard could abort on every legacy-sourced room and silently stop
+        //    persisting the whole migration.
+        let matching = present_slot_bytes(&local);
+        let out = reconcile_room_present(Some(&matching), &vk, &local, false, legacy_rank).unwrap();
+        assert!(
+            out.is_some(),
+            "a legacy-sourced copy with a MATCHING identity must still merge and persist"
+        );
+    }
+
+    /// The guard belongs to the `Present` arm only. Gating the other
+    /// `present_action` outcomes on rank would break round-9's rejoin
+    /// behaviour and the absent-slot store.
+    #[test]
+    fn the_identity_rank_guard_does_not_touch_absent_or_tombstone_paths() {
+        let vk = SigningKey::from_bytes(&[32u8; 32]).verifying_key();
+        let local = crate::room_data::test_minimal_room_data(vk);
+        let legacy_rank = 5u32;
+
+        assert!(
+            reconcile_room_present(None, &vk, &local, false, legacy_rank)
+                .unwrap()
+                .is_some(),
+            "Absent -> StoreFresh, regardless of rank"
+        );
+        assert!(
+            reconcile_room_present(
+                Some(&tombstone_slot_bytes()),
+                &vk,
+                &local,
+                true,
+                legacy_rank
+            )
+            .unwrap()
+            .is_some(),
+            "Tombstone + explicit rejoin -> StoreFresh, regardless of rank"
+        );
+        assert!(
+            reconcile_room_present(
+                Some(&tombstone_slot_bytes()),
+                &vk,
+                &local,
+                false,
+                legacy_rank
+            )
+            .unwrap()
+            .is_none(),
+            "Tombstone + background -> AbortAdoptLeave, unchanged"
+        );
+    }
+
+    /// freenet/river#588 — the absent-entry default is load-bearing.
+    ///
+    /// `identity_rank_for_save` is the ONLY place the save path decides what an
+    /// unranked room means, and the answer must be AUTHORITATIVE: an absent
+    /// entry marks a room created or imported in-session, whose identity must
+    /// win. `unwrap_or(0)` compiles, reads plausibly, and would let any legacy
+    /// delegate copy overwrite every locally-created room.
+    #[test]
+    fn an_unranked_room_is_authoritative_for_saving() {
+        let unranked = SigningKey::from_bytes(&[33u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(
+            identity_rank_for_save(&unranked),
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+            "a room with no recorded identity source was created or imported \
+             in-session and must outrank every delegate copy (#414)"
+        );
+
+        let ranked = SigningKey::from_bytes(&[34u8; 32])
+            .verifying_key()
+            .to_bytes();
+        with_identity_source_ranks(|r| {
+            r.identity.insert(ranked, 5);
+        });
+        assert_eq!(
+            identity_rank_for_save(&ranked),
+            5,
+            "a recorded rank must be returned verbatim, not replaced by the default"
+        );
+        with_identity_source_ranks(|r| {
+            r.identity.remove(&ranked);
+        });
     }
 
     fn present_slot_bytes(room: &RoomData) -> Vec<u8> {
@@ -1563,9 +1726,15 @@ mod tests {
     fn reconcile_room_present_absent_stores_fresh() {
         let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);
-        let out = reconcile_room_present(None, &vk, &local, false)
-            .unwrap()
-            .expect("absent slot must store fresh");
+        let out = reconcile_room_present(
+            None,
+            &vk,
+            &local,
+            false,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap()
+        .expect("absent slot must store fresh");
         match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => assert_eq!(r.owner_vk, vk),
             RoomSlot::Tombstone => panic!("expected Present"),
@@ -1581,9 +1750,15 @@ mod tests {
         let local = crate::room_data::test_minimal_room_data(vk);
         let current = tombstone_slot_bytes();
         assert!(
-            reconcile_room_present(Some(&current), &vk, &local, false)
-                .unwrap()
-                .is_none(),
+            reconcile_room_present(
+                Some(&current),
+                &vk,
+                &local,
+                false,
+                crate::room_data::SOURCE_RANK_AUTHORITATIVE
+            )
+            .unwrap()
+            .is_none(),
             "background update to a remotely-left room must adopt the leave"
         );
     }
@@ -1595,9 +1770,15 @@ mod tests {
         let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);
         let current = tombstone_slot_bytes();
-        let out = reconcile_room_present(Some(&current), &vk, &local, true)
-            .unwrap()
-            .expect("explicit rejoin must overwrite the tombstone");
+        let out = reconcile_room_present(
+            Some(&current),
+            &vk,
+            &local,
+            true,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap()
+        .expect("explicit rejoin must overwrite the tombstone");
         assert!(matches!(
             ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap(),
             RoomSlot::Present(_)
@@ -1614,9 +1795,15 @@ mod tests {
         let mut remote = crate::room_data::test_minimal_room_data(vk);
         remote.self_sk = SigningKey::from_bytes(&[2u8; 32]); // diverged identity
         let current = present_slot_bytes(&remote);
-        let out = reconcile_room_present(Some(&current), &vk, &local, false)
-            .unwrap()
-            .expect("diverged identity keeps local, must still store");
+        let out = reconcile_room_present(
+            Some(&current),
+            &vk,
+            &local,
+            false,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap()
+        .expect("diverged identity keeps local, must still store");
         match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => assert_eq!(
                 r.self_sk.to_bytes(),
@@ -1633,7 +1820,14 @@ mod tests {
     fn reconcile_room_present_unparseable_slot_errs() {
         let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);
-        assert!(reconcile_room_present(Some(b"garbage"), &vk, &local, false).is_err());
+        assert!(reconcile_room_present(
+            Some(b"garbage"),
+            &vk,
+            &local,
+            false,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE
+        )
+        .is_err());
     }
 
     /// Matching-identity merge (the `MergeState` branch) UNIONS `invitation_secrets`:
@@ -1651,9 +1845,15 @@ mod tests {
         remote.invitation_secrets.insert(1, [99u8; 32]); // remote v1 (local must win)
         remote.invitation_secrets.insert(2, [22u8; 32]); // remote-only v2 (must be kept)
 
-        let out = reconcile_room_present(Some(&present_slot_bytes(&remote)), &vk, &local, false)
-            .unwrap()
-            .expect("matching-identity merge stores");
+        let out = reconcile_room_present(
+            Some(&present_slot_bytes(&remote)),
+            &vk,
+            &local,
+            false,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap()
+        .expect("matching-identity merge stores");
         let merged = match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => r,
             RoomSlot::Tombstone => panic!("expected Present"),
@@ -4454,6 +4654,29 @@ where
     .await
 }
 
+/// The identity-source rank to judge a room's local copy by when saving.
+///
+/// **The default is the fix, not a fallback** (freenet/river#588). An ABSENT
+/// entry does not mean "unknown, assume the worst" — `record_identity_source`
+/// deliberately records nothing for a room that is already present and unranked,
+/// which is exactly how a room created or imported IN-SESSION looks. Such an
+/// identity must beat any delegate copy (#414), so absent must read as
+/// `SOURCE_RANK_AUTHORITATIVE`.
+///
+/// Defaulting to 0 instead would make every locally-created room overwritable by
+/// any legacy delegate copy — strictly worse than having no guard at all. It is
+/// a one-token edit that compiles, so it is pinned by
+/// `an_unranked_room_is_authoritative_for_saving`.
+fn identity_rank_for_save(room_key: &[u8; 32]) -> u32 {
+    with_identity_source_ranks(|ranks| {
+        ranks
+            .identity
+            .get(room_key)
+            .copied()
+            .unwrap_or(crate::room_data::SOURCE_RANK_AUTHORITATIVE)
+    })
+}
+
 /// The delegate's current per-room slot, classified for the reconcile decision.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SlotKind {
@@ -4492,6 +4715,7 @@ fn reconcile_room_present(
     owner_vk: &VerifyingKey,
     local: &RoomData,
     explicitly_rejoined: bool,
+    local_identity_rank: u32,
 ) -> Result<Option<Vec<u8>>, String> {
     let (kind, remote): (SlotKind, Option<Box<RoomData>>) = match current {
         None => (SlotKind::Absent, None),
@@ -4508,6 +4732,38 @@ fn reconcile_room_present(
         PresentAction::MergeState => {
             let remote = remote.expect("MergeState implies a Present remote slot");
             if local.self_sk != remote.self_sk {
+                // freenet/river#588 route 2 — a LEGACY-sourced local copy must
+                // never overwrite the current delegate's identity.
+                //
+                // There is only ONE rank in existence here: `MergeRanks` is
+                // never persisted and `RoomSlot::Present` carries no provenance,
+                // so "keep the higher-ranked identity" is not implementable —
+                // there is nothing to compare the stored slot against. What IS
+                // decidable is whether the copy WE hold came from a legacy
+                // generation. If it did, the stored slot was written by the
+                // current delegate, which outranks every legacy generation by
+                // construction, so refusing is always right.
+                //
+                // Refusing costs `room_state`, which is re-derivable from the
+                // network. Writing costs `self_sk`, which is not.
+                //
+                // NB the caller passes SOURCE_RANK_AUTHORITATIVE for a room with
+                // no recorded rank. That is not a fallback: an absent entry means
+                // the room was created or imported IN-SESSION (`record_identity_source`
+                // deliberately records nothing for an already-present unranked
+                // room), and such an identity must win. Defaulting to 0 here would
+                // make every locally-created room overwritable by any delegate
+                // copy — strictly worse than no fix at all.
+                if local_identity_rank < current_delegate_source_rank() {
+                    warn!(
+                        "Refusing to overwrite the stored identity for room {:?} with a \
+                         legacy-sourced copy (rank {} < current {}) — freenet/river#588",
+                        MemberId::from(owner_vk),
+                        local_identity_rank,
+                        current_delegate_source_rank()
+                    );
+                    return Ok(None);
+                }
                 // Diverged identity for the same room — keep local's
                 // (local-authoritative), don't merge the other identity's
                 // state, and don't fail the whole save (M1 fix: scoped to this
@@ -4671,10 +4927,14 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
         }
 
         let rejoined = REJOINED_THIS_SESSION.with(|s| s.borrow().contains(vk));
+        // Read the identity-source rank ONCE, outside the CAS closure: the
+        // closure re-runs per CAS retry and this is the same non-reentrant mutex
+        // that produced a near-deadlock in the #590 drain.
+        let identity_rank = identity_rank_for_save(&vk.to_bytes());
         let rd = room_data.clone();
         let owner = *vk;
         match cas_write_delegate_key(room_storage_key(vk), move |current| {
-            reconcile_room_present(current, &owner, &rd, rejoined)
+            reconcile_room_present(current, &owner, &rd, rejoined, identity_rank)
         })
         .await
         {
