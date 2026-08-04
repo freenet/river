@@ -858,7 +858,11 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
 
     rsx! {
         p { class: "text-text mb-2", "You have been invited to join a new room." }
-        p { class: "text-text-muted mb-4", "Choose a nickname to use in this room:" }
+        p { class: "text-text-muted mb-4",
+            "Choose "
+            span { class: "text-text font-medium", "your own display name" }
+            " (not the room's name). It's what other members will see when you post:"
+        }
 
         div { class: "mb-4",
             input {
@@ -884,7 +888,7 @@ fn render_new_invitation(inv: Invitation, invitation: Signal<Option<Invitation>>
                         accept_invitation(inv_for_enter.clone(), nickname.read().clone());
                     }
                 },
-                placeholder: "Your preferred nickname"
+                placeholder: "Your name (e.g. Alex)"
             }
             if nickname_has_emoji {
                 p {
