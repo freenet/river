@@ -1538,7 +1538,8 @@ mod tests {
             rejoined,
             crate::room_data::SOURCE_RANK_AUTHORITATIVE,
         )
-        .expect("reconcile must succeed");
+        .expect("reconcile must succeed")
+        .written();
         let bytes = out.expect(
             "a ranked resurrection MUST overwrite the delegate's tombstone — \
              without it the room lives one session and is then gone for good",
@@ -1576,9 +1577,17 @@ mod tests {
         // 1. legacy rank + differing identity -> refuse, stored survives.
         let out =
             reconcile_room_present(Some(&stored_bytes), &vk, &local, false, legacy_rank).unwrap();
-        assert!(
-            out.is_none(),
-            "a legacy-sourced copy must not be written over the stored identity"
+        // The VARIANT matters, not merely that nothing was written. The caller
+        // uses it to decide what the delegate now holds, and the two aborts imply
+        // opposite answers: `AdoptedTombstone` means a Tombstone is there,
+        // `RefusedIdentityOverwrite` means a Present we declined to touch. Assert
+        // the specific one or the caller's ROOM_SLOT_STATE bookkeeping is unpinned.
+        assert_eq!(
+            out,
+            ReconcileOutcome::RefusedIdentityOverwrite,
+            "refusing an identity overwrite must be DISTINGUISHABLE from adopting \
+             a tombstone — recording Tombstone here would be a lie about a slot \
+             that actually holds Present"
         );
         match ciborium::de::from_reader::<RoomSlot, _>(&stored_bytes[..]).unwrap() {
             RoomSlot::Present(r) => assert_eq!(
@@ -1601,7 +1610,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            out.is_some(),
+            out.written().is_some(),
             "a current-delegate-ranked copy still wins (#420 unchanged)"
         );
 
@@ -1616,7 +1625,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            out.is_some(),
+            out.written().is_some(),
             "an in-session identity must win over any delegate copy (#414)"
         );
 
@@ -1626,7 +1635,7 @@ mod tests {
         let matching = present_slot_bytes(&local);
         let out = reconcile_room_present(Some(&matching), &vk, &local, false, legacy_rank).unwrap();
         assert!(
-            out.is_some(),
+            out.written().is_some(),
             "a legacy-sourced copy with a MATCHING identity must still merge and persist"
         );
     }
@@ -1643,6 +1652,7 @@ mod tests {
         assert!(
             reconcile_room_present(None, &vk, &local, false, legacy_rank)
                 .unwrap()
+                .written()
                 .is_some(),
             "Absent -> StoreFresh, regardless of rank"
         );
@@ -1655,6 +1665,7 @@ mod tests {
                 legacy_rank
             )
             .unwrap()
+            .written()
             .is_some(),
             "Tombstone + explicit rejoin -> StoreFresh, regardless of rank"
         );
@@ -1667,8 +1678,110 @@ mod tests {
                 legacy_rank
             )
             .unwrap()
+            .written()
             .is_none(),
             "Tombstone + background -> AbortAdoptLeave, unchanged"
+        );
+    }
+
+    /// freenet/river#588 — the caller must not record `Tombstone` for an
+    /// identity refusal.
+    ///
+    /// `ROOM_SLOT_STATE` caches what we believe the delegate holds, and is
+    /// consulted to skip redundant writes. The two aborts imply OPPOSITE
+    /// contents, so collapsing them records a slot state that is simply false and
+    /// can skip a later genuine write. The loop needs the async delegate
+    /// machinery to drive directly, so pin the branch by source — and pin it on
+    /// the OUTCOME VARIANT, not on the presence of a call, so a refactor that
+    /// keeps the shape but drops the distinction still fails.
+    #[test]
+    fn an_identity_refusal_does_not_record_a_tombstone() {
+        let src = include_str!("chat_delegate.rs");
+        // NB do NOT split at `mod tests {` here the way the response_handler
+        // pins do: this file's test module sits BEFORE the save loop, so that
+        // idiom yields a prefix that does not contain the function at all — and
+        // the resulting `expect` failure looks like the function was renamed.
+        // Anchor on the definition instead; the name is unique in the file.
+        // BRACE-MATCH the body. `find("\n}\n")` does NOT terminate this function
+        // — it runs to EOF and sweeps in two later `#[cfg(test)]` modules, so
+        // every assertion below was satisfied by text OUTSIDE the function and
+        // the pin proved nothing. Caught by mutation: collapsing the refusal
+        // branch left it green.
+        // Build the needle from PIECES. A plain literal would match this test's
+        // OWN source first — `include_str!` includes the test module, and this
+        // test sits before the function it inspects — so the pin would
+        // brace-match a chunk of itself and every assertion below would be
+        // satisfied by its own text. Caught by mutation: with a plain literal,
+        // collapsing the refusal branch left the suite green.
+        let needle = concat!("async fn ", "do_save_rooms_to_delegate");
+        let start = src.find(needle).expect("the save loop must exist");
+        let open = src[start..]
+            .find('{')
+            .map(|i| start + i)
+            .expect("the function must have a body");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &src[start..=end];
+        assert!(
+            body.len() < 10_000,
+            "the extracted body is {} chars — that is the whole file, not one \
+             function, and every assertion below would be vacuous",
+            body.len()
+        );
+
+        assert!(
+            body.contains("ReconcileOutcome::RefusedIdentityOverwrite"),
+            "the save loop must distinguish the identity refusal from the \
+             tombstone adoption by VARIANT"
+        );
+        let refused = body
+            .find("refused_identity.get()")
+            .expect("the refusal must be consulted when recording slot state");
+        let tomb = body
+            .find("SavedSlot::Tombstone")
+            .expect("the tombstone-adoption branch must still record Tombstone");
+        assert!(
+            refused < tomb,
+            "the refusal must be checked BEFORE falling through to \
+             SavedSlot::Tombstone, or a refusal records a tombstone that is not there"
+        );
+        // ...and the refusal arm must set the flag TRUE. Asserting only that the
+        // flag is CONSULTED is not enough: flipping this one token reinstates the
+        // original bug (a refusal recording a tombstone) while every structural
+        // assertion above still holds. Mutation-verified.
+        let arm = body
+            .find(concat!(
+                "ReconcileOutcome::",
+                "RefusedIdentityOverwrite => {"
+            ))
+            .expect("the refusal must have its own match arm");
+        let arm_end = body[arm..]
+            .find('}')
+            .map(|i| arm + i)
+            .expect("the arm must close");
+        assert!(
+            body[arm..arm_end].contains("set(true)"),
+            "the identity-refusal arm must set the flag TRUE — setting it false \
+             makes the refusal record a tombstone, which is the bug this exists \
+             to prevent"
+        );
+        assert!(
+            body.contains("m.remove(vk)"),
+            "an identity refusal must FORGET the cached slot state — we know \
+             neither the stored content hash nor that it is a tombstone"
         );
     }
 
@@ -1766,6 +1879,7 @@ mod tests {
             crate::room_data::SOURCE_RANK_AUTHORITATIVE,
         )
         .unwrap()
+        .written()
         .expect("absent slot must store fresh");
         match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => assert_eq!(r.owner_vk, vk),
@@ -1790,6 +1904,7 @@ mod tests {
                 crate::room_data::SOURCE_RANK_AUTHORITATIVE
             )
             .unwrap()
+            .written()
             .is_none(),
             "background update to a remotely-left room must adopt the leave"
         );
@@ -1810,6 +1925,7 @@ mod tests {
             crate::room_data::SOURCE_RANK_AUTHORITATIVE,
         )
         .unwrap()
+        .written()
         .expect("explicit rejoin must overwrite the tombstone");
         assert!(matches!(
             ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap(),
@@ -1835,6 +1951,7 @@ mod tests {
             crate::room_data::SOURCE_RANK_AUTHORITATIVE,
         )
         .unwrap()
+        .written()
         .expect("diverged identity keeps local, must still store");
         match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => assert_eq!(
@@ -1885,6 +2002,7 @@ mod tests {
             crate::room_data::SOURCE_RANK_AUTHORITATIVE,
         )
         .unwrap()
+        .written()
         .expect("matching-identity merge stores");
         let merged = match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => r,
@@ -4686,6 +4804,18 @@ where
     .await
 }
 
+impl ReconcileOutcome {
+    /// The bytes to store, if any. For call sites that only care whether a write
+    /// happened; anything that must distinguish the two ABORTS should match on
+    /// the variant instead, which is the whole reason this is not an `Option`.
+    fn written(self) -> Option<Vec<u8>> {
+        match self {
+            ReconcileOutcome::Write(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
 /// The identity-source rank to judge a room's local copy by when saving.
 ///
 /// **The default is the fix, not a fallback** (freenet/river#588). An ABSENT
@@ -4730,6 +4860,25 @@ enum PresentAction {
     AbortAdoptLeave,
 }
 
+/// Why a `Present` save wrote, or did not.
+///
+/// `Option<Vec<u8>>` conflated the two aborts, and they imply OPPOSITE things
+/// about what the delegate now holds: adopting a tombstone means it holds a
+/// `Tombstone`, whereas refusing an identity overwrite means it holds a
+/// `Present` we declined to touch. `ROOM_SLOT_STATE` is consulted to skip
+/// redundant writes, so recording the wrong one can skip a later genuine write
+/// (freenet/river#588). Making the reason a type stops the caller guessing.
+#[derive(Debug, PartialEq)]
+enum ReconcileOutcome {
+    /// Store these bytes.
+    Write(Vec<u8>),
+    /// The delegate holds a `Tombstone` and we adopted the leave (round-9).
+    AdoptedTombstone,
+    /// The delegate holds a `Present` whose identity differs, and our copy is
+    /// legacy-sourced, so we refuse. Its content hash is NOT ours.
+    RefusedIdentityOverwrite,
+}
+
 fn present_action(kind: SlotKind, explicitly_rejoined: bool) -> PresentAction {
     match kind {
         SlotKind::Absent => PresentAction::StoreFresh,
@@ -4748,7 +4897,7 @@ fn reconcile_room_present(
     local: &RoomData,
     explicitly_rejoined: bool,
     local_identity_rank: u32,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<ReconcileOutcome, String> {
     let (kind, remote): (SlotKind, Option<Box<RoomData>>) = match current {
         None => (SlotKind::Absent, None),
         Some(bytes) => match ciborium::from_reader::<RoomSlot, _>(bytes) {
@@ -4759,7 +4908,7 @@ fn reconcile_room_present(
     };
 
     let merged: RoomData = match present_action(kind, explicitly_rejoined) {
-        PresentAction::AbortAdoptLeave => return Ok(None),
+        PresentAction::AbortAdoptLeave => return Ok(ReconcileOutcome::AdoptedTombstone),
         PresentAction::StoreFresh => local.clone(),
         PresentAction::MergeState => {
             let remote = remote.expect("MergeState implies a Present remote slot");
@@ -4794,7 +4943,7 @@ fn reconcile_room_present(
                         local_identity_rank,
                         current_delegate_source_rank()
                     );
-                    return Ok(None);
+                    return Ok(ReconcileOutcome::RefusedIdentityOverwrite);
                 }
                 // Diverged identity for the same room — keep local's
                 // (local-authoritative), don't merge the other identity's
@@ -4844,7 +4993,7 @@ fn reconcile_room_present(
     let mut out = Vec::new();
     ciborium::ser::into_writer(&RoomSlot::Present(Box::new(merged)), &mut out)
         .map_err(|e| format!("serialize room slot: {e}"))?;
-    Ok(Some(out))
+    Ok(ReconcileOutcome::Write(out))
 }
 
 /// Reconcile a `Tombstone` (leave) save: write a tombstone unless already one.
@@ -4963,10 +5112,32 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
         // closure re-runs per CAS retry and this is the same non-reentrant mutex
         // that produced a near-deadlock in the #590 drain.
         let identity_rank = identity_rank_for_save(&vk.to_bytes());
+        // `wrote == false` is AMBIGUOUS once the identity guard exists: it means
+        // either "adopted a remote Tombstone" (the delegate holds a Tombstone) or
+        // "refused to overwrite a diverged identity" (the delegate holds a
+        // PRESENT slot we declined to touch). The two imply OPPOSITE things about
+        // what the delegate now holds, and `ROOM_SLOT_STATE` is consulted to skip
+        // redundant writes — so recording the wrong one is a lie that can skip a
+        // later genuine write. Carry the reason out of the closure.
+        let refused_identity = std::rc::Rc::new(std::cell::Cell::new(false));
+        let refused_flag = refused_identity.clone();
         let rd = room_data.clone();
         let owner = *vk;
         match cas_write_delegate_key(room_storage_key(vk), move |current| {
-            reconcile_room_present(current, &owner, &rd, rejoined, identity_rank)
+            match reconcile_room_present(current, &owner, &rd, rejoined, identity_rank)? {
+                ReconcileOutcome::Write(bytes) => {
+                    refused_flag.set(false);
+                    Ok(Some(bytes))
+                }
+                ReconcileOutcome::AdoptedTombstone => {
+                    refused_flag.set(false);
+                    Ok(None)
+                }
+                ReconcileOutcome::RefusedIdentityOverwrite => {
+                    refused_flag.set(true);
+                    Ok(None)
+                }
+            }
         })
         .await
         {
@@ -4976,19 +5147,29 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
                 // so record THAT — recording `Present(h)` would be a lie that
                 // could later content-hash-skip a genuine rejoin write
                 // (code-first review).
+                //
+                // EXCEPT when the abort was the freenet/river#588 identity
+                // refusal: there the delegate holds a PRESENT slot, whose content
+                // hash we do not know (it is the other identity's, not `h`). We
+                // can assert neither `Present(h)` nor `Tombstone`, so FORGET the
+                // room instead. An absent entry costs one redundant re-read next
+                // pass; a wrong entry can skip a genuine write.
                 ROOM_SLOT_STATE.with(|c| {
-                    c.borrow_mut().insert(
-                        *vk,
-                        if wrote {
+                    let mut m = c.borrow_mut();
+                    if wrote {
+                        m.insert(
+                            *vk,
                             SavedSlot::Present {
                                 content: h,
                                 critical: crit,
                                 written_at_ms: now_ms(),
-                            }
-                        } else {
-                            SavedSlot::Tombstone
-                        },
-                    );
+                            },
+                        );
+                    } else if refused_identity.get() {
+                        m.remove(vk);
+                    } else {
+                        m.insert(*vk, SavedSlot::Tombstone);
+                    }
                 });
                 // Once a rejoin has actually been persisted as Present, consume
                 // the rejoin intent: a LATER cross-tab leave + background update
