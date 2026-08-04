@@ -297,11 +297,13 @@ pub(crate) fn source_rank_for_delegate_key(key_bytes: &[u8]) -> u32 {
 /// `with_mut`, and from spawned tasks with no Dioxus runtime, where reading a
 /// `GlobalSignal` would panic (the same reasoning as `CURRENT_ROOM_IDENTITY` in
 /// `signing.rs`). Single-threaded WASM, so it never contends.
-static ROOM_IDENTITY_SOURCE_RANKS: LazyLock<Mutex<HashMap<RoomKey, u32>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static ROOM_IDENTITY_SOURCE_RANKS: LazyLock<Mutex<crate::room_data::MergeRanks>> =
+    LazyLock::new(|| Mutex::new(crate::room_data::MergeRanks::default()));
 
 /// Run `f` against the identity-source-rank registry.
-pub(crate) fn with_identity_source_ranks<R>(f: impl FnOnce(&mut HashMap<RoomKey, u32>) -> R) -> R {
+pub(crate) fn with_identity_source_ranks<R>(
+    f: impl FnOnce(&mut crate::room_data::MergeRanks) -> R,
+) -> R {
     let mut guard = ROOM_IDENTITY_SOURCE_RANKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -315,7 +317,9 @@ pub(crate) fn with_identity_source_ranks<R>(f: impl FnOnce(&mut HashMap<RoomKey,
 /// freenet/river#414 guarantee now that merge can adopt an incoming identity).
 pub(crate) fn mark_identity_source_authoritative(room_key: RoomKey) {
     with_identity_source_ranks(|ranks| {
-        ranks.insert(room_key, crate::room_data::SOURCE_RANK_AUTHORITATIVE);
+        ranks
+            .identity
+            .insert(room_key, crate::room_data::SOURCE_RANK_AUTHORITATIVE);
     });
 }
 
@@ -705,6 +709,40 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
+    /// freenet/river#590: leaving a room must record an AUTHORITATIVE tombstone
+    /// rank, and rejoining must clear it.
+    ///
+    /// This is the hole a reviewer actively cleared as safe before probing it, so
+    /// it is exactly the one that gets tidied away later. Without the stamp, an
+    /// in-session leave sits UNRANKED, a legacy generation that AGREES the room
+    /// is gone stamps its own concrete rank over the implicit maximum, and a
+    /// higher-ranked `Present` from a later generation then resurrects the room —
+    /// which the migration's re-save persists.
+    #[test]
+    fn leaving_records_an_authoritative_tombstone_rank_and_rejoining_clears_it() {
+        // A room key no other test uses: the registry is a process-global.
+        let vk = SigningKey::from_bytes(&[0x7Eu8; 32]).verifying_key();
+        let key = vk.to_bytes();
+
+        clear_room_rejoined(&vk);
+        let after_leave = with_identity_source_ranks(|r| r.tombstone.get(&key).copied());
+        assert_eq!(
+            after_leave,
+            Some(crate::room_data::SOURCE_RANK_AUTHORITATIVE),
+            "an in-session leave must be recorded as authoritative, not left to \
+             the `unwrap_or` default that any agreeing source can displace"
+        );
+
+        mark_room_rejoined(vk);
+        let after_rejoin = with_identity_source_ranks(|r| r.tombstone.get(&key).copied());
+        assert_eq!(
+            after_rejoin, None,
+            "rejoining must clear the tombstone rank — `removed_rooms` and the \
+             rank are two halves of one record and must be cleared together, or a \
+             stale high rank suppresses a later legitimate Present"
+        );
+    }
+
     /// freenet/river#527: the whole generation-ranked identity fix rests on
     /// `LEGACY_DELEGATES` being in AGE order (oldest first), because an entry's
     /// INDEX is used as its authority. `legacy_delegates.toml` is append-only
@@ -1042,7 +1080,7 @@ mod tests {
         // A room key no other test uses: the registry is a process-global.
         let room_key = [0x5Au8; 32];
         mark_identity_source_authoritative(room_key);
-        let rank = with_identity_source_ranks(|ranks| ranks.get(&room_key).copied());
+        let rank = with_identity_source_ranks(|ranks| ranks.identity.get(&room_key).copied());
         assert_eq!(rank, Some(crate::room_data::SOURCE_RANK_AUTHORITATIVE));
         assert!(
             rank.unwrap() > current_delegate_source_rank(),
@@ -1405,6 +1443,105 @@ mod tests {
             critical_hash(&other),
             "owner_vk must be critical"
         );
+    }
+
+    /// freenet/river#590 — THE SESSION BOUNDARY, end to end.
+    ///
+    /// Every other test for this fix stops at one side of the boundary: the
+    /// merge tests prove the room comes back in memory, and the
+    /// `reconcile_room_present` tests prove an explicit rejoin overwrites a
+    /// tombstone. Neither exercises the seam BETWEEN them, and the seam is where
+    /// the bug lived — the merge restored the room, nothing carried that across
+    /// to the save path, and `reconcile_room_present` read the delegate's
+    /// tombstone and wrote nothing. The room then survived exactly one session.
+    ///
+    /// So drive the whole path: merge an older generation's tombstone and a
+    /// newer generation's `Present` through ONE shared `MergeRanks`, drain the
+    /// resurrections the way `hydrate_loaded_rooms` does, and check that the
+    /// delegate write actually happens against a stored `Tombstone`.
+    #[test]
+    fn a_ranked_resurrection_survives_into_the_delegate_write() {
+        use crate::room_data::{MergeAuthority, MergeRanks, Rooms};
+
+        let vk = SigningKey::from_bytes(&[23u8; 32]).verifying_key();
+        let local = crate::room_data::test_minimal_room_data(vk);
+        // NB: do NOT "reset" with `clear_room_rejoined` here. It stamps
+        // SOURCE_RANK_AUTHORITATIVE on the tombstone rank, which is exactly what
+        // makes an in-session leave unresurrectable — it would defeat the
+        // scenario under test. The key is unique to this test, so there is
+        // nothing to reset.
+
+        let mut live = Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: std::collections::HashSet::new(),
+            notification_modes: Default::default(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        };
+
+        // Merge through the SHARED registry, as `hydrate_loaded_rooms` does — the
+        // resurrection has to survive in the same place the drain reads from, and
+        // a locally-owned `MergeRanks` would prove nothing about that wiring.
+        //
+        // G3 (older) says the user left.
+        let mut g3 = live.clone();
+        g3.removed_rooms.insert(vk);
+        with_identity_source_ranks(|r| {
+            live.merge_from_source(g3, 3, MergeAuthority::OlderSnapshot, r)
+        })
+        .expect("merge must succeed");
+
+        // G20 (newer) says the room is present — a ranked resurrection.
+        let mut g20 = live.clone();
+        g20.removed_rooms.clear();
+        g20.map.insert(vk, local.clone());
+        with_identity_source_ranks(|r| {
+            live.merge_from_source(g20, 20, MergeAuthority::OlderSnapshot, r)
+        })
+        .expect("merge must succeed");
+        assert!(live.map.contains_key(&vk), "restored in memory");
+
+        // The drain, exactly as the production call site does it: COLLECT OUT of
+        // the ranks closure first. `mark_room_rejoined` takes the same
+        // non-reentrant mutex, so marking inside the closure deadlocks — on
+        // single-threaded WASM that hangs the tab rather than failing here.
+        //
+        // The registry is a process-wide static, so assert about THIS room's key
+        // rather than the set's total size; a concurrently-running test may hold
+        // resurrections of its own.
+        let resurrected: Vec<[u8; 32]> =
+            with_identity_source_ranks(|r| r.resurrected.drain().collect());
+        assert!(
+            resurrected.contains(&vk.to_bytes()),
+            "the resurrection must be recorded where the drain can find it"
+        );
+        for k in resurrected {
+            mark_room_rejoined(VerifyingKey::from_bytes(&k).expect("valid key"));
+        }
+        // A second drain must not see it again: `drain()` EMPTIES the set, where a
+        // plain iteration would re-mark every past resurrection on every later
+        // response — the over-broad marking arriving by the back door.
+        assert!(
+            !with_identity_source_ranks(|r| r.resurrected.contains(&vk.to_bytes())),
+            "the drain must REMOVE the key, not merely read it"
+        );
+
+        // The save path is rank-blind: all it has is this flag.
+        let rejoined = REJOINED_THIS_SESSION.with(|s| s.borrow().contains(&vk));
+        assert!(rejoined, "the drain must reach REJOINED_THIS_SESSION");
+
+        let out = reconcile_room_present(Some(&tombstone_slot_bytes()), &vk, &local, rejoined)
+            .expect("reconcile must succeed");
+        let bytes = out.expect(
+            "a ranked resurrection MUST overwrite the delegate's tombstone — \
+             without it the room lives one session and is then gone for good",
+        );
+        match ciborium::de::from_reader::<RoomSlot, _>(&bytes[..]).expect("slot must decode") {
+            RoomSlot::Present(r) => assert_eq!(r.owner_vk, vk),
+            RoomSlot::Tombstone => panic!("wrote a tombstone over a resurrected room"),
+        }
+        clear_room_rejoined(&vk);
     }
 
     fn present_slot_bytes(room: &RoomData) -> Vec<u8> {
@@ -4152,6 +4289,22 @@ thread_local! {
     /// re-added). Only an explicit rejoin may overwrite a remote `Tombstone`
     /// slot with `Present`; a background content update to a remotely-left room
     /// adopts the leave rather than resurrecting it (freenet/river#345 round-9).
+    ///
+    /// **freenet/river#590 widens this deliberately, and narrows round-9's
+    /// guarantee.** A ranked MERGE resurrection now also marks the room rejoined
+    /// (see `MergeRanks::resurrected`), because the ranked model cannot cross the
+    /// session boundary — `MergeRanks` is never persisted and `RoomSlot::Tombstone`
+    /// carries no rank — so without it the save path answers `AbortAdoptLeave`
+    /// and the room, correctly restored in memory, stays tombstoned on the
+    /// delegate for good.
+    ///
+    /// The cost, stated rather than inherited silently: a leave performed in
+    /// ANOTHER TAB during the legacy fan-out can now be overwritten by a legacy
+    /// generation's `Present`, which is precisely the case round-9 bought
+    /// `AbortAdoptLeave` to prevent. It is the right trade under this change's
+    /// own asymmetry — a resurrected room can be left again, a deleted `self_sk`
+    /// cannot be recovered — but it IS a narrowing, and a future change that
+    /// widens the marking further should re-argue it here.
     static REJOINED_THIS_SESSION: std::cell::RefCell<HashSet<VerifyingKey>> =
         std::cell::RefCell::new(HashSet::new());
 }
@@ -4172,6 +4325,14 @@ pub fn mark_room_rejoined(owner_vk: VerifyingKey) {
     ROOM_SLOT_STATE.with(|c| {
         c.borrow_mut().remove(&owner_vk);
     });
+    // freenet/river#590: drop any tombstone rank the room carried. `removed_rooms`
+    // has two clearers outside the merge (the explicit-rejoin paths in
+    // `get_response.rs` and `members.rs`, which both call this), and a rank left
+    // behind would suppress a later legitimate `Present` if the room is evicted
+    // again. Both halves of the tombstone record must be cleared together.
+    with_identity_source_ranks(|ranks| {
+        ranks.tombstone.remove(&owner_vk.to_bytes());
+    });
 }
 
 /// Forget that `owner_vk` was rejoined this session. Called when the user leaves
@@ -4183,6 +4344,20 @@ pub fn mark_room_rejoined(owner_vk: VerifyingKey) {
 pub fn clear_room_rejoined(owner_vk: &VerifyingKey) {
     REJOINED_THIS_SESSION.with(|s| {
         s.borrow_mut().remove(owner_vk);
+    });
+    // freenet/river#590: an in-session leave is AUTHORITATIVE, and saying so
+    // explicitly is what makes `presence_survives_tombstone`'s
+    // `unwrap_or(SOURCE_RANK_AUTHORITATIVE)` a defensive default rather than the
+    // load-bearing mechanism. Without this, a legacy generation's tombstone for
+    // the same room — a source that AGREES with the leave — records ITS rank
+    // over the unranked entry, and a higher-ranked `Present` then resurrects the
+    // room and the re-save persists it. Paired with the leave site the same way
+    // `mark_identity_source_authoritative` is.
+    with_identity_source_ranks(|ranks| {
+        ranks.tombstone.insert(
+            owner_vk.to_bytes(),
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        );
     });
 }
 

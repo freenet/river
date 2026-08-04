@@ -1065,10 +1065,20 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
                 // live rooms writes `Loaded` — a zero-live-room completion writes
                 // NOTHING so it can't stomp a concurrent legacy probe's `Migrating`
                 // into a false Empty; the universal backstop owns that terminal.
-                let had_rooms = hydrate_loaded_rooms(
+                // freenet/river#590: the blob is a frozen SNAPSHOT that lives on
+                // the current delegate — not the live current delegate, and not a
+                // legacy delegate either. Under the interrupted-migration
+                // recovery the per-room load has already merged live rooms, and
+                // the blob deliberately survives alongside the per-room keys as a
+                // rollback fallback, so a tombstone it carries for a room the user
+                // has since rejoined would evict the live room and re-save the
+                // tombstone. `OlderSnapshot` at the current delegate's own rank
+                // ties with those rooms, and a tie does not evict.
+                let had_rooms = hydrate_loaded_rooms_with_authority(
                     loaded,
                     false,
                     current_delegate_source_rank(),
+                    crate::room_data::MergeAuthority::OlderSnapshot,
                     worker.attempt(),
                 );
                 if had_rooms {
@@ -1347,6 +1357,32 @@ fn hydrate_loaded_rooms(
     source_rank: u32,
     attempt: u32,
 ) -> bool {
+    // The usual derivation: a legacy delegate is an older snapshot, the current
+    // delegate is authoritative. `migrate_current_blob_to_per_room` is the one
+    // caller that needs neither (freenet/river#590) and uses the explicit form.
+    let authority = if is_legacy_delegate {
+        crate::room_data::MergeAuthority::OlderSnapshot
+    } else {
+        crate::room_data::MergeAuthority::Authoritative
+    };
+    hydrate_loaded_rooms_with_authority(
+        loaded_rooms,
+        is_legacy_delegate,
+        source_rank,
+        authority,
+        attempt,
+    )
+}
+
+/// [`hydrate_loaded_rooms`] with the merge authority stated explicitly, for the
+/// caller whose source is neither the live current delegate nor a legacy one.
+fn hydrate_loaded_rooms_with_authority(
+    loaded_rooms: Rooms,
+    is_legacy_delegate: bool,
+    source_rank: u32,
+    authority: crate::room_data::MergeAuthority,
+    attempt: u32,
+) -> bool {
     // freenet/river#397: a legacy-delegate response means we found the user's
     // rooms under an OLD delegate key and are about to migrate them (Ivvor's
     // case). Announce `Migrating` BEFORE the ROOMS merge below (which is
@@ -1365,16 +1401,51 @@ fn hydrate_loaded_rooms(
     // Tombstone filter for all downstream loops.
     // Includes both: (a) tombstones in the
     // incoming loaded_rooms, and (b) tombstones
-    // already in the current in-memory ROOMS —
-    // because legacy delegates predate the
-    // tombstone field, the receiver's set is
-    // the authoritative one (freenet/river#247).
+    // already in the current in-memory ROOMS.
+    //
+    // NOTE (freenet/river#590): this local set is
+    // used only to filter `room_keys` for the
+    // sync/subscribe loops below — it is NOT what
+    // decides removal. The #247 rationale it used
+    // to carry ("legacy delegates predate the
+    // tombstone field, so the receiver's set is
+    // authoritative") has outlived its premise:
+    // `legacy_delegates.toml` gains an entry on
+    // every WASM bump, so recent legacy
+    // generations carry per-room tombstones
+    // routinely. Removal is decided in
+    // `Rooms::merge_from_source`, where tombstones
+    // are RANKED against the copy held.
+    //
+    // freenet/river#590 follow-up: a room in `ROOMS.removed_rooms` can now come
+    // BACK OUT of it — that is the whole point of ranking tombstones. So a room
+    // this response will RESTORE must not be filtered out here, or it is rescued
+    // from deletion and then arrives inert: never subscribed, never synced, its
+    // signing key never migrated to the delegate. The survival rule is asked of
+    // `MergeRanks` rather than re-derived, so this filter cannot drift from the
+    // merge that runs (deferred) a moment later.
+    //
+    // This filter is answering ahead of a deferred merge, so an INDIVIDUAL answer
+    // can be wrong in either direction when responses interleave — and it is
+    // still sufficient, for a reason worth writing down because nobody will
+    // reconstruct it. Over-inclusion is benign: a duplicate `mark_needs_sync` is
+    // idempotent, and the signing loop reads `ROOMS` at defer time so it migrates
+    // whichever identity actually won. Under-inclusion cannot lose a room,
+    // because a tombstone rank only ever RISES (`.max()`) or is removed, and
+    // removal happens solely in the restore branch — which only a response
+    // carrying `Present` for that room can take, and whose own filter therefore
+    // included it. So every room that ends up in the map appeared in at least one
+    // response's `room_keys`, which is all the per-key, idempotent loops need.
+    let incoming_rank = authority.rank_for(source_rank);
     let tombstoned: std::collections::HashSet<ed25519_dalek::VerifyingKey> = {
         let mut t = loaded_rooms.removed_rooms.clone();
         let cur = ROOMS.read();
         for vk in &cur.removed_rooms {
             t.insert(*vk);
         }
+        crate::components::app::chat_delegate::with_identity_source_ranks(|ranks| {
+            t.retain(|vk| !ranks.presence_survives_tombstone(&vk.to_bytes(), incoming_rank));
+        });
         t
     };
 
@@ -1444,14 +1515,57 @@ fn hydrate_loaded_rooms(
             // came from.
             let merged = crate::components::app::chat_delegate::with_identity_source_ranks(
                 |identity_ranks| {
-                    current_rooms.merge_from_source(loaded_rooms, source_rank, identity_ranks)
+                    current_rooms.merge_from_source(
+                        loaded_rooms,
+                        source_rank,
+                        authority,
+                        identity_ranks,
+                    )
                 },
             );
+            // freenet/river#591: report the failure, then run the post-processing
+            // ANYWAY. The merge is now per-room isolated, so an `Err` means "one
+            // or more rooms failed" and not "nothing merged" — skipping the two
+            // loops below would leave every room that DID merge without its
+            // decrypted secrets or its rebuilt actions_state, rendering
+            // `[Encrypted message - secret vN not available]` until reload.
             if let Err(e) = merged {
-                error!("Failed to merge rooms: {}", e);
+                error!("Failed to merge one or more rooms (others still merged): {e}");
             } else {
                 info!("Successfully merged rooms from delegate");
-
+            }
+            // freenet/river#590: tell the SAVE path about any room the ranked
+            // merge just brought back. It cannot infer it — `MergeRanks` is never
+            // persisted and `RoomSlot::Tombstone` carries no rank, so
+            // `reconcile_room_present` would see a delegate tombstone, answer
+            // `AbortAdoptLeave` and write nothing. The room would then be alive in
+            // memory for this session and tombstoned on the delegate for good,
+            // which is #590's symptom with an extra session in front of it.
+            //
+            // Drained outside the ranks lock: `mark_room_rejoined` takes it too,
+            // and the mutex is not reentrant.
+            let resurrected: Vec<[u8; 32]> =
+                crate::components::app::chat_delegate::with_identity_source_ranks(|ranks| {
+                    ranks.resurrected.drain().collect()
+                });
+            // NOTE — this widens what `REJOINED_THIS_SESSION` means. It used to
+            // say only "the user deliberately did something" (accepted an
+            // invitation, imported an identity); it now also says "the ranks
+            // concluded this room should come back". That is what makes
+            // `present_action(Tombstone, true) = StoreFresh` overwrite the
+            // delegate's tombstone — so a WRONG resurrection is no longer
+            // session-local, it is persisted. The known wrong-resurrection case
+            // is a version downgrade (rank is a proxy for wall-clock, which
+            // running an older build after a newer one breaks). Accepted
+            // deliberately: a wrongly-resurrected room is one the user leaves
+            // again, whereas #590 destroys `self_sk`, which is unrecoverable.
+            for room_key in resurrected {
+                if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&room_key) {
+                    info!("Merge resurrected a room a newer generation still holds; marking rejoined so the save path adopts it");
+                    crate::components::app::chat_delegate::mark_room_rejoined(vk);
+                }
+            }
+            {
                 // Re-decrypt ALL secret versions for each room (secrets are #[serde(skip)])
                 for room_data in current_rooms.map.values_mut() {
                     let decrypted = room_data.repopulate_secrets_from_state();
@@ -3062,6 +3176,68 @@ mod tests {
         );
     }
 
+    /// freenet/river#590: a ranked resurrection must be drained into
+    /// `mark_room_rejoined`, or the save path never learns of it.
+    ///
+    /// The merge restoring a room in memory is only half the fix. The save path
+    /// is rank-blind by construction — `MergeRanks` is never persisted and
+    /// `RoomSlot::Tombstone` carries no rank — so `reconcile_room_present` sees
+    /// the delegate's tombstone, answers `AbortAdoptLeave`, and writes nothing.
+    /// The room then lives for exactly one session and is gone for good, which is
+    /// #590's symptom with an extra session in front of it.
+    #[test]
+    fn a_ranked_resurrection_is_drained_into_mark_room_rejoined() {
+        let src = include_str!("response_handler.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let body = production
+            .find("fn hydrate_loaded_rooms_with_authority(")
+            .map(|i| &production[i..])
+            .expect("hydrate must exist");
+        let body = &body[..body.find("\n}\n").expect("terminates")];
+        // The drain must COLLECT OUT of the ranks closure, and the marking must
+        // happen after that closure has closed. Textual `drain < mark` ordering
+        // is NOT enough: calling `mark_room_rejoined` inside the closure also
+        // satisfies it, and `mark_room_rejoined` takes the same non-reentrant
+        // `Mutex` — which on single-threaded WASM deadlocks the tab rather than
+        // failing a test.
+        assert!(
+            body.contains("let resurrected: Vec<[u8; 32]> ="),
+            "the drain must collect OUT of the ranks closure into a local"
+        );
+        let drain = body
+            .find("ranks.resurrected.drain()")
+            .expect("the resurrection set must be drained after the merge");
+        // Anchor the drain to the thing that POPULATES the set, not just to the
+        // marking that consumes it. Hoisting the drain to the top of this
+        // function — next to the `tombstoned` computation, which also takes the
+        // ranks lock, so it is a natural place to consolidate the two
+        // acquisitions — preserves every shape asserted here while draining an
+        // EMPTY set. Nothing is ever marked, `reconcile_room_present` goes back
+        // to `AbortAdoptLeave`, and #590 is silently restored.
+        let merge = body
+            .find("merge_from_source(")
+            .expect("the merge that populates the set must be in this slice");
+        assert!(
+            merge < drain,
+            "the drain must run AFTER the merge that populates the resurrection set"
+        );
+        let closure_end = body[drain..]
+            .find("});")
+            .map(|i| drain + i + 3)
+            .expect("the ranks closure must close");
+        let mark = body
+            .find("mark_room_rejoined(vk)")
+            .expect("and fed to mark_room_rejoined, which also clears ROOM_SLOT_STATE");
+        assert!(
+            mark > closure_end,
+            "mark_room_rejoined must be called AFTER the ranks lock is released — \
+             inside the closure it re-locks a non-reentrant Mutex and hangs the tab"
+        );
+    }
+
     /// freenet/river#527 — THE WIRING PIN.
     ///
     /// Every behavioural test for the fix lives at the `Rooms::merge_from_source`
@@ -3100,12 +3276,116 @@ mod tests {
              per hydration makes every conflict keep local and silently reverts #527"
         );
 
-        // (2) The rank passed to the merge is the THREADED parameter.
+        // (2) The rank passed to the merge is the THREADED parameter, and the
+        // authority is derived from whether the RESPONDING delegate is legacy —
+        // a hard-coded `Authoritative` here would let an older generation's
+        // tombstone evict a live room again (freenet/river#590).
         assert!(
             squeezed.contains(&strip_ws(
-                "current_rooms.merge_from_source(loaded_rooms, source_rank, identity_ranks)"
+                "current_rooms.merge_from_source( loaded_rooms, source_rank, authority, identity_ranks,)"
             )),
-            "the merge must be given the threaded per-response source_rank"
+            "the merge must be given the threaded per-response source_rank and authority"
+        );
+        // The authority must be DERIVED in the wrapper and THREADED to the merge —
+        // asserting the derivation exists somewhere in the file is not enough, it
+        // has to be what actually reaches `merge_from_source`.
+        let wrapper = production
+            .find("fn hydrate_loaded_rooms(")
+            .map(|i| &production[i..])
+            .expect("hydrate_loaded_rooms must exist");
+        let wrapper = &wrapper[..wrapper.find("\n}\n").expect("wrapper terminates")];
+        assert!(
+            strip_ws(wrapper).contains(&strip_ws(
+                "let authority = if is_legacy_delegate { crate::room_data::MergeAuthority::OlderSnapshot } else { crate::room_data::MergeAuthority::Authoritative };"
+            )),
+            "the wrapper must derive the authority from is_legacy_delegate"
+        );
+        assert!(
+            strip_ws(wrapper).contains(&strip_ws("hydrate_loaded_rooms_with_authority(")),
+            "and pass it on rather than deriving it a second time downstream"
+        );
+        let inner = production
+            .find("fn hydrate_loaded_rooms_with_authority(")
+            .map(|i| &production[i..])
+            .expect("the explicit form must exist");
+        let inner = &inner[..inner.find("\n}\n").expect("terminates")];
+        assert!(
+            !inner.contains("if is_legacy_delegate {\n        crate::room_data::MergeAuthority"),
+            "the merge must use the PASSED authority, not re-derive it — that would \
+             silently override the blob caller's explicit OlderSnapshot"
+        );
+
+        // freenet/river#590 follow-up: the pre-merge `tombstoned` filter must ask
+        // `MergeRanks` whether a `Present` at this rank survives, not just whether
+        // the room is currently tombstoned. Ranking tombstones created a path
+        // that did not exist before — a room can come BACK OUT of
+        // `removed_rooms` — and a filter blind to it drops the restored room from
+        // `room_keys`, so it is never subscribed, never synced, and its signing
+        // key is never migrated. Rescued from deletion, then inert.
+        let tomb = production
+            .find("let tombstoned: std::collections::HashSet")
+            .map(|i| &production[i..])
+            .expect("the tombstone filter must exist");
+        let tomb = &tomb[..tomb.find("\n    };").expect("filter terminates")];
+        assert!(
+            tomb.contains("presence_survives_tombstone("),
+            "the filter must use the merge's own survival rule, or a room the \
+             merge restores is dropped from the sync/subscribe loops"
+        );
+        assert!(
+            strip_ws(production).contains(&strip_ws(
+                "let incoming_rank = authority.rank_for(source_rank);"
+            )),
+            "and it must rank the response the same way the merge does"
+        );
+
+        // freenet/river#590: EVERY `hydrate_loaded_rooms` call site's
+        // `is_legacy_delegate` argument, pinned by value. Flipping the legacy
+        // per-room site from `true` to `false` restores #590 on the exact path it
+        // was reported for — the derivation and threading pins above both stay
+        // green, because they say nothing about what is fed IN.
+        let sites: Vec<&str> = production
+            .match_indices("hydrate_loaded_rooms(")
+            .map(|(i, _)| {
+                let tail = &production[i..];
+                &tail[..tail
+                    .find(')')
+                    .map(|j| j + 1)
+                    .unwrap_or(tail.len())
+                    .min(tail.len())]
+            })
+            .filter(|c| !c.starts_with("hydrate_loaded_rooms(\n    loaded_rooms"))
+            .collect();
+        assert_eq!(
+            sites.len(),
+            3,
+            "expected three hydrate_loaded_rooms call sites (the blob site uses \
+             the explicit-authority form); got {sites:?}"
+        );
+        let legacy_sites = sites
+            .iter()
+            .filter(|c| strip_ws(c).contains("true,"))
+            .count();
+        assert_eq!(
+            legacy_sites, 1,
+            "exactly ONE call site is the legacy per-room migration and must pass \
+             is_legacy_delegate = true; got {sites:?}"
+        );
+
+        // freenet/river#590: a `rooms_data` blob is a frozen snapshot living on
+        // the current delegate. Classifying it `Authoritative` lets a tombstone it
+        // carries evict a room the user has since rejoined, during the very
+        // interrupted-migration recovery that re-reads it.
+        let blob = production
+            .find("async fn migrate_current_blob_to_per_room(")
+            .map(|i| &production[i..])
+            .expect("blob migration must exist");
+        let blob = &blob[..blob.find("\n}\n").expect("terminates")];
+        assert!(
+            strip_ws(blob).contains(&strip_ws(
+                "crate::room_data::MergeAuthority::OlderSnapshot,"
+            )),
+            "the current-delegate blob must merge as an OlderSnapshot"
         );
 
         // (3) The legacy per-room call site derives the rank from THAT
