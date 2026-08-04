@@ -1742,6 +1742,17 @@ mod tests {
             body.len()
         );
 
+        // The guard is one token from inert: replacing the call-site read with a
+        // constant disables it in production while every behavioural test stays
+        // green, because they all call `reconcile_room_present` directly with an
+        // explicit rank. There is no injectable seam here — the loop goes
+        // straight to the websocket — so a source pin is the available option,
+        // and it beats the zero coverage this had. Mutation-verified.
+        assert!(
+            body.contains(concat!("identity_rank_for_", "save(&vk.to_bytes())")),
+            "the save loop must READ the rank from the registry — substituting a \
+             constant here disables the whole guard with a green suite"
+        );
         assert!(
             body.contains("ReconcileOutcome::RefusedIdentityOverwrite"),
             "the save loop must distinguish the identity refusal from the \
@@ -1789,13 +1800,18 @@ mod tests {
     /// must agree on how a room is keyed.
     ///
     /// This is a dependency between two functions in different modules, so it
-    /// gets driven end to end rather than asserted by inspection. Nothing else
+    /// gets driven end to end rather than asserted by inspection.
+    ///
+    /// SCOPE, because the earlier name overstated it: the "reader" driven here
+    /// is `identity_rank_for_save`, NOT the save loop. That the loop actually
+    /// CALLS it is a separate property with no injectable seam, pinned by
+    /// source in `an_identity_refusal_does_not_record_a_tombstone`. Nothing else
     /// can catch a mismatch: every other test both inserts and reads through the
     /// same call, so a key-derivation change would keep them all green while the
     /// production lookup missed every time — returning the AUTHORITATIVE default
     /// and silently disabling the guard entirely.
     #[test]
-    fn the_save_path_reads_the_rank_the_merge_path_recorded() {
+    fn identity_rank_for_save_reads_the_rank_the_merge_path_recorded() {
         let vk = SigningKey::from_bytes(&[35u8; 32]).verifying_key();
         let legacy_rank = 5u32;
 
@@ -4889,8 +4905,13 @@ fn present_action(kind: SlotKind, explicitly_rejoined: bool) -> PresentAction {
 }
 
 /// Reconcile a `Present` save for room `owner_vk` against the delegate's
-/// current slot. Returns the `RoomSlot` bytes to store, or `None` to abort
-/// (adopt a remote leave on a background update — the round-9 fix).
+/// current slot. Returns either the `RoomSlot` bytes to store or a REASON for
+/// not storing. The two abort reasons imply OPPOSITE delegate contents —
+/// `AdoptedTombstone` (the round-9 fix: a remote leave on a background update,
+/// delegate holds a Tombstone) versus `RefusedIdentityOverwrite`
+/// (freenet/river#588: delegate holds a Present we declined to touch) — which is
+/// why this is not an `Option`: the caller records what the delegate holds, and
+/// guessing gets it exactly backwards for one of the two.
 fn reconcile_room_present(
     current: Option<&[u8]>,
     owner_vk: &VerifyingKey,
@@ -4925,8 +4946,22 @@ fn reconcile_room_present(
                 // current delegate, which outranks every legacy generation by
                 // construction, so refusing is always right.
                 //
-                // Refusing costs `room_state`, which is re-derivable from the
-                // network. Writing costs `self_sk`, which is not.
+                // Refusing costs MORE than `room_state`, and the honest version
+                // matters: nothing in this `RoomData` is persisted this pass —
+                // including `invitation_secrets`, whose loss leaves messages
+                // sealed under a dropped version undecryptable for good. And it
+                // is not one pass: the trigger recurs on every load (an empty
+                // index means the current-delegate copy is never fetched), so
+                // the session stays diverged rather than converging. Unlike the
+                // merge side, which REPAIRS by adopting the higher-ranked
+                // identity, this only refuses.
+                //
+                // It is still the right trade — `self_sk` is unrecoverable and
+                // everything above is either re-derivable or recoverable once
+                // the index is repaired — but "costs room_state" understated it.
+                // Converging here (adopting the stored identity into ROOMS)
+                // would make the save path mutate identity, which nothing else
+                // does; that belongs in its own change.
                 //
                 // NB the caller passes SOURCE_RANK_AUTHORITATIVE for a room with
                 // no recorded rank. That is not a fallback: an absent entry means
