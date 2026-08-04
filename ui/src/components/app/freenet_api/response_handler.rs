@@ -1548,6 +1548,17 @@ fn hydrate_loaded_rooms_with_authority(
                 crate::components::app::chat_delegate::with_identity_source_ranks(|ranks| {
                     ranks.resurrected.drain().collect()
                 });
+            // NOTE — this widens what `REJOINED_THIS_SESSION` means. It used to
+            // say only "the user deliberately did something" (accepted an
+            // invitation, imported an identity); it now also says "the ranks
+            // concluded this room should come back". That is what makes
+            // `present_action(Tombstone, true) = StoreFresh` overwrite the
+            // delegate's tombstone — so a WRONG resurrection is no longer
+            // session-local, it is persisted. The known wrong-resurrection case
+            // is a version downgrade (rank is a proxy for wall-clock, which
+            // running an older build after a newer one breaks). Accepted
+            // deliberately: a wrongly-resurrected room is one the user leaves
+            // again, whereas #590 destroys `self_sk`, which is unrecoverable.
             for room_key in resurrected {
                 if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&room_key) {
                     info!("Merge resurrected a room a newer generation still holds; marking rejoined so the save path adopts it");
@@ -3199,6 +3210,20 @@ mod tests {
         let drain = body
             .find("ranks.resurrected.drain()")
             .expect("the resurrection set must be drained after the merge");
+        // Anchor the drain to the thing that POPULATES the set, not just to the
+        // marking that consumes it. Hoisting the drain to the top of this
+        // function — next to the `tombstoned` computation, which also takes the
+        // ranks lock, so it is a natural place to consolidate the two
+        // acquisitions — preserves every shape asserted here while draining an
+        // EMPTY set. Nothing is ever marked, `reconcile_room_present` goes back
+        // to `AbortAdoptLeave`, and #590 is silently restored.
+        let merge = body
+            .find("merge_from_source(")
+            .expect("the merge that populates the set must be in this slice");
+        assert!(
+            merge < drain,
+            "the drain must run AFTER the merge that populates the resurrection set"
+        );
         let closure_end = body[drain..]
             .find("});")
             .map(|i| drain + i + 3)
