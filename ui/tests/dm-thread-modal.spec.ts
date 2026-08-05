@@ -189,15 +189,45 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     const shareInvite = page.getByTestId("dm-thread-share-invite-button");
     await expect(shareInvite).toBeVisible({ timeout: 5_000 });
 
+    const send = page.getByRole("button", { name: /^send$/i }).last();
     const inviteClass = (await shareInvite.getAttribute("class")) || "";
-    const sendClass =
-      (await page
-        .getByRole("button", { name: /^send$/i })
-        .last()
-        .getAttribute("class")) || "";
+    const sendClass = (await send.getAttribute("class")) || "";
 
+    // Send keeps the filled accent treatment; the invite link carries no
+    // background at all.
     expect(sendClass).toContain("bg-accent");
     expect(inviteClass).not.toContain("bg-accent");
-    expect(inviteClass).toContain("bg-surface");
+    expect(inviteClass).not.toContain("bg-surface");
+
+    // Measured, not assumed: the invite link must actually render smaller
+    // than Send. A class-name check alone would pass even if the utilities
+    // stopped resolving (e.g. a Tailwind `@source` regression), and it is
+    // the rendered size Ian is reacting to.
+    const inviteBox = await shareInvite.boundingBox();
+    const sendBox = await send.boundingBox();
+    expect(inviteBox).not.toBeNull();
+    expect(sendBox).not.toBeNull();
+    expect(inviteBox!.height).toBeLessThan(sendBox!.height);
+
+    // …and it must not be sitting in the composer row beside Send, where it
+    // would take width from the message box. Same row ⇒ vertically overlapping.
+    const composer = page.locator(
+      'textarea[placeholder="Type a direct message..."]',
+    );
+    const composerBox = await composer.boundingBox();
+    expect(composerBox).not.toBeNull();
+    expect(inviteBox!.y).toBeGreaterThan(composerBox!.y + composerBox!.height);
+
+    // Sharing an invite and deleting someone's messages are opposites, so
+    // they must not render identically. Compared as COMPUTED colour rather
+    // than class names: the point is what a user actually sees, and a
+    // hover-only difference is invisible on touch.
+    const deleteLink = page.getByRole("button", {
+      name: /delete their messages/i,
+    });
+    await expect(deleteLink).toBeVisible();
+    const colourOf = (loc: typeof deleteLink) =>
+      loc.evaluate((el) => getComputedStyle(el).color);
+    expect(await colourOf(shareInvite)).not.toBe(await colourOf(deleteLink));
   });
 });

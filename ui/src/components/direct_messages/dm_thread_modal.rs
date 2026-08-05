@@ -913,43 +913,6 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             },
                             disabled: !peer_still_member,
                         }
-                        // Secondary action, sitting immediately left of Send.
-                        //
-                        // Send keeps the ONLY filled `bg-accent` treatment in
-                        // this modal — sending a message is what it is for.
-                        // This uses the codebase's established secondary tier
-                        // (`bg-surface` + border, as in `member_info_modal`),
-                        // which is clearly subordinate while still being a
-                        // real button next to where attention already is. An
-                        // earlier revision put it in the fine-print row at
-                        // resting styling identical to "Delete their
-                        // messages", which read as a maintenance utility and
-                        // parked a routine action beside a destructive one.
-                        //
-                        // Disabled in lockstep with Send whenever the peer has
-                        // left the room: an invitation IS an outbound DM, and
-                        // the contract rejects it for the same reason. The
-                        // banner above already explains why.
-                        button {
-                            "data-testid": "dm-thread-share-invite-button",
-                            class: "px-3 py-2 bg-surface hover:bg-surface-hover disabled:opacity-50 text-text text-sm font-medium rounded-lg border border-border transition-colors",
-                            disabled: !peer_still_member,
-                            // Same name the Member Info dialog uses, so the
-                            // feature reads as one thing across the app. It
-                            // collides with no Playwright selector: the specs
-                            // match `/share an invite/i` and `/^send invite$/i`,
-                            // and this is neither.
-                            "aria-label": "Share invite with {peer_label}",
-                            title: "Send them an invitation to one of your other rooms",
-                            onclick: move |_| {
-                                // Writes INVITE_VIA_DM_PICKER behind `defer()`
-                                // itself, which is what the signal-safety rule
-                                // requires of an event handler touching a
-                                // global.
-                                open_invite_via_dm_picker(room, peer);
-                            },
-                            "Share invite"
-                        }
                         button {
                             class: "px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-colors",
                             disabled: draft.read().trim().is_empty() || !peer_still_member,
@@ -971,9 +934,65 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             span { class: "text-accent", "{peer_label}" }
                             " can read these messages."
                         }
-                        // Destructive, and the only thing in this row besides
-                        // the disclaimer — kept as a bare text link so it
-                        // never competes with the composer above.
+                        // Sharing an invite is a SECONDARY action here:
+                        // sending a message is what this modal is for, so
+                        // Send keeps the only filled `bg-accent` treatment and
+                        // this is a bare text link matching "Delete their
+                        // messages" — same size, same muted resting colour, no
+                        // background, border or padding.
+                        //
+                        // It deliberately does NOT sit in the composer row.
+                        // A same-height bordered button beside Send competes
+                        // with it for attention (arguably reading as MORE
+                        // prominent, since "Share invite" is the wider label)
+                        // and eats horizontal space the message box needs —
+                        // the textarea lost ~90px at phone widths. Ian asked
+                        // for smaller and less prominent, twice; this row is
+                        // where the modal's non-primary actions live.
+                        //
+                        // Same WEIGHT as "Delete their messages" (bare text,
+                        // `text-xs`) but deliberately not the same
+                        // PRESENTATION: these two are opposites — one offers
+                        // someone access, the other destroys messages — and
+                        // rendering them identically, distinguishable only by
+                        // a hover colour that touch devices never show, makes
+                        // them read as a matched pair. So this one is
+                        // accent-coloured at rest, like a link you are meant
+                        // to use; Delete stays muted grey and only turns red
+                        // on hover, like a thing you are meant to be sure
+                        // about. Prominence runs Send ≫ Share invite > Delete.
+                        //
+                        // Middle of a `justify-between` row, so it is also
+                        // physically separated from Delete: both are small hit
+                        // targets, and a mis-tap between them is the one that
+                        // matters.
+                        //
+                        // Disabled in lockstep with Send when the peer has
+                        // left the room — an invitation IS an outbound DM and
+                        // the contract rejects it for the same reason. The
+                        // banner above already says why.
+                        button {
+                            "data-testid": "dm-thread-share-invite-button",
+                            class: "text-xs text-accent hover:text-accent-hover disabled:opacity-50 disabled:hover:text-accent transition-colors",
+                            disabled: !peer_still_member,
+                            // Same name the Member Info dialog uses, so the
+                            // feature reads as one thing across the app. It
+                            // collides with no Playwright selector: the specs
+                            // match `/share an invite/i` and `/^send invite$/i`,
+                            // and this is neither.
+                            "aria-label": "Share invite with {peer_label}",
+                            title: "Send them an invitation to one of your other rooms",
+                            onclick: move |_| {
+                                // Writes INVITE_VIA_DM_PICKER behind `defer()`
+                                // itself, which is what the signal-safety rule
+                                // requires of an event handler touching a
+                                // global.
+                                open_invite_via_dm_picker(room, peer);
+                            },
+                            "Share invite"
+                        }
+                        // Destructive, so it keeps the far right of the row
+                        // and the red hover, away from the invite link.
                         button {
                             class: "text-xs text-text-muted hover:text-red-400 transition-colors",
                             onclick: move |_| confirm_delete_open.set(true),
@@ -1618,9 +1637,8 @@ mod tests {
             src.contains("bg-accenthover:bg-accent-hoverdisabled:opacity-50text-whitetext-smfont-mediumrounded-lgtransition-colors"),
             "Send stopped being the filled primary button"
         );
-        // The invite control must not adopt the filled accent treatment. The
-        // window is bounded by the NEXT button in the composer row (Send), so
-        // it cannot silently slide onto unrelated markup if this block shrinks.
+        // The window is bounded by the button's own label, so it cannot
+        // silently slide onto neighbouring markup if this block shrinks.
         let after_testid = src
             .split_once("\"data-testid\":\"dm-thread-share-invite-button\"")
             .expect("the invite button is present")
@@ -1629,14 +1647,64 @@ mod tests {
             .split_once("\"Shareinvite\"")
             .expect("the invite button's label closes its block")
             .0;
+        // It must carry NO background, border or padding — a bare text link,
+        // the same treatment as "Delete their messages". A bordered,
+        // same-height button next to Send competes with it (and reads as more
+        // prominent, the label being wider), which is the opposite of what
+        // this control is for.
+        for heavy in ["bg-accent", "bg-surface", "border-border", "px-3", "py-2"] {
+            assert!(
+                !invite_block.contains(heavy),
+                "the invite control picked up `{heavy}`; it must stay a bare \
+                 text link, smaller and quieter than Send"
+            );
+        }
         assert!(
-            !invite_block.contains("bg-accent"),
-            "the invite control took on the filled accent treatment reserved \
-             for Send; sending a message is this modal's primary purpose"
+            invite_block.contains("text-xs"),
+            "the invite control left the small bare-text weight it shares \
+             with \"Delete their messages\""
+        );
+        // …but it must NOT be presented identically to the destructive
+        // action. They are opposites — one offers access, the other destroys
+        // messages — and a hover-only distinction is invisible on touch.
+        //
+        // Pinned on the two class strings directly rather than by slicing to
+        // the delete button's label: `"Delete their messages"` first appears
+        // in this file's MODULE DOC COMMENT, and this scrape strips whitespace
+        // but not comments, so a `split_once` on the label silently cut at
+        // line 2 and made the assertion unreachable.
+        assert!(
+            src.contains("class:\"text-xstext-text-mutedhover:text-red-400transition-colors\""),
+            "the delete control stopped being the recessive muted-until-hover one"
         );
         assert!(
-            invite_block.contains("bg-surface") && invite_block.contains("border-border"),
-            "the invite control left the codebase's secondary button tier"
+            invite_block.contains("text-accent") && !invite_block.contains("text-text-muted"),
+            "the invite control now renders identically to the destructive \
+             \"Delete their messages\"; give it its own resting colour so the \
+             two are not a matched pair"
+        );
+    }
+
+    /// The invite control must not sit in the composer row. Beside Send it
+    /// eats horizontal space the message box needs — measured at ~90px of
+    /// textarea at phone widths — and competes with the modal's primary
+    /// action. It belongs in the footer row with the other secondary action.
+    #[test]
+    fn the_share_invite_button_is_not_in_the_composer_row() {
+        let src = dm_thread_production_source();
+        let composer = src
+            .find("placeholder:\"Typeadirectmessage...\"")
+            .expect("the composer textarea is present");
+        let send = src
+            .find("onclick:move|_|do_send(),\"Send\"")
+            .expect("the Send button is present");
+        let invite = src
+            .find("\"data-testid\":\"dm-thread-share-invite-button\"")
+            .expect("the invite button is present");
+        assert!(
+            invite > send && send > composer,
+            "the invite control moved back into the composer row (between the \
+             textarea and Send); it belongs in the footer row below"
         );
     }
 
