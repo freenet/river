@@ -12,7 +12,8 @@
 use crate::components::app::chat_delegate::{save_outbound_dm, unhide_dm_thread};
 use crate::components::app::{mark_needs_sync, ROOMS};
 use crate::components::direct_messages::{
-    lookup_outbound_plaintext, mark_thread_read, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
+    lookup_outbound_plaintext, mark_thread_read, open_invite_via_dm_picker,
+    parse_outbound_invite_summary, DM_DRAFT, OPEN_DM_THREAD, OUTBOUND_DMS,
 };
 use crate::components::members::Invitation;
 use crate::components::room_list::receive_invitation_modal::present_invitation;
@@ -303,7 +304,22 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         lookup_outbound_plaintext(cache, &room, &msg.message.recipient, &token).ok()
                     });
                     match resolved {
-                        Some(plaintext) => (plaintext, BodyKind::Plaintext),
+                        // An invitation the local user sent. It used to render
+                        // as the bare text "[Invitation]", so two invites to
+                        // different rooms were indistinguishable in the
+                        // sender's own thread while the RECIPIENT saw a card
+                        // naming the room. Same card here, minus the Accept
+                        // button — you cannot accept your own invitation.
+                        Some(plaintext) => match parse_outbound_invite_summary(&plaintext) {
+                            Some(parts) => (
+                                String::new(),
+                                BodyKind::SentInvite(Box::new(SentInviteData {
+                                    room_label: parts.room_label,
+                                    note: parts.note,
+                                })),
+                            ),
+                            None => (plaintext, BodyKind::Plaintext),
+                        },
                         None => ("sent — ciphertext only".to_string(), BodyKind::Placeholder),
                     }
                 };
@@ -318,11 +334,18 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             }
             rendered.sort_by_key(|d| d.timestamp);
 
+            // Mirrors the Member Info dialog's `other_rooms_count` gate
+            // (`member_info_modal.rs`): with no other room, the picker would
+            // open on an empty list, so the control is disabled rather than
+            // leading to a dead end.
+            let can_share_invite = rooms.map.keys().any(|owner_vk| *owner_vk != room);
+
             Some(ViewData {
                 peer_nickname,
                 peer_still_member,
                 messages: rendered,
                 latest_inbound_ts,
+                can_share_invite,
             })
         }
     });
@@ -426,6 +449,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
     let peer_label = view_data.peer_nickname.clone();
     let peer_still_member = view_data.peer_still_member;
+    let can_share_invite = view_data.can_share_invite;
 
     let close = move |_| {
         crate::util::defer(move || {
@@ -898,11 +922,55 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             span { class: "text-accent", "{peer_label}" }
                             " can read these messages."
                         }
-                        button {
-                            class: "text-xs text-text-muted hover:text-red-400 transition-colors",
-                            onclick: move |_| confirm_delete_open.set(true),
-                            title: "Removes messages they sent you from the network. Your own sent messages stay. Cannot be undone.",
-                            "Delete their messages"
+                        // Secondary actions live together on the right, both
+                        // as bare text buttons. They are deliberately a tier
+                        // below "Send": sending a message is what this modal
+                        // is for, so Send keeps the only filled `bg-accent`
+                        // treatment and these carry no background, border or
+                        // padding — matching the "Delete their messages"
+                        // convention that was already here.
+                        div { class: "flex items-center gap-3",
+                            button {
+                                "data-testid": "dm-thread-share-invite-button",
+                                class: if can_share_invite {
+                                    "text-xs text-text-muted hover:text-accent transition-colors"
+                                } else {
+                                    "text-xs text-text-muted opacity-50 cursor-not-allowed"
+                                },
+                                disabled: !can_share_invite,
+                                // Accessible name deliberately avoids "Send",
+                                // "Send invite" and "Share an invite": the
+                                // Playwright specs match those exactly, and the
+                                // picker overlays this still-mounted modal, so a
+                                // collision would make their selectors ambiguous
+                                // rather than fail loudly.
+                                "aria-label": if can_share_invite {
+                                    format!("Invite {peer_label} to one of your other rooms")
+                                } else {
+                                    "Inviting is unavailable — you are not a member of any other room".to_string()
+                                },
+                                title: if can_share_invite {
+                                    "Send them an invitation to one of your other rooms"
+                                } else {
+                                    "You are not a member of any other rooms"
+                                },
+                                onclick: move |_| {
+                                    if can_share_invite {
+                                        // Writes INVITE_VIA_DM_PICKER behind
+                                        // `defer()` itself, which is what the
+                                        // signal-safety rule requires of an
+                                        // event handler touching a global.
+                                        open_invite_via_dm_picker(room, peer);
+                                    }
+                                },
+                                "Invite to a room"
+                            }
+                            button {
+                                class: "text-xs text-text-muted hover:text-red-400 transition-colors",
+                                onclick: move |_| confirm_delete_open.set(true),
+                                title: "Removes messages they sent you from the network. Your own sent messages stay. Cannot be undone.",
+                                "Delete their messages"
+                            }
                         }
                     }
                 }
@@ -997,6 +1065,15 @@ struct ViewData {
     peer_still_member: bool,
     messages: Vec<RenderedDm>,
     latest_inbound_ts: u64,
+    /// Whether the local user belongs to any room OTHER than this one, i.e.
+    /// whether there is anything to invite this peer to.
+    ///
+    /// Carried on `ViewData` rather than read separately so it comes out of
+    /// the `ROOMS` guard this memo already holds: a second `try_read` would be
+    /// a second contention point needing its own anchor/nudge
+    /// (`.claude/rules/dioxus-signal-safety.md`), for a value the memo is
+    /// already positioned to compute.
+    can_share_invite: bool,
 }
 
 /// Inbound DM body presentation.
@@ -1013,16 +1090,39 @@ enum BodyKind {
     /// Structured invite delivered via DM. Rendered as an inset card with
     /// the target room name, an optional personal message, and an Accept
     /// button that hands off to the URL-bar invite-accept flow via
-    /// [`present_invitation`]. Only ever set on inbound DMs — outbound
-    /// invites the local user sent are rendered through the
-    /// `[Invitation] …` summary cached in `OUTBOUND_DMS` because the
-    /// outbound cache doesn't carry the structured body bytes today.
+    /// [`present_invitation`]. Only ever set on INBOUND DMs: the sender
+    /// cannot decrypt their own outbound DM, so a sent invite has no
+    /// structured body to build this from — see [`Self::SentInvite`].
     ///
     /// Boxed because [`InviteCardData`] is ~240 bytes and would otherwise
     /// blow up `BodyKind`'s stack size (clippy::large_enum_variant). Wire
     /// format is unaffected — `BodyKind` is a render-time enum, not a
     /// wire type.
     Invite(Box<InviteCardData>),
+    /// An invite the LOCAL USER sent, recovered from the `OUTBOUND_DMS`
+    /// plaintext-summary cache rather than from wire bytes.
+    ///
+    /// The sender's copy is ECIES-sealed to the recipient, so this is the
+    /// only material available for their own bubble. It previously rendered
+    /// as the literal text `[Invitation]`, which named no room — two invites
+    /// to different rooms looked identical in the sender's own thread, while
+    /// the recipient saw a card naming each one. This carries the room name
+    /// (recorded at send time) so both sides read the same, with no Accept
+    /// button, because accepting one's own invitation is meaningless.
+    SentInvite(Box<SentInviteData>),
+}
+
+/// Parts of a sent-invite bubble, recovered from the outbound summary cache.
+///
+/// Boxed at the `BodyKind` use site for the same reason as
+/// [`InviteCardData`].
+#[derive(Clone, PartialEq)]
+struct SentInviteData {
+    /// The invited room's display name, or `None` for invites sent before
+    /// the name was recorded (those render as a generic "Invitation sent").
+    room_label: Option<String>,
+    /// The personal note the sender attached, if any.
+    note: Option<String>,
 }
 
 /// Pre-resolved metadata for an inbound invite-DM card. Built during the
@@ -1152,6 +1252,12 @@ fn DmBubble(
                 DmInviteCard { card: card }
             }
         }
+        BodyKind::SentInvite(sent) => {
+            let sent: SentInviteData = *sent;
+            rsx! {
+                DmSentInviteCard { sent: sent }
+            }
+        }
     };
     rsx! {
         div {
@@ -1182,6 +1288,44 @@ fn DmBubble(
 /// goes through `present_invitation` → `PRESENT_INVITATION_REQUEST` →
 /// the `App` bridge effect, which sets `receive_invitation` and pops
 /// the modal.
+/// The local user's own sent invitation, rendered as the outbound twin of
+/// [`DmInviteCard`].
+///
+/// Deliberately the same card chrome (accent border, "Invitation" eyebrow,
+/// room name, optional note) so a thread reads consistently, with three
+/// differences that follow from it being the sender's own message:
+/// `self-end` rather than `self-start`, because outbound bubbles sit right;
+/// no Accept button, because you cannot accept your own invitation; and a
+/// past-tense eyebrow, so it is obvious at a glance which direction the
+/// invitation went.
+#[component]
+fn DmSentInviteCard(sent: SentInviteData) -> Element {
+    let room_label = sent.room_label.clone();
+    let note = sent.note.clone();
+
+    rsx! {
+        div {
+            class: "self-end max-w-[85%] rounded-lg border border-accent/40 bg-accent/10 p-3 space-y-2",
+            div { class: "flex items-center gap-2 text-[10px] uppercase tracking-wide text-accent",
+                span { "Invitation sent" }
+            }
+            // Invites written before the room name was recorded have no
+            // label; say nothing rather than inventing one.
+            if let Some(label) = room_label.as_ref() {
+                div { class: "text-sm text-text font-medium",
+                    "You invited them to "
+                    span { class: "text-accent", "{label}" }
+                }
+            } else {
+                div { class: "text-sm text-text font-medium", "You sent an invitation" }
+            }
+            if let Some(msg) = note.as_ref() {
+                div { class: "text-xs text-text-muted whitespace-pre-wrap break-words", "{msg}" }
+            }
+        }
+    }
+}
+
 #[component]
 fn DmInviteCard(card: InviteCardData) -> Element {
     let room_label = card.room_label.clone();
@@ -1431,6 +1575,99 @@ mod tests {
     /// - the "consistency" refactor - would make replying stop reviving
     /// archived threads entirely, with a green suite: at that moment the
     /// thread's inbound clock is by construction at or below the cutoff.
+    /// This file's production source with whitespace stripped, cut at the test
+    /// module so the needles below cannot match themselves.
+    fn dm_thread_production_source() -> String {
+        let raw = include_str!("dm_thread_modal.rs");
+        let cut = raw
+            .find("mod tests {")
+            .expect("this file must have a `mod tests {`");
+        raw[..cut].chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The in-thread "Invite to a room" entry point. The render path ends in
+    /// `rsx!` and a `GlobalSignal` write, so no native test can click it —
+    /// these pins are the only thing standing between a refactor and a button
+    /// that silently does nothing.
+    #[test]
+    fn the_share_invite_button_opens_the_picker_for_this_thread() {
+        let src = dm_thread_production_source();
+        assert!(
+            src.contains("open_invite_via_dm_picker(room,peer)"),
+            "the DM thread's invite button must open the picker for THIS \
+             thread's (room, peer) — passing anything else would invite the \
+             wrong person, or into the wrong room's DM"
+        );
+        // Going through the helper is what keeps the GlobalSignal write behind
+        // `defer()`, as `.claude/rules/dioxus-signal-safety.md` requires of an
+        // event handler. A raw write here would be a re-entrancy hazard.
+        assert!(
+            !src.contains("*INVITE_VIA_DM_PICKER.write()"),
+            "write INVITE_VIA_DM_PICKER through `open_invite_via_dm_picker`, \
+             which defers; a raw write in an event handler can re-enter"
+        );
+        assert!(
+            src.contains("\"data-testid\":\"dm-thread-share-invite-button\""),
+            "the invite control must keep its stable test id"
+        );
+    }
+
+    /// The control must stay a tier below Send: Send is the only filled
+    /// `bg-accent` button in the composer, and the invite control shares the
+    /// bare-text treatment already used by "Delete their messages".
+    #[test]
+    fn the_share_invite_button_stays_less_prominent_than_send() {
+        let src = dm_thread_production_source();
+        assert!(
+            src.contains("\"Inviteto aroom\"") || src.contains("\"Invitetoaroom\""),
+            "the invite control's label moved; keep this pin in step with it"
+        );
+        // The composer's Send button is the primary action and keeps the only
+        // filled accent treatment in this modal.
+        assert!(
+            src.contains("bg-accenthover:bg-accent-hoverdisabled:opacity-50text-whitetext-smfont-mediumrounded-lgtransition-colors"),
+            "Send stopped being the filled primary button"
+        );
+        // …and the invite control must not adopt it.
+        let invite_block = src
+            .split_once("\"data-testid\":\"dm-thread-share-invite-button\"")
+            .expect("the invite button is present")
+            .1;
+        let invite_block = &invite_block[..invite_block.len().min(600)];
+        assert!(
+            !invite_block.contains("bg-accent"),
+            "the invite control took on the filled accent treatment reserved \
+             for Send; sending a message is this modal's primary purpose"
+        );
+    }
+
+    /// A sent invite must render as the outbound twin of the recipient's card
+    /// rather than the bare `[Invitation]` text it used to show.
+    #[test]
+    fn a_sent_invite_renders_as_a_card_without_an_accept_button() {
+        let src = dm_thread_production_source();
+        assert!(
+            src.contains("parse_outbound_invite_summary(&plaintext)"),
+            "the outbound branch stopped recognising sent invites, so they \
+             render as the literal text `[Invitation]` again"
+        );
+        // The sender's card must not offer to accept their own invitation.
+        let card = src
+            .split_once("fnDmSentInviteCard")
+            .expect("the sent-invite card component is present")
+            .1;
+        let card = &card[..card.len().min(1200)];
+        assert!(
+            !card.contains("present_invitation") && !card.contains("Acceptinvitation"),
+            "the sender's own invite card must not carry an Accept button"
+        );
+        assert!(
+            card.contains("self-end"),
+            "an outbound bubble sits on the right; `self-start` is the \
+             inbound card's alignment"
+        );
+    }
+
     #[test]
     fn outbound_send_keeps_the_unconditional_unhide() {
         let raw = include_str!("dm_thread_modal.rs");
