@@ -64,10 +64,16 @@ static OUTBOUND_SEND_COUNTER: GlobalSignal<u64> = Global::new(|| 0);
 /// Record that an outbound DM just landed, so an open thread scrolls to it.
 ///
 /// Exists so `send_structured_dm` — the path the invite picker uses — gets
-/// the same auto-scroll as the thread's own composer. Both callers also grow
-/// `message_count`, which is what supplies the effect's subscription (see the
-/// note on [`OUTBOUND_SEND_COUNTER`]); a future caller that does NOT must add
-/// its own re-render trigger.
+/// the same auto-scroll as the thread's own composer.
+///
+/// The counter itself is read with `peek()`, so it supplies NO subscription.
+/// What re-runs the auto-scroll effect is `last_dm_bubble()` (the #283 fix):
+/// the sent DM lands in `ROOMS`, the rendered list grows, a fresh bubble
+/// mounts, and that signal fires. Both callers satisfy this because both
+/// actually add a message. A future caller that bumps the counter WITHOUT
+/// causing a new bubble to mount will see nothing happen — note that
+/// `OUTBOUND_SEND_COUNTER`'s own doc states this in terms of `message_count`,
+/// which is not a binding that exists in this file.
 ///
 /// Callers are already inside a `defer` block, so this takes the write
 /// directly — and computes the next value BEFORE the write guard, since a
@@ -965,7 +971,9 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             span { class: "text-accent", "{peer_label}" }
                             " can read these messages."
                         }
-                        // Secondary actions live together on the right, both
+                        // Destructive, and the only thing in this row besides
+                        // the disclaimer — kept as a bare text link so it
+                        // never competes with the composer above.
                         button {
                             class: "text-xs text-text-muted hover:text-red-400 transition-colors",
                             onclick: move |_| confirm_delete_open.set(true),
@@ -1094,12 +1102,13 @@ enum BodyKind {
     /// plaintext-summary cache rather than from wire bytes.
     ///
     /// The sender's copy is ECIES-sealed to the recipient, so this is the
-    /// only material available for their own bubble. It previously rendered
-    /// as the literal text `[Invitation]`, which named no room — two invites
-    /// to different rooms looked identical in the sender's own thread, while
-    /// the recipient saw a card naming each one. This carries the room name
-    /// (recorded at send time) so both sides read the same, with no Accept
-    /// button, because accepting one's own invitation is meaningless.
+    /// only material available for their own bubble, which previously
+    /// rendered as the literal text `[Invitation]` in a plain bubble. It now
+    /// gets the same card chrome the recipient sees, with no Accept button,
+    /// because accepting one's own invitation is meaningless.
+    ///
+    /// It does NOT name the invited room — see [`SentInviteData`] for why
+    /// that needs a delegate migration rather than a UI change.
     SentInvite(Box<SentInviteData>),
 }
 
@@ -1550,18 +1559,16 @@ fn merge_invite_into_draft(existing: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
 
-    /// Issue freenet/river#526: the archive clock is INBOUND-only, so an
-    /// outbound send no longer revives an archived thread through the
-    /// timestamp filter. The unconditional `unhide_dm_thread` call in
-    /// `do_send` is now the ONLY mechanism that does, which makes it
-    /// load-bearing rather than belt-and-braces.
-    ///
-    /// Routing it through the cutoff-gated `unhide_dm_thread_if_dm_is_newer`
-    /// - the "consistency" refactor - would make replying stop reviving
-    /// archived threads entirely, with a green suite: at that moment the
-    /// thread's inbound clock is by construction at or below the cutoff.
     /// This file's production source with whitespace stripped, cut at the test
     /// module so the needles below cannot match themselves.
+    ///
+    /// Caveat for every pin built on it: whitespace is stripped, comments are
+    /// NOT. Commenting a call out therefore leaves the needle intact and the
+    /// pin green while the behaviour is dead — the realistic path being
+    /// "commented it out while debugging and forgot". Verified against
+    /// `note_outbound_send()`. This is the shape of every source pin in this
+    /// file, not a property of any one of them; treat a green pin as evidence
+    /// the text is present, not that the code runs.
     fn dm_thread_production_source() -> String {
         let raw = include_str!("dm_thread_modal.rs");
         let cut = raw
@@ -1706,6 +1713,16 @@ mod tests {
         );
     }
 
+    /// Issue freenet/river#526: the archive clock is INBOUND-only, so an
+    /// outbound send no longer revives an archived thread through the
+    /// timestamp filter. The unconditional `unhide_dm_thread` call in
+    /// `do_send` is now the ONLY mechanism that does, which makes it
+    /// load-bearing rather than belt-and-braces.
+    ///
+    /// Routing it through the cutoff-gated `unhide_dm_thread_if_dm_is_newer`
+    /// - the "consistency" refactor - would make replying stop reviving
+    /// archived threads entirely, with a green suite: at that moment the
+    /// thread's inbound clock is by construction at or below the cutoff.
     #[test]
     fn outbound_send_keeps_the_unconditional_unhide() {
         let raw = include_str!("dm_thread_modal.rs");

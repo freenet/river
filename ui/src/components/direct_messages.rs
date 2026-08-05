@@ -530,9 +530,9 @@ pub async fn send_structured_dm(
             // who had scrolled up: the picker's success banner lives inside
             // the picker and is torn down in the same defer block that closes
             // it, so it renders for zero frames, and the thread simply looked
-            // unchanged. This send also grows `message_count`, which is what
-            // supplies the auto-scroll effect's subscription — the condition
-            // `OUTBOUND_SEND_COUNTER`'s docs require of any writer.
+            // unchanged. This send adds a message, so a fresh bubble mounts
+            // and re-runs the auto-scroll effect — the condition
+            // `note_outbound_send`'s docs require of any caller.
             dm_thread_modal::note_outbound_send();
         }
         let _ = tx.send(outcome);
