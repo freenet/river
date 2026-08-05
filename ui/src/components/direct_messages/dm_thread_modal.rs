@@ -920,7 +920,13 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             "Send"
                         }
                     }
-                    div { class: "flex justify-between items-center pt-1",
+                    // Wraps rather than crushing: three children share this
+                    // row, and at a 320px viewport its inner width is ~248px,
+                    // so without wrapping the disclaimer gets squeezed to a
+                    // few characters per line. The point of moving the invite
+                    // link out of the composer was to stop trading away
+                    // phone-width space, so it must not be re-traded here.
+                    div { class: "flex flex-wrap justify-between items-center gap-x-3 gap-y-1 pt-1",
                         // The "you" half of the disclaimer is backed by
                         // the OUTBOUND_DMS local plaintext cache (#256).
                         // On-wire encryption is to `{peer}` only —
@@ -937,9 +943,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // Sharing an invite is a SECONDARY action here:
                         // sending a message is what this modal is for, so
                         // Send keeps the only filled `bg-accent` treatment and
-                        // this is a bare text link matching "Delete their
-                        // messages" — same size, same muted resting colour, no
-                        // background, border or padding.
+                        // this is a bare text link at the same SIZE as "Delete
+                        // their messages" — no background, border or heavy
+                        // padding. Its resting COLOUR deliberately differs;
+                        // see below.
                         //
                         // It deliberately does NOT sit in the composer row.
                         // A same-height bordered button beside Send competes
@@ -973,7 +980,17 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                         // banner above already says why.
                         button {
                             "data-testid": "dm-thread-share-invite-button",
-                            class: "text-xs text-accent hover:text-accent-hover disabled:opacity-50 disabled:hover:text-accent transition-colors",
+                            // The vertical padding here is hit target, not
+                            // visual weight: with no background it is
+                            // invisible, and the bare text size alone gives a
+                            // ~16px target against WCAG 2.2 SC 2.5.8's 24x24.
+                            // Deliberately not the larger button padding, which
+                            // `the_share_invite_button_stays_less_prominent_than_send`
+                            // forbids by name. (That pin scans this file with
+                            // whitespace stripped but comments INTACT, so do
+                            // not write the forbidden class names here — this
+                            // comment tripped it once already.)
+                            class: "text-xs py-1 text-accent hover:text-accent-hover disabled:opacity-50 disabled:hover:text-accent transition-colors",
                             disabled: !peer_still_member,
                             // Same name the Member Info dialog uses, so the
                             // feature reads as one thing across the app. It
@@ -1624,8 +1641,10 @@ mod tests {
     }
 
     /// Send stays the primary action: it keeps the ONLY filled `bg-accent`
-    /// treatment in this modal, and the invite control sits on the
-    /// established secondary tier.
+    /// treatment in the modal chrome, and the invite control stays a bare
+    /// text link — no background, border or button padding. Ian asked for
+    /// smaller and less prominent than Send twice; a bordered same-height
+    /// button beside Send was rejected for reading as MORE prominent.
     #[test]
     fn the_share_invite_button_stays_less_prominent_than_send() {
         let src = dm_thread_production_source();
@@ -1689,23 +1708,32 @@ mod tests {
     /// eats horizontal space the message box needs — measured at ~90px of
     /// textarea at phone widths — and competes with the modal's primary
     /// action. It belongs in the footer row with the other secondary action.
+    ///
+    /// Anchored on the FOOTER ROW, not on Send. An earlier version asserted
+    /// `invite > send`, which only forbade the slot between the textarea and
+    /// Send: moving the button into the composer row on the far side of Send
+    /// left every pin green while re-creating exactly the regression this
+    /// exists to prevent.
     #[test]
     fn the_share_invite_button_is_not_in_the_composer_row() {
         let src = dm_thread_production_source();
-        let composer = src
-            .find("placeholder:\"Typeadirectmessage...\"")
-            .expect("the composer textarea is present");
-        let send = src
-            .find("onclick:move|_|do_send(),\"Send\"")
-            .expect("the Send button is present");
+        let footer_row = src
+            .find("class:\"flexflex-wrapjustify-betweenitems-centergap-x-3gap-y-1pt-1\"")
+            .expect("the footer row is present");
         let invite = src
             .find("\"data-testid\":\"dm-thread-share-invite-button\"")
             .expect("the invite button is present");
         assert!(
-            invite > send && send > composer,
-            "the invite control moved back into the composer row (between the \
-             textarea and Send); it belongs in the footer row below"
+            invite > footer_row,
+            "the invite control moved out of the footer row and back up into \
+             the composer, where it takes width from the message box"
         );
+        // Belt and braces: it must also come after Send, so it cannot end up
+        // between the textarea and Send either.
+        let send = src
+            .find("onclick:move|_|do_send(),\"Send\"")
+            .expect("the Send button is present");
+        assert!(invite > send, "the invite control is ahead of Send");
     }
 
     /// An invitation IS an outbound DM, so the contract rejects it for the
