@@ -821,11 +821,11 @@ fn create_notification_internal(
 /// a join would pop a browser notification while contributing to no badge and
 /// no title count.
 ///
-/// Known remaining asymmetry, pre-existing and deliberately unchanged here:
-/// action messages (edits, reactions, deletes — `is_action()`) are likewise
-/// excluded from the counts but are NOT filtered out of notifications, so a
-/// reaction can still notify without badging. Changing that would alter
-/// user-visible notification behaviour beyond the scope of #500.
+/// Action messages (edits, reactions, deletes — `is_action()`) pass this
+/// predicate but are narrowed further by [`action_notifies_self`] at the call
+/// site, which is where the "only reactions to my own messages" rule lives.
+/// The two are deliberately separate: this one needs nothing but the message,
+/// while the action rule needs the room's self-authored message ids.
 pub(crate) fn is_notifiable_external_message(
     msg: &AuthorizedMessageV1,
     self_member_id: MemberId,
@@ -833,8 +833,94 @@ pub(crate) fn is_notifiable_external_message(
     msg.message.author != self_member_id && !msg.message.content.is_event()
 }
 
+/// The action a message carries, if it is one, decrypting a private body when
+/// the room secret for its version is available.
+///
+/// Mirrors `conversation::extract_reply_target_id` for the action content type:
+/// `RoomMessageBody::target_id` only decodes a PUBLIC body, so a private room's
+/// reactions would otherwise all read as "no target".
+pub(crate) fn extract_action_content(
+    content: &RoomMessageBody,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
+) -> Option<river_core::room_state::content::ActionContentV1> {
+    use river_core::room_state::content::{ActionContentV1, CONTENT_TYPE_ACTION};
+
+    match content {
+        RoomMessageBody::Public {
+            content_type, data, ..
+        } if *content_type == CONTENT_TYPE_ACTION => ActionContentV1::decode(data).ok(),
+        RoomMessageBody::Private {
+            content_type,
+            ciphertext,
+            nonce,
+            secret_version,
+            ..
+        } if *content_type == CONTENT_TYPE_ACTION => room_secrets
+            .get(secret_version)
+            .and_then(|secret| {
+                decrypt_with_symmetric_key(secret, ciphertext.as_slice(), nonce).ok()
+            })
+            .and_then(|plaintext| ActionContentV1::decode(&plaintext).ok()),
+        _ => None,
+    }
+}
+
+/// Whether an action message is worth a browser notification: it is a
+/// REACTION, and it targets a message `self_authored` says the local user
+/// wrote.
+///
+/// freenet/river#598. Before this, every action from another member popped a
+/// notification — so a 🎉 on someone else's message read as "Reacted with 🎉"
+/// with nothing to open: the reaction is not the user's, contributes to no
+/// unread badge (`document_title::count_unread_in_room_data` skips
+/// `is_action()` messages), and does not even mark the room unread. A
+/// reaction to the user's OWN message is the one case where the notification
+/// names something they can find.
+///
+/// Everything else about an action is deliberately silent:
+/// - `ACTION_TYPE_REMOVE_REACTION` — an un-react is not news, even on one's
+///   own message.
+/// - `ACTION_TYPE_EDIT` / `ACTION_TYPE_DELETE` — a member can only edit their
+///   own message, and a delete is either their own or a moderator's; neither
+///   is content addressed to the local user.
+///
+/// Two conservative misses, both "no notification" rather than a wrong one,
+/// and both matching how the reply check in
+/// [`text_mentions_or_replies_to_self`] already fails:
+/// - the target scrolled out of the recent window, so authorship cannot be
+///   confirmed;
+/// - a private room whose secret for the reaction's version is not (yet)
+///   available, so the target id cannot be read at all.
+pub(crate) fn action_notifies_self(
+    msg: &AuthorizedMessageV1,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
+    self_authored: &SelfAuthoredIndex<'_>,
+) -> bool {
+    use river_core::room_state::content::ACTION_TYPE_REACTION;
+
+    let Some(action) = extract_action_content(&msg.message.content, room_secrets) else {
+        return false;
+    };
+    action.action_type == ACTION_TYPE_REACTION && self_authored.contains(&action.target)
+}
+
+/// [`action_notifies_self`] applied only to messages that ARE actions:
+/// non-action messages pass through untouched.
+///
+/// This is a pure narrowing of the notification set — it can never make
+/// something notify that did not before — so it composes with the per-room
+/// [`NotificationMode`] filter in either order.
+pub(crate) fn survives_action_gate(
+    msg: &AuthorizedMessageV1,
+    room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
+    self_authored: &SelfAuthoredIndex<'_>,
+) -> bool {
+    !msg.message.content.is_action() || action_notifies_self(msg, room_secrets, self_authored)
+}
+
 /// Lazily-built index of the ids of messages in `recent` authored by
-/// `self_member_id` — the set a reply's target is tested against.
+/// `self_member_id` — the set a reply's or a reaction's target is tested
+/// against.
 ///
 /// Exists because `AuthorizedMessageV1::id()` is a 64-byte rolling hash, so
 /// the naive `recent.iter().any(|m| m.id() == target)` per reply is O(N)
@@ -848,6 +934,27 @@ pub(crate) struct SelfAuthoredIndex<'a> {
     recent: &'a [AuthorizedMessageV1],
     self_member_id: MemberId,
     ids: std::cell::OnceCell<std::collections::HashSet<MessageId>>,
+}
+
+impl SelfAuthoredIndex<'static> {
+    /// A pre-computed index, for a caller that built the id set itself.
+    ///
+    /// `notify_new_messages` uses this so it can hash the ids while it already
+    /// holds the `ROOMS` read guard, instead of deep-cloning the whole
+    /// `max_recent_messages` window (ciphertext included) out of the signal
+    /// just to hash it afterwards.
+    pub(crate) fn from_ids(
+        ids: std::collections::HashSet<MessageId>,
+        self_member_id: MemberId,
+    ) -> Self {
+        let cell = std::cell::OnceCell::new();
+        let _ = cell.set(ids);
+        Self {
+            recent: &[],
+            self_member_id,
+            ids: cell,
+        }
+    }
 }
 
 impl<'a> SelfAuthoredIndex<'a> {
@@ -866,17 +973,27 @@ impl<'a> SelfAuthoredIndex<'a> {
     }
 
     /// Whether `target_id` names a message in `recent` authored by self.
-    fn contains(&self, target_id: &MessageId) -> bool {
+    pub(crate) fn contains(&self, target_id: &MessageId) -> bool {
         self.ids
-            .get_or_init(|| {
-                self.recent
-                    .iter()
-                    .filter(|m| m.message.author == self.self_member_id)
-                    .map(|m| m.id())
-                    .collect()
-            })
+            .get_or_init(|| self_authored_ids(self.recent, self.self_member_id))
             .contains(target_id)
     }
+}
+
+/// The ids of the messages in `recent` authored by `self_member_id`.
+///
+/// Shared by [`SelfAuthoredIndex`]'s lazy path and by `notify_new_messages`,
+/// which builds the set eagerly under the `ROOMS` read guard, so the two can
+/// not drift on what "authored by self" means.
+pub(crate) fn self_authored_ids(
+    recent: &[AuthorizedMessageV1],
+    self_member_id: MemberId,
+) -> std::collections::HashSet<MessageId> {
+    recent
+        .iter()
+        .filter(|m| m.message.author == self_member_id)
+        .map(|m| m.id())
+        .collect()
 }
 
 /// Pure decision for [`crate::room_data::NotificationMode::MentionsAndReplies`]:
@@ -1065,9 +1182,9 @@ pub fn notify_new_messages(
     // exactly the setting the user chose to prevent. A missed notification on
     // an unreadable signal is the safe direction.
     //
-    // The room's recent messages come out of the same read, so the per-message
-    // mention check below does not re-read `ROOMS` (and does not rebuild its
-    // self-authored index) once per message.
+    // The room's self-authored message ids come out of the same read, so the
+    // per-message mention/reaction checks below do not re-read `ROOMS` (and do
+    // not rebuild the index) once per message.
     let Ok(rooms) = ROOMS.try_read() else {
         warn!("ROOMS unreadable while deciding notifications; skipping");
         return;
@@ -1077,38 +1194,61 @@ pub fn notify_new_messages(
         .get(room_key)
         .copied()
         .unwrap_or_default();
-    // Only MentionsAndReplies needs the buffer, and it is the whole
-    // `max_recent_messages` window (ciphertext included), so `All` — the
-    // default — must not pay a deep clone of it on every delta.
-    let recent: Vec<AuthorizedMessageV1> =
-        if mode == crate::room_data::NotificationMode::MentionsAndReplies {
-            rooms
-                .map
-                .get(room_key)
-                .map(|rd| rd.room_state.recent_messages.messages.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    if mode == crate::room_data::NotificationMode::Muted {
+        drop(rooms);
+        info!(
+            "Room {:?} is muted, skipping notification",
+            MemberId::from(*room_key)
+        );
+        return;
+    }
+    // Hash the ids HERE, under the guard, rather than cloning the buffer out
+    // to hash later: it is the whole `max_recent_messages` window with
+    // ciphertext, and the ids are all either filter wants.
+    //
+    // Only two things need it — the MentionsAndReplies filter, and the action
+    // gate — so a plain-text delta into an `All` room (the common case) still
+    // pays nothing.
+    let needs_self_authored = mode == crate::room_data::NotificationMode::MentionsAndReplies
+        || external_messages
+            .iter()
+            .any(|msg| msg.message.content.is_action());
+    let self_authored_id_set = if needs_self_authored {
+        rooms
+            .map
+            .get(room_key)
+            .map(|rd| self_authored_ids(&rd.room_state.recent_messages.messages, self_member_id))
+            .unwrap_or_default()
+    } else {
+        std::collections::HashSet::new()
+    };
     drop(rooms);
+    let self_authored = SelfAuthoredIndex::from_ids(self_authored_id_set, self_member_id);
+
+    // Narrow actions BEFORE the mode filter: an action from another member is
+    // only ever notifiable as a reaction to one of the local user's own
+    // messages (freenet/river#598).
+    let external_messages: Vec<_> = external_messages
+        .into_iter()
+        .filter(|msg| survives_action_gate(msg, room_secrets, &self_authored))
+        .collect();
+    if external_messages.is_empty() {
+        info!("No messages survive the action gate");
+        return;
+    }
+
     let external_messages: Vec<_> = match mode {
         crate::room_data::NotificationMode::All => external_messages,
-        crate::room_data::NotificationMode::Muted => {
-            info!(
-                "Room {:?} is muted, skipping notification",
-                MemberId::from(*room_key)
-            );
-            return;
-        }
-        crate::room_data::NotificationMode::MentionsAndReplies => {
-            let self_authored = SelfAuthoredIndex::new(&recent, self_member_id);
-            external_messages
-                .into_iter()
-                .filter(|msg| {
-                    mentions_or_replies_to_self_indexed(msg, room_secrets, &self_authored)
-                })
-                .collect()
-        }
+        // Unreachable — muting returns above, before the index build, so a
+        // muted room pays nothing. Kept as a second `return` rather than
+        // folded into the `All` arm: if the early exit is ever moved or lost,
+        // the failure should stay "no notification", never "notify a room the
+        // user muted".
+        crate::room_data::NotificationMode::Muted => return,
+        crate::room_data::NotificationMode::MentionsAndReplies => external_messages
+            .into_iter()
+            .filter(|msg| mentions_or_replies_to_self_indexed(msg, room_secrets, &self_authored))
+            .collect(),
     };
     if external_messages.is_empty() {
         info!("No messages match the room's mentions-and-replies filter");
@@ -1163,14 +1303,38 @@ pub fn notify_new_messages(
     show_notification(*room_key, &room_name, &sender_name, &preview);
 }
 
+/// One-line preview of an action message.
+///
+/// Only the REACTION arm can actually reach a notification (see
+/// [`action_notifies_self`]), and when it does the target is by construction
+/// one of the local user's own messages — so the preview says so, which is
+/// what makes the notification findable instead of a floating "Reacted with
+/// 🎉" (freenet/river#598). The other arms remain reachable through
+/// `get_message_preview`'s other callers and are kept for that.
+fn action_preview(action: &river_core::room_state::content::ActionContentV1) -> String {
+    use river_core::room_state::content::{
+        ACTION_TYPE_DELETE, ACTION_TYPE_EDIT, ACTION_TYPE_REACTION, ACTION_TYPE_REMOVE_REACTION,
+    };
+
+    match action.action_type {
+        ACTION_TYPE_EDIT => "[Edited a message]".to_string(),
+        ACTION_TYPE_DELETE => "[Deleted a message]".to_string(),
+        ACTION_TYPE_REACTION => action
+            .reaction_payload()
+            .map(|p| format!("Reacted {} to your message", p.emoji))
+            .unwrap_or_else(|| "Reacted to your message".to_string()),
+        ACTION_TYPE_REMOVE_REACTION => "[Removed a reaction]".to_string(),
+        _ => "[Unknown action]".to_string(),
+    }
+}
+
 /// Extract a preview from message content, decrypting if necessary
 fn get_message_preview(
     content: &RoomMessageBody,
     room_secrets: &std::collections::HashMap<u32, [u8; 32]>,
 ) -> String {
     use river_core::room_state::content::{
-        ActionContentV1, EventContentV1, ReplyContentV1, TextContentV1, ACTION_TYPE_DELETE,
-        ACTION_TYPE_EDIT, ACTION_TYPE_REACTION, ACTION_TYPE_REMOVE_REACTION, CONTENT_TYPE_ACTION,
+        ActionContentV1, EventContentV1, ReplyContentV1, TextContentV1, CONTENT_TYPE_ACTION,
         CONTENT_TYPE_EVENT, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT, EVENT_TYPE_JOIN,
     };
 
@@ -1182,16 +1346,7 @@ fn get_message_preview(
                 .map(|t| t.text)
                 .unwrap_or_else(|_| "[Failed to decode message]".to_string()),
             CONTENT_TYPE_ACTION => ActionContentV1::decode(data)
-                .map(|action| match action.action_type {
-                    ACTION_TYPE_EDIT => "[Edited a message]".to_string(),
-                    ACTION_TYPE_DELETE => "[Deleted a message]".to_string(),
-                    ACTION_TYPE_REACTION => action
-                        .reaction_payload()
-                        .map(|p| format!("Reacted with {}", p.emoji))
-                        .unwrap_or_else(|| "[Reacted]".to_string()),
-                    ACTION_TYPE_REMOVE_REACTION => "[Removed a reaction]".to_string(),
-                    _ => "[Unknown action]".to_string(),
-                })
+                .map(|action| action_preview(&action))
                 .unwrap_or_else(|_| "[Action]".to_string()),
             CONTENT_TYPE_REPLY => ReplyContentV1::decode(data)
                 .map(|r| r.text)
@@ -1227,7 +1382,13 @@ fn get_message_preview(
                                 _ => format!("[Event type {}]", event.event_type),
                             })
                             .unwrap_or_else(|_| "[Event]".to_string()),
-                        CONTENT_TYPE_ACTION => "[Action]".to_string(),
+                        // A private room's reaction is only readable once
+                        // decrypted, which has just happened — so it gets the
+                        // same preview a public one does rather than the bare
+                        // "[Action]" placeholder this used to render.
+                        CONTENT_TYPE_ACTION => ActionContentV1::decode(&bytes)
+                            .map(|action| action_preview(&action))
+                            .unwrap_or_else(|_| "[Action]".to_string()),
                         _ => String::from_utf8_lossy(&bytes).to_string(),
                     })
                     .unwrap_or_else(|_| "[Encrypted message]".to_string())
@@ -1880,6 +2041,229 @@ mod notify_gate_tests {
             "the author-only filter was re-inlined, which skips the room-event \
              exclusion that keeps notifications and unread badges in agreement"
         );
+    }
+
+    // ---- freenet/river#598: reactions notify only on your own messages ----
+
+    use river_core::room_state::content::{
+        ActionContentV1, ACTION_CONTENT_VERSION, CONTENT_TYPE_ACTION,
+    };
+
+    fn action_msg(author_sk: &SigningKey, action: ActionContentV1) -> AuthorizedMessageV1 {
+        public_msg(
+            author_sk,
+            RoomMessageBody::public_raw(
+                CONTENT_TYPE_ACTION,
+                ACTION_CONTENT_VERSION,
+                action.encode(),
+            ),
+        )
+    }
+
+    /// A private-room body: the same content, sealed under `secret` at
+    /// `version`, so the gate has to decrypt before it can read the target.
+    fn private_body(
+        content_type: u32,
+        content_version: u32,
+        plaintext: &[u8],
+        secret: &[u8; 32],
+        version: u32,
+    ) -> RoomMessageBody {
+        let (ciphertext, nonce) = crate::util::ecies::encrypt_with_symmetric_key(secret, plaintext);
+        RoomMessageBody::private(content_type, content_version, ciphertext, nonce, version)
+    }
+
+    #[test]
+    fn reaction_to_own_message_notifies() {
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let mine = public_msg(&me, RoomMessageBody::public("my message".to_string()));
+        let reaction = action_msg(
+            &other,
+            ActionContentV1::reaction(mine.id(), "🎉".to_string()),
+        );
+        let recent = [mine];
+        let index = SelfAuthoredIndex::new(&recent, id_of(&me));
+        assert!(survives_action_gate(&reaction, &secrets, &index));
+    }
+
+    #[test]
+    fn reaction_to_someone_elses_message_does_not_notify() {
+        // The reported symptom: an emoji react lands in the notification tray
+        // with nothing the reader can open — the reaction is not theirs, and
+        // actions raise no unread badge to navigate by.
+        let me = key(1);
+        let other = key(2);
+        let third = key(3);
+        let secrets = HashMap::new();
+        let theirs = public_msg(&other, RoomMessageBody::public("their message".to_string()));
+        let reaction = action_msg(
+            &third,
+            ActionContentV1::reaction(theirs.id(), "🎉".to_string()),
+        );
+        let recent = [theirs];
+        let index = SelfAuthoredIndex::new(&recent, id_of(&me));
+        assert!(!survives_action_gate(&reaction, &secrets, &index));
+    }
+
+    #[test]
+    fn reaction_to_a_target_outside_the_recent_window_does_not_notify() {
+        // Authorship cannot be confirmed, so fail toward silence — the same
+        // direction `does_not_notify_when_reply_target_scrolled_out` picks.
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let mine = public_msg(&me, RoomMessageBody::public("old message".to_string()));
+        let reaction = action_msg(
+            &other,
+            ActionContentV1::reaction(mine.id(), "🎉".to_string()),
+        );
+        let index = SelfAuthoredIndex::new(&[], id_of(&me));
+        assert!(!survives_action_gate(&reaction, &secrets, &index));
+    }
+
+    #[test]
+    fn non_reaction_actions_never_notify_even_on_own_messages() {
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let mine = public_msg(&me, RoomMessageBody::public("my message".to_string()));
+        let recent = [mine.clone()];
+        let index = SelfAuthoredIndex::new(&recent, id_of(&me));
+
+        for action in [
+            ActionContentV1::remove_reaction(mine.id(), "🎉".to_string()),
+            ActionContentV1::edit(mine.id(), "edited".to_string()),
+            ActionContentV1::delete(mine.id()),
+        ] {
+            let action_type = action.action_type;
+            let msg = action_msg(&other, action);
+            assert!(
+                !survives_action_gate(&msg, &secrets, &index),
+                "action_type {action_type} notified; only reactions should"
+            );
+        }
+    }
+
+    #[test]
+    fn non_action_messages_pass_the_gate_untouched() {
+        // The gate must be a pure narrowing of actions: ordinary chat, replies
+        // and events go through it unchanged (events are excluded earlier, by
+        // `is_notifiable_external_message`).
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let index = SelfAuthoredIndex::new(&[], id_of(&me));
+        for body in [
+            RoomMessageBody::public("hello".to_string()),
+            RoomMessageBody::reply(
+                "re".to_string(),
+                public_msg(&me, RoomMessageBody::public("x".to_string())).id(),
+                "Me".to_string(),
+                "x".to_string(),
+            ),
+            RoomMessageBody::join_event(),
+        ] {
+            let msg = public_msg(&other, body);
+            assert!(survives_action_gate(&msg, &secrets, &index));
+        }
+    }
+
+    #[test]
+    fn private_reaction_to_own_message_notifies_once_the_secret_is_known() {
+        let me = key(1);
+        let other = key(2);
+        let secret = [7u8; 32];
+        use river_core::room_state::content::{
+            TextContentV1, CONTENT_TYPE_TEXT, TEXT_CONTENT_VERSION,
+        };
+        let mine = public_msg(
+            &me,
+            private_body(
+                CONTENT_TYPE_TEXT,
+                TEXT_CONTENT_VERSION,
+                &TextContentV1::new("mine".to_string()).encode(),
+                &secret,
+                0,
+            ),
+        );
+        let reaction = public_msg(
+            &other,
+            private_body(
+                CONTENT_TYPE_ACTION,
+                ACTION_CONTENT_VERSION,
+                &ActionContentV1::reaction(mine.id(), "🎉".to_string()).encode(),
+                &secret,
+                0,
+            ),
+        );
+        let recent = [mine];
+        let index = SelfAuthoredIndex::new(&recent, id_of(&me));
+
+        let mut secrets = HashMap::new();
+        secrets.insert(0u32, secret);
+        assert!(survives_action_gate(&reaction, &secrets, &index));
+
+        // Without the secret the target id is unreadable, so the gate must
+        // fail closed rather than let every private-room action through.
+        assert!(!survives_action_gate(&reaction, &HashMap::new(), &index));
+    }
+
+    /// `notify_new_messages` is `wasm`-only, so no behavioural test in this
+    /// crate can reach it. Dropping the gate call would restore reactions on
+    /// other people's messages with every test above still green.
+    #[test]
+    fn notify_new_messages_applies_the_action_gate() {
+        let production = production_source();
+        assert!(
+            production
+                .contains("filter(|msg|survives_action_gate(msg,room_secrets,&self_authored))"),
+            "the new-message filter stopped applying `survives_action_gate`, \
+             so a reaction to anyone's message can notify again (#598)"
+        );
+        // The gate must run for EVERY mode, not just inside the
+        // MentionsAndReplies arm — `All` is the default, and it is where the
+        // reported symptom occurred.
+        let (before_mode_match, _) = production
+            .split_once("matchmode{")
+            .expect("the per-room NotificationMode filter is a `match mode`");
+        assert!(
+            before_mode_match.contains("survives_action_gate"),
+            "the action gate moved inside the mode match, so rooms left on \
+             the default `All` mode notify on every reaction again (#598)"
+        );
+    }
+
+    /// The gate is only as good as the id set it is handed. Building it from
+    /// the wrong room, or from all messages rather than the local user's, is a
+    /// silent way to make every reaction notify again.
+    #[test]
+    fn the_action_gate_index_is_built_from_the_rooms_own_self_authored_messages() {
+        let production = production_source();
+        assert!(
+            production.contains(
+                "self_authored_ids(&rd.room_state.recent_messages.messages,self_member_id)"
+            ),
+            "the self-authored index stopped being built from this room's \
+             recent messages for this member"
+        );
+        assert!(
+            production.contains("SelfAuthoredIndex::from_ids(self_authored_id_set,self_member_id)"),
+            "the notification path stopped using the eagerly-built index"
+        );
+    }
+
+    #[test]
+    fn a_reaction_preview_names_the_message_it_hit() {
+        // The whole complaint was a notification pointing at nothing. Since
+        // only reactions to the reader's own messages get this far, the
+        // preview can say so.
+        let preview = action_preview(&ActionContentV1::reaction(
+            public_msg(&key(1), RoomMessageBody::public("x".to_string())).id(),
+            "🎉".to_string(),
+        ));
+        assert_eq!(preview, "Reacted 🎉 to your message");
     }
 
     #[test]
