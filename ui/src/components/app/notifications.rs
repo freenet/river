@@ -691,10 +691,18 @@ const NOTIFICATION_LINE_BREAKS: [char; 5] = ['\n', '\r', '\u{0085}', '\u{2028}',
 /// third path cannot ship without it. Pinned by
 /// `both_notification_paths_go_through_notification_body`.
 fn notification_body(sender_name: &str, message_preview: &str) -> String {
-    format!(
-        "{sender_name}: {}",
-        message_preview.replace(NOTIFICATION_LINE_BREAKS, " ")
-    )
+    let flattened = message_preview.replace(NOTIFICATION_LINE_BREAKS, " ");
+    // An empty sender is the SUMMARY path's own literal ("3 new messages" has
+    // no one sender), never a member's name: `display_nickname` routes every
+    // nickname through `sanitize_display_name`, which returns "Unnamed" for an
+    // empty or whitespace-only value. So dropping the prefix here cannot let a
+    // member render a body that reads as a whole notification — the
+    // impersonation case the `sender: ` prefix and the line-break flattening
+    // exist to prevent. Without this, summaries read ": 3 new messages".
+    if sender_name.is_empty() {
+        return flattened;
+    }
+    format!("{sender_name}: {flattened}")
 }
 
 /// Show a notification for new messages in a room
@@ -1611,8 +1619,16 @@ mod notify_gate_tests {
             notification_body("Alice", "hello there"),
             "Alice: hello there"
         );
-        // The multi-message summary path passes an empty sender name.
-        assert_eq!(notification_body("", "3 new messages"), ": 3 new messages");
+        // The multi-message summary path passes an empty sender name, because
+        // a summary has no one sender. It must not render a dangling ": ".
+        assert_eq!(notification_body("", "3 new messages"), "3 new messages");
+        // …and the flattening still applies on that path, since it is what
+        // stops a preview from painting a second notification-looking line.
+        assert_eq!(
+            notification_body("", "3 new\nmessages"),
+            "3 new messages",
+            "the summary path must keep the line-break flattening"
+        );
     }
 
     /// Both notification paths must build their body through
@@ -2353,25 +2369,34 @@ mod notify_gate_tests {
     #[test]
     fn notify_new_messages_applies_the_action_gate() {
         let body = notify_new_messages_body();
-        // The needle includes the REBINDING, not just the call: binding the
-        // filtered list to a fresh name and letting the original flow on is a
-        // plausible refactor casualty that leaves the gate present and inert.
+        // Three separate things, because each fails on its own:
         //
-        // It deliberately STOPS at the open paren. Spelling out the arguments
-        // would make a pure rustfmt rewrap (which adds a trailing comma once
-        // the call wraps — not whitespace, so stripping does not hide it) fail
-        // this pin on correct code, and a pin that cries wolf gets weakened by
-        // the next person rather than re-tightened.
+        // (a) the REBINDING — binding the filtered list to a fresh name and
+        //     letting the original flow on leaves the gate present and inert;
+        // (b) the ARGUMENTS — passing a freshly-built EMPTY index instead of
+        //     `self_authored` silently kills every reaction notification, and
+        //     a needle that stops at the open paren cannot see it;
+        // (c) the ORDER — below the mode match, `All` skips the gate entirely.
+        //
+        // (b)'s needle deliberately omits the closing paren so a rustfmt
+        // rewrap that adds a trailing comma still matches. It does NOT try to
+        // survive every rewrap: once that call wraps, rustfmt turns the
+        // closure into a block (`.filter(|msg|{survives_action_gate(`), which
+        // breaks (a) wherever it ends. If you hit that, re-tighten the needles
+        // to the new shape — do not delete the assertions.
         let gate = body
-            .find(
-                "letexternal_messages:Vec<_>=external_messages.into_iter()\
-                 .filter(|msg|survives_action_gate(",
-            )
+            .find("letexternal_messages:Vec<_>=external_messages.into_iter().filter(|msg|")
             .expect(
-                "the new-message filter stopped applying `survives_action_gate` \
+                "the new-message filter stopped applying a per-message filter \
                  to `external_messages` itself, so a reaction to anyone's \
                  message can notify again (#598)",
             );
+        assert!(
+            body.contains("survives_action_gate(msg,room_secrets,&self_authored"),
+            "the action gate is no longer called with the room's real \
+             self-authored index; an empty index answers `false` for every \
+             target, so NO reaction would notify (#598)"
+        );
         // The gate must run for EVERY mode, not just inside the
         // MentionsAndReplies arm — `All` is the default, and it is where the
         // reported symptom occurred.
