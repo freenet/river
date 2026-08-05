@@ -913,26 +913,84 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             },
                             disabled: !peer_still_member,
                         }
-                        // Secondary action, sitting immediately left of Send.
+                        button {
+                            class: "px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-colors",
+                            disabled: draft.read().trim().is_empty() || !peer_still_member,
+                            onclick: move |_| do_send(),
+                            "Send"
+                        }
+                    }
+                    // Wraps rather than crushing: three children share this
+                    // row, and at a 320px viewport its inner width is ~248px,
+                    // so without wrapping the disclaimer gets squeezed to a
+                    // few characters per line. The point of moving the invite
+                    // link out of the composer was to stop trading away
+                    // phone-width space, so it must not be re-traded here.
+                    div { class: "flex flex-wrap justify-between items-center gap-x-3 gap-y-1 pt-1",
+                        // The "you" half of the disclaimer is backed by
+                        // the OUTBOUND_DMS local plaintext cache (#256).
+                        // On-wire encryption is to `{peer}` only —
+                        // the sender cannot decrypt the network copy.
+                        // If you delete or break that cache, this
+                        // disclaimer becomes inaccurate ("you" can no
+                        // longer read your own outbound bubbles) and
+                        // should be revisited.
+                        span { class: "text-[10px] text-text-muted",
+                            "Only you and "
+                            span { class: "text-accent", "{peer_label}" }
+                            " can read these messages."
+                        }
+                        // Sharing an invite is a SECONDARY action here:
+                        // sending a message is what this modal is for, so
+                        // Send keeps the only filled `bg-accent` treatment and
+                        // this is a bare text link at the same SIZE as "Delete
+                        // their messages" — no background, border or heavy
+                        // padding. Its resting COLOUR deliberately differs;
+                        // see below.
                         //
-                        // Send keeps the ONLY filled `bg-accent` treatment in
-                        // this modal — sending a message is what it is for.
-                        // This uses the codebase's established secondary tier
-                        // (`bg-surface` + border, as in `member_info_modal`),
-                        // which is clearly subordinate while still being a
-                        // real button next to where attention already is. An
-                        // earlier revision put it in the fine-print row at
-                        // resting styling identical to "Delete their
-                        // messages", which read as a maintenance utility and
-                        // parked a routine action beside a destructive one.
+                        // It deliberately does NOT sit in the composer row.
+                        // A same-height bordered button beside Send competes
+                        // with it for attention (arguably reading as MORE
+                        // prominent, since "Share invite" is the wider label)
+                        // and eats horizontal space the message box needs —
+                        // the textarea lost ~90px at phone widths. Ian asked
+                        // for smaller and less prominent, twice; this row is
+                        // where the modal's non-primary actions live.
                         //
-                        // Disabled in lockstep with Send whenever the peer has
-                        // left the room: an invitation IS an outbound DM, and
+                        // Same WEIGHT as "Delete their messages" (bare text,
+                        // `text-xs`) but deliberately not the same
+                        // PRESENTATION: these two are opposites — one offers
+                        // someone access, the other destroys messages — and
+                        // rendering them identically, distinguishable only by
+                        // a hover colour that touch devices never show, makes
+                        // them read as a matched pair. So this one is
+                        // accent-coloured at rest, like a link you are meant
+                        // to use; Delete stays muted grey and only turns red
+                        // on hover, like a thing you are meant to be sure
+                        // about. Prominence runs Send ≫ Share invite > Delete.
+                        //
+                        // Middle of a `justify-between` row, so it is also
+                        // physically separated from Delete: both are small hit
+                        // targets, and a mis-tap between them is the one that
+                        // matters.
+                        //
+                        // Disabled in lockstep with Send when the peer has
+                        // left the room — an invitation IS an outbound DM and
                         // the contract rejects it for the same reason. The
-                        // banner above already explains why.
+                        // banner above already says why.
                         button {
                             "data-testid": "dm-thread-share-invite-button",
-                            class: "px-3 py-2 bg-surface hover:bg-surface-hover disabled:opacity-50 text-text text-sm font-medium rounded-lg border border-border transition-colors",
+                            // The vertical padding here is hit target, not
+                            // visual weight: with no background it is
+                            // invisible, and the bare text size alone gives a
+                            // ~16px target against WCAG 2.2 SC 2.5.8's 24x24.
+                            // Deliberately not the larger button padding, which
+                            // `the_share_invite_button_stays_less_prominent_than_send`
+                            // forbids by name. (That pin scans this file with
+                            // whitespace stripped but comments INTACT, so do
+                            // not write the forbidden class names here — this
+                            // comment tripped it once already.)
+                            class: "text-xs py-1 text-accent hover:text-accent-hover disabled:opacity-50 disabled:hover:text-accent transition-colors",
                             disabled: !peer_still_member,
                             // Same name the Member Info dialog uses, so the
                             // feature reads as one thing across the app. It
@@ -950,30 +1008,8 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             },
                             "Share invite"
                         }
-                        button {
-                            class: "px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-colors",
-                            disabled: draft.read().trim().is_empty() || !peer_still_member,
-                            onclick: move |_| do_send(),
-                            "Send"
-                        }
-                    }
-                    div { class: "flex justify-between items-center pt-1",
-                        // The "you" half of the disclaimer is backed by
-                        // the OUTBOUND_DMS local plaintext cache (#256).
-                        // On-wire encryption is to `{peer}` only —
-                        // the sender cannot decrypt the network copy.
-                        // If you delete or break that cache, this
-                        // disclaimer becomes inaccurate ("you" can no
-                        // longer read your own outbound bubbles) and
-                        // should be revisited.
-                        span { class: "text-[10px] text-text-muted",
-                            "Only you and "
-                            span { class: "text-accent", "{peer_label}" }
-                            " can read these messages."
-                        }
-                        // Destructive, and the only thing in this row besides
-                        // the disclaimer — kept as a bare text link so it
-                        // never competes with the composer above.
+                        // Destructive, so it keeps the far right of the row
+                        // and the red hover, away from the invite link.
                         button {
                             class: "text-xs text-text-muted hover:text-red-400 transition-colors",
                             onclick: move |_| confirm_delete_open.set(true),
@@ -1605,8 +1641,10 @@ mod tests {
     }
 
     /// Send stays the primary action: it keeps the ONLY filled `bg-accent`
-    /// treatment in this modal, and the invite control sits on the
-    /// established secondary tier.
+    /// treatment in the modal chrome, and the invite control stays a bare
+    /// text link — no background, border or button padding. Ian asked for
+    /// smaller and less prominent than Send twice; a bordered same-height
+    /// button beside Send was rejected for reading as MORE prominent.
     #[test]
     fn the_share_invite_button_stays_less_prominent_than_send() {
         let src = dm_thread_production_source();
@@ -1618,9 +1656,8 @@ mod tests {
             src.contains("bg-accenthover:bg-accent-hoverdisabled:opacity-50text-whitetext-smfont-mediumrounded-lgtransition-colors"),
             "Send stopped being the filled primary button"
         );
-        // The invite control must not adopt the filled accent treatment. The
-        // window is bounded by the NEXT button in the composer row (Send), so
-        // it cannot silently slide onto unrelated markup if this block shrinks.
+        // The window is bounded by the button's own label, so it cannot
+        // silently slide onto neighbouring markup if this block shrinks.
         let after_testid = src
             .split_once("\"data-testid\":\"dm-thread-share-invite-button\"")
             .expect("the invite button is present")
@@ -1629,15 +1666,74 @@ mod tests {
             .split_once("\"Shareinvite\"")
             .expect("the invite button's label closes its block")
             .0;
+        // It must carry NO background, border or padding — a bare text link,
+        // the same treatment as "Delete their messages". A bordered,
+        // same-height button next to Send competes with it (and reads as more
+        // prominent, the label being wider), which is the opposite of what
+        // this control is for.
+        for heavy in ["bg-accent", "bg-surface", "border-border", "px-3", "py-2"] {
+            assert!(
+                !invite_block.contains(heavy),
+                "the invite control picked up `{heavy}`; it must stay a bare \
+                 text link, smaller and quieter than Send"
+            );
+        }
         assert!(
-            !invite_block.contains("bg-accent"),
-            "the invite control took on the filled accent treatment reserved \
-             for Send; sending a message is this modal's primary purpose"
+            invite_block.contains("text-xs"),
+            "the invite control left the small bare-text weight it shares \
+             with \"Delete their messages\""
+        );
+        // …but it must NOT be presented identically to the destructive
+        // action. They are opposites — one offers access, the other destroys
+        // messages — and a hover-only distinction is invisible on touch.
+        //
+        // Pinned on the two class strings directly rather than by slicing to
+        // the delete button's label: `"Delete their messages"` first appears
+        // in this file's MODULE DOC COMMENT, and this scrape strips whitespace
+        // but not comments, so a `split_once` on the label silently cut at
+        // line 2 and made the assertion unreachable.
+        assert!(
+            src.contains("class:\"text-xstext-text-mutedhover:text-red-400transition-colors\""),
+            "the delete control stopped being the recessive muted-until-hover one"
         );
         assert!(
-            invite_block.contains("bg-surface") && invite_block.contains("border-border"),
-            "the invite control left the codebase's secondary button tier"
+            invite_block.contains("text-accent") && !invite_block.contains("text-text-muted"),
+            "the invite control now renders identically to the destructive \
+             \"Delete their messages\"; give it its own resting colour so the \
+             two are not a matched pair"
         );
+    }
+
+    /// The invite control must not sit in the composer row. Beside Send it
+    /// eats horizontal space the message box needs — measured at ~90px of
+    /// textarea at phone widths — and competes with the modal's primary
+    /// action. It belongs in the footer row with the other secondary action.
+    ///
+    /// Anchored on the FOOTER ROW, not on Send. An earlier version asserted
+    /// `invite > send`, which only forbade the slot between the textarea and
+    /// Send: moving the button into the composer row on the far side of Send
+    /// left every pin green while re-creating exactly the regression this
+    /// exists to prevent.
+    #[test]
+    fn the_share_invite_button_is_not_in_the_composer_row() {
+        let src = dm_thread_production_source();
+        let footer_row = src
+            .find("class:\"flexflex-wrapjustify-betweenitems-centergap-x-3gap-y-1pt-1\"")
+            .expect("the footer row is present");
+        let invite = src
+            .find("\"data-testid\":\"dm-thread-share-invite-button\"")
+            .expect("the invite button is present");
+        assert!(
+            invite > footer_row,
+            "the invite control moved out of the footer row and back up into \
+             the composer, where it takes width from the message box"
+        );
+        // Belt and braces: it must also come after Send, so it cannot end up
+        // between the textarea and Send either.
+        let send = src
+            .find("onclick:move|_|do_send(),\"Send\"")
+            .expect("the Send button is present");
+        assert!(invite > send, "the invite control is ahead of Send");
     }
 
     /// An invitation IS an outbound DM, so the contract rejects it for the
