@@ -333,7 +333,6 @@ pub fn InviteViaDmPickerModal() -> Element {
         });
 
         let candidate_label_for_task = candidate_label.clone();
-        let candidate_label_for_cache = candidate_label.clone();
         crate::util::safe_spawn_local(async move {
             let outcome = drive_send(
                 current_room,
@@ -344,7 +343,6 @@ pub fn InviteViaDmPickerModal() -> Element {
                 inviter_sk,
                 invitee_signing_key,
                 pmessage_opt,
-                candidate_label_for_cache,
             )
             .await;
 
@@ -632,11 +630,6 @@ async fn drive_send(
     inviter_sk: SigningKey,
     invitee_signing_key: SigningKey,
     personal_message: Option<String>,
-    // `candidate_label` is the invited room's display name, already unsealed
-    // for the candidate list. It is recorded in the sender's outbound cache
-    // so their own bubble can name the room — the sender cannot decrypt the
-    // DM they just sent, so this is the only place that name can come from.
-    candidate_label: String,
 ) -> Result<(), String> {
     // Sign the member-claim via the delegate-backed signing path. Same
     // semantics as the legacy URL-paste flow.
@@ -674,7 +667,7 @@ async fn drive_send(
         personal_message,
     }));
 
-    match send_structured_dm(current_room, target_peer, body, Some(candidate_label)).await {
+    match send_structured_dm(current_room, target_peer, body).await {
         SendDmOutcome::Sent => Ok(()),
         SendDmOutcome::RoomGone => Err("The room you're DM'ing in is no longer loaded.".into()),
         SendDmOutcome::RecipientNotMember => {
