@@ -130,4 +130,74 @@ test.describe("DM thread modal (Phase 3 structure)", () => {
     await composer.fill("test message");
     await expect(sendButton).toBeEnabled();
   });
+
+  // The in-thread "Share invite" entry point. The Rust side can only pin
+  // that certain strings exist in the source — it cannot see whether the
+  // button renders, whether it opens the picker, or whether its
+  // accessible name collides with the selectors the other specs use
+  // (the picker overlays this modal, which stays mounted underneath).
+  test("share-invite button opens the picker from inside the thread", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+
+    const opened = await openDmThreadModal(page);
+    if (!opened) {
+      test.skip(true, "no DM entry point available in example data");
+      return;
+    }
+
+    const shareInvite = page.getByTestId("dm-thread-share-invite-button");
+    await expect(shareInvite).toBeVisible({ timeout: 5_000 });
+
+    // The new control must not be picked up by the selectors the other
+    // specs use. Asserted on its own accessible name rather than on a
+    // count: the app already renders two buttons named "Send" (the room
+    // composer's and this modal's), which is why the test above reaches
+    // for `.last()` — a count assertion here would encode that incidental
+    // number and fail for reasons unrelated to this control.
+    const inviteName = await shareInvite.getAttribute("aria-label");
+    expect(inviteName).toMatch(/^Share invite with /);
+    for (const selector of [/^send$/i, /^send invite$/i, /share an invite/i]) {
+      expect(inviteName ?? "").not.toMatch(selector);
+    }
+
+    await shareInvite.click();
+
+    // The picker paints over the still-mounted thread modal.
+    await expect(
+      page.getByRole("button", { name: /close picker/i }),
+    ).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByText(/invite .+ to another room/i)).toBeVisible();
+  });
+
+  // Sending is the modal's primary purpose, so Send keeps the only filled
+  // accent treatment and the invite control sits on the secondary tier.
+  // Asserted on the rendered DOM rather than on the source, so it survives
+  // a class list being moved or recomputed.
+  test("share-invite is styled below Send", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+
+    const opened = await openDmThreadModal(page);
+    if (!opened) {
+      test.skip(true, "no DM entry point available in example data");
+      return;
+    }
+
+    const shareInvite = page.getByTestId("dm-thread-share-invite-button");
+    await expect(shareInvite).toBeVisible({ timeout: 5_000 });
+
+    const inviteClass = (await shareInvite.getAttribute("class")) || "";
+    const sendClass =
+      (await page
+        .getByRole("button", { name: /^send$/i })
+        .last()
+        .getAttribute("class")) || "";
+
+    expect(sendClass).toContain("bg-accent");
+    expect(inviteClass).not.toContain("bg-accent");
+    expect(inviteClass).toContain("bg-surface");
+  });
 });
