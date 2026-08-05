@@ -1011,19 +1011,31 @@ impl<'a> SelfAuthoredIndex<'a> {
 /// which builds the set eagerly under the `ROOMS` read guard, so the two can
 /// not drift on what "authored by self" means.
 ///
-/// Action messages are excluded even when self-authored. `recent_messages`
-/// carries them (they are only dropped at render time by
-/// `MessagesV1::display_messages`), but the state layer will not resolve an
-/// action against another action: `rebuild_actions_state_with_decrypted`
-/// builds its `message_authors` map from non-action messages only, and the
-/// REACTION arm requires the target to be in it. So a reaction naming one of
-/// the local user's own reaction/edit messages is dropped by the contract
-/// state and renders nowhere — while, without this filter, it would still
-/// raise "Reacted 🎉 to your message". That is #598's symptom again, and
-/// deliberately reachable: every input to `id()` is public to room members,
-/// so any member could aim a reaction at one of my action messages and pop a
-/// notification pointing at nothing. Excluding them is right for the reply
-/// gate too — a reply targeting an action message is equally unresolvable.
+/// Action and event messages are excluded even when self-authored, because
+/// neither can carry a VISIBLE reaction — so a reaction naming one is #598's
+/// symptom all over again: "Reacted 🎉 to your message" with nothing on
+/// screen. Both are deliberately reachable, not merely theoretical: every
+/// input to `id()` is public to room members, so any member can aim a
+/// reaction at one of them.
+///
+/// The two are excluded for DIFFERENT reasons, and the set that matters is
+/// what the UI can RENDER, which is narrower than what the contract will
+/// resolve:
+/// - **Actions** are refused by the contract itself.
+///   `rebuild_actions_state_with_decrypted` builds its `message_authors` map
+///   from non-action messages only, and the REACTION arm requires the target
+///   to be in it, so the reaction never enters `actions_state` at all.
+/// - **Events** ARE resolvable by the contract (`message_authors` excludes
+///   actions, not events), so the reaction really is recorded — but
+///   `conversation.rs` renders an event as a merged `DisplayItem::Event` and
+///   `continue`s before it ever looks up reactions, so it is invisible
+///   regardless. Every member has a self-authored join event sitting in a
+///   freshly-joined room's buffer, which makes this the easier of the two to
+///   hit.
+///
+/// Excluding both is right for the reply gate too: `conversation.rs` already
+/// refuses to quote an action or an event target, so a reply naming one
+/// renders no quote strip either.
 ///
 /// Known residual, not covered here: a reaction to a self-authored message
 /// that has since been DELETED still notifies. Deletion is author-only, so
@@ -1039,7 +1051,11 @@ pub(crate) fn self_authored_ids(
 ) -> std::collections::HashSet<MessageId> {
     recent
         .iter()
-        .filter(|m| m.message.author == self_member_id && !m.message.content.is_action())
+        .filter(|m| {
+            m.message.author == self_member_id
+                && !m.message.content.is_action()
+                && !m.message.content.is_event()
+        })
         .map(|m| m.id())
         .collect()
 }
@@ -1321,11 +1337,14 @@ pub fn notify_new_messages(
         .unwrap_or_else(|| "Room".to_string());
 
     let msg = match plan_batch_notification(&external_messages) {
-        BatchNotification::Summary(text) => {
+        Some(BatchNotification::Summary(text)) => {
             show_notification(*room_key, &room_name, "", &text);
             return;
         }
-        BatchNotification::Single(msg) => msg,
+        Some(BatchNotification::Single(msg)) => msg,
+        // Unreachable: the empty batch returns above. Fail silent, never panic
+        // — this runs in WASM, where a panic takes the whole UI down.
+        None => return,
     };
 
     // Get sender name
@@ -1358,8 +1377,13 @@ pub(crate) enum BatchNotification<'a> {
 ///
 /// Split out of `notify_new_messages` (which is unreachable from a native
 /// test, since it ends in `web_sys::Notification`) so the counting rule is
-/// testable. Callers must not pass an empty slice; `notify_new_messages`
-/// returns before this on every empty path.
+/// testable.
+///
+/// `None` for an empty slice. `notify_new_messages` already returns on every
+/// empty path before calling this, so it is unreachable today — but this runs
+/// in WASM, where a panic takes the whole UI down, and a `pub(crate)` function
+/// that panics on a plausible input is a footgun for the next caller. There is
+/// nothing to notify about, so there is nothing to panic about.
 ///
 /// **The count excludes reactions.** They are the only actions that survive
 /// the gate, and no unread surface counts an action
@@ -1375,25 +1399,28 @@ pub(crate) enum BatchNotification<'a> {
 /// `sender: preview` treatment.
 pub(crate) fn plan_batch_notification<'a>(
     survivors: &[&'a AuthorizedMessageV1],
-) -> BatchNotification<'a> {
+) -> Option<BatchNotification<'a>> {
     let (chat, reactions): (Vec<&'a AuthorizedMessageV1>, Vec<&'a AuthorizedMessageV1>) = survivors
         .iter()
         .copied()
         .partition(|msg| !msg.message.content.is_action());
 
     if chat.len() > 1 {
-        return BatchNotification::Summary(format!("{} new messages", chat.len()));
+        return Some(BatchNotification::Summary(format!(
+            "{} new messages",
+            chat.len()
+        )));
     }
     if chat.is_empty() && reactions.len() > 1 {
-        return BatchNotification::Summary(format!(
+        return Some(BatchNotification::Summary(format!(
             "{} new reactions to your messages",
             reactions.len()
-        ));
+        )));
     }
-    BatchNotification::Single(chat.first().or_else(|| reactions.first()).copied().expect(
-        "callers filter out the empty batch before planning; every \
-                 other combination leaves at least one message here",
-    ))
+    chat.first()
+        .or_else(|| reactions.first())
+        .copied()
+        .map(BatchNotification::Single)
 }
 
 /// One-line preview of an action message.
@@ -2329,10 +2356,16 @@ mod notify_gate_tests {
         // The needle includes the REBINDING, not just the call: binding the
         // filtered list to a fresh name and letting the original flow on is a
         // plausible refactor casualty that leaves the gate present and inert.
+        //
+        // It deliberately STOPS at the open paren. Spelling out the arguments
+        // would make a pure rustfmt rewrap (which adds a trailing comma once
+        // the call wraps — not whitespace, so stripping does not hide it) fail
+        // this pin on correct code, and a pin that cries wolf gets weakened by
+        // the next person rather than re-tightened.
         let gate = body
             .find(
                 "letexternal_messages:Vec<_>=external_messages.into_iter()\
-                 .filter(|msg|survives_action_gate(msg,room_secrets,&self_authored)).collect();",
+                 .filter(|msg|survives_action_gate(",
             )
             .expect(
                 "the new-message filter stopped applying `survives_action_gate` \
@@ -2396,8 +2429,14 @@ mod notify_gate_tests {
         // `match …` form fails this `contains` rather than sneaking past it.
         // (Scanning for the token `if` between the build and the gate does not
         // work — "notifiable", in the comment right there, contains it.)
+        //
+        // The needle runs all the way to `.map(|rd|self_authored_ids(` so that
+        // an interposed `.filter(|_| some_condition)` — which would restore the
+        // same silent kill while still starting `=rooms` — cannot slip through.
         assert!(
-            notify_new_messages_body().contains("letself_authored_id_set=rooms"),
+            notify_new_messages_body().contains(
+                "letself_authored_id_set=rooms.map.get(room_key).map(|rd|self_authored_ids("
+            ),
             "the self-authored id set is no longer built unconditionally from \
              the ROOMS guard; an unbuilt set is EMPTY, not absent, so the gate \
              would silently drop every reaction (#598)"
@@ -2477,6 +2516,37 @@ mod notify_gate_tests {
             ActionContentV1::reaction(mine.id(), "🎉".to_string()),
         );
         assert!(survives_action_gate(&genuine, &secrets, &index));
+    }
+
+    /// A self-authored JOIN EVENT is a resolvable reaction target as far as
+    /// the contract is concerned (`message_authors` excludes actions, not
+    /// events), so the reaction really does land in `actions_state` — but
+    /// `conversation.rs` renders an event as a merged `DisplayItem::Event` and
+    /// `continue`s before it looks up reactions, so it shows nowhere. That is
+    /// #598's symptom, and the easiest variant to hit: every member has a
+    /// self-authored join event in a freshly-joined room's buffer.
+    #[test]
+    fn self_authored_ids_excludes_my_own_join_event() {
+        let me = key(1);
+        let other = key(2);
+        let secrets = HashMap::new();
+        let my_join = public_msg(&me, RoomMessageBody::join_event());
+        let mine = public_msg(&me, RoomMessageBody::public("my message".to_string()));
+        let recent = [my_join.clone(), mine.clone()];
+
+        let ids = self_authored_ids(&recent, id_of(&me));
+        assert!(
+            !ids.contains(&my_join.id()),
+            "my join event must not be targetable"
+        );
+        assert!(ids.contains(&mine.id()), "my ordinary message still is");
+
+        let index = SelfAuthoredIndex::from_ids(ids, id_of(&me));
+        let on_join = action_msg(
+            &other,
+            ActionContentV1::reaction(my_join.id(), "🎉".to_string()),
+        );
+        assert!(!survives_action_gate(&on_join, &secrets, &index));
     }
 
     /// Pins the deliberate choice that this change only ever REMOVES
@@ -2592,13 +2662,23 @@ mod notify_gate_tests {
         );
 
         let summary = |msgs: &[&AuthorizedMessageV1]| match plan_batch_notification(msgs) {
-            BatchNotification::Summary(text) => text,
-            BatchNotification::Single(m) => panic!("expected a summary, got {:?}", m.id()),
+            Some(BatchNotification::Summary(text)) => text,
+            Some(BatchNotification::Single(m)) => {
+                panic!("expected a summary, got single {:?}", m.id())
+            }
+            None => panic!("expected a summary, got nothing"),
         };
         let single = |msgs: &[&AuthorizedMessageV1]| match plan_batch_notification(msgs) {
-            BatchNotification::Single(m) => m.id(),
-            BatchNotification::Summary(text) => panic!("expected a single message, got {text:?}"),
+            Some(BatchNotification::Single(m)) => m.id(),
+            Some(BatchNotification::Summary(text)) => {
+                panic!("expected a single message, got summary {text:?}")
+            }
+            None => panic!("expected a single message, got nothing"),
         };
+
+        // Empty batch: `None`, never a panic — this runs in WASM, where a
+        // panic takes the whole UI down.
+        assert!(plan_batch_notification(&[]).is_none());
 
         // Two chat messages plus a reaction: the badge will read 2, so must
         // the notification — the reaction rides along unmentioned.
