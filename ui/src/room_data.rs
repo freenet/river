@@ -54,7 +54,10 @@ pub struct MergeRanks {
     ///
     /// The ranked model stops at the session boundary: `MergeRanks` is never
     /// persisted and `RoomSlot::Tombstone` is a unit variant that cannot carry a
-    /// rank. So the SAVE path is necessarily rank-blind, and its one
+    /// rank. So the SAVE path is rank-blind about TOMBSTONES specifically (it
+    /// does consult the identity registry for the diverged-identity decision —
+    /// freenet/river#588 — but a tombstone carries no rank to consult), and its
+    /// one
     /// tombstone-vs-present decision — `reconcile_room_present`'s
     /// `explicitly_rejoined` flag — would answer `AbortAdoptLeave` and write
     /// nothing, leaving the room alive in memory for exactly one session and
@@ -2053,7 +2056,11 @@ impl Rooms {
                 }
                 // Strictly newer: the room is back. Record it so the SAVE path
                 // learns about the resurrection — it cannot work it out for
-                // itself, having no ranks (see `MergeRanks::resurrected`).
+                // itself, because a `RoomSlot::Tombstone` carries no rank to
+                // compare against (see `MergeRanks::resurrected`). NB the save
+                // path is not rank-blind in general: it consults
+                // `MergeRanks::identity` for the diverged-identity decision
+                // (freenet/river#588). Tombstones are the part with no signal.
                 self.removed_rooms.remove(&vk);
                 ranks.tombstone.remove(&vk.to_bytes());
                 ranks.resurrected.insert(vk.to_bytes());

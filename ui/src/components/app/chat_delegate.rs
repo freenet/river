@@ -1461,7 +1461,7 @@ mod tests {
     /// delegate write actually happens against a stored `Tombstone`.
     #[test]
     fn a_ranked_resurrection_survives_into_the_delegate_write() {
-        use crate::room_data::{MergeAuthority, MergeRanks, Rooms};
+        use crate::room_data::{MergeAuthority, Rooms};
 
         let vk = SigningKey::from_bytes(&[23u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);
@@ -1531,8 +1531,15 @@ mod tests {
         let rejoined = REJOINED_THIS_SESSION.with(|s| s.borrow().contains(&vk));
         assert!(rejoined, "the drain must reach REJOINED_THIS_SESSION");
 
-        let out = reconcile_room_present(Some(&tombstone_slot_bytes()), &vk, &local, rejoined)
-            .expect("reconcile must succeed");
+        let out = reconcile_room_present(
+            Some(&tombstone_slot_bytes()),
+            &vk,
+            &local,
+            rejoined,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .expect("reconcile must succeed")
+        .written();
         let bytes = out.expect(
             "a ranked resurrection MUST overwrite the delegate's tombstone — \
              without it the room lives one session and is then gone for good",
@@ -1542,6 +1549,323 @@ mod tests {
             RoomSlot::Tombstone => panic!("wrote a tombstone over a resurrected room"),
         }
         clear_room_rejoined(&vk);
+    }
+
+    /// freenet/river#588 route 2 — a LEGACY-sourced local copy must not
+    /// overwrite the current delegate's stored identity.
+    ///
+    /// The matrix is the whole fix. Three of these four cases exist to stop the
+    /// guard being over-broad: only a legacy-ranked copy with a DIFFERING
+    /// identity may be refused, and refusing anything else silently stops
+    /// persisting rooms.
+    #[test]
+    fn a_legacy_sourced_identity_never_overwrites_the_stored_one() {
+        use crate::room_data::SOURCE_RANK_AUTHORITATIVE;
+
+        let vk = SigningKey::from_bytes(&[31u8; 32]).verifying_key();
+        let mut local = crate::room_data::test_minimal_room_data(vk);
+        local.self_sk = SigningKey::from_bytes(&[41u8; 32]);
+        let mut stored = crate::room_data::test_minimal_room_data(vk);
+        stored.self_sk = SigningKey::from_bytes(&[42u8; 32]);
+        let stored_bytes = present_slot_bytes(&stored);
+        let legacy_rank = 5u32;
+        assert!(
+            legacy_rank < current_delegate_source_rank(),
+            "fixture must actually be legacy-ranked"
+        );
+
+        // 1. legacy rank + differing identity -> refuse, stored survives.
+        let out =
+            reconcile_room_present(Some(&stored_bytes), &vk, &local, false, legacy_rank).unwrap();
+        // The VARIANT matters, not merely that nothing was written. The caller
+        // uses it to decide what the delegate now holds, and the two aborts imply
+        // opposite answers: `AdoptedTombstone` means a Tombstone is there,
+        // `RefusedIdentityOverwrite` means a Present we declined to touch. Assert
+        // the specific one or the caller's ROOM_SLOT_STATE bookkeeping is unpinned.
+        assert_eq!(
+            out,
+            ReconcileOutcome::RefusedIdentityOverwrite,
+            "refusing an identity overwrite must be DISTINGUISHABLE from adopting \
+             a tombstone — recording Tombstone here would be a lie about a slot \
+             that actually holds Present"
+        );
+        match ciborium::de::from_reader::<RoomSlot, _>(&stored_bytes[..]).unwrap() {
+            RoomSlot::Present(r) => assert_eq!(
+                r.self_sk.to_bytes(),
+                stored.self_sk.to_bytes(),
+                "the stored self_sk must be intact — it is unrecoverable"
+            ),
+            RoomSlot::Tombstone => panic!("fixture is Present"),
+        }
+
+        // 2. current-delegate rank + differing identity -> writes local.
+        //    This is #420's documented multi-tab last-writer-wins; the fix must
+        //    not silently change it.
+        let out = reconcile_room_present(
+            Some(&stored_bytes),
+            &vk,
+            &local,
+            false,
+            current_delegate_source_rank(),
+        )
+        .unwrap();
+        assert!(
+            out.written().is_some(),
+            "a current-delegate-ranked copy still wins (#420 unchanged)"
+        );
+
+        // 3. absent rank -> the caller substitutes AUTHORITATIVE, meaning the
+        //    room was created or imported IN-SESSION. #414 requires it to win.
+        let out = reconcile_room_present(
+            Some(&stored_bytes),
+            &vk,
+            &local,
+            false,
+            SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap();
+        assert!(
+            out.written().is_some(),
+            "an in-session identity must win over any delegate copy (#414)"
+        );
+
+        // 4. legacy rank + MATCHING identity -> ordinary merge. Without this the
+        //    guard could abort on every legacy-sourced room and silently stop
+        //    persisting the whole migration.
+        let matching = present_slot_bytes(&local);
+        let out = reconcile_room_present(Some(&matching), &vk, &local, false, legacy_rank).unwrap();
+        assert!(
+            out.written().is_some(),
+            "a legacy-sourced copy with a MATCHING identity must still merge and persist"
+        );
+    }
+
+    /// The guard belongs to the `Present` arm only. Gating the other
+    /// `present_action` outcomes on rank would break round-9's rejoin
+    /// behaviour and the absent-slot store.
+    #[test]
+    fn the_identity_rank_guard_does_not_touch_absent_or_tombstone_paths() {
+        let vk = SigningKey::from_bytes(&[32u8; 32]).verifying_key();
+        let local = crate::room_data::test_minimal_room_data(vk);
+        let legacy_rank = 5u32;
+
+        assert!(
+            reconcile_room_present(None, &vk, &local, false, legacy_rank)
+                .unwrap()
+                .written()
+                .is_some(),
+            "Absent -> StoreFresh, regardless of rank"
+        );
+        assert!(
+            reconcile_room_present(
+                Some(&tombstone_slot_bytes()),
+                &vk,
+                &local,
+                true,
+                legacy_rank
+            )
+            .unwrap()
+            .written()
+            .is_some(),
+            "Tombstone + explicit rejoin -> StoreFresh, regardless of rank"
+        );
+        assert!(
+            reconcile_room_present(
+                Some(&tombstone_slot_bytes()),
+                &vk,
+                &local,
+                false,
+                legacy_rank
+            )
+            .unwrap()
+            .written()
+            .is_none(),
+            "Tombstone + background -> AbortAdoptLeave, unchanged"
+        );
+    }
+
+    /// freenet/river#588 — the caller must not record `Tombstone` for an
+    /// identity refusal.
+    ///
+    /// `ROOM_SLOT_STATE` caches what we believe the delegate holds, and is
+    /// consulted to skip redundant writes. The two aborts imply OPPOSITE
+    /// contents, so collapsing them records a slot state that is simply false and
+    /// can skip a later genuine write. The loop needs the async delegate
+    /// machinery to drive directly, so pin the branch by source — and pin it on
+    /// the OUTCOME VARIANT, not on the presence of a call, so a refactor that
+    /// keeps the shape but drops the distinction still fails.
+    #[test]
+    fn an_identity_refusal_does_not_record_a_tombstone() {
+        let src = include_str!("chat_delegate.rs");
+        // NB do NOT split at `mod tests {` here the way the response_handler
+        // pins do: this file's test module sits BEFORE the save loop, so that
+        // idiom yields a prefix that does not contain the function at all — and
+        // the resulting `expect` failure looks like the function was renamed.
+        // Anchor on the definition instead; the name is unique in the file.
+        // BRACE-MATCH the body. `find("\n}\n")` does NOT terminate this function
+        // — it runs to EOF and sweeps in two later `#[cfg(test)]` modules, so
+        // every assertion below was satisfied by text OUTSIDE the function and
+        // the pin proved nothing. Caught by mutation: collapsing the refusal
+        // branch left it green.
+        // Build the needle from PIECES. A plain literal would match this test's
+        // OWN source first — `include_str!` includes the test module, and this
+        // test sits before the function it inspects — so the pin would
+        // brace-match a chunk of itself and every assertion below would be
+        // satisfied by its own text. Caught by mutation: with a plain literal,
+        // collapsing the refusal branch left the suite green.
+        let needle = concat!("async fn ", "do_save_rooms_to_delegate");
+        let start = src.find(needle).expect("the save loop must exist");
+        let open = src[start..]
+            .find('{')
+            .map(|i| start + i)
+            .expect("the function must have a body");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &src[start..=end];
+        assert!(
+            body.len() < 10_000,
+            "the extracted body is {} chars — that is the whole file, not one \
+             function, and every assertion below would be vacuous",
+            body.len()
+        );
+
+        // The guard is one token from inert: replacing the call-site read with a
+        // constant disables it in production while every behavioural test stays
+        // green, because they all call `reconcile_room_present` directly with an
+        // explicit rank. There is no injectable seam here — the loop goes
+        // straight to the websocket — so a source pin is the available option,
+        // and it beats the zero coverage this had. Mutation-verified.
+        assert!(
+            body.contains(concat!("identity_rank_for_", "save(&vk.to_bytes())")),
+            "the save loop must READ the rank from the registry — substituting a \
+             constant here disables the whole guard with a green suite"
+        );
+        assert!(
+            body.contains("ReconcileOutcome::RefusedIdentityOverwrite"),
+            "the save loop must distinguish the identity refusal from the \
+             tombstone adoption by VARIANT"
+        );
+        let refused = body
+            .find("refused_identity.get()")
+            .expect("the refusal must be consulted when recording slot state");
+        let tomb = body
+            .find("SavedSlot::Tombstone")
+            .expect("the tombstone-adoption branch must still record Tombstone");
+        assert!(
+            refused < tomb,
+            "the refusal must be checked BEFORE falling through to \
+             SavedSlot::Tombstone, or a refusal records a tombstone that is not there"
+        );
+        // ...and the refusal arm must set the flag TRUE. Asserting only that the
+        // flag is CONSULTED is not enough: flipping this one token reinstates the
+        // original bug (a refusal recording a tombstone) while every structural
+        // assertion above still holds. Mutation-verified.
+        let arm = body
+            .find(concat!(
+                "ReconcileOutcome::",
+                "RefusedIdentityOverwrite => {"
+            ))
+            .expect("the refusal must have its own match arm");
+        let arm_end = body[arm..]
+            .find('}')
+            .map(|i| arm + i)
+            .expect("the arm must close");
+        assert!(
+            body[arm..arm_end].contains("set(true)"),
+            "the identity-refusal arm must set the flag TRUE — setting it false \
+             makes the refusal record a tombstone, which is the bug this exists \
+             to prevent"
+        );
+        assert!(
+            body.contains("m.remove(vk)"),
+            "an identity refusal must FORGET the cached slot state — we know \
+             neither the stored content hash nor that it is a tombstone"
+        );
+    }
+
+    /// freenet/river#588 — the WRITER and the READER of the identity registry
+    /// must agree on how a room is keyed.
+    ///
+    /// This is a dependency between two functions in different modules, so it
+    /// gets driven end to end rather than asserted by inspection.
+    ///
+    /// SCOPE, because the earlier name overstated it: the "reader" driven here
+    /// is `identity_rank_for_save`, NOT the save loop. That the loop actually
+    /// CALLS it is a separate property with no injectable seam, pinned by
+    /// source in `an_identity_refusal_does_not_record_a_tombstone`. Nothing else
+    /// can catch a mismatch: every other test both inserts and reads through the
+    /// same call, so a key-derivation change would keep them all green while the
+    /// production lookup missed every time — returning the AUTHORITATIVE default
+    /// and silently disabling the guard entirely.
+    #[test]
+    fn identity_rank_for_save_reads_the_rank_the_merge_path_recorded() {
+        let vk = SigningKey::from_bytes(&[35u8; 32]).verifying_key();
+        let legacy_rank = 5u32;
+
+        // Record through the PRODUCTION writer the merge path uses...
+        with_identity_source_ranks(|r| {
+            crate::room_data::record_identity_source(&mut r.identity, &vk, legacy_rank, true);
+        });
+
+        // ...and read through the production reader the save path uses.
+        assert_eq!(
+            identity_rank_for_save(&vk.to_bytes()),
+            legacy_rank,
+            "the save path must find what the merge path recorded — a key-space \
+             mismatch returns the AUTHORITATIVE default and disables the guard"
+        );
+
+        with_identity_source_ranks(|r| {
+            r.identity.remove(&vk.to_bytes());
+        });
+    }
+
+    /// freenet/river#588 — the absent-entry default is load-bearing.
+    ///
+    /// `identity_rank_for_save` is the ONLY place the save path decides what an
+    /// unranked room means, and the answer must be AUTHORITATIVE: an absent
+    /// entry marks a room created or imported in-session, whose identity must
+    /// win. `unwrap_or(0)` compiles, reads plausibly, and would let any legacy
+    /// delegate copy overwrite every locally-created room.
+    #[test]
+    fn an_unranked_room_is_authoritative_for_saving() {
+        let unranked = SigningKey::from_bytes(&[33u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(
+            identity_rank_for_save(&unranked),
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+            "a room with no recorded identity source was created or imported \
+             in-session and must outrank every delegate copy (#414)"
+        );
+
+        let ranked = SigningKey::from_bytes(&[34u8; 32])
+            .verifying_key()
+            .to_bytes();
+        with_identity_source_ranks(|r| {
+            r.identity.insert(ranked, 5);
+        });
+        assert_eq!(
+            identity_rank_for_save(&ranked),
+            5,
+            "a recorded rank must be returned verbatim, not replaced by the default"
+        );
+        with_identity_source_ranks(|r| {
+            r.identity.remove(&ranked);
+        });
     }
 
     fn present_slot_bytes(room: &RoomData) -> Vec<u8> {
@@ -1563,9 +1887,16 @@ mod tests {
     fn reconcile_room_present_absent_stores_fresh() {
         let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);
-        let out = reconcile_room_present(None, &vk, &local, false)
-            .unwrap()
-            .expect("absent slot must store fresh");
+        let out = reconcile_room_present(
+            None,
+            &vk,
+            &local,
+            false,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap()
+        .written()
+        .expect("absent slot must store fresh");
         match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => assert_eq!(r.owner_vk, vk),
             RoomSlot::Tombstone => panic!("expected Present"),
@@ -1581,9 +1912,16 @@ mod tests {
         let local = crate::room_data::test_minimal_room_data(vk);
         let current = tombstone_slot_bytes();
         assert!(
-            reconcile_room_present(Some(&current), &vk, &local, false)
-                .unwrap()
-                .is_none(),
+            reconcile_room_present(
+                Some(&current),
+                &vk,
+                &local,
+                false,
+                crate::room_data::SOURCE_RANK_AUTHORITATIVE
+            )
+            .unwrap()
+            .written()
+            .is_none(),
             "background update to a remotely-left room must adopt the leave"
         );
     }
@@ -1595,9 +1933,16 @@ mod tests {
         let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);
         let current = tombstone_slot_bytes();
-        let out = reconcile_room_present(Some(&current), &vk, &local, true)
-            .unwrap()
-            .expect("explicit rejoin must overwrite the tombstone");
+        let out = reconcile_room_present(
+            Some(&current),
+            &vk,
+            &local,
+            true,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap()
+        .written()
+        .expect("explicit rejoin must overwrite the tombstone");
         assert!(matches!(
             ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap(),
             RoomSlot::Present(_)
@@ -1614,9 +1959,16 @@ mod tests {
         let mut remote = crate::room_data::test_minimal_room_data(vk);
         remote.self_sk = SigningKey::from_bytes(&[2u8; 32]); // diverged identity
         let current = present_slot_bytes(&remote);
-        let out = reconcile_room_present(Some(&current), &vk, &local, false)
-            .unwrap()
-            .expect("diverged identity keeps local, must still store");
+        let out = reconcile_room_present(
+            Some(&current),
+            &vk,
+            &local,
+            false,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap()
+        .written()
+        .expect("diverged identity keeps local, must still store");
         match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => assert_eq!(
                 r.self_sk.to_bytes(),
@@ -1633,7 +1985,14 @@ mod tests {
     fn reconcile_room_present_unparseable_slot_errs() {
         let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk);
-        assert!(reconcile_room_present(Some(b"garbage"), &vk, &local, false).is_err());
+        assert!(reconcile_room_present(
+            Some(b"garbage"),
+            &vk,
+            &local,
+            false,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE
+        )
+        .is_err());
     }
 
     /// Matching-identity merge (the `MergeState` branch) UNIONS `invitation_secrets`:
@@ -1651,9 +2010,16 @@ mod tests {
         remote.invitation_secrets.insert(1, [99u8; 32]); // remote v1 (local must win)
         remote.invitation_secrets.insert(2, [22u8; 32]); // remote-only v2 (must be kept)
 
-        let out = reconcile_room_present(Some(&present_slot_bytes(&remote)), &vk, &local, false)
-            .unwrap()
-            .expect("matching-identity merge stores");
+        let out = reconcile_room_present(
+            Some(&present_slot_bytes(&remote)),
+            &vk,
+            &local,
+            false,
+            crate::room_data::SOURCE_RANK_AUTHORITATIVE,
+        )
+        .unwrap()
+        .written()
+        .expect("matching-identity merge stores");
         let merged = match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => r,
             RoomSlot::Tombstone => panic!("expected Present"),
@@ -4454,6 +4820,41 @@ where
     .await
 }
 
+impl ReconcileOutcome {
+    /// The bytes to store, if any. For call sites that only care whether a write
+    /// happened; anything that must distinguish the two ABORTS should match on
+    /// the variant instead, which is the whole reason this is not an `Option`.
+    fn written(self) -> Option<Vec<u8>> {
+        match self {
+            ReconcileOutcome::Write(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
+/// The identity-source rank to judge a room's local copy by when saving.
+///
+/// **The default is the fix, not a fallback** (freenet/river#588). An ABSENT
+/// entry does not mean "unknown, assume the worst" — `record_identity_source`
+/// deliberately records nothing for a room that is already present and unranked,
+/// which is exactly how a room created or imported IN-SESSION looks. Such an
+/// identity must beat any delegate copy (#414), so absent must read as
+/// `SOURCE_RANK_AUTHORITATIVE`.
+///
+/// Defaulting to 0 instead would make every locally-created room overwritable by
+/// any legacy delegate copy — strictly worse than having no guard at all. It is
+/// a one-token edit that compiles, so it is pinned by
+/// `an_unranked_room_is_authoritative_for_saving`.
+fn identity_rank_for_save(room_key: &[u8; 32]) -> u32 {
+    with_identity_source_ranks(|ranks| {
+        ranks
+            .identity
+            .get(room_key)
+            .copied()
+            .unwrap_or(crate::room_data::SOURCE_RANK_AUTHORITATIVE)
+    })
+}
+
 /// The delegate's current per-room slot, classified for the reconcile decision.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SlotKind {
@@ -4475,6 +4876,25 @@ enum PresentAction {
     AbortAdoptLeave,
 }
 
+/// Why a `Present` save wrote, or did not.
+///
+/// `Option<Vec<u8>>` conflated the two aborts, and they imply OPPOSITE things
+/// about what the delegate now holds: adopting a tombstone means it holds a
+/// `Tombstone`, whereas refusing an identity overwrite means it holds a
+/// `Present` we declined to touch. `ROOM_SLOT_STATE` is consulted to skip
+/// redundant writes, so recording the wrong one can skip a later genuine write
+/// (freenet/river#588). Making the reason a type stops the caller guessing.
+#[derive(Debug, PartialEq)]
+enum ReconcileOutcome {
+    /// Store these bytes.
+    Write(Vec<u8>),
+    /// The delegate holds a `Tombstone` and we adopted the leave (round-9).
+    AdoptedTombstone,
+    /// The delegate holds a `Present` whose identity differs, and our copy is
+    /// legacy-sourced, so we refuse. Its content hash is NOT ours.
+    RefusedIdentityOverwrite,
+}
+
 fn present_action(kind: SlotKind, explicitly_rejoined: bool) -> PresentAction {
     match kind {
         SlotKind::Absent => PresentAction::StoreFresh,
@@ -4485,14 +4905,20 @@ fn present_action(kind: SlotKind, explicitly_rejoined: bool) -> PresentAction {
 }
 
 /// Reconcile a `Present` save for room `owner_vk` against the delegate's
-/// current slot. Returns the `RoomSlot` bytes to store, or `None` to abort
-/// (adopt a remote leave on a background update — the round-9 fix).
+/// current slot. Returns either the `RoomSlot` bytes to store or a REASON for
+/// not storing. The two abort reasons imply OPPOSITE delegate contents —
+/// `AdoptedTombstone` (the round-9 fix: a remote leave on a background update,
+/// delegate holds a Tombstone) versus `RefusedIdentityOverwrite`
+/// (freenet/river#588: delegate holds a Present we declined to touch) — which is
+/// why this is not an `Option`: the caller records what the delegate holds, and
+/// guessing gets it exactly backwards for one of the two.
 fn reconcile_room_present(
     current: Option<&[u8]>,
     owner_vk: &VerifyingKey,
     local: &RoomData,
     explicitly_rejoined: bool,
-) -> Result<Option<Vec<u8>>, String> {
+    local_identity_rank: u32,
+) -> Result<ReconcileOutcome, String> {
     let (kind, remote): (SlotKind, Option<Box<RoomData>>) = match current {
         None => (SlotKind::Absent, None),
         Some(bytes) => match ciborium::from_reader::<RoomSlot, _>(bytes) {
@@ -4503,11 +4929,57 @@ fn reconcile_room_present(
     };
 
     let merged: RoomData = match present_action(kind, explicitly_rejoined) {
-        PresentAction::AbortAdoptLeave => return Ok(None),
+        PresentAction::AbortAdoptLeave => return Ok(ReconcileOutcome::AdoptedTombstone),
         PresentAction::StoreFresh => local.clone(),
         PresentAction::MergeState => {
             let remote = remote.expect("MergeState implies a Present remote slot");
             if local.self_sk != remote.self_sk {
+                // freenet/river#588 route 2 — a LEGACY-sourced local copy must
+                // never overwrite the current delegate's identity.
+                //
+                // There is only ONE rank in existence here: `MergeRanks` is
+                // never persisted and `RoomSlot::Present` carries no provenance,
+                // so "keep the higher-ranked identity" is not implementable —
+                // there is nothing to compare the stored slot against. What IS
+                // decidable is whether the copy WE hold came from a legacy
+                // generation. If it did, the stored slot was written by the
+                // current delegate, which outranks every legacy generation by
+                // construction, so refusing is always right.
+                //
+                // Refusing costs MORE than `room_state`, and the honest version
+                // matters: nothing in this `RoomData` is persisted this pass —
+                // including `invitation_secrets`, whose loss leaves messages
+                // sealed under a dropped version undecryptable for good. And it
+                // is not one pass: the trigger recurs on every load (an empty
+                // index means the current-delegate copy is never fetched), so
+                // the session stays diverged rather than converging. Unlike the
+                // merge side, which REPAIRS by adopting the higher-ranked
+                // identity, this only refuses.
+                //
+                // It is still the right trade — `self_sk` is unrecoverable and
+                // everything above is either re-derivable or recoverable once
+                // the index is repaired — but "costs room_state" understated it.
+                // Converging here (adopting the stored identity into ROOMS)
+                // would make the save path mutate identity, which nothing else
+                // does; that belongs in its own change.
+                //
+                // NB the caller passes SOURCE_RANK_AUTHORITATIVE for a room with
+                // no recorded rank. That is not a fallback: an absent entry means
+                // the room was created or imported IN-SESSION (`record_identity_source`
+                // deliberately records nothing for an already-present unranked
+                // room), and such an identity must win. Defaulting to 0 here would
+                // make every locally-created room overwritable by any delegate
+                // copy — strictly worse than no fix at all.
+                if local_identity_rank < current_delegate_source_rank() {
+                    warn!(
+                        "Refusing to overwrite the stored identity for room {:?} with a \
+                         legacy-sourced copy (rank {} < current {}) — freenet/river#588",
+                        MemberId::from(owner_vk),
+                        local_identity_rank,
+                        current_delegate_source_rank()
+                    );
+                    return Ok(ReconcileOutcome::RefusedIdentityOverwrite);
+                }
                 // Diverged identity for the same room — keep local's
                 // (local-authoritative), don't merge the other identity's
                 // state, and don't fail the whole save (M1 fix: scoped to this
@@ -4556,7 +5028,7 @@ fn reconcile_room_present(
     let mut out = Vec::new();
     ciborium::ser::into_writer(&RoomSlot::Present(Box::new(merged)), &mut out)
         .map_err(|e| format!("serialize room slot: {e}"))?;
-    Ok(Some(out))
+    Ok(ReconcileOutcome::Write(out))
 }
 
 /// Reconcile a `Tombstone` (leave) save: write a tombstone unless already one.
@@ -4671,10 +5143,36 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
         }
 
         let rejoined = REJOINED_THIS_SESSION.with(|s| s.borrow().contains(vk));
+        // Read the identity-source rank ONCE, outside the CAS closure: the
+        // closure re-runs per CAS retry and this is the same non-reentrant mutex
+        // that produced a near-deadlock in the #590 drain.
+        let identity_rank = identity_rank_for_save(&vk.to_bytes());
+        // `wrote == false` is AMBIGUOUS once the identity guard exists: it means
+        // either "adopted a remote Tombstone" (the delegate holds a Tombstone) or
+        // "refused to overwrite a diverged identity" (the delegate holds a
+        // PRESENT slot we declined to touch). The two imply OPPOSITE things about
+        // what the delegate now holds, and `ROOM_SLOT_STATE` is consulted to skip
+        // redundant writes — so recording the wrong one is a lie that can skip a
+        // later genuine write. Carry the reason out of the closure.
+        let refused_identity = std::rc::Rc::new(std::cell::Cell::new(false));
+        let refused_flag = refused_identity.clone();
         let rd = room_data.clone();
         let owner = *vk;
         match cas_write_delegate_key(room_storage_key(vk), move |current| {
-            reconcile_room_present(current, &owner, &rd, rejoined)
+            match reconcile_room_present(current, &owner, &rd, rejoined, identity_rank)? {
+                ReconcileOutcome::Write(bytes) => {
+                    refused_flag.set(false);
+                    Ok(Some(bytes))
+                }
+                ReconcileOutcome::AdoptedTombstone => {
+                    refused_flag.set(false);
+                    Ok(None)
+                }
+                ReconcileOutcome::RefusedIdentityOverwrite => {
+                    refused_flag.set(true);
+                    Ok(None)
+                }
+            }
         })
         .await
         {
@@ -4684,19 +5182,29 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
                 // so record THAT — recording `Present(h)` would be a lie that
                 // could later content-hash-skip a genuine rejoin write
                 // (code-first review).
+                //
+                // EXCEPT when the abort was the freenet/river#588 identity
+                // refusal: there the delegate holds a PRESENT slot, whose content
+                // hash we do not know (it is the other identity's, not `h`). We
+                // can assert neither `Present(h)` nor `Tombstone`, so FORGET the
+                // room instead. An absent entry costs one redundant re-read next
+                // pass; a wrong entry can skip a genuine write.
                 ROOM_SLOT_STATE.with(|c| {
-                    c.borrow_mut().insert(
-                        *vk,
-                        if wrote {
+                    let mut m = c.borrow_mut();
+                    if wrote {
+                        m.insert(
+                            *vk,
                             SavedSlot::Present {
                                 content: h,
                                 critical: crit,
                                 written_at_ms: now_ms(),
-                            }
-                        } else {
-                            SavedSlot::Tombstone
-                        },
-                    );
+                            },
+                        );
+                    } else if refused_identity.get() {
+                        m.remove(vk);
+                    } else {
+                        m.insert(*vk, SavedSlot::Tombstone);
+                    }
                 });
                 // Once a rejoin has actually been persisted as Present, consume
                 // the rejoin intent: a LATER cross-tab leave + background update

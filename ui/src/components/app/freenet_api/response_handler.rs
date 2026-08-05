@@ -3180,7 +3180,10 @@ mod tests {
     /// `mark_room_rejoined`, or the save path never learns of it.
     ///
     /// The merge restoring a room in memory is only half the fix. The save path
-    /// is rank-blind by construction — `MergeRanks` is never persisted and
+    /// is rank-blind ABOUT TOMBSTONES by construction (it does consult
+    /// `MergeRanks::identity` for the diverged-identity decision,
+    /// freenet/river#588, but a tombstone carries nothing to consult) —
+    /// `MergeRanks` is never persisted and
     /// `RoomSlot::Tombstone` carries no rank — so `reconcile_room_present` sees
     /// the delegate's tombstone, answers `AbortAdoptLeave`, and writes nothing.
     /// The room then lives for exactly one session and is gone for good, which is
