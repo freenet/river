@@ -524,6 +524,16 @@ pub async fn send_structured_dm(
                 plaintext_for_cache,
             );
             unhide_dm_thread(room, peer);
+            // Scroll an open thread to the message we just sent, exactly as
+            // the thread's own composer does. Without this, an invitation
+            // sent from the DM thread produced NO feedback at all for a user
+            // who had scrolled up: the picker's success banner lives inside
+            // the picker and is torn down in the same defer block that closes
+            // it, so it renders for zero frames, and the thread simply looked
+            // unchanged. This send adds a message, so a fresh bubble mounts
+            // and re-runs the auto-scroll effect — the condition
+            // `note_outbound_send`'s docs require of any caller.
+            dm_thread_modal::note_outbound_send();
         }
         let _ = tx.send(outcome);
     });
@@ -535,11 +545,38 @@ pub async fn send_structured_dm(
     ))
 }
 
+/// Marks a cached outbound summary as an invitation rather than ordinary
+/// text. The sender cannot decrypt their own outbound DM (it is ECIES-sealed
+/// to the recipient), so this cached string is the ONLY thing their own bubble
+/// can be rendered from — this prefix is what lets the renderer tell a sent
+/// invitation from an ordinary message.
+pub(crate) const OUTBOUND_INVITE_SENTINEL: &str = "[Invitation]";
+
+/// The parts of a cached outbound invite summary, recovered for rendering.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OutboundInviteSummary {
+    /// Everything the sender wrote alongside the invitation, verbatim.
+    pub(crate) note: Option<String>,
+}
+
 /// Compute the plaintext string we cache for the sender's own outbound
 /// bubble rendering. For `Text` bodies that's just the text; for `Invite`
 /// it's a human-readable summary so the sender's list view doesn't
 /// render a blank "Invite (binary payload)" placeholder. The recipient
 /// decodes the wire body directly — they never look at this string.
+///
+/// **This format is deliberately unchanged, and is not a data channel.**
+/// The obvious improvement — recording the invited ROOM's name here, so the
+/// sender's bubble can name it the way the recipient's card does — was tried
+/// and reverted, because this one `String` is a shared display field:
+/// `riverctl dm list` prints it as a single line per message
+/// (`cli/src/commands/dm.rs`), so a second line there becomes an orphan row
+/// with no index, direction or timestamp; and re-parsing a richer format back
+/// out mangles legacy entries, whose personal message could itself contain
+/// newlines. Naming the room properly needs structured storage in
+/// `OutboundDmEntry`, which lives in `river-core` and therefore re-keys the
+/// chat delegate — a migration, not a UI change. Tracked separately; do not
+/// re-encode fields into this string.
 fn summarise_body_for_outbound_cache(
     body: &river_core::room_state::dm_body::DirectMessageBody,
 ) -> String {
@@ -547,10 +584,34 @@ fn summarise_body_for_outbound_cache(
     match body {
         DirectMessageBody::Text { text } => text.clone(),
         DirectMessageBody::Invite(payload) => match &payload.personal_message {
-            Some(msg) if !msg.trim().is_empty() => format!("[Invitation] {}", msg.trim()),
-            _ => "[Invitation]".to_string(),
+            Some(msg) if !msg.trim().is_empty() => {
+                format!("{} {}", OUTBOUND_INVITE_SENTINEL, msg.trim())
+            }
+            _ => OUTBOUND_INVITE_SENTINEL.to_string(),
         },
     }
+}
+
+/// Recover the parts of a cached outbound invite summary, or `None` when the
+/// string is ordinary message text.
+///
+/// **Known false positive, deliberately accepted:** a message the user TYPED
+/// beginning with `"[Invitation]"` is cached verbatim and so parses as one.
+/// The sentinel predates this and is the only signal available — the cache
+/// stores a bare `String`, with no body-kind field to consult (see
+/// [`summarise_body_for_outbound_cache`] for why adding one is a migration).
+/// The cost is bounded to a mislabelled card in the sender's OWN thread: the
+/// note below carries the rest of the text through verbatim, so nothing the
+/// user wrote is hidden, and the recipient always sees the true body. Pinned
+/// by `text_that_looks_like_an_invite_keeps_the_users_words`.
+pub(crate) fn parse_outbound_invite_summary(summary: &str) -> Option<OutboundInviteSummary> {
+    let rest = summary.strip_prefix(OUTBOUND_INVITE_SENTINEL)?;
+    // Trim only the separating space; keep the sender's own line breaks, which
+    // a legacy personal message may contain.
+    let note = rest.trim();
+    Some(OutboundInviteSummary {
+        note: (!note.is_empty()).then(|| note.to_string()),
+    })
 }
 
 fn unix_now() -> u64 {
@@ -695,6 +756,116 @@ pub fn seed_dm_last_seen_if_needed() {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        parse_outbound_invite_summary, summarise_body_for_outbound_cache, OutboundInviteSummary,
+    };
+    use river_core::room_state::dm_body::{DirectMessageBody, InvitePayload};
+
+    fn invite(personal_message: Option<&str>) -> DirectMessageBody {
+        DirectMessageBody::Invite(Box::new(InvitePayload {
+            room_owner_vk: ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key(),
+            invitation_payload: vec![1, 2, 3],
+            personal_message: personal_message.map(str::to_string),
+        }))
+    }
+
+    /// A sent invitation must be recognisable in the sender's own thread —
+    /// it is the only signal their bubble has, since the outbound copy is
+    /// sealed to the recipient.
+    #[test]
+    fn a_sent_invite_is_recognisable_in_the_senders_own_thread() {
+        let bare = summarise_body_for_outbound_cache(&invite(None));
+        assert_eq!(
+            parse_outbound_invite_summary(&bare),
+            Some(OutboundInviteSummary { note: None })
+        );
+
+        let with_note = summarise_body_for_outbound_cache(&invite(Some("come say hi")));
+        assert_eq!(
+            parse_outbound_invite_summary(&with_note),
+            Some(OutboundInviteSummary {
+                note: Some("come say hi".to_string()),
+            })
+        );
+    }
+
+    /// The cached summary is ALSO what `riverctl dm list` prints, one line
+    /// per message, so it must stay single-line for a single-line note. A
+    /// previous revision of this branch put the note on a second line and
+    /// turned every invite into an orphan row there, with no index,
+    /// direction or timestamp.
+    #[test]
+    fn a_sent_invite_summary_stays_one_line() {
+        let summary = summarise_body_for_outbound_cache(&invite(Some("come say hi")));
+        assert!(
+            !summary.contains('\n'),
+            "the cached summary gained a newline: {summary:?} - riverctl prints \
+             this field as one line per message"
+        );
+    }
+
+    /// A LEGACY personal message could itself contain newlines (the picker's
+    /// field is a textarea). Those entries are already in users' delegate
+    /// storage and cannot be rewritten, so the note must come back whole —
+    /// an earlier revision of this branch returned only the text after the
+    /// first newline, silently dropping everything before it.
+    #[test]
+    fn a_multi_line_note_survives_the_round_trip_intact() {
+        let summary = summarise_body_for_outbound_cache(&invite(Some("Hey!\n\nThing on Friday.")));
+        assert_eq!(
+            parse_outbound_invite_summary(&summary),
+            Some(OutboundInviteSummary {
+                note: Some("Hey!\n\nThing on Friday.".to_string()),
+            }),
+            "a multi-line note must not lose the text before its first newline"
+        );
+    }
+
+    /// The accepted false positive, pinned so it stays a known cost rather
+    /// than a surprise — and pinned on the property that BOUNDS it: whatever
+    /// the user typed still reaches the screen.
+    ///
+    /// The previous version of this test was named
+    /// `ordinary_text_is_not_mistaken_for_an_invite` and asserted only that
+    /// the summariser caches text verbatim. It never fed that output back
+    /// into the parser, which is the call that misfires — so it was green
+    /// while its name claimed the opposite of the truth.
+    #[test]
+    fn text_that_looks_like_an_invite_keeps_the_users_words() {
+        let typed = "[Invitation] to the pub at 7";
+        let body = DirectMessageBody::Text {
+            text: typed.to_string(),
+        };
+        let cached = summarise_body_for_outbound_cache(&body);
+        assert_eq!(cached, typed, "text bodies are cached verbatim");
+
+        let parsed = parse_outbound_invite_summary(&cached)
+            .expect("this DOES parse as an invite - the accepted false positive");
+        assert_eq!(
+            parsed.note.as_deref(),
+            Some("to the pub at 7"),
+            "the user's words must survive into the card, so a mislabelled \
+             bubble still shows what they actually wrote"
+        );
+    }
+
+    /// Ordinary text without the sentinel must never render as an invite.
+    #[test]
+    fn ordinary_text_does_not_parse_as_an_invite() {
+        for text in [
+            "hello there",
+            "I sent you an [Invitation] earlier",
+            "",
+            "invitation",
+            " [Invitation] leading space",
+        ] {
+            assert_eq!(
+                parse_outbound_invite_summary(text),
+                None,
+                "{text:?} was parsed as an invite summary"
+            );
+        }
+    }
 
     /// Issue freenet/river#526: the archive clock is INBOUND-only, so an
     /// outbound send no longer revives an archived thread through the
