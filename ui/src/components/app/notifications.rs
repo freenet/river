@@ -2213,26 +2213,49 @@ mod notify_gate_tests {
     /// `notify_new_messages` is `wasm`-only, so no behavioural test in this
     /// crate can reach it. Dropping the gate call would restore reactions on
     /// other people's messages with every test above still green.
+    ///
+    /// Scoped to that function's own body, NOT the whole file: the file also
+    /// contains `survives_action_gate`'s definition, so a whole-file `contains`
+    /// stays green no matter where — or whether — the call site uses it. A
+    /// mutation that moved the gate below the mode match passed exactly that
+    /// way before this was narrowed.
     #[test]
     fn notify_new_messages_applies_the_action_gate() {
-        let production = production_source();
-        assert!(
-            production
-                .contains("filter(|msg|survives_action_gate(msg,room_secrets,&self_authored))"),
-            "the new-message filter stopped applying `survives_action_gate`, \
-             so a reaction to anyone's message can notify again (#598)"
-        );
+        let body = notify_new_messages_body();
+        let gate = body
+            .find("filter(|msg|survives_action_gate(msg,room_secrets,&self_authored))")
+            .expect(
+                "the new-message filter stopped applying `survives_action_gate`, \
+                 so a reaction to anyone's message can notify again (#598)",
+            );
         // The gate must run for EVERY mode, not just inside the
         // MentionsAndReplies arm — `All` is the default, and it is where the
         // reported symptom occurred.
-        let (before_mode_match, _) = production
-            .split_once("matchmode{")
+        let mode_match = body
+            .find("matchmode{")
             .expect("the per-room NotificationMode filter is a `match mode`");
         assert!(
-            before_mode_match.contains("survives_action_gate"),
-            "the action gate moved inside the mode match, so rooms left on \
-             the default `All` mode notify on every reaction again (#598)"
+            gate < mode_match,
+            "the action gate moved to or below the mode match, so rooms left \
+             on the default `All` mode notify on every reaction again (#598)"
         );
+    }
+
+    /// `notify_new_messages`'s body, whitespace-stripped. A `pub fn` ends at
+    /// the first column-zero closing brace.
+    fn notify_new_messages_body() -> String {
+        let source = include_str!("notifications.rs");
+        let (production, _) = source
+            .split_once("mod notify_gate_tests")
+            .expect("this test module's own declaration marks the end of production code");
+        let body = production
+            .split_once("pub fn notify_new_messages(")
+            .expect("notify_new_messages is the delta-time notification entry point")
+            .1
+            .split_once("\n}\n")
+            .expect("a top-level fn ends with a column-zero closing brace")
+            .0;
+        body.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     /// The gate is only as good as the id set it is handed. Building it from
