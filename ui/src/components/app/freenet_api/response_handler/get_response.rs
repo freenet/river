@@ -602,19 +602,27 @@ pub async fn handle_get_response(
                     // Apply membership immediately on invitation acceptance so
                     // that other room members see "X joined the room" right away
                     // (not deferred until the user's first message).
-                    // Without a local identity there is no membership to
-                    // publish; treat it as "already handled" so the accept path
-                    // does not build an unsignable member record.
-                    let Some(self_vk) = room_data.self_verifying_key() else {
-                        return;
+                    //
+                    // With no locally-known identity there is no membership to
+                    // publish, so this is treated as "already a member" — it
+                    // SKIPS the membership block below and nothing else. Do not
+                    // early-return here: real work follows this block
+                    // (`rebuild_private_actions_state` and the rest of the
+                    // accept path) that has nothing to do with the identity.
+                    // Unreachable in practice on this path, which assigns
+                    // `self_sk` a few lines above.
+                    let already_member = match room_data.self_verifying_key() {
+                        None => true,
+                        Some(self_vk) => {
+                            self_vk == owner_vk
+                                || room_data
+                                    .room_state
+                                    .members
+                                    .members
+                                    .iter()
+                                    .any(|m| m.member.member_vk == self_vk)
+                        }
                     };
-                    let already_member = self_vk == owner_vk
-                        || room_data
-                            .room_state
-                            .members
-                            .members
-                            .iter()
-                            .any(|m| m.member.member_vk == self_vk);
 
                     if !already_member {
                         // Add member + any missing invite chain members
