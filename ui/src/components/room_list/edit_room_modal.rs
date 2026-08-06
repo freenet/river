@@ -52,9 +52,11 @@ pub fn EditRoomModal() -> Element {
     // Memoize if the current user is the owner of the room being edited
     let user_is_owner = use_memo(move || {
         editing_room.read().as_ref().is_some_and(|room_data| {
-            let user_vk = room_data.self_sk.verifying_key();
+            // Public half only: an unknown local identity is not the owner,
+            // which renders the modal read-only.
+            let user_vk = room_data.self_verifying_key();
             let room_vk = EDIT_ROOM_MODAL.read().room.unwrap();
-            user_vk == room_vk
+            user_vk == Some(room_vk)
         })
     });
 
@@ -210,7 +212,7 @@ pub fn EditRoomModal() -> Element {
                             // Secret Version (only for private rooms)
                             {
                                 let is_private = room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private;
-                                let is_owner = room_data.owner_vk == room_data.self_sk.verifying_key();
+                                let is_owner = room_data.is_self_owner();
                                 let secret_version = room_data.room_state.secrets.current_version;
                                 let owner_vk = room_data.owner_vk;
 
@@ -496,20 +498,27 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
 
         let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
+        // A configuration edit is signed, so it needs the private half. Fold
+        // the key into the same `Option` the "room not found" case already
+        // uses: a room whose blob carries no local signing key simply cannot
+        // publish a config change.
         let signing_data = ROOMS.with(|rooms| {
-            rooms.map.get(&owner_key).map(|room_data| {
-                (
-                    room_data.room_key(),
-                    room_data.self_sk.clone(),
-                    room_data.room_state.clone(),
-                    room_data.is_private(),
-                    room_data.get_secret().map(|(s, v)| (*s, v)),
-                )
+            rooms.map.get(&owner_key).and_then(|room_data| {
+                room_data.signing_key().cloned().map(|self_sk| {
+                    (
+                        room_data.room_key(),
+                        self_sk,
+                        room_data.room_state.clone(),
+                        room_data.is_private(),
+                        room_data.get_secret().map(|(s, v)| (*s, v)),
+                    )
+                })
             })
         });
 
         let Some((room_key, self_sk, room_state_clone, is_private, room_secret_opt)) = signing_data
         else {
+            warn!("Cannot update the room description: room or local signing key unavailable");
             return;
         };
 
@@ -706,17 +715,20 @@ fn NumericConfigField(
 
         let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
+        // Signed configuration edit: fold the private key into the same
+        // `Option` the "room not found" case already uses, so a blob without
+        // a local signing key degrades to "cannot edit" rather than panicking.
         let signing_data = ROOMS.with(|rooms| {
-            rooms.map.get(&owner_key).map(|room_data| {
-                (
-                    room_data.room_key(),
-                    room_data.self_sk.clone(),
-                    room_data.room_state.clone(),
-                )
+            rooms.map.get(&owner_key).and_then(|room_data| {
+                room_data
+                    .signing_key()
+                    .cloned()
+                    .map(|self_sk| (room_data.room_key(), self_sk, room_data.room_state.clone()))
             })
         });
 
         let Some((room_key, self_sk, room_state_clone)) = signing_data else {
+            warn!("Cannot update the room configuration: room or local signing key unavailable");
             return;
         };
 
@@ -826,17 +838,20 @@ fn MaxMembersField(
 
         let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
+        // Signed configuration edit: fold the private key into the same
+        // `Option` the "room not found" case already uses, so a blob without
+        // a local signing key degrades to "cannot edit" rather than panicking.
         let signing_data = ROOMS.with(|rooms| {
-            rooms.map.get(&owner_key).map(|room_data| {
-                (
-                    room_data.room_key(),
-                    room_data.self_sk.clone(),
-                    room_data.room_state.clone(),
-                )
+            rooms.map.get(&owner_key).and_then(|room_data| {
+                room_data
+                    .signing_key()
+                    .cloned()
+                    .map(|self_sk| (room_data.room_key(), self_sk, room_data.room_state.clone()))
             })
         });
 
         let Some((room_key, self_sk, room_state_clone)) = signing_data else {
+            warn!("Cannot update the room configuration: room or local signing key unavailable");
             return;
         };
 

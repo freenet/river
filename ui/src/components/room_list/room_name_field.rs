@@ -75,9 +75,16 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             // Get signing data and encryption info from room
             let signing_data = ROOMS.with(|rooms| {
                 if let Some(room_data) = rooms.map.get(&owner_key) {
+                    // The rename is signed, so the private half is required.
+                    // A blob that keeps its key elsewhere degrades exactly
+                    // like a missing room: the edit is dropped, with a log.
+                    let Some(self_sk) = room_data.signing_key().cloned() else {
+                        error!("No local signing key for the current room; room name edit dropped");
+                        return None;
+                    };
                     Some((
                         room_data.room_key(),
-                        room_data.self_sk.clone(),
+                        self_sk,
                         room_data.room_state.clone(),
                         room_data.is_private(),
                         room_data.get_secret().map(|(s, v)| (*s, v)),

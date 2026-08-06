@@ -2600,7 +2600,14 @@ pub fn Conversation() -> Element {
                     .next()
                     .is_some()
                 {
-                    let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
+                    // Only the PUBLIC half is needed here (own-reaction
+                    // highlighting, deputy badges). If the local identity is
+                    // unknown we fall back to the same `None` the contended
+                    // read below returns — the empty-history render — rather
+                    // than mis-attributing messages to a wrong member id.
+                    let Some(self_member_id) = room_data.self_member_id() else {
+                        return None;
+                    };
                     // Build member name lookup (reaction tooltips, @mention chips).
                     let member_names: HashMap<MemberId, String> = room_state
                         .member_info
@@ -3085,7 +3092,13 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                let self_sk = current_room_data.self_sk.clone();
+                // Reactions are signed locally. Without the private key we
+                // cannot author one, so the toggle degrades to a no-op rather
+                // than sending an unsigned (contract-rejected) message.
+                let Some(self_sk) = current_room_data.signing_key().cloned() else {
+                    warn!("Cannot toggle reaction: local signing key unavailable for this room");
+                    return;
+                };
                 let room_state_clone = current_room_data.room_state.clone();
                 let is_private = current_room_data
                     .room_state
@@ -3279,7 +3292,12 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                let self_sk = current_room_data.self_sk.clone();
+                // Deletes are signed locally; with no private key there is
+                // nothing valid to send, so the action is a no-op.
+                let Some(self_sk) = current_room_data.signing_key().cloned() else {
+                    warn!("Cannot delete message: local signing key unavailable for this room");
+                    return;
+                };
                 let room_state_clone = current_room_data.room_state.clone();
                 let is_private = current_room_data
                     .room_state
@@ -3387,7 +3405,12 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                let self_sk = current_room_data.self_sk.clone();
+                // Edits are signed locally; with no private key there is
+                // nothing valid to send, so the action is a no-op.
+                let Some(self_sk) = current_room_data.signing_key().cloned() else {
+                    warn!("Cannot edit message: local signing key unavailable for this room");
+                    return;
+                };
                 let room_state_clone = current_room_data.room_state.clone();
                 let is_private = current_room_data
                     .room_state
@@ -3532,8 +3555,15 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (current_room_opt, fresh_room_data)
             {
-                // Clone what we need for the async block
-                let self_sk = current_room_data.self_sk.clone();
+                // Clone what we need for the async block.
+                // Sending signs locally: with no private key held for this
+                // room the send degrades to a logged no-op, the same shape as
+                // the "no room selected" / "room not loaded" bails above,
+                // rather than emitting an unsignable message.
+                let Some(self_sk) = current_room_data.signing_key().cloned() else {
+                    error!("Cannot send message: local signing key unavailable for this room");
+                    return;
+                };
                 let room_state_clone = current_room_data.room_state.clone();
                 let is_private = current_room_data.is_private();
                 // Copy the secret data (get_secret returns Option<(&[u8; 32], u32)>)
@@ -4424,13 +4454,17 @@ pub fn Conversation() -> Element {
                                 let room_is_private = room_data.is_private();
                                 // Mentionable members for the @ autocomplete: every member
                                 // with a (decrypted) nickname except self, sorted by name.
-                                let self_id = MemberId::from(&room_data.self_sk.verifying_key());
+                                // Public half only. `can_participate` already
+                                // returned Ok, so this is Some here; kept as an
+                                // Option so an absent key would merely leave
+                                // self in the mention list instead of panicking.
+                                let self_id = room_data.self_member_id();
                                 let mut mention_members: Vec<(MemberId, String)> = room_data
                                     .room_state
                                     .member_info
                                     .member_info
                                     .iter()
-                                    .filter(|ami| ami.member_info.member_id != self_id)
+                                    .filter(|ami| Some(ami.member_info.member_id) != self_id)
                                     .map(|ami| {
                                         (
                                             ami.member_info.member_id,
@@ -4462,16 +4496,32 @@ pub fn Conversation() -> Element {
                                 }
                             },
                             Err(SendMessageError::UserNotMember) => {
-                                let user_vk = room_data.self_sk.verifying_key();
-                                rsx! {
-                                    NotMemberNotification {
-                                        user_verifying_key: user_vk
-                                    }
+                                // `can_participate` reports IdentityUnavailable
+                                // (below), never UserNotMember, when the key is
+                                // absent — so this is Some. Matched rather than
+                                // unwrapped so an absent key renders nothing
+                                // instead of panicking the whole conversation.
+                                match room_data.self_verifying_key() {
+                                    Some(user_vk) => rsx! {
+                                        NotMemberNotification {
+                                            user_verifying_key: user_vk
+                                        }
+                                    },
+                                    None => rsx! {},
                                 }
                             },
                             Err(SendMessageError::UserBanned) => rsx! {
                                 div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-red-700 dark:text-red-400 rounded-lg text-sm",
                                     "You have been banned from sending messages in this room."
+                                }
+                            },
+                            // Same shape as the banned notice above: the
+                            // composer is replaced by an explanation.
+                            // `NotMemberNotification` cannot be used here — it
+                            // needs the verifying key, which is what is missing.
+                            Err(SendMessageError::IdentityUnavailable) => rsx! {
+                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-red-700 dark:text-red-400 rounded-lg text-sm",
+                                    "This device doesn't hold your key for this room, so you can't send messages here."
                                 }
                             },
                         }

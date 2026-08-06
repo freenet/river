@@ -1398,7 +1398,7 @@ mod tests {
     fn critical_hash_reacts_to_self_sk() {
         let base = room_fixture();
         let mut rotated = base.clone();
-        rotated.self_sk = SigningKey::from_bytes(&[42u8; 32]);
+        rotated.self_sk = Some(SigningKey::from_bytes(&[42u8; 32]));
 
         assert_ne!(
             critical_hash(&base),
@@ -1612,15 +1612,15 @@ mod tests {
         let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let local = crate::room_data::test_minimal_room_data(vk); // self_sk = [1u8;32]
         let mut remote = crate::room_data::test_minimal_room_data(vk);
-        remote.self_sk = SigningKey::from_bytes(&[2u8; 32]); // diverged identity
+        remote.self_sk = Some(SigningKey::from_bytes(&[2u8; 32])); // diverged identity
         let current = present_slot_bytes(&remote);
         let out = reconcile_room_present(Some(&current), &vk, &local, false)
             .unwrap()
             .expect("diverged identity keeps local, must still store");
         match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
             RoomSlot::Present(r) => assert_eq!(
-                r.self_sk.to_bytes(),
-                local.self_sk.to_bytes(),
+                r.self_sk.as_ref().map(|k| k.to_bytes()),
+                local.self_sk.as_ref().map(|k| k.to_bytes()),
                 "must keep local's identity, not adopt the remote's"
             ),
             RoomSlot::Tombstone => panic!("expected Present"),
@@ -1639,6 +1639,81 @@ mod tests {
     /// Matching-identity merge (the `MergeState` branch) UNIONS `invitation_secrets`:
     /// a version only the remote (delegate-stored) copy carries is preserved, and
     /// local wins on a version collision — so a concurrent tab's private-room
+    /// Every per-room save funnels through `reconcile_room_present`, so that is
+    /// where `self_vk` has to be stamped onto the blob — otherwise the field
+    /// depends on which of the many `RoomData` construction sites happened to
+    /// build the in-memory copy, and blobs written before the field existed
+    /// would never gain it.
+    ///
+    /// This matters for the eventual relocation of the private key: `self_vk`
+    /// is how a future River will know who the local user is once `self_sk` is
+    /// no longer in the blob, and it can only rely on that if today's build has
+    /// been writing it all along.
+    #[test]
+    fn a_saved_slot_always_carries_self_vk() {
+        let vk = SigningKey::from_bytes(&[31u8; 32]).verifying_key();
+        let mut local = crate::room_data::test_minimal_room_data(vk);
+        let expected = local
+            .self_sk
+            .as_ref()
+            .expect("fixture carries a key")
+            .verifying_key();
+        // Simulate a blob loaded from an older writer: key present, self_vk not.
+        local.self_vk = None;
+
+        let out = reconcile_room_present(None, &vk, &local, false)
+            .unwrap()
+            .expect("an absent slot stores fresh");
+        let stored = match ciborium::from_reader::<RoomSlot, _>(out.as_slice()).unwrap() {
+            RoomSlot::Present(r) => r,
+            RoomSlot::Tombstone => panic!("expected Present"),
+        };
+        assert_eq!(
+            stored.self_vk,
+            Some(expected),
+            "the save path must backfill self_vk from the private key"
+        );
+        assert_eq!(
+            stored.self_sk.as_ref().map(|k| k.to_bytes()),
+            local.self_sk.as_ref().map(|k| k.to_bytes()),
+            "and must not disturb the private key while doing it"
+        );
+    }
+
+    /// A copy that merely LACKS the private key is not a different identity.
+    /// Treating it as one would send every save down the diverged-identity
+    /// branch, which discards the remote's state — so this is a data-loss
+    /// guard, not a tidiness one.
+    #[test]
+    fn a_missing_private_key_is_not_a_diverged_identity() {
+        let vk = SigningKey::from_bytes(&[32u8; 32]).verifying_key();
+        let a = crate::room_data::test_minimal_room_data(vk);
+
+        let mut no_key = a.clone();
+        no_key.backfill_self_vk();
+        no_key.self_sk = None;
+        assert!(
+            !identities_diverged(&a, &no_key),
+            "same identity, one copy just does not hold the private half"
+        );
+
+        let mut nothing = a.clone();
+        nothing.self_sk = None;
+        nothing.self_vk = None;
+        assert!(
+            !identities_diverged(&a, &nothing),
+            "a copy that names no identity says nothing, so it cannot disagree"
+        );
+
+        let mut other = a.clone();
+        other.self_sk = Some(SigningKey::from_bytes(&[33u8; 32]));
+        other.self_vk = None;
+        assert!(
+            identities_diverged(&a, &other),
+            "two NAMED and different identities really do diverge"
+        );
+    }
+
     /// secret isn't dropped (skeptical review; this path was previously untested).
     #[test]
     fn reconcile_room_present_unions_invitation_secrets() {
@@ -4484,6 +4559,21 @@ fn present_action(kind: SlotKind, explicitly_rejoined: bool) -> PresentAction {
     }
 }
 
+/// Do two copies of the same room disagree about WHO the local user is?
+///
+/// Only `true` when both copies name an identity and the two names differ.
+/// A copy that carries no identity at all (`self_sk` absent and `self_vk`
+/// absent — possible once a future River stores the key elsewhere) is not a
+/// disagreement, it is a copy with nothing to say, and the callers' "diverged"
+/// branches are all lossy (they drop the other copy's state), so silence must
+/// not trigger them.
+fn identities_diverged(a: &RoomData, b: &RoomData) -> bool {
+    match (a.self_verifying_key(), b.self_verifying_key()) {
+        (Some(x), Some(y)) => x != y,
+        _ => false,
+    }
+}
+
 /// Reconcile a `Present` save for room `owner_vk` against the delegate's
 /// current slot. Returns the `RoomSlot` bytes to store, or `None` to abort
 /// (adopt a remote leave on a background update — the round-9 fix).
@@ -4507,7 +4597,14 @@ fn reconcile_room_present(
         PresentAction::StoreFresh => local.clone(),
         PresentAction::MergeState => {
             let remote = remote.expect("MergeState implies a Present remote slot");
-            if local.self_sk != remote.self_sk {
+            // Compared by IDENTITY, not by the raw `Option<SigningKey>`. A
+            // stored copy that merely lacks the private key (a blob written by
+            // a future River that keeps it elsewhere) is not a DIFFERENT
+            // identity, and treating it as one would throw away the remote's
+            // state on every save. Unknown on either side therefore means
+            // "same identity, merge normally" — the conservative choice, since
+            // the alternative discards a concurrent tab's messages.
+            if identities_diverged(local, &remote) {
                 // Diverged identity for the same room — keep local's
                 // (local-authoritative), don't merge the other identity's
                 // state, and don't fail the whole save (M1 fix: scoped to this
@@ -4552,6 +4649,14 @@ fn reconcile_room_present(
             }
         }
     };
+
+    // The single chokepoint every per-room save passes through, so this is
+    // where `self_vk` is guaranteed to reach storage regardless of which of the
+    // many `RoomData` construction sites produced the in-memory copy. Blobs
+    // written before the field existed gain it on their next save; nothing else
+    // about the blob changes.
+    let mut merged = merged;
+    merged.backfill_self_vk();
 
     let mut out = Vec::new();
     ciborium::ser::into_writer(&RoomSlot::Present(Box::new(merged)), &mut out)
@@ -4902,10 +5007,7 @@ fn dm_prune_suppresses_outbound(current: Option<MemberId>, entry_sender: MemberI
 fn current_room_identity_member_id(owner_vk: &VerifyingKey) -> Option<MemberId> {
     use dioxus::prelude::ReadableExt;
     let rooms = ROOMS.try_read().ok()?;
-    rooms
-        .map
-        .get(owner_vk)
-        .map(|rd| MemberId::from(&rd.self_sk.verifying_key()))
+    rooms.map.get(owner_vk).and_then(|rd| rd.self_member_id())
 }
 
 /// The identity a room's cached outbound DMs must match: the in-memory prune

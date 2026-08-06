@@ -283,7 +283,7 @@ fn current_last_inbound_ts(room: &VerifyingKey, peer: MemberId) -> Option<u64> {
     use dioxus::prelude::ReadableExt;
     let rooms = ROOMS.try_read().ok()?;
     let room_data = rooms.map.get(room)?;
-    let self_id = MemberId::from(&room_data.self_sk.verifying_key());
+    let self_id = room_data.self_member_id()?;
     Some(max_inbound_ts_from_triples(
         dm_message_triples(room_data),
         self_id,
@@ -900,7 +900,12 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
     let mut room_meta: HashMap<VerifyingKey, ArchivedRoomMeta> = HashMap::new();
     let mut last_inbound_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
     for (owner_vk, room_data) in &rooms.map {
-        let self_id: MemberId = room_data.self_sk.verifying_key().into();
+        // A room whose local identity is unknown contributes no DM rows:
+        // every row here is defined relative to "self", so there is nothing
+        // meaningful to compute for it.
+        let Some(self_id) = room_data.self_member_id() else {
+            continue;
+        };
         let sealed_name = &room_data
             .room_state
             .configuration
@@ -977,7 +982,12 @@ fn current_archived_count() -> usize {
     };
     let mut last_inbound_ts: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
     for (owner_vk, room_data) in &rooms.map {
-        let self_id: MemberId = room_data.self_sk.verifying_key().into();
+        // A room whose local identity is unknown contributes no DM rows:
+        // every row here is defined relative to "self", so there is nothing
+        // meaningful to compute for it.
+        let Some(self_id) = room_data.self_member_id() else {
+            continue;
+        };
         for (peer, activity) in
             accumulate_peer_activity(owner_vk, self_id, dm_message_triples(room_data), None)
         {
@@ -1047,7 +1057,12 @@ fn build_view() -> Vec<DmRailEntry> {
 
     let mut entries: Vec<DmRailEntry> = Vec::new();
     for (owner_vk, room_data) in &rooms.map {
-        let self_id: MemberId = room_data.self_sk.verifying_key().into();
+        // A room whose local identity is unknown contributes no DM rows:
+        // every row here is defined relative to "self", so there is nothing
+        // meaningful to compute for it.
+        let Some(self_id) = room_data.self_member_id() else {
+            continue;
+        };
 
         // Decrypted room name for display.
         let sealed_name = &room_data

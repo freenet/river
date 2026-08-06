@@ -178,7 +178,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             };
             let room_data = rooms.map.get(&room)?;
 
-            let self_sk = room_data.self_sk.clone();
+            // DM bodies are ECIES-sealed to us, so rendering the thread needs
+            // the private key. Without it there is nothing to show: fall back
+            // to the same `None` a contended ROOMS read returns.
+            let self_sk = room_data.signing_key().cloned()?;
             let self_id = MemberId::from(&self_sk.verifying_key());
             let owner_id = MemberId::from(&room);
 
@@ -502,7 +505,17 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             return;
         };
 
-        let self_sk = room_data.self_sk.clone();
+        // Composing a DM signs and seals with the local key. Without it the
+        // send is refused through the composer's existing error slot rather
+        // than attempted.
+        let Some(self_sk) = room_data.signing_key().cloned() else {
+            error!("DM send: no local signing key for this room");
+            send_error.set(Some(
+                "This device doesn't hold your key for this room, so you can't send DMs here."
+                    .into(),
+            ));
+            return;
+        };
         let self_id: MemberId = (&self_sk.verifying_key()).into();
         let peer_vk = match resolve_peer_vk(&room_data, room, peer) {
             Some(vk) => vk,
@@ -723,7 +736,18 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 error!("DM purge: room data missing");
                 return;
             };
-            let self_sk = room_data.self_sk.clone();
+            // The purge envelope is signed with the local key, so with no key
+            // there is nothing to publish: bail like the "room data missing"
+            // branch above (the confirm modal is already closed).
+            let Some(self_sk) = room_data.signing_key().cloned() else {
+                error!("DM purge: no local signing key for this room");
+                send_error.set(Some(
+                    "This device doesn't hold your key for this room, so their messages \
+                     can't be deleted from here."
+                        .into(),
+                ));
+                return;
+            };
             let self_id: MemberId = (&self_sk.verifying_key()).into();
 
             let tokens: Vec<PurgeToken> = room_data
@@ -1219,10 +1243,12 @@ fn classify_invite_card_state(
     match can_participate {
         Some(Ok(())) => InviteCardState::AlreadyMember,
         Some(Err(SendMessageError::UserBanned)) => InviteCardState::Banned,
-        // `UserNotMember` and "room not loaded" both fall through to
-        // joinable — the Accept flow itself handles "not yet a member"
-        // via the normal invitation path.
-        Some(Err(SendMessageError::UserNotMember)) | None => InviteCardState::Joinable,
+        // `UserNotMember`, "room not loaded", and "we hold no key for that
+        // room" all fall through to joinable — the Accept flow itself handles
+        // "not yet a member" via the normal invitation path, and accepting is
+        // precisely what would (re)establish a local identity there.
+        Some(Err(SendMessageError::UserNotMember | SendMessageError::IdentityUnavailable))
+        | None => InviteCardState::Joinable,
     }
 }
 

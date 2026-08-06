@@ -1413,7 +1413,12 @@ pub fn MemberList() -> Element {
         };
         let room_data = rooms_read.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
-        let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
+        // Every row's "relationship to me" flag (is_self, invited_you,
+        // sponsor, network) is derived from this id, so with no locally-known
+        // identity the list has nothing meaningful to render. Degrade exactly
+        // like the room-not-in-ROOMS case two lines above: bail out of the
+        // memo and let the panel show its empty state.
+        let self_member_id: MemberId = room_data.self_member_id()?;
         let owner_id: MemberId = room_owner.into();
 
         let member_info = &room_state.member_info;
@@ -1687,7 +1692,18 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                     return;
                 };
                 if let Some(room_data) = rooms_read.map.get(&owner_key) {
-                    let verifying_key = room_data.self_sk.verifying_key();
+                    // An identity export IS the private key, so a room whose
+                    // blob keeps the key elsewhere has nothing to export.
+                    // Reuse the modal's existing "cannot export" surface
+                    // rather than inventing a new UI state.
+                    let Some(self_sk) = room_data.signing_key().cloned() else {
+                        token_text.set(
+                            "Cannot export: the signing key for this room is not stored here."
+                                .to_string(),
+                        );
+                        return;
+                    };
+                    let verifying_key = self_sk.verifying_key();
 
                     // Resolve the AuthorizedMember and invite chain for export:
                     // 1. Use cached self_authorized_member if available
@@ -1702,7 +1718,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                             invited_by: owner_id,
                             member_vk: owner_key,
                         };
-                        Some((AuthorizedMember::new(member, &room_data.self_sk), vec![]))
+                        Some((AuthorizedMember::new(member, &self_sk), vec![]))
                     } else {
                         // Look up member and invite chain from current room state
                         let params = ChatRoomParametersV1 { owner: owner_key };
@@ -1752,7 +1768,7 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
 
                         let export = IdentityExport {
                             room_owner: owner_key,
-                            signing_key: room_data.self_sk.clone(),
+                            signing_key: self_sk.clone(),
                             authorized_member,
                             invite_chain,
                             member_info,
@@ -1886,7 +1902,8 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
     crate::room_data::RoomData {
         owner_vk: owner_key,
         room_state: initial_state, // Will be fully populated on sync
-        self_sk: export.signing_key,
+        self_sk: Some(export.signing_key),
+        self_vk: None,
         contract_key,
         last_read_message_id: None,
         secrets: HashMap::new(),
@@ -1924,6 +1941,7 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
 /// owner_vk                KEEP (the room owner; identity-independent)
 /// room_state              KEEP (identity-independent shared contract state)
 /// self_sk                 REPLACE (the imported identity)
+/// self_vk                 REPLACE (derived from self_sk; paired with it)
 /// contract_key            KEEP (owner+WASM derived)
 /// last_read_message_id    KEEP (local read-tracking preference)
 /// secrets                 CLEAR+RECOMPUTE different-key (repopulate_secrets_from_state) / KEEP same-key
@@ -1943,6 +1961,7 @@ fn _room_data_swap_classification(rd: crate::room_data::RoomData) {
         owner_vk: _,
         room_state: _,
         self_sk: _,
+        self_vk: _,
         contract_key: _,
         last_read_message_id: _,
         secrets: _,
@@ -2010,8 +2029,26 @@ fn swap_room_identity_in_place(
     existing: &mut crate::room_data::RoomData,
     export: IdentityExport,
 ) -> bool {
-    let key_changed = existing.self_sk != export.signing_key;
-    existing.self_sk = export.signing_key;
+    // Compare IDENTITIES, not the stored `Option<SigningKey>`. `self_sk` may now
+    // be absent (a blob written by a River that keeps the private key
+    // elsewhere), and the two cases that absence covers must NOT be conflated:
+    //
+    // * `self_vk` still records WHICH identity this room is. Re-importing that
+    //   same identity is not a swap — the room's decrypt access is unchanged —
+    //   so the same-key merge branch is correct, and a naive
+    //   `Some(export.signing_key) != existing.self_sk` would have wrongly
+    //   cleared the kept secrets and clobbered richer local metadata.
+    // * Neither half stored means the identity was UNKNOWN, which the
+    //   comparison below correctly reports as a change: we are gaining an
+    //   identity we did not have.
+    //
+    // `self_vk` is REPLACE-paired-with-`self_sk` in the classification table
+    // above, so both halves are written together, unconditionally, and can
+    // never drift apart.
+    let imported_vk = export.signing_key.verifying_key();
+    let key_changed = existing.self_verifying_key() != Some(imported_vk);
+    existing.self_sk = Some(export.signing_key);
+    existing.self_vk = Some(imported_vk);
 
     if key_changed {
         // DIFFERENT identity (a genuine swap): REPLACE all identity metadata with
@@ -2272,7 +2309,14 @@ fn complete_identity_import(
                                 // its own migration owns `key_migrated_to_delegate`
                                 // — don't mark it for a superseded key
                                 // (freenet/river#414).
-                                if rd.self_sk != new_sk {
+                                // Compared by IDENTITY, not by the stored
+                                // `Option<SigningKey>`: a room that no longer
+                                // holds the private half is not the identity
+                                // we migrated, so the conservative answer
+                                // (bail, leave `key_migrated_to_delegate`
+                                // alone) is the same one this guard already
+                                // gives for a superseded key.
+                                if rd.self_verifying_key() != Some(new_sk.verifying_key()) {
                                     return;
                                 }
                                 rd.key_migrated_to_delegate = true;
@@ -2750,9 +2794,14 @@ mod tests {
 
         assert!(key_changed, "swapping to a different key reports a change");
         assert_eq!(
-            existing.self_sk.to_bytes(),
-            new_sk.to_bytes(),
+            existing.signing_key().map(|sk| sk.to_bytes()),
+            Some(new_sk.to_bytes()),
             "self_sk must become the imported identity"
+        );
+        assert_eq!(
+            existing.self_vk,
+            Some(new_sk.verifying_key()),
+            "self_vk must be written alongside self_sk so the two cannot drift"
         );
         assert_eq!(
             existing.room_state, kept_state,
@@ -2787,7 +2836,10 @@ mod tests {
 
         swap_room_identity_in_place(&mut existing, export);
 
-        assert_eq!(existing.self_sk.to_bytes(), new_sk.to_bytes());
+        assert_eq!(
+            existing.signing_key().map(|sk| sk.to_bytes()),
+            Some(new_sk.to_bytes())
+        );
         assert_eq!(
             existing.secrets.get(&0u32),
             Some(&[0xABu8; 32]),

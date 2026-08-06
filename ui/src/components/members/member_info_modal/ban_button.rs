@@ -36,7 +36,13 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
             current_room_data_signal.read().as_ref(),
         ) {
             let room_key = room_data.room_key();
-            let self_sk = room_data.self_sk.clone();
+            // Banning signs a `UserBan`, so it needs the private half. A room
+            // whose blob carries no local signing key simply cannot ban;
+            // refuse the action rather than panicking.
+            let Some(self_sk) = room_data.signing_key().cloned() else {
+                warn!("Cannot ban: no local signing key for this room");
+                return;
+            };
             let room_state_clone = room_data.room_state.clone();
             let banned_by = MemberId::from(&self_sk.verifying_key());
 

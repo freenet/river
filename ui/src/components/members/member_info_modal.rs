@@ -50,10 +50,7 @@ pub fn MemberInfoModal() -> Element {
             crate::util::signal_guard::schedule_nudge();
             return None;
         };
-        rooms
-            .map
-            .get(&key)
-            .map(|r| MemberId::from(&r.self_sk.verifying_key()))
+        rooms.map.get(&key).and_then(|r| r.self_member_id())
     });
 
     // Memoized values

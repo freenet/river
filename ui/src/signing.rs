@@ -743,17 +743,71 @@ mod tests {
         );
     }
 
-    /// freenet/river#512 rests on `RoomData::self_sk` being present and
-    /// authoritative — the send path signs with it and never consults the
-    /// delegate. If it ever becomes optional (delegate-only custody, a
-    /// hardware key), the message path needs rethinking rather than an
-    /// `unwrap`, and this is what says so at compile time.
+    /// freenet/river#512 rests on the send path signing LOCALLY and never
+    /// waiting on the delegate. It used to rest on a second thing as well —
+    /// `RoomData::self_sk` being infallibly present — and the previous version
+    /// of this test asserted exactly that at compile time, with the note that
+    /// "if it ever becomes optional (delegate-only custody, a hardware key),
+    /// the message path needs rethinking rather than an `unwrap`".
+    ///
+    /// That has now happened: `self_sk` is `Option<SigningKey>` so that a blob
+    /// written by a future River which keeps the key elsewhere still decodes
+    /// here (see the field docs). This build still always WRITES the key, so
+    /// #512's local-signing property is untouched in practice. What changed is
+    /// the obligation the old test named: the send path must degrade, not
+    /// `unwrap`.
+    ///
+    /// So this pins the successor invariant in both halves — the accessor is
+    /// fallible (compile time), and no signing path recovers the key by
+    /// unwrapping it (source scrape).
     #[test]
-    fn the_send_path_always_has_a_local_signing_key() {
-        fn assert_plain_signing_key(room: &crate::room_data::RoomData) -> &SigningKey {
-            &room.self_sk
+    fn the_send_path_handles_a_missing_local_signing_key() {
+        fn assert_fallible_signing_key(room: &crate::room_data::RoomData) -> Option<&SigningKey> {
+            room.signing_key()
         }
-        let _ = assert_plain_signing_key;
+        let _ = assert_fallible_signing_key;
+
+        // Needles are assembled at runtime so this test's own source cannot
+        // match them (the `include_str!` self-match trap).
+        let unwrap = format!("{}{}", ".unwra", "p()");
+        let expect = format!("{}{}", ".expec", "t(");
+        let accessor = "signing_key()";
+        let field = "self_sk";
+
+        for (name, src) in [
+            (
+                "conversation.rs",
+                include_str!("components/conversation.rs"),
+            ),
+            ("room_data.rs", include_str!("room_data.rs")),
+            (
+                "dm_thread_modal.rs",
+                include_str!("components/direct_messages/dm_thread_modal.rs"),
+            ),
+            (
+                "direct_messages.rs",
+                include_str!("components/direct_messages.rs"),
+            ),
+        ] {
+            // Strip the test module so a test's own deliberate unwrap of a
+            // fixture key does not trip the scan.
+            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for needle in [
+                format!("{accessor}{unwrap}"),
+                format!("{accessor}{expect}"),
+                format!("{field}{unwrap}"),
+                format!("{field}{expect}"),
+            ] {
+                assert!(
+                    !prod.contains(&needle),
+                    "{name} recovers the local signing key with `{needle}`. \
+                     `self_sk` is deliberately optional so a future blob without \
+                     it still decodes; unwrapping it converts that tolerance back \
+                     into a panic. Degrade instead (return None/Err, or log and \
+                     skip)."
+                );
+            }
+        }
     }
 
     /// freenet/river#414 (Codex round-8): an AUTHORITATIVE identity choice records

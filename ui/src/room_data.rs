@@ -30,6 +30,11 @@ use std::collections::HashMap;
 pub enum SendMessageError {
     UserNotMember,
     UserBanned,
+    /// This device does not hold the local user's key for this room, so it
+    /// cannot sign anything here. Distinct from `UserNotMember` on purpose:
+    /// the user may well be a member, we just cannot prove it. Only reachable
+    /// from a `RoomData` whose `self_sk` is absent (see the field docs).
+    IdentityUnavailable,
 }
 
 /// Rank of an identity the user chose DELIBERATELY (identity import,
@@ -193,7 +198,43 @@ pub fn record_identity_source(
 pub struct RoomData {
     pub owner_vk: VerifyingKey,
     pub room_state: ChatRoomStateV1,
-    pub self_sk: SigningKey,
+    /// The local user's private signing key for this room.
+    ///
+    /// **Optional at the serde boundary on purpose — do NOT make this a
+    /// required field again.** It is `Option` so that a blob written by a
+    /// FUTURE River that no longer stores the private key here still decodes
+    /// in THIS build. A required CBOR field fails the whole
+    /// [`RoomSlot`] decode when absent, and a `RoomSlot` that fails to decode
+    /// does not degrade — the room *vanishes* from the user's list. Shipping
+    /// the tolerant reader well ahead of any writer change is what makes the
+    /// eventual relocation of the key survivable (see the "reader tolerance"
+    /// step in the key-storage staging plan).
+    ///
+    /// This build still ALWAYS writes `Some(..)`: the key has not moved, and
+    /// it must not move until a mechanism exists for private keys to survive
+    /// a delegate re-key. Secrets in the delegate's `signing_key:` namespace
+    /// do NOT survive one today, and River re-keys roughly weekly, so
+    /// relocating the key first would destroy every existing user's identity.
+    ///
+    /// Read it through [`RoomData::signing_key`] rather than matching on the
+    /// field, and prefer [`RoomData::self_verifying_key`] wherever only the
+    /// public half is needed.
+    #[serde(default)]
+    pub self_sk: Option<SigningKey>,
+    /// The local user's verifying key (the public half of [`Self::self_sk`]).
+    ///
+    /// Persisted so that the many `MemberId` / owner-check / "is this me"
+    /// sites can answer without reaching for the private key at all. Today it
+    /// is pure redundancy — `self_sk` is present and authoritative, and
+    /// [`RoomData::self_verifying_key`] derives from it in preference to this
+    /// field, so a stale or mismatched value here can never override the real
+    /// key. Once the private key moves out of this blob, this becomes the only
+    /// way the UI knows who the local user is in this room.
+    ///
+    /// `None` for blobs written before this field existed;
+    /// [`RoomData::backfill_self_vk`] populates it on load.
+    #[serde(default)]
+    pub self_vk: Option<VerifyingKey>,
     pub contract_key: ContractKey,
     /// The last message ID that was read by the user (for unread tracking).
     /// Messages after this ID from other users are considered unread when
@@ -348,6 +389,60 @@ pub(crate) fn current_secret_from_state(
 }
 
 impl RoomData {
+    /// The local user's private signing key for this room, if this build still
+    /// holds it locally.
+    ///
+    /// `None` means the blob was written by a River that keeps the key
+    /// elsewhere. No shipped writer does that yet, so in practice this is
+    /// always `Some` today — but every caller must still handle `None` without
+    /// panicking, because the whole point of the tolerant reader is that a
+    /// future writer CAN produce such a blob and this build must survive it.
+    /// The graceful behaviour is "this identity cannot act": skip the signing
+    /// or decryption, log, and leave the rest of the room readable.
+    pub fn signing_key(&self) -> Option<&SigningKey> {
+        self.self_sk.as_ref()
+    }
+
+    /// The local user's verifying key for this room, if known.
+    ///
+    /// Prefers deriving from the private key, which is authoritative whenever
+    /// it is present, and falls back to the persisted [`Self::self_vk`]. That
+    /// order matters: it makes a stale or tampered `self_vk` unable to change
+    /// who the UI thinks it is while the real key is in hand.
+    pub fn self_verifying_key(&self) -> Option<VerifyingKey> {
+        match &self.self_sk {
+            Some(sk) => Some(sk.verifying_key()),
+            None => self.self_vk,
+        }
+    }
+
+    /// The local user's [`MemberId`] in this room, if known.
+    pub fn self_member_id(&self) -> Option<MemberId> {
+        self.self_verifying_key().as_ref().map(MemberId::from)
+    }
+
+    /// True when the local user is this room's owner. `false` when the local
+    /// identity is unknown — an unknown identity is not the owner, and every
+    /// caller of this treats "not owner" as the safe, read-only answer.
+    pub fn is_self_owner(&self) -> bool {
+        self.self_verifying_key() == Some(self.owner_vk)
+    }
+
+    /// Populate [`Self::self_vk`] from the private key when it is missing.
+    ///
+    /// Called on every path that decodes a `RoomData` out of delegate storage,
+    /// so that a blob written before `self_vk` existed gains the field the next
+    /// time it is saved. Never overwrites an existing value with a different
+    /// one — see [`Self::self_verifying_key`] for why the private key stays
+    /// authoritative for *reads*.
+    pub fn backfill_self_vk(&mut self) {
+        if self.self_vk.is_none() {
+            if let Some(sk) = &self.self_sk {
+                self.self_vk = Some(sk.verifying_key());
+            }
+        }
+    }
+
     /// Regenerate the contract_key from the owner_vk using the current WASM.
     /// This ensures the contract_key always matches the bundled WASM, which may
     /// have been updated since the room was first created/stored.
@@ -523,7 +618,17 @@ impl RoomData {
         // (secret_version, ciphertext, nonce, sender_ephemeral_x25519_pk_bytes)
         type PendingBlob = (u32, Vec<u8>, [u8; 12], [u8; 32]);
 
-        let member_id = MemberId::from(&self.self_sk.verifying_key());
+        // Every blob below is ECIES-sealed to this member and can only be
+        // opened with the private key. Without it there is nothing to
+        // repopulate, so report zero rather than pretending to have tried.
+        let Some(self_sk) = self.signing_key().cloned() else {
+            warn!(
+                "repopulate_secrets_from_state: no local signing key for this room; \
+                 cannot decrypt owner-issued secrets"
+            );
+            return 0;
+        };
+        let member_id = MemberId::from(&self_sk.verifying_key());
 
         // Snapshot the member's encrypted_secrets blobs so we can release
         // the borrow on `room_state` before the `&mut self` calls below.
@@ -551,7 +656,6 @@ impl RoomData {
             })
             .collect();
 
-        let self_sk = self.self_sk.clone();
         let mut decrypted_count = 0usize;
         for (version, ciphertext, nonce, ephemeral_key_bytes) in pending {
             match decrypt_secret_from_member_blob_raw(
@@ -646,8 +750,9 @@ impl RoomData {
             return false;
         }
 
-        // Only the owner can rotate
-        if self.owner_vk != self.self_sk.verifying_key() {
+        // Only the owner can rotate. An unknown local identity is not the
+        // owner, so it never needs to rotate.
+        if !self.is_self_owner() {
             return false;
         }
 
@@ -717,7 +822,14 @@ impl RoomData {
     /// (every cached ancestor up to the owner) closes that gap (freenet/river
     /// #411 round 8).
     fn is_self_enforced_banned(&self) -> bool {
-        let self_id = MemberId::from(&self.self_sk.verifying_key());
+        // With no local identity there is nobody for a ban to name. Reporting
+        // "not banned" matches what every caller wants from an unknown
+        // identity: the ban check must not be the thing that decides the user
+        // can't act — `can_send_message` / `can_participate` refuse below on
+        // the identity itself, with an accurate reason.
+        let Some(self_id) = self.self_member_id() else {
+            return false;
+        };
         let mut members = self.room_state.members.clone();
         if !members.members.iter().any(|m| m.member.id() == self_id) {
             if let Some(self_member) = &self.self_authorized_member {
@@ -744,7 +856,16 @@ impl RoomData {
     /// A user is considered a member if they are the owner, are in the active
     /// members list, or have a stored invitation (self_authorized_member).
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
-        let verifying_key = self.self_sk.verifying_key();
+        // Sending means producing a SIGNED message, so this needs the private
+        // key — not merely a known identity. Gating on `self_verifying_key`
+        // alone would answer `Ok` for a copy that knows who it is but cannot
+        // sign, which shows the user a composer whose every send is silently
+        // rejected. Reported as its own reason rather than mislabelled
+        // "not a member": the user may well be a member.
+        let Some(self_sk) = self.signing_key() else {
+            return Err(SendMessageError::IdentityUnavailable);
+        };
+        let verifying_key = self_sk.verifying_key();
 
         // Check if banned first — using the ENFORCING banned set (deputy-aware),
         // not the raw bans list. An inert ban (revoked-deputy tombstone,
@@ -783,7 +904,13 @@ impl RoomData {
     /// Check if the user can participate in the room (send messages, edit profile).
     /// Returns Ok if user is not banned AND (is owner OR has self_authorized_member OR is in members list).
     pub fn can_participate(&self) -> Result<(), SendMessageError> {
-        let verifying_key = self.self_sk.verifying_key();
+        // Participating means publishing a signed record, so the same rule as
+        // `can_send_message` applies: the PRIVATE key is required, not just a
+        // known identity.
+        let Some(self_sk) = self.signing_key() else {
+            return Err(SendMessageError::IdentityUnavailable);
+        };
+        let verifying_key = self_sk.verifying_key();
 
         // Check if banned first — using the ENFORCING banned set (deputy-aware),
         // not the raw bans list; an inert ban removes nobody (freenet/river#411
@@ -822,7 +949,10 @@ impl RoomData {
     /// AuthorizedMember is only captured once (migration path for older rooms).
     /// MemberInfo is always updated to the latest version so nickname edits are preserved.
     pub fn capture_self_membership_data(&mut self, parameters: &ChatRoomParametersV1) {
-        let verifying_key = self.self_sk.verifying_key();
+        // Nothing to capture for an identity we cannot name.
+        let Some(verifying_key) = self.self_verifying_key() else {
+            return;
+        };
         if verifying_key == self.owner_vk {
             return; // Owner doesn't need this
         }
@@ -901,7 +1031,9 @@ impl RoomData {
         new_member_info: AuthorizedMemberInfo,
         nickname: String,
     ) {
-        if MemberId::from(&self.self_sk.verifying_key()) != edited_member {
+        // Only cache the edit when we can confirm it is OUR member_info.
+        // Without a local identity we cannot, so cache nothing.
+        if self.self_member_id() != Some(edited_member) {
             return;
         }
         self.self_member_info = Some(new_member_info);
@@ -931,7 +1063,14 @@ impl RoomData {
         use river_core::room_state::member_info::MAX_DEPUTIES;
         use river_core::room_state::ChatRoomStateV1Delta;
 
-        let self_id = MemberId::from(&self.self_sk.verifying_key());
+        // Granting or revoking a deputy republishes our OWN signed
+        // member_info, so it needs the private key. Refuse up front rather
+        // than build a delta we cannot sign.
+        let Some(self_sk) = self.signing_key().cloned() else {
+            error!("apply_deputy_change: no local signing key for this room");
+            return false;
+        };
+        let self_id = MemberId::from(&self_sk.verifying_key());
 
         // The viewer's CANONICAL signed member_info (highest member_info_rank:
         // version, then signature digest) — NOT a bare first-match. `verify`
@@ -982,7 +1121,6 @@ impl RoomData {
             preferred_nickname: current_self.member_info.preferred_nickname.clone(),
             deputies,
         };
-        let self_sk = self.self_sk.clone();
         let authorized = AuthorizedMemberInfo::new_with_member_key(new_info, &self_sk);
 
         // Re-add ourselves if we were pruned for inactivity — a
@@ -1032,7 +1170,13 @@ impl RoomData {
         Option<river_core::room_state::member::MembersDelta>,
         Option<Vec<AuthorizedMemberInfo>>,
     ) {
-        let self_vk = self.self_sk.verifying_key();
+        // The delta re-adds us AND re-signs our member_info, so both halves
+        // need the private key. With no identity there is nothing to rejoin
+        // as: return the same "nothing to do" pair the not-pruned case does.
+        let Some(self_sk) = self.signing_key() else {
+            return (None, None);
+        };
+        let self_vk = self_sk.verifying_key();
 
         // Owner is never pruned
         let is_in_members = self_vk == self.owner_vk
@@ -1117,7 +1261,7 @@ impl RoomData {
                             preferred_nickname,
                             deputies: Vec::new(),
                         },
-                        &self.self_sk,
+                        self_sk,
                     )
                 })
             };
@@ -1167,7 +1311,11 @@ impl RoomData {
     /// room secret is not yet present in `state` this returns `None`
     /// (deferring the heal) rather than publish a plaintext nickname.
     pub fn build_member_info_heal(&self, state: &ChatRoomStateV1) -> Option<AuthorizedMemberInfo> {
-        let self_vk = self.self_sk.verifying_key();
+        // A non-owner's member_info is only valid self-signed, so the heal is
+        // impossible without the private key. Defer exactly as it already does
+        // for a private room whose secret has not arrived.
+        let self_sk = self.signing_key()?;
+        let self_vk = self_sk.verifying_key();
         if self_vk == self.owner_vk {
             return None; // the owner's member_info is managed separately
         }
@@ -1216,7 +1364,7 @@ impl RoomData {
                     return Some(stored.clone());
                 }
             }
-            let (secret, version) = current_secret_from_state(state, &self.self_sk)?;
+            let (secret, version) = current_secret_from_state(state, self_sk)?;
             // The nickname the user picked at join time if we still have
             // it (the common case for a private-room join whose seal was
             // deferred — see `self_nickname`), else a generated default.
@@ -1234,10 +1382,7 @@ impl RoomData {
                 preferred_nickname: seal_bytes(nickname.as_bytes(), &secret, version),
                 deputies: Vec::new(),
             };
-            return Some(AuthorizedMemberInfo::new_with_member_key(
-                info,
-                &self.self_sk,
-            ));
+            return Some(AuthorizedMemberInfo::new_with_member_key(info, self_sk));
         }
 
         // Public room — a public nickname is not sensitive. Prefer an
@@ -1259,10 +1404,7 @@ impl RoomData {
             preferred_nickname: SealedBytes::public(nickname.into_bytes()),
             deputies: Vec::new(),
         };
-        Some(AuthorizedMemberInfo::new_with_member_key(
-            info,
-            &self.self_sk,
-        ))
+        Some(AuthorizedMemberInfo::new_with_member_key(info, self_sk))
     }
 
     pub fn owner_id(&self) -> MemberId {
@@ -1330,8 +1472,13 @@ impl RoomData {
             return Err("Cannot rotate secret for public room".to_string());
         }
 
-        // Only the room owner can rotate secrets
-        if self.owner_vk != self.self_sk.verifying_key() {
+        // Only the room owner can rotate secrets. Rotation also DERIVES the
+        // new secret from the owner's seed and signs the record, so the
+        // private key is required on top of the ownership check.
+        let Some(self_sk) = self.signing_key().cloned() else {
+            return Err("No local signing key for this room; cannot rotate the secret".to_string());
+        };
+        if self.owner_vk != self_sk.verifying_key() {
             return Err("Only room owner can rotate secrets".to_string());
         }
 
@@ -1355,7 +1502,7 @@ impl RoomData {
         // `derive_room_secret`) converges with this UI path via the
         // contract's CRDT dedup.
         let new_secret = river_core::key_derivation::derive_room_secret(
-            &self.self_sk.to_bytes(),
+            &self_sk.to_bytes(),
             &self.owner_vk,
             new_version,
         );
@@ -1367,7 +1514,7 @@ impl RoomData {
             created_at: get_current_system_time(),
         };
 
-        let authorized_version = AuthorizedSecretVersionRecord::new(secret_version, &self.self_sk);
+        let authorized_version = AuthorizedSecretVersionRecord::new(secret_version, &self_sk);
 
         // Get all current members, excluding banned members. We pair
         // each `MemberId` with their `VerifyingKey` so the shared
@@ -1413,7 +1560,7 @@ impl RoomData {
         // (Ivvor 2026-05-17).
         let new_encrypted_secrets =
             river_core::room_state::secret::build_rotation_encrypted_secrets(
-                &self.self_sk,
+                &self_sk,
                 &self.owner_vk,
                 owner_id,
                 new_version,
@@ -1445,6 +1592,9 @@ impl RoomData {
         if !self.is_private() {
             return None;
         }
+
+        // Every blob below is owner-signed, so the private key is required.
+        let self_sk = self.signing_key()?;
 
         let (room_secret, current_version) = self.get_secret()?;
 
@@ -1511,7 +1661,7 @@ impl RoomData {
                 };
 
                 let authorized_encrypted_secret =
-                    AuthorizedEncryptedSecretForMember::new(encrypted_secret, &self.self_sk);
+                    AuthorizedEncryptedSecretForMember::new(encrypted_secret, self_sk);
 
                 new_encrypted_secrets.push(authorized_encrypted_secret);
             }
@@ -1713,7 +1863,8 @@ pub(crate) fn test_minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
     RoomData {
         owner_vk,
         room_state: ChatRoomStateV1::default(),
-        self_sk: SigningKey::from_bytes(&[1u8; 32]),
+        self_sk: Some(SigningKey::from_bytes(&[1u8; 32])),
+        self_vk: None,
         contract_key,
         last_read_message_id: None,
         secrets: HashMap::new(),
@@ -1864,7 +2015,8 @@ impl Rooms {
         let room_data = RoomData {
             owner_vk,
             room_state,
-            self_sk,
+            self_sk: Some(self_sk),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets,
@@ -2083,9 +2235,26 @@ impl Rooms {
             // Identity conflict: decide by SOURCE AUTHORITY, not arrival order
             // (freenet/river#527). A strictly newer delegate generation wins;
             // anything else keeps the local identity.
+            //
+            // Compared by IDENTITY (`self_verifying_key`), not by the raw
+            // private-key field. Two copies conflict when they disagree about
+            // WHO the user is, and a copy that simply does not carry the
+            // private key is not a disagreement — it is a copy with less to
+            // say. Comparing the raw `Option<SigningKey>` would report a
+            // conflict the moment either side omitted the key, and the
+            // `KeepLocal` arm `continue`s, i.e. drops that room's incoming
+            // state for the pass. An unknown identity on either side therefore
+            // means "no conflict".
             let mut adopt_incoming_identity = false;
             if let Some(existing) = self.map.get(&vk) {
-                if existing.self_sk != room_data.self_sk {
+                let identities_conflict = match (
+                    existing.self_verifying_key(),
+                    room_data.self_verifying_key(),
+                ) {
+                    (Some(local), Some(incoming)) => local != incoming,
+                    _ => false,
+                };
+                if identities_conflict {
                     use dioxus::logger::tracing::warn;
                     let local_rank = ranks
                         .identity
@@ -2505,7 +2674,8 @@ mod tests {
         let mut room_data = RoomData {
             owner_vk,
             room_state,
-            self_sk: stale_sk,
+            self_sk: Some(stale_sk),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: HashMap::new(),
@@ -2527,7 +2697,7 @@ mod tests {
         );
 
         // After updating self_sk to the invitee's key, user should be a member
-        room_data.self_sk = invitee_sk;
+        room_data.self_sk = Some(invitee_sk);
         assert_eq!(room_data.can_send_message(), Ok(()));
     }
 
@@ -2579,7 +2749,8 @@ mod tests {
         let mut room_data = RoomData {
             owner_vk,
             room_state,
-            self_sk: invitee_sk.clone(),
+            self_sk: Some(invitee_sk.clone()),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: HashMap::new(),
@@ -2649,7 +2820,8 @@ mod tests {
             RoomData {
                 owner_vk,
                 room_state,
-                self_sk: sk,
+                self_sk: Some(sk),
+                self_vk: None,
                 contract_key,
                 last_read_message_id: None,
                 secrets: HashMap::new(),
@@ -2718,7 +2890,8 @@ mod tests {
         RoomData {
             owner_vk,
             room_state,
-            self_sk: invitee_sk.clone(),
+            self_sk: Some(invitee_sk.clone()),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: HashMap::new(),
@@ -2849,8 +3022,14 @@ mod tests {
         );
         // Room C kept the LOCAL (new) identity; the stale incoming one was skipped.
         assert_eq!(
-            local.map.get(&vk_c).unwrap().self_sk.to_bytes(),
-            new_sk_c.to_bytes(),
+            local
+                .map
+                .get(&vk_c)
+                .unwrap()
+                .self_sk
+                .as_ref()
+                .map(|k| k.to_bytes()),
+            Some(new_sk_c.to_bytes()),
             "the conflicting room must keep the local (current) identity"
         );
     }
@@ -3412,8 +3591,14 @@ mod tests {
             )
             .expect("first merge");
         assert_eq!(
-            local.map.get(&vk).unwrap().self_sk.to_bytes(),
-            old_identity.to_bytes(),
+            local
+                .map
+                .get(&vk)
+                .unwrap()
+                .self_sk
+                .as_ref()
+                .map(|k| k.to_bytes()),
+            Some(old_identity.to_bytes()),
             "precondition: the first responder seeds the room"
         );
 
@@ -3428,8 +3613,14 @@ mod tests {
             .expect("second merge");
 
         assert_eq!(
-            local.map.get(&vk).unwrap().self_sk.to_bytes(),
-            current_identity.to_bytes(),
+            local
+                .map
+                .get(&vk)
+                .unwrap()
+                .self_sk
+                .as_ref()
+                .map(|k| k.to_bytes()),
+            Some(current_identity.to_bytes()),
             "the newer delegate generation must correct the identity the older one \
              seeded — arrival order must not decide (freenet/river#527)"
         );
@@ -3477,8 +3668,14 @@ mod tests {
             .expect("second merge");
 
         assert_eq!(
-            local.map.get(&vk).unwrap().self_sk.to_bytes(),
-            current_identity.to_bytes(),
+            local
+                .map
+                .get(&vk)
+                .unwrap()
+                .self_sk
+                .as_ref()
+                .map(|k| k.to_bytes()),
+            Some(current_identity.to_bytes()),
             "an older generation arriving later must not overwrite a newer one"
         );
     }
@@ -3511,8 +3708,14 @@ mod tests {
             .expect("merge");
 
         assert_eq!(
-            local.map.get(&vk).unwrap().self_sk.to_bytes(),
-            imported.to_bytes(),
+            local
+                .map
+                .get(&vk)
+                .unwrap()
+                .self_sk
+                .as_ref()
+                .map(|k| k.to_bytes()),
+            Some(imported.to_bytes()),
             "an explicitly-chosen identity must outrank every delegate generation (#414)"
         );
     }
@@ -3543,8 +3746,14 @@ mod tests {
             .expect("merge");
 
         assert_eq!(
-            local.map.get(&vk).unwrap().self_sk.to_bytes(),
-            in_session.to_bytes(),
+            local
+                .map
+                .get(&vk)
+                .unwrap()
+                .self_sk
+                .as_ref()
+                .map(|k| k.to_bytes()),
+            Some(in_session.to_bytes()),
             "a room with no recorded source must not be overwritten by a load"
         );
         assert!(
@@ -3604,8 +3813,8 @@ mod tests {
 
         let merged = local.map.get(&vk).unwrap();
         assert_eq!(
-            merged.self_sk.to_bytes(),
-            current_identity.to_bytes(),
+            merged.self_sk.as_ref().map(|k| k.to_bytes()),
+            Some(current_identity.to_bytes()),
             "identity comes from the newer generation"
         );
         assert_eq!(
@@ -3698,6 +3907,7 @@ mod tests {
             // ADOPTED copy. Using the local values would defeat the adopt.
             owner_vk: _,
             self_sk: _,
+            self_vk: _,
             contract_key: _,
             self_authorized_member: _,
             invite_chain: _,
@@ -3814,8 +4024,14 @@ mod tests {
              and, if this pass is the one that re-saves, is stranded for good"
         );
         assert_eq!(
-            local.map.get(&vk).unwrap().self_sk.to_bytes(),
-            old_identity.to_bytes(),
+            local
+                .map
+                .get(&vk)
+                .unwrap()
+                .self_sk
+                .as_ref()
+                .map(|k| k.to_bytes()),
+            Some(old_identity.to_bytes()),
             "and it must still hold the identity it had before the failed adopt"
         );
     }
@@ -3848,8 +4064,14 @@ mod tests {
         }
 
         assert_eq!(
-            local.map.get(&vk).unwrap().self_sk.to_bytes(),
-            id_new.to_bytes(),
+            local
+                .map
+                .get(&vk)
+                .unwrap()
+                .self_sk
+                .as_ref()
+                .map(|k| k.to_bytes()),
+            Some(id_new.to_bytes()),
             "the newest generation must win across three sources in any order"
         );
         assert_eq!(
@@ -3959,8 +4181,14 @@ mod tests {
             .expect("merge");
 
         assert_eq!(
-            local.map.get(&vk).unwrap().self_sk.to_bytes(),
-            local_sk.to_bytes(),
+            local
+                .map
+                .get(&vk)
+                .unwrap()
+                .self_sk
+                .as_ref()
+                .map(|k| k.to_bytes()),
+            Some(local_sk.to_bytes()),
             "plain merge must be unchanged: local identity wins"
         );
     }
@@ -4077,7 +4305,7 @@ mod tests {
         let owner_id: MemberId = owner_sk.verifying_key().into();
 
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
         room.self_member_info = None;
         room.self_nickname = Some("UserPicked".to_string());
         let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
@@ -4121,7 +4349,7 @@ mod tests {
         let owner_id: MemberId = owner_sk.verifying_key().into();
 
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
         room.self_member_info = None;
         room.self_nickname = Some("UserPicked".to_string());
         // No secret available to seal with.
@@ -4188,7 +4416,7 @@ mod tests {
         let owner_id: MemberId = owner_sk.verifying_key().into();
 
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
         room.self_nickname = Some("UserPicked".to_string());
         let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
         let public_entry = MemberInfo {
@@ -4236,7 +4464,7 @@ mod tests {
         let owner_id: MemberId = owner_sk.verifying_key().into();
 
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
         let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
         let private_entry = MemberInfo {
             member_id: MemberId::from(&member_sk.verifying_key()),
@@ -4478,7 +4706,7 @@ mod tests {
         // Private room; `member_sk` is in `members` with no member_info
         // (stranded). self is the member.
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
         // The heal reads the secret from the network `state` it is given,
         // so that state must carry an encrypted-secret blob for the
         // member (the heal does NOT trust `self.secrets`).
@@ -4518,7 +4746,7 @@ mod tests {
         // has not arrived yet). make_private_owner_room seeds only
         // `secrets.versions`, not `encrypted_secrets`.
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
 
         let network_state = room.room_state.clone();
         // No secret in `state` to seal the nickname → the heal must defer
@@ -4566,7 +4794,7 @@ mod tests {
         let member_sk = SigningKey::generate(&mut rng);
 
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
         let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
         append_encrypted_secret_for(
             &mut room.room_state,
@@ -4626,7 +4854,7 @@ mod tests {
         let owner_sk = SigningKey::generate(&mut rng);
         let member_sk = SigningKey::generate(&mut rng);
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
         let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
         append_encrypted_secret_for(
             &mut room.room_state,
@@ -4689,7 +4917,7 @@ mod tests {
         let member_sk = SigningKey::generate(&mut rng);
 
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
         room.self_member_info = None;
         room.self_nickname = Some("UserPicked".to_string());
         let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
@@ -4793,7 +5021,7 @@ mod tests {
         let member_sk = SigningKey::generate(&mut rng);
 
         let mut room = make_private_owner_room(&owner_sk, &member_sk);
-        room.self_sk = member_sk.clone();
+        room.self_sk = Some(member_sk.clone());
         room.self_nickname = Some("JoinTimeName".to_string());
         let v0_secret = *room.secrets.get(&0).expect("v0 secret seeded");
         append_encrypted_secret_for(
@@ -4928,7 +5156,8 @@ mod tests {
         RoomData {
             owner_vk,
             room_state,
-            self_sk: owner_sk.clone(),
+            self_sk: Some(owner_sk.clone()),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets,
@@ -5234,7 +5463,8 @@ mod tests {
             RoomData {
                 owner_vk,
                 room_state: state,
-                self_sk: member_sk.clone(),
+                self_sk: Some(member_sk.clone()),
+                self_vk: None,
                 contract_key,
                 last_read_message_id: None,
                 secrets: HashMap::new(),
@@ -5683,7 +5913,8 @@ mod tests {
             RoomData {
                 owner_vk,
                 room_state: state,
-                self_sk: member_sk,
+                self_sk: Some(member_sk),
+                self_vk: None,
                 contract_key,
                 last_read_message_id: None,
                 secrets: HashMap::new(),
@@ -5753,7 +5984,8 @@ mod tests {
             RoomData {
                 owner_vk,
                 room_state: state,
-                self_sk: member_sk,
+                self_sk: Some(member_sk),
+                self_vk: None,
                 contract_key,
                 last_read_message_id: None,
                 secrets: HashMap::new(),
@@ -5984,7 +6216,8 @@ mod tests {
         let room = RoomData {
             owner_vk,
             room_state,
-            self_sk: invitee_sk.clone(),
+            self_sk: Some(invitee_sk.clone()),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: HashMap::new(),
@@ -6319,7 +6552,8 @@ mod tests {
         let mut room = RoomData {
             owner_vk,
             room_state,
-            self_sk: member_sk,
+            self_sk: Some(member_sk),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: HashMap::new(),
@@ -6499,6 +6733,431 @@ mod tests {
             ciborium::de::from_reader(buf.as_slice()).expect("legacy RoomData blob must decode");
         assert!(decoded.invitation_secrets.is_empty());
         assert!(decoded.previous_contract_key.is_none());
+        // The legacy blob's REQUIRED `self_sk` must still land in the now-
+        // optional field: this is the direction that protects every existing
+        // user, whose stored blobs all carry the key.
+        assert_eq!(
+            decoded.self_sk.as_ref().map(|k| k.to_bytes()),
+            Some(invitee_sk.to_bytes()),
+            "a pre-Option blob's self_sk must decode into Some(..)"
+        );
+        assert!(
+            decoded.self_vk.is_none(),
+            "a pre-self_vk blob has no self_vk on the wire"
+        );
+        assert_eq!(
+            decoded.self_verifying_key(),
+            Some(invitee_sk.verifying_key()),
+            "and the accessor still derives the public half from self_sk"
+        );
+    }
+
+    /// `self_sk` and `self_vk` are a paired unit: any production site that
+    /// ASSIGNS one must assign the other in the same breath, or the two drift.
+    ///
+    /// Drift is not load-bearing today — [`RoomData::self_verifying_key`]
+    /// prefers the private key whenever it is present, so a stale `self_vk`
+    /// cannot change who the UI thinks it is (pinned by
+    /// `self_sk_outranks_a_disagreeing_self_vk`). It becomes load-bearing the
+    /// moment the private key leaves the blob, because `self_vk` is then the
+    /// only record of the identity. This is the repo's "paired `Option` fields
+    /// that must co-occur" pattern; the type-system remedy (one sub-struct)
+    /// is not available here because both names are wire-format field names.
+    /// A scrape is the next best thing.
+    #[test]
+    fn self_sk_and_self_vk_are_assigned_together() {
+        let sources = [
+            ("room_data.rs", include_str!("room_data.rs")),
+            (
+                "get_response.rs",
+                include_str!("components/app/freenet_api/response_handler/get_response.rs"),
+            ),
+            ("members.rs", include_str!("components/members.rs")),
+        ];
+
+        let mut checked = 0usize;
+        for (name, full) in sources {
+            let src = full
+                .split("#[cfg(test)]")
+                .next()
+                .expect("production code precedes the first #[cfg(test)]");
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                // An ASSIGNMENT, not a struct-literal field (`self_sk: ...`)
+                // and not a comparison.
+                if !line.contains(".self_sk =") || line.contains("==") {
+                    continue;
+                }
+                checked += 1;
+                let window = lines[i.saturating_sub(3)..(i + 4).min(lines.len())].join("\n");
+                assert!(
+                    window.contains(".self_vk ="),
+                    "{}:{} assigns self_sk without assigning self_vk beside it. \
+                     The two are a paired identity record; leaving self_vk stale \
+                     is harmless only while self_sk is still stored, which is \
+                     exactly the assumption this change exists to stop relying on.",
+                    name,
+                    i + 1
+                );
+            }
+        }
+
+        // Not vacuous: if the scan finds nothing, the needle has drifted away
+        // from how the code actually spells the assignment and the pin is dead.
+        assert!(
+            checked >= 2,
+            "expected to find the production self_sk assignments (identity import \
+             and invitation-accept adoption); found {checked}. The scan needle is \
+             stale, so this pin is no longer guarding anything."
+        );
+    }
+
+    /// FORWARD compatibility — the half that makes the eventual relocation of
+    /// the private key survivable.
+    ///
+    /// A `RoomSlot` blob written by a FUTURE River that no longer stores
+    /// `self_sk` must still DECODE here. Before `self_sk` became optional it
+    /// was a required CBOR field, so such a blob failed to deserialize, and a
+    /// `RoomSlot` that fails to deserialize does not degrade — the room
+    /// disappears from the user's list entirely. That is why the tolerant
+    /// reader has to ship well ahead of any writer change.
+    ///
+    /// The blob is built from a struct that OMITS `self_sk` rather than
+    /// writing it as `null`, because that is what a future writer that has
+    /// dropped the field would actually emit.
+    #[test]
+    fn roomdata_decodes_from_a_blob_with_no_self_sk() {
+        #[derive(Serialize)]
+        struct RelocatedRoomData {
+            owner_vk: VerifyingKey,
+            room_state: ChatRoomStateV1,
+            self_vk: VerifyingKey,
+            contract_key: ContractKey,
+        }
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (_v0, room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+
+        let relocated = RelocatedRoomData {
+            owner_vk: room.owner_vk,
+            room_state: room.room_state.clone(),
+            self_vk: invitee_sk.verifying_key(),
+            contract_key: room.contract_key,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&relocated, &mut buf).unwrap();
+
+        // ORACLE, so this test cannot pass vacuously: decode the SAME bytes
+        // into the pre-change shape, where `self_sk` was a REQUIRED field.
+        // That must fail. Without this, a future refactor that made the field
+        // required again — or a serde/ciborium change that started tolerating
+        // missing required fields — would leave the assertions below passing
+        // while proving nothing.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct PreChangeRoomData {
+            owner_vk: VerifyingKey,
+            room_state: ChatRoomStateV1,
+            self_sk: SigningKey,
+            contract_key: ContractKey,
+        }
+        assert!(
+            ciborium::de::from_reader::<PreChangeRoomData, _>(buf.as_slice()).is_err(),
+            "the pre-change shape (required self_sk) must REJECT these bytes — \
+             that rejection is exactly the room-vanishes failure this change \
+             exists to prevent, and it is what makes the assertion below \
+             meaningful"
+        );
+
+        let decoded: RoomData = ciborium::de::from_reader(buf.as_slice())
+            .expect("a blob without self_sk must still decode — the room must not vanish");
+
+        assert!(
+            decoded.self_sk.is_none(),
+            "the private key is genuinely absent"
+        );
+        assert!(
+            decoded.signing_key().is_none(),
+            "and the accessor reports it as absent rather than inventing one"
+        );
+        assert_eq!(
+            decoded.self_verifying_key(),
+            Some(invitee_sk.verifying_key()),
+            "but the identity is still known, from the persisted self_vk"
+        );
+        assert_eq!(
+            decoded.self_member_id(),
+            Some(MemberId::from(&invitee_sk.verifying_key())),
+            "so member-relative rendering still works with no private key"
+        );
+        assert_eq!(decoded.owner_vk, room.owner_vk);
+    }
+
+    /// The same forward-compat case one level up: the blob the delegate
+    /// actually stores is a `RoomSlot`, and it is `RoomSlot` decoding that a
+    /// missing required field would break. Decoding `RoomData` directly (the
+    /// test above) would not catch a regression in the enum wrapper.
+    #[test]
+    fn roomslot_decodes_from_a_blob_with_no_self_sk() {
+        #[derive(Serialize)]
+        struct RelocatedRoomData {
+            owner_vk: VerifyingKey,
+            room_state: ChatRoomStateV1,
+            self_vk: VerifyingKey,
+            contract_key: ContractKey,
+        }
+        #[derive(Serialize)]
+        enum RelocatedRoomSlot {
+            Present(Box<RelocatedRoomData>),
+            #[allow(dead_code)]
+            Tombstone,
+        }
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (_v0, room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+
+        let slot = RelocatedRoomSlot::Present(Box::new(RelocatedRoomData {
+            owner_vk: room.owner_vk,
+            room_state: room.room_state.clone(),
+            self_vk: invitee_sk.verifying_key(),
+            contract_key: room.contract_key,
+        }));
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&slot, &mut buf).unwrap();
+
+        match ciborium::de::from_reader::<RoomSlot, _>(buf.as_slice())
+            .expect("a RoomSlot without self_sk must decode — the room must not vanish")
+        {
+            RoomSlot::Present(rd) => {
+                assert!(rd.self_sk.is_none());
+                assert_eq!(rd.self_verifying_key(), Some(invitee_sk.verifying_key()));
+            }
+            RoomSlot::Tombstone => panic!("expected Present"),
+        }
+    }
+
+    /// BACKWARD compatibility at the `RoomSlot` level — the half that protects
+    /// every user who has a room stored TODAY. Their blobs all carry a required
+    /// `self_sk` and no `self_vk`; both must survive this build unchanged.
+    #[test]
+    fn roomslot_from_a_current_writer_still_round_trips() {
+        #[derive(Serialize)]
+        struct CurrentRoomData {
+            owner_vk: VerifyingKey,
+            room_state: ChatRoomStateV1,
+            self_sk: SigningKey,
+            contract_key: ContractKey,
+            invitation_secrets: HashMap<u32, [u8; 32]>,
+        }
+        #[derive(Serialize)]
+        enum CurrentRoomSlot {
+            Present(Box<CurrentRoomData>),
+            #[allow(dead_code)]
+            Tombstone,
+        }
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (v0_secret, room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        let mut invitation_secrets = HashMap::new();
+        invitation_secrets.insert(0u32, v0_secret);
+
+        let slot = CurrentRoomSlot::Present(Box::new(CurrentRoomData {
+            owner_vk: room.owner_vk,
+            room_state: room.room_state.clone(),
+            self_sk: invitee_sk.clone(),
+            contract_key: room.contract_key,
+            invitation_secrets: invitation_secrets.clone(),
+        }));
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&slot, &mut buf).unwrap();
+
+        let decoded = match ciborium::de::from_reader::<RoomSlot, _>(buf.as_slice())
+            .expect("an existing user's stored RoomSlot must still decode")
+        {
+            RoomSlot::Present(rd) => *rd,
+            RoomSlot::Tombstone => panic!("expected Present"),
+        };
+
+        assert_eq!(
+            decoded.self_sk.as_ref().map(|k| k.to_bytes()),
+            Some(invitee_sk.to_bytes()),
+            "the stored private key must survive verbatim — this is the \
+             assertion that protects existing users"
+        );
+        assert_eq!(decoded.self_vk, None, "old blobs carry no self_vk");
+        assert_eq!(
+            decoded.self_verifying_key(),
+            Some(invitee_sk.verifying_key())
+        );
+        assert_eq!(decoded.invitation_secrets, invitation_secrets);
+        assert_eq!(decoded.owner_vk, room.owner_vk);
+        assert_eq!(decoded.contract_key, room.contract_key);
+    }
+
+    /// A blob this build writes must be re-readable by this build, `self_vk`
+    /// and all. Guards the round trip the two directional tests above do not:
+    /// that adding `self_vk` did not disturb the existing encoding.
+    #[test]
+    fn roomslot_written_now_round_trips_with_self_vk() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (_v0, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        room.backfill_self_vk();
+        assert_eq!(
+            room.self_vk,
+            Some(invitee_sk.verifying_key()),
+            "backfill populates the field from the private key"
+        );
+
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Present(Box::new(room.clone())), &mut buf).unwrap();
+        let decoded = match ciborium::de::from_reader::<RoomSlot, _>(buf.as_slice()).unwrap() {
+            RoomSlot::Present(rd) => *rd,
+            RoomSlot::Tombstone => panic!("expected Present"),
+        };
+        assert_eq!(decoded.self_vk, Some(invitee_sk.verifying_key()));
+        assert_eq!(
+            decoded.self_sk.as_ref().map(|k| k.to_bytes()),
+            Some(invitee_sk.to_bytes())
+        );
+    }
+
+    /// The private key stays authoritative for reads. A `self_vk` that
+    /// disagrees with the held private key must NOT change who the UI thinks
+    /// it is — otherwise a tampered or stale blob could redirect the local
+    /// identity while the real key sits right there.
+    #[test]
+    fn self_sk_outranks_a_disagreeing_self_vk() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let impostor = SigningKey::generate(&mut rng);
+        let (_v0, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+
+        room.self_vk = Some(impostor.verifying_key());
+        assert_eq!(
+            room.self_verifying_key(),
+            Some(invitee_sk.verifying_key()),
+            "the held private key wins over a disagreeing self_vk"
+        );
+
+        // And backfill must not silently "fix" the disagreement either way —
+        // it only ever fills an EMPTY slot.
+        room.backfill_self_vk();
+        assert_eq!(
+            room.self_vk,
+            Some(impostor.verifying_key()),
+            "backfill leaves an already-populated self_vk alone"
+        );
+    }
+
+    /// Every read path must survive an absent private key without panicking,
+    /// and must give the specific answer chosen for it. This is the
+    /// behavioural half of the forward-compat story: decoding is necessary but
+    /// not sufficient — the room also has to remain usable-as-far-as-possible
+    /// rather than crash on first render.
+    #[test]
+    fn read_paths_degrade_gracefully_with_no_private_key() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (v0_secret, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        room.invitation_secrets.insert(0, v0_secret);
+
+        // Precondition: with the key present this member CAN act. Without this
+        // the assertions below would pass on a room that was inert anyway.
+        assert!(room.can_send_message().is_ok());
+        assert!(room.can_participate().is_ok());
+
+        // Relocate: identity known, private key gone.
+        room.backfill_self_vk();
+        room.self_sk = None;
+
+        assert!(room.signing_key().is_none());
+        assert_eq!(
+            room.self_verifying_key(),
+            Some(invitee_sk.verifying_key()),
+            "identity survives via self_vk"
+        );
+        assert!(!room.is_self_owner());
+
+        // Signing/decrypting paths refuse, each in its own idiom.
+        assert_eq!(
+            room.can_send_message(),
+            Err(SendMessageError::IdentityUnavailable),
+            "refused with the accurate reason, NOT mislabelled UserNotMember"
+        );
+        assert_eq!(
+            room.can_participate(),
+            Err(SendMessageError::IdentityUnavailable)
+        );
+        assert_eq!(
+            room.repopulate_secrets_from_state(),
+            0,
+            "nothing can be decrypted without the key"
+        );
+        assert!(!room.needs_secret_rotation());
+        assert!(room.rotate_secret().is_err());
+        assert!(room
+            .build_member_info_heal(&room.room_state.clone())
+            .is_none());
+        assert!(room.generate_missing_member_secrets().is_none());
+        assert_eq!(room.build_rejoin_delta(), (None, None));
+        assert!(!room.apply_deputy_change(MemberId::from(&owner_sk.verifying_key()), true));
+
+        // Read-only bookkeeping is a no-op rather than a panic.
+        room.capture_self_membership_data(&room.parameters());
+        room.record_self_nickname_edit(
+            MemberId::from(&invitee_sk.verifying_key()),
+            AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo {
+                    member_id: MemberId::from(&invitee_sk.verifying_key()),
+                    version: 1,
+                    preferred_nickname: SealedBytes::public(b"x".to_vec()),
+                    deputies: Vec::new(),
+                },
+                &invitee_sk,
+            ),
+            "x".to_string(),
+        );
+        assert!(
+            room.self_member_info.is_some(),
+            "the nickname edit IS still cached: confirming the edited member is \
+             us needs only the public half, which self_vk supplies. This is the \
+             point of persisting self_vk — public-half bookkeeping keeps working \
+             with no private key in hand."
+        );
+    }
+
+    /// An owner who has lost the private key is still recognised as the owner
+    /// (that is a property of the PUBLIC half), but still cannot rotate.
+    /// Separated from the member case above because `is_self_owner` and
+    /// `rotate_secret` disagree on purpose, and a future refactor that
+    /// collapsed the ownership check into the key check would be wrong.
+    #[test]
+    fn an_owner_without_a_private_key_is_still_the_owner_but_cannot_rotate() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (_v0, mut room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+        room.self_sk = Some(owner_sk.clone());
+        room.self_vk = Some(owner_sk.verifying_key());
+        assert!(room.is_self_owner());
+        assert!(room.rotate_secret().is_ok(), "precondition: rotation works");
+
+        room.self_sk = None;
+        assert!(
+            room.is_self_owner(),
+            "ownership is decided by the public half, which is still here"
+        );
+        assert!(
+            room.rotate_secret().is_err(),
+            "but rotation derives and signs, so it needs the private key"
+        );
     }
 
     /// Refresh durability: `invitation_secrets` is persisted while
@@ -6714,7 +7373,8 @@ mod tests {
         RoomData {
             owner_vk,
             room_state,
-            self_sk: owner_sk.clone(),
+            self_sk: Some(owner_sk.clone()),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets,
@@ -6774,7 +7434,7 @@ mod tests {
         );
 
         // As T, sending / participating must be allowed despite the stored ban.
-        room.self_sk = t_sk;
+        room.self_sk = Some(t_sk);
         assert_eq!(room.can_send_message(), Ok(()));
         assert_eq!(room.can_participate(), Ok(()));
     }
@@ -6799,7 +7459,7 @@ mod tests {
             "an owner ban must enforce"
         );
 
-        room.self_sk = t_sk;
+        room.self_sk = Some(t_sk);
         assert_eq!(room.can_send_message(), Err(SendMessageError::UserBanned));
         assert_eq!(room.can_participate(), Err(SendMessageError::UserBanned));
     }
@@ -6936,7 +7596,8 @@ mod tests {
         let room = RoomData {
             owner_vk,
             room_state,
-            self_sk: s_sk,
+            self_sk: Some(s_sk),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: HashMap::new(),
@@ -6984,7 +7645,7 @@ mod tests {
         // private room so the owner-issued current-version secret keeps D and T
         // through `apply_delta`'s inactivity-prune (see `make_room_owner_d_t`).
         let mut room = make_room_owner_d_t(&owner_sk, &d_sk, &t_sk, true);
-        room.self_sk = d_sk;
+        room.self_sk = Some(d_sk);
         assert!(room.self_member_info.is_none());
 
         // Deputize T: the cached record must carry the new grant.
@@ -7152,7 +7813,8 @@ mod tests {
         let mut room = RoomData {
             owner_vk,
             room_state,
-            self_sk: d_sk,
+            self_sk: Some(d_sk),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: HashMap::new(),
@@ -7268,7 +7930,8 @@ mod tests {
         let mut room = RoomData {
             owner_vk,
             room_state,
-            self_sk: d_sk,
+            self_sk: Some(d_sk),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: HashMap::new(),
@@ -7382,7 +8045,8 @@ mod tests {
         let room = RoomData {
             owner_vk,
             room_state,
-            self_sk: s_sk,
+            self_sk: Some(s_sk),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: HashMap::new(),

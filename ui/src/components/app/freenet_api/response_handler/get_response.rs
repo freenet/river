@@ -184,7 +184,7 @@ pub async fn handle_get_response(
                 rooms
                     .map
                     .get(&owner_vk)
-                    .map(|rd| rd.self_sk.verifying_key())
+                    .and_then(|rd| rd.self_verifying_key())
             });
             let already_member_under_held_key = held_self_vk.is_some_and(|self_vk| {
                 held_key_is_member(&owner_vk, &retrieved_state.members.members, &self_vk)
@@ -460,7 +460,8 @@ pub async fn handle_get_response(
                         RoomData {
                             owner_vk,
                             room_state: retrieved_state.clone(),
-                            self_sk: self_sk.clone(),
+                            self_sk: Some(self_sk.clone()),
+                            self_vk: None,
                             contract_key: key,
                             last_read_message_id: None,
                             secrets: std::collections::HashMap::new(),
@@ -527,16 +528,23 @@ pub async fn handle_get_response(
                         // records the fresh key's credentials would split the
                         // local identity (self_sk vs credentials at different
                         // keys). (Codex review of this PR.)
-                        let existing_vk = room_data.self_sk.verifying_key();
-                        let existing_is_member = existing_vk == owner_vk
-                            || room_data
-                                .room_state
-                                .members
-                                .members
-                                .iter()
-                                .any(|m| m.member.member_vk == existing_vk);
+                        // An identity we cannot name is not a member, so the
+                        // fresh invitation key is adopted — the same outcome as a
+                        // known-but-non-member key, and the only one that leaves
+                        // the room usable.
+                        let existing_is_member =
+                            room_data.self_verifying_key().is_some_and(|existing_vk| {
+                                existing_vk == owner_vk
+                                    || room_data
+                                        .room_state
+                                        .members
+                                        .members
+                                        .iter()
+                                        .any(|m| m.member.member_vk == existing_vk)
+                            });
                         if !existing_is_member {
-                            room_data.self_sk = self_sk.clone();
+                            room_data.self_sk = Some(self_sk.clone());
+                            room_data.self_vk = Some(self_sk.verifying_key());
                             // Reset migration flag so the new key gets migrated
                             room_data.key_migrated_to_delegate = false;
                         }
@@ -594,7 +602,12 @@ pub async fn handle_get_response(
                     // Apply membership immediately on invitation acceptance so
                     // that other room members see "X joined the room" right away
                     // (not deferred until the user's first message).
-                    let self_vk = room_data.self_sk.verifying_key();
+                    // Without a local identity there is no membership to
+                    // publish; treat it as "already handled" so the accept path
+                    // does not build an unsignable member record.
+                    let Some(self_vk) = room_data.self_verifying_key() else {
+                        return;
+                    };
                     let already_member = self_vk == owner_vk
                         || room_data
                             .room_state
@@ -791,7 +804,9 @@ pub async fn handle_get_response(
                                         // and marking the room migrated for a
                                         // superseded key would strand the new identity
                                         // (freenet/river#414).
-                                        if room_data.self_sk != signing_key_clone {
+                                        if room_data.self_verifying_key()
+                                            != Some(signing_key_clone.verifying_key())
+                                        {
                                             return;
                                         }
                                         room_data.key_migrated_to_delegate = true;
@@ -1126,7 +1141,7 @@ pub async fn handle_get_response(
                     // Trigger signing key migration now that we have valid state
                     let self_sk_opt: Option<ed25519_dalek::SigningKey> = {
                         let rooms = ROOMS.read();
-                        rooms.map.get(&owner_vk).map(|rd| rd.self_sk.clone())
+                        rooms.map.get(&owner_vk).and_then(|rd| rd.self_sk.clone())
                     };
                     if let Some(self_sk) = self_sk_opt {
                         wasm_bindgen_futures::spawn_local(async move {
@@ -1151,7 +1166,9 @@ pub async fn handle_get_response(
                                             // for a superseded key would strand the new
                                             // identity (freenet/river#414, round-10 P2 —
                                             // the guard the other 3 callbacks already have).
-                                            if room_data.self_sk != migrated_key {
+                                            if room_data.self_verifying_key()
+                                                != Some(migrated_key.verifying_key())
+                                            {
                                                 return;
                                             }
                                             room_data.key_migrated_to_delegate = true;
@@ -2191,11 +2208,16 @@ mod tests {
             .split("mod tests {")
             .next()
             .expect("get_response.rs must have production code before `mod tests`");
+        // Anchored on the API surface rather than the exact expression text:
+        // the guard now compares IDENTITIES (`self_verifying_key()`) rather than
+        // raw key bytes, because `self_sk` is optional and a copy that merely
+        // lacks the private key must not be mistaken for a different identity.
         assert!(
-            src.contains("if room_data.self_sk != migrated_key {"),
+            src.contains("room_data.self_verifying_key()")
+                && src.contains("migrated_key.verifying_key()"),
             "the post-GET migration completion callback must discard a stale-key \
-             result (room_data.self_sk != migrated_key) before marking migrated \
-             (freenet/river#414 round-10 P2)."
+             result (comparing room_data.self_verifying_key() against the migrated \
+             key's identity) before marking migrated (freenet/river#414 round-10 P2)."
         );
     }
 

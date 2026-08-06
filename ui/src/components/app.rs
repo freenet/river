@@ -19,8 +19,8 @@ use crate::components::room_list::notification_modal::NotificationModal;
 use crate::components::room_list::receive_invitation_modal::{
     accept_invitation, clear_invitation_from_storage, decide_recovered_invitation,
     is_invitation_processed, load_invitation_from_storage, load_invitation_nickname_from_storage,
-    save_invitation_to_storage, take_resume_once, ReceiveInvitationModal,
-    RecoveredInvitationAction, PRESENT_INVITATION_REQUEST,
+    purge_legacy_persisted_invitation_once, save_invitation_to_storage, take_resume_once,
+    ReceiveInvitationModal, RecoveredInvitationAction, PRESENT_INVITATION_REQUEST,
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -325,9 +325,21 @@ pub fn App() -> Element {
         receive_invitation.set(Some(inv));
     });
 
-    // Recover invitation from localStorage if not found in URL (e.g. after
-    // page reload before subscription completed). The invitation artifact
-    // stays in storage from the moment it is seen until the room is
+    // Retire any invitation an OLDER River persisted to localStorage. That
+    // blob carries a full ed25519 private key plus the room's plaintext
+    // secrets, and the old flow had no terminal state for an abandoned invite,
+    // so it could sit there indefinitely. River no longer writes it (the
+    // pending invitation is held in memory for the page's lifetime), but not
+    // writing it does nothing about what is already on disk — this does.
+    purge_legacy_persisted_invitation_once();
+
+    // Recover the pending invitation if it was not found in the URL. Note this
+    // now only recovers WITHIN a page load, not across a reload: the artifact
+    // is a bearer credential and is deliberately no longer persisted. See
+    // `PENDING_INVITATION`. The three cases below are unchanged in shape; case
+    // 1 (auto-resume) is reachable only when the invitation is still in memory.
+    //
+    // The artifact is held from the moment it is seen until the room is
     // subscribed OR the user dismisses it (`clear_invitation_from_storage`).
     //
     // Three cases, in priority order:

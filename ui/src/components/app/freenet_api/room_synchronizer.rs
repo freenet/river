@@ -403,7 +403,13 @@ impl RoomSynchronizer {
                 // back-filled secret AND new private messages would otherwise
                 // leave the notification path using the pre-merge (empty) map
                 // and rendering encrypted placeholders in the preview.
-                let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
+                // `None` when this copy carries no local identity. The delta
+                // still applies in full — only the two self-relative
+                // side-effects below (inbound-DM unhide, and the new-message
+                // notification, which needs to know which messages are ours)
+                // are skipped, because neither can be decided without knowing
+                // who "self" is.
+                let self_member_id: Option<MemberId> = room_data.self_member_id();
 
                 // Issue freenet/river#267: snapshot pre-merge DM
                 // signatures so we can compute "what actually landed"
@@ -496,10 +502,10 @@ impl RoomSynchronizer {
                             if pre_merge_dm_sigs.contains(&sig_bytes) {
                                 continue;
                             }
-                            if msg.message.recipient != self_member_id {
+                            if Some(msg.message.recipient) != self_member_id {
                                 continue;
                             }
-                            if msg.message.sender == self_member_id {
+                            if Some(msg.message.sender) == self_member_id {
                                 // Self-DM is dropped by the contract,
                                 // but defence-in-depth.
                                 continue;
@@ -528,7 +534,9 @@ impl RoomSynchronizer {
                             // encrypted at a version that was back-filled in
                             // this same delta. See #251 / Codex P3.
                             let room_secrets = room_data.secrets.clone();
-                            pending_notification = Some((messages, self_member_id, updated_member_info, room_secrets));
+                            if let Some(self_member_id) = self_member_id {
+                                pending_notification = Some((messages, self_member_id, updated_member_info, room_secrets));
+                            }
                         }
 
                         // Persist to delegate so state survives refresh
@@ -926,7 +934,7 @@ impl RoomSynchronizer {
                 let (new_contract_key, is_owner) = {
                     let rooms = ROOMS.read();
                     if let Some(room_data) = rooms.map.get(owner_vk) {
-                        let is_owner = room_data.self_sk.verifying_key() == *owner_vk;
+                        let is_owner = room_data.self_verifying_key() == Some(*owner_vk);
                         (room_data.contract_key, is_owner)
                     } else {
                         continue;
@@ -979,9 +987,12 @@ impl RoomSynchronizer {
                 }
 
                 // Owner only: send upgrade pointer to old contract for old-client compat.
-                // `is_owner` guarantees `room_data.self_sk` is the owner key, so the
+                // `is_owner` guarantees the local identity IS the owner, so the
                 // `AuthorizedUpgradeV1` signature validates against the old contract's
-                // `parameters.owner`.
+                // `parameters.owner`. It does NOT guarantee the private key is held —
+                // `is_owner` is decided from the public half — so the signing step
+                // below still has to check (and skips the pointer if it can't sign;
+                // the pointer is a courtesy for stragglers, not correctness-critical).
                 if is_owner {
                     use river_core::room_state::upgrade::{AuthorizedUpgradeV1, UpgradeV1};
 
@@ -997,8 +1008,15 @@ impl RoomSynchronizer {
                                 version: 1,
                                 new_chatroom_address: new_address,
                             };
-                            let authorized_upgrade =
-                                AuthorizedUpgradeV1::new(upgrade, &room_data.self_sk);
+                            let Some(self_sk) = room_data.signing_key() else {
+                                warn!(
+                                    "Skipping upgrade pointer for room {:?}: no local \
+                                     signing key to sign it with",
+                                    MemberId::from(*owner_vk)
+                                );
+                                continue;
+                            };
+                            let authorized_upgrade = AuthorizedUpgradeV1::new(upgrade, self_sk);
 
                             // Send a minimal delta carrying ONLY the upgrade
                             // pointer — not a full `UpdateData::State`. A full
@@ -1245,7 +1263,10 @@ impl RoomSynchronizer {
                     old_ids.len(),
                     MemberId::from(room_owner_vk)
                 );
-                let self_id = MemberId::from(&room_data.self_sk.verifying_key());
+                // `None` propagates through the tuple: the consumers below all
+                // unpack it with `if let Some(self_id)`, so an unknown identity
+                // simply skips the self-relative notification work.
+                let self_id = room_data.self_member_id();
                 let member_info = room_data.room_state.member_info.clone();
                 let dm_sigs: std::collections::HashSet<[u8; 64]> = room_data
                     .room_state
@@ -1254,7 +1275,7 @@ impl RoomSynchronizer {
                     .iter()
                     .map(|m| m.sender_signature.to_bytes())
                     .collect();
-                (Some(old_ids), Some(self_id), Some(member_info), dm_sigs)
+                (Some(old_ids), self_id, Some(member_info), dm_sigs)
             } else {
                 debug!(
                     "update_room_state: Room {:?} not found in ROOMS when capturing old IDs",

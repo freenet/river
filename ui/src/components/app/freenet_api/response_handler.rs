@@ -43,7 +43,6 @@ use river_core::chat_delegate::{
     CasStoreResult, ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg,
     OutboundDmStore,
 };
-use river_core::room_state::member::MemberId;
 use river_core::room_state::message::{MessageId, RoomMessageBody};
 use river_core::room_state::privacy::PrivacyMode;
 use std::collections::HashMap;
@@ -1573,7 +1572,7 @@ fn hydrate_loaded_rooms_with_authority(
                         info!(
                             "LoadRooms merge: decrypted {} room secret(s) for {:?}",
                             decrypted,
-                            MemberId::from(&room_data.self_sk.verifying_key())
+                            room_data.self_member_id()
                         );
                     }
                 }
@@ -1662,7 +1661,11 @@ fn hydrate_loaded_rooms_with_authority(
                     // identity conflict it resolved against this copy). Nothing
                     // to migrate; pushing a key for it is exactly the bug above.
                     let room_data = rooms.map.get(vk)?;
-                    let owns_room = room_data.owner_vk == room_data.self_sk.verifying_key();
+                    // No local private key => nothing to migrate INTO the
+                    // delegate; the whole point of this pass is to copy the
+                    // key we hold. Skip the room rather than push a `None`.
+                    let self_sk = room_data.signing_key()?.clone();
+                    let owns_room = room_data.is_self_owner();
                     // Derive the contract id from the CURRENT bundled
                     // room-contract WASM so an owner-mode subscription can't
                     // target a contract generation that no longer exists
@@ -1672,12 +1675,7 @@ fn hydrate_loaded_rooms_with_authority(
                     } else {
                         None
                     };
-                    Some((
-                        *vk,
-                        room_data.room_key(),
-                        room_data.self_sk.clone(),
-                        contract_id_for_owner,
-                    ))
+                    Some((*vk, room_data.room_key(), self_sk, contract_id_for_owner))
                 })
                 .collect()
         };
@@ -1718,7 +1716,13 @@ fn hydrate_loaded_rooms_with_authority(
                                     // while this migration ran, and marking the room
                                     // migrated for a superseded key would strand the new
                                     // identity (freenet/river#414).
-                                    if room_data.self_sk != migrated_key {
+                                    // Identity comparison, not raw-key: a copy
+                                    // with no local key is not the identity
+                                    // that completed this migration either, so
+                                    // it must not be marked migrated.
+                                    if room_data.self_verifying_key()
+                                        != Some(migrated_key.verifying_key())
+                                    {
                                         return;
                                     }
                                     room_data.key_migrated_to_delegate = true;

@@ -192,7 +192,11 @@ fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usize {
 fn unread_candidate_messages(
     room_data: &crate::room_data::RoomData,
 ) -> impl Iterator<Item = &river_core::room_state::message::AuthorizedMessageV1> {
-    let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
+    // `None` when the stored room carries no locally-known identity. There is
+    // then no "own" author to exclude, so the tail keeps every message — the
+    // fail-safe direction for an unread count (an over-count is visible and
+    // clearable; a silent zero is the freenet/river#500 symptom).
+    let self_member_id: Option<MemberId> = room_data.self_member_id();
     let recent = &room_data.room_state.recent_messages;
 
     // Index just past the last-read marker. No marker — or a marker that has
@@ -214,7 +218,7 @@ fn unread_candidate_messages(
                 && !m.message.content.is_event()
                 && !recent.actions_state.deleted.contains(&m.id())
         })
-        .filter(move |m| m.message.author != self_member_id)
+        .filter(move |m| self_member_id != Some(m.message.author))
 }
 
 /// Whether a body we could NOT read (`try_decrypt_message_content` returned
@@ -325,7 +329,12 @@ fn compute_mention_unread_count(room_data: &crate::room_data::RoomData) -> usize
         text_mentions_or_replies_to_self, SelfAuthoredIndex,
     };
 
-    let self_member_id: MemberId = room_data.self_sk.verifying_key().into();
+    // No locally-known identity: nothing can mention us and nothing can be a
+    // reply to a message we authored, so the count is genuinely 0 rather than
+    // a degraded guess.
+    let Some(self_member_id) = room_data.self_member_id() else {
+        return 0;
+    };
     let recent = &room_data.room_state.recent_messages.messages;
     // One lazily-built index of self-authored message ids for the whole
     // scan: the reply check would otherwise re-hash every message in the
@@ -404,7 +413,7 @@ fn mention_count_fingerprint(room_data: &crate::room_data::RoomData) -> u64 {
     secrets.sort_unstable_by_key(|(version, _)| **version);
     secrets.hash(&mut h);
     recent.actions_state.deleted.len().hash(&mut h);
-    MemberId::from(room_data.self_sk.verifying_key()).hash(&mut h);
+    room_data.self_member_id().hash(&mut h);
     h.finish()
 }
 
@@ -510,7 +519,11 @@ fn count_unread_dms_with(
 ) -> usize {
     let mut total = 0usize;
     for (owner_key, room_data) in map {
-        let self_id: MemberId = room_data.self_sk.verifying_key().into();
+        // Without a locally-known identity we cannot tell an inbound DM from
+        // an outbound one, so this room contributes no unread DMs.
+        let Some(self_id) = room_data.self_member_id() else {
+            continue;
+        };
 
         // Per-peer accumulation: unread inbound messages plus the newest
         // INBOUND timestamp (the revival clock — see the rail's
@@ -981,7 +994,8 @@ mod tests {
         RoomData {
             owner_vk,
             room_state,
-            self_sk,
+            self_sk: Some(self_sk),
+            self_vk: None,
             contract_key,
             last_read_message_id,
             secrets: HashMap::new(),

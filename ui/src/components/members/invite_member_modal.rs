@@ -80,6 +80,16 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             }
             let room_data = current_room_data_signal();
             if let Some(room_data) = room_data {
+                // Issuing an invitation signs the invitee's `Member` record
+                // with the inviter's key, so this whole path needs the
+                // private half. Surface it as a normal resource error (the
+                // modal already renders `Err(String)`) rather than panicking.
+                let Some(self_sk) = room_data.signing_key().cloned() else {
+                    return Err(
+                        "The local signing key for this room is unavailable, so an invitation cannot be created."
+                            .to_string(),
+                    );
+                };
                 // Generate new signing key for invitee
                 let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
                 let invitee_verifying_key = invitee_signing_key.verifying_key();
@@ -87,7 +97,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                 // Create member struct
                 let member = Member {
                     owner_member_id: room_data.owner_vk.into(),
-                    invited_by: room_data.self_sk.verifying_key().into(),
+                    invited_by: self_sk.verifying_key().into(),
                     member_vk: invitee_verifying_key,
                 };
 
@@ -100,7 +110,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                 let signature = crate::signing::sign_member_with_fallback(
                     room_data.room_key(),
                     member_bytes,
-                    &room_data.self_sk,
+                    &self_sk,
                 )
                 .await;
 
