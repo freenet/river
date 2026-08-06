@@ -231,8 +231,22 @@ pub struct RoomData {
     /// key. Once the private key moves out of this blob, this becomes the only
     /// way the UI knows who the local user is in this room.
     ///
-    /// `None` for blobs written before this field existed;
-    /// [`RoomData::backfill_self_vk`] populates it on load.
+    /// `None` for blobs written before this field existed.
+    /// [`RoomData::backfill_self_vk`] populates it at the per-room SAVE
+    /// chokepoint, so a blob gains the field the next time it is written.
+    ///
+    /// **It is not yet durable, and the relocation must not assume it is.**
+    /// Two holes remain, deliberately, because closing them needs the writer
+    /// change this PR is staged ahead of:
+    ///
+    /// * An OLDER River tab or build saving the same room re-serializes without
+    ///   the field and silently strips it again.
+    /// * The backfill runs only on the save path, never on decode, so a room
+    ///   that is loaded and never re-saved keeps `None` in memory.
+    ///
+    /// So the future writer that drops `self_sk` MUST verify `self_vk` is
+    /// already present in the STORED blob for a room before dropping the key
+    /// for that room — per-room, checked, never assumed fleet-wide.
     #[serde(default)]
     pub self_vk: Option<VerifyingKey>,
     pub contract_key: ContractKey,
@@ -428,18 +442,26 @@ impl RoomData {
         self.self_verifying_key() == Some(self.owner_vk)
     }
 
-    /// Populate [`Self::self_vk`] from the private key when it is missing.
+    /// Derive [`Self::self_vk`] from the private key whenever the key is held.
     ///
-    /// Called on every path that decodes a `RoomData` out of delegate storage,
-    /// so that a blob written before `self_vk` existed gains the field the next
-    /// time it is saved. Never overwrites an existing value with a different
-    /// one — see [`Self::self_verifying_key`] for why the private key stays
-    /// authoritative for *reads*.
+    /// Called from the per-room SAVE chokepoint
+    /// (`chat_delegate::reconcile_room_present`), so a blob written before the
+    /// field existed gains it on its next save.
+    ///
+    /// **Repairs, rather than merely fills.** A `self_vk` that disagrees with a
+    /// held `self_sk` is always wrong — the private key is the identity — so it
+    /// is overwritten, not preserved. Leaving the disagreement in place would
+    /// be harmless only for as long as `self_sk` is also stored, which is
+    /// exactly the assumption this whole change exists to stop relying on: once
+    /// the private key moves out of the blob, a stale `self_vk` silently BECOMES
+    /// the user's identity in that room, and they would render as a non-member,
+    /// see their own messages attributed to a stranger, and lose DM decryption.
+    ///
+    /// Reads are unaffected either way — [`Self::self_verifying_key`] prefers
+    /// the private key — so this only ever changes what is PERSISTED.
     pub fn backfill_self_vk(&mut self) {
-        if self.self_vk.is_none() {
-            if let Some(sk) = &self.self_sk {
-                self.self_vk = Some(sk.verifying_key());
-            }
+        if let Some(sk) = &self.self_sk {
+            self.self_vk = Some(sk.verifying_key());
         }
     }
 
@@ -618,73 +640,86 @@ impl RoomData {
         // (secret_version, ciphertext, nonce, sender_ephemeral_x25519_pk_bytes)
         type PendingBlob = (u32, Vec<u8>, [u8; 12], [u8; 32]);
 
-        // Every blob below is ECIES-sealed to this member and can only be
-        // opened with the private key. Without it there is nothing to
-        // repopulate, so report zero rather than pretending to have tried.
-        let Some(self_sk) = self.signing_key().cloned() else {
-            warn!(
-                "repopulate_secrets_from_state: no local signing key for this room; \
-                 cannot decrypt owner-issued secrets"
-            );
-            return 0;
-        };
-        let member_id = MemberId::from(&self_sk.verifying_key());
-
-        // Snapshot the member's encrypted_secrets blobs so we can release
-        // the borrow on `room_state` before the `&mut self` calls below.
-        //
-        // We deliberately do NOT filter out versions already in `secrets`:
-        // the owner-signed contract blob is authoritative and MUST be able
-        // to overwrite an (unauthenticated) value a prior `invitation_secrets`
-        // fold placed at the same version — otherwise a malicious or buggy
-        // inviter who supplied a wrong secret would permanently shadow the
-        // authentic blob for the rest of the session. Re-decrypting the
-        // handful of own-member blobs on each ingestion is negligible.
-        let pending: Vec<PendingBlob> = self
-            .room_state
-            .secrets
-            .encrypted_secrets
-            .iter()
-            .filter(|s| s.secret.member_id == member_id)
-            .map(|s| {
-                (
-                    s.secret.secret_version,
-                    s.secret.ciphertext.clone(),
-                    s.secret.nonce,
-                    s.secret.sender_ephemeral_public_key,
-                )
-            })
-            .collect();
-
         let mut decrypted_count = 0usize;
-        for (version, ciphertext, nonce, ephemeral_key_bytes) in pending {
-            match decrypt_secret_from_member_blob_raw(
-                &ciphertext,
-                &nonce,
-                &ephemeral_key_bytes,
-                &self_sk,
-            ) {
-                Ok(secret) => {
-                    let is_new = !self.secrets.contains_key(&version);
-                    // `set_secret` inserts/overwrites — the owner-signed
-                    // contract secret is authoritative.
-                    self.set_secret(secret, version);
-                    // It supersedes any invitation-carried copy at this
-                    // version: drop it so a stale/garbage invitation secret
-                    // cannot resurface and is not re-persisted in
-                    // `rooms_data`.
-                    self.invitation_secrets.remove(&version);
-                    if is_new {
-                        decrypted_count += 1;
+
+        // ONLY the owner-signed `encrypted_secrets` blobs need the private key
+        // — they are ECIES-sealed to this member. Everything after this block
+        // (the `invitation_secrets` fold and the `current_secret_version`
+        // alignment) works on plaintext already in hand and MUST still run
+        // without a key.
+        //
+        // Scope this guard tightly. Bailing out of the whole function instead
+        // would leave a private room joined by invitation showing
+        // "[Encrypted message - secret vN not available]" for its messages,
+        // name and description, even though the v0 secret is sitting
+        // decrypted in `invitation_secrets`: `secrets` is `#[serde(skip)]` so
+        // it is empty on every load, and without the alignment below
+        // `current_secret_version` is never set, so `get_secret()` returns
+        // `None`. That is the freenet/river#251 symptom, reintroduced.
+        if let Some(self_sk) = self.signing_key().cloned() {
+            let member_id = MemberId::from(&self_sk.verifying_key());
+
+            // Snapshot the member's encrypted_secrets blobs so we can release
+            // the borrow on `room_state` before the `&mut self` calls below.
+            //
+            // We deliberately do NOT filter out versions already in `secrets`:
+            // the owner-signed contract blob is authoritative and MUST be able
+            // to overwrite an (unauthenticated) value a prior `invitation_secrets`
+            // fold placed at the same version — otherwise a malicious or buggy
+            // inviter who supplied a wrong secret would permanently shadow the
+            // authentic blob for the rest of the session. Re-decrypting the
+            // handful of own-member blobs on each ingestion is negligible.
+            let pending: Vec<PendingBlob> = self
+                .room_state
+                .secrets
+                .encrypted_secrets
+                .iter()
+                .filter(|s| s.secret.member_id == member_id)
+                .map(|s| {
+                    (
+                        s.secret.secret_version,
+                        s.secret.ciphertext.clone(),
+                        s.secret.nonce,
+                        s.secret.sender_ephemeral_public_key,
+                    )
+                })
+                .collect();
+
+            for (version, ciphertext, nonce, ephemeral_key_bytes) in pending {
+                match decrypt_secret_from_member_blob_raw(
+                    &ciphertext,
+                    &nonce,
+                    &ephemeral_key_bytes,
+                    &self_sk,
+                ) {
+                    Ok(secret) => {
+                        let is_new = !self.secrets.contains_key(&version);
+                        // `set_secret` inserts/overwrites — the owner-signed
+                        // contract secret is authoritative.
+                        self.set_secret(secret, version);
+                        // It supersedes any invitation-carried copy at this
+                        // version: drop it so a stale/garbage invitation secret
+                        // cannot resurface and is not re-persisted in
+                        // `rooms_data`.
+                        self.invitation_secrets.remove(&version);
+                        if is_new {
+                            decrypted_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "repopulate_secrets_from_state: failed to decrypt v{} for member {:?}: {}",
+                            version, member_id, e
+                        );
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        "repopulate_secrets_from_state: failed to decrypt v{} for member {:?}: {}",
-                        version, member_id, e
-                    );
-                }
             }
+        } else {
+            warn!(
+                "repopulate_secrets_from_state: no local signing key for this room; \
+                 skipping the owner-signed blobs. Invitation-carried secrets are \
+                 still folded in below."
+            );
         }
 
         // Fold in any secrets recovered from the invitation artifact
@@ -2243,8 +2278,23 @@ impl Rooms {
             // say. Comparing the raw `Option<SigningKey>` would report a
             // conflict the moment either side omitted the key, and the
             // `KeepLocal` arm `continue`s, i.e. drops that room's incoming
-            // state for the pass. An unknown identity on either side therefore
-            // means "no conflict".
+            // state for the pass.
+            //
+            // THE RULE, which `chat_delegate::identities_diverged` states
+            // identically: for a CONFLICT test, an unknown identity on either
+            // side means "no conflict" — silence is not disagreement, and the
+            // branch it would trigger is lossy. This is deliberately the
+            // opposite of `members::swap_room_identity_in_place`, which asks a
+            // different question ("is this import a CHANGE?") and correctly
+            // answers "yes" for an unknown identity, since an import always
+            // supplies one. Conflict tests treat unknown as no-conflict;
+            // change tests treat unknown as changed.
+            //
+            // KNOWN GAP, harmless until the relocation: a local copy naming no
+            // identity takes the plain-merge branch, which keeps local's fields
+            // and so can never ACQUIRE an identity from an incoming copy that
+            // has one. Unreachable today (every stored copy carries `self_sk`);
+            // the relocation must add that acquisition.
             let mut adopt_incoming_identity = false;
             if let Some(existing) = self.map.get(&vk) {
                 let identities_conflict = match (
@@ -6777,21 +6827,37 @@ mod tests {
 
         let mut checked = 0usize;
         for (name, full) in sources {
-            let src = full
-                .split("#[cfg(test)]")
-                .next()
-                .expect("production code precedes the first #[cfg(test)]");
+            // Split at the big `mod tests` block, NOT at the first
+            // `#[cfg(test)]`: these files put cfg(test) HELPER functions above
+            // production code (`room_data::test_minimal_room_data` sits above
+            // `Rooms::create_new_room_with_name`), so splitting at the first
+            // attribute would drop real production sites from the scan.
+            let src = full.split("mod tests {").next().unwrap_or(full);
             let lines: Vec<&str> = src.lines().collect();
             for (i, line) in lines.iter().enumerate() {
                 // An ASSIGNMENT, not a struct-literal field (`self_sk: ...`)
                 // and not a comparison.
-                if !line.contains(".self_sk =") || line.contains("==") {
+                // Two shapes: an assignment (`x.self_sk = ..`) and a struct
+                // literal field (`self_sk: ..`). The exhaustive destructure pin
+                // in members.rs forces a new field to be NAMED, not to be named
+                // CORRECTLY, so the literal shape needs covering here too — a
+                // future literal pairing a mismatched `Some`/`Some` would
+                // otherwise sail through.
+                let trimmed = line.trim_start();
+                let is_assignment = line.contains(".self_sk =") && !line.contains("==");
+                // Only a literal FIELD, whose value must be `Some(..)`/`None`
+                // because the field is an `Option`. Anchoring on that excludes
+                // function parameters (`self_sk: &SigningKey,`) and struct
+                // definitions, which are not identity writes.
+                let is_literal_field =
+                    trimmed.starts_with("self_sk: Some(") || trimmed.starts_with("self_sk: None");
+                if !is_assignment && !is_literal_field {
                     continue;
                 }
                 checked += 1;
                 let window = lines[i.saturating_sub(3)..(i + 4).min(lines.len())].join("\n");
                 assert!(
-                    window.contains(".self_vk ="),
+                    window.contains(".self_vk =") || window.contains("self_vk:"),
                     "{}:{} assigns self_sk without assigning self_vk beside it. \
                      The two are a paired identity record; leaving self_vk stale \
                      is harmless only while self_sk is still stored, which is \
@@ -6805,10 +6871,11 @@ mod tests {
         // Not vacuous: if the scan finds nothing, the needle has drifted away
         // from how the code actually spells the assignment and the pin is dead.
         assert!(
-            checked >= 2,
-            "expected to find the production self_sk assignments (identity import \
-             and invitation-accept adoption); found {checked}. The scan needle is \
-             stale, so this pin is no longer guarding anything."
+            checked >= 5,
+            "expected to find the production self_sk sites (the identity-import \
+             and invitation-accept ASSIGNMENTS, plus the struct LITERALS that \
+             construct a RoomData); found {checked}. The scan needle is stale, so \
+             this pin is no longer guarding anything."
         );
     }
 
@@ -7026,6 +7093,54 @@ mod tests {
         );
     }
 
+    /// Documents a KNOWN GAP rather than a guarantee: `self_vk` is populated on
+    /// the SAVE path only, never on decode, so a room that is loaded and never
+    /// re-saved keeps whatever the blob carried — `None` for a pre-`self_vk`
+    /// blob.
+    ///
+    /// This is why the field docs tell the future relocation writer to verify
+    /// `self_vk` is present in the STORED blob per room before dropping
+    /// `self_sk`, instead of assuming this build has backfilled it everywhere.
+    /// If someone later adds a decode-time backfill, this test SHOULD fail —
+    /// and the field docs should be relaxed in the same commit.
+    #[test]
+    fn decoding_alone_does_not_backfill_self_vk() {
+        #[derive(Serialize)]
+        struct PreSelfVkRoomData {
+            owner_vk: VerifyingKey,
+            room_state: ChatRoomStateV1,
+            self_sk: SigningKey,
+            contract_key: ContractKey,
+        }
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let (_v0, room) = make_private_invitee_room(&owner_sk, &invitee_sk);
+
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(
+            &PreSelfVkRoomData {
+                owner_vk: room.owner_vk,
+                room_state: room.room_state.clone(),
+                self_sk: invitee_sk.clone(),
+                contract_key: room.contract_key,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let decoded: RoomData = ciborium::de::from_reader(buf.as_slice()).unwrap();
+
+        assert_eq!(
+            decoded.self_vk, None,
+            "decode does not backfill — only the save path does"
+        );
+        assert_eq!(
+            decoded.self_verifying_key(),
+            Some(invitee_sk.verifying_key()),
+            "which is harmless for READS while self_sk is present"
+        );
+    }
+
     /// The private key stays authoritative for reads. A `self_vk` that
     /// disagrees with the held private key must NOT change who the UI thinks
     /// it is — otherwise a tampered or stale blob could redirect the local
@@ -7045,13 +7160,28 @@ mod tests {
             "the held private key wins over a disagreeing self_vk"
         );
 
-        // And backfill must not silently "fix" the disagreement either way —
-        // it only ever fills an EMPTY slot.
+        // And the disagreement must be REPAIRED, not preserved. A self_vk that
+        // contradicts a held self_sk is always wrong, and persisting it is
+        // harmless only while self_sk is also stored — the moment the private
+        // key moves out of the blob, that stale value silently becomes the
+        // user's identity in this room.
         room.backfill_self_vk();
         assert_eq!(
             room.self_vk,
+            Some(invitee_sk.verifying_key()),
+            "backfill overwrites a self_vk that disagrees with the held key"
+        );
+
+        // With no private key there is nothing to derive from, so whatever the
+        // blob carried is left untouched — it is the only identity record left.
+        let mut relocated = room.clone();
+        relocated.self_sk = None;
+        relocated.self_vk = Some(impostor.verifying_key());
+        relocated.backfill_self_vk();
+        assert_eq!(
+            relocated.self_vk,
             Some(impostor.verifying_key()),
-            "backfill leaves an already-populated self_vk alone"
+            "with no private key, backfill has nothing to correct against"
         );
     }
 
@@ -7095,10 +7225,26 @@ mod tests {
             room.can_participate(),
             Err(SendMessageError::IdentityUnavailable)
         );
+        // The invitation-carried secret is PLAINTEXT and already in hand, so it
+        // must still be folded in and the version pointer still aligned. Only
+        // the owner-signed ECIES blobs need the key. Bailing out of the whole
+        // function would leave this room rendering
+        // "[Encrypted message - secret vN not available]" over content it can
+        // decrypt — the freenet/river#251 symptom.
         assert_eq!(
             room.repopulate_secrets_from_state(),
-            0,
-            "nothing can be decrypted without the key"
+            1,
+            "the plaintext invitation secret is still recovered without a key"
+        );
+        assert_eq!(
+            room.secrets.get(&0),
+            Some(&v0_secret),
+            "and it lands in the live secrets map"
+        );
+        assert!(
+            room.get_secret().is_some(),
+            "current_secret_version must still be aligned, or get_secret() \
+             returns None and every message renders as undecryptable"
         );
         assert!(!room.needs_secret_rotation());
         assert!(room.rotate_secret().is_err());

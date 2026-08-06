@@ -536,7 +536,12 @@ impl MessageClock<'_> {
 fn group_messages(
     messages_state: &MessagesV1,
     member_info: &MemberInfoV1,
-    self_member_id: MemberId,
+    // `None` when this build holds no locally-known identity for the room.
+    // Every message still renders; the identity-relative cosmetics (the
+    // `is_self` side of the bubble, the "mention of you" chip highlight)
+    // degrade to "not me". Never a mis-attribution: an unknown identity
+    // matches nobody.
+    self_member_id: Option<MemberId>,
     secrets: &HashMap<u32, [u8; 32]>,
     member_names: &HashMap<MemberId, String>,
     // Which members show a 🛡 shield in THIS viewer's conversation, built once
@@ -611,7 +616,9 @@ fn group_messages(
             members_fp,
             self_member_id,
         );
-        let is_self = author_id == self_member_id;
+        // With no locally-known identity nothing is "self", so every group
+        // renders on the other-party side rather than claiming an author.
+        let is_self = Some(author_id) == self_member_id;
 
         // Get edited status and reactions
         let edited = messages_state.is_edited(&message_id);
@@ -991,11 +998,12 @@ fn markdown_to_html(text: &str, behind_gateway: bool) -> String {
 ///
 /// `member_names` maps each member id to their decrypted current nickname (the
 /// `[name]` snapshot in the token is only used as a fallback when the id is not
-/// in the map). `self_member_id` gets a distinct highlight (a mention of you).
+/// in the map). `self_member_id` gets a distinct highlight (a mention of you);
+/// `None` (no locally-known identity) simply means no chip is self-highlighted.
 pub(crate) fn message_to_html_with_mentions(
     text: &str,
     member_names: &HashMap<MemberId, String>,
-    self_member_id: MemberId,
+    self_member_id: Option<MemberId>,
 ) -> String {
     use river_core::mention::{parse_segments, MentionSegment};
 
@@ -1040,7 +1048,11 @@ pub(crate) fn message_to_html_with_mentions(
                 chips.push(render_mention_chip_html(
                     resolved,
                     &name,
-                    resolved == Some(self_member_id),
+                    // `self_member_id.is_some_and(..)` rather than
+                    // `resolved == self_member_id`: the latter would call an
+                    // UNRESOLVED mention a mention of you when the local
+                    // identity is also unknown (`None == None`).
+                    self_member_id.is_some_and(|me| resolved == Some(me)),
                 ));
                 working.push(OPEN);
                 working.push_str(&idx.to_string());
@@ -1106,7 +1118,7 @@ fn member_names_fingerprint(member_names: &HashMap<MemberId, String>) -> u64 {
 /// part of the key. Gating the member inputs on the presence of a mention
 /// means an ordinary (mention-free) message survives member joins/renames in
 /// the cache, while a message that renders a chip is invalidated by them.
-fn message_html_fingerprint(text: &str, members_fp: u64, self_member_id: MemberId) -> u64 {
+fn message_html_fingerprint(text: &str, members_fp: u64, self_member_id: Option<MemberId>) -> u64 {
     let mut h = DefaultHasher::new();
     text.hash(&mut h);
     if text.contains(river_core::mention::REF_SCHEME) {
@@ -1125,7 +1137,7 @@ fn render_message_html_cached(
     text: &str,
     member_names: &HashMap<MemberId, String>,
     members_fp: u64,
-    self_member_id: MemberId,
+    self_member_id: Option<MemberId>,
 ) -> String {
     let fp = message_html_fingerprint(text, members_fp, self_member_id);
     MESSAGE_HTML_CACHE.with(|cache| {
@@ -2600,14 +2612,15 @@ pub fn Conversation() -> Element {
                     .next()
                     .is_some()
                 {
-                    // Only the PUBLIC half is needed here (own-reaction
-                    // highlighting, deputy badges). If the local identity is
-                    // unknown we fall back to the same `None` the contended
-                    // read below returns — the empty-history render — rather
-                    // than mis-attributing messages to a wrong member id.
-                    let Some(self_member_id) = room_data.self_member_id() else {
-                        return None;
-                    };
+                    // Only the PUBLIC half is needed here, and only for
+                    // cosmetics: own-reaction highlighting, `is_self` grouping,
+                    // deputy badges. `None` (no locally-known identity) is
+                    // carried through rather than returned: bailing here would
+                    // render "No messages yet. Start the conversation!" over a
+                    // room full of history, which is the exact wrong-render
+                    // freenet/river#555 was about. Nothing is mis-attributed —
+                    // an unknown identity matches no member.
+                    let self_member_id: Option<MemberId> = room_data.self_member_id();
                     // Build member name lookup (reaction tooltips, @mention chips).
                     let member_names: HashMap<MemberId, String> = room_state
                         .member_info
@@ -2626,13 +2639,23 @@ pub fn Conversation() -> Element {
                     // Which authors show a 🛡 shield in this viewer's view.
                     // Computed once here, not per message: the maps behind it
                     // are O(members) to build.
-                    let deputy_badges = deputy_badges_for_viewer(
-                        &room_state.members,
-                        &room_state.member_info,
-                        &room_data.secrets,
-                        MemberId::from(&key),
-                        self_member_id,
-                    );
+                    // The badge map is VIEWER-relative (which deputies could
+                    // ban *you*), so with no identity there is no viewer to be
+                    // relative to and the shields degrade to "no badge" — an
+                    // empty map, exactly what a room with no deputies produces.
+                    // The helper keeps its `MemberId` parameter: it has ~30
+                    // call sites, and a fabricated viewer id here would be
+                    // worse than none.
+                    let deputy_badges = match self_member_id {
+                        Some(self_member_id) => deputy_badges_for_viewer(
+                            &room_state.members,
+                            &room_state.member_info,
+                            &room_data.secrets,
+                            MemberId::from(&key),
+                            self_member_id,
+                        ),
+                        None => HashMap::new(),
+                    };
                     // The ⚠ impersonation checker, from the SAME badge map, so
                     // "who is a deputy" has one answer across the conversation
                     // and the member list. Built once here, like the badges.
@@ -4690,7 +4713,11 @@ pub fn Conversation() -> Element {
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
-    self_member_id: MemberId,
+    /// `None` when this build holds no locally-known identity for the room.
+    /// Only cosmetics depend on it here (own-reaction highlight, excluding
+    /// yourself from the @mention list), and each degrades to the "not me"
+    /// answer.
+    self_member_id: Option<MemberId>,
     member_names: HashMap<MemberId, String>,
     /// Room max message size in ENCODED content bytes — bounds the edit
     /// action body (`RoomMessageBody::measure_edit`), not the raw text.
@@ -4769,7 +4796,10 @@ fn MessageGroupComponent(
     let edit_mention_members: Vec<(MemberId, String)> = {
         let mut v: Vec<(MemberId, String)> = member_names
             .iter()
-            .filter(|(id, _)| **id != self_member_id)
+            // With no known identity there is no "yourself" to exclude, so the
+            // list keeps every member. Over-inclusive, never wrong: excluding
+            // an arbitrary member would silently make them unmentionable.
+            .filter(|(id, _)| Some(**id) != self_member_id)
             // `display_nickname` never returns an empty string, so the old
             // is-empty filter became dead: the placeholder is what to exclude.
             .filter(|(_, name)| *name != crate::util::display_name::UNNAMED)
@@ -5552,8 +5582,12 @@ fn MessageGroupComponent(
                                     let is_inline_picker_open = open_emoji_picker.read().as_ref() == Some(&format!("inline-{}", msg_id_for_inline));
 
                                     // Find user's current reaction on this message (if any)
+                                    // No known identity ⇒ no reaction is ours,
+                                    // so nothing is highlighted and the picker
+                                    // offers a fresh reaction rather than a
+                                    // toggle of someone else's.
                                     let user_reaction: Option<String> = msg.reactions.iter().find_map(|(emoji, reactors)| {
-                                        if reactors.contains(&self_member_id) {
+                                        if self_member_id.is_some_and(|me| reactors.contains(&me)) {
                                             Some(emoji.clone())
                                         } else {
                                             None
@@ -5573,13 +5607,16 @@ fn MessageGroupComponent(
                                                 sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
                                                 sorted_reactions.into_iter().map(|(emoji, reactors)| {
                                                     let count = reactors.len();
-                                                    let is_user_reaction = reactors.contains(&self_member_id);
+                                                    let is_user_reaction = self_member_id.is_some_and(|me| reactors.contains(&me));
                                                     let emoji_for_click = emoji.clone();
                                                     let msg_id_for_click = msg_id_react.clone();
 
                                                     // Build list of reactor names for tooltip
                                                     let reactor_names: Vec<String> = reactors.iter().map(|reactor_id| {
-                                                        if *reactor_id == self_member_id {
+                                                        // Unknown identity ⇒ nobody is
+                                                        // labelled "You"; every reactor
+                                                        // falls through to their nickname.
+                                                        if Some(*reactor_id) == self_member_id {
                                                             "You".to_string()
                                                         } else {
                                                             member_names.get(reactor_id)
@@ -6521,7 +6558,7 @@ mod tests {
         let me = MemberId(freenet_scaffold::util::FastHash(1));
         let token = river_core::mention::encode_mention(unknown, "Admin 🛡");
 
-        let html = message_to_html_with_mentions(&token, &HashMap::new(), me);
+        let html = message_to_html_with_mentions(&token, &HashMap::new(), Some(me));
         assert!(
             !html.contains('\u{1F6E1}'),
             "an unresolved mention rendered a badge glyph from its snapshot: {html}"
@@ -7325,21 +7362,21 @@ mod tests {
 
         // Plain (mention-free) body: repeat call returns identical HTML.
         let text = "hello **world** https://freenet.org";
-        let first = render_message_html_cached(&id, text, &names, fp, me);
-        let second = render_message_html_cached(&id, text, &names, fp, me);
+        let first = render_message_html_cached(&id, text, &names, fp, Some(me));
+        let second = render_message_html_cached(&id, text, &names, fp, Some(me));
         assert_eq!(first, second, "cache hit is identical");
         assert_eq!(
             first,
-            message_to_html_with_mentions(text, &names, me),
+            message_to_html_with_mentions(text, &names, Some(me)),
             "cached output equals uncached"
         );
 
         // Editing the body (same id) invalidates and re-renders.
         let edited = "goodbye **world**";
-        let after_edit = render_message_html_cached(&id, edited, &names, fp, me);
+        let after_edit = render_message_html_cached(&id, edited, &names, fp, Some(me));
         assert_eq!(
             after_edit,
-            message_to_html_with_mentions(edited, &names, me),
+            message_to_html_with_mentions(edited, &names, Some(me)),
             "edited content re-rendered"
         );
         assert_ne!(after_edit, first, "edit changed the HTML");
@@ -7359,7 +7396,7 @@ mod tests {
         let mut names = HashMap::new();
         names.insert(alice, "Alice".to_string());
         let fp1 = member_names_fingerprint(&names);
-        let before = render_message_html_cached(&id, &text, &names, fp1, me);
+        let before = render_message_html_cached(&id, &text, &names, fp1, Some(me));
         assert!(
             before.contains("Alice"),
             "chip shows current name: {before}"
@@ -7370,10 +7407,10 @@ mod tests {
         names.insert(alice, "Roberta".to_string());
         let fp2 = member_names_fingerprint(&names);
         assert_ne!(fp1, fp2, "rename changes the member fingerprint");
-        let after = render_message_html_cached(&id, &text, &names, fp2, me);
+        let after = render_message_html_cached(&id, &text, &names, fp2, Some(me));
         assert_eq!(
             after,
-            message_to_html_with_mentions(&text, &names, me),
+            message_to_html_with_mentions(&text, &names, Some(me)),
             "rename invalidated the cached chip"
         );
         assert!(after.contains("Roberta"), "chip shows new name: {after}");
@@ -7388,8 +7425,8 @@ mod tests {
         let me = mid_from("00000000000000bb");
         let plain = "just a normal message, no mentions here";
         assert_eq!(
-            message_html_fingerprint(plain, 111, me),
-            message_html_fingerprint(plain, 222, me),
+            message_html_fingerprint(plain, 111, Some(me)),
+            message_html_fingerprint(plain, 222, Some(me)),
             "mention-free fingerprint ignores member fp"
         );
 
@@ -7397,8 +7434,8 @@ mod tests {
         let token = river_core::mention::encode_mention(alice, "Alice");
         let mentioned = format!("ping {token}");
         assert_ne!(
-            message_html_fingerprint(&mentioned, 111, me),
-            message_html_fingerprint(&mentioned, 222, me),
+            message_html_fingerprint(&mentioned, 111, Some(me)),
+            message_html_fingerprint(&mentioned, 222, Some(me)),
             "mention fingerprint depends on member fp"
         );
     }
@@ -7413,8 +7450,8 @@ mod tests {
         let fp = member_names_fingerprint(&names);
         let keep = msg_id(b"keep");
         let drop = msg_id(b"drop");
-        render_message_html_cached(&keep, "keep me", &names, fp, me);
-        render_message_html_cached(&drop, "drop me", &names, fp, me);
+        render_message_html_cached(&keep, "keep me", &names, fp, Some(me));
+        render_message_html_cached(&drop, "drop me", &names, fp, Some(me));
         assert_eq!(MESSAGE_HTML_CACHE.with(|c| c.borrow().len()), 2);
 
         let mut visible = std::collections::HashSet::new();
@@ -7474,7 +7511,7 @@ mod tests {
         let html = message_to_html_with_mentions(
             &format!("hi {token}!"),
             &names,
-            mid_from("00000000000000ff"),
+            Some(mid_from("00000000000000ff")),
         );
         assert!(
             html.contains("data-member-id=\"00000000000000aa\""),
@@ -7495,7 +7532,8 @@ mod tests {
         let id = mid_from("0000000000000abc");
         let names = HashMap::new(); // member not resolvable
         let token = river_core::mention::encode_mention(id, "Ghost");
-        let html = message_to_html_with_mentions(&token, &names, mid_from("0000000000000001"));
+        let html =
+            message_to_html_with_mentions(&token, &names, Some(mid_from("0000000000000001")));
         assert!(
             html.contains(">@Ghost</span>"),
             "unknown member falls back to the token's snapshot name: {html}"
@@ -7510,7 +7548,8 @@ mod tests {
         let mut names = HashMap::new();
         names.insert(id, "<img src=x onerror=alert(1)>".to_string());
         let token = river_core::mention::encode_mention(id, "snap");
-        let html = message_to_html_with_mentions(&token, &names, mid_from("0000000000000002"));
+        let html =
+            message_to_html_with_mentions(&token, &names, Some(mid_from("0000000000000002")));
         assert!(
             !html.contains("<img"),
             "raw markup must not survive: {html}"
@@ -7527,7 +7566,7 @@ mod tests {
         let mut names = HashMap::new();
         names.insert(me, "Me".to_string());
         let token = river_core::mention::encode_mention(me, "Me");
-        let html = message_to_html_with_mentions(&token, &names, me);
+        let html = message_to_html_with_mentions(&token, &names, Some(me));
         assert!(
             html.contains("river-mention-self"),
             "a mention of the local user must get the self class: {html}"
@@ -7540,7 +7579,7 @@ mod tests {
         let text = "a normal *markdown* msg with a https://example.com link";
         let any = mid_from("0000000000000001");
         assert_eq!(
-            message_to_html_with_mentions(text, &names, any),
+            message_to_html_with_mentions(text, &names, Some(any)),
             message_to_html(text),
             "the no-mention fast path must match the plain renderer byte-for-byte"
         );
@@ -7558,7 +7597,7 @@ mod tests {
             river_core::mention::encode_mention(a, "x"),
             river_core::mention::encode_mention(b, "y")
         );
-        let html = message_to_html_with_mentions(&text, &names, mid_from("00000000000000ff"));
+        let html = message_to_html_with_mentions(&text, &names, Some(mid_from("00000000000000ff")));
         assert!(html.contains(">@Ann</span>"), "{html}");
         assert!(html.contains(">@Bob</span>"), "{html}");
         assert!(
@@ -7587,7 +7626,8 @@ mod tests {
             )),
             "token uses the short base32 ref: {token}"
         );
-        let html = message_to_html_with_mentions(&token, &names, mid_from("00000000000000ff"));
+        let html =
+            message_to_html_with_mentions(&token, &names, Some(mid_from("00000000000000ff")));
         assert!(
             html.contains("data-member-id=\"00000000000000aa\""),
             "chip recovers the lossless id from the short ref: {html}"
@@ -7605,7 +7645,8 @@ mod tests {
             river_core::mention::REF_SCHEME,
             river_core::mention::member_id_to_hex(id)
         );
-        let html = message_to_html_with_mentions(&legacy, &names, mid_from("0000000000000001"));
+        let html =
+            message_to_html_with_mentions(&legacy, &names, Some(mid_from("0000000000000001")));
         assert!(
             html.contains("data-member-id=\"0000000000000abc\""),
             "legacy chip keeps the full id: {html}"
@@ -7621,7 +7662,8 @@ mod tests {
         let id = mid_from("0000000000000abc");
         let names = HashMap::new();
         let token = river_core::mention::encode_mention(id, "Ghost");
-        let html = message_to_html_with_mentions(&token, &names, mid_from("0000000000000001"));
+        let html =
+            message_to_html_with_mentions(&token, &names, Some(mid_from("0000000000000001")));
         assert!(
             html.contains(">@Ghost</span>"),
             "snapshot name shown: {html}"
@@ -7644,7 +7686,7 @@ mod tests {
             river_core::mention::REF_SCHEME,
             river_core::mention::member_id_to_hex(me)
         );
-        let html = message_to_html_with_mentions(&legacy, &names, me);
+        let html = message_to_html_with_mentions(&legacy, &names, Some(me));
         assert!(
             html.contains("river-mention-self"),
             "legacy self-mention must get the self class: {html}"
@@ -8567,7 +8609,7 @@ mod group_messages_clock_tests {
         group_messages(
             messages,
             member_info,
-            me,
+            Some(me),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -8580,6 +8622,88 @@ mod group_messages_clock_tests {
                 fallback_now,
             },
         )
+    }
+
+    /// A room whose local identity is unknown must still render its history.
+    ///
+    /// The regression this pins is user-visible and severe: `message_groups`
+    /// used to bail to `None` here, and the `None` arm renders
+    /// "No messages yet. Start the conversation!" — so a room full of history
+    /// would look empty. `signing_key()`'s own contract is to leave the rest of
+    /// the room readable (freenet/river#555 is the precedent for this exact
+    /// wrong render).
+    ///
+    /// The identity is needed here only for cosmetics, so it degrades to
+    /// "not me" rather than to nothing.
+    #[test]
+    fn messages_still_render_when_the_local_identity_is_unknown() {
+        let owner = signing_key(60);
+        let owner_id = member_id_of(&owner);
+        let a = signing_key(61);
+        let b = signing_key(62);
+        let now = Utc::now();
+        let messages = state(vec![
+            message_at(owner_id, &a, now),
+            message_at(owner_id, &b, now + chrono::Duration::minutes(1)),
+        ]);
+        let mut member_info = info(&a, "Alice");
+        member_info.member_info.extend(info(&b, "Bob").member_info);
+        let receive_times = ReceiveTimes::default();
+
+        let known = group_messages(
+            &messages,
+            &member_info,
+            Some(member_id_of(&a)),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &ImpersonationChecker::default(),
+            owner_id,
+            MessageClock {
+                receive_times: &receive_times,
+                fallback_now: now,
+            },
+        );
+        let unknown = group_messages(
+            &messages,
+            &member_info,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &ImpersonationChecker::default(),
+            owner_id,
+            MessageClock {
+                receive_times: &receive_times,
+                fallback_now: now,
+            },
+        );
+
+        // Precondition, so this cannot pass on an empty fixture.
+        assert!(
+            !known.is_empty(),
+            "fixture must produce groups with a known identity"
+        );
+        assert_eq!(
+            unknown.len(),
+            known.len(),
+            "every message must still render with no local identity — an empty \
+             result is what makes the UI claim the room has no messages"
+        );
+
+        // The only difference is the cosmetic: nothing is attributed to "me".
+        let self_flags: Vec<bool> = unknown
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Messages(g) => Some(g.is_self),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !self_flags.is_empty() && self_flags.iter().all(|f| !f),
+            "with an unknown identity nothing is 'mine' — but nothing is \
+             mis-attributed either"
+        );
     }
 
     fn only_group(items: &[DisplayItem]) -> &MessageGroup {

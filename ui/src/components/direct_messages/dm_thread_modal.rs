@@ -178,11 +178,22 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             };
             let room_data = rooms.map.get(&room)?;
 
-            // DM bodies are ECIES-sealed to us, so rendering the thread needs
-            // the private key. Without it there is nothing to show: fall back
-            // to the same `None` a contended ROOMS read returns.
-            let self_sk = room_data.signing_key().cloned()?;
-            let self_id = MemberId::from(&self_sk.verifying_key());
+            // INBOUND bodies are ECIES-sealed to us, so reading them needs the
+            // private key — but its absence must not blank the thread. Outbound
+            // bubbles come from the plaintext cache, and an unreadable inbound
+            // body degrades to the same placeholder a decrypt failure already
+            // renders. `None` here only costs the bodies.
+            let self_sk = room_data.signing_key().cloned();
+            // Direction (inbound vs outbound) is decided against the local
+            // member id, and the id survives without the private key
+            // (`self_verifying_key` falls back to the persisted `self_vk`).
+            // With NO identity at all, direction is undecidable: every DM here
+            // involves `peer`, and picking a default would render some other
+            // member's message as one the user sent. Constraint: never
+            // mislabel. So the message loop is skipped entirely and the thread
+            // renders EMPTY (the peer's name, membership state and the
+            // composer's own key check are unaffected) rather than wrong.
+            let self_id: Option<MemberId> = room_data.self_member_id();
             let owner_id = MemberId::from(&room);
 
             // Nickname / membership lookup.
@@ -241,8 +252,12 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             let mut latest_inbound_ts: u64 = 0;
             let mut rendered: Vec<RenderedDm> = Vec::new();
             for msg in &room_data.room_state.direct_messages.messages {
-                let is_self_sender = msg.message.sender == self_id;
-                let is_self_recipient = msg.message.recipient == self_id;
+                // Both `false` when `self_id` is `None`, so `between_us` below
+                // is false for every message and the thread renders empty —
+                // the "never mislabel" degradation described above, with no
+                // special case needed here.
+                let is_self_sender = Some(msg.message.sender) == self_id;
+                let is_self_recipient = Some(msg.message.recipient) == self_id;
                 let between_us = (is_self_sender && msg.message.recipient == peer)
                     || (is_self_recipient && msg.message.sender == peer);
                 if !between_us {
@@ -254,8 +269,11 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 }
 
                 let (body, kind) = if is_self_recipient {
-                    match open_direct_message(&self_sk, msg) {
-                        Ok(bytes) => match decode_body(&bytes) {
+                    // `None` = no private key held locally, so the ECIES
+                    // envelope cannot be opened at all. Rendered with the same
+                    // placeholder shape as a failed decrypt, below.
+                    match self_sk.as_ref().map(|sk| open_direct_message(sk, msg)) {
+                        Some(Ok(bytes)) => match decode_body(&bytes) {
                             Ok(DirectMessageBody::Text { text }) => (text, BodyKind::Plaintext),
                             Ok(DirectMessageBody::Invite(payload)) => {
                                 // Resolve a friendly room label and the
@@ -305,13 +323,22 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                 BodyKind::Placeholder,
                             ),
                         },
-                        Err(err) => (
+                        Some(Err(err)) => (
                             // Skeptical reviewer caught: putting `<...>`
                             // through `message_to_html` produces mangled
                             // markup because `<unable:` looks like a
                             // markdown autolink scheme. Tag the kind so
                             // the renderer skips markdown for these.
                             format!("unable to decrypt: {}", err),
+                            BodyKind::Placeholder,
+                        ),
+                        None => (
+                            // No signing key for this room on this device.
+                            // Same placeholder shape (and the same
+                            // markdown-skipping `Placeholder` kind) as the
+                            // decrypt-failure branch above.
+                            "unable to decrypt: no signing key for this room on this device"
+                                .to_string(),
                             BodyKind::Placeholder,
                         ),
                     }

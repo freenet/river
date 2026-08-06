@@ -207,6 +207,13 @@ pub fn clear_invitation_from_storage() {
 pub(crate) fn purge_persisted_invitation() {
     with_local_storage(|storage| {
         let _ = storage.remove_item(INVITATION_STORAGE_KEY);
+        // Sweep the nickname binding too. It is not sensitive, but once the
+        // artifact it is fingerprint-bound to is gone there is nothing it can
+        // ever bind to again — `load_invitation_nickname_from_storage` only
+        // returns it on a fingerprint MATCH — so leaving it behind is dead
+        // state that outlives its guard.
+        let _ = storage.remove_item(INVITATION_NICKNAME_STORAGE_KEY);
+        let _ = storage.remove_item(INVITATION_NICKNAME_FP_STORAGE_KEY);
     });
 }
 
@@ -1150,6 +1157,49 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
     }
 }
 
+/// Startup hook: retire any invitation an older River left in localStorage.
+///
+/// Called from `App()`, which re-renders often, so the localStorage write is
+/// done at most once per page load. Idempotent either way; the flag only keeps
+/// it off the render hot path.
+pub(crate) fn adopt_and_purge_legacy_persisted_invitation_once() {
+    thread_local! {
+        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if DONE.with(|d| d.replace(true)) {
+        return;
+    }
+
+    // ADOPT BEFORE PURGING. Destroying the stored artifact unread would lose a
+    // join that an older build had genuinely left in flight: the user clicks
+    // Accept, `accept_invitation` PUTs the invitee member, the room only enters
+    // `ROOMS` on the GET response, that stalls (see the auto-resume notes on
+    // the recovery block in `App` — freenet-core#4345 is cited there as a real
+    // occurrence), and the user reloads onto this build. The invitee private
+    // key would then be gone from BOTH memory and disk while the member entry
+    // may already exist in the room — the freenet/river#365 orphan shape, with
+    // nobody holding the key. Reading it into memory first costs nothing and
+    // gives up none of the security win, because the artifact still leaves
+    // durable storage in the same breath.
+    let recovered = with_local_storage(|storage| storage.get_item(INVITATION_STORAGE_KEY).ok()?)
+        .flatten()
+        .and_then(|encoded| Invitation::from_encoded_string(&encoded).ok());
+
+    if let Some(invitation) = recovered {
+        info!("Adopting a pending invitation persisted by an older River, then erasing it");
+        PENDING_INVITATION.with(|cell| {
+            // Never clobber an invitation this page load already holds (the URL
+            // parse runs first): the live one is strictly fresher.
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(invitation);
+            }
+        });
+    }
+
+    purge_persisted_invitation();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1202,6 +1252,48 @@ mod tests {
             src.contains("fn purge_persisted_invitation")
                 && src.contains("remove_item(INVITATION_STORAGE_KEY)"),
             "the legacy persisted invitation must still be erased on upgrade"
+        );
+    }
+
+    /// The startup hook must actually be wired into `App`, and must ADOPT
+    /// before it purges.
+    ///
+    /// A source scrape because the adopt/purge both go through `web_sys`,
+    /// which does not exist under `cargo test` — a behavioural test could not
+    /// fail here. What it guards is real: if the call were dropped from `App`,
+    /// an older River's stored artifact would simply sit on disk forever, which
+    /// is the exposure this change exists to retire; and if the purge ran
+    /// before the read, an in-flight join left by the older build would be
+    /// destroyed unread (the freenet/river#365 orphan shape, with nobody
+    /// holding the invitee key).
+    #[test]
+    fn the_startup_purge_is_wired_in_and_adopts_before_erasing() {
+        let app = include_str!("../app.rs");
+        assert!(
+            app.contains("adopt_and_purge_legacy_persisted_invitation_once()"),
+            "App must run the legacy-invitation adopt+purge at startup, or an \
+             older River's persisted private key is never erased"
+        );
+
+        let full = include_str!("receive_invitation_modal.rs");
+        let src = full
+            .split("mod tests {")
+            .next()
+            .expect("production code precedes `mod tests`");
+        let body = src
+            .split("fn adopt_and_purge_legacy_persisted_invitation_once")
+            .nth(1)
+            .expect("the startup hook must exist");
+        let read_at = body
+            .find("get_item(INVITATION_STORAGE_KEY)")
+            .expect("the hook must READ the legacy artifact before erasing it");
+        let purge_at = body
+            .find("purge_persisted_invitation()")
+            .expect("the hook must erase the legacy artifact");
+        assert!(
+            read_at < purge_at,
+            "the hook must adopt the stored invitation BEFORE purging it — \
+             purging first destroys an in-flight join unread"
         );
     }
 
@@ -1852,21 +1944,4 @@ mod tests {
              terminal success (the relocation target of the gravestone fix)."
         );
     }
-}
-
-/// Startup hook: retire any invitation an older River left in localStorage.
-///
-/// Called from `App()`, which re-renders often, so the localStorage write is
-/// done at most once per page load. Idempotent either way; the flag only keeps
-/// it off the render hot path.
-pub(crate) fn purge_legacy_persisted_invitation_once() {
-    thread_local! {
-        static PURGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    PURGED.with(|done| {
-        if !done.get() {
-            done.set(true);
-            purge_persisted_invitation();
-        }
-    });
 }

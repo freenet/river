@@ -49,7 +49,12 @@ pub fn EditRoomModal() -> Element {
             .map(|room_data| room_data.room_state.configuration.configuration.clone())
     });
 
-    // Memoize if the current user is the owner of the room being edited
+    // Memoize if the current user is the owner of the room being edited.
+    //
+    // Public half only, deliberately: ownership IS a property of the public
+    // key. This drives the *informational* surfaces (the leave warning, and
+    // whether the owner-only secret row exists at all), never an editing
+    // affordance — see `user_can_edit` below.
     let user_is_owner = use_memo(move || {
         editing_room.read().as_ref().is_some_and(|room_data| {
             // Public half only: an unknown local identity is not the owner,
@@ -58,6 +63,21 @@ pub fn EditRoomModal() -> Element {
             let room_vk = EDIT_ROOM_MODAL.read().room.unwrap();
             user_vk == Some(room_vk)
         })
+    });
+
+    // Whether this device can actually PERFORM an owner edit. Every
+    // configuration change is signed, so it needs the private half as well as
+    // ownership. Gating the editable affordances on this rather than on
+    // `user_is_owner` is what stops a key-less owner being offered controls
+    // whose save would then bail with only a log line (review finding R4).
+    // Identical to `user_is_owner` whenever the key is held, which is every
+    // room written by a shipped River today.
+    let user_can_edit = use_memo(move || {
+        *user_is_owner.read()
+            && editing_room
+                .read()
+                .as_ref()
+                .is_some_and(|room_data| room_data.signing_key().is_some())
     });
 
     // Render the modal if room configuration is available
@@ -86,14 +106,26 @@ pub fn EditRoomModal() -> Element {
                         class: "p-6",
                         h1 { class: "text-xl font-semibold text-text mb-4", "Room Details" }
 
+                        // A key-less owner gets the read-only modal. Say why,
+                        // rather than leaving every control unexplainedly
+                        // disabled (review finding R4). Plain conditional
+                        // markup — no new signal, no new modal.
+                        if *user_is_owner.read() && !*user_can_edit.read() {
+                            p {
+                                "data-testid": "edit-room-no-key-notice",
+                                class: "mb-4 px-3 py-2 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-yellow-400 text-sm",
+                                "This device doesn't hold your key for this room, so you can't change its settings here."
+                            }
+                        }
+
                         RoomNameField {
                             config: config.clone(),
-                            is_owner: *user_is_owner.read()
+                            is_owner: *user_can_edit.read()
                         }
 
                         RoomDescriptionField {
                             config: config.clone(),
-                            is_owner: *user_is_owner.read()
+                            is_owner: *user_can_edit.read()
                         }
 
                         // Member capacity
@@ -107,15 +139,16 @@ pub fn EditRoomModal() -> Element {
                                         member_count: member_count,
                                         max_members: max_members,
                                         is_full: is_full,
-                                        is_owner: *user_is_owner.read(),
+                                        is_owner: *user_can_edit.read(),
                                         config: config.clone(),
                                     }
                                 }
                             }
                         }
 
-                        // Numeric configuration fields (owner-only)
-                        if *user_is_owner.read() {
+                        // Numeric configuration fields (owner-only, and only
+                        // when this device can sign the resulting config edit)
+                        if *user_can_edit.read() {
                             NumericConfigField {
                                 label: "Max Recent Messages",
                                 value: config.max_recent_messages,
@@ -213,6 +246,19 @@ pub fn EditRoomModal() -> Element {
                             {
                                 let is_private = room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private;
                                 let is_owner = room_data.is_self_owner();
+                                // Rotation derives AND signs the new secret, so
+                                // it needs the private half, not just ownership
+                                // (review finding R4). The button stays visible
+                                // for a key-less owner but is disabled with an
+                                // explanatory title — this row has no error
+                                // surface of its own, and silently offering a
+                                // control that only logs on failure is the bug.
+                                let can_rotate = is_owner && room_data.signing_key().is_some();
+                                let rotate_title = if can_rotate {
+                                    "Rotate room secret now (e.g., after suspecting a leak). The delegate also rotates automatically when the member set changes."
+                                } else {
+                                    "This device doesn't hold your key for this room, so it can't rotate the secret."
+                                };
                                 let secret_version = room_data.room_state.secrets.current_version;
                                 let owner_vk = room_data.owner_vk;
 
@@ -246,8 +292,9 @@ pub fn EditRoomModal() -> Element {
                                                     // converges via the contract's duplicate-version
                                                     // dedup.
                                                     button {
-                                                        class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors",
-                                                        title: "Rotate room secret now (e.g., after suspecting a leak). The delegate also rotates automatically when the member set changes.",
+                                                        class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                                                        title: "{rotate_title}",
+                                                        disabled: !can_rotate,
                                                         onclick: move |_| {
                                                             crate::util::defer(move || {
                                                                 let mut applied = false;
@@ -518,6 +565,9 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
 
         let Some((room_key, self_sk, room_state_clone, is_private, room_secret_opt)) = signing_data
         else {
+            // Backstop only. `is_owner` is now the key-gated `user_can_edit`,
+            // so a key-less owner never gets an enabled textarea to reach this
+            // from; the modal explains the refusal up front instead (R4).
             warn!("Cannot update the room description: room or local signing key unavailable");
             return;
         };
@@ -728,6 +778,8 @@ fn NumericConfigField(
         });
 
         let Some((room_key, self_sk, room_state_clone)) = signing_data else {
+            // Backstop only: this whole field is rendered behind the key-gated
+            // `user_can_edit`, so a key-less owner never sees it (R4).
             warn!("Cannot update the room configuration: room or local signing key unavailable");
             return;
         };
@@ -851,6 +903,8 @@ fn MaxMembersField(
         });
 
         let Some((room_key, self_sk, room_state_clone)) = signing_data else {
+            // Backstop only: the input is rendered behind the key-gated
+            // `user_can_edit`, so a key-less owner never sees it (R4).
             warn!("Cannot update the room configuration: room or local signing key unavailable");
             return;
         };

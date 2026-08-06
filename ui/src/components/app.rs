@@ -17,10 +17,11 @@ use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::notification_modal::NotificationModal;
 use crate::components::room_list::receive_invitation_modal::{
-    accept_invitation, clear_invitation_from_storage, decide_recovered_invitation,
-    is_invitation_processed, load_invitation_from_storage, load_invitation_nickname_from_storage,
-    purge_legacy_persisted_invitation_once, save_invitation_to_storage, take_resume_once,
-    ReceiveInvitationModal, RecoveredInvitationAction, PRESENT_INVITATION_REQUEST,
+    accept_invitation, adopt_and_purge_legacy_persisted_invitation_once,
+    clear_invitation_from_storage, decide_recovered_invitation, is_invitation_processed,
+    load_invitation_from_storage, load_invitation_nickname_from_storage,
+    save_invitation_to_storage, take_resume_once, ReceiveInvitationModal,
+    RecoveredInvitationAction, PRESENT_INVITATION_REQUEST,
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
@@ -325,13 +326,17 @@ pub fn App() -> Element {
         receive_invitation.set(Some(inv));
     });
 
-    // Retire any invitation an OLDER River persisted to localStorage. That
-    // blob carries a full ed25519 private key plus the room's plaintext
-    // secrets, and the old flow had no terminal state for an abandoned invite,
-    // so it could sit there indefinitely. River no longer writes it (the
-    // pending invitation is held in memory for the page's lifetime), but not
-    // writing it does nothing about what is already on disk — this does.
-    purge_legacy_persisted_invitation_once();
+    // Retire any invitation an OLDER River persisted to localStorage. That blob
+    // carries a full ed25519 private key plus the room's plaintext secrets, and
+    // the old flow had no terminal state for an abandoned invite, so it could
+    // sit there indefinitely. River no longer writes it (the pending invitation
+    // is held in memory for the page's lifetime), but not writing it does
+    // nothing about what is already on disk — this does.
+    //
+    // It ADOPTS the artifact into memory before erasing it, so an in-flight
+    // join left by the older build still completes on this one. Runs before the
+    // recovery block below, which is what consumes it.
+    adopt_and_purge_legacy_persisted_invitation_once();
 
     // Recover the pending invitation if it was not found in the URL. Note this
     // now only recovers WITHIN a page load, not across a reload: the artifact

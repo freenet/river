@@ -192,10 +192,22 @@ fn count_unread_in_room_data(room_data: &crate::room_data::RoomData) -> usize {
 fn unread_candidate_messages(
     room_data: &crate::room_data::RoomData,
 ) -> impl Iterator<Item = &river_core::room_state::message::AuthorizedMessageV1> {
-    // `None` when the stored room carries no locally-known identity. There is
-    // then no "own" author to exclude, so the tail keeps every message — the
-    // fail-safe direction for an unread count (an over-count is visible and
-    // clearable; a silent zero is the freenet/river#500 symptom).
+    // `None` when the stored room carries no locally-known identity.
+    //
+    // THE RULE for badge counts with an unknown identity, which is why this
+    // one keeps counting while `count_unread_dms_with` below returns zero:
+    // degrade toward the answer that stays approximately TRUE.
+    //
+    // Here the identity only REFINES the count — it excludes the user's own
+    // messages from their own unread badge. Dropping that refinement
+    // over-counts by however many of the recent messages are the user's, which
+    // is a small, visible, clearable error; a silent zero would be the
+    // freenet/river#500 symptom. So keep counting.
+    //
+    // In the DM case the identity is what makes the count MEAN anything —
+    // which threads are even the user's, and which way each message went — so
+    // a number computed without it would be about other people's
+    // conversations. There, zero is the honest answer.
     let self_member_id: Option<MemberId> = room_data.self_member_id();
     let recent = &room_data.room_state.recent_messages;
 
@@ -519,8 +531,12 @@ fn count_unread_dms_with(
 ) -> usize {
     let mut total = 0usize;
     for (owner_key, room_data) in map {
-        // Without a locally-known identity we cannot tell an inbound DM from
-        // an outbound one, so this room contributes no unread DMs.
+        // Without a locally-known identity we cannot tell which threads are the
+        // user's, nor which way any message went, so this room contributes no
+        // unread DMs. Deliberately the opposite direction from
+        // `unread_candidate_messages` above, which keeps counting — see the
+        // rule stated there: identity only REFINES the room count, but it is
+        // what makes the DM count mean anything at all.
         let Some(self_id) = room_data.self_member_id() else {
             continue;
         };

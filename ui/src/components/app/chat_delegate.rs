@@ -1649,6 +1649,11 @@ mod tests {
     /// is how a future River will know who the local user is once `self_sk` is
     /// no longer in the blob, and it can only rely on that if today's build has
     /// been writing it all along.
+    ///
+    /// Writing it here does NOT make it durable — an older tab or build saving
+    /// the same room strips it again, and the backfill never runs on decode.
+    /// See the `RoomData::self_vk` field docs: the relocation writer must check
+    /// per-room that the STORED blob already carries it, not assume it.
     #[test]
     fn a_saved_slot_always_carries_self_vk() {
         let vk = SigningKey::from_bytes(&[31u8; 32]).verifying_key();
@@ -4567,6 +4572,13 @@ fn present_action(kind: SlotKind, explicitly_rejoined: bool) -> PresentAction {
 /// disagreement, it is a copy with nothing to say, and the callers' "diverged"
 /// branches are all lossy (they drop the other copy's state), so silence must
 /// not trigger them.
+///
+/// THE RULE, shared with the identity-conflict guard in `Rooms::merge`:
+/// a CONFLICT test treats an unknown identity as no-conflict. `members::
+/// swap_room_identity_in_place` deliberately takes the opposite view because it
+/// asks a different question — "is this import a CHANGE?" — to which an unknown
+/// identity is correctly "yes", since an import always supplies one. Conflict
+/// tests treat unknown as no-conflict; change tests treat unknown as changed.
 fn identities_diverged(a: &RoomData, b: &RoomData) -> bool {
     match (a.self_verifying_key(), b.self_verifying_key()) {
         (Some(x), Some(y)) => x != y,

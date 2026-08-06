@@ -1413,12 +1413,13 @@ pub fn MemberList() -> Element {
         };
         let room_data = rooms_read.map.get(&room_owner)?;
         let room_state = room_data.room_state.clone();
-        // Every row's "relationship to me" flag (is_self, invited_you,
-        // sponsor, network) is derived from this id, so with no locally-known
-        // identity the list has nothing meaningful to render. Degrade exactly
-        // like the room-not-in-ROOMS case two lines above: bail out of the
-        // memo and let the panel show its empty state.
-        let self_member_id: MemberId = room_data.self_member_id()?;
+        // `None` when this build holds no locally-known identity for the room.
+        // The roster is public room state and stays fully readable; only the
+        // per-row "relationship to me" flags (is_self, invited_you, sponsor,
+        // network), the viewer-relative 🛡 badge and the self-pin depend on
+        // this id, and each degrades to its "not me" answer below. Bailing
+        // here instead would empty the whole member panel.
+        let self_member_id: Option<MemberId> = room_data.self_member_id();
         let owner_id: MemberId = room_owner.into();
 
         let member_info = &room_state.member_info;
@@ -1440,12 +1441,29 @@ pub fn MemberList() -> Element {
         // a strict ancestor of the viewer (their deputy could ban the viewer)
         // OR is the viewer themselves (the viewer appointed the deputy). Shared
         // with the modal legend via `viewer_relevant_deputizer_set` (#451).
-        let viewer_relevant = viewer_relevant_deputizer_set(members, owner_id, self_member_id);
+        // With no identity there is no viewer for these to be relative TO, so
+        // both degrade to empty: no shield shows, and the display order falls
+        // back to the plain tree. An arbitrary stand-in viewer id would instead
+        // assert a relevance that is not this reader's.
+        let viewer_relevant = match self_member_id {
+            Some(self_member_id) => {
+                viewer_relevant_deputizer_set(members, owner_id, self_member_id)
+            }
+            None => HashSet::new(),
+        };
 
         // The badge (visibility + tooltip) for every member, shared verbatim
         // with the conversation's author lines.
-        let deputy_badges =
-            deputy_badges_for_viewer(members, member_info, room_secrets, owner_id, self_member_id);
+        let deputy_badges = match self_member_id {
+            Some(self_member_id) => deputy_badges_for_viewer(
+                members,
+                member_info,
+                room_secrets,
+                owner_id,
+                self_member_id,
+            ),
+            None => HashMap::new(),
+        };
 
         // The ⚠ impersonation checker, built ONCE here from the badge map above
         // — never inside the per-member loop below, which would re-fold every
@@ -1492,22 +1510,27 @@ pub fn MemberList() -> Element {
                 nickname,
                 _member_id: member_id,
                 is_owner,
-                is_self: member_id == self_member_id,
-                invited_you: members.is_inviter_of(member_id, self_member_id, &params),
+                // Each of these is a statement ABOUT the local user, so with no
+                // known identity every one is `false` — the row renders with no
+                // relationship tags rather than claiming a wrong one.
+                is_self: Some(member_id) == self_member_id,
+                invited_you: self_member_id
+                    .is_some_and(|me| members.is_inviter_of(member_id, me, &params)),
                 sponsored_you: if is_owner {
                     false
                 } else {
-                    is_member_sponsor(member_id, members, self_member_id, &params)
+                    self_member_id
+                        .is_some_and(|me| is_member_sponsor(member_id, members, me, &params))
                 },
                 invited_by_you: if is_owner {
                     false
                 } else {
-                    did_you_invite_member(member_id, members, self_member_id)
+                    self_member_id.is_some_and(|me| did_you_invite_member(member_id, members, me))
                 },
                 in_your_network: if is_owner {
                     false
                 } else {
-                    is_in_your_network(member_id, members, self_member_id)
+                    self_member_id.is_some_and(|me| is_in_your_network(member_id, members, me))
                 },
                 // The 🛡 badge shows when a deputy is viewer-relevant (#410):
                 // a deputizer that is a strict ancestor of self (their deputy
@@ -1527,8 +1550,11 @@ pub fn MemberList() -> Element {
 
         // freenet/river#584: your own row goes to the top, so finding yourself
         // isn't a scroll-and-hunt in a large room. Everything below keeps its
-        // tree order.
-        pin_self_to_top(&mut all_members, self_member_id);
+        // tree order. With no known identity there is no own row to hoist, so
+        // the list keeps its tree order unchanged.
+        if let Some(self_member_id) = self_member_id {
+            pin_self_to_top(&mut all_members, self_member_id);
+        }
 
         Some(all_members)
     })()

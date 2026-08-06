@@ -473,8 +473,12 @@ async fn delegate_sign_or_fallback(
 ///
 /// 1. `delegate_sign_or_fallback` accepts the delegate's answer only when it
 ///    verifies under `self_sk` (see above); otherwise it signs locally anyway.
-/// 2. `RoomData::self_sk` is a plain, always-present field — the private key is
-///    already in the browser, so there is nothing to wait for.
+/// 2. Every writer stores `RoomData::self_sk`, so on the send path the private
+///    key is already in the browser and there is nothing to wait for. (The
+///    field is `Option` for reader tolerance — see its docs — and the send path
+///    refuses when it is absent rather than waiting on the delegate. Do NOT
+///    read this point as licence to make the field required again; it is a
+///    statement about where the key IS, not about the field's type.)
 /// 3. Ed25519 is deterministic (RFC 8032), and the delegate signs with
 ///    `SigningKey::from_bytes(sk).sign(data)` — the same operation. So whenever
 ///    the delegate's answer is *accepted*, it is byte-identical to this.
@@ -767,44 +771,70 @@ mod tests {
         }
         let _ = assert_fallible_signing_key;
 
+        // Walk the whole crate source tree rather than a hand-listed set of
+        // files. `signing_key()` is called in ~14 files; an allow-list pins
+        // only the ones someone remembered, so a future `.unwrap()` in an
+        // unlisted file would pass CI silently. `CARGO_MANIFEST_DIR` is
+        // resolved at COMPILE time, so this cannot be defeated by the working
+        // directory the test runs from.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
         // Needles are assembled at runtime so this test's own source cannot
         // match them (the `include_str!` self-match trap).
         let unwrap = format!("{}{}", ".unwra", "p()");
         let expect = format!("{}{}", ".expec", "t(");
-        let accessor = "signing_key()";
-        let field = "self_sk";
+        let needles = [
+            format!("signing_key(){unwrap}"),
+            format!("signing_key(){expect}"),
+            format!("self_sk{unwrap}"),
+            format!("self_sk{expect}"),
+        ];
 
-        for (name, src) in [
-            (
-                "conversation.rs",
-                include_str!("components/conversation.rs"),
-            ),
-            ("room_data.rs", include_str!("room_data.rs")),
-            (
-                "dm_thread_modal.rs",
-                include_str!("components/direct_messages/dm_thread_modal.rs"),
-            ),
-            (
-                "direct_messages.rs",
-                include_str!("components/direct_messages.rs"),
-            ),
-        ] {
-            // Strip the test module so a test's own deliberate unwrap of a
-            // fixture key does not trip the scan.
-            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-            for needle in [
-                format!("{accessor}{unwrap}"),
-                format!("{accessor}{expect}"),
-                format!("{field}{unwrap}"),
-                format!("{field}{expect}"),
-            ] {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        assert!(
+            files.len() > 20,
+            "expected to walk the crate's sources, found {} files under {} — \
+             the walk is broken, so this pin is guarding nothing",
+            files.len(),
+            root.display()
+        );
+
+        for path in files {
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Scan the WHOLE file, tests included. Splitting at the first
+            // `#[cfg(test)]` would silently truncate production code that
+            // follows a cfg(test) helper — `room_data.rs` has exactly that
+            // shape — so the split weakened the guard rather than refining it.
+            // Nothing in this crate unwraps the key even in tests, so there is
+            // no exemption to carve out; if a test ever needs to, it should
+            // reach for the fixture key it already holds.
+            for needle in &needles {
                 assert!(
-                    !prod.contains(&needle),
-                    "{name} recovers the local signing key with `{needle}`. \
+                    !src.contains(needle.as_str()),
+                    "{} recovers the local signing key with `{}`. \
                      `self_sk` is deliberately optional so a future blob without \
                      it still decodes; unwrapping it converts that tolerance back \
                      into a panic. Degrade instead (return None/Err, or log and \
-                     skip)."
+                     skip).",
+                    path.display(),
+                    needle
                 );
             }
         }
