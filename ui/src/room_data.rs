@@ -6877,9 +6877,12 @@ mod tests {
                 if !is_assignment && !is_literal_field {
                     continue;
                 }
-                if !in_test_helper[i] {
-                    checked += 1;
-                }
+                // Counted per-ARM below, not here: the literal arm has its own
+                // increment, so counting up front made every literal count
+                // TWICE. That inflated the tally past the floor and silently
+                // undid the point of tracking test helpers at all — a
+                // production site could be deleted and the floor would still
+                // hold on the double-counted remainder.
                 let window = lines[i.saturating_sub(3)..(i + 4).min(lines.len())].join("\n");
 
                 // For a LITERAL, naming the field is not enough — that is
@@ -6940,6 +6943,9 @@ mod tests {
                     continue;
                 }
 
+                if !in_test_helper[i] {
+                    checked += 1;
+                }
                 assert!(
                     window.contains(".self_vk ="),
                     "{}:{} assigns self_sk without assigning self_vk beside it. \

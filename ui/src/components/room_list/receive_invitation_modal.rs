@@ -110,11 +110,19 @@ pub fn present_invitation(inv: Invitation) {
 // being reachable only in a browser. Behaviour on wasm is unchanged: the same
 // `window().local_storage()` call behind the same `Ok(Some(..))` gate.
 //
-// This is not a convenience. The one BLOCKING defect this file has had — a
-// purge that erased the nickname binding and silently turned the #218
-// auto-resume into a re-prompt — was invisible to a source-scrape test and
-// only falsifiable by driving the real sequence. See
+// This is not a convenience: a purge that erased the nickname binding, and so
+// silently turned the #218 auto-resume into a re-prompt, was invisible to a
+// source-scrape test and only falsifiable by driving the real sequence. See
 // `a_legacy_invite_with_its_nickname_still_auto_resumes`.
+//
+// REACHABILITY, so the coverage is not overstated: in the deployed gateway the
+// iframe has an opaque origin, `localStorage` throws, and all three of these
+// functions are no-ops. Every test that drives them therefore exercises a
+// branch that CANNOT occur there — as does the legacy artifact they read, which
+// no gateway user has. Real coverage is `dx serve` and non-sandboxed
+// deployments (self-hosted, or any future non-iframe embedding). The logic is
+// worth getting right for those, and worth having tested rather than scraped,
+// but this is not coverage of the production path.
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     static FAKE_STORAGE: RefCell<std::collections::HashMap<String, String>> =
@@ -291,6 +299,14 @@ fn clear_invitation_nickname_from_storage() {
 /// `invitation_encoded` is the canonical `Invitation::to_encoded_string()`;
 /// its fingerprint is stored too so the nickname is only ever applied back to
 /// the same invitation it was chosen for.
+/// The two writes are deliberately NOT guarded against a half-write, which the
+/// pre-kv version was: it bailed before writing the fingerprint if the nickname
+/// write failed. Losing that is benign, and the reason is worth recording
+/// rather than restoring the code. `load_invitation_nickname_from_storage`
+/// requires BOTH keys, so a nickname without a fingerprint reads as absent, and
+/// the cross-invitation leak #333 guarded against additionally needs a stale
+/// nickname that `save_invitation_to_storage` already clears at the single
+/// chokepoint every fresh invitation passes through.
 pub fn save_invitation_nickname_to_storage(invitation_encoded: &str, nickname: &str) {
     storage_set(INVITATION_NICKNAME_STORAGE_KEY, nickname);
     storage_set(
@@ -1222,13 +1238,16 @@ pub(crate) fn adopt_and_purge_legacy_persisted_invitation_once() {
 
     if let Some(invitation) = recovered {
         info!("Adopting a pending invitation persisted by an older River, then erasing it");
+        // Unconditional. This hook now runs BEFORE the URL-parse block (that
+        // ordering is what stops the artifact being purged unread, and is
+        // pinned), so the slot is always empty here on the path that matters.
+        // An earlier version guarded with `if slot.is_none()` and justified it
+        // as "the URL parse runs first" — true when the hook ran later, false
+        // once it moved, and dead either way. A live invitation still wins:
+        // the URL parse calls `save_invitation_to_storage` after this, which
+        // overwrites the slot outright.
         PENDING_INVITATION.with(|cell| {
-            // Never clobber an invitation this page load already holds (the URL
-            // parse runs first): the live one is strictly fresher.
-            let mut slot = cell.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(invitation);
-            }
+            *cell.borrow_mut() = Some(invitation);
         });
     }
 
@@ -1446,13 +1465,26 @@ mod tests {
         );
         // The click-interceptor's `save_invitation_to_storage` sits textually
         // earlier but runs inside a `use_effect`, i.e. after the render body,
-        // so it is not a counterexample. Anchoring on the URL-parse block keeps
-        // this pin about the calls that actually run during the first render.
-        assert!(
-            app[..adopt_at].contains("use_effect"),
-            "expected the click-interceptor use_effect above the adopt call; if \
-             that moved, re-check which invitation-save paths now run before it"
-        );
+        // so it is not a counterexample. Assert that specifically — that EVERY
+        // save above the adopt call is inside an effect — rather than merely
+        // that the string "use_effect" appears somewhere above, which is true
+        // of almost any edit to this file and so proves nothing.
+        let saves_above: Vec<usize> = app[..adopt_at]
+            .match_indices("save_invitation_to_storage(&")
+            .map(|(i, _)| i)
+            .collect();
+        for at in saves_above {
+            let effect_at = app[..at]
+                .rfind("use_effect(")
+                .expect("a save above the adopt call must sit inside a use_effect");
+            let closes = app[effect_at..at].matches("});").count();
+            assert!(
+                closes == 0,
+                "app.rs has a save_invitation_to_storage at byte {at} that runs \
+                 during the render body, BEFORE the legacy adopt hook. It would \
+                 purge the legacy artifact before the hook can read it."
+            );
+        }
 
         let full = include_str!("receive_invitation_modal.rs");
         let src = full

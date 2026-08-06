@@ -827,12 +827,18 @@ mod tests {
                     .unwrap_or(false)
             })
             .count();
+        // NB the tally includes signing.rs itself (this test's own text), so a
+        // floor of 5 is really four INDEPENDENT files. Deliberate: raising the
+        // floor to chase that off would just make it brittle against ordinary
+        // refactors, and the control only has to distinguish "the needle still
+        // matches something" from "the needle matches nothing".
         assert!(
             accessor_sites >= 5,
-            "expected the `signing_key()` accessor at several sites, found {accessor_sites}. \
-             Either it was renamed — in which case the needles below are searching \
-             for a string that no longer exists and this pin is dead — or the key \
-             stopped being read through the accessor at all."
+            "expected the `signing_key()` accessor at several sites, found {accessor_sites} \
+             (one of which is signing.rs itself). Either it was renamed — in which \
+             case the needles below are searching for a string that no longer \
+             exists and this pin is dead — or the key stopped being read through \
+             the accessor at all."
         );
 
         for path in files {
