@@ -312,7 +312,21 @@ pub fn InviteViaDmPickerModal() -> Element {
 
         let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
         let invitee_vk = invitee_signing_key.verifying_key();
-        let invited_by: MemberId = candidate_data.self_sk.verifying_key().into();
+        // The invitation is signed with the local key for the CANDIDATE room,
+        // so hoist it here: with no key there is nothing to sign, and the pick
+        // is refused through the picker's existing error slot (same shape as
+        // the "candidate room data missing" bail above). `invited_by` is the
+        // public half of this same key.
+        let Some(inviter_sk) = candidate_data.signing_key().cloned() else {
+            error!("invite-via-DM: no local signing key for the candidate room");
+            send_error.set(Some(
+                "This device doesn't hold your key for the room you picked, so it can't \
+                 create an invitation there."
+                    .into(),
+            ));
+            return;
+        };
+        let invited_by: MemberId = inviter_sk.verifying_key().into();
         let owner_id: MemberId = candidate_data.owner_vk.into();
 
         let member = Member {
@@ -321,7 +335,6 @@ pub fn InviteViaDmPickerModal() -> Element {
             member_vk: invitee_vk,
         };
         let room_key = candidate_data.room_key();
-        let inviter_sk = candidate_data.self_sk.clone();
 
         let my_generation = PICK_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -691,6 +704,11 @@ async fn drive_send(
         SendDmOutcome::SilentDrop => Err(
             "Invite couldn't be added to the room (your member entry may be \
              missing). Try posting a message in the room first, then retry."
+                .into(),
+        ),
+        SendDmOutcome::IdentityUnavailable => Err(
+            "This device doesn't hold your key for the room you're DM'ing in, so the \
+             invite can't be sent from here."
                 .into(),
         ),
     }

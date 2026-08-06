@@ -49,6 +49,9 @@ fn stored_room_name(config: &Configuration) -> String {
     }
 }
 
+/// `is_owner` means "may edit this room's name", which the caller
+/// (`EditRoomModal::user_can_edit`) computes as ownership AND holding the local
+/// signing key — the rename is signed, so the public half alone is not enough.
 #[component]
 pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
     let seed_config = config.clone();
@@ -75,9 +78,20 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             // Get signing data and encryption info from room
             let signing_data = ROOMS.with(|rooms| {
                 if let Some(room_data) = rooms.map.get(&owner_key) {
+                    // The rename is signed, so the private half is required.
+                    // A blob that keeps its key elsewhere degrades exactly
+                    // like a missing room: the edit is dropped, with a log.
+                    // Backstop only. `is_owner` is the caller's key-gated
+                    // `user_can_edit`, so a key-less owner gets a disabled
+                    // input and the modal's own "this device doesn't hold your
+                    // key" notice instead of an edit that only logs (R4).
+                    let Some(self_sk) = room_data.signing_key().cloned() else {
+                        error!("No local signing key for the current room; room name edit dropped");
+                        return None;
+                    };
                     Some((
                         room_data.room_key(),
-                        room_data.self_sk.clone(),
+                        self_sk,
                         room_data.room_state.clone(),
                         room_data.is_private(),
                         room_data.get_secret().map(|(s, v)| (*s, v)),

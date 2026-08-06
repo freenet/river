@@ -28,7 +28,13 @@ pub fn NicknameField(member_info: AuthorizedMemberInfo) -> Element {
                 .ok()
                 .and_then(|rooms| {
                     rooms.map.get(key).map(|room_data| {
-                        (Some(room_data.self_sk.clone()), room_data.secrets.clone())
+                        // `self_sk` is itself an `Option` now: a blob written
+                        // by a River that keeps the key elsewhere has no
+                        // private half. Collapsing it here means "no key"
+                        // degrades exactly like "no room" already did — the
+                        // field renders read-only (`is_self` is false) and the
+                        // existing guard in `save_changes` never fires a save.
+                        (room_data.signing_key().cloned(), room_data.secrets.clone())
                     })
                 })
                 .unwrap_or((None, HashMap::new()))

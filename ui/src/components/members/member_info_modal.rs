@@ -16,6 +16,30 @@ use dioxus::prelude::*;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::ChatRoomParametersV1;
 
+/// The viewer's own [`MemberId`] in this room, or `None` when this build holds
+/// no local identity for it (see `RoomData::self_member_id`).
+///
+/// A newtype rather than a bare `Option<MemberId>` so that the `member_id ==
+/// self_member_id` sites below keep reading as the question they actually ask —
+/// "is this the viewer?" — and answer `false` for every member when there is no
+/// identity to compare against. Sites that genuinely need the id (the ban gate,
+/// the deputy helpers) match on the inner `Option` and degrade explicitly, so
+/// the two halves of the identity question cannot be conflated.
+#[derive(Clone, Copy, PartialEq)]
+struct SelfMemberId(Option<MemberId>);
+
+impl PartialEq<SelfMemberId> for MemberId {
+    fn eq(&self, other: &SelfMemberId) -> bool {
+        other.0 == Some(*self)
+    }
+}
+
+impl PartialEq<MemberId> for SelfMemberId {
+    fn eq(&self, other: &MemberId) -> bool {
+        self.0 == Some(*other)
+    }
+}
+
 #[component]
 pub fn MemberInfoModal() -> Element {
     // Memos
@@ -50,10 +74,7 @@ pub fn MemberInfoModal() -> Element {
             crate::util::signal_guard::schedule_nudge();
             return None;
         };
-        rooms
-            .map
-            .get(&key)
-            .map(|r| MemberId::from(&r.self_sk.verifying_key()))
+        rooms.map.get(&key).and_then(|r| r.self_member_id())
     });
 
     // Memoized values
@@ -85,11 +106,22 @@ pub fn MemberInfoModal() -> Element {
     // `self_member_id` sites are panic-safe under a
     // concurrent ROOMS-write race (Skeptical M2 on PR #260). The
     // pre-existing code unwraps in three places; this single
-    // early-return covers all of them.
-    let self_member_id: MemberId = match self_member_id() {
-        Some(id) => id,
-        None => return rsx! {},
-    };
+    // resolution covers all of them.
+    //
+    // This used to early-return an EMPTY element when the id was unknown, which
+    // blanked the whole modal — and became newly reachable once the member list
+    // stopped blanking, so a reader could click a rendered row and get nothing.
+    // Everything the modal says about the TARGET is public room state that needs
+    // no local identity: the nickname, the member id, the invite chain, the 🛡
+    // appointer names, and the ⚠ impersonation sentence — which this is the ONLY
+    // surface to render as visible TEXT, and therefore the only explanation a
+    // touch user can reach at all (`title=` never fires on touch).
+    //
+    // Only the statements ABOUT THE VIEWER depend on the id — is-this-me, the
+    // "invited by you" / "invited you" tags, Ban, Deputize, and the
+    // viewer-relative 🛡 — and each degrades to its "not me" / unavailable
+    // answer below, the same way the member-list row does.
+    let self_member_id = SelfMemberId(self_member_id());
 
     // Count rooms other than the current one — used to gate the
     // "Share invite" button so it doesn't lead to an empty picker
@@ -152,8 +184,11 @@ pub fn MemberInfoModal() -> Element {
                     // Get the invite chain for this member
                     let invite_chain = room_state.room_state.members.get_invite_chain(m, &params);
 
-                    // `self_member_id` (a `MemberId`, resolved at modal-top
-                    // with an early-return) is captured by this closure.
+                    // `self_member_id` (a `SelfMemberId`, resolved at
+                    // modal-top) is captured by this closure. With no known
+                    // identity BOTH comparisons below are false, so the
+                    // "🔑 Invited by You" tag simply does not show — the
+                    // relationship is unknowable, not false-able.
                     // Member is downstream if:
                     // 1. Current user is owner (owner can ban anyone), or
                     // 2. Current user appears in their invite chain (upstream of target)
@@ -177,13 +212,20 @@ pub fn MemberInfoModal() -> Element {
         // action is taken away from someone who would otherwise have had it —
         // banning yourself, or banning an ancestor whose cascade sweeps you up —
         // gets a visible explanation instead of a mysteriously absent button.
+        //
+        // With no known identity there is no viewer for the rule to be about,
+        // so it degrades to `NoAuthority` — the same answer an unrelated member
+        // gets. That hides Ban (rather than offering an action whose ban
+        // envelope could not be signed) and leaves `ban_refusal` `None`, which
+        // is correct: nothing was taken away from anyone.
         let gate = owner_key_signal
             .as_ref()
-            .map(|owner| {
+            .zip(self_member_id.0)
+            .map(|(owner, me)| {
                 ban_gate(
                     &room_state.room_state.members,
                     &room_state.room_state.member_info,
-                    self_member_id,
+                    me,
                     member_id,
                     MemberId::from(&*owner),
                 )
@@ -222,6 +264,12 @@ pub fn MemberInfoModal() -> Element {
         // can be any member, so this shows in any member's modal (except self /
         // owner as targets); it is hidden entirely for a viewer with an empty
         // subtree to avoid advertising power they don't have.
+        //
+        // No code change was needed for the unknown-identity case: both branches
+        // compare a member id against `self_member_id`, which matches nobody when
+        // there is no identity, so this lands on `false` — the same "hide the
+        // action" answer a viewer with an empty subtree gets. Deputizing signs a
+        // `member_info` record, so an offered button would fail anyway.
         let viewer_has_authority = {
             let viewer_is_owner = owner_key_signal
                 .as_ref()
@@ -244,11 +292,16 @@ pub fn MemberInfoModal() -> Element {
             }
         };
         // Whether the target is currently one of the VIEWER's own deputies.
-        let target_is_my_deputy = room_state
-            .room_state
-            .member_info
-            .deputies_of(self_member_id)
-            .contains(&member_id);
+        // Unanswerable without a local identity, so it degrades to `false`
+        // (moot in practice — `viewer_has_authority` is also false there, which
+        // hides the button entirely).
+        let target_is_my_deputy = self_member_id.0.is_some_and(|me| {
+            room_state
+                .room_state
+                .member_info
+                .deputies_of(me)
+                .contains(&member_id)
+        });
 
         // The 🛡 legend chip below (freenet/river#451). Computed with the SAME
         // shared helper the member-list row and the conversation's author line
@@ -257,14 +310,22 @@ pub fn MemberInfoModal() -> Element {
         //
         // Single-target variant: this component is not memoised, and the sweep
         // decrypts every deputy's appointer nicknames.
-        let deputy_badge: Option<super::DeputyBadge> =
-            owner_key_signal.as_ref().and_then(|owner| {
+        //
+        // The shield is viewer-RELATIVE ("this member could ban me"), so with no
+        // known identity there is nobody for it to be relative to and it degrades
+        // to no shield — the same choice the member-list row makes. Standing in
+        // an arbitrary viewer id would assert a relevance that is not this
+        // reader's. The appointer names below hang off this, so they go with it.
+        let deputy_badge: Option<super::DeputyBadge> = owner_key_signal
+            .as_ref()
+            .zip(self_member_id.0)
+            .and_then(|(owner, me)| {
                 super::deputy_badge_for_viewer(
                     &room_state.room_state.members,
                     &room_state.room_state.member_info,
                     &room_state.secrets,
                     MemberId::from(&*owner),
-                    self_member_id,
+                    me,
                     member_id,
                 )
             });
@@ -304,13 +365,23 @@ pub fn MemberInfoModal() -> Element {
         // different code path for no gain.
         let impersonation = owner_key_signal.as_ref().and_then(|owner| {
             let owner_id = MemberId::from(&*owner);
-            let deputy_badges = super::deputy_badges_for_viewer(
-                &room_state.room_state.members,
-                &room_state.room_state.member_info,
-                &room_state.secrets,
-                owner_id,
-                self_member_id,
-            );
+            // Same viewer-relative degradation as the single-target shield
+            // above. Losing the map does NOT lose the warning: the protected
+            // set is "the owner, plus every member badged in this viewer's
+            // view", so it falls back to the owner alone — and someone imitating
+            // the room owner is exactly the case that needs no local identity to
+            // judge. That matters here more than anywhere: this modal is the
+            // only surface that spells the warning out as visible text.
+            let deputy_badges = match self_member_id.0 {
+                Some(me) => super::deputy_badges_for_viewer(
+                    &room_state.room_state.members,
+                    &room_state.room_state.member_info,
+                    &room_state.secrets,
+                    owner_id,
+                    me,
+                ),
+                None => std::collections::HashMap::new(),
+            };
             let checker = super::impersonation_checker_for_viewer(
                 &room_state.room_state.member_info,
                 &room_state.secrets,
@@ -538,6 +609,14 @@ pub fn MemberInfoModal() -> Element {
                         // accent border. Ban remains separate below
                         // because it's destructive — different styling
                         // is intentional there.
+                        //
+                        // With no known identity nobody matches, so this row
+                        // shows for every member including the viewer's own —
+                        // the "not me" degradation. Offering a DM the user
+                        // cannot send is the milder failure: the thread itself
+                        // now says why (see `dm_thread_modal`), whereas
+                        // suppressing the row would hide a working action from
+                        // everyone else in the same state.
                         if member_id != self_member_id {
                             {
                                 let dm_room = owner_key_signal.unwrap();

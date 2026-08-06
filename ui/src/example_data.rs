@@ -427,7 +427,8 @@ fn create_room(
         room_data: RoomData {
             owner_vk: owner_vk.clone(),
             room_state,
-            self_sk: self_sk.clone(),
+            self_sk: Some(self_sk.clone()),
+            self_vk: None,
             contract_key,
             last_read_message_id: None,
             secrets: std::collections::HashMap::new(),
@@ -1130,7 +1131,12 @@ mod tests {
 
         for (owner_vk, room_data) in create_example_rooms().map.iter() {
             let owner_id = MemberId::from(owner_vk);
-            let self_member_id = MemberId::from(&room_data.self_sk.verifying_key());
+            // Fixture invariant, asserted rather than unwrapped: an example
+            // room with no local identity would make every check below
+            // vacuous, so this is a fixture invariant and must fail loudly.
+            let self_member_id = room_data
+                .self_member_id()
+                .expect("every example room must carry a local identity");
             let state = &room_data.room_state;
 
             let deputy_badges = deputy_badges_for_viewer(
@@ -1221,8 +1227,11 @@ mod tests {
             "the muted room must have no read marker, or it has nothing unread \
              to suppress"
         );
-        let self_id: river_core::room_state::member::MemberId =
-            muted_room.self_sk.verifying_key().into();
+        // Fixture invariant: without a local identity the unread count below
+        // would be meaningless, so fail loudly rather than skip.
+        let self_id = muted_room
+            .self_member_id()
+            .expect("the muted example room must carry a local identity");
         let unread = muted_room
             .room_state
             .recent_messages

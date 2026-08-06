@@ -17,8 +17,9 @@ use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::notification_modal::NotificationModal;
 use crate::components::room_list::receive_invitation_modal::{
-    accept_invitation, clear_invitation_from_storage, decide_recovered_invitation,
-    is_invitation_processed, load_invitation_from_storage, load_invitation_nickname_from_storage,
+    accept_invitation, adopt_and_purge_legacy_persisted_invitation_once,
+    clear_invitation_from_storage, decide_recovered_invitation, is_invitation_processed,
+    load_invitation_from_storage, load_invitation_nickname_from_storage,
     save_invitation_to_storage, take_resume_once, ReceiveInvitationModal,
     RecoveredInvitationAction, PRESENT_INVITATION_REQUEST,
 };
@@ -193,6 +194,22 @@ pub fn App() -> Element {
         }
     });
 
+    // Retire any invitation an OLDER River persisted to localStorage, adopting
+    // it into memory first. That blob carries a full ed25519 private key plus
+    // the room's plaintext secrets, and the old flow had no terminal state for
+    // an abandoned invite, so it could sit there indefinitely. River no longer
+    // writes it (the pending invitation is held in memory for the page's
+    // lifetime), but not writing it does nothing about what is already on disk.
+    //
+    // MUST STAY ABOVE the URL-parse block below. That block calls
+    // `save_invitation_to_storage`, which itself purges the legacy artifact —
+    // so with the order reversed this hook would find nothing left to adopt,
+    // and an in-flight join left by the older build would be destroyed unread.
+    // Running first makes the ordering structural rather than a coincidence of
+    // which path happens to be taken; pinned by
+    // `the_startup_purge_is_wired_in_and_adopts_before_erasing`.
+    adopt_and_purge_legacy_persisted_invitation_once();
+
     // Get auth token from window global (injected by Freenet gateway)
     // This is synchronous - no network request needed
     get_auth_token_from_window();
@@ -325,9 +342,13 @@ pub fn App() -> Element {
         receive_invitation.set(Some(inv));
     });
 
-    // Recover invitation from localStorage if not found in URL (e.g. after
-    // page reload before subscription completed). The invitation artifact
-    // stays in storage from the moment it is seen until the room is
+    // Recover the pending invitation if it was not found in the URL. Note this
+    // now only recovers WITHIN a page load, not across a reload: the artifact
+    // is a bearer credential and is deliberately no longer persisted. See
+    // `PENDING_INVITATION`. The three cases below are unchanged in shape; case
+    // 1 (auto-resume) is reachable only when the invitation is still in memory.
+    //
+    // The artifact is held from the moment it is seen until the room is
     // subscribed OR the user dismisses it (`clear_invitation_from_storage`).
     //
     // Three cases, in priority order:

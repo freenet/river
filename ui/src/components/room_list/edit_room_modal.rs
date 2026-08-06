@@ -1,17 +1,60 @@
 use super::room_name_field::RoomNameField;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
+use crate::room_data::RoomData;
 use crate::util::ecies::{seal_for_room, unseal_bytes_with_secrets};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaCopy;
 use dioxus_free_icons::Icon;
+use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::ops::Deref;
 use wasm_bindgen_futures::spawn_local;
+
+/// The two owner gates this modal applies, decided together.
+///
+/// They are bundled in one struct, and produced by one function, so they cannot
+/// drift apart: the whole point of review finding R4 is that they are NOT the
+/// same question. `is_owner` is a property of the PUBLIC key and drives only the
+/// *informational* surfaces (the leave warning, whether the owner-only secret
+/// row exists at all). `can_edit` additionally requires the PRIVATE half and
+/// drives every *editing* affordance — gating an editable control on `is_owner`
+/// alone offers a key-less owner a control whose save then bails with only a log
+/// line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct OwnerEditGate {
+    is_owner: bool,
+    can_edit: bool,
+}
+
+impl OwnerEditGate {
+    /// Neither owner nor editor: the read-only answer for an unknown room or an
+    /// unknown local identity.
+    const DENIED: Self = Self {
+        is_owner: false,
+        can_edit: false,
+    };
+
+    /// Decide both gates for `room_data` viewed as the room owned by `room_vk`.
+    fn for_room(room_data: &RoomData, room_vk: &VerifyingKey) -> Self {
+        // Public half only: ownership IS a property of the public key, and an
+        // unknown local identity is not the owner (which renders the modal
+        // read-only).
+        let is_owner = room_data.self_verifying_key() == Some(*room_vk);
+        Self {
+            is_owner,
+            // Every configuration change is signed, so PERFORMING one needs the
+            // private half as well as ownership. Identical to `is_owner`
+            // whenever the key is held, which is every room written by a
+            // shipped River today.
+            can_edit: is_owner && room_data.signing_key().is_some(),
+        }
+    }
+}
 
 #[component]
 pub fn EditRoomModal() -> Element {
@@ -49,14 +92,26 @@ pub fn EditRoomModal() -> Element {
             .map(|room_data| room_data.room_state.configuration.configuration.clone())
     });
 
-    // Memoize if the current user is the owner of the room being edited
-    let user_is_owner = use_memo(move || {
-        editing_room.read().as_ref().is_some_and(|room_data| {
-            let user_vk = room_data.self_sk.verifying_key();
-            let room_vk = EDIT_ROOM_MODAL.read().room.unwrap();
-            user_vk == room_vk
-        })
+    // Memoize both owner gates for the room being edited. One decision site, so
+    // the informational gate and the editing gate cannot drift apart — see
+    // `OwnerEditGate`.
+    let edit_gate = use_memo(move || {
+        let room_vk = EDIT_ROOM_MODAL.read().room;
+        match (editing_room.read().as_ref(), room_vk) {
+            (Some(room_data), Some(room_vk)) => OwnerEditGate::for_room(room_data, &room_vk),
+            _ => OwnerEditGate::DENIED,
+        }
     });
+
+    // Informational only: the leave warning, and whether the owner-only secret
+    // row exists at all. Never an editing affordance — see `user_can_edit`.
+    let user_is_owner = use_memo(move || edit_gate.read().is_owner);
+
+    // Whether this device can actually PERFORM an owner edit. Gating the
+    // editable affordances on this rather than on `user_is_owner` is what stops
+    // a key-less owner being offered controls whose save would then bail with
+    // only a log line (review finding R4).
+    let user_can_edit = use_memo(move || edit_gate.read().can_edit);
 
     // Render the modal if room configuration is available
     if let Some(config) = room_config.clone().read().deref() {
@@ -84,14 +139,26 @@ pub fn EditRoomModal() -> Element {
                         class: "p-6",
                         h1 { class: "text-xl font-semibold text-text mb-4", "Room Details" }
 
+                        // A key-less owner gets the read-only modal. Say why,
+                        // rather than leaving every control unexplainedly
+                        // disabled (review finding R4). Plain conditional
+                        // markup — no new signal, no new modal.
+                        if *user_is_owner.read() && !*user_can_edit.read() {
+                            p {
+                                "data-testid": "edit-room-no-key-notice",
+                                class: "mb-4 px-3 py-2 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-yellow-400 text-sm",
+                                "This device doesn't hold your key for this room, so you can't change its settings here."
+                            }
+                        }
+
                         RoomNameField {
                             config: config.clone(),
-                            is_owner: *user_is_owner.read()
+                            is_owner: *user_can_edit.read()
                         }
 
                         RoomDescriptionField {
                             config: config.clone(),
-                            is_owner: *user_is_owner.read()
+                            is_owner: *user_can_edit.read()
                         }
 
                         // Member capacity
@@ -105,15 +172,16 @@ pub fn EditRoomModal() -> Element {
                                         member_count: member_count,
                                         max_members: max_members,
                                         is_full: is_full,
-                                        is_owner: *user_is_owner.read(),
+                                        is_owner: *user_can_edit.read(),
                                         config: config.clone(),
                                     }
                                 }
                             }
                         }
 
-                        // Numeric configuration fields (owner-only)
-                        if *user_is_owner.read() {
+                        // Numeric configuration fields (owner-only, and only
+                        // when this device can sign the resulting config edit)
+                        if *user_can_edit.read() {
                             NumericConfigField {
                                 label: "Max Recent Messages",
                                 value: config.max_recent_messages,
@@ -210,7 +278,24 @@ pub fn EditRoomModal() -> Element {
                             // Secret Version (only for private rooms)
                             {
                                 let is_private = room_data.room_state.configuration.configuration.privacy_mode == PrivacyMode::Private;
-                                let is_owner = room_data.owner_vk == room_data.self_sk.verifying_key();
+                                // Rotation derives AND signs the new secret, so
+                                // it needs the private half, not just ownership
+                                // (review finding R4). The button stays visible
+                                // for a key-less owner but is disabled with an
+                                // explanatory title — this row has no error
+                                // surface of its own, and silently offering a
+                                // control that only logs on failure is the bug.
+                                // Same decision function as the modal-level
+                                // gates above: `is_owner` here is exactly
+                                // `room_data.is_self_owner()`.
+                                let gate = OwnerEditGate::for_room(room_data, &room_data.owner_vk);
+                                let is_owner = gate.is_owner;
+                                let can_rotate = gate.can_edit;
+                                let rotate_title = if can_rotate {
+                                    "Rotate room secret now (e.g., after suspecting a leak). The delegate also rotates automatically when the member set changes."
+                                } else {
+                                    "This device doesn't hold your key for this room, so it can't rotate the secret."
+                                };
                                 let secret_version = room_data.room_state.secrets.current_version;
                                 let owner_vk = room_data.owner_vk;
 
@@ -244,8 +329,9 @@ pub fn EditRoomModal() -> Element {
                                                     // converges via the contract's duplicate-version
                                                     // dedup.
                                                     button {
-                                                        class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors",
-                                                        title: "Rotate room secret now (e.g., after suspecting a leak). The delegate also rotates automatically when the member set changes.",
+                                                        class: "px-3 py-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                                                        title: "{rotate_title}",
+                                                        disabled: !can_rotate,
                                                         onclick: move |_| {
                                                             crate::util::defer(move || {
                                                                 let mut applied = false;
@@ -496,20 +582,30 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
 
         let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
+        // A configuration edit is signed, so it needs the private half. Fold
+        // the key into the same `Option` the "room not found" case already
+        // uses: a room whose blob carries no local signing key simply cannot
+        // publish a config change.
         let signing_data = ROOMS.with(|rooms| {
-            rooms.map.get(&owner_key).map(|room_data| {
-                (
-                    room_data.room_key(),
-                    room_data.self_sk.clone(),
-                    room_data.room_state.clone(),
-                    room_data.is_private(),
-                    room_data.get_secret().map(|(s, v)| (*s, v)),
-                )
+            rooms.map.get(&owner_key).and_then(|room_data| {
+                room_data.signing_key().cloned().map(|self_sk| {
+                    (
+                        room_data.room_key(),
+                        self_sk,
+                        room_data.room_state.clone(),
+                        room_data.is_private(),
+                        room_data.get_secret().map(|(s, v)| (*s, v)),
+                    )
+                })
             })
         });
 
         let Some((room_key, self_sk, room_state_clone, is_private, room_secret_opt)) = signing_data
         else {
+            // Backstop only. `is_owner` is now the key-gated `user_can_edit`,
+            // so a key-less owner never gets an enabled textarea to reach this
+            // from; the modal explains the refusal up front instead (R4).
+            warn!("Cannot update the room description: room or local signing key unavailable");
             return;
         };
 
@@ -706,17 +802,22 @@ fn NumericConfigField(
 
         let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
+        // Signed configuration edit: fold the private key into the same
+        // `Option` the "room not found" case already uses, so a blob without
+        // a local signing key degrades to "cannot edit" rather than panicking.
         let signing_data = ROOMS.with(|rooms| {
-            rooms.map.get(&owner_key).map(|room_data| {
-                (
-                    room_data.room_key(),
-                    room_data.self_sk.clone(),
-                    room_data.room_state.clone(),
-                )
+            rooms.map.get(&owner_key).and_then(|room_data| {
+                room_data
+                    .signing_key()
+                    .cloned()
+                    .map(|self_sk| (room_data.room_key(), self_sk, room_data.room_state.clone()))
             })
         });
 
         let Some((room_key, self_sk, room_state_clone)) = signing_data else {
+            // Backstop only: this whole field is rendered behind the key-gated
+            // `user_can_edit`, so a key-less owner never sees it (R4).
+            warn!("Cannot update the room configuration: room or local signing key unavailable");
             return;
         };
 
@@ -826,17 +927,22 @@ fn MaxMembersField(
 
         let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
+        // Signed configuration edit: fold the private key into the same
+        // `Option` the "room not found" case already uses, so a blob without
+        // a local signing key degrades to "cannot edit" rather than panicking.
         let signing_data = ROOMS.with(|rooms| {
-            rooms.map.get(&owner_key).map(|room_data| {
-                (
-                    room_data.room_key(),
-                    room_data.self_sk.clone(),
-                    room_data.room_state.clone(),
-                )
+            rooms.map.get(&owner_key).and_then(|room_data| {
+                room_data
+                    .signing_key()
+                    .cloned()
+                    .map(|self_sk| (room_data.room_key(), self_sk, room_data.room_state.clone()))
             })
         });
 
         let Some((room_key, self_sk, room_state_clone)) = signing_data else {
+            // Backstop only: the input is rendered behind the key-gated
+            // `user_can_edit`, so a key-less owner never sees it (R4).
+            warn!("Cannot update the room configuration: room or local signing key unavailable");
             return;
         };
 
@@ -924,5 +1030,224 @@ fn MaxMembersField(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::room_data::test_minimal_room_data;
+    use ed25519_dalek::SigningKey;
+
+    /// The local identity `test_minimal_room_data` installs.
+    fn local_sk() -> SigningKey {
+        SigningKey::from_bytes(&[1u8; 32])
+    }
+
+    /// The room owner AND holding the private half: every room a shipped River
+    /// has ever written.
+    fn owner_holding_key() -> (RoomData, VerifyingKey) {
+        let owner_vk = local_sk().verifying_key();
+        (test_minimal_room_data(owner_vk), owner_vk)
+    }
+
+    /// The room owner, but this device no longer holds the private half — the
+    /// tolerant-reader case the whole `Option<SigningKey>` change exists for.
+    fn owner_without_key() -> (RoomData, VerifyingKey) {
+        let (mut room, owner_vk) = owner_holding_key();
+        room.self_sk = None;
+        room.self_vk = Some(owner_vk);
+        (room, owner_vk)
+    }
+
+    /// An ordinary member, holding their own key, in someone else's room.
+    fn non_owner_holding_key() -> (RoomData, VerifyingKey) {
+        let owner_vk = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        (test_minimal_room_data(owner_vk), owner_vk)
+    }
+
+    /// A room blob with no local identity at all.
+    fn unknown_identity() -> (RoomData, VerifyingKey) {
+        let (mut room, owner_vk) = owner_holding_key();
+        room.self_sk = None;
+        room.self_vk = None;
+        (room, owner_vk)
+    }
+
+    /// The property the R4 fix exists for: a key-less owner still OWNS the room
+    /// (so the leave warning and the secret row are correct) but must not be
+    /// offered any editing affordance, because every config edit is signed.
+    #[test]
+    fn a_key_less_owner_is_the_owner_but_cannot_edit() {
+        let (room, owner_vk) = owner_without_key();
+        let gate = OwnerEditGate::for_room(&room, &owner_vk);
+        assert!(
+            gate.is_owner,
+            "ownership is a property of the PUBLIC key, so a key-less owner is \
+             still the owner — the leave warning and the owner-only secret row \
+             depend on this"
+        );
+        assert!(
+            !gate.can_edit,
+            "a key-less owner MUST NOT be offered editing affordances: the save \
+             path cannot sign, so it would bail with only a log line (R4)"
+        );
+    }
+
+    /// The other half of the conjunction: holding a key is not ownership.
+    #[test]
+    fn a_non_owner_holding_a_key_cannot_edit() {
+        let (room, owner_vk) = non_owner_holding_key();
+        let gate = OwnerEditGate::for_room(&room, &owner_vk);
+        assert!(room.signing_key().is_some(), "fixture must hold a key");
+        assert!(!gate.is_owner);
+        assert!(
+            !gate.can_edit,
+            "holding a signing key for one's own membership is not ownership"
+        );
+    }
+
+    #[test]
+    fn an_owner_holding_the_key_can_edit() {
+        let (room, owner_vk) = owner_holding_key();
+        let gate = OwnerEditGate::for_room(&room, &owner_vk);
+        assert!(gate.is_owner);
+        assert!(gate.can_edit);
+    }
+
+    #[test]
+    fn an_unknown_local_identity_is_neither_owner_nor_editor() {
+        let (room, owner_vk) = unknown_identity();
+        let gate = OwnerEditGate::for_room(&room, &owner_vk);
+        assert_eq!(gate, OwnerEditGate::DENIED);
+    }
+
+    /// The "no behaviour change for existing users" property, and the one that
+    /// matters most: whenever the private half IS held, `can_edit` is exactly
+    /// `is_owner`. Every room written by a shipped River is in this case, so
+    /// splitting the gates changed nothing for anyone in the field.
+    #[test]
+    fn can_edit_equals_is_owner_whenever_the_key_is_held() {
+        for (label, (room, room_vk)) in [
+            ("owner", owner_holding_key()),
+            ("non-owner", non_owner_holding_key()),
+        ] {
+            assert!(
+                room.signing_key().is_some(),
+                "{label}: fixture must hold the private half"
+            );
+            let gate = OwnerEditGate::for_room(&room, &room_vk);
+            assert_eq!(
+                gate.can_edit, gate.is_owner,
+                "{label}: with the key held, the editing gate must be exactly \
+                 the ownership gate — otherwise the R4 split changed behaviour \
+                 for existing users"
+            );
+        }
+    }
+
+    /// `is_self_owner()` is what the secret row used before the split; the gate
+    /// must keep agreeing with it, or the row's visibility silently changes.
+    #[test]
+    fn is_owner_agrees_with_room_data_is_self_owner() {
+        for (room, _) in [
+            owner_holding_key(),
+            owner_without_key(),
+            non_owner_holding_key(),
+            unknown_identity(),
+        ] {
+            let gate = OwnerEditGate::for_room(&room, &room.owner_vk);
+            assert_eq!(gate.is_owner, room.is_self_owner());
+        }
+    }
+
+    /// The pure gate above cannot see whether the RENDER still consults it, so
+    /// pin the call sites and the two key-less-owner surfaces by source scrape.
+    /// Needles are assembled at runtime and the test module is sliced off, so
+    /// this test's own text cannot satisfy any of them.
+    #[test]
+    fn the_render_gates_editing_affordances_on_can_edit() {
+        let full = include_str!("edit_room_modal.rs");
+        let src = full
+            .split(&format!("{} {} {{", "mod", "tests"))
+            .next()
+            .expect("edit_room_modal.rs must have production code before its test module");
+        assert!(
+            src.len() < full.len(),
+            "positive control: the test module must have been sliced off — if \
+             the slice marker drifts, every needle below would be matchable by \
+             this test's own source"
+        );
+        // Whitespace-insensitive so rustfmt cannot disarm the pin.
+        let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Positive controls: the anchors these needles hang off must exist, so
+        // a rename/restructure fails loudly instead of matching nothing.
+        for control in [
+            format!("fn{}()", "EditRoomModal"),
+            format!("{}::{}", "OwnerEditGate", "for_room"),
+            format!("let{}=use_memo", "user_can_edit"),
+            format!("let{}=use_memo", "user_is_owner"),
+        ] {
+            assert!(
+                squashed.contains(&control),
+                "positive control {control:?} missing — this pin is scraping \
+                 something other than the code it means to pin"
+            );
+        }
+
+        // Both gates must come from the one decision function.
+        assert!(
+            squashed.contains(&format!("{}.read().{}", "edit_gate", "can_edit"))
+                && squashed.contains(&format!("{}.read().{}", "edit_gate", "is_owner")),
+            "`user_is_owner` and `user_can_edit` must both derive from the \
+             single `OwnerEditGate` decision, so they cannot drift apart"
+        );
+
+        // Every editing affordance is gated on the key-aware memo. There are
+        // five sites: the notice, the name field, the description field, the
+        // member-capacity field, and the numeric-config block.
+        let editing_needle = format!("*{}.read()", "user_can_edit");
+        assert!(
+            squashed.matches(&editing_needle).count() >= 5,
+            "every editing affordance must be gated on `user_can_edit`, not on \
+             `user_is_owner` (R4)"
+        );
+        let reverted = format!("{}:*{}.read()", "is_owner", "user_is_owner");
+        assert!(
+            !squashed.contains(&reverted),
+            "an editing affordance is gated on the PUBLIC half again — that is \
+             exactly the R4 regression (a key-less owner offered a control \
+             whose save bails with only a log line)"
+        );
+
+        // The key-less owner gets told why, rather than an unexplainedly
+        // read-only modal.
+        assert!(
+            squashed.contains(&format!("{}-{}-{}", "edit-room", "no-key", "notice")),
+            "the key-less-owner notice must exist"
+        );
+        assert!(
+            squashed.contains(&format!(
+                "*{}.read()&&!*{}.read()",
+                "user_is_owner", "user_can_edit"
+            )),
+            "the notice must render exactly for an owner who cannot edit"
+        );
+
+        // The Rotate button stays visible for a key-less owner (the row has no
+        // error surface of its own) but must be disabled and explain itself.
+        assert!(
+            squashed.contains(&format!("{}:!{}", "disabled", "can_rotate")),
+            "the Rotate button must be disabled when the key is not held"
+        );
+        assert!(
+            squashed.contains(&format!("let{}={}.{}", "can_rotate", "gate", "can_edit")),
+            "Rotate must use the same key-aware gate as the rest of the modal"
+        );
+        assert!(
+            squashed.contains(&format!("{}:\"{{{}}}\"", "title", "rotate_title")),
+            "the disabled Rotate button must carry the explanatory title"
+        );
     }
 }

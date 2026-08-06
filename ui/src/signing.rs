@@ -473,8 +473,12 @@ async fn delegate_sign_or_fallback(
 ///
 /// 1. `delegate_sign_or_fallback` accepts the delegate's answer only when it
 ///    verifies under `self_sk` (see above); otherwise it signs locally anyway.
-/// 2. `RoomData::self_sk` is a plain, always-present field — the private key is
-///    already in the browser, so there is nothing to wait for.
+/// 2. Every writer stores `RoomData::self_sk`, so on the send path the private
+///    key is already in the browser and there is nothing to wait for. (The
+///    field is `Option` for reader tolerance — see its docs — and the send path
+///    refuses when it is absent rather than waiting on the delegate. Do NOT
+///    read this point as licence to make the field required again; it is a
+///    statement about where the key IS, not about the field's type.)
 /// 3. Ed25519 is deterministic (RFC 8032), and the delegate signs with
 ///    `SigningKey::from_bytes(sk).sign(data)` — the same operation. So whenever
 ///    the delegate's answer is *accepted*, it is byte-identical to this.
@@ -743,17 +747,124 @@ mod tests {
         );
     }
 
-    /// freenet/river#512 rests on `RoomData::self_sk` being present and
-    /// authoritative — the send path signs with it and never consults the
-    /// delegate. If it ever becomes optional (delegate-only custody, a
-    /// hardware key), the message path needs rethinking rather than an
-    /// `unwrap`, and this is what says so at compile time.
+    /// freenet/river#512 rests on the send path signing LOCALLY and never
+    /// waiting on the delegate. It used to rest on a second thing as well —
+    /// `RoomData::self_sk` being infallibly present — and the previous version
+    /// of this test asserted exactly that at compile time, with the note that
+    /// "if it ever becomes optional (delegate-only custody, a hardware key),
+    /// the message path needs rethinking rather than an `unwrap`".
+    ///
+    /// That has now happened: `self_sk` is `Option<SigningKey>` so that a blob
+    /// written by a future River which keeps the key elsewhere still decodes
+    /// here (see the field docs). This build still always WRITES the key, so
+    /// #512's local-signing property is untouched in practice. What changed is
+    /// the obligation the old test named: the send path must degrade, not
+    /// `unwrap`.
+    ///
+    /// So this pins the successor invariant in both halves — the accessor is
+    /// fallible (compile time), and no signing path recovers the key by
+    /// unwrapping it (source scrape).
     #[test]
-    fn the_send_path_always_has_a_local_signing_key() {
-        fn assert_plain_signing_key(room: &crate::room_data::RoomData) -> &SigningKey {
-            &room.self_sk
+    fn the_send_path_handles_a_missing_local_signing_key() {
+        fn assert_fallible_signing_key(room: &crate::room_data::RoomData) -> Option<&SigningKey> {
+            room.signing_key()
         }
-        let _ = assert_plain_signing_key;
+        let _ = assert_fallible_signing_key;
+
+        // Walk the whole crate source tree rather than a hand-listed set of
+        // files. `signing_key()` is called in ~14 files; an allow-list pins
+        // only the ones someone remembered, so a future `.unwrap()` in an
+        // unlisted file would pass CI silently. `CARGO_MANIFEST_DIR` is
+        // resolved at COMPILE time, so this cannot be defeated by the working
+        // directory the test runs from.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        // Needles are assembled at runtime so this test's own source cannot
+        // match them (the `include_str!` self-match trap).
+        let unwrap = format!("{}{}", ".unwra", "p()");
+        let expect = format!("{}{}", ".expec", "t(");
+        let needles = [
+            format!("signing_key(){unwrap}"),
+            format!("signing_key(){expect}"),
+            format!("self_sk{unwrap}"),
+            format!("self_sk{expect}"),
+        ];
+
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        assert!(
+            files.len() > 20,
+            "expected to walk the crate's sources, found {} files under {} — \
+             the walk is broken, so this pin is guarding nothing",
+            files.len(),
+            root.display()
+        );
+
+        // POSITIVE CONTROL for the NEEDLE, not just the walk. `files.len()`
+        // proves we read the tree; it does not prove the strings we search for
+        // still correspond to anything. Rename `signing_key()` and every
+        // `!contains` assertion below becomes vacuously true while CI stays
+        // green. So require the accessor to actually appear somewhere.
+        let accessor_sites = files
+            .iter()
+            .filter(|p| {
+                std::fs::read_to_string(p)
+                    .map(|s| s.contains("signing_key()"))
+                    .unwrap_or(false)
+            })
+            .count();
+        // NB the tally includes signing.rs itself (this test's own text), so a
+        // floor of 5 is really four INDEPENDENT files. Deliberate: raising the
+        // floor to chase that off would just make it brittle against ordinary
+        // refactors, and the control only has to distinguish "the needle still
+        // matches something" from "the needle matches nothing".
+        assert!(
+            accessor_sites >= 5,
+            "expected the `signing_key()` accessor at several sites, found {accessor_sites} \
+             (one of which is signing.rs itself). Either it was renamed — in which \
+             case the needles below are searching for a string that no longer \
+             exists and this pin is dead — or the key stopped being read through \
+             the accessor at all."
+        );
+
+        for path in files {
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Scan the WHOLE file, tests included. Splitting at the first
+            // `#[cfg(test)]` would silently truncate production code that
+            // follows a cfg(test) helper — `room_data.rs` has exactly that
+            // shape — so the split weakened the guard rather than refining it.
+            // Nothing in this crate unwraps the key even in tests, so there is
+            // no exemption to carve out; if a test ever needs to, it should
+            // reach for the fixture key it already holds.
+            for needle in &needles {
+                assert!(
+                    !src.contains(needle.as_str()),
+                    "{} recovers the local signing key with `{}`. \
+                     `self_sk` is deliberately optional so a future blob without \
+                     it still decodes; unwrapping it converts that tolerance back \
+                     into a panic. Degrade instead (return None/Err, or log and \
+                     skip).",
+                    path.display(),
+                    needle
+                );
+            }
+        }
     }
 
     /// freenet/river#414 (Codex round-8): an AUTHORITATIVE identity choice records

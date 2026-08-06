@@ -1012,7 +1012,8 @@ mod tests {
         let mut room_data = RoomData {
             owner_vk,
             room_state: ChatRoomStateV1::default(),
-            self_sk: owner_sk,
+            self_sk: Some(owner_sk),
+            self_vk: None,
             contract_key: bogus_key,
             last_read_message_id: None,
             secrets: HashMap::new(),

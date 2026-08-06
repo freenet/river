@@ -251,8 +251,13 @@ pub fn open_invite_via_dm_picker(current_room: VerifyingKey, peer: MemberId) {
     let Ok(rooms) = crate::components::app::ROOMS.try_read() else {
         return;
     };
-    if let Some(room_data) = rooms.map.get(&current_room) {
-        let self_id: MemberId = room_data.self_sk.verifying_key().into();
+    // Public half only. With no local identity the self-as-peer check simply
+    // does not apply — the same fall-through as a room that isn't loaded.
+    if let Some(self_id) = rooms
+        .map
+        .get(&current_room)
+        .and_then(|room_data| room_data.self_member_id())
+    {
         if self_id == peer {
             dioxus::logger::tracing::warn!(
                 "open_invite_via_dm_picker: refusing to open for self-as-peer"
@@ -308,6 +313,10 @@ pub enum SendDmOutcome {
     /// recipient missing from members AND no rejoin bundle could fix
     /// it. See `ApplyOutcome::SilentDrop` in `dm_thread_modal.rs`.
     SilentDrop,
+    /// This device does not hold the local user's key for this room, so the
+    /// DM cannot be signed or sealed. Distinct from `SenderMissingRejoin`:
+    /// the user may well be a member, we just cannot author as them here.
+    IdentityUnavailable,
 }
 
 /// Compose, locally-apply, and queue for network sync a single direct
@@ -386,7 +395,11 @@ pub async fn send_structured_dm(
             else {
                 return PreflightOutcome::Reject(SendDmOutcome::RoomGone);
             };
-            let self_sk = room_data.self_sk.clone();
+            // A DM is signed AND sealed with the local key, so an absent one
+            // is a hard reject rather than a degraded send.
+            let Some(self_sk) = room_data.signing_key().cloned() else {
+                return PreflightOutcome::Reject(SendDmOutcome::IdentityUnavailable);
+            };
             let self_id: MemberId = (&self_sk.verifying_key()).into();
             let owner_id = MemberId::from(&room);
             if self_id == peer {
@@ -629,7 +642,11 @@ pub(crate) fn compute_dm_last_seen(
 ) -> HashMap<(VerifyingKey, MemberId), u64> {
     let mut updates: HashMap<(VerifyingKey, MemberId), u64> = HashMap::new();
     for (owner_vk, room_data) in &rooms.map {
-        let self_id: MemberId = room_data.self_sk.verifying_key().into();
+        // Without the local identity we cannot tell inbound DMs from outbound
+        // ones, so this room contributes no last-seen entries.
+        let Some(self_id) = room_data.self_member_id() else {
+            continue;
+        };
         for msg in &room_data.room_state.direct_messages.messages {
             if msg.message.recipient != self_id {
                 continue;
@@ -1094,7 +1111,8 @@ mod tests {
             RoomData {
                 owner_vk,
                 room_state: state,
-                self_sk: self_sk.clone(),
+                self_sk: Some(self_sk.clone()),
+                self_vk: None,
                 contract_key,
                 last_read_message_id: None,
                 secrets: std::collections::HashMap::new(),

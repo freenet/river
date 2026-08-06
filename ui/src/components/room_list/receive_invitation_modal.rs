@@ -4,7 +4,9 @@ use crate::components::members::Invitation;
 use crate::invites::{PendingRoomJoin, PendingRoomStatus};
 use crate::room_data::Rooms;
 use crate::util::display_name::{contains_hidden_chars, EMOJI_REJECTION_MESSAGE};
-use dioxus::logger::tracing::{error, info, warn};
+#[cfg(target_arch = "wasm32")]
+use dioxus::logger::tracing::warn;
+use dioxus::logger::tracing::{error, info};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::{AuthorizedMember, MemberId};
@@ -99,47 +101,187 @@ pub fn present_invitation(inv: Invitation) {
     });
 }
 
-/// Save invitation to localStorage so it survives page reloads.
+// This module's single door to `localStorage`.
+//
+// `web_sys::window()` does not merely return `None` off-wasm — touching it
+// panics ("cannot access imported statics on non-wasm targets"). Routing every
+// access through these three functions means the module's invitation logic is
+// exercisable under `cargo test`, backed by an in-process map, instead of
+// being reachable only in a browser. Behaviour on wasm is unchanged: the same
+// `window().local_storage()` call behind the same `Ok(Some(..))` gate.
+//
+// This is not a convenience: a purge that erased the nickname binding, and so
+// silently turned the #218 auto-resume into a re-prompt, was invisible to a
+// source-scrape test and only falsifiable by driving the real sequence. See
+// `a_legacy_invite_with_its_nickname_still_auto_resumes`.
+//
+// REACHABILITY, so the coverage is not overstated: in the deployed gateway the
+// iframe has an opaque origin, `localStorage` throws, and all three of these
+// functions are no-ops. Every test that drives them therefore exercises a
+// branch that CANNOT occur there — as does the legacy artifact they read, which
+// no gateway user has. Real coverage is `dx serve` and non-sandboxed
+// deployments (self-hosted, or any future non-iframe embedding). The logic is
+// worth getting right for those, and worth having tested rather than scraped,
+// but this is not coverage of the production path.
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static FAKE_STORAGE: RefCell<std::collections::HashMap<String, String>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn storage_get(key: &str) -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let window = web_sys::window()?;
+        let storage = window.local_storage().ok()??;
+        storage.get_item(key).ok()?
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        FAKE_STORAGE.with(|m| m.borrow().get(key).cloned())
+    }
+}
+
+fn storage_set(key: &str, value: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                if let Err(e) = storage.set_item(key, value) {
+                    warn!("Failed to write {key} to localStorage: {e:?}");
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        FAKE_STORAGE.with(|m| {
+            m.borrow_mut().insert(key.to_string(), value.to_string());
+        });
+    }
+}
+
+fn storage_remove(key: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                let _ = storage.remove_item(key);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        FAKE_STORAGE.with(|m| {
+            m.borrow_mut().remove(key);
+        });
+    }
+}
+
+thread_local! {
+    /// The pending invitation, held in PROCESS MEMORY for the life of the page.
+    ///
+    /// It used to live in `localStorage[INVITATION_STORAGE_KEY]`, base58 of the
+    /// whole CBOR artifact. An `Invitation` carries `invitee_signing_key`, a
+    /// full ed25519 PRIVATE key, and `room_secrets`, the room's plaintext
+    /// symmetric secrets. localStorage is durable and readable by any script in
+    /// the origin, and — see `clear_invitation_from_storage` — the flow has no
+    /// terminal state for an abandoned invite, so an invitation merely OPENED
+    /// and never acted on parked that key material on disk indefinitely.
+    ///
+    /// A `thread_local!` is the right lifetime for it: the pending-invite window
+    /// runs from "invitation seen" to "subscribed or dismissed", which is
+    /// entirely within one page load. The same trade is already made for the
+    /// delegate cipher material in `chat_delegate::chat_delegate_cipher_material`.
+    ///
+    /// Cost, stated plainly: a mid-flow RELOAD no longer recovers the
+    /// invitation from storage. For the URL-bar entry path — the common one —
+    /// nothing changes in practice, because the `?invitation=` query parameter
+    /// survives the reload (the strip at `app.rs` is best-effort and fails in
+    /// the sandboxed gateway iframe) and `App` re-parses it BEFORE the recovery
+    /// block runs. For the DM-card, paste-a-code, and click-interceptor paths
+    /// there is no URL copy, so a reload drops the pending invite and the user
+    /// re-opens it. That is the deliberate trade: an invitation is a bearer
+    /// credential, and not writing bearer credentials to durable storage is
+    /// worth one re-click on a path that already fails this way in production
+    /// (localStorage is unavailable to an opaque-origin iframe, so the
+    /// reload-resume it backed has never worked in the deployed gateway —
+    /// freenet/river#219).
+    static PENDING_INVITATION: RefCell<Option<Invitation>> = const { RefCell::new(None) };
+}
+
+/// Hold the invitation for the pending-invite window.
 ///
-/// Clears any previously-saved nickname binding first: this is the single
+/// Also clears any previously-saved nickname binding: this is the single
 /// chokepoint every fresh-invitation save path (URL bar, click interceptor,
 /// DM-card present, and `accept_invitation` itself) goes through, so a stale
 /// nickname from a previously-accepted invitation can never linger to be
-/// applied to a different invitation that overwrites the invitation key. The
+/// applied to a different invitation that replaces this one. The
 /// fingerprint binding in `load_invitation_nickname_from_storage` is the
 /// authoritative guard; this clear is defense-in-depth that keeps storage
 /// honest. `accept_invitation` re-saves the nickname immediately after, so its
 /// own binding survives. (Codex review, PR #333.)
+///
+/// The NICKNAME and its fingerprint stay in localStorage. Neither is a secret:
+/// a nickname is published into the room, and the fingerprint is a BLAKE3 hash.
 pub fn save_invitation_to_storage(invitation: &Invitation) {
     clear_invitation_nickname_from_storage();
-    if let Some(window) = web_sys::window() {
-        if let Ok(Some(storage)) = window.local_storage() {
-            let encoded = invitation.to_encoded_string();
-            if let Err(e) = storage.set_item(INVITATION_STORAGE_KEY, &encoded) {
-                warn!("Failed to save invitation to localStorage: {:?}", e);
-            }
-        }
-    }
+    purge_persisted_invitation();
+    PENDING_INVITATION.with(|cell| {
+        *cell.borrow_mut() = Some(invitation.clone());
+    });
 }
 
-/// Load invitation from localStorage (for recovery after page reload)
+/// Recover the pending invitation (after a re-render, not after a reload — see
+/// [`PENDING_INVITATION`]).
 pub fn load_invitation_from_storage() -> Option<Invitation> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    let encoded = storage.get_item(INVITATION_STORAGE_KEY).ok()??;
-    Invitation::from_encoded_string(&encoded).ok()
+    PENDING_INVITATION.with(|cell| cell.borrow().clone())
 }
 
-/// Clear saved invitation (and any saved nickname + its fingerprint binding)
-/// from localStorage.
+/// Drop the pending invitation and any saved nickname + fingerprint binding.
 pub fn clear_invitation_from_storage() {
-    if let Some(window) = web_sys::window() {
-        if let Ok(Some(storage)) = window.local_storage() {
-            let _ = storage.remove_item(INVITATION_STORAGE_KEY);
-            let _ = storage.remove_item(INVITATION_NICKNAME_STORAGE_KEY);
-            let _ = storage.remove_item(INVITATION_NICKNAME_FP_STORAGE_KEY);
-        }
-    }
+    PENDING_INVITATION.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+    purge_persisted_invitation();
+    storage_remove(INVITATION_NICKNAME_STORAGE_KEY);
+    storage_remove(INVITATION_NICKNAME_FP_STORAGE_KEY);
+}
+
+/// Erase an invitation left in localStorage by an older River.
+///
+/// Not merely tidiness: because the old flow had no terminal state for an
+/// abandoned invite, an upgrading user can be carrying a private key and a set
+/// of plaintext room secrets under [`INVITATION_STORAGE_KEY`] from an invite
+/// they opened months ago. Removing the key is the only thing that actually
+/// retires that exposure — ceasing to WRITE it does nothing for data already
+/// written, and the users most exposed are exactly the ones who never touch an
+/// invitation again. So this runs unconditionally at startup
+/// ([`purge_legacy_persisted_invitation_once`]) as well as on the save and
+/// clear paths.
+pub(crate) fn purge_persisted_invitation() {
+    // ONLY the artifact. The nickname binding must survive.
+    //
+    // An earlier version of this swept the nickname and its fingerprint too,
+    // on the reasoning that once the artifact is gone the binding has nothing
+    // to bind to. That reasoning was wrong, and the bug it caused was the
+    // sharpest kind: the startup adopt hook calls this immediately after
+    // reading the artifact into memory, so the nickname was destroyed while
+    // the invitation it belonged to lived on. `decide_recovered_invitation`
+    // returns `Resume` only on `Some(nickname)`, and `accept_invitation` never
+    // marks the invite processed — so the user got the nickname prompt AGAIN
+    // for a join already in flight, and could re-accept under a different
+    // name. That is the exact freenet/river#218 symptom this hook exists to
+    // preserve against.
+    //
+    // The binding is not orphaned by the move to in-memory holding: it is
+    // fingerprint-bound to `Invitation::to_encoded_string()`, and that
+    // invitation is now held in `PENDING_INVITATION`, so it still resolves.
+    // The genuinely stale cases are already covered — `clear_invitation_from_storage`
+    // drops it at terminal success/dismiss, `save_invitation_to_storage` drops
+    // it when a different invitation replaces this one, and an unmatched
+    // fingerprint makes any leftover inert.
+    storage_remove(INVITATION_STORAGE_KEY);
 }
 
 /// Remove only the saved nickname binding, leaving the invitation artifact in
@@ -148,12 +290,8 @@ pub fn clear_invitation_from_storage() {
 /// not-yet-accepted invitation that overwrote `INVITATION_STORAGE_KEY` (Codex
 /// review, PR #333).
 fn clear_invitation_nickname_from_storage() {
-    if let Some(window) = web_sys::window() {
-        if let Ok(Some(storage)) = window.local_storage() {
-            let _ = storage.remove_item(INVITATION_NICKNAME_STORAGE_KEY);
-            let _ = storage.remove_item(INVITATION_NICKNAME_FP_STORAGE_KEY);
-        }
-    }
+    storage_remove(INVITATION_NICKNAME_STORAGE_KEY);
+    storage_remove(INVITATION_NICKNAME_FP_STORAGE_KEY);
 }
 
 /// Save the accepted nickname alongside the pending invitation so a reload
@@ -161,29 +299,20 @@ fn clear_invitation_nickname_from_storage() {
 /// `invitation_encoded` is the canonical `Invitation::to_encoded_string()`;
 /// its fingerprint is stored too so the nickname is only ever applied back to
 /// the same invitation it was chosen for.
+/// The two writes are deliberately NOT guarded against a half-write, which the
+/// pre-kv version was: it bailed before writing the fingerprint if the nickname
+/// write failed. Losing that is benign, and the reason is worth recording
+/// rather than restoring the code. `load_invitation_nickname_from_storage`
+/// requires BOTH keys, so a nickname without a fingerprint reads as absent, and
+/// the cross-invitation leak #333 guarded against additionally needs a stale
+/// nickname that `save_invitation_to_storage` already clears at the single
+/// chokepoint every fresh invitation passes through.
 pub fn save_invitation_nickname_to_storage(invitation_encoded: &str, nickname: &str) {
-    if let Some(window) = web_sys::window() {
-        if let Ok(Some(storage)) = window.local_storage() {
-            if let Err(e) = storage.set_item(INVITATION_NICKNAME_STORAGE_KEY, nickname) {
-                warn!(
-                    "Failed to save invitation nickname to localStorage: {:?}",
-                    e
-                );
-                return;
-            }
-            let fp = invitation_fingerprint(invitation_encoded);
-            if let Err(e) = storage.set_item(INVITATION_NICKNAME_FP_STORAGE_KEY, &fp) {
-                warn!(
-                    "Failed to save invitation nickname fingerprint to localStorage: {:?}",
-                    e
-                );
-                // Leave no half-written binding: drop the nickname too so the
-                // resume path falls back to prompting rather than applying an
-                // unbound nickname.
-                let _ = storage.remove_item(INVITATION_NICKNAME_STORAGE_KEY);
-            }
-        }
-    }
+    storage_set(INVITATION_NICKNAME_STORAGE_KEY, nickname);
+    storage_set(
+        INVITATION_NICKNAME_FP_STORAGE_KEY,
+        &invitation_fingerprint(invitation_encoded),
+    );
 }
 
 /// What the app should do with an invitation recovered from localStorage on
@@ -256,12 +385,8 @@ pub fn take_resume_once(fired: &std::cell::Cell<bool>) -> bool {
 /// invitation (a stale nickname from a different invitation; Codex review,
 /// PR #333).
 pub fn load_invitation_nickname_from_storage(invitation_encoded: &str) -> Option<String> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    let nickname = storage.get_item(INVITATION_NICKNAME_STORAGE_KEY).ok()??;
-    let stored_fp = storage
-        .get_item(INVITATION_NICKNAME_FP_STORAGE_KEY)
-        .ok()??;
+    let nickname = storage_get(INVITATION_NICKNAME_STORAGE_KEY)?;
+    let stored_fp = storage_get(INVITATION_NICKNAME_FP_STORAGE_KEY)?;
     // The nickname must belong to THIS invitation. Without the match, a
     // nickname saved for invitation A would be applied to a different
     // invitation B that overwrote the invitation key before A's join cleared
@@ -726,15 +851,21 @@ fn vk_is_room_member(
 /// restore-access branch still fires for the case it is meant for: a lost
 /// `self_vk` that is not itself a member (see
 /// `restore_access_invitation_still_detected`).
+///
+/// `self_vk` is `None` when the stored room carries no locally-known identity
+/// (a blob written by a River that keeps the key elsewhere). That drops only
+/// the `self_vk` disjunct below: the invitation's own key is still checked, so
+/// the routing degrades to "we cannot prove you are already a member", which is
+/// the same answer as for a room that is not stored locally at all.
 fn membership_status(
     owner_vk: &VerifyingKey,
     members: &[AuthorizedMember],
-    self_vk: &VerifyingKey,
+    self_vk: Option<&VerifyingKey>,
     invitation_key_vk: &VerifyingKey,
     invitation_invitee_vk: &VerifyingKey,
 ) -> (bool, bool) {
     let current_key_is_member = vk_is_room_member(owner_vk, members, invitation_key_vk)
-        || vk_is_room_member(owner_vk, members, self_vk);
+        || self_vk.is_some_and(|vk| vk_is_room_member(owner_vk, members, vk));
     let invited_member_exists = members
         .iter()
         .any(|m| &m.member.member_vk == invitation_invitee_vk);
@@ -747,7 +878,7 @@ fn check_membership_status(inv: &Invitation, current_rooms: &Rooms) -> (bool, bo
         membership_status(
             &room_data.owner_vk,
             &room_data.room_state.members.members,
-            &room_data.self_sk.verifying_key(),
+            room_data.self_verifying_key().as_ref(),
             &inv.invitee_signing_key.verifying_key(),
             &inv.invitee.member.member_vk,
         )
@@ -953,11 +1084,17 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
     // `self_sk` is no longer a member and this guard does not fire.
     if let Ok(rooms) = ROOMS.try_read() {
         if let Some(room_data) = rooms.map.get(&inv.room) {
-            let already_member = vk_is_room_member(
-                &room_data.owner_vk,
-                &room_data.room_state.members.members,
-                &room_data.self_sk.verifying_key(),
-            );
+            // With no locally-known identity there is nothing to compare, so
+            // the guard cannot fire. That is the same fall-through the
+            // best-effort contract documented above already allows for an
+            // unreadable/cold `ROOMS`.
+            let already_member = room_data.self_verifying_key().is_some_and(|self_vk| {
+                vk_is_room_member(
+                    &room_data.owner_vk,
+                    &room_data.room_state.members.members,
+                    &self_vk,
+                )
+            });
             if already_member {
                 drop(rooms);
                 info!(
@@ -1072,11 +1209,341 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
     }
 }
 
+/// Startup hook: retire any invitation an older River left in localStorage.
+///
+/// Called from `App()`, which re-renders often, so the localStorage write is
+/// done at most once per page load. Idempotent either way; the flag only keeps
+/// it off the render hot path.
+pub(crate) fn adopt_and_purge_legacy_persisted_invitation_once() {
+    thread_local! {
+        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if DONE.with(|d| d.replace(true)) {
+        return;
+    }
+
+    // ADOPT BEFORE PURGING. Destroying the stored artifact unread would lose a
+    // join that an older build had genuinely left in flight: the user clicks
+    // Accept, `accept_invitation` PUTs the invitee member, the room only enters
+    // `ROOMS` on the GET response, that stalls (see the auto-resume notes on
+    // the recovery block in `App` — freenet-core#4345 is cited there as a real
+    // occurrence), and the user reloads onto this build. The invitee private
+    // key would then be gone from BOTH memory and disk while the member entry
+    // may already exist in the room — the freenet/river#365 orphan shape, with
+    // nobody holding the key. Reading it into memory first costs nothing and
+    // gives up none of the security win, because the artifact still leaves
+    // durable storage in the same breath.
+    let recovered = storage_get(INVITATION_STORAGE_KEY)
+        .and_then(|encoded| Invitation::from_encoded_string(&encoded).ok());
+
+    if let Some(invitation) = recovered {
+        info!("Adopting a pending invitation persisted by an older River, then erasing it");
+        // Unconditional. This hook now runs BEFORE the URL-parse block (that
+        // ordering is what stops the artifact being purged unread, and is
+        // pinned), so the slot is always empty here on the path that matters.
+        // An earlier version guarded with `if slot.is_none()` and justified it
+        // as "the URL parse runs first" — true when the hook ran later, false
+        // once it moved, and dead either way. A live invitation still wins:
+        // the URL parse calls `save_invitation_to_storage` after this, which
+        // overwrites the slot outright.
+        PENDING_INVITATION.with(|cell| {
+            *cell.borrow_mut() = Some(invitation);
+        });
+    }
+
+    purge_persisted_invitation();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use river_core::room_state::member::Member;
+
+    /// The pending invitation must never be written to durable browser
+    /// storage. It carries `invitee_signing_key` — a full ed25519 PRIVATE key —
+    /// and `room_secrets`, the room's plaintext symmetric secrets, and the flow
+    /// has no terminal state for an abandoned invite, so anything persisted can
+    /// linger indefinitely where any script in the origin can read it.
+    ///
+    /// A source scrape rather than a behavioural test because the write would
+    /// go through `web_sys`, which does not exist under `cargo test`: a
+    /// behavioural test here would pass whether or not the write was
+    /// reintroduced, i.e. it could not fail. This can.
+    #[test]
+    fn the_pending_invitation_is_never_persisted() {
+        let full = include_str!("receive_invitation_modal.rs");
+        let src = full
+            .split("mod tests {")
+            .next()
+            .expect("production code precedes `mod tests`");
+
+        // Assembled at runtime so this test's own text cannot satisfy the scan.
+        let set_item = format!("{}{}", "set_i", "tem(");
+        for (i, line) in src.lines().enumerate() {
+            if line.contains(&set_item) && line.contains("INVITATION_STORAGE_KEY") {
+                panic!(
+                    "receive_invitation_modal.rs:{} writes the invitation artifact to \
+                     browser storage. It holds a private key and the room's plaintext \
+                     secrets; keep it in `PENDING_INVITATION` (process memory) for the \
+                     pending-invite window instead.",
+                    i + 1
+                );
+            }
+        }
+
+        // The nickname keys ARE still persisted, and deliberately so — neither a
+        // nickname nor a BLAKE3 fingerprint is a secret. Assert that, so this
+        // pin cannot be "satisfied" by deleting the storage code wholesale and
+        // silently dropping the #333 nickname binding with it.
+        assert!(
+            src.contains("INVITATION_NICKNAME_STORAGE_KEY"),
+            "the nickname binding must still be persisted (freenet/river#218/#333)"
+        );
+        // And the legacy artifact must still be actively REMOVED, since ceasing
+        // to write it does nothing about copies already on users' disks.
+        assert!(
+            src.contains("fn purge_persisted_invitation")
+                && src.contains("storage_remove(INVITATION_STORAGE_KEY)"),
+            "the legacy persisted invitation must still be erased on upgrade"
+        );
+    }
+
+    /// Reset the in-process storage fake so each test starts clean.
+    fn reset_storage() {
+        FAKE_STORAGE.with(|m| m.borrow_mut().clear());
+        PENDING_INVITATION.with(|c| *c.borrow_mut() = None);
+    }
+
+    fn an_invitation(seed: u8) -> Invitation {
+        let owner_sk = SigningKey::from_bytes(&[seed; 32]);
+        let invitee_sk = SigningKey::from_bytes(&[seed.wrapping_add(1); 32]);
+        Invitation {
+            room: owner_sk.verifying_key(),
+            invitee_signing_key: invitee_sk.clone(),
+            invitee: owner_invited_member(&owner_sk, invitee_sk.verifying_key()),
+            room_secrets: vec![(0u32, [9u8; 32])],
+        }
+    }
+
+    /// THE property the startup adopt hook exists for, driven end to end.
+    ///
+    /// An older River left BOTH an invitation artifact and the nickname the
+    /// user had already chosen when they clicked Accept. That pair is what
+    /// makes the join resumable: `decide_recovered_invitation` returns `Resume`
+    /// only on `Some(nickname)`, and `accept_invitation` deliberately does NOT
+    /// mark the invitation processed, so a mid-flight reload sees
+    /// `is_invitation_processed == false`. Adopt the artifact but drop the
+    /// nickname and the user is re-prompted for a name on a join that is
+    /// already in flight — free to answer differently — which is the exact
+    /// freenet/river#218 symptom.
+    ///
+    /// This is the regression test for a real defect: the purge used to sweep
+    /// the nickname binding alongside the artifact. The ordering pin below did
+    /// NOT catch it, because the ordering was still correct — the hook read
+    /// before it purged, and then purged the wrong thing. Ordering was only
+    /// ever a proxy; this asserts the outcome.
+    #[test]
+    fn a_legacy_invite_with_its_nickname_still_auto_resumes() {
+        reset_storage();
+        let invitation = an_invitation(71);
+        let encoded = invitation.to_encoded_string();
+
+        // What an older River left behind: the artifact, plus the accepted
+        // nickname bound to it by fingerprint.
+        storage_set(INVITATION_STORAGE_KEY, &encoded);
+        save_invitation_nickname_to_storage(&encoded, "Chosen Name");
+
+        adopt_and_purge_legacy_persisted_invitation_once();
+
+        // The artifact is adopted into memory and gone from durable storage.
+        let recovered = load_invitation_from_storage().expect("artifact must be adopted");
+        assert_eq!(recovered.to_encoded_string(), encoded);
+        assert_eq!(
+            storage_get(INVITATION_STORAGE_KEY),
+            None,
+            "and it must not remain on disk — that is the whole point"
+        );
+
+        // ...and the join is still RESUMABLE, which is the property that
+        // survived-the-upgrade actually means.
+        let action = decide_recovered_invitation(
+            load_invitation_nickname_from_storage(&recovered.to_encoded_string()),
+            false,
+        );
+        assert_eq!(
+            action,
+            RecoveredInvitationAction::Resume {
+                nickname: "Chosen Name".to_string()
+            },
+            "adopting the artifact but dropping its nickname re-prompts the user \
+             for a name on a join already in flight (freenet/river#218)"
+        );
+    }
+
+    /// The purge must not take the nickname binding with it. Stated separately
+    /// from the resume test so a failure says WHICH half broke.
+    #[test]
+    fn purging_the_legacy_artifact_keeps_the_nickname_binding() {
+        reset_storage();
+        let invitation = an_invitation(73);
+        let encoded = invitation.to_encoded_string();
+        storage_set(INVITATION_STORAGE_KEY, &encoded);
+        save_invitation_nickname_to_storage(&encoded, "Keep Me");
+
+        purge_persisted_invitation();
+
+        assert_eq!(storage_get(INVITATION_STORAGE_KEY), None, "artifact erased");
+        assert_eq!(
+            load_invitation_nickname_from_storage(&encoded),
+            Some("Keep Me".to_string()),
+            "the nickname binding is still live — it is fingerprint-bound to an \
+             invitation that now lives in memory, so it is not orphaned"
+        );
+    }
+
+    /// The terminal paths DO still drop the binding, so this fix did not just
+    /// leak the state the sweep was aiming at.
+    #[test]
+    fn terminal_and_replacement_paths_still_drop_the_nickname_binding() {
+        reset_storage();
+        let invitation = an_invitation(75);
+        let encoded = invitation.to_encoded_string();
+
+        save_invitation_nickname_to_storage(&encoded, "Gone Soon");
+        clear_invitation_from_storage();
+        assert_eq!(
+            load_invitation_nickname_from_storage(&encoded),
+            None,
+            "dismiss / terminal success clears the binding"
+        );
+
+        save_invitation_nickname_to_storage(&encoded, "Also Gone");
+        save_invitation_to_storage(&an_invitation(77));
+        assert_eq!(
+            load_invitation_nickname_from_storage(&encoded),
+            None,
+            "a replacing invitation clears the previous binding (#333)"
+        );
+    }
+
+    /// The startup hook must actually be wired into `App`, and must ADOPT
+    /// before it purges.
+    ///
+    /// A source scrape because the adopt/purge both go through `web_sys`,
+    /// which does not exist under `cargo test` — a behavioural test could not
+    /// fail here. What it guards is real: if the call were dropped from `App`,
+    /// an older River's stored artifact would simply sit on disk forever, which
+    /// is the exposure this change exists to retire; and if the purge ran
+    /// before the read, an in-flight join left by the older build would be
+    /// destroyed unread (the freenet/river#365 orphan shape, with nobody
+    /// holding the invitee key).
+    #[test]
+    fn the_startup_purge_is_wired_in_and_adopts_before_erasing() {
+        let app = include_str!("../app.rs");
+        let adopt_at = app
+            .find("adopt_and_purge_legacy_persisted_invitation_once()")
+            .expect(
+                "App must run the legacy-invitation adopt+purge at startup, or an \
+                 older River's persisted private key is never erased",
+            );
+
+        // ACROSS call sites, not just inside the hook. `save_invitation_to_storage`
+        // purges the legacy artifact itself, so if the URL-parse block ran first
+        // the hook would find nothing to adopt and an in-flight join left by an
+        // older build would be destroyed unread. The in-function ordering pin
+        // below cannot see this; a property that depends on two calls a hundred
+        // lines apart not being reordered needs a pin that spans both.
+        let url_parse_at = app
+            .find(r#"params.get("invitation")"#)
+            .expect("App must still parse an invitation out of the URL query");
+        assert!(
+            adopt_at < url_parse_at,
+            "the legacy adopt+purge must run BEFORE the URL-parse block, which \
+             calls save_invitation_to_storage and so purges the legacy artifact \
+             as a side effect"
+        );
+        // The click-interceptor's `save_invitation_to_storage` sits textually
+        // earlier but runs inside a `use_effect`, i.e. after the render body,
+        // so it is not a counterexample. Assert that specifically — that EVERY
+        // save above the adopt call is inside an effect — rather than merely
+        // that the string "use_effect" appears somewhere above, which is true
+        // of almost any edit to this file and so proves nothing.
+        let saves_above: Vec<usize> = app[..adopt_at]
+            .match_indices("save_invitation_to_storage(&")
+            .map(|(i, _)| i)
+            .collect();
+        for at in saves_above {
+            let effect_at = app[..at]
+                .rfind("use_effect(")
+                .expect("a save above the adopt call must sit inside a use_effect");
+            let closes = app[effect_at..at].matches("});").count();
+            assert!(
+                closes == 0,
+                "app.rs has a save_invitation_to_storage at byte {at} that runs \
+                 during the render body, BEFORE the legacy adopt hook. It would \
+                 purge the legacy artifact before the hook can read it."
+            );
+        }
+
+        let full = include_str!("receive_invitation_modal.rs");
+        let src = full
+            .split("mod tests {")
+            .next()
+            .expect("production code precedes `mod tests`");
+        let body = src
+            .split("fn adopt_and_purge_legacy_persisted_invitation_once")
+            .nth(1)
+            .expect("the startup hook must exist");
+        let read_at = body
+            .find("storage_get(INVITATION_STORAGE_KEY)")
+            .expect("the hook must READ the legacy artifact before erasing it");
+        let purge_at = body
+            .find("purge_persisted_invitation()")
+            .expect("the hook must erase the legacy artifact");
+        assert!(
+            read_at < purge_at,
+            "the hook must adopt the stored invitation BEFORE purging it — \
+             purging first destroys an in-flight join unread"
+        );
+    }
+
+    /// The in-memory slot behaves like the storage it replaced for the only
+    /// lifetime that now matters: within one page load.
+    #[test]
+    fn pending_invitation_round_trips_in_memory_and_clears() {
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let invitee_sk = SigningKey::generate(&mut rng);
+        let invitation = Invitation {
+            room: owner_sk.verifying_key(),
+            invitee_signing_key: invitee_sk.clone(),
+            invitee: owner_invited_member(&owner_sk, invitee_sk.verifying_key()),
+            room_secrets: vec![(0u32, [7u8; 32])],
+        };
+
+        clear_invitation_from_storage();
+        assert!(
+            load_invitation_from_storage().is_none(),
+            "precondition: nothing held"
+        );
+
+        save_invitation_to_storage(&invitation);
+        let recovered = load_invitation_from_storage().expect("held for the pending window");
+        assert_eq!(
+            recovered.invitee_signing_key.to_bytes(),
+            invitee_sk.to_bytes(),
+            "the full artifact is recoverable in-process — the accept path needs \
+             the private key to complete the join"
+        );
+        assert_eq!(recovered.room_secrets, invitation.room_secrets);
+
+        clear_invitation_from_storage();
+        assert!(
+            load_invitation_from_storage().is_none(),
+            "dismiss/terminal-success drops the credential"
+        );
+    }
 
     /// Build an `AuthorizedMember` invited directly by the owner.
     fn owner_invited_member(owner_sk: &SigningKey, member_vk: VerifyingKey) -> AuthorizedMember {
@@ -1134,7 +1601,7 @@ mod tests {
         let (current_key_is_member, invited_member_exists) = membership_status(
             &owner_vk,
             &members,
-            &self_sk.verifying_key(),
+            Some(&self_sk.verifying_key()),
             &fresh_invite_sk.verifying_key(),
             &invited_vk,
         );
@@ -1168,7 +1635,7 @@ mod tests {
         let (current_key_is_member, invited_member_exists) = membership_status(
             &owner_vk,
             &members,
-            &self_sk.verifying_key(),
+            Some(&self_sk.verifying_key()),
             &fresh_invite_sk.verifying_key(),
             &invited_vk,
         );
@@ -1205,7 +1672,7 @@ mod tests {
         let (current_key_is_member, invited_member_exists) = membership_status(
             &owner_vk,
             &members,
-            &lost_self_sk.verifying_key(),
+            Some(&lost_self_sk.verifying_key()),
             &invitation_key_sk.verifying_key(),
             &existing_member_sk.verifying_key(),
         );
