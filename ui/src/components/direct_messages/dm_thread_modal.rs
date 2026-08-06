@@ -191,8 +191,13 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
             // involves `peer`, and picking a default would render some other
             // member's message as one the user sent. Constraint: never
             // mislabel. So the message loop is skipped entirely and the thread
-            // renders EMPTY (the peer's name, membership state and the
+            // renders with no bubbles (the peer's name, membership state and the
             // composer's own key check are unaffected) rather than wrong.
+            //
+            // That "no bubbles" state is NOT the same as an empty thread, and
+            // `identity_known` below carries the difference to the render: the
+            // empty-state copy must not claim a thread with real history is
+            // empty.
             let self_id: Option<MemberId> = room_data.self_member_id();
             let owner_id = MemberId::from(&room);
 
@@ -389,6 +394,8 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 peer_still_member,
                 messages: rendered,
                 latest_inbound_ts,
+                identity_known: self_id.is_some(),
+                can_send: self_sk.is_some(),
             })
         }
     });
@@ -492,6 +499,8 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
     let peer_label = view_data.peer_nickname.clone();
     let peer_still_member = view_data.peer_still_member;
+    let identity_known = view_data.identity_known;
+    let can_send = view_data.can_send;
 
     let close = move |_| {
         crate::util::defer(move || {
@@ -908,7 +917,19 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                 div {
                     id: "dm-scroll-container",
                     class: "flex-1 overflow-y-auto px-5 py-4 space-y-2",
-                    if view_data.messages.is_empty() {
+                    if view_data.messages.is_empty() && !identity_known {
+                        // NOT "No messages yet". With no local identity every
+                        // DM in this thread was skipped rather than shown (see
+                        // the memo), so the history may be substantial — and
+                        // telling the reader it is empty is a claim about their
+                        // data that happens to be false. Same register as the
+                        // send path's refusal below.
+                        p {
+                            "data-testid": "dm-thread-identity-unavailable",
+                            class: "text-sm text-text-muted italic",
+                            "This device doesn't hold your key for this room, so this conversation can't be shown here."
+                        }
+                    } else if view_data.messages.is_empty() {
                         p { class: "text-sm text-text-muted italic",
                             "No messages yet. Say hello!"
                         }
@@ -944,6 +965,19 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             "This member is not currently in the room — outbound DMs will be rejected by the contract."
                         }
                     }
+                    // Up front, not on Send. Composing a DM signs and seals with
+                    // the local private key, so without it the send can only
+                    // ever be refused; letting the user type a message first and
+                    // then fail is the worse of the two. Same wording as the
+                    // send path's refusal, which stays in place as the action
+                    // boundary. `edit_room_modal` warns the same way.
+                    if !can_send {
+                        div {
+                            "data-testid": "dm-thread-no-key-notice",
+                            class: "text-xs text-yellow-400",
+                            "This device doesn't hold your key for this room, so you can't send DMs here."
+                        }
+                    }
                     div { class: "flex items-end gap-2",
                         textarea {
                             class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text resize-none min-h-[2.5rem] max-h-32",
@@ -957,16 +991,16 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             onkeydown: move |e| {
                                 if e.key() == Key::Enter && !e.modifiers().shift() {
                                     e.prevent_default();
-                                    if !draft.read().trim().is_empty() && peer_still_member {
+                                    if !draft.read().trim().is_empty() && peer_still_member && can_send {
                                         do_send();
                                     }
                                 }
                             },
-                            disabled: !peer_still_member,
+                            disabled: !peer_still_member || !can_send,
                         }
                         button {
                             class: "px-3 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-colors",
-                            disabled: draft.read().trim().is_empty() || !peer_still_member,
+                            disabled: draft.read().trim().is_empty() || !peer_still_member || !can_send,
                             onclick: move |_| do_send(),
                             "Send"
                         }
@@ -1042,7 +1076,10 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                             // not write the forbidden class names here — this
                             // comment tripped it once already.)
                             class: "text-xs py-1 text-accent hover:text-accent-hover disabled:opacity-50 disabled:hover:text-accent transition-colors",
-                            disabled: !peer_still_member,
+                            // Also disabled with no local private key, for the
+                            // same reason Send is: an invitation IS an outbound
+                            // DM, signed and sealed with that key.
+                            disabled: !peer_still_member || !can_send,
                             // Same name the Member Info dialog uses, so the
                             // feature reads as one thing across the app. It
                             // collides with no Playwright selector: the specs
@@ -1160,6 +1197,20 @@ struct ViewData {
     peer_still_member: bool,
     messages: Vec<RenderedDm>,
     latest_inbound_ts: u64,
+    /// Whether this build knows the local user's `MemberId` in this room.
+    ///
+    /// `false` means the message loop could not attribute a single DM, so
+    /// `messages` is empty for a reason that has nothing to do with the thread
+    /// being new. The empty state uses this to say "cannot be shown here"
+    /// instead of "no messages yet".
+    identity_known: bool,
+    /// Whether this build holds the local private key for this room.
+    ///
+    /// Composing a DM signs and seals with it, so `false` disables the composer
+    /// up front rather than letting the user write a message that only fails at
+    /// Send. Distinct from `identity_known`: an identity can be known (from the
+    /// persisted verifying key) while the private key is not held.
+    can_send: bool,
 }
 
 /// Inbound DM body presentation.

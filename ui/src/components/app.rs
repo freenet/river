@@ -194,6 +194,22 @@ pub fn App() -> Element {
         }
     });
 
+    // Retire any invitation an OLDER River persisted to localStorage, adopting
+    // it into memory first. That blob carries a full ed25519 private key plus
+    // the room's plaintext secrets, and the old flow had no terminal state for
+    // an abandoned invite, so it could sit there indefinitely. River no longer
+    // writes it (the pending invitation is held in memory for the page's
+    // lifetime), but not writing it does nothing about what is already on disk.
+    //
+    // MUST STAY ABOVE the URL-parse block below. That block calls
+    // `save_invitation_to_storage`, which itself purges the legacy artifact —
+    // so with the order reversed this hook would find nothing left to adopt,
+    // and an in-flight join left by the older build would be destroyed unread.
+    // Running first makes the ordering structural rather than a coincidence of
+    // which path happens to be taken; pinned by
+    // `the_startup_purge_is_wired_in_and_adopts_before_erasing`.
+    adopt_and_purge_legacy_persisted_invitation_once();
+
     // Get auth token from window global (injected by Freenet gateway)
     // This is synchronous - no network request needed
     get_auth_token_from_window();
@@ -325,18 +341,6 @@ pub fn App() -> Element {
         );
         receive_invitation.set(Some(inv));
     });
-
-    // Retire any invitation an OLDER River persisted to localStorage. That blob
-    // carries a full ed25519 private key plus the room's plaintext secrets, and
-    // the old flow had no terminal state for an abandoned invite, so it could
-    // sit there indefinitely. River no longer writes it (the pending invitation
-    // is held in memory for the page's lifetime), but not writing it does
-    // nothing about what is already on disk — this does.
-    //
-    // It ADOPTS the artifact into memory before erasing it, so an in-flight
-    // join left by the older build still completes on this one. Runs before the
-    // recovery block below, which is what consumes it.
-    adopt_and_purge_legacy_persisted_invitation_once();
 
     // Recover the pending invitation if it was not found in the URL. Note this
     // now only recovers WITHIN a page load, not across a reload: the artifact

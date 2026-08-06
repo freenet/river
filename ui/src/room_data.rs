@@ -6834,6 +6834,29 @@ mod tests {
             // attribute would drop real production sites from the scan.
             let src = full.split("mod tests {").next().unwrap_or(full);
             let lines: Vec<&str> = src.lines().collect();
+
+            // Which of those lines sit inside a `#[cfg(test)]` HELPER block.
+            // They are still SCANNED — a fixture that pairs the fields wrongly
+            // is worth catching — but they must not count toward the
+            // positive control below, or a production site could be deleted
+            // while a test fixture holds the floor up.
+            let mut in_test_helper = vec![false; lines.len()];
+            let mut depth: i32 = -1;
+            let mut braces: i32 = 0;
+            for (n, line) in lines.iter().enumerate() {
+                if depth < 0 && line.trim_start().starts_with("#[cfg(test)]") {
+                    depth = 0;
+                    braces = 0;
+                }
+                if depth >= 0 {
+                    in_test_helper[n] = true;
+                    braces += line.matches('{').count() as i32;
+                    braces -= line.matches('}').count() as i32;
+                    if braces <= 0 && line.contains('}') {
+                        depth = -1;
+                    }
+                }
+            }
             for (i, line) in lines.iter().enumerate() {
                 // An ASSIGNMENT, not a struct-literal field (`self_sk: ...`)
                 // and not a comparison.
@@ -6854,10 +6877,71 @@ mod tests {
                 if !is_assignment && !is_literal_field {
                     continue;
                 }
-                checked += 1;
+                if !in_test_helper[i] {
+                    checked += 1;
+                }
                 let window = lines[i.saturating_sub(3)..(i + 4).min(lines.len())].join("\n");
+
+                // For a LITERAL, naming the field is not enough — that is
+                // verbatim the weakness that makes the exhaustive destructure
+                // pin in members.rs insufficient, so repeating it here would
+                // buy nothing. Require the two values to AGREE: either both
+                // absent, or `self_vk` derived from the same key `self_sk`
+                // takes. `self_sk: Some(k)` beside `self_vk: None` is allowed
+                // ONLY because the save chokepoint backfills it — recorded
+                // explicitly so the exception is a decision, not an oversight.
+                if is_literal_field {
+                    let sk_is_some = trimmed.starts_with("self_sk: Some(");
+                    let vk_line = lines[i + 1..(i + 4).min(lines.len())]
+                        .iter()
+                        .map(|l| l.trim_start())
+                        .find(|l| l.starts_with("self_vk:"));
+                    let vk = vk_line.unwrap_or_else(|| {
+                        panic!(
+                            "{}:{} constructs a RoomData without a self_vk field beside \
+                             self_sk — they are a paired identity record",
+                            name,
+                            i + 1
+                        )
+                    });
+                    let vk_is_none = vk.starts_with("self_vk: None");
+                    let vk_is_some = vk.starts_with("self_vk: Some(");
+                    assert!(
+                        vk_is_none || vk_is_some,
+                        "{}:{} writes an unrecognised self_vk value `{}`",
+                        name,
+                        i + 1,
+                        vk
+                    );
+                    if !sk_is_some {
+                        assert!(
+                            vk_is_none,
+                            "{}:{} has no self_sk but claims a self_vk — a literal \
+                             must not invent an identity",
+                            name,
+                            i + 1
+                        );
+                    } else if vk_is_some {
+                        // Both present: the values must be derived from the same
+                        // key, textually `self_vk: Some(<x>.verifying_key())`
+                        // against `self_sk: Some(<x>...)`.
+                        assert!(
+                            vk.contains("verifying_key()"),
+                            "{}:{} sets self_vk to something not derived from the \
+                             signing key beside it — that is exactly the drift this \
+                             pin exists to stop",
+                            name,
+                            i + 1
+                        );
+                    }
+                    if !in_test_helper[i] {
+                        checked += 1;
+                    }
+                    continue;
+                }
+
                 assert!(
-                    window.contains(".self_vk =") || window.contains("self_vk:"),
+                    window.contains(".self_vk ="),
                     "{}:{} assigns self_sk without assigning self_vk beside it. \
                      The two are a paired identity record; leaving self_vk stale \
                      is harmless only while self_sk is still stored, which is \
@@ -6874,7 +6958,8 @@ mod tests {
             checked >= 5,
             "expected to find the production self_sk sites (the identity-import \
              and invitation-accept ASSIGNMENTS, plus the struct LITERALS that \
-             construct a RoomData); found {checked}. The scan needle is stale, so \
+             construct a RoomData), EXCLUDING cfg(test) fixtures from the tally; \
+             found {checked}. The scan needle is stale, so \
              this pin is no longer guarding anything."
         );
     }

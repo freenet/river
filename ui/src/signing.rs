@@ -814,6 +814,27 @@ mod tests {
             root.display()
         );
 
+        // POSITIVE CONTROL for the NEEDLE, not just the walk. `files.len()`
+        // proves we read the tree; it does not prove the strings we search for
+        // still correspond to anything. Rename `signing_key()` and every
+        // `!contains` assertion below becomes vacuously true while CI stays
+        // green. So require the accessor to actually appear somewhere.
+        let accessor_sites = files
+            .iter()
+            .filter(|p| {
+                std::fs::read_to_string(p)
+                    .map(|s| s.contains("signing_key()"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            accessor_sites >= 5,
+            "expected the `signing_key()` accessor at several sites, found {accessor_sites}. \
+             Either it was renamed — in which case the needles below are searching \
+             for a string that no longer exists and this pin is dead — or the key \
+             stopped being read through the accessor at all."
+        );
+
         for path in files {
             let Ok(src) = std::fs::read_to_string(&path) else {
                 continue;

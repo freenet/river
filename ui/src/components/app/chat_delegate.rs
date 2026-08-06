@@ -1685,6 +1685,54 @@ mod tests {
         );
     }
 
+    /// LATENT, and it goes live exactly when the relocation lands.
+    ///
+    /// `reconcile_room_present` builds `merged` from `local.clone()` on every
+    /// branch, and `backfill_self_vk` can only derive `self_vk` from a held
+    /// `self_sk`. So a local copy carrying NEITHER half would serialize
+    /// `self_vk: None` over a stored `Some` and erase the only record of who
+    /// the user is in that room — orphaning it with no way to recover the
+    /// identity.
+    ///
+    /// Unreachable today: every production construction site writes
+    /// `self_sk: Some(..)`, which the paired-field pin in `room_data.rs`
+    /// enforces. The test exists because "unreachable" is a property of the
+    /// current writers, and the relocation changes exactly those writers —
+    /// at which point this becomes a live data-loss path. Cheap to pin now,
+    /// while someone still remembers why it matters.
+    #[test]
+    fn a_save_never_erases_a_stored_self_vk() {
+        let vk = SigningKey::from_bytes(&[41u8; 32]).verifying_key();
+
+        // What the delegate already holds: a full identity record.
+        let mut stored = crate::room_data::test_minimal_room_data(vk);
+        stored.backfill_self_vk();
+        let stored_identity = stored.self_vk.expect("fixture has an identity");
+
+        // A local copy that has lost BOTH halves — the shape the relocation
+        // makes reachable.
+        let mut local = stored.clone();
+        local.self_sk = None;
+        local.self_vk = None;
+
+        let out =
+            reconcile_room_present(Some(&present_slot_bytes(&stored)), &vk, &local, false).unwrap();
+
+        if let Some(bytes) = out {
+            let written = match ciborium::from_reader::<RoomSlot, _>(bytes.as_slice()).unwrap() {
+                RoomSlot::Present(r) => r,
+                RoomSlot::Tombstone => panic!("expected Present"),
+            };
+            assert_eq!(
+                written.self_vk,
+                Some(stored_identity),
+                "a save must never write self_vk: None over a stored identity — \
+                 once self_sk is no longer in the blob that erases the only \
+                 record of who the user is and orphans the room"
+            );
+        }
+    }
+
     /// A copy that merely LACKS the private key is not a different identity.
     /// Treating it as one would send every save down the diverged-identity
     /// branch, which discards the remote's state — so this is a data-loss
@@ -4604,6 +4652,11 @@ fn reconcile_room_present(
         },
     };
 
+    // The identity the delegate already has recorded for this room, captured
+    // before `remote` is consumed by the merge below. Used to stop a save from
+    // ERASING it — see the `self_vk` restore after the match.
+    let stored_self_vk: Option<VerifyingKey> = remote.as_ref().and_then(|r| r.self_verifying_key());
+
     let merged: RoomData = match present_action(kind, explicitly_rejoined) {
         PresentAction::AbortAdoptLeave => return Ok(None),
         PresentAction::StoreFresh => local.clone(),
@@ -4638,6 +4691,18 @@ fn reconcile_room_present(
                 // #420 and out of scope for the #414 escape hatch. Until then the
                 // overwrite-confirm dialog tells the user to close other sessions
                 // for the room first.
+                //
+                // `self_vk` rides along with this. The save chokepoint derives
+                // it from whichever `self_sk` this branch keeps, so a stale tab
+                // stamps its stale VERIFYING key too. No change in effect today
+                // — the stale private key was already being written beside it,
+                // and reads prefer the private key — but it matters for the
+                // relocation: after `self_sk` leaves the blob, `self_vk` is the
+                // only identity record, so this reversal stops being invisible
+                // and becomes the thing that decides who the user is. Deriving
+                // the pair together is what keeps them consistent through the
+                // reversal; #420's fix (an identity-generation counter) is what
+                // stops the reversal itself.
                 local.clone()
             } else {
                 let mut m = local.clone();
@@ -4669,6 +4734,25 @@ fn reconcile_room_present(
     // about the blob changes.
     let mut merged = merged;
     merged.backfill_self_vk();
+
+    // Identity must never REGRESS to unknown.
+    //
+    // Every branch above builds `merged` from `local.clone()`, and
+    // `backfill_self_vk` can only derive `self_vk` from a held `self_sk`. So a
+    // local copy carrying neither half would serialize `self_vk: None` over the
+    // delegate's stored `Some` and erase the only record of who the user is in
+    // this room — orphaning it, with nothing left to recover the identity from.
+    //
+    // Unreachable while every writer stores `self_sk`, which is why this is
+    // cheap now. It becomes live exactly when the relocation lands and
+    // `self_vk` is the only identity record there is, so the guard goes in
+    // before the change that needs it rather than after. Pinned by
+    // `a_save_never_erases_a_stored_self_vk`.
+    if merged.self_vk.is_none() {
+        if let Some(stored) = stored_self_vk {
+            merged.self_vk = Some(stored);
+        }
+    }
 
     let mut out = Vec::new();
     ciborium::ser::into_writer(&RoomSlot::Present(Box::new(merged)), &mut out)
