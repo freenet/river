@@ -6960,6 +6960,23 @@ mod tests {
 
         // Not vacuous: if the scan finds nothing, the needle has drifted away
         // from how the code actually spells the assignment and the pin is dead.
+        //
+        // WHAT THIS FLOOR DOES AND DOES NOT CATCH — the two guards in this test
+        // divide the work, and neither covers the other:
+        //
+        // * This floor catches a site that leaves the scan's SHAPE. Refactor
+        //   `self_sk: Some(k)` into `let sk = Some(k); … self_sk: sk,` and the
+        //   line stops matching, the tally drops, and this fires. That is the
+        //   drift that would otherwise silently stop the pin checking a real
+        //   site while CI stayed green.
+        // * It does NOT catch a site that keeps the shape and changes the
+        //   VALUE. `self_sk: None` still starts with `self_sk: ` and still
+        //   counts, so the tally is unmoved. Catching that is the
+        //   value-agreement arm's job, above.
+        //
+        // Do not assume one subsumes the other: a shape-preserving value change
+        // is invisible to the tally, and a shape-breaking refactor is invisible
+        // to the value check because it never reaches it.
         assert!(
             checked >= 5,
             "expected to find the production self_sk sites (the identity-import \
