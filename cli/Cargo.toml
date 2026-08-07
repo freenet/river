@@ -92,6 +92,6 @@ fs2 = "0.4"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
-freenet-test-network = "0.1.23"
+freenet-test-network = "0.1.24"
 tempfile = "3"
 assert_cmd = "2"
