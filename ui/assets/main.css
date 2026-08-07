@@ -40,10 +40,11 @@
  * which reads as "the composer now takes up more room" — a real visible
  * regression, not just a WCAG nice-to-have. This button is also a
  * lower-stakes target than the DM-archive ✕ (a mis-tap just opens the
- * emoji picker, not a destructive action) and touch users have a second,
- * already-sized path to the same action via the message kebab menu's
- * "React" entry (`conversation.rs`, `.touch-actions`). So: fix visibility
- * only, leave sizing alone. */
+ * emoji picker, not a destructive action) and touch users have a second
+ * path to the same action via the message kebab menu's "React" entry
+ * (`conversation.rs`, `.touch-actions`) — a full menu row, comfortably
+ * above the WCAG 2.5.8 AA 24px floor though still short of the 44px AAA
+ * target itself. So: fix visibility only, leave sizing alone. */
 @media (hover: none), (any-pointer: coarse) {
     .add-reaction-btn {
         opacity: 0.4;
