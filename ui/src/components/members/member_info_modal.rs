@@ -686,18 +686,31 @@ pub fn MemberInfoModal() -> Element {
                             // contract-VALID and cascades to their whole invite
                             // subtree (freenet/river#478).
                             if member_id != self_member_id {
+                                // #478, transitive case: the Ban action is ALSO
+                                // withheld when the cascade would sweep the
+                                // viewer up — i.e. the target is one of the
+                                // viewer's own invite ancestors. Same damage as
+                                // a self-ban, different route, so it is the same
+                                // rule (`ban_gate`), not a second special case.
+                                // `ban_refusal` is `Some` only when the viewer
+                                // would OTHERWISE have had the action, which is
+                                // why it also carries the text: a moderator
+                                // whose Ban button vanished is owed a reason.
+                                //
+                                // Rendered as its own full-width block, NOT as a
+                                // flex sibling inside the button row below: it
+                                // is a sentence-length explanation, not a
+                                // button-sized label, and squeezing it into the
+                                // row alongside Deputize wrapped and clipped it.
+                                if let Some(reason) = ban_refusal {
+                                    div {
+                                        "data-testid": "ban-withheld-reason",
+                                        class: "mt-4 px-3 py-2 text-sm text-text-muted bg-surface border border-border rounded-lg",
+                                        "{reason}"
+                                    }
+                                }
+
                                 div { class: "mt-4 flex items-start gap-3",
-                                    // #478, transitive case: the Ban action is
-                                    // ALSO withheld when the cascade would sweep
-                                    // the viewer up — i.e. the target is one of
-                                    // the viewer's own invite ancestors. Same
-                                    // damage as a self-ban, different route, so
-                                    // it is the same rule (`ban_gate`), not a
-                                    // second special case. `ban_refusal` is
-                                    // `Some` only when the viewer would OTHERWISE
-                                    // have had the action, which is why it also
-                                    // carries the text: a moderator whose Ban
-                                    // button vanished is owed a reason.
                                     if ban_refusal.is_none() {
                                         BanButton {
                                             member_to_ban: member_id,
@@ -712,13 +725,6 @@ pub fn MemberInfoModal() -> Element {
                                             // showed "[Encrypted: N bytes, vN]" instead
                                             // of a name in private rooms.
                                             nickname: target_nickname.clone()
-                                        }
-                                    }
-                                    if let Some(reason) = ban_refusal {
-                                        div {
-                                            "data-testid": "ban-withheld-reason",
-                                            class: "flex-1 px-3 py-2 text-sm text-text-muted bg-surface border border-border rounded-lg",
-                                            "{reason}"
                                         }
                                     }
 
