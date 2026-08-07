@@ -11,6 +11,13 @@ import { test, expect } from "@playwright/test";
 // #462's pointer-capability media query. This probes the cascade directly
 // against the shipped stylesheets, since that's the layer where the bug
 // actually lived (Tailwind's utility layer vs. main.css's plain rules).
+//
+// Deliberately does NOT assert a minimum tap-target size: an earlier version
+// of this fix added `min-width`/`min-height: 2.75rem` (mirroring #462), but
+// that grew the reaction row's height on every message and read as a visible
+// regression (river chat feedback, 2026-08-07) — reverted. The size
+// assertion below pins that decision: it fails if `min-width`/`min-height`
+// gets re-added to `.add-reaction-btn` without deliberately revisiting this.
 
 const PROBE_ID = "add-reaction-cascade-probe";
 
@@ -64,13 +71,15 @@ test.describe("Add-reaction + button cascade", () => {
             "at rest — if this is 0 (or 0.2), main.css's touch rule regressed " +
             "and the + button is invisible again"
         ).toBeGreaterThanOrEqual(0.4);
-        // WCAG 2.5.8 asks for 24px; Apple HIG for 44. The rule sets 2.75rem,
-        // matching the #462 archive-button precedent for the same bug class.
+        // No min-width/min-height on touch — see the file header. A plain
+        // <button> with no explicit sizing renders well under 44px from UA
+        // default padding alone, so this catches a re-added min-size rule.
         expect(
           Math.min(m.width, m.height),
-          "the touch tap target must be at least 44px, or a finger can miss " +
-            "the now-visible + button"
-        ).toBeGreaterThanOrEqual(44);
+          "the button must NOT have a forced minimum tap-target size on " +
+            "touch — that was tried and reverted because it grew the " +
+            "reaction row's height on every message (visible regression)"
+        ).toBeLessThan(44);
       } else {
         // Mouse-only: the hover reveal must be preserved.
         const expected = hasReactions ? 0.2 : 0;
