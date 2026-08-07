@@ -32,10 +32,20 @@
  * Gate on pointer CAPABILITY, not viewport width — see the #462 comment
  * above for why `(hover: none), (any-pointer: coarse)` is the correct query
  * (`any-pointer: coarse` also catches a touchscreen laptop, which reports
- * `hover: hover` while a finger is on the glass). */
+ * `hover: hover` while a finger is on the glass).
+ *
+ * Also widen the tap target to >=44px (WCAG 2.5.8 / Apple HIG), matching
+ * #462's fix for the same bug class: at rest the button is just a bare "+"
+ * glyph (`text-xl leading-none`, no padding), well under the minimum. Unlike
+ * #462's absolutely-positioned archive ✕, this button sits inline in a
+ * `flex flex-wrap` reaction row (`conversation.rs`), so growing it needs no
+ * companion padding fix elsewhere — the row simply wraps if a message has
+ * many reactions and the row is tight. */
 @media (hover: none), (any-pointer: coarse) {
     .add-reaction-btn {
         opacity: 0.4;
+        min-width: 2.75rem;
+        min-height: 2.75rem;
     }
 
     .add-reaction-btn.has-reactions {

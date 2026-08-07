@@ -29,9 +29,12 @@ async function measureProbe(page: import("@playwright/test").Page, hasReactions:
       document.body.appendChild(row);
 
       const style = getComputedStyle(btn);
+      const rect = btn.getBoundingClientRect();
       const result = {
         coarse: window.matchMedia("(hover: none), (any-pointer: coarse)").matches,
         opacity: style.opacity,
+        width: rect.width,
+        height: rect.height,
       };
       row.remove();
       return result;
@@ -61,6 +64,13 @@ test.describe("Add-reaction + button cascade", () => {
             "at rest — if this is 0 (or 0.2), main.css's touch rule regressed " +
             "and the + button is invisible again"
         ).toBeGreaterThanOrEqual(0.4);
+        // WCAG 2.5.8 asks for 24px; Apple HIG for 44. The rule sets 2.75rem,
+        // matching the #462 archive-button precedent for the same bug class.
+        expect(
+          Math.min(m.width, m.height),
+          "the touch tap target must be at least 44px, or a finger can miss " +
+            "the now-visible + button"
+        ).toBeGreaterThanOrEqual(44);
       } else {
         // Mouse-only: the hover reveal must be preserved.
         const expected = hasReactions ? 0.2 : 0;
