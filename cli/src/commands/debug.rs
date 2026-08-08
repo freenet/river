@@ -40,6 +40,18 @@ pub enum DebugCommands {
         /// Room owner key (base58 encoded)
         room_owner_key: String,
     },
+    /// Dump the RAW `member_info` records as fetched from the live network —
+    /// one row per record, deliberately NOT canonicalized via
+    /// `MemberInfoV1::canonical` (freenet/river#577). `member list` and
+    /// `debug room-state` both route through `canonical`, so a duplicate
+    /// `member_id` (two signed records at the same or different `version`) is
+    /// invisible there by construction. This exists to make duplicates
+    /// visible before a change to the equal-version tiebreak (freenet/river#571
+    /// / #572) can flip which record wins.
+    MemberInfo {
+        /// Room owner key (base58 encoded)
+        room_owner_key: String,
+    },
 }
 
 /// What a ban is currently doing, as opposed to merely being stored
@@ -428,6 +440,124 @@ fn status_error_json(message: &str) -> serde_json::Value {
     serde_json::json!({ "status": "error", "message": message })
 }
 
+/// One RAW `member_info` record as stored on the wire — before any
+/// canonicalization. `member_id` and `version` are exactly what
+/// `MemberInfoV1::canonical`'s tiebreak (freenet/river#571 / #572) ranks on;
+/// `sig_digest` is the SAME 128-bit BLAKE3 digest of the signature that
+/// breaks an equal-version tie there (see `SigDigest` in
+/// `river-core::room_state::member_info`), recomputed here rather than
+/// exposed by that module since the digest itself is private. Two records
+/// for the same `member_id` at the same `version` is exactly the case this
+/// command exists to surface: under the old tiebreak (raw signature bytes)
+/// and the new one (this digest) an equal-version pair can resolve to a
+/// DIFFERENT winner.
+#[derive(Serialize, Clone)]
+struct MemberInfoRecord {
+    member_id: String,
+    version: u32,
+    sig_digest: String,
+    deputies_count: usize,
+}
+
+/// A `member_id` that appears more than once in the raw `member_info`
+/// vector, with every version at which it appears (in stored order,
+/// duplicates included).
+#[derive(Serialize)]
+struct DuplicateMemberId {
+    member_id: String,
+    versions: Vec<u32>,
+}
+
+/// The full pre-migration duplicate-check payload (freenet/river#577).
+#[derive(Serialize)]
+struct MemberInfoDump {
+    total_records: usize,
+    distinct_member_ids: usize,
+    /// Any `member_id` with more than one raw record, regardless of version.
+    duplicate_member_ids: Vec<DuplicateMemberId>,
+    /// The dangerous subset of `duplicate_member_ids`: two or more records
+    /// for the same member at the IDENTICAL version. A non-empty list here
+    /// means the equal-version tiebreak change (freenet/river#571/#572) can
+    /// flip a winner at migration.
+    equal_version_duplicates: Vec<DuplicateMemberId>,
+    records: Vec<MemberInfoRecord>,
+}
+
+/// The same 128-bit BLAKE3 digest `river-core`'s private `sig_digest` uses
+/// as the equal-version tiebreak discriminator: the first 16 bytes of
+/// `blake3(signature.to_bytes())`, hex-encoded. Recomputed rather than
+/// imported because that function is not `pub` — it is an internal
+/// implementation detail of `MemberInfoV1`'s conflict resolution, not part of
+/// river-core's public API surface.
+fn sig_digest_hex(signature: &ed25519_dalek::Signature) -> String {
+    let hash = blake3::hash(signature.to_bytes().as_ref());
+    hash.as_bytes()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Build the raw dump from a room's `member_info`, deliberately reading
+/// `member_info.member_info` (the raw `Vec<AuthorizedMemberInfo>`) directly
+/// rather than through `MemberInfoV1::canonical` — canonicalizing here would
+/// defeat the entire point, since a duplicate is exactly what canonical
+/// resolves away.
+fn collect_member_info_dump(member_info: &MemberInfoV1) -> MemberInfoDump {
+    let records: Vec<MemberInfoRecord> = member_info
+        .member_info
+        .iter()
+        .map(|info| MemberInfoRecord {
+            member_id: info.member_info.member_id.to_string(),
+            version: info.member_info.version,
+            sig_digest: sig_digest_hex(&info.signature),
+            deputies_count: info.member_info.deputies.len(),
+        })
+        .collect();
+
+    let mut by_member: HashMap<String, Vec<u32>> = HashMap::new();
+    for record in &records {
+        by_member
+            .entry(record.member_id.clone())
+            .or_default()
+            .push(record.version);
+    }
+
+    let mut duplicate_member_ids: Vec<DuplicateMemberId> = by_member
+        .iter()
+        .filter(|(_, versions)| versions.len() > 1)
+        .map(|(member_id, versions)| DuplicateMemberId {
+            member_id: member_id.clone(),
+            versions: versions.clone(),
+        })
+        .collect();
+    duplicate_member_ids.sort_by(|a, b| a.member_id.cmp(&b.member_id));
+
+    let equal_version_duplicates: Vec<DuplicateMemberId> = duplicate_member_ids
+        .iter()
+        .filter(|dup| {
+            // Equal-version means at least one version value repeats within
+            // this member's own version list — not merely that the member
+            // has multiple records (those may legitimately differ in
+            // version, e.g. a nickname update superseding an older one).
+            let mut sorted = dup.versions.clone();
+            sorted.sort_unstable();
+            sorted.windows(2).any(|w| w[0] == w[1])
+        })
+        .map(|dup| DuplicateMemberId {
+            member_id: dup.member_id.clone(),
+            versions: dup.versions.clone(),
+        })
+        .collect();
+
+    MemberInfoDump {
+        total_records: records.len(),
+        distinct_member_ids: by_member.len(),
+        duplicate_member_ids,
+        equal_version_duplicates,
+        records,
+    }
+}
+
 pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputFormat) -> Result<()> {
     match command {
         DebugCommands::ContractGet { room_owner_key } => {
@@ -676,6 +806,65 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
                 }
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&room_config)?);
+                }
+            }
+            Ok(())
+        }
+        DebugCommands::MemberInfo { room_owner_key } => {
+            let owner_vk = parse_owner_key(&room_owner_key)?;
+            let room_state = api.get_room(&owner_vk, false).await?;
+
+            let dump = collect_member_info_dump(&room_state.member_info);
+
+            match format {
+                OutputFormat::Human => {
+                    println!(
+                        "member_info: {} record(s), {} distinct member_id(s)",
+                        dump.total_records, dump.distinct_member_ids
+                    );
+                    println!(
+                        "{:<44} {:>7} {:<34} deputies",
+                        "member_id", "version", "sig_digest"
+                    );
+                    for record in &dump.records {
+                        println!(
+                            "{:<44} {:>7} {:<34} {}",
+                            record.member_id,
+                            record.version,
+                            record.sig_digest,
+                            record.deputies_count
+                        );
+                    }
+                    println!();
+                    if dump.duplicate_member_ids.is_empty() {
+                        println!("No member_id appears more than once.");
+                    } else {
+                        println!(
+                            "{} member_id(s) have more than one record:",
+                            dump.duplicate_member_ids.len()
+                        );
+                        for dup in &dump.duplicate_member_ids {
+                            println!("  {} at versions {:?}", dup.member_id, dup.versions);
+                        }
+                    }
+                    println!();
+                    if dump.equal_version_duplicates.is_empty() {
+                        println!(
+                            "EQUAL-VERSION DUPLICATE CHECK: PASS — no member_id repeats a version."
+                        );
+                    } else {
+                        println!(
+                            "EQUAL-VERSION DUPLICATE CHECK: FAIL — {} member_id(s) have two or more \
+                             records at the SAME version:",
+                            dump.equal_version_duplicates.len()
+                        );
+                        for dup in &dump.equal_version_duplicates {
+                            println!("  {} at versions {:?}", dup.member_id, dup.versions);
+                        }
+                    }
+                }
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&dump)?);
                 }
             }
             Ok(())
@@ -1466,6 +1655,145 @@ mod tests {
             !arm_src.contains("BanInfo {"),
             "the Bans arm must not construct `BanInfo` itself — that bypasses \
              `classify_ban` and can reintroduce a hardcoded verdict."
+        );
+    }
+
+    // --- `debug member-info` raw-record dump (#577) -----------------------
+    //
+    // Pre-migration gate for freenet/river#571/#572's equal-version tiebreak
+    // change: a duplicate `member_id` at the SAME `version` is exactly the
+    // case where the old tiebreak (raw signature bytes) and the new one
+    // (`SigDigest`) can pick a different winner.
+
+    /// Build a raw `AuthorizedMemberInfo` with a given signature, bypassing
+    /// signing entirely. `collect_member_info_dump` never verifies a
+    /// signature — it only reads `member_id`/`version` and digests the
+    /// signature bytes — so a fixed signature is enough to construct two
+    /// records that collide on purpose, without finding a real `SigDigest`
+    /// collision.
+    fn raw_info(member_id: MemberId, version: u32, sig_byte: u8) -> AuthorizedMemberInfo {
+        let info = MemberInfo::new_public(member_id, version, "member".to_string());
+        AuthorizedMemberInfo::with_signature(
+            info,
+            ed25519_dalek::Signature::from_bytes(&[sig_byte; 64]),
+        )
+    }
+
+    #[test]
+    fn member_info_dump_reports_no_duplicates_for_distinct_members() {
+        let alice = key(2);
+        let bob = key(3);
+        let mut state = MemberInfoV1::default();
+        state.member_info.push(raw_info(id(&alice), 0, 1));
+        state.member_info.push(raw_info(id(&bob), 3, 2));
+
+        let dump = collect_member_info_dump(&state);
+        assert_eq!(dump.total_records, 2);
+        assert_eq!(dump.distinct_member_ids, 2);
+        assert!(dump.duplicate_member_ids.is_empty());
+        assert!(dump.equal_version_duplicates.is_empty());
+    }
+
+    #[test]
+    fn member_info_dump_flags_equal_version_duplicate() {
+        // The dangerous case this command exists to catch: two records for
+        // the SAME member at the SAME version. Distinct signature bytes so
+        // the two records are genuinely different entries, not one pushed
+        // twice.
+        let alice = key(2);
+        let mut state = MemberInfoV1::default();
+        state.member_info.push(raw_info(id(&alice), 5, 1));
+        state.member_info.push(raw_info(id(&alice), 5, 2));
+
+        let dump = collect_member_info_dump(&state);
+        assert_eq!(dump.total_records, 2);
+        assert_eq!(dump.distinct_member_ids, 1);
+        assert_eq!(dump.duplicate_member_ids.len(), 1);
+        assert_eq!(dump.duplicate_member_ids[0].versions, vec![5, 5]);
+        assert_eq!(
+            dump.equal_version_duplicates.len(),
+            1,
+            "a same-version duplicate must be flagged as an equal-version duplicate"
+        );
+    }
+
+    #[test]
+    fn member_info_dump_does_not_flag_a_legitimate_version_bump_as_equal_version() {
+        // Two records for the same member at DIFFERENT versions (e.g. a
+        // nickname update superseding an older record, not yet collapsed by
+        // `dedup_to_canonical`) is a duplicate `member_id`, but NOT the
+        // dangerous equal-version case — `canonical` picks the higher
+        // version unambiguously regardless of the tiebreak rule.
+        let alice = key(2);
+        let mut state = MemberInfoV1::default();
+        state.member_info.push(raw_info(id(&alice), 0, 1));
+        state.member_info.push(raw_info(id(&alice), 1, 2));
+
+        let dump = collect_member_info_dump(&state);
+        assert_eq!(dump.duplicate_member_ids.len(), 1);
+        assert!(
+            dump.equal_version_duplicates.is_empty(),
+            "a version bump is a duplicate record but not an equal-version \
+             collision, and must not be reported as one"
+        );
+    }
+
+    #[test]
+    fn sig_digest_hex_matches_river_cores_golden_vector() {
+        // Same fixed input and expected bytes as
+        // `river_core::room_state::member_info::tests::sig_digest_golden_vector`
+        // (the first 16 bytes of `blake3(signature.to_bytes())`). This command
+        // recomputes that digest independently because the source function is
+        // private, so it must be pinned here too: a mismatch would mean the
+        // check reports a discriminator different from the one that actually
+        // decides equal-version ties, silently defeating the whole command.
+        let mut raw = [0u8; 64];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let signature = ed25519_dalek::Signature::from_bytes(&raw);
+
+        const EXPECTED_HEX: &str = "4eed7141ea4a5cd4b788606bd23f46e2";
+        assert_eq!(sig_digest_hex(&signature), EXPECTED_HEX);
+    }
+
+    #[test]
+    fn sig_digest_hex_differs_for_different_signatures() {
+        let a = ed25519_dalek::Signature::from_bytes(&[1u8; 64]);
+        let b = ed25519_dalek::Signature::from_bytes(&[2u8; 64]);
+        assert_ne!(sig_digest_hex(&a), sig_digest_hex(&b));
+    }
+
+    /// Source pin for the `debug member-info` CALL SITE, mirroring
+    /// `bans_command_delegates_to_the_shared_helpers` above: every assertion
+    /// on `collect_member_info_dump`'s behavior is worthless if the `execute`
+    /// arm stops calling it and builds the dump inline instead.
+    #[test]
+    fn member_info_command_delegates_to_the_shared_helper() {
+        let src = include_str!("debug.rs");
+        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+
+        let arm = body
+            .find("DebugCommands::MemberInfo { room_owner_key }")
+            .expect("the `debug member-info` arm must exist");
+        let arm_src = &body[arm..];
+
+        assert!(
+            arm_src.contains("collect_member_info_dump("),
+            "the MemberInfo arm must build its dump via `collect_member_info_dump`, \
+             not inline — this is the ONLY place duplicates must NOT be \
+             canonicalized away."
+        );
+        assert!(
+            arm_src.contains("serde_json::to_string_pretty(&dump)"),
+            "the JSON branch must serialize the SAME `dump` value the human \
+             branch reads, so `-f json` and the human listing cannot disagree."
+        );
+        assert!(
+            !arm_src.contains(".canonical("),
+            "the MemberInfo arm must never canonicalize — `member list` and \
+             `debug room-state` already do that, and doing it here would hide \
+             the exact duplicates this command exists to expose (freenet/river#577)."
         );
     }
 }
