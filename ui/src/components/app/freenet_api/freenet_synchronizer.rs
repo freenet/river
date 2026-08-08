@@ -683,9 +683,18 @@ impl FreenetSynchronizer {
                                 // Log more details based on response type
                                 match &host_response {
                                     HostResponse::DelegateResponse { key, values } => {
+                                        // Key fingerprint, not the full Debug: that prints
+                                        // the 32-byte key as a decimal array on every
+                                        // delegate response (freenet/river#569).
+                                        let key_head: String = key
+                                            .bytes()
+                                            .iter()
+                                            .take(4)
+                                            .map(|b| format!("{b:02x}"))
+                                            .collect();
                                         info!(
-                                            "Delegate response with key: {:?}, values count: {}",
-                                            key,
+                                            "Delegate response with key: {}.., values count: {}",
+                                            key_head,
                                             values.len()
                                         );
                                         for (i, v) in values.iter().enumerate() {
