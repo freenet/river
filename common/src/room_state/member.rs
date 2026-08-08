@@ -1,4 +1,4 @@
-use crate::room_state::ban::BansV1;
+use crate::room_state::ban::{BanSignatureCache, BansV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, truncated_base32, verify_struct};
@@ -54,6 +54,10 @@ impl ComposableState for MembersV1 {
 
         let owner_id = parameters.owner_id();
         let members_by_id = self.members_by_member_id();
+        // Memoized across members so each member's own invite signature is
+        // verified ONCE, instead of once per descendant that walks through it
+        // (freenet/river#422). See [`InviteChainCache`].
+        let mut chains = InviteChainCache::new(parameters, &members_by_id);
 
         for member in &self.members {
             if member.member.id() == owner_id {
@@ -69,7 +73,7 @@ impl ComposableState for MembersV1 {
             }
 
             // Verify the full invite chain with Ed25519 signature checks
-            self.get_invite_chain_with_lookup(member, parameters, &members_by_id)?;
+            chains.validate_chain(member)?;
         }
         Ok(())
     }
@@ -122,8 +126,9 @@ impl ComposableState for MembersV1 {
             }
 
             // Verify that all new members have valid invites
+            let mut chains = InviteChainCache::new(parameters, &combined_members_by_id);
             for member in &delta.added {
-                self.verify_member_invite_with_lookup(member, parameters, &combined_members_by_id)?;
+                Self::verify_member_invite_with_lookup(&mut chains, member, parameters)?;
             }
 
             // Add ALL new members (deduplicated), let remove_excess_members handle trimming.
@@ -167,11 +172,15 @@ impl MembersV1 {
     /// The lookup map should include both existing members AND delta members
     /// when called during apply_delta, so that inviters in the same delta
     /// can be found.
+    ///
+    /// The owner-invited fast path is DELIBERATELY kept distinct from the
+    /// chain walk (and is not memoized): it checks only the signature, where
+    /// the walk additionally rejects self-invitation and cycles. Collapsing the
+    /// two would change which deltas `apply_delta` accepts.
     fn verify_member_invite_with_lookup(
-        &self,
+        chains: &mut InviteChainCache<'_>,
         member: &AuthorizedMember,
         parameters: &ChatRoomParametersV1,
-        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
     ) -> Result<(), String> {
         if member.member.invited_by == parameters.owner_id() {
             // Member was invited by the owner, verify signature against owner's key
@@ -180,9 +189,259 @@ impl MembersV1 {
                 .map_err(|e| format!("Invalid signature for member invited by owner: {}", e))?;
         } else {
             // Member was invited by another member, verify the invite chain
-            self.get_invite_chain_with_lookup(member, parameters, members_by_id)?;
+            chains.validate_chain(member)?;
         }
         Ok(())
+    }
+}
+
+/// Memoizes invite-chain validation within one `verify` / `apply_delta`.
+///
+/// [`MembersV1::get_invite_chain_with_lookup`] walks from a member up to the
+/// room owner, Ed25519-verifying every link on the way. Running that per member
+/// re-verifies each ancestor's invite signature once for every descendant, so
+/// validating a room of `M` members whose invite tree is `D` deep costs
+/// `O(sum of chain lengths)` — up to `O(M^2)` — verifications where `O(M)`
+/// suffices, because a member's own invite signature is the same signature no
+/// matter who walks through it.
+///
+/// This is the `validate_state`-side half of freenet/river#422 (`update_state`
+/// never calls `verify`; it pays this only for the members a delta ADDS).
+///
+/// How much it saves depends entirely on the invite tree, and the honest range
+/// is wide. Measured by counting calls into `verify_struct`, for
+/// `MembersV1::verify`:
+///
+/// * The live Freenet Official room is a near-flat star — owner -> invite bot ->
+///   everyone — with invite depth max 4 and mean 2.02 over 496 members
+///   (2026-07-29, `cli/examples/invite_depth_probe.rs`). 1003 verifications
+///   before, 496 after: **2x**, and only ~7% of that room's whole
+///   `validate_state` because its 2000 messages dominate.
+/// * A synthetic 400-member room at invite depth 50 needs 10,700 before and 900
+///   after (**12x**, 4.52 s -> 0.38 s); at depth 200, 40,700 before
+///   (**45x**, 17.19 s). Those breach the 5s budget — but no room has been
+///   measured with a tree that deep, so treat them as the shape of the curve,
+///   not as a characterisation of any real room.
+///
+/// # Why memoizing is exactly equivalent
+///
+/// "Member `X`'s chain is valid" is a property of `X`, its ancestors, the room
+/// OWNER, and the `members_by_id` the ancestors resolve through. The first
+/// three are fixed for a cache (see "Why the context is bound at
+/// construction"), and the fourth is `X` itself — so a verdict travels between
+/// walks correctly, with ONE exception, handled by the non-canonical-start
+/// bypass in [`Self::validate_chain`]: the start's `MemberId` seeds the cycle
+/// guard, so a walk starting at a non-canonical duplicate can terminate with a
+/// circular-chain error that a memo hit would suppress. Such a start neither
+/// reads nor writes the memo. (An earlier version of this comment claimed "the
+/// starting member of a walk never enters the checks". That was false, and it
+/// is the bug this bypass fixes.)
+///
+/// For every other start, caching the walk's verdict per member and reusing it
+/// for descendants yields the same verdict the full walk would produce. Every
+/// node on a completed walk is recorded with that walk's verdict, which is
+/// sound in both directions:
+///
+/// * `Ok` — every node between the start and the owner had its own signature
+///   verified and a valid chain above it, which is exactly what a walk started
+///   at that node would check.
+/// * `Err` — the failure happened at some node `E` on the path, so every node
+///   BELOW `E` also has an invalid chain, and its walk would fail at `E` with
+///   the very same message (the messages name `E`, not the starting member).
+///
+/// Errors are surfaced by the FIRST failing member in iteration order and the
+/// callers propagate with `?`, so a later member can never observe a memoized
+/// error that a fresh walk would have phrased differently — the operation has
+/// already returned.
+///
+/// # Why the key is the whole member, and NOT its `MemberId`
+///
+/// `MemberId` is a 64-bit `fast_hash` of a verifying key. Keying the memo on it
+/// would let an attacker who grinds a `MemberId` collision between two keypairs
+/// they generated (a birthday search, ~2^33 work — not 2^64) get a SECOND,
+/// forged member entry admitted on the first one's verdict, with its own invite
+/// signature never checked. That would let them forge their position in the
+/// invite tree — claiming to be invited by the owner, or by whoever's subtree
+/// confers ban authority — which is precisely what this check exists to
+/// prevent. Ancestor RESOLUTION is still `MemberId`-keyed via `members_by_id`,
+/// exactly as it was before; this only keeps the memo from being a new way in.
+/// `AuthorizedMember`'s `Hash` covers only `member`, but its `Eq` is derived
+/// over every field, so a hash collision costs a bucket probe rather than a
+/// wrong answer. The struct is inline data (no heap), so keying on a clone is a
+/// flat memcpy — ~272 bytes, since `VerifyingKey` carries a decompressed
+/// 160-byte `EdwardsPoint` alongside the 32 compressed ones — against a
+/// ~422 us verification.
+///
+/// # Why the context is bound at construction
+///
+/// A verdict is only meaningful relative to the room OWNER it was earned under
+/// and the `members_by_id` map its ancestors were resolved through. Both are
+/// therefore taken by [`InviteChainCache::new`] and held for the cache's whole
+/// life, so one instance is structurally incapable of spanning two contexts.
+///
+/// This is not hypothetical tidiness — the type is `pub`, and there are two
+/// distinct ways a shared instance would hand out an unearned `Ok`:
+///
+/// * **Across rooms.** `Ok` means "this chain reaches THE OWNER". A member
+///   validated under owner A would inherit that verdict under owner B, whose
+///   key never signed anything in the chain.
+/// * **Across `verify` and `apply_delta` within one room.** `apply_delta`
+///   deliberately resolves inviters through a map that also contains the
+///   delta's not-yet-verified members, so the same member can earn a WEAKER
+///   `Ok` there than `verify`'s stricter map would grant. Sharing would leak
+///   the weaker verdict into the stronger context.
+///
+/// A stored-owner + `debug_assert` would not catch either: the room contract
+/// ships as a release build, where debug assertions are compiled out. Binding
+/// the borrow is checked by the compiler instead, in every build.
+#[derive(Debug)]
+pub struct InviteChainCache<'a> {
+    /// The owner every `Ok` in `verdicts` was earned against.
+    parameters: &'a ChatRoomParametersV1,
+    /// The map every ancestor in `verdicts` was resolved through.
+    members_by_id: &'a HashMap<MemberId, &'a AuthorizedMember>,
+    verdicts: HashMap<AuthorizedMember, Result<(), String>>,
+    verifications: usize,
+}
+
+impl<'a> InviteChainCache<'a> {
+    /// Binds a cache to one room owner and one member lookup. Every verdict it
+    /// memoizes is earned, and reused, under exactly these.
+    pub fn new(
+        parameters: &'a ChatRoomParametersV1,
+        members_by_id: &'a HashMap<MemberId, &'a AuthorizedMember>,
+    ) -> Self {
+        Self {
+            parameters,
+            members_by_id,
+            verdicts: HashMap::new(),
+            verifications: 0,
+        }
+    }
+
+    /// How many Ed25519 verifications this cache has actually performed.
+    ///
+    /// Exposed so the regression tests for freenet/river#422 can assert the
+    /// `O(members x depth)` blow-up is gone DETERMINISTICALLY, rather than by
+    /// timing (which varies with the machine and would be flaky in CI).
+    pub fn verifications_performed(&self) -> usize {
+        self.verifications
+    }
+
+    /// Memoized equivalent of [`MembersV1::get_invite_chain_with_lookup`]'s
+    /// validation (it discards the assembled chain, which no caller of this
+    /// path uses).
+    pub fn validate_chain(&mut self, member: &AuthorizedMember) -> Result<(), String> {
+        let parameters = self.parameters;
+        let members_by_id = self.members_by_id;
+        let owner_id = parameters.owner_id();
+
+        // The start of a walk is NOT purely an input to its ancestors' checks:
+        // its `MemberId` seeds `visited` below, so the original walk can
+        // terminate with a circular-chain error that exists only because of
+        // where the walk began. The memo is therefore unsound for exactly one
+        // class of start — a NON-CANONICAL duplicate, i.e. an entry whose
+        // `MemberId` resolves through `members_by_id` to a DIFFERENT
+        // `AuthorizedMember`. For such a start a memo hit can short-circuit
+        // above the point where the original re-entered the start's own id and
+        // errored. Every node reached AFTER the start comes out of
+        // `members_by_id` and is canonical by construction, so the start is the
+        // only place this can arise.
+        //
+        // Concretely (freenet/river#422 review): B, invited by A, mints a
+        // second entry for A's key claiming B invited it. Walking B memoizes
+        // `B -> Ok`; the duplicate's walk then hits that memo and returns `Ok`
+        // where the original walked on into A's already-visited id and errored.
+        // Note that moving the memo lookup below the cycle guard does NOT fix
+        // this — the hit lands on B before the walk ever reaches A again.
+        //
+        // Such a start bypasses the memo entirely: it neither reads a verdict
+        // nor writes one, so it runs as the untouched original walk and cannot
+        // leave a start-dependent verdict behind for anyone else. Duplicates
+        // are rare, so this costs one hash lookup per walk and does not affect
+        // the `O(members)` bound in any ordinary state.
+        let start_is_canonical = members_by_id
+            .get(&member.member.id())
+            .is_none_or(|canonical| *canonical == member);
+        // Nodes walked during THIS call, all of which share the walk's verdict.
+        let mut walked: Vec<AuthorizedMember> = Vec::new();
+        // Cycle guard, scoped to this walk exactly as in the uncached version.
+        let mut visited: HashSet<MemberId> = HashSet::new();
+        let mut current = member;
+
+        // A cycle verdict is the ONE outcome that depends on where the walk
+        // STARTED — it names the first node the walk revisits, which is the
+        // point at which this particular walk entered the cycle. Every other
+        // outcome names a specific offending node, or is a plain `Ok`, and is
+        // therefore identical whoever asks. So cycle verdicts are not memoized.
+        // That costs nothing in practice: a cyclic member set is invalid, and
+        // both `MembersV1::verify` and `MembersV1::apply_delta` propagate the
+        // first error with `?`, so at most one such walk ever runs.
+        let mut cyclic = false;
+
+        let verdict = loop {
+            let current_id = current.member.id();
+
+            if start_is_canonical {
+                if let Some(memoized) = self.verdicts.get(current) {
+                    break memoized.clone();
+                }
+            }
+
+            if !visited.insert(current_id) {
+                cyclic = true;
+                break Err(format!(
+                    "Circular invite chain detected for member {:?}",
+                    current_id
+                ));
+            }
+
+            if current.member.invited_by == current_id {
+                break Err(format!(
+                    "Self-invitation detected for member {:?}",
+                    current_id
+                ));
+            }
+
+            walked.push(current.clone());
+
+            if current.member.invited_by == owner_id {
+                self.verifications += 1;
+                break current.verify_signature(&parameters.owner).map_err(|e| {
+                    format!(
+                        "Invalid signature for member {:?} invited by owner: {}",
+                        current_id, e
+                    )
+                });
+            }
+
+            let inviter = match members_by_id.get(&current.member.invited_by) {
+                Some(inviter) => *inviter,
+                None => {
+                    break Err(format!(
+                        "Inviter {:?} not found for member {:?}",
+                        current.member.invited_by, current_id
+                    ))
+                }
+            };
+
+            self.verifications += 1;
+            if let Err(e) = current.verify_signature(&inviter.member.member_vk) {
+                break Err(format!(
+                    "Invalid signature for member {:?}: {}",
+                    current_id, e
+                ));
+            }
+
+            current = inviter;
+        };
+
+        if start_is_canonical && !cyclic {
+            for member in walked {
+                self.verdicts.insert(member, verdict.clone());
+            }
+        }
+        verdict
     }
 }
 
@@ -256,6 +515,25 @@ impl MembersV1 {
         member_info: &MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) -> HashSet<MemberId> {
+        self.banned_member_ids_cached(
+            &mut BanSignatureCache::new(),
+            bans_v1,
+            member_info,
+            parameters,
+        )
+    }
+
+    /// [`Self::banned_member_ids`] against a caller-owned
+    /// [`BanSignatureCache`]. `post_apply_cleanup` shares one cache across all
+    /// of its ban passes so each ban's Ed25519 signature is verified once per
+    /// apply instead of once per pass (freenet/river#422).
+    pub fn banned_member_ids_cached(
+        &self,
+        cache: &mut BanSignatureCache,
+        bans_v1: &BansV1,
+        member_info: &MemberInfoV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> HashSet<MemberId> {
         let owner_id = parameters.owner_id();
         let members_by_id = self.members_by_member_id();
         let mut banned_ids = HashSet::new();
@@ -268,7 +546,7 @@ impl MembersV1 {
             // them must be re-checked here — otherwise the retained deputy grant
             // would remove members via a ban forged without the deputy's key. This
             // never rejects a genuine ban (a member's id is the hash of their key).
-            if !BansV1::ban_signature_matches_current_key(
+            if !cache.ban_signature_matches_current_key(
                 ban,
                 &members_by_id,
                 owner_id,

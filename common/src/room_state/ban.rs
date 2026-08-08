@@ -46,6 +46,112 @@ use std::time::SystemTime;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
+/// Memoizes [`BansV1::ban_signature_matches_current_key`] within one state
+/// operation.
+///
+/// [`crate::room_state::ChatRoomStateV1::post_apply_cleanup`] asks the SAME
+/// question about the SAME ban three times — ban enforcement (step 0), the
+/// banner inactivity-prune exemption (step 2), and the signature sweep (step 5)
+/// — plus a fourth time under `max_user_bans` pressure (step 0-cap). Each ask
+/// used to be an independent Ed25519 verification, so a room sitting at its
+/// configured ban ceiling paid `O(bans)` verifications several times over on
+/// EVERY apply, whether or not the delta touched bans at all.
+///
+/// This is the `update_state`-side half of freenet/river#422. Note it is
+/// `update_state` ONLY: the contract's `update_state` never calls `verify`, so
+/// the ban passes cost nothing on the `validate_state` path (which pays a
+/// separate, single `BansV1::verify` sweep).
+///
+/// Measured on the live Freenet Official room's shape (496 members, 200 bans,
+/// 2000 messages, 2026-07-29) by counting calls into `verify_struct`: one
+/// `update_state` carrying a single new message did 800 ban-signature
+/// verifications before this change and 400 after — 338 ms -> 169 ms at
+/// 0.4224 ms per verification under wasmtime with Cranelift at
+/// `OptLevel::None`. A real 2x, but NOT on its own the 5s-budget breach the
+/// issue reports.
+///
+/// # Why memoizing is exactly equivalent
+///
+/// The cache key is the WHOLE ban together with the verifying key its signature
+/// is checked against. `AuthorizedUserBan::verify_signature` is a pure function
+/// of exactly that pair, so a cache hit answers a byte-for-byte identical
+/// question and the memoized answer is the answer recomputation would give.
+///
+/// This holds even though the member set — and therefore which key a given
+/// banner resolves to — CHANGES between the steps that share a cache
+/// (`post_apply_cleanup` removes members at steps 0 and 3 and rebuilds
+/// `members_by_id` afterwards). A banner that resolves to a different key, or
+/// stops resolving at all, is a different cache key (or an early `false` that
+/// never consults the cache), so a stale key can never be reused. Callers are
+/// free to share one cache across an entire operation.
+///
+/// # Why the key is the whole ban, and NOT its `BanId`
+///
+/// `BanId` is a 64-bit `fast_hash` of the signature, and both the signature and
+/// the ban body are attacker-chosen. Keying on it would let an attacker who
+/// grinds a `BanId` collision (a birthday search over their own candidate bans,
+/// ~2^33 work — not 2^64) pair a genuine ban with a garbage-signature one and
+/// have the garbage ban inherit the genuine one's `true`. That is exactly the
+/// forged-ban enforcement `ban_signature_matches_current_key` exists to stop
+/// (#411 round 4 A), so the memo must not be the thing that reopens it.
+/// `AuthorizedUserBan`'s `Hash` covers only the signature, but its `Eq` is
+/// derived over every field, so lookups compare structurally and a hash
+/// collision costs a bucket probe rather than a wrong answer. The whole struct
+/// is inline data (no heap), so keying on a clone is a flat ~120-byte memcpy
+/// against a ~422 us verification.
+#[derive(Debug, Default)]
+pub struct BanSignatureCache {
+    /// `(ban, banner verifying key bytes) -> signature verifies`.
+    verified: HashMap<(AuthorizedUserBan, [u8; 32]), bool>,
+    verifications: usize,
+}
+
+impl BanSignatureCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many Ed25519 verifications this cache has actually performed.
+    ///
+    /// Exposed so the regression tests for freenet/river#422 can assert the
+    /// redundancy is gone DETERMINISTICALLY, rather than by timing (which
+    /// varies with the machine and would be flaky in CI).
+    pub fn verifications_performed(&self) -> usize {
+        self.verifications
+    }
+
+    /// Cached [`BansV1::ban_signature_matches_current_key`]. Identical result;
+    /// the Ed25519 verification runs at most once per `(ban, key)` pair.
+    pub fn ban_signature_matches_current_key(
+        &mut self,
+        ban: &AuthorizedUserBan,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        owner_id: MemberId,
+        owner_vk: &VerifyingKey,
+    ) -> bool {
+        let banner = ban.banned_by;
+        let vk = if banner == owner_id {
+            *owner_vk
+        } else if let Some(member) = members_by_id.get(&banner) {
+            member.member.member_vk
+        } else {
+            // Non-member banner: unverifiable here (key unavailable). Treated as
+            // not-matching so callers classify it inert / sweep it. Deliberately
+            // NOT cached — the answer is a property of the member set, not of
+            // the (ban, key) pair, and the member set changes mid-cleanup.
+            return false;
+        };
+        let entry = (ban.clone(), vk.to_bytes());
+        if let Some(hit) = self.verified.get(&entry) {
+            return *hit;
+        }
+        let matches = ban.verify_signature(&vk).is_ok();
+        self.verifications += 1;
+        self.verified.insert(entry, matches);
+        matches
+    }
+}
+
 /// Validation errors that can occur with bans.
 ///
 /// Since #410, ban ENFORCEMENT authority (owner / ancestor / deputy) is no
@@ -219,17 +325,12 @@ impl BansV1 {
         owner_id: MemberId,
         owner_vk: &VerifyingKey,
     ) -> bool {
-        let banner = ban.banned_by;
-        let vk = if banner == owner_id {
-            *owner_vk
-        } else if let Some(member) = members_by_id.get(&banner) {
-            member.member.member_vk
-        } else {
-            // Non-member banner: unverifiable here (key unavailable). Treated as
-            // not-matching so callers classify it inert / sweep it.
-            return false;
-        };
-        ban.verify_signature(&vk).is_ok()
+        BanSignatureCache::new().ban_signature_matches_current_key(
+            ban,
+            members_by_id,
+            owner_id,
+            owner_vk,
+        )
     }
 
     /// Whether `ban` is currently ENFORCING (worth keeping under `max_user_bans`
@@ -254,6 +355,28 @@ impl BansV1 {
         owner_id: MemberId,
         owner_vk: &VerifyingKey,
     ) -> bool {
+        Self::ban_is_enforcing_cached(
+            &mut BanSignatureCache::new(),
+            ban,
+            members_by_id,
+            member_info,
+            owner_id,
+            owner_vk,
+        )
+    }
+
+    /// [`Self::ban_is_enforcing`] against a caller-owned
+    /// [`BanSignatureCache`], so a caller that asks about the same ban more
+    /// than once pays for the Ed25519 verification only the first time. See
+    /// [`BanSignatureCache`] for why sharing the cache is safe.
+    pub fn ban_is_enforcing_cached(
+        cache: &mut BanSignatureCache,
+        ban: &AuthorizedUserBan,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        member_info: &MemberInfoV1,
+        owner_id: MemberId,
+        owner_vk: &VerifyingKey,
+    ) -> bool {
         let banner = ban.banned_by;
         // A ban can only enforce while its banner is the owner or a current
         // member (#411 round 3). A non-member banner ID — a stale/pruned deputy,
@@ -265,7 +388,7 @@ impl BansV1 {
         // Re-verify the signature against the banner's CURRENT converged key
         // (#411 round 4 A). Closes the same-delta pruned-deputy-replay bypass:
         // `verify` skipped this at apply time because the banner was absent then.
-        if !Self::ban_signature_matches_current_key(ban, members_by_id, owner_id, owner_vk) {
+        if !cache.ban_signature_matches_current_key(ban, members_by_id, owner_id, owner_vk) {
             return false;
         }
         let target = ban.ban.banned_user;
@@ -446,7 +569,26 @@ pub struct AuthorizedUserBan {
 impl Eq for AuthorizedUserBan {}
 
 impl Hash for AuthorizedUserBan {
+    /// Hashes EVERY field, matching the derived `Eq`.
+    ///
+    /// This used to hash the signature alone. That was consistent with `Eq`
+    /// (equal bans do have equal signatures, so the `Hash`/`Eq` contract held)
+    /// and harmless while nothing hashed a ban. [`BanSignatureCache`] now does,
+    /// which makes bucketing load-bearing: a signature is attacker-supplied and
+    /// replayable across different ban bodies — exactly the #411 round 4 replay
+    /// shape — so an attacker could pile distinct bans into one bucket and turn
+    /// cache lookups linear. Correctness never depended on this (`Eq` compares
+    /// all three fields, so a collision costs a probe, never a wrong answer),
+    /// but hashing the whole struct is free and removes the influence.
+    ///
+    /// Safe to change: no `HashSet`/`HashMap` keyed on `AuthorizedUserBan` is
+    /// ever iterated into state, so bucket order cannot reach the wire and
+    /// cannot affect CRDT convergence.
     fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ban.owner_member_id.hash(state);
+        self.ban.banned_at.hash(state);
+        self.ban.banned_user.hash(state);
+        self.banned_by.hash(state);
         self.signature.to_bytes().hash(state);
     }
 }
