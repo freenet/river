@@ -1449,6 +1449,80 @@ mod tests {
     ///
     /// Every other test for this fix stops at one side of the boundary: the
     /// merge tests prove the room comes back in memory, and the
+    /// The delegate-side mechanism that makes `self_sk` migrate at all
+    /// (freenet/river#612), turned from prose into a checked fact.
+    ///
+    /// A secret survives a delegate WASM re-key only if the migration probe's
+    /// `ListRequest` can SEE it, and `ListRequest` returns exactly the delegate's
+    /// `key_index`. So the two generic storage handlers add every key they write
+    /// to that index, and `handle_store_signing_key` — the bespoke,
+    /// deliberately-invisible path — does not. That asymmetry is the whole
+    /// reason a room's private identity key survives today (it rides in the
+    /// indexed `room:<vk>` blob) and the whole reason relocating it to a
+    /// `signing_key:`-style secret would silently destroy it.
+    ///
+    /// The doc comments on `RoomData::self_sk` and `reconcile_room_present`
+    /// assert this asymmetry; without this pin they are unverified prose that
+    /// could rot the moment the delegate changes. Source-scraped because the
+    /// behavioral version is untestable: on native targets `DelegateCtx`'s
+    /// `set_secret` is a no-op and `get_secret` always returns `None`, so a test
+    /// asserting "this secret never appears in a ListResponse" would pass
+    /// whether or not the handler indexed it — a verification that cannot fail.
+    ///
+    /// Lives in the UI crate rather than beside the code it scrapes because the
+    /// `chat-delegate` crate's own tests are not wired into CI (freenet/river#614);
+    /// move it there once they are. Scraping another crate's file cannot
+    /// self-match the needles the way an in-file pin can.
+    #[test]
+    fn only_the_indexed_delegate_paths_register_keys_for_migration() {
+        let src = include_str!("../../../../delegates/chat-delegate/src/handlers.rs");
+
+        let body = |anchor: &str| -> &str {
+            let start = src
+                .find(anchor)
+                .unwrap_or_else(|| panic!("{anchor} must exist in the delegate handlers"));
+            let end = src[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("{anchor} must terminate"));
+            &src[start..start + end]
+        };
+
+        // The generic, indexed paths — the ones a `room:<vk>` blob is written
+        // through. These MUST keep registering their keys, or every room stops
+        // migrating, not just its identity key.
+        for anchor in ["fn handle_store_request(", "fn handle_cas_store_request("] {
+            assert!(
+                body(anchor).contains("set_key_index("),
+                "{anchor} must add its key to the delegate's key_index — that \
+                 index is what the migration probe's ListRequest enumerates, so \
+                 a write that skips it is a write that never migrates \
+                 (freenet/river#612)"
+            );
+        }
+
+        // The bespoke path, which is invisible to migration BY DESIGN: the
+        // `signing_key:` secret is regenerable, re-derived from `self_sk` after
+        // every migration by `crate::signing::migrate_signing_key`.
+        let signing = body("fn handle_store_signing_key(");
+        assert!(
+            !signing.contains("set_key_index(") && !signing.contains("get_key_index("),
+            "handle_store_signing_key is expected to stay OUT of the key_index \
+             (its secret is regenerable, so it is deliberately not migrated). \
+             If it now indexes itself, the reasoning recorded on \
+             `RoomData::self_sk` and `reconcile_room_present` is stale and must \
+             be rewritten — do not just delete this assertion"
+        );
+
+        // The claim above is only meaningful if ListRequest really is fed by the
+        // index rather than by enumerating the secret store directly.
+        assert!(
+            body("fn handle_list_request(").contains("get_key_index("),
+            "ListRequest must answer from the key_index — if it ever enumerates \
+             secrets directly, un-indexed secrets would become discoverable and \
+             the entire migration hazard in freenet/river#612 changes shape"
+        );
+    }
+
     /// `reconcile_room_present` tests prove an explicit rejoin overwrites a
     /// tombstone. Neither exercises the seam BETWEEN them, and the seam is where
     /// the bug lived — the merge restored the room, nothing carried that across
@@ -4637,7 +4711,22 @@ fn identities_diverged(a: &RoomData, b: &RoomData) -> bool {
 /// Reconcile a `Present` save for room `owner_vk` against the delegate's
 /// current slot. Returns the `RoomSlot` bytes to store, or `None` to abort
 /// (adopt a remote leave on a background update — the round-9 fix).
-fn reconcile_room_present(
+///
+/// THIS IS THE ONLY WRITER OF A POPULATED `room:<b58 owner_vk>` SLOT — the
+/// sibling `reconcile_room_tombstone` writes the only other variant, and that
+/// one carries no room data at all. So this function is the only thing that
+/// puts a room's private identity key (`RoomData::self_sk`) somewhere a
+/// delegate re-key can carry it forward. Whatever it omits from the blob does
+/// not survive the next delegate WASM bump — silently, with no error on any
+/// path. See freenet/river#612, and the pair of tests
+/// `self_sk_survives_a_legacy_delegate_migration` /
+/// `a_relocated_self_sk_would_not_survive_a_legacy_delegate_migration` in
+/// `freenet_api::response_handler`, which drive this function's output through
+/// the real migration reader.
+///
+/// `pub(crate)` solely so those migration tests can use the real writer rather
+/// than hand-rolling the blob; nothing outside this module calls it.
+pub(crate) fn reconcile_room_present(
     current: Option<&[u8]>,
     owner_vk: &VerifyingKey,
     local: &RoomData,
