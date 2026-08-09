@@ -4638,11 +4638,13 @@ fn identities_diverged(a: &RoomData, b: &RoomData) -> bool {
 /// current slot. Returns the `RoomSlot` bytes to store, or `None` to abort
 /// (adopt a remote leave on a background update — the round-9 fix).
 ///
-/// THIS IS THE ONLY WRITER OF THE `room:<b58 owner_vk>` BLOB, and therefore the
-/// only thing that puts a room's private identity key (`RoomData::self_sk`)
-/// somewhere a delegate re-key can carry it forward. Whatever this function
-/// omits from the blob does not survive the next delegate WASM bump — silently,
-/// with no error on any path. See freenet/river#612, and the pair of tests
+/// THIS IS THE ONLY WRITER OF A POPULATED `room:<b58 owner_vk>` SLOT — the
+/// sibling `reconcile_room_tombstone` writes the only other variant, and that
+/// one carries no room data at all. So this function is the only thing that
+/// puts a room's private identity key (`RoomData::self_sk`) somewhere a
+/// delegate re-key can carry it forward. Whatever it omits from the blob does
+/// not survive the next delegate WASM bump — silently, with no error on any
+/// path. See freenet/river#612, and the pair of tests
 /// `self_sk_survives_a_legacy_delegate_migration` /
 /// `a_relocated_self_sk_would_not_survive_a_legacy_delegate_migration` in
 /// `freenet_api::response_handler`, which drive this function's output through
