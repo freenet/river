@@ -100,6 +100,14 @@ jobs:
     - name: Build Project
       run: cargo make build
 
+    - name: Check every workspace member has a test step
+      # Guards the CLASS of gap that the per-crate steps below have each closed
+      # one instance of (freenet/river#614). A crate added to [workspace]
+      # members without a `cargo test -p <crate>` step here now fails CI,
+      # instead of shipping tests that quietly never execute — which is what
+      # the chat-delegate did for its entire existence.
+      run: ./scripts/check-ci-test-coverage.sh
+
     - name: Test room-contract
       env:
         RUST_MIN_STACK: 8388608
@@ -198,6 +206,52 @@ jobs:
       # them. Without this step a fixture regression that vacuates the
       # windowing Playwright specs would pass CI silently.
       run: cargo test -p river-ui --bins --features example-data,no-sync
+
+    - name: Test chat-delegate (delegate dispatch, CAS envelopes, room subscription)
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # 40 unit tests that had never run in CI (freenet/river#614) — the
+      # `Makefile.toml` `test-chat-delegate` task existed, but no workflow
+      # invoked it, so they gated only a developer's local `cargo make test`.
+      # That mattered more here than for a normal crate: this is where River's
+      # secret storage and its delegate-re-key migration path live, and the
+      # delegate is re-keyed roughly weekly (see freenet/river#612).
+      #
+      # No `--target x86_64-unknown-linux-gnu` pin, unlike the Makefile task.
+      # The pin there pairs with `--target-dir target/native` to keep a local
+      # host build from clobbering the wasm artifacts that the UI pulls in via
+      # `include_bytes!`. CI has no such conflict — `cargo make build` has
+      # already produced the wasm, and every test step above likewise builds
+      # for the host into the same CARGO_TARGET_DIR. The crate's default
+      # target is only wasm by convention of how it is built, not by a
+      # `[build] target` setting, so a bare host `cargo test` is correct.
+      #
+      # Scope caveat, so this is not over-read: on native targets
+      # `DelegateCtx`'s `set_secret` is a no-op and `get_secret` always returns
+      # `None` (freenet-stdlib's stub — see the `cfg(not(target_family =
+      # "wasm"))` arm at handlers.rs:191-198). These tests cover dispatch and
+      # pure-value logic, NOT storage round-trips. Measured, not assumed:
+      # deleting the `set_key_index(...)` call from `handle_store_request` — a
+      # regression that would stop every room migrating — leaves all 40 of
+      # these tests passing.
+      #
+      # The migration behaviour is gated elsewhere: the #613 source-scrape pin
+      # `only_the_indexed_delegate_paths_register_keys_for_migration`, which
+      # runs in the `cargo test -p river-ui --bins` step above and does catch
+      # that deletion. Trust that step, not this one, for freenet/river#612.
+      run: cargo test -p chat-delegate
+
+    - name: Test web-container-contract + web-container-tool
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Same gap as the chat-delegate, found while fixing it: 9 tests
+      # (6 lib + 2 integration + 1 in the tool) that `Makefile.toml` knows how
+      # to run and no workflow ever did. Includes
+      # `test_tool_and_contract_compatibility`, which pins that the signing
+      # tool and the verifying contract agree on the parameter encoding.
+      run: cargo test -p web-container-contract -p web-container-tool
 
   ui-playwright-tests:
     runs-on: freenet-default-runner
