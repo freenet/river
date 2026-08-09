@@ -3064,6 +3064,195 @@ mod tests {
         assert!(rooms.room_order.is_empty());
     }
 
+    /// A room's PRIVATE IDENTITY KEY survives a delegate WASM re-key
+    /// (freenet/river#612).
+    ///
+    /// `RoomData::self_sk` IS the user's identity in a room. It is not derived
+    /// from anything and cannot be regenerated — unlike the `signing_key:`
+    /// secret, which `crate::signing::migrate_signing_key` re-derives from
+    /// `self_sk` after every migration. If `self_sk` is lost, the room is lost.
+    ///
+    /// Nothing deliberately protects it. It survives only because it happens to
+    /// sit inside the `RoomData` blob stored under the generic, INDEXED key
+    /// `room:<b58 owner_vk>` — and the delegate's key index is what the
+    /// migration probe's `ListRequest` enumerates. Move the key to a bespoke
+    /// secret written the way `handle_store_signing_key` writes one (no
+    /// `key_index` update, see `delegates/chat-delegate/src/handlers.rs`) and it
+    /// leaves the indexed set, stops being listed, and stops migrating. River
+    /// re-keys its delegate roughly weekly, so that lands as "every user's room
+    /// identity is gone" at the next routine release, with no error raised
+    /// anywhere.
+    ///
+    /// This test therefore drives the REAL code on both sides of the re-key
+    /// rather than asserting the field exists on the struct:
+    ///   * the predecessor's blob comes from `reconcile_room_present`, the sole
+    ///     production writer of `room:<vk>`;
+    ///   * discovery goes through the real `plan_load_from_keys`, which is what
+    ///     turns a `ListResponse` into the set of slots to fetch;
+    ///   * the successor's read is the same `from_reader::<RoomSlot>` +
+    ///     `reconstruct_rooms` pair that `migrate_legacy_per_room` runs.
+    ///
+    /// Its companion below proves the negative, which is what makes this
+    /// assertion load-bearing rather than a serde round-trip in disguise.
+    #[test]
+    fn self_sk_survives_a_legacy_delegate_migration() {
+        let owner = vk(21);
+        let identity = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut room = crate::room_data::test_minimal_room_data(owner);
+        room.self_sk = Some(identity.clone());
+
+        // (a) PREDECESSOR DELEGATE. The bytes the old delegate holds, produced
+        // by the real per-room save chokepoint against an absent slot.
+        let stored = crate::components::app::chat_delegate::reconcile_room_present(
+            /* current */ None,
+            &owner,
+            &room,
+            /* explicitly_rejoined */ false,
+        )
+        .expect("the save path must reconcile a fresh room")
+        .expect("an absent slot stores fresh rather than aborting");
+
+        // (b) DISCOVERY. The migration probe only ever sees what the delegate's
+        // key index lists. Keys reach `migrate_legacy_per_room` through
+        // `plan_load_from_keys`, so a room that does not plan as `PerRoom` here
+        // is a room the migration never fetches at all.
+        let listed = vec![ChatDelegateKey::new(room_storage_key(&owner))];
+        assert_eq!(
+            plan_load_from_keys(&listed),
+            LoadPlan::PerRoom {
+                room_vks: vec![owner],
+                has_meta: false,
+            },
+            "the per-room key must be discoverable from the delegate's key \
+             index — this is the whole reason the blob migrates"
+        );
+
+        // (c) SUCCESSOR DELEGATE. Exactly the decode + reconstruct that
+        // `migrate_legacy_per_room` performs on each fetched slot.
+        let slot: RoomSlot =
+            from_reader(&stored[..]).expect("the migration must be able to decode the slot");
+        let migrated = reconstruct_rooms(vec![(owner, slot)], None);
+
+        // (d) The identity arrived on the far side, intact.
+        let arrived = migrated
+            .map
+            .get(&owner)
+            .expect("the room itself must migrate");
+        assert_eq!(
+            arrived.self_sk.as_ref().map(|k| k.to_bytes()),
+            Some(identity.to_bytes()),
+            "the room's PRIVATE identity key must survive the delegate re-key \
+             verbatim — if this fails, every existing user loses their identity \
+             in every room at the next release (freenet/river#612)"
+        );
+        assert_eq!(
+            arrived.signing_key().map(|k| k.to_bytes()),
+            Some(identity.to_bytes()),
+            "and the accessor the rest of the UI signs through must find it"
+        );
+    }
+
+    /// The negative half of the pin above (freenet/river#612): if `self_sk` were
+    /// relocated out of the room blob into its own bespoke secret — the
+    /// `signing_key:` pattern, and a genuinely reasonable-looking hardening
+    /// move — the migration would NOT carry it, and would report success anyway.
+    ///
+    /// Without this test the positive one could pass for the wrong reason: a
+    /// CBOR round-trip of a struct that still has the field would satisfy it
+    /// even under the refactor that breaks production. Here the writer stores a
+    /// blob shaped the way the relocation would shape it, everything else is
+    /// held identical, and the same real migration reader runs — so the two
+    /// tests together isolate "the key survives" to the one thing that actually
+    /// causes it: `self_sk` being inside the indexed `room:<vk>` blob.
+    ///
+    /// Note what does NOT happen below: no decode error, no missing room, no
+    /// failure signal of any kind. The room migrates, still knows WHO the user
+    /// is (`self_vk` rides along), and has merely lost the ability to SIGN. That
+    /// silence is the hazard — the migration cannot notice this and neither can
+    /// the user, until the first send fails.
+    #[test]
+    fn a_relocated_self_sk_would_not_survive_a_legacy_delegate_migration() {
+        // The room blob as a River that had relocated the private key would
+        // write it: same room, same identity, `self_sk` simply absent. Mirrors
+        // `room_data::tests::roomslot_decodes_from_a_blob_with_no_self_sk`.
+        #[derive(serde::Serialize)]
+        struct RelocatedRoomData {
+            owner_vk: ed25519_dalek::VerifyingKey,
+            room_state: river_core::room_state::ChatRoomStateV1,
+            self_vk: ed25519_dalek::VerifyingKey,
+            contract_key: freenet_stdlib::prelude::ContractKey,
+        }
+        #[derive(serde::Serialize)]
+        enum RelocatedRoomSlot {
+            Present(Box<RelocatedRoomData>),
+            #[allow(dead_code)]
+            Tombstone,
+        }
+
+        let owner = vk(22);
+        let identity = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let room = crate::room_data::test_minimal_room_data(owner);
+
+        let mut stored = Vec::new();
+        ciborium::ser::into_writer(
+            &RelocatedRoomSlot::Present(Box::new(RelocatedRoomData {
+                owner_vk: owner,
+                room_state: room.room_state.clone(),
+                self_vk: identity.verifying_key(),
+                contract_key: room.contract_key,
+            })),
+            &mut stored,
+        )
+        .unwrap();
+
+        // The bespoke secret the relocation would introduce, alongside the room
+        // blob. `handle_store_signing_key` never updates `key_index`, so in
+        // production a key like this is not even LISTED by the migration probe.
+        // Grant the refactor the more generous case anyway — pretend it somehow
+        // reached the probe — and it still changes nothing: the loader has no
+        // concept of this key and plans to fetch only the room slot.
+        let bespoke = ChatDelegateKey::new(
+            format!("self_sk:{}", bs58::encode(owner.to_bytes()).into_string()).into_bytes(),
+        );
+        assert_eq!(
+            plan_load_from_keys(&[ChatDelegateKey::new(room_storage_key(&owner)), bespoke]),
+            LoadPlan::PerRoom {
+                room_vks: vec![owner],
+                has_meta: false,
+            },
+            "a key outside the room:/rooms_meta/rooms_data family is invisible \
+             to the loader even when listed — relocating the private key puts \
+             it somewhere the migration has no way to ask for"
+        );
+
+        // The same real migration read as the positive test.
+        let slot: RoomSlot = from_reader(&stored[..])
+            .expect("the relocated blob still decodes — the room does not vanish");
+        let migrated = reconstruct_rooms(vec![(owner, slot)], None);
+        let arrived = migrated
+            .map
+            .get(&owner)
+            .expect("the room still migrates, which is exactly why this is silent");
+
+        assert!(
+            arrived.self_sk.is_none(),
+            "the private identity key did NOT cross the delegate re-key — this \
+             is the regression freenet/river#612 exists to prevent, and the \
+             reason the positive test above is a real pin and not a serde \
+             round-trip"
+        );
+        assert!(
+            arrived.signing_key().is_none(),
+            "so nothing in the UI can sign for this room any more"
+        );
+        assert_eq!(
+            arrived.self_verifying_key(),
+            Some(identity.verifying_key()),
+            "yet the room migrated and still names the user — no error is \
+             raised on any path, which is what makes the loss silent"
+        );
+    }
+
     /// Single-blob → per-room migration round-trip (the on-node upgrade
     /// contract): a legacy `Rooms` value, when EXPLODED into per-room slots the
     /// way the save path serializes them (`RoomSlot::Present` per room +
