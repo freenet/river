@@ -229,8 +229,17 @@ jobs:
       #
       # Scope caveat, so this is not over-read: on native targets
       # `DelegateCtx`'s `set_secret` is a no-op and `get_secret` always returns
-      # `None` (freenet-stdlib's stub — see the cfg at handlers.rs:190). These
-      # tests cover dispatch and pure-value logic, NOT storage round-trips.
+      # `None` (freenet-stdlib's stub — see the `cfg(not(target_family =
+      # "wasm"))` arm at handlers.rs:191-198). These tests cover dispatch and
+      # pure-value logic, NOT storage round-trips. Measured, not assumed:
+      # deleting the `set_key_index(...)` call from `handle_store_request` — a
+      # regression that would stop every room migrating — leaves all 40 of
+      # these tests passing.
+      #
+      # The migration behaviour is gated elsewhere: the #613 source-scrape pin
+      # `only_the_indexed_delegate_paths_register_keys_for_migration`, which
+      # runs in the `cargo test -p river-ui --bins` step above and does catch
+      # that deletion. Trust that step, not this one, for freenet/river#612.
       run: cargo test -p chat-delegate
 
     - name: Test web-container-contract + web-container-tool
