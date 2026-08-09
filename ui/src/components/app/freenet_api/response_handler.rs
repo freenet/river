@@ -3104,10 +3104,7 @@ mod tests {
         // (a) PREDECESSOR DELEGATE. The bytes the old delegate holds, produced
         // by the real per-room save chokepoint against an absent slot.
         let stored = crate::components::app::chat_delegate::reconcile_room_present(
-            /* current */ None,
-            &owner,
-            &room,
-            /* explicitly_rejoined */ false,
+            /* current */ None, &owner, &room, /* explicitly_rejoined */ false,
         )
         .expect("the save path must reconcile a fresh room")
         .expect("an absent slot stores fresh rather than aborting");

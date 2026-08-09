@@ -219,6 +219,37 @@ pub struct RoomData {
     /// Read it through [`RoomData::signing_key`] rather than matching on the
     /// field, and prefer [`RoomData::self_verifying_key`] wherever only the
     /// public half is needed.
+    ///
+    /// # Moving this field is a data-loss change (freenet/river#612)
+    ///
+    /// Nothing deliberately protects this key across a delegate WASM re-key. It
+    /// survives only because it sits INSIDE this blob, which is stored under
+    /// the generic, INDEXED delegate key `room:<b58 owner_vk>` — and the
+    /// delegate's key index is exactly what the migration probe's `ListRequest`
+    /// enumerates. Give the key its own bespoke secret the way
+    /// `handle_store_signing_key` does (that writer never updates `key_index`,
+    /// see `delegates/chat-delegate/src/handlers.rs`) and it drops out of the
+    /// indexed set, stops being listed, and stops migrating.
+    ///
+    /// That refactor is a reasonable-looking hardening move — a raw private key
+    /// does not belong in a multi-purpose blob — which is precisely why it is
+    /// dangerous: it reads as pure improvement. The `signing_key:` secret gets
+    /// away with the pattern only because it is REGENERABLE
+    /// (`crate::signing::migrate_signing_key` re-derives it from this field
+    /// after every migration). This key is not derivable from anything. It IS
+    /// the room identity, and there is no equivalent fallback.
+    ///
+    /// River re-keys its delegate roughly weekly, so relocating this without a
+    /// compensating migration mechanism in the SAME change destroys every
+    /// user's identity in every room at the next routine release, silently —
+    /// the migration reports success because the fields it knows about all
+    /// migrated fine.
+    ///
+    /// Pinned by `self_sk_survives_a_legacy_delegate_migration` and its
+    /// negative companion in
+    /// `components::app::freenet_api::response_handler::tests`, which drive the
+    /// real writer and the real migration reader. If you are relocating this
+    /// field, read freenet/river#612 before "fixing" those tests.
     #[serde(default)]
     pub self_sk: Option<SigningKey>,
     /// The local user's verifying key (the public half of [`Self::self_sk`]).
