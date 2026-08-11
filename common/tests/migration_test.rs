@@ -154,3 +154,43 @@ fn no_duplicate_delegate_keys() {
         );
     }
 }
+
+/// `common/build.rs` bakes `LEGACY_ROOM_CONTRACT_CODE_HASHES` from
+/// `legacy_room_contracts.toml`. The freenet-migrate-build crate declares the
+/// registry as a `rerun-if-changed` input by default; pin that nothing opts
+/// out, and that a missing registry fails a normal build instead of silently
+/// shipping an empty table (which disables the dormant-room recovery,
+/// freenet/river#292). Only non-comment lines count, so a commented-out call
+/// cannot satisfy the pin.
+#[test]
+fn build_script_keeps_registry_fresh_and_missing_registry_fatal() {
+    let src = include_str!("../build.rs");
+    let active: Vec<&str> = src
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//"))
+        .collect();
+    let has = |needle: &str| active.iter().any(|l| l.contains(needle));
+    let line_starts = |prefix: &str| active.iter().any(|l| l.starts_with(prefix));
+
+    assert!(
+        !has(".rerun_if_changed(false)"),
+        "common/build.rs must not disable the crate's registry \
+         rerun-if-changed directive — a stale build script ships a stale \
+         LEGACY_ROOM_CONTRACT_CODE_HASHES table"
+    );
+    assert!(
+        line_starts(r#"println!("cargo:rerun-if-changed=build.rs")"#),
+        "common/build.rs must declare itself as an input (emitting any \
+         directive disables Cargo's default re-run heuristic)"
+    );
+    assert!(
+        has(".allow_missing_registry(docs_rs_build())"),
+        "common/build.rs must gate the missing-registry leniency on docs.rs"
+    );
+    assert!(
+        !has(".allow_missing_registry(true)"),
+        "common/build.rs must not blanket-allow a missing registry — an empty \
+         table silently disables dormant-room recovery (freenet/river#292)"
+    );
+}

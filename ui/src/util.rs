@@ -1076,4 +1076,85 @@ mod tests {
              LEGACY_ROOM_CONTRACT_CODE_HASHES (freenet/river#292)"
         );
     }
+
+    /// `ui/build.rs` bakes `LEGACY_DELEGATES` from `../legacy_delegates.toml`,
+    /// which lives OUTSIDE this package — so Cargo's default re-run heuristic
+    /// (files in the package) never covers it, and only an explicit
+    /// `rerun-if-changed` keeps the baked table fresh. Without it,
+    /// `scripts/add-migration.sh` records a migration entry and the next build
+    /// ships a bundle whose table omits the outgoing delegate: the startup
+    /// sweep asks nobody and every returning user silently loses their rooms
+    /// (the delta#52 failure mode; reproduced in this repo 2026-08-11).
+    ///
+    /// Source scan, not a behavioural test: both shapes build identically —
+    /// the difference only shows up as a stale artifact in a NON-worktree
+    /// checkout, which no test harness here runs under. Only non-comment lines
+    /// count, so a commented-out directive cannot satisfy the pin (Delta's
+    /// first version of this pin had exactly that hole).
+    #[test]
+    fn build_script_declares_registry_and_timestamp_inputs() {
+        let src = include_str!("../build.rs");
+        let active: Vec<&str> = src
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .collect();
+        let has = |needle: &str| active.iter().any(|l| l.contains(needle));
+        let line_starts = |prefix: &str| active.iter().any(|l| l.starts_with(prefix));
+
+        // The registry directive itself is emitted by freenet-migrate-build;
+        // pin that build.rs explicitly opts IN and that nothing opts back out.
+        assert!(
+            has(".rerun_if_changed(true)"),
+            "ui/build.rs must keep .rerun_if_changed(true) on the codegen \
+             builder — the registry lives outside the package, so this \
+             directive is the ONLY thing keeping the baked LEGACY_DELEGATES \
+             fresh after scripts/add-migration.sh edits it"
+        );
+        assert!(
+            !has(".rerun_if_changed(false)"),
+            "ui/build.rs must not disable the registry rerun-if-changed \
+             directive — that re-opens the stale-migration-table bug (delta#52)"
+        );
+
+        // Emitting ANY rerun-if-changed disables Cargo's default heuristic,
+        // so the script's other inputs must be declared explicitly.
+        assert!(
+            line_starts(r#"println!("cargo:rerun-if-changed=build.rs")"#),
+            "ui/build.rs must declare itself as an input (the default \
+             heuristic is disabled once any directive is emitted)"
+        );
+        assert!(
+            has("rerun-if-env-changed=FORCE_REBUILD_TIMESTAMP"),
+            "ui/build.rs must keep the FORCE_REBUILD_TIMESTAMP escape hatch \
+             so BUILD_TIMESTAMP_ISO can be refreshed on demand"
+        );
+
+        // Git paths must be resolved via `git rev-parse --git-path`: a literal
+        // ../.git/HEAD does not resolve in a worktree (where .git is a file),
+        // and Cargo treats an unresolvable path as permanently dirty.
+        assert!(
+            has(r#""--git-path""#),
+            "ui/build.rs must resolve git metadata paths via \
+             `git rev-parse --git-path` so they work in both a worktree and a \
+             normal checkout"
+        );
+        assert!(
+            !has("../.git/"),
+            "ui/build.rs must not hardcode ../.git/ paths — they do not \
+             resolve in a worktree and make the script permanently dirty there"
+        );
+
+        // A missing registry must FAIL a normal build; the empty-table
+        // fallback is scoped to docs.rs only.
+        assert!(
+            has(".allow_missing_registry(docs_rs_build())"),
+            "ui/build.rs must gate the missing-registry leniency on docs.rs"
+        );
+        assert!(
+            !has(".allow_missing_registry(true)"),
+            "ui/build.rs must not blanket-allow a missing registry — an empty \
+             LEGACY_DELEGATES is silent total migration failure"
+        );
+    }
 }
