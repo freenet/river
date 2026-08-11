@@ -255,6 +255,32 @@ pub fn is_legacy_delegate_key(key_bytes: &[u8]) -> bool {
         .any(|(dk, _)| dk.as_slice() == key_bytes)
 }
 
+/// The generated legacy registry, `(delegate_key, code_hash)` oldest-first.
+/// Exposed for the crate-migration walk (`delegate_migration.rs`), which
+/// builds its lineage from the SAME table the sweep probes so the two paths
+/// can never disagree about which generations exist.
+pub(crate) fn legacy_delegate_pairs() -> &'static [([u8; 32], [u8; 32])] {
+    LEGACY_DELEGATES
+}
+
+/// The current chat delegate's key (session-cached; see [`CHAT_DELEGATE_KEY`]).
+pub(crate) fn current_delegate_key() -> DelegateKey {
+    CHAT_DELEGATE_KEY.clone()
+}
+
+/// Whether `key` is the CURRENT chat delegate. Decides bare vs.
+/// delegate-scoped correlation in the crate-migration transport.
+pub(crate) fn is_current_delegate_key(key: &DelegateKey) -> bool {
+    *key == *CHAT_DELEGATE_KEY
+}
+
+/// Number of active awaited load workers (see [`PENDING_LOADS`]). The
+/// crate-migration walk polls this to let the initial load settle before
+/// starting its own round-trips.
+pub(crate) fn pending_load_workers() -> u32 {
+    PENDING_LOADS.load(Ordering::Relaxed)
+}
+
 // =============================================================================
 // DELEGATE-GENERATION AUTHORITY (freenet/river#527)
 // =============================================================================
@@ -6294,6 +6320,19 @@ pub(crate) async fn enqueue_delegate_request(
     enqueue_delegate_request_inner(CHAT_DELEGATE_KEY.clone(), request, key_bytes).await
 }
 
+/// Enqueue a request to a SPECIFIC (legacy) delegate, correlation scoped by the
+/// target delegate (see [`legacy_scoped_correlation`]) — the send/await split of
+/// [`send_delegate_request_to`]. Used by the crate-migration walk's pre-warm,
+/// which fires many probes concurrently; the per-delegate scoping is what makes
+/// that safe in the single-waiter `PENDING_REQUESTS` map.
+pub(crate) async fn enqueue_delegate_request_to(
+    delegate_key: DelegateKey,
+    request: ChatDelegateRequestMsg,
+) -> Result<PendingDelegateRequest, String> {
+    let key_bytes = legacy_scoped_correlation(&delegate_key, &get_request_key(&request));
+    enqueue_delegate_request_inner(delegate_key, request, key_bytes).await
+}
+
 /// Register the response waiter and SEND the request, WITHOUT awaiting the
 /// response. Returns a [`PendingDelegateRequest`] the caller awaits (once, or
 /// many concurrently via [`await_delegate_response`]).
@@ -6365,12 +6404,40 @@ async fn enqueue_delegate_request_inner(
     })
 }
 
+/// The typed outcome of awaiting a delegate response. The crate-migration
+/// walk needs the three cases kept apart: a timeout is SILENCE (never
+/// "absent"), and a cancellation is a displaced waiter (never an answer at
+/// all). String-matching the legacy error messages would make that mapping
+/// rot silently, hence the enum.
+pub(crate) enum DelegateAwaitOutcome {
+    /// The delegate executed and replied.
+    Response(ChatDelegateResponseMsg),
+    /// No response within the 10 s bound; the waiter was evicted.
+    TimedOut,
+    /// The waiter's sender was dropped without a response — another request
+    /// re-registered the same correlation key in the single-waiter
+    /// `PENDING_REQUESTS` map.
+    Cancelled,
+}
+
 /// Await the response for a request already sent via `enqueue_delegate_request*`.
 /// Many of these can be awaited concurrently (e.g. `join_all`) because each holds
 /// no `WEB_API` borrow — only its own oneshot receiver and timeout.
 pub(crate) async fn await_delegate_response(
     pending: PendingDelegateRequest,
 ) -> Result<ChatDelegateResponseMsg, String> {
+    match await_delegate_response_outcome(pending).await {
+        DelegateAwaitOutcome::Response(resp) => Ok(resp),
+        DelegateAwaitOutcome::Cancelled => Err("Response channel was cancelled".to_string()),
+        DelegateAwaitOutcome::TimedOut => Err("Timeout waiting for delegate response".to_string()),
+    }
+}
+
+/// [`await_delegate_response`] with the outcome kept as a typed
+/// [`DelegateAwaitOutcome`] instead of stringified errors.
+pub(crate) async fn await_delegate_response_outcome(
+    pending: PendingDelegateRequest,
+) -> DelegateAwaitOutcome {
     let PendingDelegateRequest {
         receiver,
         key_bytes,
@@ -6387,16 +6454,16 @@ pub(crate) async fn await_delegate_response(
         Either::Left((response, _)) => match response {
             Ok(resp) => {
                 debug!("Received delegate response: {:?}", resp);
-                Ok(resp)
+                DelegateAwaitOutcome::Response(resp)
             }
-            Err(_) => Err("Response channel was cancelled".to_string()),
+            Err(_) => DelegateAwaitOutcome::Cancelled,
         },
         Either::Right((_, _)) => {
             // Timeout occurred - remove the pending request
             if let Ok(mut pending) = PENDING_REQUESTS.lock() {
                 pending.remove(&key_bytes);
             }
-            Err("Timeout waiting for delegate response".to_string())
+            DelegateAwaitOutcome::TimedOut
         }
     }
 }
