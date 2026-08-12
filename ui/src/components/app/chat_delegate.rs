@@ -1921,6 +1921,190 @@ mod tests {
         assert_eq!(s1, legacy_scoped_correlation(&d1, &base));
     }
 
+    /// **Both sides of the correlation seam, for every variant that uses it.**
+    ///
+    /// The request side (`get_request_key`) and the response side
+    /// (`response_correlation_base`) are two independent derivations that MUST
+    /// agree, or the waiter registered by the request can never be completed by
+    /// the response. They disagreed for `ListResponse`, and the pre-existing
+    /// pin (`legacy_scoped_correlation_is_per_delegate`) could not see it: it
+    /// checked only that the request side produced distinct keys per delegate,
+    /// against a base (`b"list"`) that was not even the real one, and asserted
+    /// nothing about the response side. A mismatch across the seam was the only
+    /// interesting failure and the only one it could not detect.
+    ///
+    /// This drives the REAL functions on both sides, over matched
+    /// request/response pairs, so the seam is checked as a round trip.
+    #[test]
+    fn request_and_response_correlation_keys_round_trip() {
+        use river_core::chat_delegate::CasStoreResult;
+
+        let skey = ChatDelegateKey::new(b"room:some-owner-vk".to_vec());
+        let pairs: Vec<(&str, ChatDelegateRequestMsg, ChatDelegateResponseMsg)> = vec![
+            (
+                "Get",
+                ChatDelegateRequestMsg::GetRequest { key: skey.clone() },
+                ChatDelegateResponseMsg::GetResponse {
+                    key: skey.clone(),
+                    value: None,
+                },
+            ),
+            (
+                "Store",
+                ChatDelegateRequestMsg::StoreRequest {
+                    key: skey.clone(),
+                    value: vec![1, 2, 3],
+                },
+                ChatDelegateResponseMsg::StoreResponse {
+                    key: skey.clone(),
+                    value_size: 3,
+                    result: Ok(()),
+                },
+            ),
+            (
+                "Delete",
+                ChatDelegateRequestMsg::DeleteRequest { key: skey.clone() },
+                ChatDelegateResponseMsg::DeleteResponse {
+                    key: skey.clone(),
+                    result: Ok(()),
+                },
+            ),
+            (
+                "GetVersioned",
+                ChatDelegateRequestMsg::GetVersionedRequest { key: skey.clone() },
+                ChatDelegateResponseMsg::GetVersionedResponse {
+                    key: skey.clone(),
+                    value: None,
+                    generation: 0,
+                },
+            ),
+            (
+                "CasStore",
+                ChatDelegateRequestMsg::CasStoreRequest {
+                    key: skey.clone(),
+                    value: vec![4, 5],
+                    expected_generation: 0,
+                },
+                ChatDelegateResponseMsg::CasStoreResponse {
+                    key: skey.clone(),
+                    result: CasStoreResult::Stored { generation: 1 },
+                },
+            ),
+            (
+                // The variant that was broken. `ListRequest` carries no key, so
+                // there is nothing in the response to rebuild the base FROM —
+                // which is exactly why it is the one that drifted.
+                "List",
+                ChatDelegateRequestMsg::ListRequest,
+                ChatDelegateResponseMsg::ListResponse { keys: vec![] },
+            ),
+        ];
+
+        let legacy = DelegateKey::new([9u8; 32], freenet_stdlib::prelude::CodeHash::new([9u8; 32]));
+
+        for (name, request, response) in pairs {
+            let request_side = get_request_key(&request);
+            let response_side = response_correlation_base(&response).unwrap_or_else(|| {
+                panic!("{name}: response must correlate through PENDING_REQUESTS")
+            });
+            assert_eq!(
+                request_side, response_side,
+                "{name}: the request registers its waiter under one key and the \
+                 response completes under another — the waiter can never fire"
+            );
+
+            // ...and the delegate-scoped composition (the legacy-probe path,
+            // which is what the crate walk uses) must agree too. This is the
+            // half B1 actually broke: the bases matched, the SCOPING did not.
+            assert_eq!(
+                legacy_scoped_correlation(&legacy, &request_side),
+                legacy_scoped_correlation(&legacy, &response_side),
+                "{name}: scoped correlation must agree across the seam"
+            );
+            assert_ne!(
+                legacy_scoped_correlation(&legacy, &request_side),
+                request_side,
+                "{name}: a legacy-scoped key must differ from the bare one, or \
+                 scoping is a no-op and legacy/current reads can collide"
+            );
+        }
+    }
+
+    /// The response side must apply the legacy scoping in ONE place, over a
+    /// base it gets from the shared `response_correlation_base`.
+    ///
+    /// B1 existed because the scoping was applied per-variant, by hand, six
+    /// times — and one of the six forgot. The round-trip test above proves the
+    /// two derivations agree; this proves `response_handler.rs` actually routes
+    /// through them rather than reconstructing a key inline, which is the shape
+    /// that let a variant skip `scoped()` in the first place.
+    #[test]
+    fn response_handler_derives_correlation_keys_from_one_place() {
+        let rh_src = include_str!("freenet_api/response_handler.rs");
+        let production = rh_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        assert!(
+            production.contains("response_correlation_base(&response)"),
+            "response_handler.rs must derive storage-response correlation keys \
+             from the shared response_correlation_base()"
+        );
+        // No variant may rebuild the list base inline again — that literal
+        // living at the response side is precisely what drifted.
+        assert!(
+            !production.contains("b\"__list_request__\""),
+            "response_handler.rs must not hand-build the list correlation base; \
+             use list_request_correlation_key() via response_correlation_base()"
+        );
+        // Exactly one scoping site for the whole storage-response family.
+        assert_eq!(
+            production.matches("complete_pending_request(").count(),
+            1,
+            "there must be exactly ONE complete_pending_request call for storage \
+             responses, so no variant can be left unscoped (B1). Adding a second \
+             re-opens the per-variant shape that broke ListResponse."
+        );
+    }
+
+    /// A legacy `ListResponse` that a waiter already consumed must NOT also
+    /// spawn `migrate_legacy_per_room`.
+    ///
+    /// The sweep fires its ListRequest fire-and-forget (no waiter), so it still
+    /// drives the migration. The crate walk AWAITS its probes, so once B1's
+    /// routing fix lands its response is consumed — and spawning here as well
+    /// would run a second concurrent migration against the same legacy
+    /// delegate, whose per-key reads share the walk's scoped correlation keys.
+    /// Single-waiter displacement, `Cancelled` reads, and a possible false
+    /// `LoadFailed` for a user whose migration actually SUCCEEDED.
+    #[test]
+    fn consumed_legacy_list_response_does_not_double_spawn_migration() {
+        let rh_src = include_str!("freenet_api/response_handler.rs");
+        let production = rh_src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+
+        // Find the legacy branch of the ListResponse processing arm.
+        let arm = production
+            .split("ChatDelegateResponseMsg::ListResponse { keys }")
+            .nth(1)
+            .expect("the ListResponse processing arm must exist");
+        let spawn_at = arm
+            .find("migrate_legacy_per_room(")
+            .expect("the legacy branch must still spawn the sweep's migration");
+        let guard_at = arm.find("if !completed {").expect(
+            "the migrate_legacy_per_room spawn must be gated on !completed, \
+                 or a walk-consumed ListResponse spawns a duplicate concurrent \
+                 migration (B1)",
+        );
+        assert!(
+            guard_at < spawn_at,
+            "the !completed guard must precede the migrate_legacy_per_room spawn"
+        );
+    }
+
     /// `mark_room_rejoined` (set) / `clear_room_rejoined` (consume on leave) are
     /// the inputs to `present_action`'s rejoin override. A rejoin then a leave
     /// must NOT leave the flag set, or a later background update would resurrect
@@ -5271,9 +5455,18 @@ pub(crate) fn reset_dm_prune_tombstones() {
 }
 
 pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
-    use crate::components::direct_messages::OUTBOUND_DMS;
     let count = entries.len();
     crate::util::defer(move || {
+        hydrate_outbound_dms_cache_now(entries);
+    });
+    count
+}
+
+/// The body of [`hydrate_outbound_dms_cache`] WITHOUT the `defer` wrapper.
+/// See [`hydrate_hidden_dm_threads_now`] for why a caller would want this.
+pub(crate) fn hydrate_outbound_dms_cache_now(entries: Vec<OutboundDmEntry>) {
+    use crate::components::direct_messages::OUTBOUND_DMS;
+    {
         let mut suppressed_any = false;
         OUTBOUND_DMS.with_mut(|cache| {
             for entry in entries {
@@ -5320,8 +5513,7 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
         if suppressed_any {
             persist_sanitized_dm_store_after_tombstone_filter();
         }
-    });
-    count
+    }
 }
 
 /// Persist the sanitized outbound-DM store after a tombstone filter dropped a
@@ -5473,12 +5665,29 @@ pub(crate) fn resolve_hidden_thread_hydration(
 }
 
 pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
-    use crate::components::direct_messages::HIDDEN_DM_THREADS;
     let count = entries.len();
     if count == 0 {
         return 0;
     }
     crate::util::defer(move || {
+        hydrate_hidden_dm_threads_now(entries);
+    });
+    count
+}
+
+/// The body of [`hydrate_hidden_dm_threads`] WITHOUT the `defer` wrapper, for a
+/// caller that must know when the write has actually landed.
+///
+/// The deferring wrapper is the right default for UI call sites (see the
+/// `defer()` rule in `.claude/rules/dioxus-signal-safety.md`), but it makes the
+/// write a MACROTASK: the caller returns before the signal is touched. A
+/// migration seam that merges and then flushes runs on microtasks, which drain
+/// first, so through the wrapper it would serialise the PRE-merge cache and
+/// then seal the predecessor as imported. Callers that need the write to have
+/// happened run this inside their own single `defer` and signal from there.
+pub(crate) fn hydrate_hidden_dm_threads_now(entries: Vec<HiddenDmThreadEntry>) {
+    use crate::components::direct_messages::HIDDEN_DM_THREADS;
+    {
         // Drop hidden-thread (archive) entries for a room that was overwritten
         // (freenet/river#414 P2-3, identity-based since round-9): they belong to
         // the replaced identity. Hidden entries carry no local-identity field, so
@@ -5524,8 +5733,7 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
         if suppressed_any {
             persist_sanitized_dm_store_after_tombstone_filter();
         }
-    });
-    count
+    }
 }
 
 /// Outcome of [`decide_hide_action`]: should the caller (un)write the
@@ -6182,13 +6390,65 @@ pub(crate) fn get_versioned_correlation_key(key: &ChatDelegateKey) -> Vec<u8> {
     k
 }
 
+/// The correlation base for `ListRequest`/`ListResponse`.
+///
+/// `ListRequest` carries no key, so unlike every other KV op there is nothing in
+/// the response to rebuild a correlation key FROM — both sides must construct it
+/// from the same literal. When that literal was written out by hand at each side
+/// they drifted: the request side scoped it by target delegate
+/// (`legacy_scoped_correlation`) while the response side rebuilt it bare, so a
+/// legacy `ListRequest`'s waiter could never be completed. Both sides now call
+/// this, so the base cannot drift again; the delegate-scoping half is pinned
+/// separately by `legacy_list_request_round_trips_through_scoped_correlation`.
+pub(crate) fn list_request_correlation_key() -> Vec<u8> {
+    b"__list_request__".to_vec()
+}
+
+/// The response-side mirror of [`get_request_key`] for the storage ops that
+/// correlate through `PENDING_REQUESTS`.
+///
+/// `Some(base)` is the UNSCOPED correlation base; the caller applies
+/// `legacy_scoped_correlation` when the responding delegate is a legacy one,
+/// in exactly ONE place, so no individual variant can be left unscoped.
+/// `None` means the response correlates through a different registry
+/// (signing-key, public-key, sign, room-subscription) and this map is not
+/// involved.
+///
+/// This exists because the two sides of the seam were previously written out
+/// by hand, per variant, at two call sites — and drifted. `ListResponse` was
+/// rebuilt bare while its request had registered under a delegate-scoped key,
+/// so every legacy `ListRequest` waiter was uncompletable and the crate walk
+/// timed out on all 27 generations. Keeping the derivation here, paired with
+/// `get_request_key`, is what makes
+/// `request_and_response_correlation_keys_round_trip` able to check BOTH sides
+/// of the seam instead of one.
+pub(crate) fn response_correlation_base(response: &ChatDelegateResponseMsg) -> Option<Vec<u8>> {
+    match response {
+        ChatDelegateResponseMsg::GetResponse { key, .. }
+        | ChatDelegateResponseMsg::StoreResponse { key, .. }
+        | ChatDelegateResponseMsg::DeleteResponse { key, .. } => Some(key.as_bytes().to_vec()),
+        // CAS storage responses (freenet/river#345) correlate on DISTINCT keys
+        // (prefix + storage key) so they can't be confused with a concurrent
+        // plain Get/Store for the same storage key.
+        ChatDelegateResponseMsg::GetVersionedResponse { key, .. } => {
+            Some(get_versioned_correlation_key(key))
+        }
+        ChatDelegateResponseMsg::CasStoreResponse { key, .. } => {
+            Some(cas_store_correlation_key(key))
+        }
+        // `ListResponse` carries no key: the base is the shared literal.
+        ChatDelegateResponseMsg::ListResponse { .. } => Some(list_request_correlation_key()),
+        _ => None,
+    }
+}
+
 fn get_request_key(request: &ChatDelegateRequestMsg) -> Vec<u8> {
     match request {
         // Key-value storage operations
         ChatDelegateRequestMsg::StoreRequest { key, .. } => key.as_bytes().to_vec(),
         ChatDelegateRequestMsg::GetRequest { key } => key.as_bytes().to_vec(),
         ChatDelegateRequestMsg::DeleteRequest { key } => key.as_bytes().to_vec(),
-        ChatDelegateRequestMsg::ListRequest => b"__list_request__".to_vec(),
+        ChatDelegateRequestMsg::ListRequest => list_request_correlation_key(),
         // CAS storage ops use DISTINCT correlation keys (freenet/river#345)
         // so a concurrent plain Get/Store response for the same storage key
         // can't steal the awaiting save's slot. See the helper doc-comments.

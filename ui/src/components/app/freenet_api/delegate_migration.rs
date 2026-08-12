@@ -714,12 +714,35 @@ impl RiverImportSeam for LiveImportSeam {
     }
 
     async fn merge_outbound_dms(&mut self, store: OutboundDmStore) -> Result<(), String> {
-        // Same helpers the sweep's legacy DM arm uses; both defer their signal
-        // writes internally and are idempotent per entry.
-        chat_delegate::hydrate_hidden_dm_threads(store.hidden_threads);
-        chat_delegate::hydrate_outbound_dms_cache(store.entries);
         self.dms_dirty = true;
-        Ok(())
+        // Same helpers the sweep's legacy DM arm uses, and idempotent per entry
+        // — but the PUBLIC forms defer their signal writes through
+        // `util::defer` (`setTimeout(0)`, a MACROTASK) and return immediately.
+        //
+        // `flush` -> `save_outbound_dms_to_delegate` reads `OUTBOUND_DMS`
+        // SYNCHRONOUSLY, and the merge -> flush -> snapshot chain runs on
+        // microtasks, which drain before any macrotask. Returning `Ok` here
+        // without awaiting therefore let `flush` serialise the PRE-merge cache
+        // while the driver went on to seal `Done { had_data: true }` — and the
+        // marker guarantees the predecessor is never re-fetched, so the DMs
+        // were lost permanently. Deterministic for a DM-only predecessor (no
+        // rooms means no intervening network round-trip to let the timer fire),
+        // and worst in the gateway iframe, where no `localStorage` means the
+        // marker is the only authority.
+        //
+        // So run both writes inside ONE `defer` and await a oneshot signalled
+        // from within it, exactly as `merge_rooms` above already does. The
+        // `_now` helpers are the same bodies without their own `defer`, so this
+        // keeps the single-`setTimeout` execution context the signal-safety
+        // rules require rather than writing signals inline.
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        crate::util::defer(move || {
+            chat_delegate::hydrate_hidden_dm_threads_now(store.hidden_threads);
+            chat_delegate::hydrate_outbound_dms_cache_now(store.entries);
+            let _ = tx.send(());
+        });
+        rx.await
+            .map_err(|_| "outbound-DM merge was dropped before running".to_string())
     }
 
     async fn flush(&mut self) -> Result<(), String> {
@@ -2014,6 +2037,66 @@ mod tests {
         );
     }
 
+    /// **`LiveImportSeam::merge_outbound_dms` must not return until its writes
+    /// have landed.**
+    ///
+    /// This pin is a source scrape rather than a behavioural test, and that is
+    /// deliberate: nothing below it can see the bug. `util::defer` is
+    /// `setTimeout(0)` on wasm32 but a SYNCHRONOUS call natively (`util.rs`),
+    /// and `MemorySeam` merges synchronously too — so on every surface a test
+    /// can run, the deferred write has always landed by the time `flush` reads.
+    /// The ordering only exists in the browser. A behavioural test here would
+    /// pass identically with the bug present, which is worse than no test.
+    ///
+    /// The bug: the PUBLIC hydrate helpers defer their signal writes as a
+    /// macrotask and return immediately, while `flush` reads `OUTBOUND_DMS`
+    /// synchronously on a microtask chain that drains first. For a DM-only
+    /// predecessor the save serialised the PRE-merge cache, the driver sealed
+    /// `Done { had_data: true }`, and the marker guaranteed the predecessor was
+    /// never re-fetched — silent, permanent DM loss, worst in the gateway
+    /// iframe where the marker is the only authority.
+    #[test]
+    fn merge_outbound_dms_awaits_its_deferred_writes() {
+        let src = include_str!("delegate_migration.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let body = production
+            .split("async fn merge_outbound_dms(")
+            .nth(1)
+            .expect("LiveImportSeam::merge_outbound_dms must exist")
+            .split("\n    async fn ")
+            .next()
+            .expect("merge_outbound_dms body");
+
+        assert!(
+            body.contains("rx.await"),
+            "merge_outbound_dms must AWAIT its deferred writes before returning, \
+             as merge_rooms does — otherwise flush snapshots the pre-merge cache \
+             and the driver seals Done over DM data that was never saved"
+        );
+        // It must use the non-deferring cores inside its own single defer. The
+        // public helpers would re-defer, putting the writes back on a later
+        // macrotask and restoring the bug even with the await in place.
+        for helper in [
+            "hydrate_hidden_dm_threads_now(",
+            "hydrate_outbound_dms_cache_now(",
+        ] {
+            assert!(
+                body.contains(helper),
+                "merge_outbound_dms must call {helper} inside its own defer"
+            );
+        }
+        assert!(
+            !body.contains("hydrate_hidden_dm_threads(")
+                && !body.contains("hydrate_outbound_dms_cache("),
+            "merge_outbound_dms must NOT call the deferring public hydrate \
+             helpers — they schedule a further macrotask, so the awaited signal \
+             fires before the writes land"
+        );
+    }
+
     // ---------------- concurrency shape ----------------
 
     /// The crate's walk is strictly sequential (one outstanding request), and
@@ -2060,7 +2143,11 @@ mod tests {
         );
 
         // The pre-warm's correlation keys are DISTINCT per target delegate.
-        let base = b"list".to_vec();
+        // Use the REAL base the pre-warm's `ListRequest` registers under, not a
+        // stand-in: this assertion previously ran against `b"list"`, a literal
+        // that appears nowhere in the code, so it could not have noticed that
+        // the real base was being completed unscoped on the response side (B1).
+        let base = chat_delegate::list_request_correlation_key();
         let k0 = chat_delegate::legacy_scoped_correlation(&pred_key(0), &base);
         let k1 = chat_delegate::legacy_scoped_correlation(&pred_key(1), &base);
         let k2 = chat_delegate::legacy_scoped_correlation(&pred_key(2), &base);
