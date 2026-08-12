@@ -430,14 +430,25 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
             )
             .await;
         // `request_all`'s "one outcome per request, in order" contract is
-        // documentation only; a short vec would silently drop the tail
-        // predecessors from the cache and degrade them to full 10 s live probes
-        // rather than failing loudly.
-        assert_eq!(
-            outcomes.len(),
-            targets.len(),
-            "request_all must return exactly one outcome per request"
-        );
+        // documentation only. A short vec would silently drop the tail
+        // predecessors from the cache and degrade them to full 10 s live
+        // probes, so say so loudly.
+        //
+        // Deliberately a `warn!` and NOT an assert. `[profile.release]` sets
+        // `panic = 'abort'` and `safe_spawn_local` does not catch panics, so an
+        // assert here would kill the whole UI — on the one code path whose
+        // purpose is to not lose the user's rooms. What it would guard is
+        // benign by comparison: `zip` truncates safely and `key_index` falls
+        // back to a live probe, so a short vec is slower-but-correct. Trading
+        // that for total app death is the wrong way round.
+        if outcomes.len() != targets.len() {
+            warn!(
+                "request_all returned {} outcome(s) for {} request(s); tail \
+                 predecessors will fall back to live probes",
+                outcomes.len(),
+                targets.len()
+            );
+        }
         for (key, outcome) in targets.iter().zip(outcomes) {
             let key_bytes = key.bytes().to_vec();
             let learned = match outcome {
@@ -1473,8 +1484,12 @@ mod tests {
         // case so a reconnect re-probes; if the latch were already armed, that
         // re-probe would never run the walk for the rest of the page load.
         // Whitespace-stripped, per the repo's source-pin convention, so a
-        // rustfmt wrap or an added `use` does not fail this with a message
-        // about `any_dispatched` that misdescribes the real change. (The old
+        // rustfmt wrap does not fail this with a message about `any_dispatched`
+        // that misdescribes the real change. Note the limit: stripping
+        // whitespace does nothing for the fully-qualified path, so importing
+        // `arm_crate_walk_once` and calling it unqualified WOULD fail this with
+        // that same misdescribing message. Fix the pin, not the import, if that
+        // ever happens. (The old
         // `body[latch..].starts_with(..)` conjunct was true by construction of
         // `latch` and asserted nothing.)
         let before: String = body[..latch]
@@ -2248,8 +2263,26 @@ mod tests {
         // — which compiles (tx simply is not captured), satisfies every other
         // assertion here, and restores B2 exactly, because the await then
         // returns before the macrotask runs.
+        // Brace-matched from the `defer(` opening rather than `find("});")`.
+        // A first-match anchor breaks on any nested closure call inside the
+        // defer: `merge_rooms` right next door already has that shape
+        // (`ROOMS.with_mut(|current| { ... });` closes long before its
+        // `tx.send`), so the same pin applied there would fail on correct code
+        // while claiming B2 had been restored — the misdescribing failure this
+        // file has been bitten by before.
         let closure_end = body[defer_at..]
-            .find("});")
+            .char_indices()
+            .scan(0i32, |depth, (i, c)| {
+                match c {
+                    '{' => *depth += 1,
+                    '}' => *depth -= 1,
+                    _ => {}
+                }
+                Some((i, *depth))
+            })
+            .skip_while(|(_, d)| *d == 0)
+            .find(|(_, d)| *d == 0)
+            .map(|(i, _)| i)
             .map(|off| defer_at + off)
             .expect("the defer closure must be terminated");
         assert!(
