@@ -442,6 +442,17 @@ impl ResponseHandler {
                                             // processing match still runs for every
                                             // response, so swallow these here rather
                                             // than warning "unexpected key".
+                                        } else if crate::components::app::freenet_api::delegate_migration::is_migration_marker_key(
+                                            key.as_bytes(),
+                                        ) {
+                                            // Crate-walk per-predecessor markers. Like the
+                                            // per-room keys above, these are consumed by the
+                                            // awaiting walk via the pending-request registry;
+                                            // the processing match still runs for every
+                                            // response. Without this branch a single walk
+                                            // logged ~54 "Unexpected key" warnings per page
+                                            // load — noise that trains the reader to ignore a
+                                            // warning that is meant to indicate a real gap.
                                         } else {
                                             warn!(
                                                 "Unexpected key in GetResponse: {:?}",

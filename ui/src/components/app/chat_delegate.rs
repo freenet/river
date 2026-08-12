@@ -7657,22 +7657,6 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
         return false;
     }
 
-    // freenet/river#398 phase 3: run the shared `freenet-migrate` walk ALONGSIDE
-    // this hand-rolled sweep (release 1 — the sweep stays authoritative for the
-    // user-facing load states; the walk adds durable per-predecessor markers and
-    // the library's classification). Spawning HERE — after the #253-inherited
-    // done-gate and the per-session guard above — is what scopes the walk to
-    // "current delegate observed empty, or interrupted migration recovery", the
-    // same conditions this probe fires under. The latch is once-per-page-load;
-    // the walk itself waits for the sweep's load workers to settle before its
-    // first round-trip (the quiescence loop in `delegate_migration.rs`).
-    if super::freenet_api::delegate_migration::arm_crate_walk_once() {
-        crate::util::safe_spawn_local(async {
-            let _report =
-                super::freenet_api::delegate_migration::run_crate_delegate_migration().await;
-        });
-    }
-
     info!(
         "Attempting to migrate data from {} legacy delegate(s)",
         LEGACY_DELEGATES.len()
@@ -7820,6 +7804,32 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // the new attempt (whose own probe already ran / set it).
     if !any_dispatched && load_attempt_is_current(attempt) {
         LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+    }
+
+    // freenet/river#398 phase 3: run the shared `freenet-migrate` walk ALONGSIDE
+    // this hand-rolled sweep (release 1 — the sweep stays authoritative for the
+    // user-facing load states; the walk adds durable per-predecessor markers and
+    // the library's classification). Reaching HERE means we are past the
+    // #253-inherited done-gate and the per-session guard, which is what scopes
+    // the walk to "current delegate observed empty, or interrupted migration
+    // recovery" — the same conditions this probe fires under.
+    //
+    // Gated on `any_dispatched` for the same reason the guard reset above is:
+    // if EVERY send failed the connection is down, and arming the walk would
+    // burn its once-per-page-load shot on a dead transport. The sweep resets
+    // its own guard so a reconnect re-probes; without this gate the reconnect's
+    // re-probe would find the walk latch already armed and never run the walk
+    // at all for the rest of the page load.
+    //
+    // Still armed at most once per page load, so a reconnect can never stack a
+    // second concurrent walk — the property the latch exists for. The walk
+    // itself then waits for the sweep's load workers to settle before its first
+    // round-trip (the quiescence loop in `delegate_migration.rs`).
+    if any_dispatched && super::freenet_api::delegate_migration::arm_crate_walk_once() {
+        crate::util::safe_spawn_local(async {
+            let _report =
+                super::freenet_api::delegate_migration::run_crate_delegate_migration().await;
+        });
     }
     true
 }

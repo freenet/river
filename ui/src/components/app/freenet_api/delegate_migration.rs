@@ -180,6 +180,35 @@ pub(crate) trait RiverDelegateChannel {
         target: &DelegateKey,
         request: ChatDelegateRequestMsg,
     ) -> impl Future<Output = Result<Option<ChatDelegateResponseMsg>, String>>;
+
+    /// Issue several requests concurrently, returning outcomes in input order.
+    ///
+    /// This exists because "concurrent" must NOT mean "concurrent sends" on the
+    /// production transport. A send takes the single `WEB_API` write borrow and
+    /// holds it across `api.send().await`; polling a second request into its
+    /// send while the first is suspended there is a `RefCell` double-borrow,
+    /// which in single-threaded WASM is a panic rather than contention. Today
+    /// that is survived only by `WebApi::send` happening not to yield for
+    /// small payloads — true of every delegate request, but a property of the
+    /// transport rather than of this code, and free to stop being true.
+    ///
+    /// The default is the naive fan-out, which is correct for test doubles:
+    /// they hold no shared borrow, and it keeps their observed concurrency
+    /// (and so the `max_in_flight` assertions) exactly as before.
+    /// [`NodeDelegateChannel`] overrides it with the safe shape.
+    fn request_all(
+        &self,
+        requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,
+    ) -> impl Future<Output = Vec<Result<Option<ChatDelegateResponseMsg>, String>>> {
+        async move {
+            futures::future::join_all(
+                requests
+                    .iter()
+                    .map(|(target, request)| self.request(target, request.clone())),
+            )
+            .await
+        }
+    }
 }
 
 /// The production transport: River's pending-request registry
@@ -229,6 +258,48 @@ impl RiverDelegateChannel for NodeDelegateChannel {
                 Err("delegate response waiter was displaced by a concurrent request".to_string())
             }
         }
+    }
+
+    /// Enqueue every request SEQUENTIALLY, then await the replies together.
+    ///
+    /// Each enqueue confines the `WEB_API` write borrow to its own synchronous
+    /// send and returns a `PendingDelegateRequest`, so no two borrows can
+    /// overlap however the sends are scheduled; the concurrency lives entirely
+    /// in the await phase, which holds no borrow. Same shape the startup
+    /// per-room fan-out uses (freenet/river#417).
+    ///
+    /// The wire behaviour is unchanged: every request is still in flight before
+    /// any reply is awaited.
+    async fn request_all(
+        &self,
+        requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,
+    ) -> Vec<Result<Option<ChatDelegateResponseMsg>, String>> {
+        let mut pending = Vec::with_capacity(requests.len());
+        for (target, request) in requests {
+            let enqueued = if chat_delegate::is_current_delegate_key(&target) {
+                chat_delegate::enqueue_delegate_request(request).await
+            } else {
+                chat_delegate::enqueue_delegate_request_to(target, request).await
+            };
+            pending.push(enqueued);
+        }
+
+        let mut out = Vec::with_capacity(pending.len());
+        let awaits = pending.into_iter().map(|enqueued| async move {
+            match enqueued {
+                Ok(p) => match chat_delegate::await_delegate_response_outcome(p).await {
+                    DelegateAwaitOutcome::Response(resp) => Ok(Some(resp)),
+                    DelegateAwaitOutcome::TimedOut => Ok(None),
+                    DelegateAwaitOutcome::Cancelled => Err(
+                        "delegate response waiter was displaced by a concurrent request"
+                            .to_string(),
+                    ),
+                },
+                Err(e) => Err(e),
+            }
+        });
+        out.extend(futures::future::join_all(awaits).await);
+        out
     }
 }
 
@@ -341,16 +412,24 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
         // A shared `&C` is what each concurrent probe captures — `self` stays
         // free for the cache inserts after the join.
         let channel = self.channel;
-        let probes = predecessors.iter().map(|entry| {
-            let key = DelegateKey::new(entry.delegate_key, CodeHash::new(entry.code_hash));
-            async move {
-                let outcome = channel
-                    .request(&key, ChatDelegateRequestMsg::ListRequest)
-                    .await;
-                (key.bytes().to_vec(), outcome)
-            }
-        });
-        for (key_bytes, outcome) in futures::future::join_all(probes).await {
+        let targets: Vec<DelegateKey> = predecessors
+            .iter()
+            .map(|entry| DelegateKey::new(entry.delegate_key, CodeHash::new(entry.code_hash)))
+            .collect();
+        // `request_all`, NOT a `join_all` of `request` — on the production
+        // transport the latter can poll a second probe into its send while the
+        // first still holds the `WEB_API` write borrow across `send().await`,
+        // which is a RefCell double-borrow panic in single-threaded WASM.
+        let outcomes = channel
+            .request_all(
+                targets
+                    .iter()
+                    .map(|key| (key.clone(), ChatDelegateRequestMsg::ListRequest))
+                    .collect(),
+            )
+            .await;
+        for (key, outcome) in targets.iter().zip(outcomes) {
+            let key_bytes = key.bytes().to_vec();
             let learned = match outcome {
                 Ok(Some(ChatDelegateResponseMsg::ListResponse { keys })) => Prewarmed::Listed(keys),
                 Ok(Some(_)) => Prewarmed::Executed,
@@ -1343,7 +1422,7 @@ mod tests {
             .find("LEGACY_MIGRATION_ATTEMPTED.swap(true")
             .expect("the per-session guard must exist");
         let latch = body
-            .find("if super::freenet_api::delegate_migration::arm_crate_walk_once() {")
+            .find("arm_crate_walk_once() {")
             .expect("the spawn must be gated on arm_crate_walk_once()");
         let spawn = body
             .find("run_crate_delegate_migration")
@@ -1355,6 +1434,27 @@ mod tests {
         assert!(
             latch < spawn,
             "the spawn must be inside the latch-gated block"
+        );
+
+        // ...and on `any_dispatched`, so a page load whose every send failed
+        // (connection down) does not burn the once-per-page-load latch on a
+        // dead transport. The sweep resets its own per-session guard in that
+        // case so a reconnect re-probes; if the latch were already armed, that
+        // re-probe would never run the walk for the rest of the page load.
+        assert!(
+            body[latch..].starts_with("arm_crate_walk_once()")
+                && body[..latch]
+                    .ends_with("if any_dispatched && super::freenet_api::delegate_migration::"),
+            "the walk spawn must be gated on `any_dispatched &&` — arming it on a \
+             page load where no probe dispatched wastes the latch on a dead transport"
+        );
+        let dispatch_reset = body
+            .find("if !any_dispatched && load_attempt_is_current(attempt)")
+            .expect("the sweep's transport-failure guard reset must exist");
+        assert!(
+            dispatch_reset < latch,
+            "the walk must be armed AFTER any_dispatched is final, or the gate \
+             reads a value that later sends can still change"
         );
     }
 
@@ -2094,6 +2194,45 @@ mod tests {
             "merge_outbound_dms must NOT call the deferring public hydrate \
              helpers — they schedule a further macrotask, so the awaited signal \
              fires before the writes land"
+        );
+    }
+
+    /// The pre-warm burst must fan out through `request_all`, never a
+    /// `join_all` of `request`.
+    ///
+    /// On the production transport `request` takes the single `WEB_API` write
+    /// borrow and holds it across `api.send().await`. Polling a second probe
+    /// into its send while the first is suspended there is a `RefCell`
+    /// double-borrow — a PANIC in single-threaded WASM, not contention. The
+    /// only thing standing between the old shape and that panic was
+    /// `WebApi::send` happening not to yield for small payloads.
+    ///
+    /// A mock cannot catch this (it holds no shared borrow), so this is a
+    /// source pin — the same reason the DM-merge pin above is one.
+    #[test]
+    fn prewarm_fans_out_through_the_borrow_safe_primitive() {
+        let src = include_str!("delegate_migration.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let body = production
+            .split("pub(crate) async fn prewarm(")
+            .nth(1)
+            .expect("prewarm must exist")
+            .split("\n    async fn ")
+            .next()
+            .expect("prewarm body");
+
+        assert!(
+            body.contains("request_all("),
+            "prewarm must fan out via request_all(), which enqueues sequentially \
+             so the WEB_API borrows cannot overlap"
+        );
+        assert!(
+            !body.contains("join_all("),
+            "prewarm must not join_all over request() — that can overlap the \
+             WEB_API write borrow across send().await (RefCell panic in WASM)"
         );
     }
 
