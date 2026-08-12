@@ -7900,7 +7900,14 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // at all for the rest of the page load.
     //
     // Still armed at most once per page load, so a reconnect can never stack a
-    // second concurrent walk — the property the latch exists for. The walk
+    // second concurrent walk — the property the latch exists for.
+    //
+    // Residual, deliberate: if every send failed AND a reconnect already bumped
+    // the attempt, neither the guard reset above (gated on still-current) nor
+    // this arming fires, so nothing retries for the rest of the page load. Not
+    // arming on a dead transport is the correct half — that is the whole point
+    // of the gate — and the durable markers make the next load retry. The
+    // guard-reset half is pre-existing behaviour, unchanged here. The walk
     // itself then waits for the sweep's load workers to settle before its first
     // round-trip (the quiescence loop in `delegate_migration.rs`).
     if any_dispatched && super::freenet_api::delegate_migration::arm_crate_walk_once() {

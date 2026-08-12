@@ -264,6 +264,13 @@ impl RiverDelegateChannel for NodeDelegateChannel {
     ///
     /// The wire behaviour is unchanged: every request is still in flight before
     /// any reply is awaited.
+    ///
+    /// Scope, stated honestly: this removes the overlap WITHIN the pre-warm.
+    /// It does NOT remove the cross-task case — while this is suspended inside
+    /// `send().await`, a `migrate_legacy_per_room` task spawned from the
+    /// message loop can call `send_delegate_request_to` and take the same
+    /// borrow. That case is still survived only by `WebApi::send` not yielding
+    /// for small payloads, exactly as before.
     async fn request_all(
         &self,
         requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,

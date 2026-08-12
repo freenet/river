@@ -217,18 +217,57 @@ rooms on the current delegate but outbound DM plaintext only on a legacy
 delegate will not have those plaintexts migrated.
 
 **Adding new storage keys**: how to make a new top-level key survive a delegate
-rebuild depends on the key's shape:
+rebuild depends on the key's shape. Note there are now **three** sites, not two —
+the crate walk (below) carries its own fixed-probe list:
 - **Fixed, single-key** (like `outbound_dms`): add it to the `storage_keys`
-  array in `fire_legacy_migration_request` AND route its `GetResponse` in
-  `response_handler.rs` next to the existing `OUTBOUND_DMS_STORAGE_KEY` arm.
+  array in `fire_legacy_migration_request`, route its `GetResponse` in
+  `response_handler.rs` next to the existing `OUTBOUND_DMS_STORAGE_KEY` arm,
+  AND add it to the crate walk's fixed-probe list in
+  `ui/src/components/app/freenet_api/delegate_migration.rs` (the
+  `for fixed in [ROOMS_STORAGE_KEY, OUTBOUND_DMS_STORAGE_KEY]` loop, which is
+  asked even when unlisted because a frozen legacy WASM reports a corrupt index
+  as empty).
 - **Dynamic / open-ended key families** (like `room:<vk>`): a fixed probe can't
   enumerate them. They are discovered via the legacy `ListRequest` →
   `migrate_legacy_per_room` path instead. A new dynamic family needs its own
   branch there (and in the current-delegate `load_rooms_per_room`).
 
-Missing the relevant side leaves the new key orphaned across delegate rebuilds —
+Missing any of these leaves the new key orphaned across delegate rebuilds —
 exactly the bug the per-room `ListRequest` legacy probe (freenet/river#345) was
 added to prevent.
+
+## The crate walk (freenet-migrate) — the second, parallel recovery path
+
+Since freenet/river#398 phase 3 there are **two** migration mechanisms running
+side by side, and this file historically described only the first:
+
+1. the hand-rolled sweep documented above, which stays authoritative for the
+   user-facing load states; and
+2. the shared `freenet-migrate` crate's **walk**, which adds durable
+   per-predecessor markers and the library's classification.
+
+The walk is armed once per page load from the end of
+`fire_legacy_migration_request`, after the `any_dispatched` determination and
+gated on it (arming it when every send failed would burn the once-per-load
+latch on a dead transport). It waits for the sweep's load workers to settle
+before its first round-trip.
+
+Its durable markers live in the CURRENT delegate's KV store under
+`__migrate_pred_done__:<hex>` and `__migrate_pred_wip__:<hex>`, hex-encoded
+because the delegate's own key handling is `String::from_utf8_lossy`, which
+would alias two predecessors whose raw keys differ only in invalid UTF-8. These
+markers are what make the walk idempotent across page loads: a predecessor with
+a Done marker is never re-fetched.
+
+Because both mechanisms probe the same legacy delegates with the same
+correlation keys, a legacy `ListResponse` is routed to `migrate_legacy_per_room`
+only when no waiter consumed it (`!completed`) — otherwise the walk is already
+importing that delegate and a second concurrent migration would displace its
+reads in the single-waiter registry. See the comment at that call site for the
+counting argument and its two exceptions.
+
+Release 2 retires the sweep; until then, treat the sweep as authoritative and
+the walk as additive.
 
 ## Migration Limitations
 
