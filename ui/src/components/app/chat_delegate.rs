@@ -1926,12 +1926,14 @@ mod tests {
     /// The request side (`get_request_key`) and the response side
     /// (`response_correlation_base`) are two independent derivations that MUST
     /// agree, or the waiter registered by the request can never be completed by
-    /// the response. They disagreed for `ListResponse`, and the pre-existing
-    /// pin (`legacy_scoped_correlation_is_per_delegate`) could not see it: it
-    /// checked only that the request side produced distinct keys per delegate,
-    /// against a base (`b"list"`) that was not even the real one, and asserted
-    /// nothing about the response side. A mismatch across the seam was the only
-    /// interesting failure and the only one it could not detect.
+    /// the response. They disagreed for `ListResponse`, and no pre-existing pin
+    /// could see it. `legacy_scoped_correlation_is_per_delegate` checks only
+    /// that the REQUEST side produces distinct keys per delegate;
+    /// `walk_is_sequential_and_prewarm_keys_are_distinct` (a different test, in
+    /// `delegate_migration.rs`) did the same against a stand-in base literal.
+    /// Neither asserted anything about the RESPONSE side, so a mismatch across
+    /// the seam was the only interesting failure and the only one neither
+    /// could detect.
     ///
     /// This drives the REAL functions on both sides, over matched
     /// request/response pairs, so the seam is checked as a round trip.
@@ -2013,19 +2015,37 @@ mod tests {
                  response completes under another — the waiter can never fire"
             );
 
-            // ...and the delegate-scoped composition (the legacy-probe path,
-            // which is what the crate walk uses) must agree too. This is the
-            // half B1 actually broke: the bases matched, the SCOPING did not.
-            assert_eq!(
-                legacy_scoped_correlation(&legacy, &request_side),
-                legacy_scoped_correlation(&legacy, &response_side),
-                "{name}: scoped correlation must agree across the seam"
+            // Round-trip through the REGISTRY, not just the two derivations:
+            // register a waiter exactly as `enqueue_delegate_request_to` does
+            // for a legacy target, then complete it exactly as the response
+            // handler does. This is the half B1 actually broke — the bases
+            // matched, the SCOPING did not — and comparing the two pure
+            // functions cannot observe it, because the scoping DECISION lives
+            // in `response_handler.rs` rather than in either function.
+            //
+            // A bare-key completion must NOT satisfy a scoped waiter, and the
+            // scoped one must.
+            let scoped_key = legacy_scoped_correlation(&legacy, &request_side);
+            let reply = response.clone();
+
+            let (tx, _rx) = futures::channel::oneshot::channel();
+            PENDING_REQUESTS
+                .lock()
+                .expect("pending requests lock")
+                .insert(scoped_key.clone(), tx);
+
+            assert!(
+                !complete_pending_request(
+                    &ChatDelegateKey::new(response_side.clone()),
+                    reply.clone()
+                ),
+                "{name}: completing under the BARE base must not satisfy a \
+                 legacy waiter — that is exactly B1"
             );
-            assert_ne!(
-                legacy_scoped_correlation(&legacy, &request_side),
-                request_side,
-                "{name}: a legacy-scoped key must differ from the bare one, or \
-                 scoping is a no-op and legacy/current reads can collide"
+            assert!(
+                complete_pending_request(&ChatDelegateKey::new(scoped_key), reply),
+                "{name}: completing under the scoped base must satisfy the \
+                 waiter the request registered"
             );
         }
     }
@@ -2057,6 +2077,22 @@ mod tests {
             !production.contains("b\"__list_request__\""),
             "response_handler.rs must not hand-build the list correlation base; \
              use list_request_correlation_key() via response_correlation_base()"
+        );
+        // The single site must actually APPLY the legacy scoping. Without this
+        // assertion the "one place" is only a tidier way to be wrong
+        // everywhere at once: dropping `scoped` here reproduces B1 for every
+        // storage variant, and now also kills the hand-rolled sweep's own
+        // per-room recovery (`migrate_legacy_per_room` reads through
+        // `send_delegate_request_to`, which is legacy-scoped) — a strictly
+        // wider blast radius than the bug this consolidation fixed.
+        assert!(
+            production.contains("&scoped(base)"),
+            "the single correlation site must scope the base by the responding \
+             delegate (scoped(base)); completing under the bare base is B1"
+        );
+        assert!(
+            production.contains("legacy_scoped_correlation("),
+            "the scoping helper must still be applied in production"
         );
         // Exactly one scoping site for the whole storage-response family.
         assert_eq!(
@@ -2102,6 +2138,15 @@ mod tests {
         assert!(
             guard_at < spawn_at,
             "the !completed guard must precede the migrate_legacy_per_room spawn"
+        );
+        // Ordering alone would also pass for `if !completed { debug!(..); }`
+        // followed by an UNGATED spawn, so require the spawn to be the guarded
+        // block's own first statement.
+        let guarded = &arm[guard_at + "if !completed {".len()..];
+        assert!(
+            guarded.trim_start().starts_with("let legacy_key"),
+            "the migrate_legacy_per_room spawn must be INSIDE the !completed \
+             block, not merely after it"
         );
     }
 
@@ -5687,6 +5732,15 @@ pub fn hydrate_hidden_dm_threads(entries: Vec<HiddenDmThreadEntry>) -> usize {
 /// happened run this inside their own single `defer` and signal from there.
 pub(crate) fn hydrate_hidden_dm_threads_now(entries: Vec<HiddenDmThreadEntry>) {
     use crate::components::direct_messages::HIDDEN_DM_THREADS;
+    // Shared with the wrapper rather than left there: `merge_outbound_dms`
+    // calls this directly, and `hidden_threads` is `#[serde(default)]`, so
+    // every predecessor whose store predates the archive feature would
+    // otherwise perform a no-op WRITE to a GlobalSignal — marking it dirty and
+    // notifying subscribers once per predecessor during migration. Given the
+    // #499/#555 contention family, gratuitous global-signal writes are not free.
+    if entries.is_empty() {
+        return;
+    }
     {
         // Drop hidden-thread (archive) entries for a room that was overwritten
         // (freenet/river#414 P2-3, identity-based since round-9): they belong to
@@ -6398,8 +6452,10 @@ pub(crate) fn get_versioned_correlation_key(key: &ChatDelegateKey) -> Vec<u8> {
 /// they drifted: the request side scoped it by target delegate
 /// (`legacy_scoped_correlation`) while the response side rebuilt it bare, so a
 /// legacy `ListRequest`'s waiter could never be completed. Both sides now call
-/// this, so the base cannot drift again; the delegate-scoping half is pinned
-/// separately by `legacy_list_request_round_trips_through_scoped_correlation`.
+/// this, so the base cannot drift again. The delegate-scoping half — the half
+/// B1 actually broke — is pinned by
+/// `request_and_response_correlation_keys_round_trip`, which round-trips
+/// through the real `PENDING_REQUESTS` registry.
 pub(crate) fn list_request_correlation_key() -> Vec<u8> {
     b"__list_request__".to_vec()
 }
@@ -6409,10 +6465,17 @@ pub(crate) fn list_request_correlation_key() -> Vec<u8> {
 ///
 /// `Some(base)` is the UNSCOPED correlation base; the caller applies
 /// `legacy_scoped_correlation` when the responding delegate is a legacy one,
-/// in exactly ONE place, so no individual variant can be left unscoped.
-/// `None` means the response correlates through a different registry
-/// (signing-key, public-key, sign, room-subscription) and this map is not
-/// involved.
+/// in exactly ONE place, so no individual variant of the STORAGE family can be
+/// left unscoped. (The four non-storage responses are not scoped at all; see
+/// the note on `None` below.)
+/// `None` means the response is correlated by one of the `complete_pending_*`
+/// helpers instead (signing-key, public-key, sign, room-subscription). Those
+/// use the SAME `PENDING_REQUESTS` map under their own prefixed keys — there
+/// is only one map. That matters: the request side scopes EVERY variant for a
+/// legacy target, while the response side scopes only the storage family, so
+/// if one of those four were ever sent to a legacy delegate it would be B1
+/// again, one layer over. Today none is (only `GetRequest` and `ListRequest`
+/// go to legacy delegates), which is what makes this safe.
 ///
 /// This exists because the two sides of the seam were previously written out
 /// by hand, per variant, at two call sites — and drifted. `ListResponse` was
@@ -6438,7 +6501,17 @@ pub(crate) fn response_correlation_base(response: &ChatDelegateResponseMsg) -> O
         }
         // `ListResponse` carries no key: the base is the shared literal.
         ChatDelegateResponseMsg::ListResponse { .. } => Some(list_request_correlation_key()),
-        _ => None,
+        // Enumerated, NOT a `_ =>` catch-all, deliberately. This function
+        // exists to stop per-variant correlation drift, and a catch-all would
+        // re-open exactly the class of bug B1 was: a newly added storage
+        // variant would silently correlate to nothing (`completed` stays
+        // false, the waiter never fires) instead of failing to compile. These
+        // four correlate through their own registries and never touch
+        // `PENDING_REQUESTS`.
+        ChatDelegateResponseMsg::StoreSigningKeyResponse { .. }
+        | ChatDelegateResponseMsg::GetPublicKeyResponse { .. }
+        | ChatDelegateResponseMsg::SignResponse { .. }
+        | ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse { .. } => None,
     }
 }
 

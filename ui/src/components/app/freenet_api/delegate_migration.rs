@@ -192,23 +192,17 @@ pub(crate) trait RiverDelegateChannel {
     /// small payloads — true of every delegate request, but a property of the
     /// transport rather than of this code, and free to stop being true.
     ///
-    /// The default is the naive fan-out, which is correct for test doubles:
-    /// they hold no shared borrow, and it keeps their observed concurrency
-    /// (and so the `max_in_flight` assertions) exactly as before.
-    /// [`NodeDelegateChannel`] overrides it with the safe shape.
+    /// **Deliberately has NO default.** The obvious default would be a
+    /// `join_all` over `request` — which is precisely the unsafe shape this
+    /// method exists to replace. With such a default, deleting
+    /// [`NodeDelegateChannel`]'s override (an entirely plausible "the default
+    /// already does this" cleanup) would silently return production to the
+    /// overlapping-borrow fan-out while every test stayed green. Requiring
+    /// each implementor to state its choice makes that a compile error.
     fn request_all(
         &self,
         requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,
-    ) -> impl Future<Output = Vec<Result<Option<ChatDelegateResponseMsg>, String>>> {
-        async move {
-            futures::future::join_all(
-                requests
-                    .iter()
-                    .map(|(target, request)| self.request(target, request.clone())),
-            )
-            .await
-        }
-    }
+    ) -> impl Future<Output = Vec<Result<Option<ChatDelegateResponseMsg>, String>>>;
 }
 
 /// The production transport: River's pending-request registry
@@ -1334,6 +1328,27 @@ mod tests {
             self.in_flight.set(self.in_flight.get() - 1);
             out
         }
+
+        /// The double fans out naively ON PURPOSE: it holds no shared
+        /// `WEB_API` borrow, so the hazard `NodeDelegateChannel::request_all`
+        /// guards against cannot exist here, and keeping the concurrency
+        /// observable is what lets `max_in_flight` assert the pre-warm really
+        /// does probe every predecessor at once.
+        ///
+        /// Note what this means: these assertions measure the DOUBLE's shape,
+        /// never production's. The production override is pinned separately,
+        /// by source scrape.
+        async fn request_all(
+            &self,
+            requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,
+        ) -> Vec<Result<Option<ChatDelegateResponseMsg>, String>> {
+            futures::future::join_all(
+                requests
+                    .iter()
+                    .map(|(target, request)| self.request(target, request.clone())),
+            )
+            .await
+        }
     }
 
     // ---------------- in-memory seam ----------------
@@ -1441,10 +1456,17 @@ mod tests {
         // dead transport. The sweep resets its own per-session guard in that
         // case so a reconnect re-probes; if the latch were already armed, that
         // re-probe would never run the walk for the rest of the page load.
+        // Whitespace-stripped, per the repo's source-pin convention, so a
+        // rustfmt wrap or an added `use` does not fail this with a message
+        // about `any_dispatched` that misdescribes the real change. (The old
+        // `body[latch..].starts_with(..)` conjunct was true by construction of
+        // `latch` and asserted nothing.)
+        let before: String = body[..latch]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            body[latch..].starts_with("arm_crate_walk_once()")
-                && body[..latch]
-                    .ends_with("if any_dispatched && super::freenet_api::delegate_migration::"),
+            before.ends_with("if any_dispatched && super::freenet_api::delegate_migration::"),
             "the walk spawn must be gated on `any_dispatched &&` — arming it on a \
              page load where no probe dispatched wastes the latch on a dead transport"
         );
@@ -2195,6 +2217,75 @@ mod tests {
              helpers — they schedule a further macrotask, so the awaited signal \
              fires before the writes land"
         );
+        // The load-bearing ordering: the completion signal must be sent from
+        // INSIDE the defer closure, after the writes. Signalling before the
+        // defer satisfies every assertion above while restoring the bug
+        // exactly, because the await then returns before the writes land.
+        let defer_at = body
+            .find("defer(move ||")
+            .expect("the writes must run inside a defer closure");
+        let send_at = body
+            .find("tx.send(")
+            .expect("the oneshot must be signalled");
+        assert!(
+            defer_at < send_at,
+            "tx.send must happen INSIDE the defer closure, after the writes — \
+             signalling before it makes the await return pre-merge (B2)"
+        );
+        for helper in [
+            "hydrate_hidden_dm_threads_now(",
+            "hydrate_outbound_dms_cache_now(",
+        ] {
+            assert!(
+                body.find(helper).expect("helper call") < send_at,
+                "{helper} must run BEFORE the completion signal"
+            );
+        }
+    }
+
+    /// The PRODUCTION `request_all` must keep the safe shape.
+    ///
+    /// `MockChannel` deliberately fans out naively, so every `max_in_flight`
+    /// assertion measures the double rather than production. Nothing else
+    /// exercises `NodeDelegateChannel::request_all` — so without this, deleting
+    /// its override or rewriting it as a `join_all` over `request` would return
+    /// production to the overlapping-`WEB_API`-borrow shape with all tests green.
+    #[test]
+    fn production_request_all_enqueues_before_it_awaits() {
+        let src = include_str!("delegate_migration.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let body = production
+            .split("impl RiverDelegateChannel for NodeDelegateChannel {")
+            .nth(1)
+            .expect("the production channel impl must exist")
+            .split("\n}")
+            .next()
+            .expect("impl body");
+        let request_all = body.split("async fn request_all(").nth(1).expect(
+            "NodeDelegateChannel must define request_all — the trait has \
+                     no default, but a re-added default would make this silent",
+        );
+
+        let last_enqueue = request_all
+            .rfind("enqueue_delegate_request")
+            .expect("request_all must enqueue");
+        let first_await = request_all
+            .find("await_delegate_response_outcome")
+            .expect("request_all must await the replies");
+        assert!(
+            last_enqueue < first_await,
+            "every send must be enqueued BEFORE the first reply is awaited, so \
+             the WEB_API borrows never overlap and all requests are still in \
+             flight before any reply is awaited"
+        );
+        assert!(
+            request_all[..last_enqueue].contains("for "),
+            "the enqueue phase must be a sequential loop, not a concurrent \
+             combinator — concurrency here is the borrow hazard itself"
+        );
     }
 
     /// The pre-warm burst must fan out through `request_all`, never a
@@ -2282,10 +2373,11 @@ mod tests {
         );
 
         // The pre-warm's correlation keys are DISTINCT per target delegate.
-        // Use the REAL base the pre-warm's `ListRequest` registers under, not a
-        // stand-in: this assertion previously ran against `b"list"`, a literal
-        // that appears nowhere in the code, so it could not have noticed that
-        // the real base was being completed unscoped on the response side (B1).
+        // Use the REAL base the pre-warm's `ListRequest` registers under rather
+        // than the previous `b"list"` stand-in. This is a READABILITY fix and
+        // detects nothing new — the assertions below hold for any base at all.
+        // The response side is covered by
+        // `request_and_response_correlation_keys_round_trip`, not here.
         let base = chat_delegate::list_request_correlation_key();
         let k0 = chat_delegate::legacy_scoped_correlation(&pred_key(0), &base);
         let k1 = chat_delegate::legacy_scoped_correlation(&pred_key(1), &base);

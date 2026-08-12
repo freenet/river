@@ -473,22 +473,39 @@ impl ResponseHandler {
                                         // GETs can be awaited without blocking the message
                                         // loop (the responses arrive through this loop).
                                         if is_legacy_delegate {
-                                            // Only the SWEEP's List drives this migration. The
-                                            // sweep fires its `ListRequest` fire-and-forget
-                                            // (`chat_delegate.rs`, legacy probe) so it registers
-                                            // no waiter and `completed` is false here.
+                                            // Suppresses the DUPLICATE migration when the crate
+                                            // walk is also probing this delegate. Two concurrent
+                                            // `migrate_legacy_per_room` runs share the walk's
+                                            // scoped correlation keys, so they displace each
+                                            // other in the single-waiter map — `Cancelled` reads,
+                                            // and a possible false `LoadFailed` for a user whose
+                                            // migration actually SUCCEEDED.
                                             //
-                                            // The crate WALK, by contrast, awaits its probes
-                                            // through the pending-request registry, so a
-                                            // completed response was consumed by the walk and is
-                                            // already being imported by the crate driver.
-                                            // Spawning here as well would run a second concurrent
-                                            // `migrate_legacy_per_room` against the same legacy
-                                            // delegate, whose per-key reads share the walk's
-                                            // scoped correlation keys — single-waiter
-                                            // displacement, `Cancelled` reads, and a possible
-                                            // false `LoadFailed` for a user whose migration
-                                            // actually SUCCEEDED. Deterministic, not a race.
+                                            // Be precise about WHY this is sufficient, because
+                                            // the obvious reason is the wrong one. Responses bind
+                                            // to waiters by CORRELATION KEY, not by which send
+                                            // produced them: the sweep's `ListRequest` and the
+                                            // walk's go to the same delegate under the same
+                                            // scoped key, so the sweep's response can perfectly
+                                            // well complete the WALK's waiter. Which response
+                                            // sees `completed == true` is interleaving-dependent.
+                                            //
+                                            // What makes it safe is a COUNTING argument: the
+                                            // sweep's probe registers no waiter (it is
+                                            // fire-and-forget), so N responses meet at most N-1
+                                            // walk waiters, and at least one response therefore
+                                            // falls through to spawn the migration exactly once.
+                                            //
+                                            // Two reachable exceptions, both fail-safe and both
+                                            // recovered by the durable markers on the next page
+                                            // load, neither losing data:
+                                            //  * a walk waiter times out (10 s) and is evicted
+                                            //    before its response lands — the late response
+                                            //    then spawns a migration that can overlap the
+                                            //    sweep-driven one;
+                                            //  * the sweep's send fails while the walk's
+                                            //    succeeds — the walk consumes the only response
+                                            //    and no sweep migration spawns this load.
                                             if !completed {
                                                 let legacy_key = key.clone();
                                                 crate::util::safe_spawn_local(async move {
