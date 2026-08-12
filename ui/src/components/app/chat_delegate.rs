@@ -4173,6 +4173,26 @@ mod tests {
             "cached CHAT_DELEGATE_KEY drifted from per-call construction"
         );
     }
+
+    /// The freenet-migrate adoption (freenet/river#398 phase 3) is UI-side
+    /// ONLY: the committed delegate WASM must be byte-identical to the one
+    /// shipping before it. A changed delegate WASM re-keys the delegate —
+    /// creating exactly the data-loss event `delegate_migration.rs` exists to
+    /// prevent — and requires the full migration ritual
+    /// (`.claude/rules/delegate-migration.md`) INCLUDING a new
+    /// `legacy_delegates.toml` entry, at which point this hash must be updated
+    /// alongside that entry, never alone.
+    #[test]
+    fn chat_delegate_wasm_is_byte_identical() {
+        let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
+        assert_eq!(
+            blake3::hash(bytes).to_hex().as_str(),
+            "a44c64014d60fd245fe8fb5172f8fd7397039b248b3b6a8e95e89a0bb539fb5e",
+            "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
+             if the change is intentional, follow .claude/rules/delegate-migration.md \
+             (add-migration BEFORE rebuilding) and update this pin in the same commit"
+        );
+    }
 }
 
 /// Remove a `room_owner_vk` from the per-session ensure-subscription dedup
@@ -7375,6 +7395,22 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     if LEGACY_MIGRATION_ATTEMPTED.swap(true, Ordering::Relaxed) {
         info!("Legacy migration already attempted this session, skipping");
         return false;
+    }
+
+    // freenet/river#398 phase 3: run the shared `freenet-migrate` walk ALONGSIDE
+    // this hand-rolled sweep (release 1 — the sweep stays authoritative for the
+    // user-facing load states; the walk adds durable per-predecessor markers and
+    // the library's classification). Spawning HERE — after the #253-inherited
+    // done-gate and the per-session guard above — is what scopes the walk to
+    // "current delegate observed empty, or interrupted migration recovery", the
+    // same conditions this probe fires under. The latch is once-per-page-load;
+    // the walk itself waits for the sweep's load workers to settle before its
+    // first round-trip (the quiescence loop in `delegate_migration.rs`).
+    if super::freenet_api::delegate_migration::arm_crate_walk_once() {
+        crate::util::safe_spawn_local(async {
+            let _report =
+                super::freenet_api::delegate_migration::run_crate_delegate_migration().await;
+        });
     }
 
     info!(
