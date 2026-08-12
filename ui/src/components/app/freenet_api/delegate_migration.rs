@@ -422,6 +422,15 @@ impl<'a, C: RiverDelegateChannel> RiverPredecessorIo<'a, C> {
                     .collect(),
             )
             .await;
+        // `request_all`'s "one outcome per request, in order" contract is
+        // documentation only; a short vec would silently drop the tail
+        // predecessors from the cache and degrade them to full 10 s live probes
+        // rather than failing loudly.
+        assert_eq!(
+            outcomes.len(),
+            targets.len(),
+            "request_all must return exactly one outcome per request"
+        );
         for (key, outcome) in targets.iter().zip(outcomes) {
             let key_bytes = key.bytes().to_vec();
             let learned = match outcome {
@@ -2227,18 +2236,28 @@ mod tests {
         let send_at = body
             .find("tx.send(")
             .expect("the oneshot must be signalled");
+        // Bound by the closure's TERMINATOR, not just its opening. `defer_at <
+        // send_at` alone passes for a `tx.send` placed AFTER the whole closure
+        // — which compiles (tx simply is not captured), satisfies every other
+        // assertion here, and restores B2 exactly, because the await then
+        // returns before the macrotask runs.
+        let closure_end = body[defer_at..]
+            .find("});")
+            .map(|off| defer_at + off)
+            .expect("the defer closure must be terminated");
         assert!(
-            defer_at < send_at,
+            defer_at < send_at && send_at < closure_end,
             "tx.send must happen INSIDE the defer closure, after the writes — \
-             signalling before it makes the await return pre-merge (B2)"
+             signalling outside it makes the await return pre-merge (B2)"
         );
         for helper in [
             "hydrate_hidden_dm_threads_now(",
             "hydrate_outbound_dms_cache_now(",
         ] {
+            let at = body.find(helper).expect("helper call");
             assert!(
-                body.find(helper).expect("helper call") < send_at,
-                "{helper} must run BEFORE the completion signal"
+                at > defer_at && at < send_at,
+                "{helper} must run inside the defer, BEFORE the signal"
             );
         }
     }
@@ -2285,6 +2304,22 @@ mod tests {
             request_all[..last_enqueue].contains("for "),
             "the enqueue phase must be a sequential loop, not a concurrent \
              combinator — concurrency here is the borrow hazard itself"
+        );
+        // Text order alone is ALSO satisfied by a fully sequential rewrite that
+        // enqueues and awaits inside one loop. That stays borrow-safe but
+        // destroys the concurrency prewarm exists for: 27 predecessors would
+        // serialise into 27 x the 10 s timeout, the exact cost prewarm removes.
+        assert!(
+            request_all.contains("join_all"),
+            "the AWAIT phase must fan out (join_all) — enqueue-then-await in a \
+             single loop is borrow-safe but serialises the whole pre-warm"
+        );
+        let enqueue_loop_end = request_all[..first_await]
+            .rfind("\n        }")
+            .expect("the enqueue loop must close before the await phase");
+        assert!(
+            last_enqueue < enqueue_loop_end && enqueue_loop_end < first_await,
+            "the await phase must come after the enqueue loop CLOSES, not inside it"
         );
     }
 

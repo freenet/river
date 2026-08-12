@@ -5511,6 +5511,11 @@ pub fn hydrate_outbound_dms_cache(entries: Vec<OutboundDmEntry>) -> usize {
 /// See [`hydrate_hidden_dm_threads_now`] for why a caller would want this.
 pub(crate) fn hydrate_outbound_dms_cache_now(entries: Vec<OutboundDmEntry>) {
     use crate::components::direct_messages::OUTBOUND_DMS;
+    // Symmetric with `hydrate_hidden_dm_threads_now`: skip the GlobalSignal
+    // write entirely when there is nothing to merge.
+    if entries.is_empty() {
+        return;
+    }
     {
         let mut suppressed_any = false;
         OUTBOUND_DMS.with_mut(|cache| {
