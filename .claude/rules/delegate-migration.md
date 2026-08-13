@@ -31,8 +31,10 @@ migration entry, **users lose all room data**.
 
 All legacy delegate entries are defined in `legacy_delegates.toml` at the
 repo root. This file is the **only** place migration entries are managed.
-The UI's `build.rs` generates Rust code from it at compile time. CI reads
-it directly for validation.
+`ui/build.rs` turns it into Rust at compile time by calling
+`freenet_migrate_build::codegen()`; the build script itself keeps only the
+local gate that fails the build when the generated table comes out empty.
+CI reads the TOML directly for validation.
 
 ## Single Source of Truth: `common/legacy_room_contracts.toml`
 
@@ -41,8 +43,9 @@ recording the BLAKE3 code hash of every previous room-contract WASM
 generation. A client re-derives the contract key any owner's room used
 under each generation and probes them newest-to-oldest to recover a room
 dormant across one or more WASM upgrades (freenet/river#292).
-`common/build.rs` generates `LEGACY_ROOM_CONTRACT_CODE_HASHES` from it;
-the `river-core` `migration` feature exposes the lookup. It lives inside
+`common/build.rs` generates `LEGACY_ROOM_CONTRACT_CODE_HASHES` from it via
+the same `freenet_migrate_build::codegen()` call; the `river-core`
+`migration` feature exposes the lookup. It lives inside
 the `common` crate (not the repo root) so it ships with the published
 `river-core` crate and riverctl keeps the full registry.
 
@@ -87,8 +90,8 @@ git commit -m "fix: update WASMs with delegate migration entry"
 |------|---------|
 | `legacy_delegates.toml` | Single source of truth for delegate migration entries |
 | `common/legacy_room_contracts.toml` | Single source of truth for room-contract generations (#292) |
-| `ui/build.rs` | Generates `LEGACY_DELEGATES` const from the delegate TOML |
-| `common/build.rs` | Generates `LEGACY_ROOM_CONTRACT_CODE_HASHES` from the room-contract TOML |
+| `ui/build.rs` | Calls `freenet_migrate_build::codegen()` to generate the `LEGACY_DELEGATES` const from the delegate TOML |
+| `common/build.rs` | Calls `freenet_migrate_build::codegen()` to generate `LEGACY_ROOM_CONTRACT_CODE_HASHES` from the room-contract TOML |
 | `common/src/migration.rs` | Re-derives legacy room-contract keys for backward recovery (#292) |
 | `ui/src/components/app/chat_delegate.rs` | Uses generated `LEGACY_DELEGATES` for runtime migration |
 | `scripts/check-migration.sh` / `scripts/add-migration.sh` | Delegate migration validation / entry |
