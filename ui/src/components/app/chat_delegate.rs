@@ -4422,6 +4422,804 @@ mod tests {
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
         );
     }
+
+    // =====================================================================
+    // Two drivers, one delegate, over the REAL `PENDING_REQUESTS` registry
+    // =====================================================================
+    //
+    // River runs TWO delegate-migration drivers concurrently against one
+    // delegate: the hand-rolled sweep (`fire_legacy_migration_request` ->
+    // `migrate_legacy_per_room`, reading through `send_delegate_request_to`)
+    // and the `freenet-migrate` crate walk (`delegate_migration::walk_with`,
+    // reading through `enqueue_delegate_request{,_to}`). Nothing ran both
+    // against one delegate at the same time, and that is exactly the layer
+    // the worst bug of the adoption PR (freenet/river#617) lived in: the
+    // legacy `ListRequest` registered its waiter under a delegate-SCOPED
+    // correlation key while the response side completed under the BARE key.
+    // Completion is an exact-key removal, so the waiter never fired, every
+    // predecessor classified `Unresponsive`, and a stray response could route
+    // into a second concurrent migration that displaced the walk's own reads.
+    //
+    // `delegate_migration`'s own `MockChannel` cannot express that class of
+    // bug at all: it models per-delegate key-value stores and has NO
+    // correlation map, no single-waiter slot, and no displacement. A double
+    // that cannot displace can never fail this way, which is why the bug
+    // lived below it. These tests therefore drive the real registry:
+    //
+    //  * waiters go into the real `PENDING_REQUESTS` under keys derived by
+    //    the real `get_request_key` + `legacy_scoped_correlation`
+    //    (`register_waiter`, mirroring `enqueue_delegate_request{,_to}` and
+    //    `send_delegate_request{,_to}` — pinned by
+    //    `the_harness_mirrors_the_production_correlation_sites`);
+    //  * replies are routed by the real `response_correlation_base` +
+    //    `legacy_scoped_correlation` + `complete_pending_request`
+    //    (`route_response`, mirroring the single scoping site in
+    //    `response_handler.rs`);
+    //  * the walk is the real `walk_with` over a lineage built from the real
+    //    `LEGACY_DELEGATES` registry, so `is_legacy_delegate_key` and
+    //    `is_current_delegate_key` make the SAME routing decisions production
+    //    makes rather than test-controlled ones;
+    //  * displacement is the real `HashMap::insert` dropping the previous
+    //    `oneshot::Sender`, surfacing as the real `DelegateAwaitOutcome`.
+    //
+    // Only the WebSocket is stubbed, and it has to be: `WEB_API` is `None` in
+    // a native test and `WebApi` is wasm-only, so `enqueue_delegate_request_inner`
+    // cannot be reached natively — it would fail its `api.send()` and evict
+    // the waiter it had just registered. Everything from the correlation key
+    // inwards is production code.
+    mod two_driver_interleaving {
+        use super::*;
+        use crate::components::app::freenet_api::delegate_migration::{
+            pred_done_marker_key, river_delegate_lineage, walk_with, RiverDelegateChannel,
+            RiverImportSeam,
+        };
+        use crate::room_data::Rooms;
+        use futures::executor::block_on;
+        use std::cell::{Cell, RefCell};
+        use std::collections::{BTreeMap, VecDeque};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        /// `PENDING_REQUESTS` is a process-global and these tests drive it
+        /// with the REAL correlation keys, which are byte-identical from run
+        /// to run. Two of them on parallel test threads would displace each
+        /// other's waiters and manufacture the very `Cancelled` outcome under
+        /// test, so they run one at a time. Poison is deliberately ignored:
+        /// a panicking test has already reported its own failure, and
+        /// poisoning the rest would replace their results with noise.
+        static REGISTRY_TESTS: Mutex<()> = Mutex::new(());
+
+        fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+            REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// Yield to the executor, waking immediately, so the joined drivers
+        /// and the node pump genuinely interleave under `block_on`.
+        struct YieldNow(bool);
+
+        impl Future for YieldNow {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.0 {
+                    Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+
+        fn yield_now() -> YieldNow {
+            YieldNow(false)
+        }
+
+        // ---------------- the production seam, mirrored ----------------
+
+        /// Register a response waiter in the REAL registry under the REAL
+        /// correlation key, exactly as `enqueue_delegate_request{,_to}` (and
+        /// `send_delegate_request{,_to}`) do, minus the WebSocket send that a
+        /// native test cannot perform.
+        ///
+        /// The current/legacy branch mirrors `NodeDelegateChannel`'s. Both
+        /// halves are pinned by
+        /// `the_harness_mirrors_the_production_correlation_sites`.
+        fn register_waiter(
+            target: &DelegateKey,
+            request: &ChatDelegateRequestMsg,
+        ) -> PendingDelegateRequest {
+            let key_bytes = if is_current_delegate_key(target) {
+                get_request_key(request)
+            } else {
+                legacy_scoped_correlation(target, &get_request_key(request))
+            };
+            let (sender, receiver) = oneshot::channel();
+            PENDING_REQUESTS
+                .lock()
+                .expect("pending requests lock")
+                .insert(key_bytes.clone(), sender);
+            PendingDelegateRequest {
+                receiver,
+                key_bytes,
+            }
+        }
+
+        /// Route a storage response the way the single scoping site in
+        /// `response_handler.rs` does: one shared correlation base, scoped by
+        /// the RESPONDING delegate when that delegate is a legacy one.
+        /// Returns whether it completed a waiter (`completed` in production,
+        /// the flag that gates the sweep's duplicate-migration spawn).
+        fn route_response(responding: &DelegateKey, response: ChatDelegateResponseMsg) -> bool {
+            let Some(base) = response_correlation_base(&response) else {
+                return false;
+            };
+            let key = if is_legacy_delegate_key(responding.bytes()) {
+                legacy_scoped_correlation(responding, &base)
+            } else {
+                base
+            };
+            complete_pending_request(&ChatDelegateKey::new(key), response)
+        }
+
+        // ---------------- the scripted node ----------------
+
+        type Store = BTreeMap<Vec<u8>, Vec<u8>>;
+
+        /// A request whose waiter is registered and which the node has not
+        /// yet answered — i.e. genuinely in flight.
+        struct Sent {
+            target: DelegateKey,
+            request: ChatDelegateRequestMsg,
+        }
+
+        /// What the node answered, and whether that answer found a waiter.
+        struct Delivery {
+            delegate: Vec<u8>,
+            storage_key: Option<Vec<u8>>,
+            completed: bool,
+        }
+
+        /// Hold requests to one `(delegate, storage key)` unanswered until
+        /// either a request to `until` has been answered or `release()` is
+        /// called. This is what makes the two drivers' reads genuinely
+        /// SIMULTANEOUS — both waiters registered and both requests
+        /// unanswered at the same instant — rather than merely adjacent.
+        struct Hold {
+            hold: (Vec<u8>, Vec<u8>),
+            until: Option<(Vec<u8>, Vec<u8>)>,
+            released: bool,
+            parked: Vec<Sent>,
+        }
+
+        #[derive(Default)]
+        struct TestNode {
+            stores: RefCell<HashMap<Vec<u8>, Store>>,
+            inbox: RefCell<VecDeque<Sent>>,
+            hold: RefCell<Option<Hold>>,
+            delivered: RefCell<Vec<Delivery>>,
+        }
+
+        fn request_storage_key(request: &ChatDelegateRequestMsg) -> Option<Vec<u8>> {
+            match request {
+                ChatDelegateRequestMsg::GetRequest { key }
+                | ChatDelegateRequestMsg::StoreRequest { key, .. } => Some(key.as_bytes().to_vec()),
+                _ => None,
+            }
+        }
+
+        fn is_for(sent: &Sent, delegate: &[u8], storage_key: &[u8]) -> bool {
+            sent.target.bytes() == delegate
+                && request_storage_key(&sent.request).as_deref() == Some(storage_key)
+        }
+
+        impl TestNode {
+            fn put(&self, delegate: &DelegateKey, key: &[u8], value: Vec<u8>) {
+                self.stores
+                    .borrow_mut()
+                    .entry(delegate.bytes().to_vec())
+                    .or_default()
+                    .insert(key.to_vec(), value);
+            }
+
+            fn stored(&self, delegate: &DelegateKey, key: &[u8]) -> Option<Vec<u8>> {
+                self.stores
+                    .borrow()
+                    .get(delegate.bytes())
+                    .and_then(|s| s.get(key).cloned())
+            }
+
+            fn hold_until(
+                &self,
+                hold: (&DelegateKey, &[u8]),
+                until: Option<(&DelegateKey, &[u8])>,
+            ) {
+                *self.hold.borrow_mut() = Some(Hold {
+                    hold: (hold.0.bytes().to_vec(), hold.1.to_vec()),
+                    until: until.map(|(d, k)| (d.bytes().to_vec(), k.to_vec())),
+                    released: false,
+                    parked: Vec::new(),
+                });
+            }
+
+            fn release(&self) {
+                if let Some(hold) = self.hold.borrow_mut().as_mut() {
+                    hold.released = true;
+                }
+            }
+
+            /// Is a request for `(delegate, storage_key)` currently parked —
+            /// waiter registered, answer withheld?
+            fn holding(&self, delegate: &DelegateKey, storage_key: &[u8]) -> bool {
+                self.hold.borrow().as_ref().is_some_and(|h| {
+                    h.parked
+                        .iter()
+                        .any(|s| is_for(s, delegate.bytes(), storage_key))
+                })
+            }
+
+            fn send(&self, target: DelegateKey, request: ChatDelegateRequestMsg) {
+                self.inbox.borrow_mut().push_back(Sent { target, request });
+            }
+
+            fn reply_for(
+                &self,
+                target: &DelegateKey,
+                request: &ChatDelegateRequestMsg,
+            ) -> ChatDelegateResponseMsg {
+                let mut stores = self.stores.borrow_mut();
+                let store = stores.entry(target.bytes().to_vec()).or_default();
+                match request {
+                    ChatDelegateRequestMsg::ListRequest => ChatDelegateResponseMsg::ListResponse {
+                        keys: store.keys().cloned().map(ChatDelegateKey::new).collect(),
+                    },
+                    ChatDelegateRequestMsg::GetRequest { key } => {
+                        ChatDelegateResponseMsg::GetResponse {
+                            key: key.clone(),
+                            value: store.get(key.as_bytes()).cloned(),
+                        }
+                    }
+                    ChatDelegateRequestMsg::StoreRequest { key, value } => {
+                        store.insert(key.as_bytes().to_vec(), value.clone());
+                        ChatDelegateResponseMsg::StoreResponse {
+                            key: key.clone(),
+                            value_size: value.len(),
+                            result: Ok(()),
+                        }
+                    }
+                    other => panic!("test node: unsupported request {other:?}"),
+                }
+            }
+
+            fn answer(&self, sent: Sent) {
+                let response = self.reply_for(&sent.target, &sent.request);
+                let completed = route_response(&sent.target, response);
+                self.delivered.borrow_mut().push(Delivery {
+                    delegate: sent.target.bytes().to_vec(),
+                    storage_key: request_storage_key(&sent.request),
+                    completed,
+                });
+            }
+
+            /// One unit of node work. `false` means "nothing to do right now".
+            fn step(&self) -> bool {
+                let next = self.inbox.borrow_mut().pop_front();
+                let Some(sent) = next else {
+                    let ready = {
+                        let mut hold = self.hold.borrow_mut();
+                        match hold.as_mut() {
+                            Some(h) if h.released => std::mem::take(&mut h.parked),
+                            _ => Vec::new(),
+                        }
+                    };
+                    if ready.is_empty() {
+                        return false;
+                    }
+                    for sent in ready {
+                        self.answer(sent);
+                    }
+                    return true;
+                };
+
+                let park = {
+                    let hold = self.hold.borrow();
+                    hold.as_ref()
+                        .is_some_and(|h| !h.released && is_for(&sent, &h.hold.0, &h.hold.1))
+                };
+                if park {
+                    if let Some(h) = self.hold.borrow_mut().as_mut() {
+                        h.parked.push(sent);
+                    }
+                    return true;
+                }
+
+                let releases = {
+                    let hold = self.hold.borrow();
+                    hold.as_ref()
+                        .is_some_and(|h| h.until.as_ref().is_some_and(|(d, k)| is_for(&sent, d, k)))
+                };
+                self.answer(sent);
+                if releases {
+                    self.release();
+                }
+                true
+            }
+
+            fn completed_for(&self, delegate: &DelegateKey, storage_key: &[u8]) -> Vec<bool> {
+                self.delivered
+                    .borrow()
+                    .iter()
+                    .filter(|d| {
+                        d.delegate == delegate.bytes()
+                            && d.storage_key.as_deref() == Some(storage_key)
+                    })
+                    .map(|d| d.completed)
+                    .collect()
+            }
+        }
+
+        /// The transport under test: the walk's own requests, but registered
+        /// in and completed through the real registry.
+        struct RegistryChannel<'a> {
+            node: &'a TestNode,
+        }
+
+        impl RegistryChannel<'_> {
+            fn outcome(
+                pending: PendingDelegateRequest,
+            ) -> impl Future<Output = Result<Option<ChatDelegateResponseMsg>, String>> {
+                async move {
+                    // The SAME mapping `NodeDelegateChannel` applies, including
+                    // "cancelled is a displaced waiter, never an answer".
+                    match await_delegate_response_outcome(pending).await {
+                        DelegateAwaitOutcome::Response(resp) => Ok(Some(resp)),
+                        DelegateAwaitOutcome::TimedOut => Ok(None),
+                        DelegateAwaitOutcome::Cancelled => Err(
+                            "delegate response waiter was displaced by a concurrent request"
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
+        }
+
+        impl RiverDelegateChannel for RegistryChannel<'_> {
+            async fn request(
+                &self,
+                target: &DelegateKey,
+                request: ChatDelegateRequestMsg,
+            ) -> Result<Option<ChatDelegateResponseMsg>, String> {
+                let pending = register_waiter(target, &request);
+                self.node.send(target.clone(), request);
+                Self::outcome(pending).await
+            }
+
+            async fn request_all(
+                &self,
+                requests: Vec<(DelegateKey, ChatDelegateRequestMsg)>,
+            ) -> Vec<Result<Option<ChatDelegateResponseMsg>, String>> {
+                // Register + send every request before awaiting any, the same
+                // shape `NodeDelegateChannel::request_all` uses.
+                let mut pending = Vec::with_capacity(requests.len());
+                for (target, request) in requests {
+                    pending.push(register_waiter(&target, &request));
+                    self.node.send(target, request);
+                }
+                futures::future::join_all(pending.into_iter().map(Self::outcome)).await
+            }
+        }
+
+        /// Records what the walk imported, without touching Dioxus signals.
+        #[derive(Default)]
+        struct RecordingSeam {
+            room_merges: Vec<u32>,
+            dm_merges: usize,
+            flushes: usize,
+        }
+
+        impl RiverImportSeam for RecordingSeam {
+            async fn merge_rooms(&mut self, _rooms: Rooms, source_rank: u32) -> Result<(), String> {
+                self.room_merges.push(source_rank);
+                Ok(())
+            }
+            async fn merge_outbound_dms(&mut self, _store: OutboundDmStore) -> Result<(), String> {
+                self.dm_merges += 1;
+                Ok(())
+            }
+            async fn flush(&mut self) -> Result<(), String> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        /// Drive the node until every driver has finished. Bounded so a
+        /// regression fails the test instead of hanging it (or burning the
+        /// real 10 s response timeout per outstanding request).
+        async fn pump(node: &TestNode, live: &Cell<usize>) {
+            let mut idle = 0usize;
+            loop {
+                if node.step() {
+                    idle = 0;
+                    continue;
+                }
+                if live.get() == 0 {
+                    return;
+                }
+                idle += 1;
+                assert!(
+                    idle < 20_000,
+                    "test node made no progress with {} driver(s) still live",
+                    live.get()
+                );
+                if idle == 10_000 {
+                    // Nothing left to answer but a driver is still waiting:
+                    // let anything parked through so the test reports a real
+                    // assertion failure rather than a timeout.
+                    node.release();
+                }
+                yield_now().await;
+            }
+        }
+
+        /// The first two entries of the REAL legacy registry. Real keys are
+        /// what make `is_legacy_delegate_key` (and therefore the response-side
+        /// scoping decision) behave as it does in production; two entries is
+        /// enough for the property and keeps the walk short.
+        fn real_lineage() -> Vec<freenet_migrate::DelegateLineageEntry> {
+            let pairs = legacy_delegate_pairs();
+            assert!(
+                pairs.len() >= 2,
+                "these tests need at least two real legacy delegate generations"
+            );
+            river_delegate_lineage(&pairs[..2])
+        }
+
+        fn lineage_key(entry: &freenet_migrate::DelegateLineageEntry) -> DelegateKey {
+            DelegateKey::new(entry.delegate_key, CodeHash::new(entry.code_hash))
+        }
+
+        fn room_slot_bytes(owner: VerifyingKey, sk_seed: u8) -> Vec<u8> {
+            let mut room = crate::room_data::test_minimal_room_data(owner);
+            room.self_sk = Some(ed25519_dalek::SigningKey::from_bytes(&[sk_seed; 32]));
+            let mut out = Vec::new();
+            ciborium::ser::into_writer(&RoomSlot::Present(Box::new(room)), &mut out)
+                .expect("serialize room slot");
+            out
+        }
+
+        // ---------------- the tests ----------------
+
+        /// **The property B1 broke.** A legacy delegate's reply must complete
+        /// the waiter the legacy read registered, and must NOT complete a
+        /// concurrently-outstanding CURRENT-delegate waiter for the same
+        /// storage key.
+        ///
+        /// Both drivers are in flight against `room:<vk>` at once: the crate
+        /// walk reads it from a real legacy delegate (delegate-scoped
+        /// correlation) while a sweep-shaped reader reads the same storage
+        /// key from the current delegate (bare correlation). The node holds
+        /// the current-delegate answer until it has already answered the
+        /// legacy one, so at that instant both waiters are registered and
+        /// both requests unanswered.
+        ///
+        /// Collapse the scoping — `legacy_scoped_correlation` returning the
+        /// bare base, or the response side completing under the bare base —
+        /// and the two collide on one single-waiter slot: the walk's
+        /// registration displaces the sweep's waiter (`Cancelled`), the
+        /// legacy bytes are delivered to the bare key, and the
+        /// current-delegate reply finds no waiter at all.
+        #[test]
+        fn a_legacy_reply_reaches_the_legacy_reader_not_the_current_delegate_reader() {
+            let _guard = registry_guard();
+
+            let lineage = real_lineage();
+            let legacy = lineage_key(&lineage[0]);
+            let current = current_delegate_key();
+            // A room key no other test uses: the registry is process-global.
+            let owner = SigningKey::from_bytes(&[0xC1u8; 32]).verifying_key();
+            let storage_key = room_storage_key(&owner);
+
+            let node = TestNode::default();
+            node.put(&legacy, &storage_key, room_slot_bytes(owner, 0xC2));
+            node.put(&current, &storage_key, b"CURRENT-DELEGATE-COPY".to_vec());
+            // Withhold the current-delegate answer until the legacy one has
+            // been routed, so the two reads genuinely overlap.
+            node.hold_until((&current, &storage_key), Some((&legacy, &storage_key)));
+
+            let channel = RegistryChannel { node: &node };
+            let live = Cell::new(2usize);
+
+            let sweep = async {
+                let request = ChatDelegateRequestMsg::GetRequest {
+                    key: ChatDelegateKey::new(storage_key.clone()),
+                };
+                let pending = register_waiter(&current, &request);
+                node.send(current.clone(), request);
+                let outcome = await_delegate_response_outcome(pending).await;
+                live.set(live.get() - 1);
+                outcome
+            };
+            let walk = async {
+                let out = walk_with(
+                    &channel,
+                    RecordingSeam::default(),
+                    current.clone(),
+                    &lineage,
+                )
+                .await;
+                live.set(live.get() - 1);
+                out
+            };
+
+            let (sweep_outcome, (report, seam), ()) =
+                block_on(futures::future::join3(sweep, walk, pump(&node, &live)));
+
+            // 1. The sweep's read was satisfied by the CURRENT delegate's own
+            //    bytes — not displaced, and not handed the legacy copy.
+            match sweep_outcome {
+                DelegateAwaitOutcome::Response(ChatDelegateResponseMsg::GetResponse {
+                    key,
+                    value,
+                }) => {
+                    assert_eq!(key.as_bytes(), storage_key.as_slice());
+                    assert_eq!(
+                        value.as_deref(),
+                        Some(b"CURRENT-DELEGATE-COPY".as_slice()),
+                        "the current-delegate reader must receive the CURRENT delegate's \
+                         value; receiving the legacy copy means a legacy reply completed \
+                         a bare-key waiter"
+                    );
+                }
+                DelegateAwaitOutcome::Cancelled => panic!(
+                    "the current-delegate reader's waiter was DISPLACED by the walk's \
+                     legacy read — the two share one single-waiter slot, which is B1"
+                ),
+                DelegateAwaitOutcome::TimedOut => panic!(
+                    "the current-delegate reader's waiter was never completed — its reply \
+                     was routed to some other correlation key"
+                ),
+                DelegateAwaitOutcome::Response(other) => {
+                    panic!("expected the current delegate's GetResponse, got {other:?}")
+                }
+            }
+
+            // 2. Each reply found its own driver's waiter.
+            assert_eq!(
+                node.completed_for(&legacy, &storage_key),
+                vec![true],
+                "the legacy reply must complete the walk's delegate-scoped waiter"
+            );
+            assert_eq!(
+                node.completed_for(&current, &storage_key),
+                vec![true],
+                "the current-delegate reply must complete the sweep's bare waiter"
+            );
+
+            // 3. The walk imported the LEGACY copy and sealed its marker.
+            assert!(
+                !report.any_unresponsive(),
+                "no predecessor should be unresponsive here: {report:?}"
+            );
+            assert!(
+                seam.room_merges.contains(&0),
+                "the walk must have imported generation 0's room, got {:?}",
+                seam.room_merges
+            );
+            assert!(
+                node.stored(&current, &pred_done_marker_key(&legacy))
+                    .is_some(),
+                "a completed predecessor seals its durable done marker"
+            );
+        }
+
+        /// The registry really is single-waiter, and this harness can observe
+        /// it. Two reads of the SAME storage key on the SAME delegate derive
+        /// the SAME correlation key, so the second registration drops the
+        /// first's sender and the first resolves `Cancelled`.
+        ///
+        /// This is the documented residual the sweep's `!completed` gate
+        /// exists for — scoping separates DELEGATES, never two drivers on one
+        /// delegate — and it is what makes the assertions above trustworthy:
+        /// a harness in which displacement were impossible could not fail
+        /// them however the scoping was mutated.
+        #[test]
+        fn the_registry_displaces_a_second_waiter_for_the_same_correlation_key() {
+            let _guard = registry_guard();
+
+            let legacy = lineage_key(&real_lineage()[0]);
+            let owner = SigningKey::from_bytes(&[0xD1u8; 32]).verifying_key();
+            let storage_key = room_storage_key(&owner);
+            let request = ChatDelegateRequestMsg::GetRequest {
+                key: ChatDelegateKey::new(storage_key.clone()),
+            };
+
+            let first = register_waiter(&legacy, &request);
+            let second = register_waiter(&legacy, &request);
+
+            assert!(
+                route_response(
+                    &legacy,
+                    ChatDelegateResponseMsg::GetResponse {
+                        key: ChatDelegateKey::new(storage_key.clone()),
+                        value: Some(b"LEGACY".to_vec()),
+                    },
+                ),
+                "the reply must complete the surviving waiter"
+            );
+
+            assert!(
+                matches!(
+                    block_on(await_delegate_response_outcome(first)),
+                    DelegateAwaitOutcome::Cancelled
+                ),
+                "the displaced waiter must resolve Cancelled, never an answer"
+            );
+            assert!(
+                matches!(
+                    block_on(await_delegate_response_outcome(second)),
+                    DelegateAwaitOutcome::Response(ChatDelegateResponseMsg::GetResponse { .. })
+                ),
+                "the surviving waiter receives the reply"
+            );
+        }
+
+        /// **Neither driver's completion marker attests to the other's
+        /// import.** The sweep and the walk read the same key from the same
+        /// legacy delegate; they share one correlation slot, the sweep's
+        /// registration displaces the walk's, and the sweep gets the data.
+        /// The walk must then record the predecessor `Unresponsive` and write
+        /// NO done marker — a marker here would claim, durably and for every
+        /// future page load, that the walk imported bytes it never saw.
+        #[test]
+        fn a_displaced_walk_read_seals_no_marker_though_the_other_driver_got_the_data() {
+            let _guard = registry_guard();
+
+            let lineage = real_lineage();
+            let legacy = lineage_key(&lineage[0]);
+            let current = current_delegate_key();
+            let owner = SigningKey::from_bytes(&[0xE1u8; 32]).verifying_key();
+            let storage_key = room_storage_key(&owner);
+
+            let node = TestNode::default();
+            node.put(&legacy, &storage_key, room_slot_bytes(owner, 0xE2));
+            // Hold the walk's own read of this key until the sweep has taken
+            // the slot from under it.
+            node.hold_until((&legacy, &storage_key), None);
+
+            let channel = RegistryChannel { node: &node };
+            let live = Cell::new(2usize);
+
+            let sweep = async {
+                // Wait until the walk's read for this exact (delegate, key) is
+                // in flight — registered and unanswered.
+                while !node.holding(&legacy, &storage_key) {
+                    yield_now().await;
+                }
+                let request = ChatDelegateRequestMsg::GetRequest {
+                    key: ChatDelegateKey::new(storage_key.clone()),
+                };
+                // Same delegate, same storage key: the SAME correlation key
+                // the walk registered. This drops the walk's sender.
+                let pending = register_waiter(&legacy, &request);
+                node.send(legacy.clone(), request);
+                node.release();
+                let outcome = await_delegate_response_outcome(pending).await;
+                live.set(live.get() - 1);
+                outcome
+            };
+            let walk = async {
+                let out = walk_with(
+                    &channel,
+                    RecordingSeam::default(),
+                    current.clone(),
+                    &lineage,
+                )
+                .await;
+                live.set(live.get() - 1);
+                out
+            };
+
+            let (sweep_outcome, (report, seam), ()) =
+                block_on(futures::future::join3(sweep, walk, pump(&node, &live)));
+
+            // The other driver really did read the data.
+            match sweep_outcome {
+                DelegateAwaitOutcome::Response(ChatDelegateResponseMsg::GetResponse {
+                    value,
+                    ..
+                }) => assert!(
+                    value.is_some(),
+                    "the sweep-shaped reader must have received the legacy room"
+                ),
+                other => panic!(
+                    "the surviving waiter must receive the reply, got {}",
+                    outcome_name(&other)
+                ),
+            }
+
+            // The walk saw none of it, and says so.
+            assert!(
+                seam.room_merges.is_empty(),
+                "a displaced read is not an import: {:?}",
+                seam.room_merges
+            );
+            assert!(
+                report.any_unresponsive(),
+                "a displaced read must classify the predecessor Unresponsive: {report:?}"
+            );
+            assert_eq!(
+                node.stored(&current, &pred_done_marker_key(&legacy)),
+                None,
+                "no done marker may be sealed for a predecessor the walk could not read \
+                 — the other driver's success is not the walk's, and the marker is what \
+                 every future page load trusts"
+            );
+        }
+
+        fn outcome_name(outcome: &DelegateAwaitOutcome) -> &'static str {
+            match outcome {
+                DelegateAwaitOutcome::Response(_) => "Response",
+                DelegateAwaitOutcome::TimedOut => "TimedOut",
+                DelegateAwaitOutcome::Cancelled => "Cancelled",
+            }
+        }
+
+        /// The harness above re-derives correlation keys rather than calling
+        /// the production send paths, because those paths cannot run natively
+        /// (`WEB_API` is `None`, `WebApi` is wasm-only). That re-derivation is
+        /// only trustworthy while it still matches production, so pin both
+        /// production sites textually. If a send path stops scoping by target
+        /// delegate — or `NodeDelegateChannel` stops choosing bare vs. scoped
+        /// by `is_current_delegate_key` — this fails rather than letting the
+        /// tests above quietly measure a shape production no longer has.
+        #[test]
+        fn the_harness_mirrors_the_production_correlation_sites() {
+            fn squeeze(s: &str) -> String {
+                s.chars().filter(|c| !c.is_whitespace()).collect()
+            }
+
+            // `chat_delegate.rs`'s own `mod tests` sits MID-FILE, with the
+            // send paths BELOW it, so there is no "production prefix" to split
+            // on here — the whole file is scraped. The needles are therefore
+            // assembled at runtime so this test's own source cannot match them
+            // (a literal needle would count itself, and the count would then
+            // stay right while production went wrong).
+            let derive = "get_request_key";
+            let bare = format!("letkey_bytes={derive}(&request);");
+            let scoped = format!(
+                "letkey_bytes=legacy_scoped_correlation(&delegate_key,&{derive}(&request));"
+            );
+
+            let chat_delegate = squeeze(include_str!("chat_delegate.rs"));
+            assert_eq!(
+                chat_delegate.matches(&bare).count(),
+                2,
+                "send_delegate_request and enqueue_delegate_request must register the \
+                 CURRENT delegate's waiters under the bare correlation key"
+            );
+            assert_eq!(
+                chat_delegate.matches(&scoped).count(),
+                2,
+                "send_delegate_request_to and enqueue_delegate_request_to must scope a \
+                 non-current delegate's waiters by the target delegate"
+            );
+
+            let migration = squeeze(
+                include_str!("freenet_api/delegate_migration.rs")
+                    .split("mod tests {")
+                    .next()
+                    .expect("production code before `mod tests`"),
+            );
+            assert_eq!(
+                migration
+                    .matches("chat_delegate::is_current_delegate_key(")
+                    .count(),
+                2,
+                "NodeDelegateChannel's request and request_all must each choose bare vs. \
+                 delegate-scoped correlation from is_current_delegate_key"
+            );
+        }
+    }
 }
 
 /// Remove a `room_owner_vk` from the per-session ensure-subscription dedup
