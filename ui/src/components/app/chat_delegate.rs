@@ -5218,6 +5218,30 @@ mod tests {
                 "NodeDelegateChannel's request and request_all must each choose bare vs. \
                  delegate-scoped correlation from is_current_delegate_key"
             );
+
+            // The response half of the mirror. `route_response` above cannot
+            // call the production site: the scoping decision lives inside
+            // `handle_api_response`, which needs a `RoomSynchronizer` and the
+            // Dioxus signals, so nothing native can drive it. Pin its shape
+            // instead, or reverting the B1 fix — completing under the BARE
+            // base — would leave `route_response` mirroring a production path
+            // that no longer exists, and the tests above would keep passing
+            // while production was broken. (`response_handler_derives_correlation_keys_from_one_place`
+            // pins the same site more thoroughly; this deliberately overlaps
+            // so the harness's own faithfulness is checked where the harness
+            // is, not only somewhere else.)
+            let response_handler = squeeze(
+                include_str!("freenet_api/response_handler.rs")
+                    .split("mod tests {")
+                    .next()
+                    .expect("production code before `mod tests`"),
+            );
+            assert!(
+                response_handler.contains("complete_pending_request(&scoped(base)"),
+                "the storage-response completion must scope the shared correlation base \
+                 by the RESPONDING delegate; completing under the bare base is B1, and \
+                 route_response would then no longer mirror production"
+            );
         }
     }
 }
