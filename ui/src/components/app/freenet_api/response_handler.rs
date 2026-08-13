@@ -11,16 +11,16 @@ mod update_response;
 use super::error::SynchronizerError;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    arm_legacy_migration_recovery, await_delegate_response, cas_store_correlation_key,
-    clear_legacy_migration_in_progress, complete_pending_public_key_request,
-    complete_pending_request, complete_pending_sign_request, complete_pending_signing_key_request,
-    current_delegate_source_rank, decide_legacy_migration_action, decide_per_room_load_action,
-    enqueue_delegate_request, fire_legacy_migration_request, get_versioned_correlation_key,
-    hydrate_hidden_dm_threads, hydrate_outbound_dms_cache, is_legacy_delegate_key,
-    is_legacy_migration_in_progress, legacy_scoped_correlation, load_state_after_probe_legacy,
-    mark_legacy_migration_done, mark_legacy_migration_in_progress, parse_room_storage_key,
-    per_room_terminal, prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence,
-    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
+    arm_legacy_migration_recovery, await_delegate_response, clear_legacy_migration_in_progress,
+    complete_pending_public_key_request, complete_pending_request, complete_pending_sign_request,
+    complete_pending_signing_key_request, current_delegate_source_rank,
+    decide_legacy_migration_action, decide_per_room_load_action, enqueue_delegate_request,
+    fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
+    is_legacy_delegate_key, is_legacy_migration_in_progress, legacy_scoped_correlation,
+    load_state_after_probe_legacy, mark_legacy_migration_done, mark_legacy_migration_in_progress,
+    parse_room_storage_key, per_room_terminal, prune_outbound_dms_for_purges,
+    request_legacy_seal_on_quiescence, response_correlation_base, room_storage_key,
+    save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
     send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
     LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
     OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
@@ -202,51 +202,30 @@ impl ResponseHandler {
                                         )
                                     };
 
-                                // Try to complete any pending request waiting for this response
+                                // Try to complete any pending request waiting for this response.
+                                //
+                                // Every storage response derives its correlation base from the
+                                // SINGLE shared `response_correlation_base` (the mirror of
+                                // `get_request_key`) and is scoped HERE, in one place. It used
+                                // to be six hand-written per-variant arms, and `ListResponse`
+                                // was the one that forgot `scoped()` — leaving every legacy
+                                // `ListRequest` waiter uncompletable and the crate walk dead.
+                                // Do NOT reintroduce per-variant key construction: a variant
+                                // that builds its own key can silently skip the scoping again.
                                 let completed = match &response {
-                                    // Key-value storage responses
-                                    ChatDelegateResponseMsg::GetResponse { key: skey, .. } => {
-                                        complete_pending_request(
-                                            &scoped(skey.as_bytes().to_vec()),
-                                            response.clone(),
-                                        )
-                                    }
-                                    ChatDelegateResponseMsg::StoreResponse { key: skey, .. } => {
-                                        complete_pending_request(
-                                            &scoped(skey.as_bytes().to_vec()),
-                                            response.clone(),
-                                        )
-                                    }
-                                    ChatDelegateResponseMsg::DeleteResponse { key: skey, .. } => {
-                                        complete_pending_request(
-                                            &scoped(skey.as_bytes().to_vec()),
-                                            response.clone(),
-                                        )
-                                    }
-                                    // CAS storage responses (freenet/river#345) correlate on
-                                    // DISTINCT keys (prefix + storage key) so they can't be
-                                    // confused with a concurrent plain Get/Store for the same
-                                    // storage key. Rebuild the same correlation key the request
-                                    // registered under (delegate-scoped too, for legacy).
-                                    ChatDelegateResponseMsg::GetVersionedResponse { key: skey, .. } => {
-                                        complete_pending_request(
-                                            &scoped(get_versioned_correlation_key(skey)),
-                                            response.clone(),
-                                        )
-                                    }
-                                    ChatDelegateResponseMsg::CasStoreResponse { key: skey, .. } => {
-                                        complete_pending_request(
-                                            &scoped(cas_store_correlation_key(skey)),
-                                            response.clone(),
-                                        )
-                                    }
-                                    ChatDelegateResponseMsg::ListResponse { .. } => {
-                                        // Use the special list request key
-                                        let list_key =
-                                            river_core::chat_delegate::ChatDelegateKey::new(
-                                                b"__list_request__".to_vec(),
-                                            );
-                                        complete_pending_request(&list_key, response.clone())
+                                    ChatDelegateResponseMsg::GetResponse { .. }
+                                    | ChatDelegateResponseMsg::StoreResponse { .. }
+                                    | ChatDelegateResponseMsg::DeleteResponse { .. }
+                                    | ChatDelegateResponseMsg::GetVersionedResponse { .. }
+                                    | ChatDelegateResponseMsg::CasStoreResponse { .. }
+                                    | ChatDelegateResponseMsg::ListResponse { .. } => {
+                                        match response_correlation_base(&response) {
+                                            Some(base) => complete_pending_request(
+                                                &scoped(base),
+                                                response.clone(),
+                                            ),
+                                            None => false,
+                                        }
                                     }
                                     // Signing key management responses
                                     ChatDelegateResponseMsg::StoreSigningKeyResponse {
@@ -463,6 +442,17 @@ impl ResponseHandler {
                                             // processing match still runs for every
                                             // response, so swallow these here rather
                                             // than warning "unexpected key".
+                                        } else if crate::components::app::freenet_api::delegate_migration::is_migration_marker_key(
+                                            key.as_bytes(),
+                                        ) {
+                                            // Crate-walk per-predecessor markers. Like the
+                                            // per-room keys above, these are consumed by the
+                                            // awaiting walk via the pending-request registry;
+                                            // the processing match still runs for every
+                                            // response. Without this branch a single walk
+                                            // logged ~54 "Unexpected key" warnings per page
+                                            // load — noise that trains the reader to ignore a
+                                            // warning that is meant to indicate a real gap.
                                         } else {
                                             warn!(
                                                 "Unexpected key in GetResponse: {:?}",
@@ -483,10 +473,45 @@ impl ResponseHandler {
                                         // GETs can be awaited without blocking the message
                                         // loop (the responses arrive through this loop).
                                         if is_legacy_delegate {
-                                            let legacy_key = key.clone();
-                                            crate::util::safe_spawn_local(async move {
-                                                migrate_legacy_per_room(legacy_key, keys).await;
-                                            });
+                                            // Suppresses the DUPLICATE migration when the crate
+                                            // walk is also probing this delegate. Two concurrent
+                                            // `migrate_legacy_per_room` runs share the walk's
+                                            // scoped correlation keys, so they displace each
+                                            // other in the single-waiter map — `Cancelled` reads,
+                                            // and a possible false `LoadFailed` for a user whose
+                                            // migration actually SUCCEEDED.
+                                            //
+                                            // Be precise about WHY this is sufficient, because
+                                            // the obvious reason is the wrong one. Responses bind
+                                            // to waiters by CORRELATION KEY, not by which send
+                                            // produced them: the sweep's `ListRequest` and the
+                                            // walk's go to the same delegate under the same
+                                            // scoped key, so the sweep's response can perfectly
+                                            // well complete the WALK's waiter. Which response
+                                            // sees `completed == true` is interleaving-dependent.
+                                            //
+                                            // What makes it safe is a COUNTING argument: the
+                                            // sweep's probe registers no waiter (it is
+                                            // fire-and-forget), so N responses meet at most N-1
+                                            // walk waiters, and at least one response therefore
+                                            // falls through to spawn the migration exactly once.
+                                            //
+                                            // Two reachable exceptions, both fail-safe and both
+                                            // recovered by the durable markers on the next page
+                                            // load, neither losing data:
+                                            //  * a walk waiter times out (10 s) and is evicted
+                                            //    before its response lands — the late response
+                                            //    then spawns a migration that can overlap the
+                                            //    sweep-driven one;
+                                            //  * the sweep's send fails while the walk's
+                                            //    succeeds — the walk consumes the only response
+                                            //    and no sweep migration spawns this load.
+                                            if !completed {
+                                                let legacy_key = key.clone();
+                                                crate::util::safe_spawn_local(async move {
+                                                    migrate_legacy_per_room(legacy_key, keys).await;
+                                                });
+                                            }
                                         } else {
                                             crate::util::safe_spawn_local(async move {
                                                 load_rooms_per_room(keys).await;

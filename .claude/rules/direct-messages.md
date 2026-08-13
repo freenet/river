@@ -108,7 +108,14 @@ plaintext in the chat delegate.
   round-trip tests pin both shapes.
 - **UI in-memory cache**: `OUTBOUND_DMS: GlobalSignal<OutboundDmsCache>`
   keyed by `(VerifyingKey, MemberId, PurgeToken)`. Hydrated by
-  `fire_load_outbound_dms_request`.
+  `fire_load_outbound_dms_request`, and also by the crate walk's
+  `LiveImportSeam::merge_outbound_dms`. The hydrate helpers come in two
+  forms: the public `hydrate_*` wrappers defer their signal writes through
+  `util::defer`, while the `hydrate_*_now` cores do NOT and must therefore
+  only ever be called from inside a `defer` closure. The walk needs the
+  `_now` form because it has to know when the write has landed before it
+  flushes and seals a migration marker — deferring made `flush` snapshot
+  the pre-merge cache and seal `Done` over DM data that was never saved.
 - **Render path**: both `DmThreadModalBody` and `riverctl dm list` go
   through the shared pure helper
   `lookup_outbound_plaintext(cache, room, recipient, token)`. Cache
@@ -138,8 +145,9 @@ plaintext in the chat delegate.
 - **Legacy migration**: see `.claude/rules/river-publish.md` "How
   Delegate Migration Works". `outbound_dms` is a FIXED single key, so it
   must stay in the `storage_keys` probe array in
-  `fire_legacy_migration_request` AND keep its routing in
-  `response_handler.rs`. (Dynamic key families like `room:<vk>` are
+  `fire_legacy_migration_request`, keep its routing in
+  `response_handler.rs`, AND stay in the crate walk's own fixed-probe list
+  in `delegate_migration.rs` (three sites, not two). (Dynamic key families like `room:<vk>` are
   instead discovered via the legacy `ListRequest` path — see river-publish.md
   for that carve-out. `outbound_dms` is NOT dynamic, so the fixed probe
   is the right mechanism for it.)
