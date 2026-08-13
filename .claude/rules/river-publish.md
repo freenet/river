@@ -161,7 +161,8 @@ where stale legacy data overwrites newer state on the current delegate
    List-driven, not a `GetRequest{rooms_data}`, because the per-room keys are
    dynamic and must be discovered.)
 2. `LEGACY_DELEGATES` is generated at compile time from `legacy_delegates.toml`
-   by `ui/build.rs`.
+   by `ui/build.rs`, which delegates the codegen itself to
+   `freenet_migrate_build::codegen()`.
 3. The current delegate's `ListResponse` is classified by `plan_load_from_keys`:
    - **Has `room:<vk>` keys** → `load_rooms_per_room` plain-GETs each slot
      (+ `rooms_meta`), reconstructs `Rooms`, and hydrates. What it does about
@@ -267,7 +268,8 @@ reads in the single-waiter registry. See the comment at that call site for the
 counting argument and its two exceptions.
 
 Release 2 retires the sweep; until then, treat the sweep as authoritative and
-the walk as additive.
+the walk as additive. The `freenet-migrate-adoption` skill covers the
+call-site swap, the dual-running period and the parity test.
 
 ## Migration Limitations
 
