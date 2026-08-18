@@ -56,22 +56,12 @@ for tool in fdev b3sum xxd tar python3 jq gh pointer-record pointer-codehash; do
 done
 [ -f "$TOML_PATH" ] || die "$TOML_PATH not found"
 
-field_of_record() {
-    awk -v want="$1" -v key="$2" '
-        /^\[\[record\]\]/ { i++; next }
-        i == want && $0 ~ "^"key"[ \t]*=" {
-            sub("^"key"[ \t]*=[ \t]*", ""); gsub(/^"|"$/, ""); print; exit
-        }
-    ' "$TOML_PATH"
-}
-top_level_field() {
-    awk -v key="$1" '
-        /^\[\[record\]\]/ { exit }
-        $0 ~ "^"key"[ \t]*=" {
-            sub("^"key"[ \t]*=[ \t]*", ""); gsub(/^"|"$/, ""); print; exit
-        }
-    ' "$TOML_PATH"
-}
+# The same shared reader the gate and the signer use. All three MUST agree
+# about what a record says — see scripts/pointer-toml-lib.sh.
+. "$(dirname "$0")/pointer-toml-lib.sh"
+
+field_of_record() { pointer_field "$TOML_PATH" "$1" "$2"; }
+top_level_field() { pointer_top_field "$TOML_PATH" "$1"; }
 
 AUTHOR_VK="$(top_level_field author_verifying_key)"
 POINTER_CODE_HASH="$(top_level_field pointer_code_hash)"

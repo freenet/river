@@ -43,28 +43,25 @@ command -v pointer-record >/dev/null 2>&1 || die "pointer-record not found — s
 
 # Refuse to sign against a key file anyone else can read. The author key is the
 # whole trust anchor for every integrator resolving a River pointer.
+#
+# Deliberately NOT `stat -L`: on a symlinked key file this reports the link's
+# own mode (typically 777) and refuses, which is the safe direction. Following
+# the link would report the target's mode and accept, which is the direction
+# that hides a surprise. A narrow TOCTOU window remains between this check and
+# the read below; it is not worth closing for a script a human runs while
+# holding the key, and closing it badly would be worse than naming it.
 PERMS="$(stat -c '%a' "$KEY_FILE")"
 case "$PERMS" in
     600|400) ;;
     *) die "$KEY_FILE has mode $PERMS; expected 600. Fix with: chmod 600 '$KEY_FILE'" ;;
 esac
 
-field_of_record() {
-    awk -v want="$1" -v key="$2" '
-        /^\[\[record\]\]/ { i++; next }
-        i == want && $0 ~ "^"key"[ \t]*=" {
-            sub("^"key"[ \t]*=[ \t]*", ""); gsub(/^"|"$/, ""); print; exit
-        }
-    ' "$TOML_PATH"
-}
-top_level_field() {
-    awk -v key="$1" '
-        /^\[\[record\]\]/ { exit }
-        $0 ~ "^"key"[ \t]*=" {
-            sub("^"key"[ \t]*=[ \t]*", ""); gsub(/^"|"$/, ""); print; exit
-        }
-    ' "$TOML_PATH"
-}
+# The same shared reader the gate uses — see scripts/pointer-toml-lib.sh for
+# why it is shared rather than copied.
+. "$(dirname "$0")/pointer-toml-lib.sh"
+
+field_of_record() { pointer_field "$TOML_PATH" "$1" "$2"; }
+top_level_field() { pointer_top_field "$TOML_PATH" "$1"; }
 
 AUTHOR_VK="$(top_level_field author_verifying_key)"
 [ -n "$AUTHOR_VK" ] || die "no author_verifying_key in $TOML_PATH"
@@ -125,7 +122,28 @@ for b in blocks[1:]:
     out.append(b)
 if hits != 1:
     sys.exit("expected exactly one [[record]] with app_id=%s, found %d" % (app_id, hits))
-open(path, 'w', encoding='utf-8').write('[[record]]'.join(out))
+
+# Write to a temp file in the same directory, then rename. `open(path, 'w')`
+# truncates FIRST and writes second, so an interrupt in between leaves the
+# registry empty or half-written with no backup — and this file is the gate's
+# oracle and the record of what we signed. os.replace is atomic within a
+# filesystem, so a reader sees either the old file or the new one, never a
+# fragment.
+import os, tempfile
+d = os.path.dirname(os.path.abspath(path)) or '.'
+fd, tmp = tempfile.mkstemp(dir=d, prefix='.pointer-records.', suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write('[[record]]'.join(out))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PY
     CHANGED=1
 done

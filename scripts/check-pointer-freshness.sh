@@ -53,63 +53,17 @@ command -v pointer-record >/dev/null 2>&1 || die "pointer-record not found. Inst
 
 # --------------------------------------------------------------------- parsing
 #
-# Deliberately line-oriented rather than a TOML library: this has to run in a CI
-# job whose only job is to check, and adding a Python/Rust TOML dependency to do
-# it would make the gate itself something that can fail to install. The schema is
-# ours and is three scalar keys per [[record]] block.
-#
-# `field_of_record N KEY` prints the value of KEY in the Nth [[record]] block.
-field_of_record() {
-    local n="$1" key="$2" src="${3:-$TOML_PATH}"
-    awk -v want="$n" -v key="$key" '
-        /^\[\[record\]\]/ { i++; next }
-        i == want && $0 ~ "^"key"[ \t]*=" {
-            sub("^"key"[ \t]*=[ \t]*", "")
-            gsub(/^"|"$/, "")
-            print
-            exit
-        }
-    ' "$src"
-}
+# One shared reader, in scripts/pointer-toml-lib.sh, used by this gate AND by
+# sign-pointer-records.sh. There used to be two near-identical copies; the two
+# disagreeing about what a record says is the worst failure available here,
+# because the signer would write something the gate reads differently.
+. "$(dirname "$0")/pointer-toml-lib.sh"
 
-record_count() { grep -c '^\[\[record\]\]' "$TOML_PATH"; }
-
-# Every app_id in a file, one per line, anchored so a `[[record]]` mentioned in
-# a comment cannot contribute one.
-app_ids_in() {
-    awk '/^app_id[ \t]*=/ { sub("^app_id[ \t]*=[ \t]*", ""); gsub(/^"|"$/, ""); print }' "$1"
-}
-
-# The 1-based record index carrying APP_ID in a file, or empty.
-#
-# Records are matched BY app_id and never by position. Matching by position
-# means reordering two blocks makes each index compare two DIFFERENT apps, so
-# the version check below skips both — a free way to republish at an old
-# version, which is a silent no-op on the network.
-index_of_app() {
-    awk -v want="$2" '
-        /^\[\[record\]\]/ { i++; next }
-        /^app_id[ \t]*=/ {
-            v = $0
-            sub("^app_id[ \t]*=[ \t]*", "", v)
-            gsub(/^"|"$/, "", v)
-            if (v == want) { print i; exit }
-        }
-    ' "$1"
-}
-
-top_level_field() {
-    local key="$1" src="${2:-$TOML_PATH}"
-    awk -v key="$key" '
-        /^\[\[record\]\]/ { exit }
-        $0 ~ "^"key"[ \t]*=" {
-            sub("^"key"[ \t]*=[ \t]*", "")
-            gsub(/^"|"$/, "")
-            print
-            exit
-        }
-    ' "$src"
-}
+field_of_record() { pointer_field "${3:-$TOML_PATH}" "$1" "$2"; }
+top_level_field() { pointer_top_field "${2:-$TOML_PATH}" "$1"; }
+record_count()    { pointer_record_count "$TOML_PATH"; }
+app_ids_in()      { pointer_app_ids "$1"; }
+index_of_app()    { pointer_index_of_app "$1" "$2"; }
 
 wasm_hash_at_ref() {
     local ref="$1" path="$2"
