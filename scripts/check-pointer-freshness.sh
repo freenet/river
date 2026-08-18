@@ -74,6 +74,30 @@ field_of_record() {
 
 record_count() { grep -c '^\[\[record\]\]' "$TOML_PATH"; }
 
+# Every app_id in a file, one per line, anchored so a `[[record]]` mentioned in
+# a comment cannot contribute one.
+app_ids_in() {
+    awk '/^app_id[ \t]*=/ { sub("^app_id[ \t]*=[ \t]*", ""); gsub(/^"|"$/, ""); print }' "$1"
+}
+
+# The 1-based record index carrying APP_ID in a file, or empty.
+#
+# Records are matched BY app_id and never by position. Matching by position
+# means reordering two blocks makes each index compare two DIFFERENT apps, so
+# the version check below skips both — a free way to republish at an old
+# version, which is a silent no-op on the network.
+index_of_app() {
+    awk -v want="$2" '
+        /^\[\[record\]\]/ { i++; next }
+        /^app_id[ \t]*=/ {
+            v = $0
+            sub("^app_id[ \t]*=[ \t]*", "", v)
+            gsub(/^"|"$/, "", v)
+            if (v == want) { print i; exit }
+        }
+    ' "$1"
+}
+
 top_level_field() {
     local key="$1" src="${2:-$TOML_PATH}"
     awk -v key="$key" '
@@ -155,11 +179,21 @@ FAILED=0
 if [ "$MODE" = "ci" ]; then
     BASE_TOML_ALL="$(mktemp)"
     if git show "$BASE_SHA:$TOML_PATH" > "$BASE_TOML_ALL" 2>/dev/null; then
+        # Compared as exact STRINGS via `grep -qxF` against the head file's
+        # extracted app_id list — never by interpolating the app_id into a
+        # regex. Both real app_ids contain a `.`, which is a regex wildcard, so
+        # an `-E` match would have accepted `riverXroom-contract` as proof that
+        # `river.room-contract` is still present. A rename is exactly the
+        # deletion this check exists to catch, so that is the one input that
+        # must not slip through.
+        HEAD_APPS="$(mktemp)"
+        app_ids_in "$TOML_PATH" > "$HEAD_APPS"
         MISSING=""
         while IFS= read -r base_app; do
             [ -z "$base_app" ] && continue
-            grep -qE "^app_id[ \t]*=[ \t]*\"$base_app\"" "$TOML_PATH" || MISSING="$MISSING $base_app"
-        done < <(grep -E '^app_id[ \t]*=' "$BASE_TOML_ALL" | sed 's/.*= *"\([^"]*\)".*/\1/')
+            grep -qxF "$base_app" "$HEAD_APPS" || MISSING="$MISSING $base_app"
+        done < <(app_ids_in "$BASE_TOML_ALL")
+        rm -f "$HEAD_APPS"
         if [ -n "$MISSING" ]; then
             echo "FAILED: a pointer record present at the base commit is GONE at head:"
             for m in $MISSING; do echo "    $m"; done
@@ -243,13 +277,18 @@ for i in $(seq 1 "$N"); do
     if [ "$MODE" = "ci" ]; then
         BASE_TOML="$(mktemp)"
         if git show "$BASE_SHA:$TOML_PATH" > "$BASE_TOML" 2>/dev/null; then
-            BASE_STATE="$(field_of_record "$i" state "$BASE_TOML")"
-            BASE_VERSION="$(field_of_record "$i" version "$BASE_TOML")"
-            BASE_APP="$(field_of_record "$i" app_id "$BASE_TOML")"
-            # Index-matched, so only compare when it is the same record. A
-            # reordered or inserted record would otherwise compare two different
-            # apps' versions and report nonsense.
-            if [ "$BASE_APP" = "$APP_ID" ] && [ -n "$BASE_STATE" ]; then
+            # Looked up BY app_id. An index-matched lookup skips this check
+            # whenever the two blocks are reordered — for each index the base
+            # and head apps differ, so both records dodge the version gate at
+            # once, in a diff where nothing signals "skip me".
+            BASE_I="$(index_of_app "$BASE_TOML" "$APP_ID")"
+            BASE_STATE=""
+            BASE_VERSION=""
+            if [ -n "$BASE_I" ]; then
+                BASE_STATE="$(field_of_record "$BASE_I" state "$BASE_TOML")"
+                BASE_VERSION="$(field_of_record "$BASE_I" version "$BASE_TOML")"
+            fi
+            if [ -n "$BASE_STATE" ]; then
                 if [ "$BASE_STATE" != "$STATE" ] && [ "$VERSION" -le "$BASE_VERSION" ]; then
                     echo "  FAILED: the record changed but version did not increase"
                     echo "    base ($BASE_SHA): version $BASE_VERSION"
