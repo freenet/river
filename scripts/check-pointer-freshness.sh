@@ -49,7 +49,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 command -v b3sum >/dev/null 2>&1 || die "b3sum not found. Install with: cargo install b3sum"
 command -v pointer-record >/dev/null 2>&1 || die "pointer-record not found. Install with:
-  cargo install --git $POINTER_TOOL_REPO --rev $POINTER_TOOL_REV --features publish freenet-pointer-contract"
+  cargo install --git $POINTER_TOOL_REPO --rev $POINTER_TOOL_REV --features publish --locked freenet-pointer-contract"
 
 # --------------------------------------------------------------------- parsing
 #
