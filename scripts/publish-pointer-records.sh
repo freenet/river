@@ -48,9 +48,12 @@ done
 # path and testing against it is explicitly out of bounds.
 [ "$PORT" != "7509" ] || die "port 7509 is the production gateway — publish through your own node"
 
-command -v fdev >/dev/null 2>&1 || die "fdev not found"
-command -v b3sum >/dev/null 2>&1 || die "b3sum not found"
-command -v pointer-record >/dev/null 2>&1 || die "pointer-record not found"
+# Every external tool this script calls, checked up front. A `command not
+# found` in the middle of the publish sequence is the worst place to discover
+# one, because some records may already be on the network by then.
+for tool in fdev b3sum xxd tar python3 jq gh pointer-record pointer-codehash; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool not found (needed by this script)"
+done
 [ -f "$TOML_PATH" ] || die "$TOML_PATH not found"
 
 field_of_record() {
@@ -94,23 +97,27 @@ ORIGIN_SHA="$(git rev-parse origin/main)"
 [ "$HEAD_SHA" = "$ORIGIN_SHA" ] || die "HEAD ($HEAD_SHA) != origin/main ($ORIGIN_SHA). Pull first."
 say "HEAD == origin/main == $HEAD_SHA"
 
-if command -v gh >/dev/null 2>&1; then
-    # Non-SUCCESS conclusions include failure, cancelled and timed_out; a
-    # still-running check is also not a green signal.
-    BAD="$(gh run list --repo freenet/river --commit "$HEAD_SHA" \
-             --json conclusion,status,name \
-             --jq '[.[] | select(.status != "completed" or (.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral"))] | length' 2>/dev/null || echo "?")"
-    if [ "$BAD" = "?" ]; then
-        say "WARNING: could not read CI status for $HEAD_SHA — verify by hand"
-    elif [ "$BAD" != "0" ]; then
-        gh run list --repo freenet/river --commit "$HEAD_SHA" --limit 20 | sed 's/^/    /'
-        die "$BAD CI check(s) on $HEAD_SHA are not green. Never publish on red or pending CI."
-    else
-        say "CI green on $HEAD_SHA"
-    fi
-else
-    say "WARNING: gh not found — verify CI on $HEAD_SHA by hand"
+command -v gh >/dev/null 2>&1 || die "gh not found — cannot verify CI on $HEAD_SHA"
+RUNS="$(gh run list --repo freenet/river --commit "$HEAD_SHA" --json conclusion,status,name 2>/dev/null || echo "")"
+[ -n "$RUNS" ] || die "could not read CI status for $HEAD_SHA. Refusing to publish on an unknown signal."
+
+# COUNT THE RUNS, not only the bad ones. An empty list yields zero failures,
+# so a `length == 0` test on its own reports "green" for a commit CI never ran
+# on — a guard that cannot fail, which is worse than no guard because it is
+# reassuring. Ask for evidence of success, then for absence of failure.
+TOTAL="$(printf '%s' "$RUNS" | jq 'length')"
+[ "$TOTAL" -gt 0 ] || die "NO CI runs exist for $HEAD_SHA.
+That is not the same as green. Either CI has not started, or this commit is not
+what you think it is. Refusing to publish."
+
+# Non-SUCCESS conclusions include failure, cancelled and timed_out; a
+# still-running check is also not a green signal.
+BAD="$(printf '%s' "$RUNS" | jq '[.[] | select(.status != "completed" or (.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral"))] | length')"
+if [ "$BAD" != "0" ]; then
+    gh run list --repo freenet/river --commit "$HEAD_SHA" --limit 20 | sed 's/^/    /'
+    die "$BAD of $TOTAL CI check(s) on $HEAD_SHA are not green. Never publish on red or pending CI."
 fi
+say "CI green on $HEAD_SHA ($TOTAL run(s), all successful)"
 
 # ------------------------------------------------------------------ THE NODE
 echo ""
