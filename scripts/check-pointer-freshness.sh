@@ -140,6 +140,41 @@ N="$(record_count)"
 [ "$N" -gt 0 ] || die "no [[record]] blocks in $TOML_PATH"
 
 FAILED=0
+
+# ------------------------------------------------- no record may VANISH
+#
+# Every check below is per-record, so they all pass happily on a file that has
+# had a record DELETED from it — the gate dutifully verifies what remains and
+# reports success. That is the one way a pointer can go stale with CI green:
+# the record stops being maintained here while the address it published stays
+# live on the network forever, still answering with the last hash it was given.
+#
+# Adding a record is fine. Removing one is a deliberate act with consequences
+# for anyone already resolving it, so it must be visible in review rather than
+# silent.
+if [ "$MODE" = "ci" ]; then
+    BASE_TOML_ALL="$(mktemp)"
+    if git show "$BASE_SHA:$TOML_PATH" > "$BASE_TOML_ALL" 2>/dev/null; then
+        MISSING=""
+        while IFS= read -r base_app; do
+            [ -z "$base_app" ] && continue
+            grep -qE "^app_id[ \t]*=[ \t]*\"$base_app\"" "$TOML_PATH" || MISSING="$MISSING $base_app"
+        done < <(grep -E '^app_id[ \t]*=' "$BASE_TOML_ALL" | sed 's/.*= *"\([^"]*\)".*/\1/')
+        if [ -n "$MISSING" ]; then
+            echo "FAILED: a pointer record present at the base commit is GONE at head:"
+            for m in $MISSING; do echo "    $m"; done
+            echo ""
+            echo "The address that record published stays live on the network and keeps"
+            echo "answering with the last code hash it was given. Deleting the record here"
+            echo "only stops us maintaining it — it does not retract it."
+            echo ""
+            echo "If retiring a pointer is genuinely intended, that is a withdrawal and"
+            echo "needs doing on the network, not by deleting a line."
+            exit 1
+        fi
+    fi
+    rm -f "$BASE_TOML_ALL"
+fi
 for i in $(seq 1 "$N"); do
     APP_ID="$(field_of_record "$i" app_id)"
     WASM_PATH="$(field_of_record "$i" wasm_path)"
