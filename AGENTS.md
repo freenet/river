@@ -242,6 +242,19 @@ lives in **`.claude/rules/delegate-migration.md`**. Read it before
 publishing any change that touches those paths. The publish-side
 counterpart is **`.claude/rules/river-publish.md`**.
 
+**The same change also invalidates River's pointer records.** A migration
+entry carries OUR users' data forward; a pointer record tells THIRD PARTIES
+where the artifact moved to, so they resolve instead of pinning a key that
+re-keys weekly. Run `cargo make sign-pointer-records` alongside
+`add-migration`, and `cargo make publish-pointer-records` from main after the
+merge. CI's `check-pointer-freshness` fails the PR if a pointed-at WASM changed
+and no new record was signed. See `pointer-records.toml` and `FREENET.md`.
+
+A pointer solves **addressing only** — it says nothing about whether state or
+secrets under the old key survived, which is what the migration registries are
+for. Do not let the two blur together; conflating them is the specific error
+this mechanism exists to prevent.
+
 ## Testing Notes
 - Run `cd common && cargo test private_room` when modifying encryption or secret distribution.
 - Use `cargo make test` before every PR to ensure all components still build and pass tests.

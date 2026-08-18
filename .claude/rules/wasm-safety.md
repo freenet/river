@@ -24,7 +24,11 @@ If `git status` shows modified `.wasm` files in `ui/public/contracts/` or `cli/c
 **do not commit them** unless you have:
 1. Run `cargo make add-migration` to record the old delegate key
 2. Run `cargo make sync-wasm` to intentionally rebuild WASMs
-3. Run `cargo test -p river-core --test migration_test` to validate
+3. Run `cargo make sign-pointer-records` — a rebuilt WASM invalidates River's
+   published pointer records, which third parties resolve instead of pinning a
+   key (see `pointer-records.toml`). CI's `check-pointer-freshness` fails the PR
+   if you skip it.
+4. Run `cargo test -p river-core --test migration_test` to validate
 
 If you see modified WASMs and did NOT intentionally change them (e.g., `cargo make build`
 rebuilt them as a side effect), restore them:
