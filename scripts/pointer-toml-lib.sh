@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared reader for pointer-records.toml. Source this; do not execute it.
 #
 # ## Why a hand-rolled reader rather than a TOML library

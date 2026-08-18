@@ -91,6 +91,32 @@ fi
 
 [ -f "$TOML_PATH" ] || die "$TOML_PATH not found"
 
+# ------------------------------------------------- read ONE tree, not two
+#
+# On `pull_request`, actions/checkout gives the synthetic MERGE commit, so the
+# working tree is base+head merged. The WASM is hashed from
+# `github.event.pull_request.head.sha`. Reading the registry from the working
+# tree while hashing the WASM from head.sha compares two different trees: if
+# the base branch lands a new WASM and its matching record after this branch
+# forked, the merged registry (correctly carrying base's new record) is checked
+# against head's OLD WASM and fails as stale, on a PR that is actually fine.
+#
+# So in CI mode every head-side file is materialized from $HEAD_SHA. Base-side
+# reads already used `git show`. This mirrors check-migration.sh, which reads
+# both sides through git and never touches the working tree.
+if [ "$MODE" = "ci" ]; then
+    HEAD_TREE="$(mktemp -d)"
+    trap 'rm -rf "$HEAD_TREE"' EXIT
+    for f in "$TOML_PATH" "$FREENET_MD"; do
+        git show "$HEAD_SHA:$f" > "$HEAD_TREE/$(basename "$f")" 2>/dev/null \
+            || die "$f does not exist at head ($HEAD_SHA)"
+    done
+    TOML_PATH="$HEAD_TREE/$(basename "$TOML_PATH")"
+    FREENET_MD="$HEAD_TREE/$(basename "$FREENET_MD")"
+    echo "== reading the registry and FREENET.md from head ($HEAD_SHA) =="
+    echo ""
+fi
+
 AUTHOR_VK="$(top_level_field author_verifying_key)"
 [ -n "$AUTHOR_VK" ] || die "no author_verifying_key in $TOML_PATH"
 

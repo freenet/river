@@ -100,7 +100,13 @@ for i in $(seq 1 "$N"); do
 
     NEW_STATE="$(printf '%s\n' "$OUT" | sed -n 's/^state=//p')"
     NEW_KEY="$(printf '%s\n' "$OUT" | sed -n 's/^key=//p')"
-    [ -n "$NEW_STATE" ] && [ -n "$NEW_KEY" ] || die "signer produced no state/key for $APP_ID"
+    # Written as an explicit `if` rather than `A && B || die`: that form runs
+    # the `die` whenever the conjunction is false, which happens to be right
+    # here, but it reads as if-then-else and is not one. Not worth leaving a
+    # shape that invites a wrong edit later.
+    if [ -z "$NEW_STATE" ] || [ -z "$NEW_KEY" ]; then
+        die "signer produced no state/key for $APP_ID"
+    fi
 
     # Rewrite only this record's block, matched by app_id rather than by line
     # number: a line-addressed edit silently rewrites the wrong record the first

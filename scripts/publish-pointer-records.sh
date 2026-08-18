@@ -112,7 +112,13 @@ say "CI green on $HEAD_SHA ($TOTAL run(s), all successful)"
 # ------------------------------------------------------------------ THE NODE
 echo ""
 echo "[node] the target node is the intended one, and is on the network"
-PEERS="$(fdev -p "$PORT" query 2>/dev/null | grep -cE '^\| [1-9A-HJ-NP-Za-km-z]{17} ' || true)"
+# 16 OR 17 characters. A peer id is base58 of 12 bytes, and base58 of 12 random
+# bytes is 16 characters about 18% of the time (measured: 71 of 400). A `{17}`
+# pattern therefore undercounts always, and returns ZERO for a node whose peers
+# all happen to be short — which would abort every publish claiming the node has
+# no peers. Requiring the following column separator keeps the 46/47-character
+# contract keys in the same output from matching.
+PEERS="$(fdev -p "$PORT" query 2>/dev/null | grep -cE '^\| [1-9A-HJ-NP-Za-km-z]{16,17} +\|' || true)"
 [ "${PEERS:-0}" -gt 0 ] || die "node on port $PORT reports no connected peers. A PUT there reaches nobody."
 say "node on port $PORT has $PEERS connected peer(s)"
 
@@ -160,7 +166,10 @@ tar -xJf "$WORK/webapp.tar.xz" -C "$WORK/live" contracts/ 2>/dev/null \
 
 # --------------------------------------------------------------- PER-RECORD
 N="$(grep -c '^\[\[record\]\]' "$TOML_PATH")"
-declare -a PUB_APP PUB_KEY PUB_STATE PUB_VERSION PUB_HASH
+# No PUB_STATE array: the bytes live in $WORK/state_$i.bin, written below.
+# Keeping a second copy in a shell variable would be two things that can
+# disagree about what we are publishing.
+declare -a PUB_APP PUB_KEY PUB_VERSION PUB_HASH
 for i in $(seq 1 "$N"); do
     APP_ID="$(field_of_record "$i" app_id)"
     WASM_PATH="$(field_of_record "$i" wasm_path)"
@@ -212,8 +221,11 @@ Refusing to publish a record whose target could not be checked against the netwo
         || die "[5] the record for $APP_ID does not verify"
     say "[5] signature verifies against the key published in FREENET.md"
 
-    # 4. The version must be exactly one above what is ON THE NETWORK, read
-    #    from the network rather than assumed.
+    # The bytes we intend to publish, needed by the comparison below.
+    printf '%s' "$STATE" | xxd -r -p > "$WORK/state_$i.bin"
+
+    # 4. The version must be ABOVE what is ON THE NETWORK, read from the
+    #    network rather than assumed.
     #
     # ABSENCE MUST BE PROVEN, NOT INFERRED FROM A FAILED GET. A timeout and a
     # genuine "nothing there" both leave us without bytes, and treating them
@@ -249,19 +261,34 @@ Retry, or fix the node. Do not proceed on an ambiguous answer."
     elif [ -z "$ONNET_VERSION" ]; then
         die "[4] $APP_ID's pointer returned bytes that do not verify under our own author key.
 Refusing to publish over state whose provenance is unclear."
+    elif cmp -s "$WORK/cur_$i.bin" "$WORK/state_$i.bin"; then
+        # Already exactly what we were going to publish. This is the normal
+        # state when re-running after a PARTIAL publish, which the failure
+        # path explicitly tells the operator to do — so it must not be an
+        # error, or the documented recovery would abort on the record that
+        # already succeeded.
+        say "[4] already on the network at version $ONNET_VERSION, byte-identical — nothing to do"
+        PUB_OP="skip"
     else
-        EXPECT=$((ONNET_VERSION + 1))
-        [ "$VERSION" -eq "$EXPECT" ] || die "[4] on-network version is $ONNET_VERSION, so this publish must be
-version $EXPECT, but the record says $VERSION.
-A publish at an already-used version is a silent NO-OP: the network accepts it
-and keeps the OLD record. Re-sign with the right version."
+        # STRICTLY GREATER, not exactly one more. The contract's rule is
+        # monotonicity, not contiguity, and an exact `+1` breaks two ordinary
+        # situations: re-running after a partial publish, and two WASM changes
+        # merging before anyone runs the network publish (local v3, network v1).
+        # Both are legitimate; only going backwards or sideways is not.
+        [ "$VERSION" -gt "$ONNET_VERSION" ] || die "[4] the network holds version $ONNET_VERSION and this record says $VERSION.
+A publish at an already-used or older version is a silent NO-OP: the network
+accepts it and keeps the OLD record, and nothing downstream will tell you.
+Re-sign at a version above $ONNET_VERSION."
+        if [ "$VERSION" -ne $((ONNET_VERSION + 1)) ]; then
+            say "[4] note: skipping from $ONNET_VERSION to $VERSION (gaps are fine — the contract"
+            say "    enforces monotonicity, not contiguity)"
+        fi
         say "[4] on-network version $ONNET_VERSION -> publishing $VERSION (UPDATE)"
         PUB_OP="update"
     fi
 
-    PUB_APP[$i]="$APP_ID"; PUB_KEY[$i]="$POINTER_KEY"; PUB_STATE[$i]="$STATE"
-    PUB_VERSION[$i]="$VERSION"; PUB_HASH[$i]="$CODE_HASH"
-    printf '%s' "$STATE" | xxd -r -p > "$WORK/state_$i.bin"
+    PUB_APP[i]="$APP_ID"; PUB_KEY[i]="$POINTER_KEY"
+    PUB_VERSION[i]="$VERSION"; PUB_HASH[i]="$CODE_HASH"
     echo "$PUB_OP" > "$WORK/op_$i"
 done
 
@@ -270,7 +297,7 @@ echo "=============================================================="
 echo " All pre-flight checks PASSED."
 echo "=============================================================="
 for i in $(seq 1 "$N"); do
-    echo "  $(cat "$WORK/op_$i" | tr a-z A-Z) ${PUB_APP[$i]} v${PUB_VERSION[$i]} -> ${PUB_KEY[$i]}"
+    echo "  $(tr '[:lower:]' '[:upper:]' < "$WORK/op_$i") ${PUB_APP[$i]} v${PUB_VERSION[$i]} -> ${PUB_KEY[$i]}"
 done
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -334,6 +361,17 @@ for i in $(seq 1 "$N"); do
     PARAMS="$WORK/params_$i.bin"
     pointer-record key --author-vk "$AUTHOR_VK" --app-id "${PUB_APP[$i]}" \
         | sed -n 's/^params=//p' | xxd -r -p > "$PARAMS"
+
+    if [ "$(cat "$WORK/op_$i")" = "skip" ]; then
+        say "already on the network and byte-identical; verifying only"
+        set +e
+        verify_one "$i"
+        V_RC=$?
+        set -e
+        if [ "$V_RC" -eq 0 ]; then PUBLISHED="$PUBLISHED ${PUB_APP[$i]}"
+        else FAILED_VERIFY="$FAILED_VERIFY ${PUB_APP[$i]}"; fi
+        continue
+    fi
 
     set +e
     if [ "$(cat "$WORK/op_$i")" = "put" ]; then
