@@ -35,4 +35,54 @@ This file enumerates the Freenet contracts and delegates published from this rep
 ## Notes for integrators
 
 - Depend on `river-core` for the wire types; you almost never need to compile or execute the contract/delegate WASM yourself to read or construct River-compatible data.
-- Every contract/delegate here can re-key on any release (see the Migration notes above) — a build-time-constant reference to a key will silently go stale. There is no stable-identity pointer published yet; track [freenet-core#5194](https://github.com/freenet/freenet-core/issues/5194) for when one lands.
+- Every contract/delegate here can re-key on any release (see the Migration notes above) — **a build-time-constant reference to a key will silently go stale.** Resolve a pointer instead; see below.
+
+## Stable identity: resolve a pointer, do not pin a key
+
+River publishes **pointer records** for the two artifacts that re-key. A pointer record is a contract at a **fixed address** whose state names the artifact's *current* code hash, signed by River's author key. You GET the pointer, read the code hash, and derive the key you actually wanted from that hash **plus your own params**. The address never changes, so your build-time constant never goes stale.
+
+This implements the convention in [freenet-core#5194](https://github.com/freenet/freenet-core/issues/5194).
+
+### The author verifying key — your trust anchor
+
+```
+river:v1:vk:9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ
+```
+
+Pin **this 32-byte value** as a constant in your build. It is the entire trust anchor: take it from anywhere else and you may resolve a validly-signed pointer belonging to somebody else. It is the same key that signs River's web container, which is why `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv` derives from it.
+
+Two things we would rather you learned here than discovered later:
+
+- **River does not keep this key offline**, contrary to the pointer contract's own recommendation, because the same key signs every UI publish. We are telling you what we actually do rather than what the docs advise.
+- **Rotating it would move everything at once** — the web container's address and both pointer addresses. That would strand anyone who baked in the author vk, so it is a coordinated flag day, not routine key hygiene.
+
+### The pointers
+
+| `app_id` | Points at | Pointer key (fixed, GET this) |
+|---|---|---|
+| `river.room-contract` | [`contracts/room-contract/`](contracts/room-contract/) | `Ai4VLoC2jGdhpcB2UU8VPo3efUoxjm1Ju9VKXqRC63Az` |
+| `river.chat-delegate` | [`delegates/chat-delegate/`](delegates/chat-delegate/) | `6qF2H5JRPBxbKC45UtPnzdDzyfsejYFW1UwDLGDU66mu` |
+
+Both addresses are derivable offline from the pointer contract's frozen code hash `8wnAPaSRY1oYZCz723fdwK6BgzL6q8ozP3buVovXnt6v` and `(author_vk ‖ app_id)` — you do not have to trust the table.
+
+Current records are in [`pointer-records.toml`](pointer-records.toml), which CI checks on every PR (`scripts/check-pointer-freshness.sh`): if a pointed-at WASM changes and no new record is signed, the build fails. That gate is the reason resolving is safer than pinning.
+
+### How to resolve
+
+Rust integrators should use the resolver rather than hand-rolling it — it carries the anti-rollback floor and the absence-vs-unreachability distinction, neither of which you get from decoding the record yourself:
+
+```rust
+use freenet_migrate::pointer::{resolve_app_pointer, PointerFloor, PointerOutcome};
+
+let outcome = resolve_app_pointer(&mut io, &RIVER_AUTHOR_VK, b"river.chat-delegate", floor).await?;
+```
+
+Handle **every** arm. A bare `if let Some(r) = outcome.resolved()` silently does nothing on the outcomes that carry no record, which is how a withdrawal, a rollback attempt and a plain timeout all become "no output". Only `NeverPublished` permits falling back to a baked-in key. Persist `outcome.next_floor()`, keyed by `(author_vk, app_id)`.
+
+Non-Rust implementers: the wire format, the four resolution steps and hex test vectors are in the [pointer contract's README](https://github.com/freenet/freenet-migrate/tree/main/contracts/pointer-contract) and `TEST-VECTORS.md`.
+
+### What a pointer does NOT tell you
+
+**It solves addressing only.** It tells you which code hash is current. It says nothing about whether any state or any secret held under the previous key survived the re-key.
+
+This matters most for `river.chat-delegate`. Delegate secrets move only when River's own UI has run on that user's node, so you can resolve the pointer perfectly, derive the right key, and still find an **empty namespace** — which looks like "this user has no data" rather than like an error. That is the specific confusion the pointer exists to remove, so please do not let it back in one level up: treat data survival as a separate question, verify it per artifact, and assume it is unsolved until you have.

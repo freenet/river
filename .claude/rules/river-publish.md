@@ -47,10 +47,30 @@ If changes are already in the tree, stash first: `git stash`, run add-migration,
 cargo make sync-wasm
 ```
 
+### Step 3b: Re-sign the pointer records
+
+The WASM you just rebuilt has a new code hash, so River's **pointer records**
+now name a key that no longer exists. Those records are what third parties
+resolve instead of pinning a key — see `pointer-records.toml` and FREENET.md.
+
+```bash
+cargo make sign-pointer-records   # re-signs against the WASM you just built
+```
+
+Step 2's migration entry carries **our own users'** data forward. This carries
+**everyone else** forward. Same trigger, different set of people who lose if it
+is skipped — and their failure is quieter, because a stale pointer answers
+confidently with a dead key rather than erroring.
+
+CI's `check-pointer-freshness` fails the PR if you skip this, so it is not
+possible to publish a stale pointer through the normal flow. That is the
+backstop, not the plan.
+
 ### Step 4: Validate and Test
 
 ```bash
 cargo make check-migration
+cargo make check-pointer-freshness
 cargo test -p river-core --test migration_test
 cargo check -p river-ui --target wasm32-unknown-unknown --features no-sync
 cargo fmt
@@ -77,6 +97,24 @@ git commit -m "chore: bump web-container version after publish"
 curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | head -5
 git push origin main
 ```
+
+### Step 7: Publish the pointer records (only if step 3b re-signed any)
+
+Signing (3b) happens in the PR; publishing is the network half and runs from
+`main` after the merge, like every other publish here.
+
+```bash
+POINTER_NODE_PORT=<a network node of yours, NOT 7509> \
+POINTER_WASM=~/code/freenet/freenet-migrate/contracts/pointer-contract/pointer-v1.wasm \
+  cargo make publish-pointer-records
+```
+
+It runs its own pre-flight (clean tree, on main, CI green on this exact SHA,
+the record's hash matches the artifact **live on the network**, the version is
+exactly one above what the network holds) and then re-reads each record back
+and verifies it. Do not accept "the PUT returned OK": a publish at an
+already-used version is a no-op *success*, so the network will never tell you
+it was ignored.
 
 **Version policy:** the canonical source is `published-contract/contract-version.txt`, which `cargo make sign-webapp` increments and writes back each publish. NEVER base the version on wall-clock time (`date +%s / 60`) — the previous scheme bit us 2026-05-16 when the on-network version had drifted ahead of the timestamp-derived value. The counter file makes the version a strict monotonic local invariant; gaps are fine (the contract enforces monotonicity, not contiguity).
 
