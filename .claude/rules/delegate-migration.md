@@ -63,17 +63,28 @@ cargo make add-room-contract-migration
 # 2. Build new WASMs and copy to all committed locations
 cargo make sync-wasm
 
+# 2b. Re-sign the pointer records against the WASM you just built.
+#     Step 1 carries OUR users forward; this carries THIRD PARTIES forward
+#     (see "The other half of a re-key" below). Same trigger, and CI's
+#     check-pointer-freshness fails the PR if you skip it.
+cargo make sign-pointer-records
+
 # 3. Run migration tests
 cargo test -p river-core --test migration_test
 cargo test -p river-core --test room_contract_migration_test
+cargo make check-pointer-freshness
 
 # 4. Verify UI compiles with new generated code
 cargo check -p river-ui --target wasm32-unknown-unknown --features no-sync
 
 # 5. Commit everything
 git add legacy_delegates.toml common/legacy_room_contracts.toml \
-    ui/public/contracts/ cli/contracts/
+    pointer-records.toml ui/public/contracts/ cli/contracts/
 git commit -m "fix: update WASMs with delegate migration entry"
+
+# 6. AFTER the PR merges, from main: publish the re-signed records.
+#    Signing is offline and belongs in the PR; the network write does not.
+#    See .claude/rules/river-publish.md Step 7.
 ```
 
 ## The other half of a re-key: pointer records
