@@ -212,6 +212,23 @@ Refusing to publish a record whose target could not be checked against the netwo
     [ "$DERIVED" = "$POINTER_KEY" ] || die "[3] derived key $DERIVED != recorded $POINTER_KEY for $APP_ID"
     say "[3] app_id '$APP_ID' derives to $DERIVED (matches)"
 
+    # 3b. And the NODE agrees. Both values above come from this crate; if the
+    # crate and the node ever disagreed about how a key is derived, every check
+    # here would pass while the record landed somewhere nobody queries. So ask
+    # a second, independent implementation — fdev, from the raw wasm and params.
+    # This is the cross-check the pre-publish gate ran as its step 0, and it is
+    # the only one that involves an implementation we did not write.
+    printf '%s' "$(pointer-record key --author-vk "$AUTHOR_VK" --app-id "$APP_ID" \
+        | sed -n 's/^params=//p')" | xxd -r -p > "$WORK/pcheck_$i.bin"
+    FDEV_KEY="$(fdev get-contract-id --code "$POINTER_WASM" --parameters "$WORK/pcheck_$i.bin" 2>/dev/null | tail -1)"
+    [ "$FDEV_KEY" = "$POINTER_KEY" ] || die "[3b] DERIVATION FORK for $APP_ID.
+  this crate derives : $POINTER_KEY
+  fdev derives       : $FDEV_KEY
+The node and the signing tool disagree about where this record lives. Publishing
+would put it at an address no consumer derives, and every other check here would
+still pass."
+    say "[3b] fdev derives the same key from the raw wasm + params (no convention fork)"
+
     # 5. The signature verifies, under the key published in FREENET.md, BEFORE
     #    the PUT. A key-file/doc mismatch must fail loudly rather than ship a
     #    record integrators cannot verify.
