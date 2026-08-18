@@ -76,6 +76,32 @@ git add legacy_delegates.toml common/legacy_room_contracts.toml \
 git commit -m "fix: update WASMs with delegate migration entry"
 ```
 
+## The other half of a re-key: pointer records
+
+The registries above carry **our own users'** data across a re-key. They do
+nothing for a **third party** integrating with River, whose reference to our
+contract or delegate key is a build-time constant that silently goes stale —
+every read comes back looking like "this user has nothing stored".
+
+That half is `pointer-records.toml`: a record at a FIXED address naming the
+artifact's current code hash, signed by River's author key, which integrators
+resolve instead of pinning. Same trigger as a migration entry, different
+beneficiary.
+
+```bash
+cargo make sign-pointer-records      # after sync-wasm, BEFORE committing
+cargo make check-pointer-freshness   # what CI runs
+# then, from main after the PR merges:
+cargo make publish-pointer-records
+```
+
+CI's `check-pointer-freshness` fails the PR if a pointed-at WASM changed and no
+new record was signed. So in practice: whenever you run `add-migration`, you
+also need `sign-pointer-records`. See FREENET.md for the integrator-facing side,
+including the scope boundary — **a pointer solves addressing only** and says
+nothing about whether secrets survived the re-key, which is exactly what the
+rest of this file is about.
+
 ## Validation
 
 - **`cargo make check-migration`** — local check: builds delegate WASM and verifies migration entry exists if hash changed
@@ -83,6 +109,7 @@ git commit -m "fix: update WASMs with delegate migration entry"
 - **CI `check-delegate-migration` workflow** — builds base and PR WASMs, verifies old hash is in `legacy_delegates.toml`
 - **CI `check-room-contract-migration` workflow** — verifies a changed room-contract WASM's old hash is in `common/legacy_room_contracts.toml`
 - **CI `check-cli-wasm` workflow** — verifies `ui/public/contracts/` and `cli/contracts/` WASMs are in sync
+- **CI `check-pointer-freshness` workflow** — verifies every record in `pointer-records.toml` still names the committed WASM and is signed by the author key published in `FREENET.md`
 
 ## Key Files
 
@@ -96,6 +123,8 @@ git commit -m "fix: update WASMs with delegate migration entry"
 | `ui/src/components/app/chat_delegate.rs` | Uses generated `LEGACY_DELEGATES` for runtime migration |
 | `scripts/check-migration.sh` / `scripts/add-migration.sh` | Delegate migration validation / entry |
 | `scripts/check-room-contract-migration.sh` / `scripts/add-room-contract-migration.sh` | Room-contract registry validation / entry |
+| `pointer-records.toml` | Signed pointer records — third-party stable identity (addressing only) |
+| `scripts/check-pointer-freshness.sh` / `scripts/sign-pointer-records.sh` / `scripts/publish-pointer-records.sh` | Pointer gate / re-sign / network publish |
 | `scripts/sync-wasm.sh` | Builds all WASMs and copies to committed locations |
 | `common/tests/migration_test.rs` / `common/tests/room_contract_migration_test.rs` | Validate TOML entries are well-formed |
 

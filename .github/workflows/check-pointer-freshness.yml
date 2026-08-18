@@ -1,0 +1,49 @@
+name: Check Pointer Freshness
+
+# River publishes pointer records so third parties can resolve our artifacts'
+# current keys instead of pinning one that re-keys under them. This gate exists
+# because a STALE pointer is worse than no pointer: an integrator resolves it,
+# gets a confident answer, and derives a dead key.
+#
+# It fails the build when a pointed-at WASM changed and no new record was
+# signed. Sibling of check-delegate-migration, and the same shape — see
+# scripts/check-pointer-freshness.sh for why this asks a different question
+# ("does the record name THESE bytes?" rather than "does an entry exist?").
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-pointer-freshness:
+    runs-on: freenet-default-runner
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        # Full history: the gate compares the record against the PR's base
+        # commit to confirm the version moved when the record did.
+        fetch-depth: 0
+
+    - name: Install b3sum
+      run: command -v b3sum || cargo install b3sum --locked
+
+    # Pinned by revision, deliberately. This tool decides what a pointer
+    # record's bytes ARE; a gate whose oracle can change under it is not a
+    # gate. Bumping the rev is a reviewed act, not a silent floating upgrade.
+    - name: Install pointer-record
+      run: |
+        REV="$(grep -m1 '^POINTER_TOOL_REV=' scripts/check-pointer-freshness.sh \
+               | sed 's/.*:-\([0-9a-f]*\)}.*/\1/')"
+        test -n "$REV" || { echo "could not read POINTER_TOOL_REV from the script"; exit 1; }
+        echo "pinned freenet-migrate rev: $REV"
+        cargo install --git https://github.com/freenet/freenet-migrate \
+          --rev "$REV" --features publish --locked freenet-pointer-contract
+
+    - name: Verify every pointer record names the committed WASM and is signed
+      run: |
+        ./scripts/check-pointer-freshness.sh --ci \
+          "${{ github.event.pull_request.base.sha }}" \
+          "${{ github.event.pull_request.head.sha }}"

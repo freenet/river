@@ -354,6 +354,14 @@ echo "Please commit the changes to git"
 # migration entry. A local `sync-wasm` + `publish-river` that skips committing
 # the new WASM would silently re-key the on-network contract with NO CI
 # trip-wire and orphan every user's room data.
+#
+# The same republish also invalidates our POINTER RECORDS, which are what third
+# parties resolve instead of pinning a key (FREENET.md, pointer-records.toml).
+# Run `cargo make sign-pointer-records` in the same PR — CI's
+# check-pointer-freshness demands it — and `cargo make publish-pointer-records`
+# from main after the merge. Migration entries carry OUR users forward; the
+# pointer tells everyone ELSE where the artifact went. Same trigger, two
+# different sets of people who lose if it is skipped.
 description = "Publish River to Freenet using the committed contract version"
 dependencies = ["sign-webapp"]
 script = '''
@@ -696,6 +704,50 @@ echo "Don't forget to: git push origin main"
 [tasks.check-migration]
 description = "Check if delegate WASM changed and migration entry is needed"
 script = ["scripts/check-migration.sh"]
+
+# --- Pointer records (stable identity for third parties) ---------------------
+#
+# These are the OTHER half of a re-key. The migration registries above carry
+# OUR users' data forward across a re-key; a pointer record tells THIRD PARTIES
+# where the artifact moved to. Different problem, same trigger — so whenever you
+# run `add-migration`, you almost certainly also need `sign-pointer-records`.
+#
+# See FREENET.md and pointer-records.toml.
+
+[tasks.check-pointer-freshness]
+description = "Check every pointer record still names the committed WASM (CI runs this)"
+script = ["scripts/check-pointer-freshness.sh"]
+
+[tasks.sign-pointer-records]
+description = "Re-sign pointer records against the current WASM (needs the author key)"
+script = ["scripts/sign-pointer-records.sh"]
+
+[tasks.publish-pointer-records]
+description = "Publish signed pointer records to the network. FROM MAIN, AFTER MERGE."
+script = ['''
+#!/bin/bash
+# Deliberately not defaulted: the node to publish through and the committed
+# pointer WASM are both decisions, and a wrong default for either is a publish
+# that looks fine here and is invisible to everyone else.
+if [ -z "${POINTER_NODE_PORT:-}" ] || [ -z "${POINTER_WASM:-}" ]; then
+  cat <<'USAGE'
+Set both, then re-run:
+
+  POINTER_NODE_PORT   the ws-api port of a network-mode node to publish THROUGH.
+                      NOT 7509 (that is the production gateway).
+  POINTER_WASM        path to the COMMITTED contracts/pointer-contract/pointer-v1.wasm
+                      from a freenet-migrate checkout. Do NOT build it locally:
+                      a locally rebuilt WASM lands every record at an address
+                      nobody else derives.
+
+  POINTER_NODE_PORT=7599 \
+  POINTER_WASM=~/code/freenet/freenet-migrate/contracts/pointer-contract/pointer-v1.wasm \
+    cargo make publish-pointer-records
+USAGE
+  exit 2
+fi
+exec scripts/publish-pointer-records.sh --node-port "$POINTER_NODE_PORT" --pointer-wasm "$POINTER_WASM"
+''']
 
 [tasks.add-migration]
 description = "Add migration entry for currently committed delegate WASM"

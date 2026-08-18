@@ -1,0 +1,89 @@
+# River's pointer records — stable identity for things that re-key.
+#
+# A pointer record is a tiny contract at a FIXED address whose state names the
+# CURRENT code hash of one of River's artifacts. Third parties resolve it
+# instead of pinning a key, so they survive our re-keys. See
+# freenet-core#5194 and the contract's README:
+# https://github.com/freenet/freenet-migrate/tree/main/contracts/pointer-contract
+#
+# This solves ADDRESSING ONLY. It says nothing about whether state or secrets
+# under the old key survived — see the note under [[record]] for the delegate.
+#
+# ## What this file is for
+#
+# It is BOTH the registry integrators read AND the thing CI checks. Every
+# record here carries its own signature, so `scripts/check-pointer-freshness.sh`
+# can prove, with no network and no key, that:
+#
+#   * the record is signed by the author key published in FREENET.md, AND
+#   * it names the BLAKE3 of the WASM committed at `wasm_path` right now.
+#
+# That second clause is the point. "Is there a record?" passes forever after
+# the first one is committed; "does the record name THESE bytes?" fails the
+# moment the WASM re-keys and nobody signed a new one. A pointer that has gone
+# stale is worse than no pointer at all, because an integrator resolves it,
+# gets a confident answer, and derives a dead key.
+#
+# ## Editing this file
+#
+#   Do not hand-edit `code_hash`, `version` or `state`. Run:
+#       cargo make sign-pointer-records      # re-signs against the committed WASM
+#   then commit the result. A hand-edited hash leaves the signature behind and
+#   CI fails, which is the intended outcome and not a bug in the gate.
+#
+#   `version` is a monotonic counter per record, gating the network update. It
+#   must strictly increase on every publish. Like
+#   `published-contract/contract-version.txt`, it is NOT safe under two parallel
+#   publishes on one workstation — wrap in `flock` if you need that.
+
+# The author identity. Also published in FREENET.md, and the gate checks the two
+# agree: an integrator takes this value from FREENET.md, so if the two ever
+# drift, the records we sign are ones nobody can verify.
+#
+# This is the SAME key that signs River's web container. Ian's decision,
+# 2026-08-18. It is safe against cross-app replay because the pointer contract
+# signs over the whole params blob (author_vk ‖ app_id), so a record for one
+# app_id cannot be replayed into another. Two consequences worth stating rather
+# than discovering:
+#
+#   * River does NOT keep this key offline, contrary to the pointer contract's
+#     own recommendation, because the same key is used on every UI publish.
+#   * Rotating it changes BOTH the web container's address AND both pointer
+#     addresses, stranding integrators who baked in the author vk. Acceptable,
+#     but it couples the flag days.
+author_verifying_key = "river:v1:vk:9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ"
+
+# The pointer contract's own frozen code hash. A CONSTANT, never recomputed:
+# every pointer address in the ecosystem is BLAKE3(this ‖ params), so a locally
+# rebuilt pointer WASM lands every record at an address nobody else derives —
+# invisible to every consumer while looking, from here, like a successful
+# publish. See contracts/pointer-contract/WASM-STABILITY.md upstream.
+pointer_code_hash = "8wnAPaSRY1oYZCz723fdwK6BgzL6q8ozP3buVovXnt6v"
+
+
+[[record]]
+app_id = "river.room-contract"
+wasm_path = "ui/public/contracts/room_contract.wasm"
+# The fixed address integrators GET. Derived from pointer_code_hash and
+# (author_verifying_key ‖ app_id); recorded here so a human can check it and
+# so the gate can catch a derivation that has drifted.
+pointer_key = "Ai4VLoC2jGdhpcB2UU8VPo3efUoxjm1Ju9VKXqRC63Az"
+version = 1
+code_hash = "e765339ba3039f937256f4b6f7e8683d43f90e158f5d80f0dd45afdca69911e5"
+state = "00000001e765339ba3039f937256f4b6f7e8683d43f90e158f5d80f0dd45afdca69911e5626b9b5565ee3f6c17d45f50fcc79f88a5b49233669fdd8bec396f89ee891dd88a2b083f6072fe1ab1ae0dc420ae4b0b2ed5f391f95d495e9d8ad0327f13280a"
+
+[[record]]
+app_id = "river.chat-delegate"
+wasm_path = "ui/public/contracts/chat_delegate.wasm"
+pointer_key = "6qF2H5JRPBxbKC45UtPnzdDzyfsejYFW1UwDLGDU66mu"
+version = 1
+code_hash = "a44c64014d60fd245fe8fb5172f8fd7397039b248b3b6a8e95e89a0bb539fb5e"
+state = "00000001a44c64014d60fd245fe8fb5172f8fd7397039b248b3b6a8e95e89a0bb539fb5e94857075de1c9d70377fd4929ba5eeedfb00685c11be3940fa9a16ba493f6deda2e6af94d787532332b0f00d30ac89415b822e6bef4e8259264bb51b862cbe0e"
+# SCOPE, and it matters most here. Resolving this pointer correctly tells you
+# the delegate's current key. It does NOT tell you that the user's secrets came
+# with it: delegate secrets only move when River's own UI has run on that user's
+# node, so an integrator can resolve this record perfectly and still find an
+# EMPTY namespace. That looks like "this user has no data" rather than like an
+# error, which is exactly the confusion this record exists to remove — so do not
+# let it re-introduce it one level up. Data survival is a separate, unsolved
+# problem; see legacy_delegates.toml and .claude/rules/delegate-migration.md.
