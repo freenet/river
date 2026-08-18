@@ -21,8 +21,11 @@
 # `# comment` after either. A `#` INSIDE a quoted value survives correctly,
 # because a quoted value is taken up to its closing quote.
 #
-# NOT handled: multi-line values, arrays, inline tables, and — deliberately —
-# a key INDENTED from the line start. Every pattern anchors `[[record]]` and
+# NOT handled: multi-line values, arrays, inline tables, a DUPLICATE key within
+# one block (the first occurrence wins and no error is raised, where real TOML
+# would reject the file — the signer writes this file so a duplicate means a bad
+# merge or a hand-edit), and — deliberately — a key INDENTED from the line
+# start. Every pattern anchors `[[record]]` and
 # the key at column zero, which is what stops a mention of either inside a
 # comment or a prose block from contributing a phantom record or field. The
 # cost is that TOML's legal leading indentation is not read. That cost is paid

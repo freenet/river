@@ -172,6 +172,14 @@ for i in $(seq 1 "$N"); do
     echo ""
     echo "--- $APP_ID ---"
 
+    # Defence in depth: this script should only ever run against a main HEAD
+    # that already passed check-pointer-freshness in CI, but it can also be run
+    # by hand against a locally-edited file, and an empty field would otherwise
+    # reach fdev as an empty argument.
+    for v in APP_ID WASM_PATH VERSION CODE_HASH STATE POINTER_KEY; do
+        [ -n "${!v}" ] || die "record $i is missing $(echo "$v" | tr 'A-Z_' 'a-z-')"
+    done
+
     LIVE_WASM="$WORK/live/contracts/$(basename "$WASM_PATH")"
     if [ -f "$LIVE_WASM" ]; then
         LIVE_HASH="$(b3sum "$LIVE_WASM" | cut -d' ' -f1)"
@@ -206,15 +214,41 @@ Refusing to publish a record whose target could not be checked against the netwo
 
     # 4. The version must be exactly one above what is ON THE NETWORK, read
     #    from the network rather than assumed.
+    #
+    # ABSENCE MUST BE PROVEN, NOT INFERRED FROM A FAILED GET. A timeout and a
+    # genuine "nothing there" both leave us without bytes, and treating them
+    # alike takes the PUT branch — which SKIPS the version-monotonicity check
+    # below. So a transient hiccup against an already-published pointer would
+    # silently downgrade the one check that stops a no-op republish.
+    #
+    # fdev distinguishes them: a real negative prints
+    # `Error: Contract not found: <key>`. Anything else is "we did not learn",
+    # and this refuses rather than guessing.
     ONNET_VERSION=""
+    GET_OK=0
     if fdev -p "$PORT" execute get --timeout 120 -o "$WORK/cur_$i.bin" "$POINTER_KEY" >"$WORK/cur_$i.log" 2>&1 \
        && [ -s "$WORK/cur_$i.bin" ]; then
+        GET_OK=1
         ONNET_VERSION="$(pointer-record verify --author-vk "$AUTHOR_VK" --app-id "$APP_ID" \
                           --state "$WORK/cur_$i.bin" | sed -n 's/^version=//p')"
     fi
-    if [ -z "$ONNET_VERSION" ]; then
-        say "[4] nothing on the network yet — this is the FIRST publish (PUT), version $VERSION"
-        PUB_OP="put"
+    if [ "$GET_OK" -eq 0 ]; then
+        if grep -qF "Contract not found: $POINTER_KEY" "$WORK/cur_$i.log"; then
+            say "[4] the network reports NOT FOUND — this is the FIRST publish (PUT), version $VERSION"
+            PUB_OP="put"
+        else
+            tail -3 "$WORK/cur_$i.log" | sed 's/^/      /'
+            die "[4] could not read $APP_ID's pointer, and the node did NOT say 'not found'.
+
+That is 'we learned nothing', not 'nothing is there'. Publishing as a FIRST
+publish here would skip the version check that stops a silent no-op republish
+against a pointer that already exists.
+
+Retry, or fix the node. Do not proceed on an ambiguous answer."
+        fi
+    elif [ -z "$ONNET_VERSION" ]; then
+        die "[4] $APP_ID's pointer returned bytes that do not verify under our own author key.
+Refusing to publish over state whose provenance is unclear."
     else
         EXPECT=$((ONNET_VERSION + 1))
         [ "$VERSION" -eq "$EXPECT" ] || die "[4] on-network version is $ONNET_VERSION, so this publish must be
@@ -251,47 +285,35 @@ if [ "$ASSUME_YES" -eq 0 ]; then
     case "$REPLY" in y|Y|yes|YES) ;; *) echo "aborted."; exit 1 ;; esac
 fi
 
-# ------------------------------------------------------------------ PUBLISH
-for i in $(seq 1 "$N"); do
-    echo ""
-    echo "--- publishing ${PUB_APP[$i]} ---"
-    PARAMS="$WORK/params_$i.bin"
-    pointer-record key --author-vk "$AUTHOR_VK" --app-id "${PUB_APP[$i]}" \
-        | sed -n 's/^params=//p' | xxd -r -p > "$PARAMS"
-    if [ "$(cat "$WORK/op_$i")" = "put" ]; then
-        fdev -p "$PORT" execute put --timeout 180 \
-            --code "$POINTER_WASM" --parameters "$PARAMS" \
-            contract --state "$WORK/state_$i.bin" 2>&1 | tail -3 | sed 's/^/    /'
-    else
-        fdev -p "$PORT" execute update --timeout 180 \
-            "${PUB_KEY[$i]}" "$WORK/state_$i.bin" 2>&1 | tail -3 | sed 's/^/    /'
-    fi
-done
+# ------------------------------------------------------- PUBLISH, THEN VERIFY
+#
+# ONE loop, publishing and verifying each record before moving on.
+#
+# These used to be two loops. Under `set -e` a failed `fdev` on record 2 killed
+# the script before the verification loop ran at all — including for record 1,
+# which had already gone live. The header above argues that re-reading is the
+# only thing that proves a publish worked; running it in a second loop meant it
+# was skipped in exactly the partial-failure case where it matters most, and an
+# operator was left inferring what had landed from scrollback.
+#
+# `errexit` is suspended around each record so one failure cannot take the
+# summary down with it.
+PUBLISHED=""
+FAILED_PUB=""
+FAILED_VERIFY=""
 
-# --------------------------------------------------------------- VERIFY BACK
-# "The PUT returned OK" is not evidence. A stale publish is a no-op SUCCESS, so
-# the only check that proves an integrator gets the right answer is to read the
-# record back and resolve it end to end.
-echo ""
-echo "=============================================================="
-echo " Post-publish verification (the only check that proves anything)"
-echo "=============================================================="
-FAILED=0
-for i in $(seq 1 "$N"); do
-    echo ""
-    echo "--- ${PUB_APP[$i]} ---"
+verify_one() {
+    local i="$1"
     rm -f "$WORK/back_$i.bin"
     if ! fdev -p "$PORT" execute get --timeout 180 -o "$WORK/back_$i.bin" "${PUB_KEY[$i]}" \
          >"$WORK/back_$i.log" 2>&1 || [ ! -s "$WORK/back_$i.bin" ]; then
         echo "  FAILED: could not read the record back from ${PUB_KEY[$i]}"
-        FAILED=1
-        continue
+        return 1
     fi
     if ! cmp -s "$WORK/back_$i.bin" "$WORK/state_$i.bin"; then
         echo "  FAILED: the bytes on the network are not the bytes we published."
         echo "  This is what a silently-ignored stale publish looks like."
-        FAILED=1
-        continue
+        return 1
     fi
     say "byte-identical to what we published"
     if ! pointer-record verify --author-vk "$AUTHOR_VK" --app-id "${PUB_APP[$i]}" \
@@ -300,17 +322,69 @@ for i in $(seq 1 "$N"); do
             --expect-code-hash "${PUB_HASH[$i]}" \
             --expect-key "${PUB_KEY[$i]}" >/dev/null; then
         echo "  FAILED: the record read BACK from the network does not verify"
-        FAILED=1
-        continue
+        return 1
     fi
     say "verifies from the network at version ${PUB_VERSION[$i]}, code hash ${PUB_HASH[$i]}"
+    return 0
+}
+
+for i in $(seq 1 "$N"); do
+    echo ""
+    echo "--- ${PUB_APP[$i]} ---"
+    PARAMS="$WORK/params_$i.bin"
+    pointer-record key --author-vk "$AUTHOR_VK" --app-id "${PUB_APP[$i]}" \
+        | sed -n 's/^params=//p' | xxd -r -p > "$PARAMS"
+
+    set +e
+    if [ "$(cat "$WORK/op_$i")" = "put" ]; then
+        fdev -p "$PORT" execute put --timeout 180 \
+            --code "$POINTER_WASM" --parameters "$PARAMS" \
+            contract --state "$WORK/state_$i.bin" >"$WORK/pub_$i.log" 2>&1
+    else
+        fdev -p "$PORT" execute update --timeout 180 \
+            "${PUB_KEY[$i]}" "$WORK/state_$i.bin" >"$WORK/pub_$i.log" 2>&1
+    fi
+    PUB_RC=$?
+    set -e
+    tail -3 "$WORK/pub_$i.log" | sed 's/^/    /'
+
+    if [ "$PUB_RC" -ne 0 ]; then
+        echo "  FAILED: the $(cat "$WORK/op_$i") itself returned $PUB_RC"
+        FAILED_PUB="$FAILED_PUB ${PUB_APP[$i]}"
+        continue
+    fi
+
+    # Verify THIS record now, not after every publish. "The PUT returned OK" is
+    # not evidence: a publish at an already-used version is a no-op SUCCESS.
+    set +e
+    verify_one "$i"
+    V_RC=$?
+    set -e
+    if [ "$V_RC" -eq 0 ]; then
+        PUBLISHED="$PUBLISHED ${PUB_APP[$i]}"
+    else
+        FAILED_VERIFY="$FAILED_VERIFY ${PUB_APP[$i]}"
+    fi
 done
 
 echo ""
-if [ "$FAILED" -ne 0 ]; then
-    echo "PUBLISH DID NOT FULLY VERIFY. Do not announce these pointers."
+echo "=============================================================="
+echo " Result"
+echo "=============================================================="
+[ -n "$PUBLISHED" ]     && { echo " published AND verified:"; for a in $PUBLISHED; do echo "   $a"; done; }
+[ -n "$FAILED_PUB" ]    && { echo " NOT published (the write failed):"; for a in $FAILED_PUB; do echo "   $a"; done; }
+[ -n "$FAILED_VERIFY" ] && { echo " WROTE but did NOT verify — treat as UNKNOWN state on the network:"; for a in $FAILED_VERIFY; do echo "   $a"; done; }
+
+if [ -n "$FAILED_PUB" ] || [ -n "$FAILED_VERIFY" ]; then
+    echo ""
+    echo "PARTIAL PUBLISH. Some records may be live and some not — the lists above"
+    echo "say which. Do not announce these pointers. Re-run once the cause is fixed:"
+    echo "the version check reads the network, so a record that DID land will be"
+    echo "detected and its version requirement recomputed."
     exit 1
 fi
+
+echo ""
 echo "All $N record(s) published AND verified from the network."
 echo ""
 echo "An integrator resolving these now gets the code hash of the artifact"
