@@ -41,7 +41,7 @@ FREENET_MD="FREENET.md"
 # the same reason integrators pin it: this tool decides what a record's bytes
 # ARE, and a gate whose oracle can change under it is not a gate.
 POINTER_TOOL_REPO="https://github.com/freenet/freenet-migrate"
-POINTER_TOOL_REV="${POINTER_TOOL_REV:-REPLACE_WITH_MERGE_SHA}"
+POINTER_TOOL_REV="${POINTER_TOOL_REV:-5e1759c39f98ec54f51c84d632e28fc33578b48d}"
 
 cd "$REPO_ROOT"
 
