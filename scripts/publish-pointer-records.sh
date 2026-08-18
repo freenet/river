@@ -358,10 +358,6 @@ verify_one() {
 for i in $(seq 1 "$N"); do
     echo ""
     echo "--- ${PUB_APP[$i]} ---"
-    PARAMS="$WORK/params_$i.bin"
-    pointer-record key --author-vk "$AUTHOR_VK" --app-id "${PUB_APP[$i]}" \
-        | sed -n 's/^params=//p' | xxd -r -p > "$PARAMS"
-
     if [ "$(cat "$WORK/op_$i")" = "skip" ]; then
         say "already on the network and byte-identical; verifying only"
         set +e
@@ -370,6 +366,23 @@ for i in $(seq 1 "$N"); do
         set -e
         if [ "$V_RC" -eq 0 ]; then PUBLISHED="$PUBLISHED ${PUB_APP[$i]}"
         else FAILED_VERIFY="$FAILED_VERIFY ${PUB_APP[$i]}"; fi
+        continue
+    fi
+
+    # Inside the same errexit suspension as everything else in this loop. It is
+    # a local computation that already succeeded during preflight, so a failure
+    # here would be surprising — but an unguarded `set -e` abort at this point
+    # would kill the script before the Result summary prints, losing the record
+    # of which records DID publish. Consistency is cheaper than that risk.
+    PARAMS="$WORK/params_$i.bin"
+    set +e
+    pointer-record key --author-vk "$AUTHOR_VK" --app-id "${PUB_APP[$i]}" \
+        | sed -n 's/^params=//p' | xxd -r -p > "$PARAMS"
+    PARAMS_RC=$?
+    set -e
+    if [ "$PARAMS_RC" -ne 0 ] || [ ! -s "$PARAMS" ]; then
+        echo "  FAILED: could not derive params for ${PUB_APP[$i]}"
+        FAILED_PUB="$FAILED_PUB ${PUB_APP[$i]}"
         continue
     fi
 

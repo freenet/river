@@ -37,7 +37,16 @@ jobs:
       run: |
         REV="$(grep -m1 '^POINTER_TOOL_REV=' scripts/check-pointer-freshness.sh \
                | sed 's/.*:-\([0-9a-f]*\)}.*/\1/')"
-        test -n "$REV" || { echo "could not read POINTER_TOOL_REV from the script"; exit 1; }
+        # Validate the SHAPE, not just non-emptiness. If the line ever stops
+        # matching, sed passes the whole line through unchanged — which is
+        # non-empty, so a bare `test -n` would accept it and then hand cargo a
+        # garbage rev. A guard that cannot fail is the thing this whole gate
+        # exists to avoid.
+        case "$REV" in
+          [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+          *) echo "POINTER_TOOL_REV is not a hex SHA: '$REV'"; exit 1 ;;
+        esac
+        test "${#REV}" -ge 7 || { echo "POINTER_TOOL_REV too short: '$REV'"; exit 1; }
         echo "pinned freenet-migrate rev: $REV"
         cargo install --git https://github.com/freenet/freenet-migrate \
           --rev "$REV" --features publish --locked freenet-pointer-contract
