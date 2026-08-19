@@ -42,9 +42,17 @@ jobs:
         # non-empty, so a bare `test -n` would accept it and then hand cargo a
         # garbage rev. A guard that cannot fail is the thing this whole gate
         # exists to avoid.
+        #
+        # It must reject ANY non-hex character, not merely require a hex PREFIX.
+        # The first version of this check was
+        # `[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*`, whose
+        # trailing `*` matches anything at all — so `abcdef1zzzz`,
+        # `abcdef1;rm -rf /` and `abcdef1 --features evil` all passed it, and
+        # the `-ge 7` length test below did not help, because the problem was
+        # never length. A guard whose comment says "validates the SHAPE" has to
+        # actually do that.
         case "$REV" in
-          [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
-          *) echo "POINTER_TOOL_REV is not a hex SHA: '$REV'"; exit 1 ;;
+          ""|*[!0-9a-f]*) echo "POINTER_TOOL_REV is not lowercase hex: '$REV'"; exit 1 ;;
         esac
         test "${#REV}" -ge 7 || { echo "POINTER_TOOL_REV too short: '$REV'"; exit 1; }
         echo "pinned freenet-migrate rev: $REV"
