@@ -82,8 +82,34 @@ pointer_top_field() {
     ' "$1"
 }
 
-# Number of [[record]] blocks in FILE.
-pointer_record_count() { grep -c '^\[\[record\]\]' "$1"; }
+# Number of [[record]] blocks in FILE. Refuses to return zero.
+#
+# `grep -c` exits 1 when it matches nothing, so under `set -e` an empty registry
+# killed the caller with a bare exit code and NO message — swallowing the
+# caller's own "no [[record]] blocks" error in exactly the case that message
+# exists for. This says the same thing out loud and still fails.
+#
+# The `|| true` below suppresses grep's exit code ONLY so this function can
+# report the reason itself; it must never be relaxed into simply returning 0.
+# Every caller multiplies this number into a `seq 1 $N` loop, so a quiet 0 turns
+# each of them into a loop that runs zero times and then reports success over
+# nothing — a publish script printing "All 0 record(s) published AND verified
+# from the network" having published nothing at all. That is a fail-CLOSED bug
+# traded for a fail-OPEN one. Failing stays the point; the only thing fixed here
+# is that it now says why. Callers guard the result as well, so an empty
+# registry is still refused where `set -e` is off.
+pointer_record_count() {
+    local n
+    n="$(grep -c '^\[\[record\]\]' "$1" || true)"
+    if [ "${n:-0}" -eq 0 ]; then
+        echo "ERROR: no [[record]] blocks in $1 — the registry is empty, so there is" >&2
+        echo "       nothing to check, sign or publish. This is a hard failure: an empty" >&2
+        echo "       registry is not 'zero work to do', it is a registry that lost its" >&2
+        echo "       records." >&2
+        return 1
+    fi
+    printf '%s\n' "$n"
+}
 
 # Every app_id in FILE, one per line.
 pointer_app_ids() {
