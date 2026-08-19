@@ -33,6 +33,14 @@ PORT=""
 DRY_RUN=0
 ASSUME_YES=0
 POINTER_WASM="${POINTER_WASM:-}"
+# Initialised here, not only where it is computed in the provenance section,
+# because it is read again in the Result summary AFTER the network write. Under
+# `set -u` an unset read there would kill the script at the one point where
+# dying is most expensive: records are already live and the summary saying
+# which ones is what the operator has left. The assignment below always runs
+# today, so this costs nothing; it stops a future edit that guards or moves
+# that assignment from turning a note into a post-publish abort.
+UNTRACKED=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --node-port) PORT="${2:?--node-port needs a value}"; shift 2 ;;
@@ -84,7 +92,12 @@ echo "[provenance] clean tree, on main, at origin/main, CI green"
 # copy has not hit it.
 #
 # They are still PRINTED rather than ignored silently — if one of them is a
-# surprise, the operator should see it before writing to the network.
+# surprise, the operator should see it. An interactive run sees it here, before
+# the confirmation prompt. An unattended run (--yes) has nobody watching stdout
+# at this point, so the same list is REPEATED in the Result summary at the end:
+# that is the part of the output a later reader actually reads, and it is what
+# makes this note a durable record rather than a line that scrolled past. It
+# stays a note either way — untracked files never block a publish.
 #
 # A modified TRACKED file remains a hard refusal, deliberately: it means this
 # checkout differs from the commit whose CI was verified above, which is exactly
@@ -461,6 +474,18 @@ echo "=============================================================="
 [ -n "$PUBLISHED" ]     && { echo " published AND verified:"; for a in $PUBLISHED; do echo "   $a"; done; }
 [ -n "$FAILED_PUB" ]    && { echo " NOT published (the write failed):"; for a in $FAILED_PUB; do echo "   $a"; done; }
 [ -n "$FAILED_VERIFY" ] && { echo " WROTE but did NOT verify — treat as UNKNOWN state on the network:"; for a in $FAILED_VERIFY; do echo "   $a"; done; }
+
+# Repeated from the provenance section on purpose. Under --yes nobody is
+# watching stdout when that first note prints, so this is the copy an operator
+# (or an incident review) actually reads. `if` rather than the `&&` form above
+# because this is the last statement before the exit-1 branch, and a failing
+# `[` there is exactly where `set -e` semantics get argued about. Not a gate:
+# an untracked file cannot change what was published, and the run has already
+# finished by the time this prints.
+if [ -n "$UNTRACKED" ]; then
+    echo " untracked files present at publish time (they cannot affect what was published):"
+    printf '%s\n' "$UNTRACKED" | sed 's/^/   /'
+fi
 
 if [ -n "$FAILED_PUB" ] || [ -n "$FAILED_VERIFY" ]; then
     echo ""
