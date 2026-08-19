@@ -197,7 +197,8 @@ tar -xJf "$WORK/webapp.tar.xz" -C "$WORK/live" contracts/ 2>/dev/null \
     || die "could not unpack contracts/ from the live webapp archive"
 
 # --------------------------------------------------------------- PER-RECORD
-N="$(grep -c '^\[\[record\]\]' "$TOML_PATH")"
+N="$(pointer_record_count "$TOML_PATH")"
+[ "${N:-0}" -gt 0 ] || die "no [[record]] blocks in $TOML_PATH"
 # No PUB_STATE array: the bytes live in $WORK/state_$i.bin, written below.
 # Keeping a second copy in a shell variable would be two things that can
 # disagree about what we are publishing.
