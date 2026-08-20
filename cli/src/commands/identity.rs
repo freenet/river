@@ -465,7 +465,11 @@ async fn import_identity(
     // the lock, so a concurrent import can't interleave. Seeds `invitation_secrets`
     // from the export so a non-owner of a private room keeps the secret across a
     // device migration (freenet/river#306).
-    let contract_key = api_client.owner_vk_to_contract_key(&export.room_owner);
+    // Read: the import itself is purely local (it writes `rooms.json`), and the
+    // key it records must be the generation the network paths will address.
+    let contract_key = api_client
+        .contract_key_for(&export.room_owner, crate::pointer::KeyIntent::Read)
+        .await?;
     let outcome = api_client.storage().import_room_atomic(
         &export.room_owner,
         &export.signing_key,
@@ -804,6 +808,8 @@ mod tests {
         // room from the decoded export, mirroring `import_identity`.
         let temp_dir = TempDir::new().unwrap();
         let storage = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        // bundled-wasm-ok: a test seeding local storage directly, with no node
+        // connection and so no resolved generation to derive from.
         let contract_key = compute_contract_key(&decoded.room_owner);
         storage
             .add_room_with_invitation_secrets(
@@ -855,6 +861,8 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let storage = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        // bundled-wasm-ok: a test seeding local storage directly, with no node
+        // connection and so no resolved generation to derive from.
         let contract_key = compute_contract_key(&decoded.room_owner);
         storage
             .add_room_with_invitation_secrets(
@@ -990,6 +998,8 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let storage = Storage::new(Some(temp_dir.path().to_str().unwrap())).unwrap();
+        // bundled-wasm-ok: a test seeding local storage directly, with no node
+        // connection and so no resolved generation to derive from.
         let contract_key = compute_contract_key(&owner_vk);
 
         // First import establishes the OLD identity.

@@ -448,7 +448,11 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
             let owner_vk = VerifyingKey::from_bytes(&key_bytes)
                 .map_err(|e| anyhow!("Invalid verifying key: {}", e))?;
 
-            let contract_key = api.owner_vk_to_contract_key(&owner_vk);
+            // Read: `debug contract get` only fetches, so it works even when
+            // River's room contract is newer than this riverctl.
+            let contract_key = api
+                .contract_key_for(&owner_vk, crate::pointer::KeyIntent::Read)
+                .await?;
 
             if !matches!(format, OutputFormat::Json) {
                 eprintln!(
@@ -556,7 +560,11 @@ pub async fn execute(command: DebugCommands, api: ApiClient, format: OutputForma
             let owner_vk = VerifyingKey::from_bytes(&key_bytes)
                 .map_err(|e| anyhow!("Invalid verifying key: {}", e))?;
 
-            let contract_key = api.owner_vk_to_contract_key(&owner_vk);
+            // Read: this command only prints the key it would use, which is
+            // exactly the value a user debugging a stale riverctl needs to see.
+            let contract_key = api
+                .contract_key_for(&owner_vk, crate::pointer::KeyIntent::Read)
+                .await?;
 
             match format {
                 OutputFormat::Human => {

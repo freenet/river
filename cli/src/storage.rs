@@ -1,4 +1,5 @@
 use crate::api::compute_contract_key;
+use crate::pointer::{floor_corruption_hint, FloorStore, StoredFloor};
 use anyhow::{anyhow, Context, Result};
 use directories::ProjectDirs;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +302,22 @@ pub struct Storage {
     /// nominate the right identity at command time without touching
     /// `rooms.json`. See discussion on river#281.
     signing_key_override: Option<SigningKey>,
+    /// The room-contract pointer's floor store (`pointer_floors.json`). A side
+    /// file, like `outbound_dms.json`, so the anti-rollback floor is never
+    /// entangled with the room blob's read-modify-write.
+    pointer_floors_path: PathBuf,
+    /// The room-contract code hash resolved from River's pointer record this
+    /// run, installed by [`crate::api::ApiClient`] once resolution completes.
+    ///
+    /// Unset for a command that never opens a node connection, in which case
+    /// key regeneration falls back to the bundled WASM, which is exactly the behaviour
+    /// riverctl has always had, and the only behaviour available offline.
+    ///
+    /// A `OnceLock` rather than a constructor argument because resolution needs
+    /// a live connection and must stay lazy: `Storage` is built before the
+    /// first GET, and offline commands must not pay for a resolution they will
+    /// never use.
+    room_code_hash: OnceLock<[u8; 32]>,
 }
 
 impl Storage {
@@ -330,12 +348,86 @@ impl Storage {
         let storage_path = data_dir.join("rooms.json");
         let outbound_dms_path = data_dir.join("outbound_dms.json");
         let lock_path = data_dir.join(".river.lock");
+        let pointer_floors_path = data_dir.join("pointer_floors.json");
 
         Ok(Self {
             storage_path,
             outbound_dms_path,
             lock_path,
             signing_key_override,
+            pointer_floors_path,
+            room_code_hash: OnceLock::new(),
+        })
+    }
+
+    /// Record the room-contract code hash resolved from River's pointer record,
+    /// so key regeneration in [`Self::load_rooms`] agrees with the keys the
+    /// network paths are deriving. Idempotent; a second call is ignored.
+    pub fn set_room_code_hash(&self, code_hash: [u8; 32]) {
+        let _ = self.room_code_hash.set(code_hash);
+    }
+
+    /// Where the anti-rollback floor store lives, so an error can name the file
+    /// the user has to inspect or delete.
+    pub fn pointer_floors_path(&self) -> &Path {
+        &self.pointer_floors_path
+    }
+
+    /// Load the anti-rollback floor stored under `key`.
+    ///
+    /// Three outcomes, and the difference between the second and third is the
+    /// whole point: `Ok(None)` means nothing has ever resolved here (the one
+    /// state that permits a build-time fallback), while `Err` means a floor
+    /// exists and could not be trusted. Returning `Ok(None)` for a corrupt or
+    /// unreadable file would convert corruption into "first run" and hand back
+    /// the baked-in key, which is precisely the downgrade the floor exists to
+    /// prevent.
+    pub fn load_pointer_floor(&self, key: &str) -> Result<Option<StoredFloor>> {
+        if !self.pointer_floors_path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&self.pointer_floors_path).with_context(|| {
+            format!(
+                "reading pointer floor store {}. {}",
+                self.pointer_floors_path.display(),
+                floor_corruption_hint(&self.pointer_floors_path)
+            )
+        })?;
+        let store: FloorStore = serde_json::from_str(&contents).with_context(|| {
+            format!(
+                "parsing pointer floor store {}. {}",
+                self.pointer_floors_path.display(),
+                floor_corruption_hint(&self.pointer_floors_path)
+            )
+        })?;
+        Ok(store.floors.get(key).cloned())
+    }
+
+    /// Persist the anti-rollback floor for `key`, merging into whatever other
+    /// `(author_vk, app_id)` pairs the file already holds.
+    ///
+    /// Under the same advisory lock and the same atomic temp-file rename as the
+    /// room blob, so a concurrent riverctl cannot interleave a read-modify-write
+    /// and lose the other pair's row.
+    pub fn save_pointer_floor(&self, key: &str, floor: StoredFloor) -> Result<()> {
+        self.with_lock(|| {
+            let mut store: FloorStore = if self.pointer_floors_path.exists() {
+                let contents = fs::read_to_string(&self.pointer_floors_path)?;
+                serde_json::from_str(&contents).with_context(|| {
+                    format!(
+                        "parsing pointer floor store {}. {}",
+                        self.pointer_floors_path.display(),
+                        floor_corruption_hint(&self.pointer_floors_path)
+                    )
+                })?
+            } else {
+                FloorStore::default()
+            };
+            store.floors.insert(key.to_string(), floor);
+            Self::atomic_write(
+                &self.pointer_floors_path,
+                &serde_json::to_string_pretty(&store)?,
+            )
         })
     }
 
@@ -465,7 +557,14 @@ impl Storage {
     }
 
     /// Load all stored rooms, regenerating each room's contract key to match the
-    /// currently-bundled WASM (and persisting the regeneration).
+    /// room-contract generation this run resolved (and persisting the
+    /// regeneration).
+    ///
+    /// The regeneration runs only once [`Self::set_room_code_hash`] has recorded
+    /// what River's pointer record names. Until then the stored keys are returned
+    /// untouched, because rewriting them would be a migration decision taken from
+    /// this binary's build date rather than from what is deployed. See the body
+    /// for the full argument.
     ///
     /// Takes the advisory lock for the whole read-and-maybe-rewrite, so a
     /// concurrent mutating invocation can't interleave with the key-regeneration
@@ -486,8 +585,26 @@ impl Storage {
         let contents = fs::read_to_string(&self.storage_path)?;
         let mut storage: RoomStorage = serde_json::from_str(&contents)?;
 
-        // Regenerate contract keys to ensure they match the current bundled WASM
-        // This handles the case where rooms were stored with an older WASM version
+        // Regenerate each room's cached contract key to match the room-contract
+        // generation this run RESOLVED from River's pointer record.
+        //
+        // Skipped entirely when nothing has been resolved, and that is the point.
+        // This loop rewrites `contract_key` and demotes the old value into
+        // `previous_contract_key`, which is the input to the migration probe: it
+        // is a migration decision, not a display detail. A command that has not
+        // consulted the pointer record has no business making that decision from
+        // its own build date, and doing so would redefine `previous_contract_key`
+        // from "the immediately-previous generation" to "whatever this binary was
+        // built with" (plus a rooms.json write on every command that only reads).
+        //
+        // Before the pointer record existed, riverctl had nothing better than its
+        // own build and did this unconditionally. It has something better now, so
+        // it waits for it. Every path that migrates or addresses a contract calls
+        // `room_anchor()` first, which sets the hash before touching storage, so
+        // nothing that needs the regeneration loses it.
+        let Some(code_hash) = self.room_code_hash.get() else {
+            return Ok(storage);
+        };
         let mut updated = false;
         for (owner_key_str, room_info) in storage.rooms.iter_mut() {
             let owner_key_bytes = match bs58::decode(owner_key_str).into_vec() {
@@ -502,7 +619,7 @@ impl Storage {
                 Ok(vk) => vk,
                 Err(_) => continue,
             };
-            let new_key = compute_contract_key(&owner_vk);
+            let new_key = river_core::migration::contract_key_for_code_hash(&owner_vk, code_hash);
             let new_key_str = new_key.id().to_string();
             if room_info.contract_key != new_key_str {
                 info!(
@@ -1188,8 +1305,10 @@ mod tests {
     }
 
     /// Compute the expected contract key for a given owner verifying key.
-    /// This matches what load_rooms will regenerate.
+    /// This matches what load_rooms regenerates when nothing has been resolved.
     fn expected_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
+        // bundled-wasm-ok: these tests never resolve a pointer, so the bundled
+        // derivation is the one `load_rooms` will use.
         compute_contract_key(owner_vk)
     }
 
@@ -1845,6 +1964,9 @@ mod tests {
     #[test]
     fn test_update_contract_key_success() {
         let (storage, _temp_dir) = create_test_storage();
+        // As above: regeneration needs a resolved generation, and the bundled
+        // hash keeps this test's expectations unchanged.
+        storage.set_room_code_hash(crate::api::bundled_room_code_hash());
         let owner_sk = create_test_signing_key();
         let owner_vk = owner_sk.verifying_key();
         let state = create_test_state(&owner_sk);
@@ -2180,6 +2302,10 @@ mod tests {
     #[test]
     fn test_load_rooms_sets_previous_contract_key_on_mismatch() {
         let (storage, _temp_dir) = create_test_storage();
+        // `load_rooms` regenerates only against a RESOLVED generation, so record
+        // one. The bundled hash keeps every expected key below identical to what
+        // this test asserted before pointer resolution existed.
+        storage.set_room_code_hash(crate::api::bundled_room_code_hash());
         let owner_sk = create_test_signing_key();
         let owner_vk = owner_sk.verifying_key();
         let state = create_test_state(&owner_sk);
@@ -3569,6 +3695,157 @@ mod tests {
                 && src.contains("fn load_rooms_unlocked("),
             "load_rooms must save via save_rooms_unlocked to avoid lock reentrancy \
              self-deadlock (issue #307)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Pointer floor persistence + resolved-generation key regeneration
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn pointer_floor_round_trips_and_is_scoped_by_key() {
+        let (storage, _tmp) = create_test_storage();
+        assert!(
+            storage
+                .load_pointer_floor("nobody/river.room-contract")
+                .unwrap()
+                .is_none(),
+            "a fresh install has no floor, which is what permits a build-time fallback"
+        );
+
+        let room = StoredFloor {
+            version: 4,
+            code_hash: Some(crate::pointer::code_hash_b58(&[0x33; 32])),
+            withdrawn: false,
+        };
+        let delegate = StoredFloor {
+            version: 9,
+            code_hash: None,
+            withdrawn: true,
+        };
+        storage
+            .save_pointer_floor("author/river.room-contract", room.clone())
+            .unwrap();
+        storage
+            .save_pointer_floor("author/river.chat-delegate", delegate.clone())
+            .unwrap();
+
+        // Saving the second must not have dropped the first: the file holds one
+        // row per (author_vk, app_id) and a save is a read-merge-write.
+        assert_eq!(
+            storage
+                .load_pointer_floor("author/river.room-contract")
+                .unwrap(),
+            Some(room)
+        );
+        assert_eq!(
+            storage
+                .load_pointer_floor("author/river.chat-delegate")
+                .unwrap(),
+            Some(delegate)
+        );
+    }
+
+    /// A floor store that will not parse must be an ERROR, never `Ok(None)`.
+    ///
+    /// `Ok(None)` reads as "nothing has ever resolved here", which is the one
+    /// state that re-enables the baked-in build-time key. Turning corruption
+    /// into that is a silent downgrade, and it is exactly the reflex fix
+    /// (`unwrap_or_default`) this asserts against.
+    #[test]
+    fn a_corrupt_pointer_floor_store_surfaces_rather_than_reading_as_never_resolved() {
+        let (storage, _tmp) = create_test_storage();
+        fs::write(storage.pointer_floors_path(), "{ this is not json").unwrap();
+        let err = storage
+            .load_pointer_floor("author/river.room-contract")
+            .expect_err("a corrupt floor store must not read as `never resolved`");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pointer floor store"), "{msg}");
+        assert!(
+            msg.contains("will not treat an unreadable anti-rollback floor"),
+            "the error must tell the user why it refuses to recover: {msg}"
+        );
+    }
+
+    /// `load_rooms` regenerates each room's cached contract key. Once a run has
+    /// resolved River's pointer record, that regeneration must target the
+    /// RESOLVED generation, not the WASM this binary bundles. Otherwise the
+    /// cache points at a contract none of the network paths address.
+    #[test]
+    fn load_rooms_regenerates_keys_against_the_resolved_generation() {
+        let (storage, _tmp) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+
+        // The room starts under a generation that is NEITHER the bundled one nor
+        // the one that will be resolved. That matters: if the fixture stored it
+        // under the bundled key, the unresolved assertions below would hold even
+        // if `load_rooms` DID regenerate against the bundled hash, because the
+        // recomputed key would equal the stored one and no write would happen.
+        // A first draft of this test made exactly that mistake and passed under
+        // the mutation it exists to catch.
+        let stored_gen = river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES[0];
+        let stored_key = river_core::migration::contract_key_for_code_hash(&owner_vk, &stored_gen)
+            .id()
+            .to_string();
+        // bundled-wasm-ok: named only to assert the regeneration never lands here.
+        let bundled_key = compute_contract_key(&owner_vk).id().to_string();
+        assert_ne!(
+            stored_key, bundled_key,
+            "the fixture must start on a generation the bundled derivation would change"
+        );
+        storage
+            .add_room(
+                &owner_vk,
+                &owner_sk,
+                state,
+                &river_core::migration::contract_key_for_code_hash(&owner_vk, &stored_gen),
+            )
+            .unwrap();
+
+        // With NOTHING resolved, `load_rooms` must leave the stored key alone:
+        // no rewrite, no demotion into `previous_contract_key`, no write to disk.
+        // Rewriting here would redefine `previous_contract_key` as "the bundled
+        // key" rather than "the immediately-previous generation", and it would do
+        // so from a command that never consulted River's pointer record.
+        let before = std::fs::read_to_string(&storage.storage_path).unwrap();
+        let unresolved = storage.load_rooms().unwrap();
+        let unresolved_info = &unresolved.rooms[&bs58::encode(owner_vk.as_bytes()).into_string()];
+        assert_eq!(
+            unresolved_info.contract_key, stored_key,
+            "an unresolved run must not regenerate the cached key against its own build"
+        );
+        assert_ne!(
+            unresolved_info.contract_key, bundled_key,
+            "an unresolved run must not rewrite the cached key to the bundled generation"
+        );
+        assert_eq!(
+            unresolved_info.previous_contract_key, None,
+            "an unresolved run must not demote anything into previous_contract_key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&storage.storage_path).unwrap(),
+            before,
+            "an unresolved run must not rewrite rooms.json"
+        );
+
+        // Now a run resolves a generation from the pointer record.
+        let resolved = [0x5Au8; 32];
+        storage.set_room_code_hash(resolved);
+        let rooms = storage.load_rooms().unwrap();
+        let info = &rooms.rooms[&bs58::encode(owner_vk.as_bytes()).into_string()];
+        assert_eq!(
+            info.contract_key,
+            river_core::migration::contract_key_for_code_hash(&owner_vk, &resolved)
+                .id()
+                .to_string(),
+            "the cached key must follow the resolved generation"
+        );
+        assert_eq!(
+            info.previous_contract_key.as_deref(),
+            Some(stored_key.as_str()),
+            "the superseded key must be kept as the migration fallback"
         );
     }
 }
