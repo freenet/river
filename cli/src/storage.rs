@@ -1,3 +1,6 @@
+// Test-only: the production paths here derive through the resolved anchor, so
+// this is unused outside `mod tests` and warns if imported unconditionally.
+#[cfg(test)]
 use crate::api::compute_contract_key;
 use crate::pointer::{floor_corruption_hint, FloorStore, StoredFloor};
 use anyhow::{anyhow, Context, Result};
