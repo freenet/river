@@ -2327,6 +2327,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-migrate"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "099e0ac5fed5bdd30f35d1d10a881b292ac221f2880debc470c299983f343075"
+dependencies = [
+ "blake3",
+ "bs58",
+ "ciborium",
+ "ed25519-dalek",
+ "freenet-scaffold",
+ "freenet-stdlib 0.8.5",
+ "serde",
+ "serde_with",
+]
+
+[[package]]
 name = "freenet-migrate-build"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4741,7 +4757,7 @@ dependencies = [
  "dioxus",
  "dioxus-free-icons",
  "ed25519-dalek",
- "freenet-migrate",
+ "freenet-migrate 0.5.0",
  "freenet-migrate-build",
  "freenet-scaffold",
  "freenet-stdlib 0.8.5",
@@ -4781,7 +4797,7 @@ dependencies = [
  "dialoguer",
  "directories 5.0.1",
  "ed25519-dalek",
- "freenet-migrate",
+ "freenet-migrate 0.6.0",
  "freenet-scaffold",
  "freenet-stdlib 0.8.5",
  "freenet-test-network",

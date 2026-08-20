@@ -55,9 +55,14 @@ freenet-stdlib = { workspace = true, features = ["net"] }
 freenet-scaffold = "0.2.2"
 # Sans-IO backward-probe decision driver (freenet/river#398 phase 2b): drives
 # the legacy-generation recovery search (newest-first, first real generation
-# wins). Its stdlib dep unifies with the workspace's 0.8.x. 0.5 is the same
-# contract-side API; the new surface is the delegate-secret walk the UI uses.
-freenet-migrate = "0.5"
+# wins). Its stdlib dep unifies with the workspace's 0.8.x.
+#
+# 0.6 is required, not merely newer: it is the first release to expose
+# `pub mod pointer` (the forward-discovery resolver riverctl uses to re-anchor
+# its room-contract key at runtime), and it is the release that stopped a probe
+# timeout reading as a definitive absence. That distinction is load-bearing
+# here, because absence is the ONLY answer that may unlock a baked-in key.
+freenet-migrate = "0.6"
 
 # Serialization (for contract state)
 ciborium = "0.2.2"

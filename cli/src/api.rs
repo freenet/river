@@ -1,9 +1,14 @@
 use crate::config::Config;
 use crate::output::OutputFormat;
+use crate::pointer::{
+    anchor_from_report, floor_key, probe_plan, river_author_vk, KeyIntent, ProbePlan,
+    ResolveReport, RoomAnchor, StoredFloor, ROOM_CONTRACT_APP_ID,
+};
 use crate::storage::Storage;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use freenet_migrate::pointer::{resolve_app_pointer, PointerFetch, PointerFloor, PointerIo};
 use freenet_migrate::{NewestFirst, Outcome, ProbeDriver, ProbeStateOps, SelectionPolicy, Step};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{
@@ -45,6 +50,97 @@ const UPGRADE_HOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum upgrade-pointer hops to follow before giving up — guards against a
 /// cyclic or runaway chain.
 const MAX_UPGRADE_HOPS: usize = 32;
+/// Timeout for the single GET that resolves River's room-contract pointer.
+///
+/// Short on purpose. Every command that opens a node connection pays it once,
+/// and a node that cannot reach the pointer must not turn every riverctl
+/// invocation into a 30-second wait. The record is ~100 bytes and the GET does
+/// not request contract code, so a reachable pointer answers well inside this.
+const POINTER_GET_TIMEOUT: Duration = Duration::from_secs(10);
+/// Responses to step over while waiting for the pointer's `GetResponse`.
+///
+/// The node multiplexes every response onto one connection, so an
+/// `UpdateNotification` for an already-subscribed room can overtake the answer
+/// we asked for (freenet-core#4970 is the same race on the SUBSCRIBE
+/// acknowledgement). Bounded so a chatty subscription cannot starve the wait.
+const MAX_UNRELATED_RESPONSES_DURING_POINTER_GET: usize = 16;
+
+/// The BLAKE3 code hash of the room-contract WASM this binary bundles.
+///
+/// This is the anchor riverctl used to have as its ONLY anchor, and the thing
+/// the pointer record is compared against.
+pub fn bundled_room_code_hash() -> [u8; 32] {
+    *blake3::hash(ROOM_CONTRACT_WASM).as_bytes()
+}
+
+/// [`PointerIo`] over riverctl's existing node connection.
+///
+/// Deliberately not built on the crate's `ConservativeProbeIo` adapter: that
+/// routes through `ProbeIo::get`, which requests the contract code, and would
+/// pull the pointer contract's own ~130 KB WASM on every run to read a
+/// 100-byte record.
+struct NodePointerIo<'a> {
+    web_api: &'a Arc<Mutex<WebApi>>,
+}
+
+impl PointerIo for NodePointerIo<'_> {
+    /// Never returned: every transport condition is reported as
+    /// [`PointerFetch::Unreachable`] instead, so a resolution is never aborted
+    /// by one bad round trip. `Err` here would surface as
+    /// `ResolveError::Transport`, which says the same thing with less nuance.
+    type Error = std::convert::Infallible;
+
+    async fn get_pointer(&mut self, id: ContractInstanceId) -> Result<PointerFetch, Self::Error> {
+        let request = ContractRequest::Get {
+            key: id,
+            // The record IS the answer, and the pointer contract's own WASM is
+            // ~130 KB. Asking for the code would pay that on every riverctl run.
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        };
+        let mut web_api = self.web_api.lock().await;
+        if let Err(e) = web_api.send(ClientRequest::ContractOp(request)).await {
+            warn!("Could not send the pointer GET: {e}");
+            return Ok(PointerFetch::Unreachable);
+        }
+        let deadline = tokio::time::Instant::now() + POINTER_GET_TIMEOUT;
+        for _ in 0..MAX_UNRELATED_RESPONSES_DURING_POINTER_GET {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, web_api.recv()).await {
+                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    key,
+                    state,
+                    ..
+                }))) if *key.id() == id => return Ok(PointerFetch::State(state.to_vec())),
+                // Something else on the shared connection. Keep waiting.
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => {
+                    debug!("Pointer GET failed: {e}");
+                    break;
+                }
+                Err(_) => {
+                    debug!("Pointer GET timed out after {POINTER_GET_TIMEOUT:?}");
+                    break;
+                }
+            }
+        }
+        // NEVER `PointerFetch::Absent`. `Absent` is the only answer that can
+        // unlock a baked-in build-time key, and this transport cannot produce a
+        // trustworthy one: the node reports a missing contract as a
+        // `ContractError::Get` whose cause is a free-text string, and on the
+        // live network a `NotFound` is overwhelmingly a routing dead-end for a
+        // contract that exists rather than a real absence. Reporting absence
+        // from that would be a downgrade primitive. The cost is that
+        // `PointerOutcome::NeverPublished` is unreachable through this adapter,
+        // which costs nothing: its arm falls back to the bundled hash, and so
+        // does `Unavailable`.
+        Ok(PointerFetch::Unreachable)
+    }
+}
 
 /// Optional fail-closed checks for non-interactive moderation callers. All
 /// predicates are evaluated against the fresh state fetched by the ban path.
@@ -418,6 +514,15 @@ fn migration_candidate_ids(
 ///   [`RiverCliMigrationProbeOps::merge_with_local`]).
 /// * `SeedLocal { local }` / `NoLegacy { local }` — every candidate missed (or
 ///   there were none): migrate the local cache forward.
+/// * `Indeterminate { local }`: at least one candidate never answered, so
+///   whether there is anything to recover is still unknown. freenet-migrate
+///   0.6 split this out of `SeedLocal`, and riverctl's I/O adapter cannot tell
+///   a real absence from a timeout (see `probe_legacy_bytes`), so in this
+///   integration every miss arrives here. Mapping it to the local cache is
+///   therefore exactly the pre-0.6 behaviour, deliberately preserved: the
+///   active-migration path has always fallen back to the local cache when
+///   nothing was reachable, and the migrating PUT is idempotent and retried on
+///   the next run.
 /// * `None` — defensive (an already-taken outcome): the local cache.
 fn resolve_migration_state_outcome(
     outcome: Option<Outcome<ChatRoomStateV1>>,
@@ -425,13 +530,90 @@ fn resolve_migration_state_outcome(
 ) -> ChatRoomStateV1 {
     match outcome {
         Some(Outcome::Recovered { merged, .. }) => merged,
-        Some(Outcome::SeedLocal { local }) | Some(Outcome::NoLegacy { local }) => local,
-        None => local_state.clone(),
+        Some(Outcome::SeedLocal { local })
+        | Some(Outcome::NoLegacy { local })
+        | Some(Outcome::Indeterminate { local, .. }) => local,
+        // `Outcome` is `#[non_exhaustive]`. A future arm has not been reasoned
+        // about here, so it must not silently adopt network state: the local
+        // cache is the conservative answer, exactly as for a taken outcome.
+        Some(_) | None => local_state.clone(),
     }
 }
 
-/// Compute the contract key for a room from its owner verifying key.
-/// This uses the current bundled WASM to ensure consistency.
+/// Build the backward-probe decision driver riverctl uses, in ONE place.
+///
+/// Both production paths (the read-path recovery search and the active
+/// migration search) and every test go through this. That is deliberate: the
+/// configuration below is not incidental, and a test that rebuilt a driver by
+/// hand would stop describing what riverctl actually does the moment the
+/// configuration changed, which is exactly what happened when freenet-migrate
+/// 0.6 changed the `NewestFirstWins` default for an unanswered candidate.
+///
+/// * `NewestFirstWins`: stop at the first generation with real state, so an
+///   older generation can never shadow a newer one.
+/// * `continue_past_unknown`: keep walking past a candidate that did not
+///   answer. See the long note at the call: riverctl cannot tell absence from
+///   silence, and almost every candidate is genuinely absent, so stopping at the
+///   first unknown would end the search at the first generation probed.
+/// * `with_max_hops` sized to the candidate list, because the pre-driver loop was
+///   unbounded, and the crate's default cap (64) would silently strand the
+///   oldest generations if the registry outgrew it.
+fn new_probe_driver<O: ProbeStateOps>(
+    ops: O,
+    local: O::State,
+    candidates_newest_first: Vec<ContractInstanceId>,
+) -> ProbeDriver<O> {
+    let count = candidates_newest_first.len();
+    ProbeDriver::new(
+        ops,
+        local,
+        // Candidates are newest-first BY CONSTRUCTION at every call site, so
+        // `assume_ordered` is sound.
+        NewestFirst::assume_ordered(candidates_newest_first),
+        SelectionPolicy::NewestFirstWins,
+    )
+    // Keep walking past an unanswered candidate. 0.6 made `NewestFirstWins`
+    // STOP at the first unknown, which is the right default for a driver that
+    // can tell absence from silence, since walking past a newer generation that
+    // merely failed to answer risks adopting an older one over it.
+    //
+    // riverctl cannot tell them apart. `try_get_state` collapses "the contract
+    // does not exist", "the GET timed out" and "the bytes did not decode" into
+    // one `None`, and the node offers no trustworthy absence signal to build on.
+    // Almost every candidate here is genuinely absent (a room lives on ONE
+    // generation out of the 31 in the registry), so stopping at the first
+    // unknown would end the search at the first generation probed and disable
+    // dormant-room recovery outright. That is not a safer probe, it is a probe
+    // that never runs.
+    //
+    // The rollback the token warns about is separately mitigated: the active
+    // path's candidate list deliberately re-lists the stored key so a transient
+    // miss on the newest generation is RETRIED before the probe advances (see
+    // `migration_candidate_ids`), and `NewestFirstWins` still stops at the first
+    // generation with real state.
+    .continue_past_unknown(
+        freenet_migrate::RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+    )
+    .with_max_hops(count.max(freenet_migrate::DEFAULT_MAX_PROBE_HOPS))
+}
+
+/// Compute the contract key for a room from its owner verifying key, using the
+/// room-contract WASM **this binary bundles**.
+///
+/// This is a build-time answer, and it is only current for as long as River has
+/// not re-keyed since this binary was built. It remains correct for the offline
+/// local-cache path (a command that never opens a node connection has nothing
+/// better available) and as the comparison point for a resolved pointer record.
+///
+/// **Do not use it to address a contract on the network.** Use
+/// [`ApiClient::contract_key_for`], which derives from the generation River's
+/// pointer record names. See [`crate::pointer`] for why the difference matters:
+/// riverctl is installed from crates.io and kept, so "the WASM I was built
+/// with" and "the WASM River is running" drift apart, and a key derived from
+/// the former addresses a contract nobody is using. Pinned by
+/// `room_keys_for_the_network_are_derived_only_through_the_anchor`.
+// bundled-wasm-ok: this function IS the bundled derivation, kept for the offline
+// local-cache path and as the comparison point for a resolved pointer record.
 pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
     let params = ChatRoomParametersV1 { owner: *owner_vk };
     let params_bytes = {
@@ -439,6 +621,7 @@ pub fn compute_contract_key(owner_vk: &VerifyingKey) -> ContractKey {
         ciborium::ser::into_writer(&params, &mut buf).expect("Failed to serialize parameters");
         buf
     };
+    // bundled-wasm-ok: see above.
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
     ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code)
 }
@@ -1519,6 +1702,14 @@ pub struct ApiClient {
     #[allow(dead_code)]
     config: Config,
     storage: Storage,
+    /// River's room-contract generation for this run, resolved from the pointer
+    /// record on first use and reused thereafter.
+    ///
+    /// Lazy rather than resolved in [`ApiClient::new`] so a command that opens a
+    /// connection but never touches a room key pays nothing, and so the one GET
+    /// happens where its failure can be reported against the operation that
+    /// needed it.
+    room_anchor: tokio::sync::OnceCell<RoomAnchor>,
 }
 
 impl ApiClient {
@@ -1560,7 +1751,104 @@ impl ApiClient {
             web_api: Arc::new(Mutex::new(web_api)),
             config,
             storage,
+            room_anchor: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// River's room-contract generation for this run, resolved once.
+    ///
+    /// Resolution is one GET of a fixed address, so the cost is a single short
+    /// round trip per riverctl invocation that touches a room.
+    pub async fn room_anchor(&self) -> Result<&RoomAnchor> {
+        self.room_anchor
+            .get_or_try_init(|| self.resolve_room_anchor())
+            .await
+    }
+
+    /// Resolve River's room-contract pointer, persist the anti-rollback floor,
+    /// and announce anything the user needs to know.
+    async fn resolve_room_anchor(&self) -> Result<RoomAnchor> {
+        let bundled = bundled_room_code_hash();
+        let author_vk = river_author_vk()?;
+        let key = floor_key(&author_vk, ROOM_CONTRACT_APP_ID);
+
+        // A floor that will not rebuild is an ERROR, never a reset. See
+        // `StoredFloor::to_floor`: `never_resolved` is the one state that
+        // re-enables the build-time key, so "recovering" into it is the
+        // downgrade the floor exists to prevent.
+        let floor = match self.storage.load_pointer_floor(&key)? {
+            Some(stored) => stored.to_floor().with_context(|| {
+                crate::pointer::floor_corruption_hint(self.storage.pointer_floors_path())
+            })?,
+            None => PointerFloor::never_resolved(),
+        };
+
+        let mut io = NodePointerIo {
+            web_api: &self.web_api,
+        };
+        let report =
+            match resolve_app_pointer(&mut io, &author_vk, ROOM_CONTRACT_APP_ID, floor).await {
+                Ok(outcome) => ResolveReport::Outcome(outcome),
+                // `NodePointerIo` never returns `Err`, so only the pointer-side
+                // error (a malformed or unverifiable record) can land here.
+                Err(e) => ResolveReport::Failed(e.to_string()),
+            };
+
+        // Persist the floor BEFORE acting on the outcome, and specifically
+        // including a withdrawal: `anchor_from_report` refuses on a withdrawal,
+        // and returning early without persisting would leave the floor at the
+        // pre-withdrawal version, so any peer could then serve a genuine
+        // pre-withdrawal record and resurrect the retired code.
+        if let ResolveReport::Outcome(outcome) = &report {
+            if let Some(next) = outcome.next_floor() {
+                if let Err(e) = self
+                    .storage
+                    .save_pointer_floor(&key, StoredFloor::from_floor(&next))
+                {
+                    // Best-effort: failing to persist costs anti-rollback
+                    // protection on the NEXT run, but the record verified on
+                    // THIS one, so refusing the operation would be worse.
+                    warn!("Could not persist the pointer anti-rollback floor: {e}");
+                }
+            }
+        }
+
+        let anchor = anchor_from_report(&report, &floor, bundled)?;
+
+        // Once per run, on stderr, so it is visible in a pipeline whose stdout
+        // is being parsed. Repeating it per derived key would train users to
+        // ignore it.
+        if let Some(advisory) = anchor.advisory() {
+            eprintln!("{advisory}");
+        }
+        info!(
+            "Room-contract generation for this run: {} ({:?}, {:?})",
+            crate::pointer::code_hash_b58(anchor.code_hash()),
+            anchor.generation(),
+            anchor.source(),
+        );
+
+        // Let the local room cache regenerate its keys against the same
+        // generation the network paths use, instead of against the bundled WASM.
+        self.storage.set_room_code_hash(*anchor.code_hash());
+        Ok(anchor)
+    }
+
+    /// The room-contract key for `owner_vk` under this run's resolved
+    /// generation, refusing when `intent` is not something this binary can
+    /// honestly do against that generation.
+    ///
+    /// **This is the choke point.** Deriving a room key from
+    /// [`ROOM_CONTRACT_WASM`] anywhere else re-introduces the stale-anchor bug;
+    /// `room_keys_for_the_network_are_derived_only_through_the_anchor` pins that.
+    pub async fn contract_key_for(
+        &self,
+        owner_vk: &VerifyingKey,
+        intent: KeyIntent,
+    ) -> Result<ContractKey> {
+        let anchor = self.room_anchor().await?;
+        anchor.authorize(intent)?;
+        Ok(anchor.contract_key(owner_vk))
     }
 
     pub async fn create_room(
@@ -1574,6 +1862,12 @@ impl ApiClient {
             if private { "private" } else { "public" },
             name
         );
+        // Publishing the room contract means PUTting the bytes this binary
+        // bundles, which is only honest when River's pointer record agrees that
+        // those bytes are the current generation.
+        self.room_anchor()
+            .await?
+            .authorize(KeyIntent::PublishCode)?;
 
         // Generate signing key for the room owner
         let signing_key =
@@ -1603,6 +1897,10 @@ impl ApiClient {
             buf
         };
 
+        // bundled-wasm-ok: this path PUTs the contract's real bytes, and riverctl
+        // only has the ones it bundles. Gated above on `KeyIntent::PublishCode`,
+        // which refuses unless River's pointer record agrees these bytes are the
+        // current generation.
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         // Use the full ContractKey constructor that includes the code hash
         let contract_key = ContractKey::from_params_and_code(
@@ -1737,6 +2035,12 @@ impl ApiClient {
             "Republishing room owned by: {}",
             bs58::encode(room_owner_key.as_bytes()).into_string()
         );
+        // Publishing the room contract means PUTting the bytes this binary
+        // bundles, which is only honest when River's pointer record agrees that
+        // those bytes are the current generation.
+        self.room_anchor()
+            .await?
+            .authorize(KeyIntent::PublishCode)?;
 
         // Get the room state from local storage
         let room_data = self.storage.get_room(room_owner_key)?.ok_or_else(|| {
@@ -1755,6 +2059,10 @@ impl ApiClient {
             buf
         };
 
+        // bundled-wasm-ok: this path PUTs the contract's real bytes, and riverctl
+        // only has the ones it bundles. Gated above on `KeyIntent::PublishCode`,
+        // which refuses unless River's pointer record agrees these bytes are the
+        // current generation.
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         let contract_key = ContractKey::from_params_and_code(
             Parameters::from(params_bytes.clone()),
@@ -2084,13 +2392,23 @@ impl ApiClient {
         }
 
         // 2. Backward search across previous contract generations, driven by
-        //    freenet_migrate's sans-IO decision driver. Candidates are the
-        //    legacy keys, already newest-first BY CONSTRUCTION
-        //    (`legacy_contract_keys_for_owner` reverses the oldest-first
-        //    registry), so `assume_ordered` is sound; `NewestFirstWins` stops
-        //    at the first real generation — the anti-rollback guarantee.
-        let legacy_keys = river_core::migration::legacy_contract_keys_for_owner(room_owner_key);
-        let legacy_count = legacy_keys.len();
+        //    freenet_migrate's sans-IO decision driver. Candidates are newest
+        //    first BY CONSTRUCTION, so `assume_ordered` is sound;
+        //    `NewestFirstWins` stops at the first real generation, which is the
+        //    anti-rollback guarantee.
+        //
+        //    The candidate list is ANCHORED ON THE RESOLVED GENERATION, not on
+        //    the bundled one. That is the whole point of resolving: "older than
+        //    where the room is" is only meaningful relative to where the room
+        //    actually is. Anchored at the bundled generation instead, a riverctl
+        //    that River has moved past searches a set that cannot contain the
+        //    live room, and can surface an ancient copy and republish it onto a
+        //    retired key.
+        let candidate_ids = match probe_plan(room_owner_key, self.room_anchor().await?) {
+            ProbePlan::Probe(ids) => ids,
+            ProbePlan::Refuse(message) => return Err(anyhow!(message)),
+        };
+        let legacy_count = candidate_ids.len();
         info!(
             "Room not present on current contract {current_id}; probing {legacy_count} previous \
              contract generation(s)"
@@ -2102,25 +2420,17 @@ impl ApiClient {
         // `river_core::migration`, and feeding the raw driver avoids fabricating
         // lineage values just to satisfy that signature. The pump below is the
         // same trivial loop `migrate_contract` runs.
-        let candidate_ids: Vec<ContractInstanceId> = legacy_keys.iter().map(|k| *k.id()).collect();
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverCliProbeOps {
                 owner_vk: *room_owner_key,
             },
             // The CLI never merges device-local state and never seeds it, so the
             // local snapshot is an empty default: `merge_with_local` returns the
-            // recovered state verbatim, and exhaustion (SeedLocal) maps to the
-            // not-found error below rather than PUTting anything.
+            // recovered state verbatim, and exhaustion maps to the not-found
+            // error below rather than PUTting anything.
             ChatRoomStateV1::default(),
-            NewestFirst::assume_ordered(candidate_ids),
-            SelectionPolicy::NewestFirstWins,
-        )
-        // The pre-driver loop probed EVERY legacy key unbounded; the driver's
-        // default hop cap (64) would silently strand the oldest generations if
-        // the registry ever exceeded it (27 today). Size the cap to fit the whole
-        // registry so it only ever guards a runaway registry, never truncates a
-        // real one.
-        .with_max_hops(legacy_count.max(freenet_migrate::DEFAULT_MAX_PROBE_HOPS));
+            candidate_ids,
+        );
 
         // Trivial pump: one awaitable GET (with its forward chain-walk) per
         // candidate. `probe_legacy_bytes` is the I/O adapter — it returns the
@@ -2133,7 +2443,14 @@ impl ApiClient {
             probes_run += 1;
             match self.probe_legacy_bytes(room_owner_key, id).await {
                 Some(bytes) => driver.on_response(id, &bytes),
-                None => driver.on_timeout(id),
+                // `on_unknown`, never `on_absent`: this adapter cannot tell an
+                // answered "no state here" from a timeout, a send failure or an
+                // undecodable body. `try_get_state` collapses all of them to
+                // `None`. Absence is the only answer that may seal a generation
+                // as empty, so claiming it here would seal a predecessor that
+                // was merely slow. (freenet-migrate#19; `on_timeout` is its
+                // deprecated alias for exactly this call.)
+                None => driver.on_unknown(id),
             }
         }
 
@@ -2287,6 +2604,31 @@ impl ApiClient {
         // key plus every known legacy key. A pointer to any of these is
         // current-or-older and must not be followed (freenet/river#427).
         let mut known_keys: HashSet<ContractInstanceId> = HashSet::new();
+        // The generation resolved from River's pointer record AND the bundled
+        // one. Both are "current-or-older" for this owner: an upgrade pointer
+        // aimed at either is not a forward hop, and following it can only
+        // regress (freenet/river#427). When the two are the same key this is one
+        // insert, as before.
+        // Read the ALREADY-resolved anchor rather than re-resolving: every path
+        // that reaches here went through `room_anchor()` first, so the value is
+        // cached and this performs no I/O and can swallow no transport error.
+        match self.room_anchor.get() {
+            Some(anchor) => {
+                known_keys.insert(*anchor.contract_key(room_owner_key).id());
+            }
+            // Unreachable today. Loud rather than silent, because the effect is a
+            // SMALLER refuse-list, which means following an upgrade pointer we
+            // would otherwise refuse (freenet/river#427) rather than failing.
+            None => warn!(
+                "Upgrade-pointer guard is running before the room-contract anchor was \
+                 resolved; the resolved generation is missing from `known_keys`, so a \
+                 pointer aimed at it would be followed (freenet/river#427)"
+            ),
+        }
+        // bundled-wasm-ok: `known_keys` must recognise a pointer aimed at ANY
+        // generation this binary knows, bundled included, so a backward pointer
+        // planted by migration poisoning is never chased (freenet/river#427).
+        // This set is never used to ADDRESS a contract.
         known_keys.insert(*self.owner_vk_to_contract_key(room_owner_key).id());
         for legacy_key in river_core::migration::legacy_contract_keys_for_owner(room_owner_key) {
             known_keys.insert(*legacy_key.id());
@@ -2311,12 +2653,22 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         room_state: &ChatRoomStateV1,
     ) -> Result<()> {
+        // Publishing the room contract means PUTting the bytes this binary
+        // bundles, which is only honest when River's pointer record agrees that
+        // those bytes are the current generation.
+        self.room_anchor()
+            .await?
+            .authorize(KeyIntent::PublishCode)?;
         let parameters = ChatRoomParametersV1 {
             owner: *room_owner_key,
         };
         let mut params_bytes = Vec::new();
         ciborium::ser::into_writer(&parameters, &mut params_bytes)
             .map_err(|e| anyhow!("Failed to serialize parameters: {e}"))?;
+        // bundled-wasm-ok: this path PUTs the contract's real bytes, and riverctl
+        // only has the ones it bundles. Gated above on `KeyIntent::PublishCode`,
+        // which refuses unless River's pointer record agrees these bytes are the
+        // current generation.
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
             WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
@@ -2547,7 +2899,9 @@ impl ApiClient {
         info!("Accepting invitation with nickname: {}", nickname);
 
         let room_owner_vk = invitation.room;
-        let contract_key = self.owner_vk_to_contract_key(&room_owner_vk);
+        let contract_key = self
+            .contract_key_for(&room_owner_vk, KeyIntent::Write)
+            .await?;
 
         // Refuse to re-accept an invitation for a room we already have stored
         // credentials for (issue freenet/river#308). Re-accepting rebuilds the
@@ -2820,6 +3174,14 @@ impl ApiClient {
         }
     }
 
+    /// The room key this binary's bundled WASM derives.
+    ///
+    /// Kept for the one caller that legitimately needs the BUNDLED generation
+    /// rather than the resolved one: `follow_upgrade_chain`'s `known_keys`,
+    /// which must recognise a pointer aimed at any generation we know about.
+    /// Every other caller wants [`Self::contract_key_for`].
+    // bundled-wasm-ok: this method IS the bundled derivation; the doc above names
+    // its one legitimate caller.
     pub fn owner_vk_to_contract_key(&self, owner_vk: &VerifyingKey) -> ContractKey {
         let parameters = ChatRoomParametersV1 { owner: *owner_vk };
         let params_bytes = {
@@ -2828,6 +3190,7 @@ impl ApiClient {
                 .expect("Serialization should not fail");
             buf
         };
+        // bundled-wasm-ok: see above.
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         // Use the full ContractKey constructor that includes the code hash
         ContractKey::from_params_and_code(Parameters::from(params_bytes), &contract_code)
@@ -2846,9 +3209,25 @@ impl ApiClient {
     ///
     /// Any member can perform this migration — not just the owner.
     ///
+    /// Migration only runs when River's pointer record agrees that the bundled
+    /// generation is the current one. Migrating means PUTting the bundled
+    /// contract code, so against any other generation the target would be a key
+    /// nobody uses: when the network is ahead, we cannot publish its code, and
+    /// when it is behind, publishing ours would move the room somewhere the rest
+    /// of River is not looking. In both cases the resolved key is already
+    /// correct and there is nothing to migrate TO.
+    ///
     /// Returns the current contract key (possibly updated).
     pub async fn ensure_room_migrated(&self, room_owner_key: &VerifyingKey) -> Result<ContractKey> {
-        let expected_key = self.owner_vk_to_contract_key(room_owner_key);
+        let anchor = self.room_anchor().await?;
+        let expected_key = anchor.contract_key(room_owner_key);
+        if anchor.authorize(KeyIntent::PublishCode).is_err() {
+            debug!(
+                "Skipping room migration: the resolved room-contract generation is not the one \
+                 this riverctl bundles, so there is nothing to migrate onto"
+            );
+            return Ok(expected_key);
+        }
 
         // Check if we have this room locally
         let storage = self.storage.load_rooms()?;
@@ -3088,23 +3467,15 @@ impl ApiClient {
         // and exhaustion falls back to the local cache rather than erroring.
         // `NewestFirstWins` stops at the first real generation — so the stored
         // key short-circuits the deep scan on a hit, preserving the fast path.
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverCliMigrationProbeOps {
                 inner: RiverCliProbeOps {
                     owner_vk: *room_owner_key,
                 },
             },
-            // Folded into a hit via `merge_with_local`, and handed back verbatim
-            // on exhaustion (SeedLocal / NoLegacy) — the pre-driver
-            // `Ok(local_state.clone())` fallback.
             local_state.clone(),
-            NewestFirst::assume_ordered(candidate_ids),
-            SelectionPolicy::NewestFirstWins,
-        )
-        // Size the hop cap to the candidate set so the driver's default 64-hop
-        // cap can never truncate a >64-generation registry (the pre-driver deep
-        // path was unbounded), mirroring the read path.
-        .with_max_hops(candidate_count.max(freenet_migrate::DEFAULT_MAX_PROBE_HOPS));
+            candidate_ids,
+        );
 
         // Trivial pump: one awaitable GET per candidate. `probe_migration_bytes`
         // is the I/O adapter (plain GET, no upgrade-chain walk — matching the
@@ -3112,7 +3483,14 @@ impl ApiClient {
         while let Step::Get(id) = driver.next_action() {
             match self.probe_migration_bytes(room_owner_key, id).await {
                 Some(bytes) => driver.on_response(id, &bytes),
-                None => driver.on_timeout(id),
+                // `on_unknown`, never `on_absent`: this adapter cannot tell an
+                // answered "no state here" from a timeout, a send failure or an
+                // undecodable body. `try_get_state` collapses all of them to
+                // `None`. Absence is the only answer that may seal a generation
+                // as empty, so claiming it here would seal a predecessor that
+                // was merely slow. (freenet-migrate#19; `on_timeout` is its
+                // deprecated alias for exactly this call.)
+                None => driver.on_unknown(id),
             }
         }
 
@@ -3189,6 +3567,12 @@ impl ApiClient {
         new_contract_key: ContractKey,
     ) -> Result<ContractKey> {
         info!("Migrating room to new contract: {}", new_contract_key.id());
+        // Publishing the room contract means PUTting the bytes this binary
+        // bundles, which is only honest when River's pointer record agrees that
+        // those bytes are the current generation.
+        self.room_anchor()
+            .await?
+            .authorize(KeyIntent::PublishCode)?;
 
         let parameters = ChatRoomParametersV1 {
             owner: *room_owner_key,
@@ -3200,6 +3584,10 @@ impl ApiClient {
             buf
         };
 
+        // bundled-wasm-ok: this path PUTs the contract's real bytes, and riverctl
+        // only has the ones it bundles. Gated above on `KeyIntent::PublishCode`,
+        // which refuses unless River's pointer record agrees these bytes are the
+        // current generation.
         let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
         let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
             WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
@@ -3480,7 +3868,9 @@ impl ApiClient {
             .map_err(|e| anyhow!("Failed to apply message delta: {:?}", e))?;
 
         // Send the delta to the network
-        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        let contract_key = self
+            .contract_key_for(room_owner_key, KeyIntent::Write)
+            .await?;
 
         let delta_bytes = {
             let mut buf = Vec::new();
@@ -3601,7 +3991,9 @@ impl ApiClient {
             .update_room_state(room_owner_key, room_state.clone())?;
 
         // Send the delta to the network
-        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        let contract_key = self
+            .contract_key_for(room_owner_key, KeyIntent::Write)
+            .await?;
 
         // Serialize the delta
         let delta_bytes = {
@@ -3656,7 +4048,9 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         delta: &ChatRoomStateV1Delta,
     ) -> Result<()> {
-        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        let contract_key = self
+            .contract_key_for(room_owner_key, KeyIntent::Write)
+            .await?;
 
         let delta_bytes = {
             let mut buf = Vec::new();
@@ -4119,7 +4513,9 @@ impl ApiClient {
         room_owner_key: &VerifyingKey,
         delta: ChatRoomStateV1Delta,
     ) -> Result<()> {
-        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        let contract_key = self
+            .contract_key_for(room_owner_key, KeyIntent::Write)
+            .await?;
 
         // Serialize the delta
         let delta_bytes = {
@@ -4836,7 +5232,9 @@ impl ApiClient {
         };
 
         // Get contract key and send the update
-        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        let contract_key = self
+            .contract_key_for(room_owner_key, KeyIntent::Write)
+            .await?;
 
         let update_request = ContractRequest::Update {
             key: contract_key,
@@ -5030,7 +5428,9 @@ impl ApiClient {
         };
 
         // Get contract key and send the update
-        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        let contract_key = self
+            .contract_key_for(room_owner_key, KeyIntent::Write)
+            .await?;
 
         let update_request = ContractRequest::Update {
             key: contract_key,
@@ -5239,7 +5639,9 @@ impl ApiClient {
             buf
         };
 
-        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        let contract_key = self
+            .contract_key_for(room_owner_key, KeyIntent::Write)
+            .await?;
 
         let update_request = ContractRequest::Update {
             key: contract_key,
@@ -5322,7 +5724,9 @@ impl ApiClient {
 
         // Fetch current room state to pre-populate seen_messages and trigger
         // migration if needed (get_room calls ensure_room_migrated internally).
-        let contract_key = self.owner_vk_to_contract_key(room_owner_key);
+        let contract_key = self
+            .contract_key_for(room_owner_key, KeyIntent::Read)
+            .await?;
         let contract_instance_id = *contract_key.id();
         {
             let mut room_state = self.get_room(room_owner_key, false).await?;
@@ -6019,6 +6423,164 @@ mod invitation_tests {
 mod migration_recovery_tests {
     use super::*;
 
+    /// Every room key that reaches the NETWORK must come from the resolved
+    /// pointer anchor, never from the WASM this binary bundles.
+    ///
+    /// This is the actual regression guard for the stale-anchor bug this change
+    /// exists to fix. Re-introducing that bug is ONE edit: a send path that
+    /// derives its key from the bundled WASM compiles, passes every behavioural
+    /// test in this crate, and silently UPDATEs a retired key for every user on
+    /// that build. Nothing but a scrape catches it, because the wrong key is a
+    /// perfectly well-formed key.
+    ///
+    /// # How it works, and why it is shaped this way
+    ///
+    /// An earlier version of this pin scraped ONE literal
+    /// (`self.owner_vk_to_contract_key`) in ONE file (`api.rs`). That is worth
+    /// recording, because it looked like a guard and was not one: the free
+    /// function `compute_contract_key` reaches the same derivation, is already
+    /// imported by `storage.rs` and `commands/identity.rs`, and was not in the
+    /// needle set. Swapping the main message-send path to it left the suite at
+    /// 337 passed. A guard with one door is not a guard.
+    ///
+    /// So this pin closes all three doors and scans the whole crate:
+    ///
+    /// * `compute_contract_key` and `owner_vk_to_contract_key`, the two helpers
+    ///   that derive from the bundled WASM; and
+    /// * the `ContractCode::from` of the bundled WASM, the root both helpers
+    ///   use, which catches a fresh derivation calling neither.
+    ///
+    /// It walks `src/` rather than naming files, so a NEW file cannot be born
+    /// outside its scope. Legitimate uses carry an explicit `bundled-wasm-ok:`
+    /// marker with a reason, so the allowlist lives at the call site instead of
+    /// drifting from it, and every future use has to be argued in writing
+    /// rather than merely compile.
+    #[test]
+    fn room_keys_for_the_network_are_derived_only_through_the_anchor() {
+        // Marker a line must carry to use the bundled WASM deliberately.
+        const OK: &str = "bundled-wasm-ok:";
+        let needles = [
+            "compute_contract_key(",     // bundled-wasm-ok: the needle itself
+            "owner_vk_to_contract_key(", // bundled-wasm-ok: the needle itself
+            // bundled-wasm-ok: the needle itself
+            "ContractCode::from(ROOM_CONTRACT_WASM)",
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    sources.push(path);
+                }
+            }
+        }
+
+        // Fail CLOSED. A walk that silently found nothing would leave this pin
+        // passing forever while checking nothing, which is the exact failure its
+        // own history above is about.
+        assert!(
+            sources.len() >= 8,
+            "the source walk found only {} files under {}; it is not scanning the crate",
+            sources.len(),
+            root.display()
+        );
+        for required in ["api.rs", "storage.rs", "identity.rs"] {
+            assert!(
+                sources.iter().any(|p| p.ends_with(required)),
+                "the source walk missed {required}, which imports a bundled-WASM derivation"
+            );
+        }
+
+        // A line is allowed if it carries the marker itself, or if the contiguous
+        // comment block directly above it does. Reasons worth reading rarely fit
+        // in a trailing comment, and requiring one would select for reasons too
+        // short to be worth writing. The block must be CONTIGUOUS, so a marker
+        // cannot drift upward and silently cover a whole function.
+        fn allowed(lines: &[&str], i: usize, ok: &str) -> bool {
+            if lines[i].contains(ok) {
+                return true;
+            }
+            let mut j = i;
+            while j > 0 {
+                let prev = lines[j - 1].trim_start();
+                if !prev.starts_with("//") {
+                    return false;
+                }
+                if prev.contains(ok) {
+                    return true;
+                }
+                j -= 1;
+            }
+            false
+        }
+
+        let mut offending = Vec::new();
+        for path in &sources {
+            let text = std::fs::read_to_string(path).expect("readable source file");
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if needles.iter().any(|n| line.contains(n)) && !allowed(&lines, i, OK) {
+                    offending.push(format!(
+                        "{}:{}: {}",
+                        path.strip_prefix(&root).unwrap_or(path).display(),
+                        i + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        offending.sort();
+        assert!(
+            offending.is_empty(),
+            "these lines derive a room key from the WASM this binary bundles, which goes stale \
+             the moment River re-keys. Use `contract_key_for(owner_vk, KeyIntent::..)`, which \
+             derives from the generation River's pointer record names. If a line genuinely needs \
+             the bundled generation, mark it `// {OK} <reason>` and say why.\n  {}",
+            offending.join("\n  ")
+        );
+    }
+
+    /// The four operations that PUT the room contract's actual bytes must each
+    /// check that the bundled generation is the current one first. riverctl only
+    /// has the bytes it bundles, so publishing them against any other resolved
+    /// generation writes to a key nobody reads, silently, with a successful
+    /// PutResponse.
+    #[test]
+    fn every_room_contract_put_is_gated_on_publishing_the_bundled_generation() {
+        let src = include_str!("api.rs");
+        let gate = "authorize(KeyIntent::PublishCode)";
+        for (fn_name, next_marker) in [
+            ("pub async fn create_room(", "ContractRequest::Put"),
+            ("pub async fn republish_room(", "ContractRequest::Put"),
+            ("async fn put_room_state(", "ContractRequest::Put"),
+            (
+                "async fn migrate_room_to_new_contract(",
+                "ContractRequest::Put",
+            ),
+        ] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("`{fn_name}` must exist"));
+            let put_at = src[start..]
+                .find(next_marker)
+                .map(|off| start + off)
+                .unwrap_or_else(|| panic!("`{fn_name}` has no {next_marker}"));
+            assert!(
+                src[start..put_at].contains(gate),
+                "`{fn_name}` PUTs the room contract without first checking \
+                 `{gate}`; a stale riverctl would publish its own bundled code onto a \
+                 generation River has moved past"
+            );
+        }
+    }
+
     /// The legacy registry derives a contract key exactly as the live code path
     /// (`compute_contract_key` / `owner_vk_to_contract_key`) does. If this ever
     /// drifts, every backward probe would target the wrong contract instance
@@ -6031,6 +6593,8 @@ mod migration_recovery_tests {
         let current_code_hash: [u8; 32] = *blake3::hash(ROOM_CONTRACT_WASM).as_bytes();
         let via_registry =
             river_core::migration::contract_key_for_code_hash(&owner, &current_code_hash);
+        // bundled-wasm-ok: this test's whole point is that the registry's
+        // derivation matches the bundled one for the same code hash.
         let via_live = compute_contract_key(&owner);
         assert_eq!(
             via_registry.id(),
@@ -6506,11 +7070,10 @@ mod migration_recovery_tests {
     fn cli_driver_adopts_newest_real_generation() {
         let owner_sk = SigningKey::from_bytes(&[73u8; 32]);
         let owner_vk = owner_sk.verifying_key();
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverCliProbeOps { owner_vk },
             ChatRoomStateV1::default(),
-            NewestFirst::assume_ordered(vec![cli_id(9), cli_id(5)]),
-            SelectionPolicy::NewestFirstWins,
+            vec![cli_id(9), cli_id(5)],
         );
         let Step::Get(newest) = driver.next_action() else {
             panic!("expected a GET")
@@ -6532,20 +7095,69 @@ mod migration_recovery_tests {
         assert!(merged.configuration.verify_signature(&owner_vk).is_ok());
     }
 
-    /// End-to-end: every generation misses (a timeout then an undecodable
-    /// response), so the driver reports SeedLocal — which
-    /// `fetch_room_state_with_recovery` maps to the not-found error. The CLI
-    /// never seeds device-local state.
+    /// The shared driver constructor keeps the three settings riverctl's probe
+    /// depends on. They are easy to drop in a refactor and each failure is
+    /// silent:
+    ///
+    /// * without `NewestFirstWins`, an older generation can shadow a newer one;
+    /// * without `continue_past_unknown`, the search stops at the first
+    ///   generation that does not answer, and since riverctl reports every
+    ///   miss as "did not answer", that is the FIRST candidate, so recovery
+    ///   stops working entirely while every test still passes;
+    /// * without `with_max_hops`, the crate's default 64-hop cap silently
+    ///   strands the oldest generations once the registry outgrows it.
     #[test]
-    fn cli_driver_exhausts_to_seed_local() {
+    fn the_shared_probe_driver_keeps_its_configuration() {
+        let full = include_str!("api.rs");
+        let start = full
+            .find("fn new_probe_driver")
+            .expect("new_probe_driver must exist");
+        let end = full[start..]
+            .find("\n/// Compute the contract key for a room")
+            .map(|off| start + off)
+            .expect("new_probe_driver must be followed by compute_contract_key's doc comment");
+        let body = &full[start..end];
+        for (needle, why) in [
+            (
+                "NewestFirstWins",
+                "an older generation could shadow a newer one",
+            ),
+            (
+                "continue_past_unknown",
+                "the probe would stop at the first candidate that did not answer, and riverctl \
+                 reports every miss that way, so recovery would stop working silently",
+            ),
+            (
+                "with_max_hops",
+                "the crate's default hop cap would silently strand the oldest generations",
+            ),
+        ] {
+            assert!(
+                body.contains(needle),
+                "`new_probe_driver` no longer sets `{needle}`: {why}"
+            );
+        }
+    }
+
+    /// End-to-end: every generation misses (a silent one, then an undecodable
+    /// response), so the driver exhausts, and the read path maps that to the
+    /// not-found error. The CLI never seeds device-local state.
+    ///
+    /// The outcome is `Indeterminate` rather than `SeedLocal` because one
+    /// candidate never answered, and freenet-migrate 0.6 keeps those apart:
+    /// "asked everyone, found nothing" is a different fact from "somebody never
+    /// answered". riverctl's I/O adapter cannot tell absence from silence, so
+    /// every one of its misses is the latter. The mapping is what this test is
+    /// really about, and it is unchanged: neither one seeds.
+    #[test]
+    fn cli_driver_exhausts_to_the_not_found_error() {
         let owner_sk = SigningKey::from_bytes(&[74u8; 32]);
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverCliProbeOps {
                 owner_vk: owner_sk.verifying_key(),
             },
             ChatRoomStateV1::default(),
-            NewestFirst::assume_ordered(vec![cli_id(2), cli_id(1)]),
-            SelectionPolicy::NewestFirstWins,
+            vec![cli_id(2), cli_id(1)],
         );
         let Step::Get(a) = driver.next_action() else {
             panic!()
@@ -6556,9 +7168,19 @@ mod migration_recovery_tests {
         };
         driver.on_response(b, &[0xffu8; 8]); // undecodable → miss
         assert_eq!(driver.next_action(), Step::Done);
+        let outcome = driver.take_outcome();
         assert!(
-            matches!(driver.take_outcome(), Some(Outcome::SeedLocal { .. })),
-            "exhaustion must be SeedLocal — which the CLI maps to the not-found Err, never a seed"
+            matches!(outcome, Some(Outcome::Indeterminate { .. })),
+            "a candidate that never answered must exhaust to Indeterminate, not SeedLocal; \
+             got {outcome:?}"
+        );
+        // The load-bearing half: whatever the variant is called, the read path
+        // must map exhaustion to the not-found Err and PUT nothing.
+        let err = resolve_legacy_recovery_outcome(outcome, cli_id(2), 2)
+            .expect_err("the CLI never seeds device-local state");
+        assert!(
+            err.to_string().contains("Room not found"),
+            "exhaustion must surface the stable not-found message; got: {err}"
         );
     }
 
@@ -6581,19 +7203,24 @@ mod migration_recovery_tests {
             .expect("probe_legacy_bytes must follow fetch_room_state_with_recovery");
         let body = &rest[..body_end];
 
-        // Match "NewestFirstWins" bare so a `use` that drops the
-        // `SelectionPolicy::` prefix cannot false-fail this pin.
+        // The driver's configuration (newest-first, hop cap, continue-past-
+        // unknown) lives in `new_probe_driver` and is pinned by
+        // `the_shared_probe_driver_keeps_its_configuration`. What THIS pin
+        // guards is that the recovery search still goes through it, rather than
+        // re-rolling a driver with its own settings.
         assert!(
-            body.contains("NewestFirstWins"),
-            "the legacy recovery search must use the newest-first decision driver"
+            body.contains("new_probe_driver("),
+            "the legacy recovery search must build its driver through `new_probe_driver`, \
+             which is where the newest-first policy and the hop cap live"
         );
-        // The hop cap must be sized to the registry so the driver's default
-        // 64-hop cap never silently truncates a >64-generation registry (the old
-        // loop was unbounded).
+        // The candidate list must come from the pointer-anchored plan, never
+        // straight off the legacy registry. Anchored at the bundled generation
+        // instead, a riverctl River has moved past searches a set that cannot
+        // contain the live room (see `crate::pointer::probe_plan`).
         assert!(
-            body.contains("with_max_hops"),
-            "the driver must set with_max_hops (sized to the registry) so the default hop cap \
-             can never strand the oldest legacy generations"
+            body.contains("probe_plan("),
+            "the backward probe's candidates must come from `probe_plan`, so the search is \
+             anchored on the RESOLVED generation and not on the WASM this binary bundles"
         );
         assert!(
             body.contains("resolve_legacy_recovery_outcome"),
@@ -6813,11 +7440,10 @@ mod migration_recovery_tests {
         let owner_vk = owner_sk.verifying_key();
         let original = fully_populated_state(&owner_sk);
 
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverCliProbeOps { owner_vk },
             ChatRoomStateV1::default(),
-            NewestFirst::assume_ordered(vec![cli_id(3), cli_id(2)]),
-            SelectionPolicy::NewestFirstWins,
+            vec![cli_id(3), cli_id(2)],
         );
         let Step::Get(newest) = driver.next_action() else {
             panic!("expected a GET")
@@ -6847,6 +7473,9 @@ mod migration_recovery_tests {
 
         let (out_state, out_id, migrate_forward) = resolve_legacy_recovery_outcome(
             Some(Outcome::Recovered {
+                // 0.6 added `unresolved`: candidates that never answered.
+                // Empty here, because these fixtures model a clean hit.
+                unresolved: Vec::new(),
                 merged: state.clone(),
                 source: cli_id(9),
                 truncated_fold: false,
@@ -6867,6 +7496,9 @@ mod migration_recovery_tests {
 
         let (_, _, migrate_same) = resolve_legacy_recovery_outcome(
             Some(Outcome::Recovered {
+                // 0.6 added `unresolved`: candidates that never answered.
+                // Empty here, because these fixtures model a clean hit.
+                unresolved: Vec::new(),
                 merged: state,
                 source: current,
                 truncated_fold: false,
@@ -6935,6 +7567,9 @@ mod migration_recovery_tests {
 
         let out = resolve_migration_state_outcome(
             Some(Outcome::Recovered {
+                // 0.6 added `unresolved`: candidates that never answered.
+                // Empty here, because these fixtures model a clean hit.
+                unresolved: Vec::new(),
                 merged: merged.clone(),
                 source: cli_id(9),
                 truncated_fold: false,
@@ -7127,13 +7762,12 @@ mod migration_recovery_tests {
         let local = owner_state_with_messages(&owner_sk, &["local"]);
         // Candidates as migration_candidate_ids builds them when the stored key
         // is the newest registry generation: [stored, stored(retry), older].
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverCliMigrationProbeOps {
                 inner: RiverCliProbeOps { owner_vk },
             },
             local.clone(),
-            NewestFirst::assume_ordered(vec![cli_id(9), cli_id(9), cli_id(5)]),
-            SelectionPolicy::NewestFirstWins,
+            vec![cli_id(9), cli_id(9), cli_id(5)],
         );
         // Fast-path attempt on the newest generation transiently times out.
         let Step::Get(first) = driver.next_action() else {
@@ -7184,13 +7818,12 @@ mod migration_recovery_tests {
         let owner_sk = SigningKey::from_bytes(&[95u8; 32]);
         let owner_vk = owner_sk.verifying_key();
         let local = owner_state_with_messages(&owner_sk, &["local"]);
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverCliMigrationProbeOps {
                 inner: RiverCliProbeOps { owner_vk },
             },
             local.clone(),
-            NewestFirst::assume_ordered(vec![cli_id(9), cli_id(5)]),
-            SelectionPolicy::NewestFirstWins,
+            vec![cli_id(9), cli_id(5)],
         );
         let Step::Get(newest) = driver.next_action() else {
             panic!("expected a GET")
@@ -7229,15 +7862,14 @@ mod migration_recovery_tests {
     fn cli_migration_driver_exhausts_to_local_cache() {
         let owner_sk = SigningKey::from_bytes(&[96u8; 32]);
         let local = owner_state_with_messages(&owner_sk, &["only local"]);
-        let mut driver = ProbeDriver::new(
+        let mut driver = new_probe_driver(
             RiverCliMigrationProbeOps {
                 inner: RiverCliProbeOps {
                     owner_vk: owner_sk.verifying_key(),
                 },
             },
             local.clone(),
-            NewestFirst::assume_ordered(vec![cli_id(2), cli_id(1)]),
-            SelectionPolicy::NewestFirstWins,
+            vec![cli_id(2), cli_id(1)],
         );
         let Step::Get(a) = driver.next_action() else {
             panic!()
@@ -7274,20 +7906,15 @@ mod migration_recovery_tests {
             .expect("probe_migration_bytes must follow get_migration_state");
         let body = &rest[..body_end];
 
-        // Match "NewestFirstWins" bare so a `use` that drops the
-        // `SelectionPolicy::` prefix cannot false-fail this pin.
+        // As above: the configuration lives in `new_probe_driver`; this pin
+        // guards that the active path goes through it.
         assert!(
-            body.contains("NewestFirstWins"),
-            "the active-migration search must use the newest-first decision driver"
+            body.contains("new_probe_driver("),
+            "the active-migration search must build its driver through `new_probe_driver`"
         );
         assert!(
             body.contains("RiverCliMigrationProbeOps"),
             "the active path must use the merge-with-local ops, NOT the read path's pass-through"
-        );
-        assert!(
-            body.contains("with_max_hops"),
-            "the driver must size its hop cap to the candidate set (the pre-driver deep path \
-             was unbounded)"
         );
         assert!(
             body.contains("migration_candidate_ids"),
