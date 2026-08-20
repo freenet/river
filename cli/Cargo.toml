@@ -1,6 +1,6 @@
 [package]
 name = "riverctl"
-version = "0.2.10"
+version = "0.2.11"
 edition = "2021"
 authors = ["Freenet Project"]
 description = "Command-line interface for River decentralized chat on Freenet"
