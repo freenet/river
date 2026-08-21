@@ -231,6 +231,81 @@ pub enum ChatDelegateRequestMsg {
         request_id: RequestId,
         contract_id: [u8; 32],
     },
+
+    // -----------------------------------------------------------------
+    // Delegate succession (see docs/delegate-succession).
+    //
+    // Appended, never reordered — ciborium tags variants by NAME, and only
+    // the CURRENT delegate ever receives these, so older delegate WASM is
+    // unaffected by their existence.
+    // -----------------------------------------------------------------
+    /// Hand this delegate the author-signed pointer record naming its
+    /// authorized successor, and ask it to push its secrets there.
+    ///
+    /// The delegate does not trust the caller for anything except delivery.
+    /// It verifies the signature against the author key compiled into it, and
+    /// refuses a record that is not strictly newer than the highest it has
+    /// already accepted. So a hostile caller can withhold the record, or
+    /// replay an older genuine one, and nothing else.
+    ///
+    /// `record` is the pointer contract's state verbatim: 100 bytes of
+    /// `version(u32 BE) ‖ code_hash(32) ‖ signature(64)`.
+    BeginSuccession {
+        request_id: RequestId,
+        record: Vec<u8>,
+    },
+}
+
+/// Why a succession attempt did not proceed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SuccessionRejection {
+    /// The record was not exactly 100 bytes, or its version was the reserved
+    /// `u32::MAX`.
+    MalformedRecord,
+    /// The signature did not verify under the author key compiled into this
+    /// delegate. Either the record is forged, or it belongs to another app.
+    BadSignature,
+    /// The record is not strictly newer than one already accepted. `seen` is
+    /// the highest version this delegate has honoured.
+    NotNewer { seen: u32 },
+    /// The record's code hash is all zeros, meaning the author has withdrawn
+    /// the app. Nothing is transferred.
+    Withdrawn,
+    /// The record names this delegate's own code hash, so there is no
+    /// successor to push to yet.
+    SameGeneration,
+}
+
+/// How complete the delegate's view of its own store was.
+///
+/// The host's key enumeration is best-effort: it silently omits keys when its
+/// registry is unreadable, and stops recording new ones past a per-scope
+/// ceiling. A delegate cannot distinguish either case from genuinely holding
+/// less, so it reports the CONDITION rather than only a count and lets the
+/// caller decide what to make of it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EnumerationHealth {
+    /// Nothing looked wrong.
+    Ok,
+    /// The listing came back empty. Transient and self-correcting: nothing was
+    /// deleted, so a later attempt sends whatever is visible then.
+    EmptyListing,
+    /// The listing is sitting on the host's per-scope ceiling, so it may be
+    /// truncated. This does NOT self-correct — keys past the ceiling were
+    /// never recorded and no retry will surface them.
+    AtCapacity { cap: u32 },
+}
+
+/// Outcome of a [`ChatDelegateRequestMsg::BeginSuccession`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SuccessionOutcome {
+    /// Secrets were pushed to the successor the record names.
+    Pushed {
+        count: u32,
+        health: EnumerationHealth,
+    },
+    /// Nothing was transferred, and why.
+    Rejected(SuccessionRejection),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -318,6 +393,14 @@ pub enum ChatDelegateResponseMsg {
         room_owner_vk: RoomKey,
         request_id: RequestId,
         result: Result<(), String>,
+    },
+
+    /// Response to [`ChatDelegateRequestMsg::BeginSuccession`].
+    ///
+    /// Appended, never reordered — see the note on the request enum.
+    SuccessionResponse {
+        request_id: RequestId,
+        outcome: SuccessionOutcome,
     },
 }
 

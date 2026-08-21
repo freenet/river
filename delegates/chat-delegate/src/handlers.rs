@@ -38,6 +38,15 @@ pub(crate) fn handle_application_message(
             logging::info("Delegate received ListRequest");
             handle_list_request(ctx, origin)
         }
+        // Succession is NOT namespaced by `origin`: it hands over the whole
+        // store, every calling app's compartment included, because only this
+        // delegate can see across them. That is deliberate — see the module
+        // docs on `succession`. The caller is a trigger and a courier and
+        // never sees the data.
+        ChatDelegateRequestMsg::BeginSuccession { request_id, record } => {
+            logging::info("Delegate received BeginSuccession");
+            crate::succession::handle_begin_succession(ctx, request_id, &record)
+        }
         ChatDelegateRequestMsg::GetVersionedRequest { key } => {
             logging::info(format!("Delegate received GetVersionedRequest key: {key:?}").as_str());
             handle_get_versioned_request(ctx, origin, key)

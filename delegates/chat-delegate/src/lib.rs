@@ -4,6 +4,7 @@ mod context;
 mod handlers;
 mod models;
 mod subscription;
+mod succession;
 mod utils;
 mod versioning;
 
@@ -97,10 +98,24 @@ impl DelegateInterface for ChatDelegate {
                     "unexpected message type: UserResponse".into(),
                 ))
             }
+            // A push from a previous generation of THIS delegate. The runtime
+            // overwrites `sender` with the key of the delegate that actually
+            // ran, so it cannot be forged by the sending code; succession
+            // checks it against the predecessor list baked in at build time.
+            //
+            // Note this arm deliberately does NOT go through `check_origin`.
+            // That function rejects every `Delegate` origin, which is correct
+            // for the app-facing protocol — a delegate must not be able to
+            // drive the key-value API on some app's behalf — but a handover is
+            // the one case where a delegate caller is legitimate, and it is
+            // authorised by the attested sender rather than by an origin.
+            InboundDelegateMsg::DelegateMessage(msg) => {
+                logging::info("Delegate received an inherited-secrets push");
+                succession::handle_inherited_secrets(ctx, &msg.sender, &msg.payload)
+            }
             InboundDelegateMsg::GetContractResponse(_)
             | InboundDelegateMsg::PutContractResponse(_)
-            | InboundDelegateMsg::UpdateContractResponse(_)
-            | InboundDelegateMsg::DelegateMessage(_) => {
+            | InboundDelegateMsg::UpdateContractResponse(_) => {
                 logging::info(&format!(
                     "Received unexpected contract response: {message_type}"
                 ));

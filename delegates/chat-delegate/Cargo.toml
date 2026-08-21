@@ -23,6 +23,9 @@ ed25519-dalek = { workspace = true }
 # here, derive randomness from delegate-controlled inputs via blake3 (see
 # `encrypt_secret_for_member` for the pattern).
 
+[build-dependencies]
+freenet-migrate-build = "0.2"
+
 [dev-dependencies]
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand.workspace = true

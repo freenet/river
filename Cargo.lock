@@ -590,6 +590,7 @@ dependencies = [
  "bs58",
  "ciborium",
  "ed25519-dalek",
+ "freenet-migrate-build",
  "freenet-scaffold",
  "freenet-stdlib 0.8.5",
  "rand 0.8.6",
