@@ -1182,7 +1182,7 @@ mod tests {
     }
 
     /// `cas_write_key` stores the reconciled bytes at the generation just read,
-    /// and reports `Ok(true)` (a write happened).
+    /// and reports `Stored` (a write happened).
     #[test]
     fn cas_write_key_stores_reconciled_value() {
         let stored = std::cell::RefCell::new(None);
@@ -1196,12 +1196,12 @@ mod tests {
             },
         ))
         .unwrap_or_else(|e| panic!("cas_write_key failed: {e}"));
-        assert!(wrote, "a store must report wrote=true");
+        assert_eq!(wrote, CasWriteOutcome::Stored, "a store must report Stored");
         assert_eq!(*stored.borrow(), Some(b"v1".to_vec()));
     }
 
     /// `reconcile` returning `None` aborts the write — nothing is stored, and
-    /// the call reports `Ok(false)` so the caller records the delegate's actual
+    /// the call reports `Aborted` so the caller records the delegate's actual
     /// (un-overwritten) state rather than a phantom `Present` (code-first review).
     #[test]
     fn cas_write_key_abort_does_not_store() {
@@ -1215,7 +1215,11 @@ mod tests {
             },
         ))
         .unwrap_or_else(|e| panic!("cas_write_key failed: {e}"));
-        assert!(!wrote, "abort (None) must report wrote=false");
+        assert_eq!(
+            wrote,
+            CasWriteOutcome::Aborted,
+            "abort (None) must report Aborted"
+        );
         assert_eq!(*stores.borrow(), 0, "abort (None) must not store");
     }
 
@@ -1259,6 +1263,103 @@ mod tests {
             *store_expected.borrow(),
             vec![0, 7],
             "the retry stores at the re-read generation"
+        );
+    }
+
+    /// Re-storing the bytes the delegate ALREADY holds is reported as
+    /// `Unchanged` and issues no store at all (freenet/river#629).
+    ///
+    /// This is the load-time save: the UI hydrates a room from the delegate and
+    /// immediately re-serializes it, so `to_store` is byte-identical to
+    /// `current`. Before #629 that looked like a real write.
+    #[test]
+    fn cas_write_key_reports_unchanged_and_skips_identical_store() {
+        let stores = std::cell::RefCell::new(0u32);
+        let outcome = futures::executor::block_on(cas_write_key(
+            |_current| Ok(Some(b"same".to_vec())),
+            || async { Ok::<_, String>((Some(b"same".to_vec()), 3u64)) },
+            |_value, _expected| {
+                *stores.borrow_mut() += 1;
+                async move { Ok(CasStoreResult::Stored { generation: 4 }) }
+            },
+        ))
+        .unwrap_or_else(|e| panic!("cas_write_key failed: {e}"));
+        assert_eq!(outcome, CasWriteOutcome::Unchanged);
+        assert_eq!(*stores.borrow(), 0, "identical bytes must not be re-stored");
+    }
+
+    /// A byte DIFFERENCE against the stored value is still a real write, so the
+    /// no-op detection above cannot swallow a genuine change.
+    #[test]
+    fn cas_write_key_stores_when_bytes_differ() {
+        let stores = std::cell::RefCell::new(0u32);
+        let outcome = futures::executor::block_on(cas_write_key(
+            |_current| Ok(Some(b"new".to_vec())),
+            || async { Ok::<_, String>((Some(b"old".to_vec()), 3u64)) },
+            |_value, _expected| {
+                *stores.borrow_mut() += 1;
+                async move { Ok(CasStoreResult::Stored { generation: 4 }) }
+            },
+        ))
+        .unwrap_or_else(|e| panic!("cas_write_key failed: {e}"));
+        assert_eq!(outcome, CasWriteOutcome::Stored);
+        assert_eq!(*stores.borrow(), 1);
+    }
+
+    /// The #629 invariant itself, stated against the defer predicate rather
+    /// than the I/O: a slot recorded from an `Unchanged` write carries NO
+    /// timestamp, so the next cache-only change cannot be deferred against it.
+    ///
+    /// Pinned as a unit because the end-to-end sequence (hydrate -> self-save ->
+    /// network converges -> save) spans the synchronizer, the Dioxus effect in
+    /// `app.rs` and the websocket, and was therefore never covered by #534's
+    /// own tests — which is exactly why the regression shipped.
+    #[test]
+    fn unchanged_write_does_not_arm_the_snapshot_debounce() {
+        // The load-time save: the delegate already held what we hydrated.
+        let after_hydrate = slot_after_write(CasWriteOutcome::Unchanged, 1, Some(2), 1_000.0);
+        assert_eq!(
+            after_hydrate,
+            SavedSlot::Present {
+                content: 1,
+                critical: Some(2),
+                written_at_ms: None,
+            },
+            "an Unchanged write must record NO write timestamp"
+        );
+        // The defer branch matches only `written_at_ms: Some(_)`, so a slot
+        // recorded this way can never reach `should_defer_cache_only_save`.
+        assert!(
+            !matches!(
+                after_hydrate,
+                SavedSlot::Present {
+                    written_at_ms: Some(_),
+                    ..
+                }
+            ),
+            "a slot that persisted nothing new must not be deferrable against"
+        );
+
+        // A real write still arms it, so #534's write-amplification fix stands.
+        let after_real = slot_after_write(CasWriteOutcome::Stored, 3, Some(2), 1_000.0);
+        assert_eq!(
+            after_real,
+            SavedSlot::Present {
+                content: 3,
+                critical: Some(2),
+                written_at_ms: Some(1_000.0),
+            },
+            "a Stored write must arm the debounce window"
+        );
+        assert!(
+            should_defer_cache_only_save(0.0),
+            "a cache-only change right after a real write is still deferred"
+        );
+
+        // An abort still records the tombstone the delegate actually holds.
+        assert_eq!(
+            slot_after_write(CasWriteOutcome::Aborted, 4, Some(2), 1_000.0),
+            SavedSlot::Tombstone
         );
     }
 
@@ -5552,7 +5653,7 @@ fn critical_hash(room_data: &RoomData) -> Option<u64> {
 /// What we last persisted for a room key, so a save only writes the rooms that
 /// actually changed. Per-room isolation: a change to room X never rewrites room
 /// R's key, so it can't resurrect R's tombstone (freenet/river#345 round-9).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum SavedSlot {
     /// Last-saved content hash of the room's serialized `RoomData`, plus the
     /// hash of just its critical fields and when we last wrote it, so a
@@ -5563,8 +5664,12 @@ enum SavedSlot {
         /// Hash of the unrecoverable subset. `None` if the critical projection
         /// failed to serialize, which forces the write (fail-safe).
         critical: Option<u64>,
-        /// `now_ms()` at the last successful write of this room's key.
-        written_at_ms: f64,
+        /// `now_ms()` at the last write of this room's key that actually
+        /// persisted NEW bytes this session, or `None` if no such write has
+        /// happened yet — in which case there is nothing to defer against and
+        /// the next cache-only change must be written immediately
+        /// (freenet/river#629).
+        written_at_ms: Option<f64>,
     },
     /// We've persisted this room as a tombstone (the user left it).
     Tombstone,
@@ -5681,11 +5786,64 @@ fn content_hash(bytes: &[u8]) -> u64 {
 /// avoid recording a "we persisted Present" cache entry for a key the delegate
 /// still holds as a `Tombstone` (code-first review: abort poisoned
 /// `ROOM_SLOT_STATE` and could later skip a needed rejoin write).
+/// What a CAS write actually did.
+///
+/// `Unchanged` is deliberately NOT folded into `Stored`: it means the delegate
+/// already held byte-for-byte what we reconciled, so no new state was
+/// persisted. Treating that as a write is precisely the freenet/river#629
+/// defect — the load-time save re-persists the snapshot it just hydrated,
+/// which armed the `ROOM_SNAPSHOT_MIN_INTERVAL_MS` debounce with data that was
+/// never new, so the genuinely fresh state arriving moments later was deferred
+/// and (for a session shorter than the interval) never written at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CasWriteOutcome {
+    /// New bytes were persisted.
+    Stored,
+    /// The delegate already held these exact bytes; no store was issued.
+    Unchanged,
+    /// The reconcile declined to write (e.g. adopting a remote tombstone).
+    Aborted,
+}
+
+/// What to record in [`ROOM_SLOT_STATE`] after a per-room CAS write.
+///
+/// Pulled out as a pure function on purpose: this mapping IS the
+/// freenet/river#629 fix, and inlined at the call site it sat behind a
+/// websocket and two Dioxus signals, so no test could have failed if it
+/// regressed. Keep it testable.
+fn slot_after_write(
+    outcome: CasWriteOutcome,
+    content: u64,
+    critical: Option<u64>,
+    now_ms: f64,
+) -> SavedSlot {
+    match outcome {
+        // A real write: arm the debounce window (freenet/river#534).
+        CasWriteOutcome::Stored => SavedSlot::Present {
+            content,
+            critical,
+            written_at_ms: Some(now_ms),
+        },
+        // The delegate already held these bytes. It IS Present, but nothing
+        // new was persisted, so there is no write to defer against and the
+        // next cache-only change must go straight out (freenet/river#629).
+        CasWriteOutcome::Unchanged => SavedSlot::Present {
+            content,
+            critical,
+            written_at_ms: None,
+        },
+        // The reconcile adopted a remote tombstone (freenet/river#345
+        // round-9): record what the delegate actually holds, not a phantom
+        // Present that could later content-hash-skip a genuine rejoin.
+        CasWriteOutcome::Aborted => SavedSlot::Tombstone,
+    }
+}
+
 async fn cas_write_key<R, G, GFut, S, SFut>(
     mut reconcile: R,
     get_versioned: G,
     mut cas_store: S,
-) -> Result<bool, String>
+) -> Result<CasWriteOutcome, String>
 where
     R: FnMut(Option<&[u8]>) -> Result<Option<Vec<u8>>, String>,
     G: Fn() -> GFut,
@@ -5697,10 +5855,18 @@ where
         let (current, generation) = get_versioned().await?;
         let to_store = match reconcile(current.as_deref())? {
             Some(bytes) => bytes,
-            None => return Ok(false),
+            None => return Ok(CasWriteOutcome::Aborted),
         };
+        // Storing X over X is a no-op that is not free: it rewrites the whole
+        // per-room blob (~373 KiB per member, freenet/river#533) and, far
+        // worse, it used to be indistinguishable from a real write and so
+        // armed the snapshot debounce (freenet/river#629). Both sides are in
+        // hand right here, which is the only place that can tell them apart.
+        if current.as_deref() == Some(to_store.as_slice()) {
+            return Ok(CasWriteOutcome::Unchanged);
+        }
         match cas_store(to_store, generation).await? {
-            CasStoreResult::Stored { .. } => return Ok(true),
+            CasStoreResult::Stored { .. } => return Ok(CasWriteOutcome::Stored),
             CasStoreResult::Conflict { .. } => continue,
             CasStoreResult::Failed(e) => return Err(e),
         }
@@ -5710,9 +5876,9 @@ where
     ))
 }
 
-/// [`cas_write_key`] bound to a real delegate key over the websocket. Returns
-/// `Ok(true)` if a value was stored, `Ok(false)` if the reconcile aborted.
-async fn cas_write_delegate_key<R>(key: Vec<u8>, reconcile: R) -> Result<bool, String>
+/// [`cas_write_key`] bound to a real delegate key over the websocket. See
+/// [`CasWriteOutcome`] for what the three results mean.
+async fn cas_write_delegate_key<R>(key: Vec<u8>, reconcile: R) -> Result<CasWriteOutcome, String>
 where
     R: FnMut(Option<&[u8]>) -> Result<Option<Vec<u8>>, String>,
 {
@@ -6042,7 +6208,7 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
         if !force_flush {
             if let Some(SavedSlot::Present {
                 critical,
-                written_at_ms,
+                written_at_ms: Some(written_at_ms),
                 ..
             }) = prev
             {
@@ -6065,31 +6231,30 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
         })
         .await
         {
-            Ok(wrote) => {
-                // `wrote == false` means the reconcile aborted to adopt a remote
-                // Tombstone (round-9). The delegate then still holds a Tombstone,
-                // so record THAT — recording `Present(h)` would be a lie that
+            Ok(outcome) => {
+                // `Aborted` means the reconcile adopted a remote Tombstone
+                // (round-9). The delegate then still holds a Tombstone, so
+                // record THAT — recording `Present(h)` would be a lie that
                 // could later content-hash-skip a genuine rejoin write
                 // (code-first review).
+                //
+                // `Unchanged` records `Present` (the delegate does hold these
+                // bytes) but with NO write timestamp: nothing new was
+                // persisted, so it must not start the debounce window
+                // (freenet/river#629).
                 ROOM_SLOT_STATE.with(|c| {
-                    c.borrow_mut().insert(
-                        *vk,
-                        if wrote {
-                            SavedSlot::Present {
-                                content: h,
-                                critical: crit,
-                                written_at_ms: now_ms(),
-                            }
-                        } else {
-                            SavedSlot::Tombstone
-                        },
-                    );
+                    c.borrow_mut()
+                        .insert(*vk, slot_after_write(outcome, h, crit, now_ms()));
                 });
-                // Once a rejoin has actually been persisted as Present, consume
-                // the rejoin intent: a LATER cross-tab leave + background update
-                // must then adopt the leave, not resurrect on a stale flag
-                // (skeptical/big-picture review).
-                if wrote {
+                // Once a rejoin is persisted as Present, consume the rejoin
+                // intent: a LATER cross-tab leave + background update must then
+                // adopt the leave, not resurrect on a stale flag
+                // (skeptical/big-picture review). `Unchanged` counts — the
+                // delegate holds our Present bytes either way.
+                if matches!(
+                    outcome,
+                    CasWriteOutcome::Stored | CasWriteOutcome::Unchanged
+                ) {
                     REJOINED_THIS_SESSION.with(|s| {
                         s.borrow_mut().remove(vk);
                     });
