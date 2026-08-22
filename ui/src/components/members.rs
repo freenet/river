@@ -1810,7 +1810,14 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
                             // useful `room_secrets` via new invitations
                             // (freenet/river#306). Empty for public rooms and
                             // for owners.
-                            invitation_secrets: room_data.invitation_secrets.clone(),
+                            // `IdentityExport` keeps a `HashMap` (it lives in river-core, which is
+                            // published — bumping it would force a contract migration), so
+                            // convert at the boundary rather than changing the shared type.
+                            invitation_secrets: room_data
+                                .invitation_secrets
+                                .iter()
+                                .map(|(k, v)| (*k, *v))
+                                .collect(),
                         };
                         token_text.set(export.to_armored_string());
                     } else {
@@ -1952,7 +1959,7 @@ fn build_imported_room_data(export: IdentityExport) -> crate::room_data::RoomDat
         // (freenet/river#306). Folded into the `#[serde(skip)]` `secrets` map
         // by `repopulate_secrets_from_state` on the next sync. Empty for
         // public rooms, owners, and pre-#306 exports.
-        invitation_secrets: export.invitation_secrets,
+        invitation_secrets: export.invitation_secrets.into_iter().collect(),
     }
 }
 
@@ -2090,7 +2097,7 @@ fn swap_room_identity_in_place(
         existing.secrets.clear();
         existing.current_secret_version = None;
         existing.last_secret_rotation = None;
-        existing.invitation_secrets = export.invitation_secrets;
+        existing.invitation_secrets = export.invitation_secrets.into_iter().collect();
     } else {
         // SAME identity re-import (the user re-importing their OWN token, e.g. a
         // legacy/stale one). A backward-compat decode of an old token yields

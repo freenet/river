@@ -24,7 +24,7 @@ use river_core::room_state::secret::{
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, PartialEq)]
 pub enum SendMessageError {
@@ -363,8 +363,16 @@ pub struct RoomData {
     /// [`RoomData::repopulate_secrets_from_state`]. Empty for public
     /// rooms, for the room owner, and for rooms joined before this field
     /// existed.
+    ///
+    /// A `BTreeMap`, not a `HashMap`, so the persisted CBOR is CANONICAL.
+    /// A `HashMap`'s iteration order follows its own random seed, so a
+    /// hydrate-then-re-serialize would not reproduce the on-disk byte order
+    /// and every same-content save would look like a change
+    /// (freenet/river#629). Ordering is not load-bearing for correctness —
+    /// `slot_after_write` does not rest on byte equality — but a canonical
+    /// encoding is what lets the no-op detection actually fire.
     #[serde(default)]
-    pub invitation_secrets: HashMap<u32, [u8; 32]>,
+    pub invitation_secrets: BTreeMap<u32, [u8; 32]>,
 }
 
 /// Compute the `SealedBytes` for an invitee's chosen nickname at join time.
@@ -1942,7 +1950,7 @@ pub(crate) fn test_minimal_room_data(owner_vk: VerifyingKey) -> RoomData {
         self_member_info: None,
         self_nickname: None,
         previous_contract_key: None,
-        invitation_secrets: HashMap::new(),
+        invitation_secrets: BTreeMap::new(),
     }
 }
 
@@ -2098,7 +2106,7 @@ impl Rooms {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         };
 
         info!("🟢 Inserting room into map...");
@@ -2768,7 +2776,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         };
 
         // With stale key, user should NOT be recognized as a member
@@ -2843,7 +2851,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         };
 
         // Before capture, self_member_info should be None
@@ -2914,7 +2922,7 @@ mod tests {
                 self_member_info: None,
                 self_nickname: None,
                 previous_contract_key: None,
-                invitation_secrets: HashMap::new(),
+                invitation_secrets: BTreeMap::new(),
             }
         };
 
@@ -2984,7 +2992,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         }
     }
 
@@ -5250,7 +5258,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         }
     }
 
@@ -5557,7 +5565,7 @@ mod tests {
                 self_member_info: None,
                 self_nickname: None,
                 previous_contract_key: None,
-                invitation_secrets: HashMap::new(),
+                invitation_secrets: BTreeMap::new(),
             }
         };
 
@@ -6007,7 +6015,7 @@ mod tests {
                 self_member_info: None,
                 self_nickname: None,
                 previous_contract_key: None,
-                invitation_secrets: HashMap::new(),
+                invitation_secrets: BTreeMap::new(),
             }
         };
 
@@ -6078,7 +6086,7 @@ mod tests {
                 self_member_info: None,
                 self_nickname: None,
                 previous_contract_key: None,
-                invitation_secrets: HashMap::new(),
+                invitation_secrets: BTreeMap::new(),
             }
         };
 
@@ -6310,7 +6318,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         };
 
         (v0_secret, room)
@@ -6646,7 +6654,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         };
 
         let decrypted = room.repopulate_secrets_from_state();
@@ -7198,7 +7206,17 @@ mod tests {
             decoded.self_verifying_key(),
             Some(invitee_sk.verifying_key())
         );
-        assert_eq!(decoded.invitation_secrets, invitation_secrets);
+        // The emulated writer above deliberately still uses a `HashMap` (that
+        // is what every blob stored today was written by), so convert for the
+        // comparison — proving a HashMap-written blob decodes into the
+        // `BTreeMap` field this build reads (freenet/river#629).
+        assert_eq!(
+            decoded.invitation_secrets,
+            invitation_secrets
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<BTreeMap<u32, [u8; 32]>>()
+        );
         assert_eq!(decoded.owner_vk, room.owner_vk);
         assert_eq!(decoded.contract_key, room.contract_key);
     }
@@ -7675,7 +7693,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         }
     }
 
@@ -7894,7 +7912,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         };
 
         // Sanity check pinning the bug: the raw live-members-only view
@@ -8113,7 +8131,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         };
 
         // Deputize T. Since the CANONICAL base (clean) does not yet list T,
@@ -8228,7 +8246,7 @@ mod tests {
             self_member_info: Some(authorized_v5),
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         };
 
         assert!(room.apply_deputy_change(t_id, true));
@@ -8345,7 +8363,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: BTreeMap::new(),
         };
 
         // Sanity: the raw live-members view can't see S's ancestry at all —

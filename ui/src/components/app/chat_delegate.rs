@@ -1314,53 +1314,143 @@ mod tests {
     /// network converges -> save) spans the synchronizer, the Dioxus effect in
     /// `app.rs` and the websocket, and was therefore never covered by #534's
     /// own tests — which is exactly why the regression shipped.
+    /// The freenet/river#629 invariant, against the real `slot_after_write`
+    /// mapping rather than a restatement of it.
+    ///
+    /// The load-time save must NOT arm the snapshot debounce, whether or not
+    /// the CAS happened to prove the bytes identical. Resting this on byte
+    /// equality alone is what an earlier cut of the fix did, and it failed
+    /// silently for rooms carrying a nondeterministically-encoded field.
     #[test]
-    fn unchanged_write_does_not_arm_the_snapshot_debounce() {
-        // The load-time save: the delegate already held what we hydrated.
-        let after_hydrate = slot_after_write(CasWriteOutcome::Unchanged, 1, Some(2), 1_000.0);
+    fn the_first_write_of_a_session_never_arms_the_snapshot_debounce() {
+        let present_without_timestamp = SavedSlot::Present {
+            content: 1,
+            critical: Some(2),
+            written_at_ms: None,
+        };
+
+        // Bytes provably identical: nothing was persisted at all.
         assert_eq!(
-            after_hydrate,
-            SavedSlot::Present {
-                content: 1,
-                critical: Some(2),
-                written_at_ms: None,
-            },
-            "an Unchanged write must record NO write timestamp"
+            slot_after_write(CasWriteOutcome::Unchanged, true, 1, Some(2), 9_000.0),
+            present_without_timestamp,
+            "an Unchanged write persists nothing and must record no timestamp"
         );
-        // The defer branch matches only `written_at_ms: Some(_)`, so a slot
-        // recorded this way can never reach `should_defer_cache_only_save`.
-        assert!(
-            !matches!(
-                after_hydrate,
-                SavedSlot::Present {
-                    written_at_ms: Some(_),
-                    ..
-                }
-            ),
-            "a slot that persisted nothing new must not be deferrable against"
+        // The load-time echo, where the bytes did NOT compare equal (e.g. a
+        // map re-encoded in a different order, or hydration legitimately
+        // rewriting the room). Still the snapshot we just loaded, so still
+        // must not start the window. This is the case byte equality missed.
+        assert_eq!(
+            slot_after_write(CasWriteOutcome::Stored, true, 1, Some(2), 9_000.0),
+            present_without_timestamp,
+            "the first write of a session is the hydrated snapshot, not new state"
         );
 
-        // A real write still arms it, so #534's write-amplification fix stands.
-        let after_real = slot_after_write(CasWriteOutcome::Stored, 3, Some(2), 1_000.0);
+        // A later write IS new state, and arms the window — so #534's
+        // write-amplification fix is preserved, not weakened.
         assert_eq!(
-            after_real,
+            slot_after_write(CasWriteOutcome::Stored, false, 3, Some(2), 9_000.0),
             SavedSlot::Present {
                 content: 3,
                 critical: Some(2),
-                written_at_ms: Some(1_000.0),
+                written_at_ms: Some(9_000.0),
             },
-            "a Stored write must arm the debounce window"
+            "a subsequent real write must arm the debounce window"
         );
         assert!(
             should_defer_cache_only_save(0.0),
             "a cache-only change right after a real write is still deferred"
         );
 
-        // An abort still records the tombstone the delegate actually holds.
+        // An Unchanged write later in the session still persisted nothing.
         assert_eq!(
-            slot_after_write(CasWriteOutcome::Aborted, 4, Some(2), 1_000.0),
+            slot_after_write(CasWriteOutcome::Unchanged, false, 1, Some(2), 9_000.0),
+            present_without_timestamp
+        );
+
+        // An abort records the tombstone the delegate actually holds.
+        assert_eq!(
+            slot_after_write(CasWriteOutcome::Aborted, false, 4, Some(2), 9_000.0),
             SavedSlot::Tombstone
         );
+    }
+
+    /// The defer branch matches only `written_at_ms: Some(_)`, so a slot the
+    /// rule above recorded can never reach `should_defer_cache_only_save`.
+    /// Pins the coupling between the two halves of the fix.
+    #[test]
+    fn a_slot_with_no_write_timestamp_is_not_deferrable() {
+        for outcome in [CasWriteOutcome::Unchanged, CasWriteOutcome::Stored] {
+            let slot = slot_after_write(outcome, true, 1, Some(2), 9_000.0);
+            assert!(
+                !matches!(
+                    slot,
+                    SavedSlot::Present {
+                        written_at_ms: Some(_),
+                        ..
+                    }
+                ),
+                "{outcome:?} on the first write of a session must not be deferrable against"
+            );
+        }
+    }
+
+    /// `RoomData::invitation_secrets` must encode canonically, so that a
+    /// hydrate-then-re-serialize reproduces the on-disk bytes and the no-op
+    /// detection can actually fire. It was a `HashMap`, whose CBOR key order
+    /// follows each map's own random seed (freenet/river#629).
+    ///
+    /// Deliberately uses several entries and several independent round trips:
+    /// a single entry, or a single trip, would pass under the old type too.
+    #[test]
+    fn a_persisted_room_re_serializes_to_identical_bytes() {
+        let mut room = room_fixture();
+        for v in 0..8u32 {
+            room.invitation_secrets.insert(v, [v as u8; 32]);
+        }
+        // CONTROL: prove the hazard this test guards against is real, so the
+        // test cannot pass merely because CBOR happens to be deterministic for
+        // everything. A `HashMap` with the same contents must actually
+        // re-encode differently across round trips; if this control ever stops
+        // failing to match, the guard above has become vacuous and the whole
+        // rationale needs re-checking.
+        {
+            #[derive(serde::Serialize, serde::Deserialize)]
+            struct HashMapControl {
+                secrets: HashMap<u32, [u8; 32]>,
+            }
+            let control = HashMapControl {
+                secrets: (0..8u32).map(|v| (v, [v as u8; 32])).collect(),
+            };
+            let mut first = Vec::new();
+            ciborium::ser::into_writer(&control, &mut first).expect("serialize control");
+            let differed = (0..8).any(|_| {
+                let hydrated: HashMapControl =
+                    ciborium::de::from_reader(&first[..]).expect("deserialize control");
+                let mut again = Vec::new();
+                ciborium::ser::into_writer(&hydrated, &mut again).expect("re-serialize control");
+                again != first
+            });
+            assert!(
+                differed,
+                "control: a HashMap field was expected to re-encode differently \
+                 across round trips. If it no longer does, this test proves nothing."
+            );
+        }
+
+        let mut on_disk = Vec::new();
+        ciborium::ser::into_writer(&room, &mut on_disk).expect("serialize");
+
+        for trip in 0..8 {
+            let hydrated: crate::room_data::RoomData =
+                ciborium::de::from_reader(&on_disk[..]).expect("deserialize");
+            let mut again = Vec::new();
+            ciborium::ser::into_writer(&hydrated, &mut again).expect("re-serialize");
+            assert_eq!(
+                again, on_disk,
+                "round trip {trip} re-encoded the same room to different bytes; \
+                 a persisted field has a nondeterministic encoding"
+            );
+        }
     }
 
     /// Exhaustion after `ROOMS_CAS_MAX_ATTEMPTS` consecutive conflicts errors.
@@ -5685,6 +5775,13 @@ thread_local! {
     /// form (e.g. `regenerate_contract_key`, `remove_unverifiable_messages`), so
     /// seeding the baseline from the loaded bytes could wrongly skip a needed
     /// write. CAS reconcile makes the redundant same-content writes harmless.
+    ///
+    /// "Harmless" was FALSE between freenet/river#534 and #629: that redundant
+    /// first write stamped `written_at_ms`, arming the snapshot debounce with
+    /// data that was never new, so the state arriving from the network moments
+    /// later was deferred and usually never written. It is true again only
+    /// because [`slot_after_write`] now refuses to arm the window on the first
+    /// write of a session. Do not weaken that without re-reading #629.
     static ROOM_SLOT_STATE: std::cell::RefCell<HashMap<VerifyingKey, SavedSlot>> =
         std::cell::RefCell::new(HashMap::new());
     /// Last-persisted content hash of the `rooms_meta` value.
@@ -5781,11 +5878,10 @@ fn content_hash(bytes: &[u8]) -> u64 {
 /// re-reads and re-reconciles. `get_versioned`/`cas_store` are injected so the
 /// loop is unit-testable without the websocket.
 ///
-/// Returns `Ok(true)` if a value was actually stored, `Ok(false)` if the
-/// reconcile aborted the write (no store happened). The caller needs this to
-/// avoid recording a "we persisted Present" cache entry for a key the delegate
-/// still holds as a `Tombstone` (code-first review: abort poisoned
-/// `ROOM_SLOT_STATE` and could later skip a needed rejoin write).
+/// Reports what actually happened as a [`CasWriteOutcome`]. The caller needs
+/// the distinction to avoid recording a "we persisted Present" cache entry for
+/// a key the delegate still holds as a `Tombstone` (code-first review: abort
+/// poisoned `ROOM_SLOT_STATE` and could later skip a needed rejoin write).
 /// What a CAS write actually did.
 ///
 /// `Unchanged` is deliberately NOT folded into `Stored`: it means the delegate
@@ -5811,26 +5907,53 @@ enum CasWriteOutcome {
 /// freenet/river#629 fix, and inlined at the call site it sat behind a
 /// websocket and two Dioxus signals, so no test could have failed if it
 /// regressed. Keep it testable.
+///
+/// `first_write_of_session` is `true` when this room had no
+/// [`ROOM_SLOT_STATE`] entry before this save — which, because that map is a
+/// `thread_local` that starts empty on every page load, means this write is
+/// the load-time echo of the snapshot we just HYDRATED, not a response to new
+/// room state arriving. That write must not arm the debounce window: doing so
+/// is freenet/river#629, where the genuinely fresh state landing seconds later
+/// was deferred and, for any session shorter than
+/// [`ROOM_SNAPSHOT_MIN_INTERVAL_MS`], never written at all.
+///
+/// This deliberately does NOT depend on the bytes being equal. An earlier cut
+/// of the fix armed the clock unless the CAS proved the stored bytes identical,
+/// which quietly failed for the one persisted field with a nondeterministic
+/// encoding (`RoomData::invitation_secrets`, a `HashMap`): its CBOR key order
+/// follows each `HashMap`'s own random seed, so a re-serialized hydrate does
+/// not reproduce the on-disk byte order and the room silently kept the bug.
+/// That field is now a `BTreeMap` so the encoding is canonical, but the
+/// arming rule must not rest on that — serialization determinism is an easy
+/// property to lose again, and losing it here would fail silently.
 fn slot_after_write(
     outcome: CasWriteOutcome,
+    first_write_of_session: bool,
     content: u64,
     critical: Option<u64>,
     now_ms: f64,
 ) -> SavedSlot {
     match outcome {
-        // A real write: arm the debounce window (freenet/river#534).
-        CasWriteOutcome::Stored => SavedSlot::Present {
-            content,
-            critical,
-            written_at_ms: Some(now_ms),
-        },
-        // The delegate already held these bytes. It IS Present, but nothing
-        // new was persisted, so there is no write to defer against and the
-        // next cache-only change must go straight out (freenet/river#629).
+        // The delegate already held these exact bytes: nothing was persisted,
+        // so there is nothing to defer against.
         CasWriteOutcome::Unchanged => SavedSlot::Present {
             content,
             critical,
             written_at_ms: None,
+        },
+        // The load-time echo of the hydrated snapshot. It carries no room
+        // state we did not already have, so it must not start the window.
+        CasWriteOutcome::Stored if first_write_of_session => SavedSlot::Present {
+            content,
+            critical,
+            written_at_ms: None,
+        },
+        // A real write driven by new state: arm the window, which is what
+        // keeps freenet/river#534's write-amplification fix in force.
+        CasWriteOutcome::Stored => SavedSlot::Present {
+            content,
+            critical,
+            written_at_ms: Some(now_ms),
         },
         // The reconcile adopted a remote tombstone (freenet/river#345
         // round-9): record what the delegate actually holds, not a phantom
@@ -6243,8 +6366,10 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
                 // persisted, so it must not start the debounce window
                 // (freenet/river#629).
                 ROOM_SLOT_STATE.with(|c| {
-                    c.borrow_mut()
-                        .insert(*vk, slot_after_write(outcome, h, crit, now_ms()));
+                    c.borrow_mut().insert(
+                        *vk,
+                        slot_after_write(outcome, prev.is_none(), h, crit, now_ms()),
+                    );
                 });
                 // Once a rejoin is persisted as Present, consume the rejoin
                 // intent: a LATER cross-tab leave + background update must then
