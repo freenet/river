@@ -3,6 +3,13 @@ name: Check Delegate Migration
 on:
   pull_request:
 
+# Least-privilege floor: this gate only reads the repo. Without this block it
+# inherits the org default of `write`, handing a third-party runner a
+# GITHUB_TOKEN that can push contents and packages. See release-riverctl.yml
+# for the same idiom.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

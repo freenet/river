@@ -9,6 +9,17 @@ on:
       - develop
       - 'releases/**'
 
+# Least-privilege floor for the whole workflow: these jobs need to read the
+# repo and nothing else. Without this block they inherit the org default,
+# which is `write` (see /orgs/freenet/actions/permissions/workflow), so every
+# job gets a GITHUB_TOKEN able to push contents, packages and deployments.
+# That blast radius is worth closing now the jobs run on a third-party runner.
+# Same idiom as release-riverctl.yml: set a read-only floor here and elevate
+# per-job where a job genuinely needs more (see `claude-ci-analysis` below,
+# which declares its own block and is unaffected by this floor).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
