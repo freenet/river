@@ -885,9 +885,11 @@ fn clean_reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> 
 }
 
 /// Reduce markdown to its plain-text content (emphasis/headings/code-fences
-/// removed, links rendered as their visible text). Used for the single-line
-/// reply-preview snapshot, never for the message body (which renders full
-/// markdown). Falls back to the input unchanged if parsing fails.
+/// removed, links rendered as their visible text — except bare Freenet
+/// web-contract URLs, which collapse to a short `freenet:<id-prefix>` label).
+/// Used for the single-line reply-preview snapshot, never for the message body
+/// (which renders full markdown). Falls back to the input unchanged if parsing
+/// fails.
 fn strip_markdown(text: &str) -> String {
     match markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
         Ok(node) => {
@@ -909,6 +911,31 @@ fn collect_mdast_text(node: &markdown::mdast::Node, out: &mut String) {
         // A hard/soft break or thematic break becomes a space so words on
         // separate lines don't run together in the single-line preview.
         Node::Break(_) | Node::ThematicBreak(_) => out.push(' '),
+        // A bare Freenet web-contract URL collapses to the short
+        // `freenet:<id-prefix>` label, so a quoted reply doesn't show the
+        // sender's raw gateway address. `[label](url)` text is left alone,
+        // mirroring `finalize_anchors`' "visible text equals href" rule for
+        // the message body.
+        //
+        // Mirroring, NOT identical: `finalize_anchors` compares the scraped
+        // HTML anchor text against the href AFTER markdown's `sanitize_uri`
+        // percent-encoding, while here both sides are raw mdast. A URL whose
+        // suffix markdown percent-encodes (non-ASCII, `^`, `|`, …) therefore
+        // shortens in the preview but not in the body. Superset, one-way, and
+        // harmless: the preview is a non-clickable text node (`:5284`,
+        // `message_input.rs:200`), so the worse case is a shortened label
+        // where the body kept the full URL — never the reverse.
+        Node::Link(l) => {
+            let mut inner = String::new();
+            for child in &l.children {
+                collect_mdast_text(child, &mut inner);
+            }
+            match beautify_freenet_label(&l.url) {
+                Some(label) if inner == l.url => out.push_str(&label),
+                _ => out.push_str(&inner),
+            }
+            return;
+        }
         _ => {}
     }
     if let Some(children) = node.children() {
@@ -7500,6 +7527,52 @@ mod tests {
             "markdown stripped: {cleaned}"
         );
         assert!(cleaned.contains("see"));
+    }
+
+    /// A quoted reply showing a bare Freenet URL renders the short
+    /// `freenet:<id-prefix>` label instead of the sender's raw gateway
+    /// host/port. User-written `[label](url)` text is untouched.
+    ///
+    /// Asserts this path's own behaviour, NOT byte-parity with the body
+    /// renderer — see the encoding caveat on the `Node::Link` arm.
+    #[test]
+    fn clean_reply_preview_shortens_bare_freenet_urls() {
+        let names = HashMap::new();
+        let id = SAMPLE_ID;
+
+        let bare = clean_reply_preview(
+            &format!("look http://127.0.0.1:7509/v1/contract/web/{id}/index.html here"),
+            &names,
+        );
+        assert_eq!(bare, "look freenet:UDzGbcWr/index.html here", "{bare}");
+
+        // Any host, not just loopback.
+        let lan = clean_reply_preview(
+            &format!("https://10.0.0.4:7509/v1/contract/web/{id}/"),
+            &names,
+        );
+        assert_eq!(lan, "freenet:UDzGbcWr", "{lan}");
+
+        // Non-Freenet links keep their visible text.
+        let other = clean_reply_preview("see http://example.com/a", &names);
+        assert_eq!(other, "see http://example.com/a", "{other}");
+
+        // A hostile URL that only *mentions* the marker in its query must not
+        // be labelled. This matters more here than in the body: the preview is
+        // plain text with no href, so a false-positive label is a spoof the
+        // reader cannot hover to check.
+        let spoof = clean_reply_preview(
+            &format!("https://evil.example/r?next=/v1/contract/web/{id}/"),
+            &names,
+        );
+        assert!(!spoof.contains("freenet:"), "{spoof}");
+
+        // Explicit link text wins over the label.
+        let labeled = clean_reply_preview(
+            &format!("[my site](http://127.0.0.1:7509/v1/contract/web/{id}/)"),
+            &names,
+        );
+        assert_eq!(labeled, "my site", "{labeled}");
     }
 
     #[test]
