@@ -1269,9 +1269,10 @@ mod tests {
     /// Re-storing the bytes the delegate ALREADY holds is reported as
     /// `Unchanged` and issues no store at all (freenet/river#629).
     ///
-    /// This is the load-time save: the UI hydrates a room from the delegate and
-    /// immediately re-serializes it, so `to_store` is byte-identical to
-    /// `current`. Before #629 that looked like a real write.
+    /// This covers the write-amplification saving only. Whether the load-time
+    /// save arms the debounce is decided by `first_write_of_session` in
+    /// [`slot_after_write`], not here — a byte comparison cannot be relied on
+    /// to fire, which is the whole reason the arming rule does not use one.
     #[test]
     fn cas_write_key_reports_unchanged_and_skips_identical_store() {
         let stores = std::cell::RefCell::new(0u32);
@@ -1306,21 +1307,18 @@ mod tests {
         assert_eq!(*stores.borrow(), 1);
     }
 
-    /// The #629 invariant itself, stated against the defer predicate rather
-    /// than the I/O: a slot recorded from an `Unchanged` write carries NO
-    /// timestamp, so the next cache-only change cannot be deferred against it.
-    ///
-    /// Pinned as a unit because the end-to-end sequence (hydrate -> self-save ->
-    /// network converges -> save) spans the synchronizer, the Dioxus effect in
-    /// `app.rs` and the websocket, and was therefore never covered by #534's
-    /// own tests — which is exactly why the regression shipped.
-    /// The freenet/river#629 invariant, against the real `slot_after_write`
-    /// mapping rather than a restatement of it.
+    /// The freenet/river#629 invariant, exercised against the real
+    /// [`slot_after_write`] mapping rather than restating it.
     ///
     /// The load-time save must NOT arm the snapshot debounce, whether or not
     /// the CAS happened to prove the bytes identical. Resting this on byte
     /// equality alone is what an earlier cut of the fix did, and it failed
     /// silently for rooms carrying a nondeterministically-encoded field.
+    ///
+    /// Pinned as a unit because the end-to-end sequence (hydrate -> self-save
+    /// -> network converges -> save) spans the synchronizer, the Dioxus effect
+    /// in `app.rs` and the websocket, and was therefore never covered by
+    /// #534's own tests — which is exactly why the regression shipped.
     #[test]
     fn the_first_write_of_a_session_never_arms_the_snapshot_debounce() {
         let present_without_timestamp = SavedSlot::Present {
@@ -5869,28 +5867,16 @@ fn content_hash(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
-/// Generic read-merge-write CAS for a single delegate key (freenet/river#345).
-///
-/// `reconcile(current)` receives the delegate's current value (`None` if
-/// absent) and returns `Ok(Some(bytes))` to store, `Ok(None)` to abort the
-/// write as a no-op (e.g. adopt a remote tombstone), or `Err` to fail. On a CAS
-/// `Conflict` (another writer advanced the key between our read and store) it
-/// re-reads and re-reconciles. `get_versioned`/`cas_store` are injected so the
-/// loop is unit-testable without the websocket.
-///
-/// Reports what actually happened as a [`CasWriteOutcome`]. The caller needs
-/// the distinction to avoid recording a "we persisted Present" cache entry for
-/// a key the delegate still holds as a `Tombstone` (code-first review: abort
-/// poisoned `ROOM_SLOT_STATE` and could later skip a needed rejoin write).
 /// What a CAS write actually did.
 ///
 /// `Unchanged` is deliberately NOT folded into `Stored`: it means the delegate
 /// already held byte-for-byte what we reconciled, so no new state was
-/// persisted. Treating that as a write is precisely the freenet/river#629
-/// defect — the load-time save re-persists the snapshot it just hydrated,
-/// which armed the `ROOM_SNAPSHOT_MIN_INTERVAL_MS` debounce with data that was
-/// never new, so the genuinely fresh state arriving moments later was deferred
-/// and (for a session shorter than the interval) never written at all.
+/// persisted. The distinction buys two separate things — it lets the caller
+/// skip a pointless ~373 KiB rewrite (freenet/river#533), and it records a
+/// slot that carries no write timestamp. It is NOT what fixes
+/// freenet/river#629 on its own; see [`slot_after_write`], which refuses to
+/// arm the debounce on the first write of a session whether or not the bytes
+/// compared equal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CasWriteOutcome {
     /// New bytes were persisted.
@@ -5909,13 +5895,22 @@ enum CasWriteOutcome {
 /// regressed. Keep it testable.
 ///
 /// `first_write_of_session` is `true` when this room had no
-/// [`ROOM_SLOT_STATE`] entry before this save — which, because that map is a
-/// `thread_local` that starts empty on every page load, means this write is
-/// the load-time echo of the snapshot we just HYDRATED, not a response to new
-/// room state arriving. That write must not arm the debounce window: doing so
-/// is freenet/river#629, where the genuinely fresh state landing seconds later
+/// [`ROOM_SLOT_STATE`] entry before this save. Because that map is a
+/// `thread_local` starting empty on every page load, the case that matters is
+/// the load-time echo of the snapshot we just HYDRATED: a write carrying no
+/// room state we did not already have. Arming the window on it is
+/// freenet/river#629, where the genuinely fresh state landing seconds later
 /// was deferred and, for any session shorter than
 /// [`ROOM_SNAPSHOT_MIN_INTERVAL_MS`], never written at all.
+///
+/// It is deliberately not ONLY the hydration echo, and the flag is not a
+/// claim that it is (skeptical review). Two other writes have no prior slot:
+/// a room created this session, and an explicit rejoin, which
+/// [`mark_room_rejoined`] clears the slot for on purpose so the next save
+/// re-evaluates. Both are then allowed one un-debounced cache-only write
+/// before the window re-arms. That is bounded at one extra write per event
+/// and errs toward writing, so it cannot resurrect freenet/river#534's
+/// unbounded write amplification; erring the other way would resurrect #629.
 ///
 /// This deliberately does NOT depend on the bytes being equal. An earlier cut
 /// of the fix armed the clock unless the CAS proved the stored bytes identical,
@@ -5962,6 +5957,19 @@ fn slot_after_write(
     }
 }
 
+/// Generic read-merge-write CAS for a single delegate key (freenet/river#345).
+///
+/// `reconcile(current)` receives the delegate's current value (`None` if
+/// absent) and returns `Ok(Some(bytes))` to store, `Ok(None)` to abort the
+/// write as a no-op (e.g. adopt a remote tombstone), or `Err` to fail. On a CAS
+/// `Conflict` (another writer advanced the key between our read and store) it
+/// re-reads and re-reconciles. `get_versioned`/`cas_store` are injected so the
+/// loop is unit-testable without the websocket.
+///
+/// Reports what actually happened as a [`CasWriteOutcome`]. The caller needs
+/// the distinction to avoid recording a "we persisted Present" cache entry for
+/// a key the delegate still holds as a `Tombstone` (code-first review: abort
+/// poisoned `ROOM_SLOT_STATE` and could later skip a needed rejoin write).
 async fn cas_write_key<R, G, GFut, S, SFut>(
     mut reconcile: R,
     get_versioned: G,
@@ -5981,10 +5989,11 @@ where
             None => return Ok(CasWriteOutcome::Aborted),
         };
         // Storing X over X is a no-op that is not free: it rewrites the whole
-        // per-room blob (~373 KiB per member, freenet/river#533) and, far
-        // worse, it used to be indistinguishable from a real write and so
-        // armed the snapshot debounce (freenet/river#629). Both sides are in
-        // hand right here, which is the only place that can tell them apart.
+        // per-room blob (~373 KiB per member, freenet/river#533). Both sides
+        // are in hand right here, which is the only place that can tell them
+        // apart. This is purely that write-amplification saving — it does NOT
+        // decide whether the snapshot debounce is armed, because a byte
+        // comparison cannot be trusted to fire (see `slot_after_write`).
         if current.as_deref() == Some(to_store.as_slice()) {
             return Ok(CasWriteOutcome::Unchanged);
         }
