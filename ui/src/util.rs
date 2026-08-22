@@ -1025,7 +1025,7 @@ mod tests {
             self_member_info: None,
             self_nickname: None,
             previous_contract_key: None,
-            invitation_secrets: HashMap::new(),
+            invitation_secrets: std::collections::BTreeMap::new(),
         };
         room_data.regenerate_contract_key();
 
