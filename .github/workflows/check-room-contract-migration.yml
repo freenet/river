@@ -3,12 +3,21 @@ name: Check Room-Contract Migration
 on:
   pull_request:
 
+# Least-privilege floor: this gate only reads the repo. Without this block it
+# inherits the org default of `write`, handing a third-party runner a
+# GITHUB_TOKEN that can push contents and packages. See release-riverctl.yml
+# for the same idiom.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   check-room-contract-migration:
-    runs-on: freenet-default-runner
+    # Ubicloud, NOT a GitHub-hosted larger runner: larger runners are billed
+    # at $0.022/min even on public repos. See .github/workflows/build.yml.
+    runs-on: ubicloud-standard-8
     steps:
     - uses: actions/checkout@v3
       with:

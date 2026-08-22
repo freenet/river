@@ -9,12 +9,32 @@ on:
       - develop
       - 'releases/**'
 
+# Least-privilege floor for the whole workflow: these jobs need to read the
+# repo and nothing else. Without this block they inherit the org default,
+# which is `write` (see /orgs/freenet/actions/permissions/workflow), so every
+# job gets a GITHUB_TOKEN able to push contents, packages and deployments.
+# That blast radius is worth closing now the jobs run on a third-party runner.
+# Same idiom as release-riverctl.yml: set a read-only floor here and elevate
+# per-job where a job genuinely needs more (see `claude-ci-analysis` below,
+# which declares its own block and is unaffected by this floor).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    runs-on: freenet-default-runner
+    # Ubicloud, NOT a GitHub-hosted larger runner. GitHub bills larger
+    # runners (`freenet-default-runner`, an 8-core/32GB org runner) at
+    # $0.022/min even on PUBLIC repos -- the free-minutes discount that zeroes
+    # every other line on our bill never applies to them. In July 2026 that one
+    # label was the ONLY billed item on the whole org invoice: $221.25 of a
+    # $1,767.51 gross usage figure, all of it from this repo, while
+    # freenet-core's $1,525.77 of gross usage billed $0 because it runs on
+    # Ubicloud. Same 8-core class of machine, off GitHub's meter.
+    # Do not move these jobs back to a larger-runner label.
+    runs-on: ubicloud-standard-8
 
     steps:
     - uses: actions/checkout@v3
@@ -62,11 +82,16 @@ jobs:
         key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('ui/Cargo.toml') }}
 
     - name: Install Dioxus CLI
-      # Gate on the cache *result*, not on whether the file exists:
-      # freenet-default-runner is self-hosted, so a stale ~/.cargo/bin/dx can
-      # persist from an earlier job even when this key misses (e.g. after a
-      # dioxus bump). A file-existence check would then skip the install and
-      # use the stale CLI; a cache-key miss must always (re)install.
+      # Gate on the cache *result*, not on whether the file exists: a
+      # `dx` on disk is not evidence that it matches THIS key. It may have
+      # been restored by another cache step, shipped in the runner image, or
+      # left by an earlier step, so after a dioxus bump a file-existence check
+      # would skip the install and use the stale CLI. A cache-key miss must
+      # always (re)install. This held on `freenet-default-runner` and still
+      # holds on Ubicloud; it was never a consequence of the runner being
+      # self-hosted. `freenet-default-runner` was a GitHub-HOSTED larger
+      # runner, and believing otherwise is what let a billed 8-core machine
+      # sit in this file unnoticed. See the runs-on comment above.
       #
       # Pass GITHUB_TOKEN so binstall makes authenticated GitHub API requests
       # (5000/hr) instead of unauthenticated ones (60/hr). The unauthenticated
@@ -254,7 +279,8 @@ jobs:
       run: cargo test -p web-container-contract -p web-container-tool
 
   ui-playwright-tests:
-    runs-on: freenet-default-runner
+    # Ubicloud, NOT a GitHub-hosted larger runner -- see the `build` job above.
+    runs-on: ubicloud-standard-8
 
     steps:
     - uses: actions/checkout@v3
@@ -302,11 +328,16 @@ jobs:
         key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('ui/Cargo.toml') }}
 
     - name: Install Dioxus CLI
-      # Gate on the cache *result*, not on whether the file exists:
-      # freenet-default-runner is self-hosted, so a stale ~/.cargo/bin/dx can
-      # persist from an earlier job even when this key misses (e.g. after a
-      # dioxus bump). A file-existence check would then skip the install and
-      # use the stale CLI; a cache-key miss must always (re)install.
+      # Gate on the cache *result*, not on whether the file exists: a
+      # `dx` on disk is not evidence that it matches THIS key. It may have
+      # been restored by another cache step, shipped in the runner image, or
+      # left by an earlier step, so after a dioxus bump a file-existence check
+      # would skip the install and use the stale CLI. A cache-key miss must
+      # always (re)install. This held on `freenet-default-runner` and still
+      # holds on Ubicloud; it was never a consequence of the runner being
+      # self-hosted. `freenet-default-runner` was a GitHub-HOSTED larger
+      # runner, and believing otherwise is what let a billed 8-core machine
+      # sit in this file unnoticed. See the runs-on comment above.
       #
       # Pass GITHUB_TOKEN so binstall makes authenticated GitHub API requests
       # (5000/hr) instead of unauthenticated ones (60/hr). The unauthenticated
