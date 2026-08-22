@@ -8,7 +8,9 @@ env:
 
 jobs:
   check-delegate-migration:
-    runs-on: freenet-default-runner
+    # Ubicloud, NOT a GitHub-hosted larger runner: larger runners are billed
+    # at $0.022/min even on public repos. See .github/workflows/build.yml.
+    runs-on: ubicloud-standard-8
     steps:
     - uses: actions/checkout@v3
       with:
