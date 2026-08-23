@@ -710,7 +710,35 @@ pub(crate) fn message_display_text_with_secrets(
     msg: &river_core::room_state::message::AuthorizedMessageV1,
     secrets: &HashMap<u32, [u8; 32]>,
 ) -> String {
-    let raw = room_state
+    render_mentions_raw(room_state, &raw_message_body_text(room_state, msg, secrets))
+}
+
+/// Like [`message_display_text_with_secrets`], but escapes every substituted
+/// `@mention` nickname for terminal output (freenet/river#474). ONLY for a
+/// human/terminal println — never for JSON or persistence, since a mentioned
+/// member's nickname is attacker-controlled and escaping it would corrupt the
+/// byte-for-byte contract those paths depend on.
+pub(crate) fn message_display_text_for_terminal(
+    room_state: &ChatRoomStateV1,
+    msg: &river_core::room_state::message::AuthorizedMessageV1,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> String {
+    render_mentions_for_terminal_escaped(
+        room_state,
+        &raw_message_body_text(room_state, msg, secrets),
+    )
+}
+
+/// Decrypt/decode a message's display body, WITHOUT yet resolving `@mention`
+/// tokens — shared by [`message_display_text_with_secrets`] and
+/// [`message_display_text_for_terminal`] so the two differ only in whether the
+/// substituted mention name gets escaped, never in body resolution.
+fn raw_message_body_text(
+    room_state: &ChatRoomStateV1,
+    msg: &river_core::room_state::message::AuthorizedMessageV1,
+    secrets: &HashMap<u32, [u8; 32]>,
+) -> String {
+    room_state
         .recent_messages
         .effective_text(msg)
         .or_else(|| decrypt_private_body_text(&msg.message.content, secrets))
@@ -720,8 +748,7 @@ pub(crate) fn message_display_text_with_secrets(
                 .decode_content()
                 .map(|decoded| decoded.to_display_string())
                 .unwrap_or_else(|| "<encrypted>".to_string())
-        });
-    render_mentions_for_terminal(room_state, &raw)
+        })
 }
 
 /// Decrypt a **private** message body to its display text, mirroring the UI's
@@ -766,28 +793,65 @@ fn decrypt_private_body_text(
     Some(String::from_utf8_lossy(&plaintext).to_string())
 }
 
-/// Replace `@[name](rv:id)` mention tokens with `@<name>` for terminal display.
-/// Prefers each member's *current* public nickname (so the rendered name
-/// follows renames); falls back to the token's snapshot name when the member is
+/// Resolve a mention token's member_id to its *current* public nickname, for
+/// [`render_mentions_raw`] / [`render_mentions_for_terminal_escaped`].
+/// Shared so the two renderers cannot drift on WHICH name is substituted —
+/// only on whether it gets escaped afterward.
+fn resolve_mention_nickname(
+    room_state: &ChatRoomStateV1,
+    r: &river_core::mention::MemberRef,
+) -> Option<String> {
+    // Resolve the mention token to a member_id first (identity lookup,
+    // not a content read — safe to leave as a bare `.find()`), then fetch
+    // that member's CANONICAL record for the nickname. A bare `.find()`
+    // straight to the nickname could return a losing (e.g. stale) duplicate
+    // record if the state holds more than one (#411 round 8 item A).
+    room_state
+        .member_info
+        .member_info
+        .iter()
+        .find(|info| r.matches(info.member_info.member_id))
+        .map(|info| info.member_info.member_id)
+        .and_then(|id| room_state.member_info.canonical(id))
+        .and_then(|info| info.member_info.preferred_nickname.as_public_bytes())
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+}
+
+/// Replace `@[name](rv:id)` mention tokens with `@<name>`. Prefers each
+/// member's *current* public nickname (so the rendered name follows
+/// renames); falls back to the token's snapshot name when the member is
 /// unknown or their nickname is encrypted (riverctl does not decrypt
 /// private-room nicknames). Plain text without tokens is returned unchanged.
-pub(crate) fn render_mentions_for_terminal(room_state: &ChatRoomStateV1, text: &str) -> String {
-    river_core::mention::render_plaintext(text, |r| {
-        // Resolve the mention token to a member_id first (identity lookup,
-        // not a content read — safe to leave as a bare `.find()`), then fetch
-        // that member's CANONICAL record for the nickname. A bare `.find()`
-        // straight to the nickname could return a losing (e.g. stale) duplicate
-        // record if the state holds more than one (#411 round 8 item A).
-        room_state
-            .member_info
-            .member_info
-            .iter()
-            .find(|info| r.matches(info.member_info.member_id))
-            .map(|info| info.member_info.member_id)
-            .and_then(|id| room_state.member_info.canonical(id))
-            .and_then(|info| info.member_info.preferred_nickname.as_public_bytes())
-            .map(|bytes| String::from_utf8_lossy(bytes).to_string())
-    })
+///
+/// RAW — the substituted name, resolved OR snapshot fallback, is NOT escaped
+/// here. This feeds the JSON/persistence path (see
+/// [`message_display_text_with_secrets`]), so escaping it would corrupt that
+/// byte-for-byte contract. Despite the name resembling "for terminal
+/// display", this is NOT safe to print directly: for a human/terminal-only
+/// println, use [`render_mentions_for_terminal_escaped`] instead.
+pub(crate) fn render_mentions_raw(room_state: &ChatRoomStateV1, text: &str) -> String {
+    river_core::mention::render_plaintext(text, |r| resolve_mention_nickname(room_state, r))
+}
+
+/// Like [`render_mentions_raw`], but escapes the substituted name —
+/// resolved live nickname OR the token's snapshot fallback, both attacker-
+/// controlled — via [`crate::deputies::escape_nickname_inline`] before
+/// splicing it in (freenet/river#474). The NON-quoting sibling of
+/// `display_nickname` is deliberate here: this name lands in the MIDDLE of
+/// other text (a message body, a reply preview), not a standalone column, so
+/// the quoting that defends a column/label site would only cost legibility
+/// on every ordinary mention. ONLY for a human/terminal println; never for
+/// output that also feeds JSON or persistence, since escaping would corrupt
+/// that byte-for-byte contract.
+pub(crate) fn render_mentions_for_terminal_escaped(
+    room_state: &ChatRoomStateV1,
+    text: &str,
+) -> String {
+    river_core::mention::render_plaintext_transformed(
+        text,
+        |r| resolve_mention_nickname(room_state, r),
+        |name| crate::deputies::escape_nickname_inline(&name),
+    )
 }
 
 /// Resolve a member's `preferred_nickname` [`SealedBytes`] to its display
@@ -1023,7 +1087,15 @@ pub(crate) enum ReplyContextDisplay {
         author: String,
         author_id: String,
         message_id: String,
+        /// Faithful, unescaped preview — for JSON/bridge consumers and
+        /// anything persisted. A quoted message can itself `@mention` someone,
+        /// and that mentioned member's nickname is attacker-controlled, so
+        /// this must stay byte-identical to what a bridge already sees.
         preview: String,
+        /// The SAME preview, but with every substituted `@mention` nickname
+        /// escaped for terminal output (freenet/river#474). Human/terminal
+        /// output only — see [`reply_prefix_display`].
+        preview_for_terminal: String,
     },
 }
 
@@ -1145,7 +1217,10 @@ pub(crate) fn reply_context_display_with_secrets(
         author,
         author_id: target.message.author.to_string(),
         message_id: target.id().0 .0.to_string(),
-        preview: truncate_reply_preview(&render_mentions_for_terminal(room_state, &text)),
+        preview: truncate_reply_preview(&render_mentions_raw(room_state, &text)),
+        preview_for_terminal: truncate_reply_preview(&render_mentions_for_terminal_escaped(
+            room_state, &text,
+        )),
     }
 }
 
@@ -1223,9 +1298,24 @@ fn decrypt_private_quote_text(
 pub(crate) fn reply_prefix_display(ctx: &ReplyContextDisplay) -> String {
     match ctx {
         ReplyContextDisplay::Quote {
-            author, preview, ..
+            author,
+            preview_for_terminal,
+            ..
         } => {
-            format!("[reply to {}: {}] ", author, preview)
+            // `author` is attacker-controlled (any member sets their own
+            // nickname) and is the FAITHFUL decoded value shared with
+            // `reply_to_json` — escape only here, at the terminal print site,
+            // never at the shared source. See `display_nickname`.
+            //
+            // `preview_for_terminal` (rather than `preview`) because a quoted
+            // message can itself `@mention` someone, and that mentioned
+            // member's nickname is just as attacker-controlled as `author` —
+            // see `render_mentions_for_terminal_escaped` (freenet/river#474).
+            format!(
+                "[reply to {}: {}] ",
+                crate::deputies::display_nickname(author),
+                preview_for_terminal
+            )
         }
         // The quoted message could not be read back — its author was banned and
         // their messages purged, it was deleted, it aged out, or (for a private
@@ -1250,6 +1340,7 @@ pub(crate) fn reply_to_json(ctx: &ReplyContextDisplay) -> Option<serde_json::Val
             author_id,
             message_id,
             preview,
+            ..
         } => Some(json!({
             "author": author,
             "author_id": author_id,
@@ -4424,6 +4515,9 @@ impl ApiClient {
         // `ReplyContentV1.target_author_name` and PERSISTS it to contract state.
         // Without decrypting here, the reply's quoted author would read
         // "[Encrypted: N bytes, vN]" to every reader (including the UI) forever.
+        // Deliberately NOT run through `display_nickname`: this value is
+        // persisted, not printed, and escaping it would corrupt the stored
+        // author name for every future reader.
         let target_author_name = room_state
             .member_info
             .canonical(target_msg.message.author)
@@ -4889,6 +4983,11 @@ impl ApiClient {
                 let display_name = nickname
                     .clone()
                     .unwrap_or_else(|| author_str.chars().take(8).collect());
+                // Escaped only for this terminal line — `nickname` itself
+                // stays raw below because the JSON branch below serializes it
+                // faithfully (attacker-controlled nickname; JSON escaping
+                // already makes it safe there).
+                let display_name = crate::deputies::display_nickname(&display_name);
                 let reactions_str = reactions
                     .map(|r| {
                         if r.is_empty() {
@@ -4972,6 +5071,9 @@ impl ApiClient {
                 let display_name = nickname
                     .clone()
                     .unwrap_or_else(|| author_str.chars().take(8).collect());
+                // Escaped only for this terminal line — see the identical
+                // comment in `output_reaction_change`.
+                let display_name = crate::deputies::display_nickname(&display_name);
                 println!(
                     "[deleted] [{} - {}]: (message deleted)",
                     local_time.format("%H:%M:%S"),
@@ -5014,11 +5116,6 @@ impl ApiClient {
         is_edit: bool,
         secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
-        // Get display content (handles edits and non-text public content like
-        // join events; `secrets` decrypts private-room bodies — only a body
-        // whose secret is unavailable renders as "<encrypted>")
-        let content = message_display_text_with_secrets(room_state, msg, secrets);
-
         // Get message ID for checking edited status and reactions
         let msg_id = msg.id();
         let edited = room_state.recent_messages.is_edited(&msg_id);
@@ -5030,12 +5127,19 @@ impl ApiClient {
                 let author_str = msg.message.author.to_string();
                 let author_short = author_str.chars().take(8).collect::<String>();
 
-                // Get nickname if available (decrypted for a private room)
+                // Get nickname if available (decrypted for a private room).
+                // Escaped for this HUMAN-only println — the JSON branch below
+                // makes its own separate `unseal_nickname_display` call and
+                // stays raw (attacker-controlled nickname; JSON escaping
+                // already makes it safe there).
                 let nickname = room_state
                     .member_info
                     .canonical(msg.message.author)
                     .map(|info| {
-                        unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
+                        crate::deputies::display_nickname(&unseal_nickname_display(
+                            &info.member_info.preferred_nickname,
+                            secrets,
+                        ))
                     })
                     .unwrap_or(author_short);
 
@@ -5061,13 +5165,21 @@ impl ApiClient {
                     })
                     .unwrap_or_default();
 
+                // A message can itself `@mention` someone, and that mentioned
+                // member's nickname is attacker-controlled — a SEPARATE call
+                // from the JSON arm's own `content` below (which still uses
+                // the raw helper), escaping only the substituted mention name
+                // for this println (freenet/river#474).
+                let content_for_terminal =
+                    message_display_text_for_terminal(room_state, msg, secrets);
+
                 println!(
                     "{}[{} - {}]: {}{}{}{}",
                     edit_prefix,
                     local_time.format("%H:%M:%S"),
                     nickname,
                     reply_prefix,
-                    content,
+                    content_for_terminal,
                     edited_indicator,
                     reactions_str
                 );
@@ -5083,6 +5195,15 @@ impl ApiClient {
                     });
 
                 let datetime: DateTime<Utc> = msg.message.time.into();
+
+                // Get display content (handles edits and non-text public
+                // content like join events; `secrets` decrypts private-room
+                // bodies — only a body whose secret is unavailable renders as
+                // "<encrypted>"). Computed here, not before the `match`: the
+                // Human arm above uses its own `content_for_terminal` and
+                // never reads this raw value, so hoisting it would decrypt
+                // and mention-render the body a second time for nothing.
+                let content = message_display_text_with_secrets(room_state, msg, secrets);
 
                 let reactions_map: std::collections::HashMap<String, usize> = reactions
                     .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
@@ -9363,7 +9484,7 @@ mod mention_cli_tests {
         assert_eq!(resolve_outgoing_mentions(&state, &token), token);
     }
 
-    // --- render_mentions_for_terminal (display path) ---
+    // --- render_mentions_raw (display path) ---
 
     #[test]
     fn render_uses_current_nickname_over_snapshot() {
@@ -9371,7 +9492,7 @@ mod mention_cli_tests {
         let state =
             state_with_members(&[(alice.clone(), SealedBytes::public(b"NewName".to_vec()))]);
         let text = format!("hey {}", encode_mention(member_id(&alice), "OldName"));
-        assert_eq!(render_mentions_for_terminal(&state, &text), "hey @NewName");
+        assert_eq!(render_mentions_raw(&state, &text), "hey @NewName");
     }
 
     #[test]
@@ -9379,7 +9500,7 @@ mod mention_cli_tests {
         let ghost = SigningKey::from_bytes(&[9u8; 32]);
         let state = state_with_members(&[]); // ghost not present
         let text = format!("hey {}", encode_mention(member_id(&ghost), "Ghost"));
-        assert_eq!(render_mentions_for_terminal(&state, &text), "hey @Ghost");
+        assert_eq!(render_mentions_raw(&state, &text), "hey @Ghost");
     }
 
     #[test]
@@ -9387,8 +9508,150 @@ mod mention_cli_tests {
         let alice = SigningKey::from_bytes(&[1u8; 32]);
         let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
         let msg = msg_with_text(format!("hi {}", encode_mention(member_id(&alice), "Alice")));
-        // The full display path wraps render_mentions_for_terminal.
+        // The full display path wraps render_mentions_raw.
         assert_eq!(message_display_text(&state, &msg), "hi @Alice");
+    }
+
+    // --- render_mentions_for_terminal_escaped (freenet/river#474) ---
+    //
+    // A mentioned member's nickname is exactly as attacker-controlled as the
+    // message author's: any member can set it, and a message mentioning them
+    // splices it into terminal output the same way the author's name does.
+    // One attacker, no second party needed — set your own nickname to a
+    // hostile payload and mention yourself.
+
+    #[test]
+    fn render_escaped_escapes_the_resolved_live_nickname() {
+        let eve = SigningKey::from_bytes(&[3u8; 32]);
+        let hostile = "\u{1b}[2J\rEve\u{7}";
+        let state = state_with_members(&[(eve.clone(), SealedBytes::public(hostile.into()))]);
+        let text = format!("hey {}", encode_mention(member_id(&eve), "OldName"));
+
+        let unescaped = render_mentions_raw(&state, &text);
+        assert_eq!(
+            unescaped,
+            format!("hey @{hostile}"),
+            "sanity: the raw (JSON/persistence) path is unaffected by this fix"
+        );
+
+        let escaped = render_mentions_for_terminal_escaped(&state, &text);
+        assert!(
+            !escaped.contains('\u{1b}') && !escaped.contains('\r') && !escaped.contains('\u{7}'),
+            "raw control bytes must not reach the terminal: {escaped:?}"
+        );
+        assert_eq!(
+            escaped,
+            format!("hey @{}", crate::deputies::escape_nickname_inline(hostile))
+        );
+    }
+
+    /// The snapshot-fallback branch (unknown member, or a private-room
+    /// nickname `render_mentions_raw` never decrypts) is JUST AS
+    /// attacker-controlled as the resolved-live-nickname branch above: the
+    /// token's `display_name` is whatever bytes sit between `[` and `]` in
+    /// the wire token, which `try_parse_token_at` accepts with no charset
+    /// restriction. The token is built BY HAND here, not via `encode_mention`
+    /// — that helper's own `sanitize_name` strips control characters at
+    /// AUTHORING time, which is exactly the gap: a hostile client (or a
+    /// stdlib bump that changes the outgoing encoder) can put a raw token on
+    /// the wire directly, and the PARSER must not depend on the encoder
+    /// having been polite.
+    #[test]
+    fn render_escaped_escapes_the_snapshot_fallback_name_too() {
+        let ghost = SigningKey::from_bytes(&[9u8; 32]); // not in room state
+        let hostile = "\u{1b}[2J\rGhost\u{7}";
+        let state = state_with_members(&[]);
+        let text = format!(
+            "hey @[{hostile}]({}{})",
+            river_core::mention::REF_SCHEME,
+            river_core::mention::member_id_to_short(member_id(&ghost))
+        );
+
+        let escaped = render_mentions_for_terminal_escaped(&state, &text);
+        assert!(
+            !escaped.contains('\u{1b}') && !escaped.contains('\r') && !escaped.contains('\u{7}'),
+            "raw control bytes in the snapshot fallback must not reach the \
+             terminal: {escaped:?}"
+        );
+        assert_eq!(
+            escaped,
+            format!("hey @{}", crate::deputies::escape_nickname_inline(hostile))
+        );
+    }
+
+    /// End-to-end through the message-display helpers actually wired into
+    /// `output_message` / `message list`: a message mentioning a member whose
+    /// LIVE nickname is an ANSI/CR/bell payload must render escaped through
+    /// `message_display_text_for_terminal` (the human path), while
+    /// `message_display_text_with_secrets` (the JSON/persistence path) must
+    /// stay byte-identical to the raw mention substitution — mirroring the
+    /// author/JSON split this whole PR is built on.
+    #[test]
+    fn message_display_text_for_terminal_escapes_mentioned_nickname_json_stays_raw() {
+        let eve = SigningKey::from_bytes(&[3u8; 32]);
+        let hostile = "\u{1b}[2J\rEve\u{7}";
+        let state = state_with_members(&[(eve.clone(), SealedBytes::public(hostile.into()))]);
+        let msg = msg_with_text(format!("hi {}", encode_mention(member_id(&eve), "OldName")));
+
+        let terminal = message_display_text_for_terminal(&state, &msg, &HashMap::new());
+        assert!(
+            !terminal.contains('\u{1b}') && !terminal.contains('\r') && !terminal.contains('\u{7}'),
+            "raw control bytes must not reach the terminal: {terminal:?}"
+        );
+
+        let json_path = message_display_text_with_secrets(&state, &msg, &HashMap::new());
+        assert_eq!(
+            json_path,
+            format!("hi @{hostile}"),
+            "the JSON/persistence path must carry the raw mentioned nickname \
+             byte-for-byte"
+        );
+    }
+
+    /// A REPLY's preview goes through mention rendering too (it quotes
+    /// another message's text), so the third injection site — the quoted
+    /// message mentions the hostile-nicknamed member — must also be closed.
+    /// `reply_prefix_display` (terminal) must escape it via
+    /// `preview_for_terminal`; `reply_to_json` (JSON/bridge) must keep the
+    /// raw `preview` byte-identical.
+    #[test]
+    fn reply_preview_escapes_mentioned_nickname_for_terminal_json_stays_raw() {
+        let bob = SigningKey::from_bytes(&[4u8; 32]);
+        let eve = SigningKey::from_bytes(&[3u8; 32]);
+        let hostile = "\u{1b}[2J\rEve\u{7}";
+        let mut state = state_with_members(&[(eve.clone(), SealedBytes::public(hostile.into()))]);
+        let reply = reply_quoting(
+            &mut state,
+            &bob,
+            &format!("see {}", encode_mention(member_id(&eve), "OldName")),
+        );
+
+        let ctx = reply_context_display(&state, &reply);
+        let ReplyContextDisplay::Quote {
+            preview,
+            preview_for_terminal,
+            ..
+        } = &ctx
+        else {
+            panic!("expected a resolved quote, got {ctx:?}");
+        };
+        assert_eq!(
+            preview,
+            &format!("see @{hostile}"),
+            "the JSON/persistence preview must carry the raw mentioned \
+             nickname byte-for-byte"
+        );
+
+        let terminal = reply_prefix_display(&ctx);
+        assert!(
+            !terminal.contains('\u{1b}') && !terminal.contains('\r') && !terminal.contains('\u{7}'),
+            "raw control bytes in a reply preview's mention must not reach \
+             the terminal: {terminal:?}"
+        );
+        assert_eq!(
+            preview_for_terminal,
+            &format!("see @{}", crate::deputies::escape_nickname_inline(hostile))
+        );
     }
 
     #[test]
@@ -9703,8 +9966,11 @@ mod mention_cli_tests {
             author_id: "ALICE123".to_string(),
             message_id: "42".to_string(),
             preview: "hello".to_string(),
+            preview_for_terminal: "hello".to_string(),
         };
-        assert_eq!(reply_prefix_display(&quote), "[reply to Alice: hello] ");
+        // Escaped and quoted for the terminal (freenet/river#474) — see
+        // `display_nickname`. The JSON author below stays the bare string.
+        assert_eq!(reply_prefix_display(&quote), "[reply to \"Alice\": hello] ");
         assert_eq!(
             reply_to_json(&quote),
             Some(json!({
@@ -9724,6 +9990,46 @@ mod mention_cli_tests {
 
         assert_eq!(reply_prefix_display(&ReplyContextDisplay::NotAReply), "");
         assert_eq!(reply_to_json(&ReplyContextDisplay::NotAReply), None);
+    }
+
+    /// A member's nickname is attacker-controlled — any room member sets
+    /// their own — so a nickname carrying ANSI escapes, a bare CR, or a bell
+    /// must not reach the terminal unescaped (freenet/river#474): unescaped,
+    /// it can rewrite prior terminal output, hide/replace text via `\r`, or
+    /// beep. `reply_prefix_display` (the terminal path) must render it
+    /// escaped, while `reply_to_json` (the JSON/bridge path, and the same
+    /// value persisted into `ReplyContentV1`) must carry the BYTE-IDENTICAL
+    /// raw value: JSON's own string escaping already makes it safe there, and
+    /// escaping it a second time would corrupt the data for any consumer.
+    #[test]
+    fn reply_author_ansi_escapes_are_escaped_for_terminal_and_raw_in_json() {
+        let hostile = "\u{1b}[2J\rEve\u{7}";
+        let quote = ReplyContextDisplay::Quote {
+            author: hostile.to_string(),
+            author_id: "EVE123".to_string(),
+            message_id: "1".to_string(),
+            preview: "hi".to_string(),
+            preview_for_terminal: "hi".to_string(),
+        };
+
+        let text = reply_prefix_display(&quote);
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\r') && !text.contains('\u{7}'),
+            "raw control bytes must not reach the terminal: {text:?}"
+        );
+        assert_eq!(
+            text,
+            format!(
+                "[reply to {}: hi] ",
+                crate::deputies::display_nickname(hostile)
+            )
+        );
+
+        let json = reply_to_json(&quote).unwrap();
+        assert_eq!(
+            json["author"], hostile,
+            "the JSON path must carry the raw nickname byte-for-byte"
+        );
     }
 }
 
@@ -10673,5 +10979,96 @@ pub(crate) fn unseal_nickname_display(",
     #[test]
     fn pin_accepts_the_unmutated_source() {
         assert!(membership_guard_violations(include_str!("api.rs")).is_empty());
+    }
+
+    /// `output_reaction_change`, `output_deletion`, and `output_message` each
+    /// resolve a member's nickname (attacker-controlled — any room member sets
+    /// their own, freenet/river#474) and print it to BOTH a human terminal
+    /// line and a JSON field. The human line must escape it via
+    /// `display_nickname`; the JSON field must stay raw (JSON's own string
+    /// escaping already makes it safe there, and escaping it again would
+    /// corrupt the value for a bridge/consumer). Reuses `production_source`
+    /// (defined above in this module) so `#[cfg(test)]` content — including
+    /// this test's own literals — cannot satisfy the counts.
+    #[test]
+    fn terminal_nickname_sites_escape_human_output_and_leave_json_raw() {
+        let p = production_source(include_str!("api.rs"));
+        assert!(p.problems.is_empty(), "{:?}", p.problems);
+        let src = &p.source;
+
+        // `output_reaction_change` and `output_deletion` share the same
+        // shape: escape a *derived* `display_name`, never the shared
+        // `nickname` variable the JSON arm also reads.
+        assert_eq!(
+            src.matches("let display_name = crate::deputies::display_nickname(&display_name);")
+                .count(),
+            2,
+            "expected exactly one escaped human display_name in each of \
+             output_reaction_change and output_deletion"
+        );
+        // `output_message`'s human branch makes its own separate
+        // `unseal_nickname_display` call (distinct from the JSON branch's),
+        // so it can be escaped inline.
+        assert_eq!(
+            src.matches("crate::deputies::display_nickname(&unseal_nickname_display(")
+                .count(),
+            1,
+            "expected output_message's human branch to escape its own nickname call"
+        );
+        // All three JSON arms must still emit the nickname UNescaped.
+        assert_eq!(
+            src.matches("\"nickname\": nickname,").count(),
+            3,
+            "expected output_reaction_change, output_deletion, and \
+             output_message to each emit the nickname raw in their JSON arm; \
+             the pin would pass vacuously if this drifted to 0"
+        );
+    }
+
+    /// This PR (freenet/river#474) exists because a `println!` path was
+    /// missed reaching for a RAW (unescaped) content/nickname helper — TWICE:
+    /// once for the direct author/nickname case, once for the `@mention`
+    /// substitution case. Rather than trust that every future `Human` arm
+    /// remembers to pick the escaped sibling, scan every
+    /// `OutputFormat::Human => { ... }` arm in production `api.rs` (brace-
+    /// matched via `end_of_item`, so nested braces/strings/comments can't
+    /// desynchronize the scan) and assert NONE of them calls either RAW
+    /// helper directly.
+    #[test]
+    fn human_output_arms_never_call_a_raw_content_or_mention_helper() {
+        const ANCHOR: &str = "OutputFormat::Human => {";
+        const RAW_HELPERS: [&str; 2] =
+            ["render_mentions_raw(", "message_display_text_with_secrets("];
+
+        let p = production_source(include_str!("api.rs"));
+        assert!(p.problems.is_empty(), "{:?}", p.problems);
+        let src = &p.source;
+
+        let mut idx = 0usize;
+        let mut arms_checked = 0usize;
+        while let Some(rel) = src[idx..].find(ANCHOR) {
+            let open_brace = idx + rel + ANCHOR.len() - 1; // index of the `{`
+            let len = end_of_item(&src[open_brace..]).unwrap_or_else(|| {
+                panic!("unterminated `OutputFormat::Human` arm at byte {open_brace}; the pin cannot scan it")
+            });
+            let body = &src[open_brace..open_brace + len];
+            for helper in RAW_HELPERS {
+                assert!(
+                    !body.contains(helper),
+                    "a Human println arm calls the RAW helper `{helper}` \
+                     directly -- this exact miss is what freenet/river#474 \
+                     was about, twice. Arm body:\n{body}"
+                );
+            }
+            arms_checked += 1;
+            idx = open_brace + len;
+        }
+        assert!(
+            arms_checked >= 3,
+            "expected to find every `OutputFormat::Human` arm in api.rs \
+             (output_message, output_reaction_change, output_deletion); \
+             found {arms_checked} -- the pin may be scanning the wrong \
+             region and would pass vacuously"
+        );
     }
 }

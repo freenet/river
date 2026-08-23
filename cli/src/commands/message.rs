@@ -242,13 +242,21 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // `canonical`, not a bare `.find()` (#411 round 8 item A): a
                             // duplicate-holding state could otherwise display a stale
                             // (e.g. revoked) record's nickname.
+                            //
+                            // Escaped for this HUMAN-only println below — the
+                            // JSON branch further down makes its own separate
+                            // `unseal_nickname_display` call and stays raw
+                            // (attacker-controlled nickname; JSON escaping
+                            // already makes it safe there).
                             let nickname = room_state
                                 .member_info
                                 .canonical(msg.message.author)
                                 .map(|info| {
-                                    crate::api::unseal_nickname_display(
-                                        &info.member_info.preferred_nickname,
-                                        &secrets,
+                                    crate::deputies::display_nickname(
+                                        &crate::api::unseal_nickname_display(
+                                            &info.member_info.preferred_nickname,
+                                            &secrets,
+                                        ),
                                     )
                                 })
                                 .unwrap_or(author_short);
@@ -260,8 +268,14 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // public content like join events, and — via
                             // `secrets` — decrypted private-room bodies; only a
                             // body whose secret is unavailable renders as
-                            // "<encrypted>")
-                            let content = crate::api::message_display_text_with_secrets(
+                            // "<encrypted>"). The `_for_terminal` variant also
+                            // escapes any `@mention` nickname substituted into
+                            // the text — a mentioned member's nickname is
+                            // attacker-controlled just like the author's
+                            // (freenet/river#474). The JSON arm below keeps its
+                            // own separate `message_display_text_with_secrets`
+                            // call and stays raw.
+                            let content = crate::api::message_display_text_for_terminal(
                                 &room_state,
                                 msg,
                                 &secrets,
@@ -588,6 +602,67 @@ fn parse_message_id(message_id: &str) -> Result<MessageId> {
 
 #[cfg(test)]
 mod tests {
+    /// `message list`'s nickname is attacker-controlled (any room member sets
+    /// their own) — freenet/river#474. The HUMAN println must escape it via
+    /// `display_nickname` (ANSI/CR/bell must not reach the terminal), while
+    /// the JSON arm's separate `unseal_nickname_display` call must stay raw:
+    /// escaping it there would corrupt the value for a bridge/consumer, since
+    /// JSON's own string escaping already makes it safe.
+    ///
+    /// Source-scrape, not a live round trip: this file has no stdout-capture
+    /// harness. Split on the unique `OutputFormat::Json => {` for `message
+    /// list` (verified unique in production) so the human/json regions can't
+    /// be confused with each other or with the unrelated Human/Json arms of
+    /// the other `message` subcommands later in this file.
+    ///
+    /// The plain `.split_once("mod tests")` cut below (rather than the
+    /// `production_source` brace-aware stripper used elsewhere in this repo)
+    /// is only equivalent to it because this file has exactly ONE
+    /// `#[cfg(test)] mod tests` block, at the very end, with no earlier
+    /// `#[cfg(test)]` item. If an earlier `#[cfg(test)]` item is ever added
+    /// above this point, this cut would stop excluding it and the pin could
+    /// silently start matching against test-only code.
+    #[test]
+    fn message_list_escapes_nickname_for_human_and_keeps_json_raw() {
+        let source = include_str!("message.rs");
+        let production = source
+            .split_once("mod tests")
+            .map(|(before, _)| before)
+            .expect("test module marker missing; the cut would scan everything");
+        assert_eq!(
+            production.matches("OutputFormat::Json => {").count(),
+            1,
+            "split anchor must be unique or this pin scrapes the wrong region"
+        );
+        let (human_region, json_and_after) = production
+            .split_once("OutputFormat::Json => {")
+            .expect("anchor not found; the pin would scan nothing");
+
+        assert!(
+            human_region.contains("display_nickname("),
+            "the message list HUMAN branch must escape the nickname"
+        );
+        // Same failure mode this whole PR is about, closed a second time:
+        // the human branch must reach for the escaped content helper, never
+        // the raw one directly.
+        assert!(
+            !human_region.contains("message_display_text_with_secrets(")
+                && !human_region.contains("render_mentions_raw("),
+            "the message list HUMAN branch must not call a raw content/\
+             mention helper directly; use `message_display_text_for_terminal`"
+        );
+        assert!(
+            json_and_after.contains("unseal_nickname_display("),
+            "the message list JSON branch must still resolve a nickname; \
+             the pin would pass vacuously otherwise"
+        );
+        assert!(
+            !json_and_after.contains("display_nickname("),
+            "the message list JSON branch's nickname must stay raw — \
+             escaping it here would corrupt the value for a bridge/consumer"
+        );
+    }
+
     /// `message reply --format json` must return the new message's ID, and in
     /// the SAME form `message list` prints and `message delete` accepts.
     ///

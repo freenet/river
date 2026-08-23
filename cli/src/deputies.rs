@@ -562,6 +562,31 @@ pub fn display_nickname(nickname: &str) -> String {
     format!("{:?}", nickname)
 }
 
+/// Like [`display_nickname`], but WITHOUT the surrounding quote pair — for
+/// splicing an escaped name into the MIDDLE of other text (e.g. an
+/// `@mention` substituted inline into a message or reply preview,
+/// freenet/river#474), rather than presenting it as a standalone row/column.
+///
+/// The quoting `display_nickname` adds is there to defend a COLUMN or LABEL
+/// site: a nickname of purely printable characters can otherwise forge a
+/// plausible second output row (see its doc comment). That defense does not
+/// transfer inline — inside a message body the attacker already controls
+/// every surrounding byte and can type a fake row as plain prose with no
+/// mention at all — so quoting there buys no security and costs legibility
+/// on every ordinary, non-hostile mention (`hey @"Alice" can you review?`).
+///
+/// Reuses the EXACT SAME escape table as `display_nickname` (`str`'s
+/// `Debug`), so this is not a second, hand-maintained escaping scheme: it is
+/// `display_nickname`'s output with the outer quote character trimmed off
+/// each end. `{:?}` on a `&str` always emits exactly one ASCII `"` at each
+/// end (never doubled, never omitted), so trimming one byte from each side is
+/// exact — including on an empty name, where the two quote bytes are all
+/// there is.
+pub fn escape_nickname_inline(nickname: &str) -> String {
+    let quoted = display_nickname(nickname);
+    quoted[1..quoted.len() - 1].to_string()
+}
+
 /// Render a party as `"Nickname" (SHORTID)`, or `(unknown) (SHORTID)` when they
 /// have no `member_info` record in this room. The nickname is escaped and quoted
 /// by [`display_nickname`]; `(unknown)` is unquoted precisely so it cannot be
@@ -1313,6 +1338,52 @@ mod tests {
         assert_eq!(display_nickname("Ian Clarke"), "\"Ian Clarke\"");
         assert_eq!(display_nickname("O'Brien"), "\"O'Brien\"");
         assert_eq!(display_nickname("emoji \u{1f600}"), "\"emoji \u{1f600}\"");
+    }
+
+    /// `escape_nickname_inline` (freenet/river#474) must escape exactly the
+    /// same control/format/separator bytes as `display_nickname` — it is
+    /// `display_nickname`'s output with the outer quote pair trimmed, not a
+    /// second hand-maintained escaping scheme — but must NOT wrap the result
+    /// in quotes, since it is meant to sit inline inside other text (an
+    /// `@mention` substituted into a message or reply preview) rather than
+    /// stand as a labelled column.
+    #[test]
+    fn escape_nickname_inline_matches_display_nickname_minus_quotes() {
+        let hostile = "\u{1b}[2J\rEve\u{7}";
+        let quoted = display_nickname(hostile);
+        let inline = escape_nickname_inline(hostile);
+
+        assert!(
+            quoted.starts_with('"') && quoted.ends_with('"'),
+            "sanity: display_nickname always wraps in exactly one quote pair"
+        );
+        assert_eq!(
+            inline,
+            quoted[1..quoted.len() - 1],
+            "escape_nickname_inline must be display_nickname's escaping with \
+             only the surrounding quotes removed"
+        );
+        assert!(
+            !inline.starts_with('"') && !inline.ends_with('"'),
+            "escape_nickname_inline must not add its own quoting: {inline:?}"
+        );
+        for forbidden in ['\u{1b}', '\r', '\u{7}'] {
+            assert!(
+                !inline.contains(forbidden),
+                "{forbidden:?} must not survive into inline terminal output: {inline:?}"
+            );
+        }
+
+        // Ordinary names round-trip with no visible change at all — this is
+        // the property that makes it safe for EVERY ordinary @mention, not
+        // just hostile ones.
+        assert_eq!(escape_nickname_inline("Alice"), "Alice");
+
+        // The empty name is a genuine edge case (an empty nickname is a
+        // degenerate but not impossible resolved value): `display_nickname`
+        // produces exactly two quote characters and nothing else, so the
+        // inline form must be empty, not panic on an out-of-bounds slice.
+        assert_eq!(escape_nickname_inline(""), "");
     }
 
     #[test]

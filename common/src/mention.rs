@@ -295,9 +295,24 @@ pub fn contains_mention_of(text: &str, id: MemberId) -> bool {
 /// member's *current* display name (typically by scanning the room's members
 /// with [`MemberRef::matches`]); when it returns `None` the snapshot name in the
 /// token is used.
-pub fn render_plaintext<F>(text: &str, mut resolve: F) -> String
+pub fn render_plaintext<F>(text: &str, resolve: F) -> String
 where
     F: FnMut(&MemberRef) -> Option<String>,
+{
+    render_plaintext_transformed(text, resolve, |name| name)
+}
+
+/// Like [`render_plaintext`], but passes the CHOSEN name — the resolver's
+/// live-nickname result, OR (when it returns `None`) the token's own
+/// attacker-supplied snapshot `display_name` — through `transform` before
+/// splicing it into the output. Both sources are equally untrusted, so a
+/// caller that needs to sanitize a substituted name (e.g. escaping terminal
+/// control bytes, freenet/river#474) must transform AFTER the fallback, not
+/// inside `resolve`, or the snapshot-fallback branch stays unsanitized.
+pub fn render_plaintext_transformed<F, T>(text: &str, mut resolve: F, mut transform: T) -> String
+where
+    F: FnMut(&MemberRef) -> Option<String>,
+    T: FnMut(String) -> String,
 {
     let mut out = String::with_capacity(text.len());
     for seg in parse_segments(text) {
@@ -306,7 +321,7 @@ where
             MentionSegment::Mention(m) => {
                 let name = resolve(&m.member_ref).unwrap_or(m.display_name);
                 out.push('@');
-                out.push_str(&name);
+                out.push_str(&transform(name));
             }
         }
     }
@@ -731,5 +746,34 @@ mod tests {
         let text = format!("(see {}, thanks)", encode_mention(id, "Cat"));
         let rendered = render_plaintext(&text, |_| Some("Cat".to_string()));
         assert_eq!(rendered, "(see @Cat, thanks)");
+    }
+
+    /// `transform` must see the CHOSEN name — resolved OR the snapshot
+    /// fallback — not just the resolver's own `Some(...)` branch. A caller
+    /// (riverctl, freenet/river#474) uses this to sanitize a substituted name
+    /// for terminal output regardless of which branch produced it; a
+    /// transform wired only around `resolve` would silently skip the
+    /// fallback case.
+    #[test]
+    fn render_plaintext_transformed_applies_to_resolved_and_fallback_names_alike() {
+        let known = mid(1);
+        let unknown = mid(2);
+        let text = format!(
+            "hey {} and {}",
+            encode_mention(known, "OldName"),
+            encode_mention(unknown, "Ghost")
+        );
+        let rendered = render_plaintext_transformed(
+            &text,
+            |r| {
+                if r.matches(known) {
+                    Some("NewName".to_string())
+                } else {
+                    None
+                }
+            },
+            |name| format!("<{name}>"),
+        );
+        assert_eq!(rendered, "hey @<NewName> and @<Ghost>");
     }
 }
