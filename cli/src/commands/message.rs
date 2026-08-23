@@ -642,6 +642,15 @@ mod tests {
             human_region.contains("display_nickname("),
             "the message list HUMAN branch must escape the nickname"
         );
+        // Same failure mode this whole PR is about, closed a second time:
+        // the human branch must reach for the escaped content helper, never
+        // the raw one directly.
+        assert!(
+            !human_region.contains("message_display_text_with_secrets(")
+                && !human_region.contains("render_mentions_raw("),
+            "the message list HUMAN branch must not call a raw content/\
+             mention helper directly; use `message_display_text_for_terminal`"
+        );
         assert!(
             json_and_after.contains("unseal_nickname_display("),
             "the message list JSON branch must still resolve a nickname; \

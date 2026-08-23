@@ -710,7 +710,7 @@ pub(crate) fn message_display_text_with_secrets(
     msg: &river_core::room_state::message::AuthorizedMessageV1,
     secrets: &HashMap<u32, [u8; 32]>,
 ) -> String {
-    render_mentions_for_terminal(room_state, &raw_message_body_text(room_state, msg, secrets))
+    render_mentions_raw(room_state, &raw_message_body_text(room_state, msg, secrets))
 }
 
 /// Like [`message_display_text_with_secrets`], but escapes every substituted
@@ -794,7 +794,7 @@ fn decrypt_private_body_text(
 }
 
 /// Resolve a mention token's member_id to its *current* public nickname, for
-/// [`render_mentions_for_terminal`] / [`render_mentions_for_terminal_escaped`].
+/// [`render_mentions_raw`] / [`render_mentions_for_terminal_escaped`].
 /// Shared so the two renderers cannot drift on WHICH name is substituted —
 /// only on whether it gets escaped afterward.
 fn resolve_mention_nickname(
@@ -817,25 +817,30 @@ fn resolve_mention_nickname(
         .map(|bytes| String::from_utf8_lossy(bytes).to_string())
 }
 
-/// Replace `@[name](rv:id)` mention tokens with `@<name>` for terminal display.
-/// Prefers each member's *current* public nickname (so the rendered name
-/// follows renames); falls back to the token's snapshot name when the member is
+/// Replace `@[name](rv:id)` mention tokens with `@<name>`. Prefers each
+/// member's *current* public nickname (so the rendered name follows
+/// renames); falls back to the token's snapshot name when the member is
 /// unknown or their nickname is encrypted (riverctl does not decrypt
 /// private-room nicknames). Plain text without tokens is returned unchanged.
 ///
-/// The substituted name — resolved OR snapshot fallback — is NOT escaped here.
-/// This is shared with the JSON/persistence path (see
+/// RAW — the substituted name, resolved OR snapshot fallback, is NOT escaped
+/// here. This feeds the JSON/persistence path (see
 /// [`message_display_text_with_secrets`]), so escaping it would corrupt that
-/// byte-for-byte contract. For a human/terminal-only println, use
-/// [`render_mentions_for_terminal_escaped`] instead.
-pub(crate) fn render_mentions_for_terminal(room_state: &ChatRoomStateV1, text: &str) -> String {
+/// byte-for-byte contract. Despite the name resembling "for terminal
+/// display", this is NOT safe to print directly: for a human/terminal-only
+/// println, use [`render_mentions_for_terminal_escaped`] instead.
+pub(crate) fn render_mentions_raw(room_state: &ChatRoomStateV1, text: &str) -> String {
     river_core::mention::render_plaintext(text, |r| resolve_mention_nickname(room_state, r))
 }
 
-/// Like [`render_mentions_for_terminal`], but escapes the substituted name —
+/// Like [`render_mentions_raw`], but escapes the substituted name —
 /// resolved live nickname OR the token's snapshot fallback, both attacker-
-/// controlled — via [`crate::deputies::display_nickname`] before splicing it
-/// in (freenet/river#474). ONLY for a human/terminal println; never for
+/// controlled — via [`crate::deputies::escape_nickname_inline`] before
+/// splicing it in (freenet/river#474). The NON-quoting sibling of
+/// `display_nickname` is deliberate here: this name lands in the MIDDLE of
+/// other text (a message body, a reply preview), not a standalone column, so
+/// the quoting that defends a column/label site would only cost legibility
+/// on every ordinary mention. ONLY for a human/terminal println; never for
 /// output that also feeds JSON or persistence, since escaping would corrupt
 /// that byte-for-byte contract.
 pub(crate) fn render_mentions_for_terminal_escaped(
@@ -845,7 +850,7 @@ pub(crate) fn render_mentions_for_terminal_escaped(
     river_core::mention::render_plaintext_transformed(
         text,
         |r| resolve_mention_nickname(room_state, r),
-        |name| crate::deputies::display_nickname(&name),
+        |name| crate::deputies::escape_nickname_inline(&name),
     )
 }
 
@@ -1212,7 +1217,7 @@ pub(crate) fn reply_context_display_with_secrets(
         author,
         author_id: target.message.author.to_string(),
         message_id: target.id().0 .0.to_string(),
-        preview: truncate_reply_preview(&render_mentions_for_terminal(room_state, &text)),
+        preview: truncate_reply_preview(&render_mentions_raw(room_state, &text)),
         preview_for_terminal: truncate_reply_preview(&render_mentions_for_terminal_escaped(
             room_state, &text,
         )),
@@ -5111,11 +5116,6 @@ impl ApiClient {
         is_edit: bool,
         secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
-        // Get display content (handles edits and non-text public content like
-        // join events; `secrets` decrypts private-room bodies — only a body
-        // whose secret is unavailable renders as "<encrypted>")
-        let content = message_display_text_with_secrets(room_state, msg, secrets);
-
         // Get message ID for checking edited status and reactions
         let msg_id = msg.id();
         let edited = room_state.recent_messages.is_edited(&msg_id);
@@ -5195,6 +5195,15 @@ impl ApiClient {
                     });
 
                 let datetime: DateTime<Utc> = msg.message.time.into();
+
+                // Get display content (handles edits and non-text public
+                // content like join events; `secrets` decrypts private-room
+                // bodies — only a body whose secret is unavailable renders as
+                // "<encrypted>"). Computed here, not before the `match`: the
+                // Human arm above uses its own `content_for_terminal` and
+                // never reads this raw value, so hoisting it would decrypt
+                // and mention-render the body a second time for nothing.
+                let content = message_display_text_with_secrets(room_state, msg, secrets);
 
                 let reactions_map: std::collections::HashMap<String, usize> = reactions
                     .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
@@ -9475,7 +9484,7 @@ mod mention_cli_tests {
         assert_eq!(resolve_outgoing_mentions(&state, &token), token);
     }
 
-    // --- render_mentions_for_terminal (display path) ---
+    // --- render_mentions_raw (display path) ---
 
     #[test]
     fn render_uses_current_nickname_over_snapshot() {
@@ -9483,7 +9492,7 @@ mod mention_cli_tests {
         let state =
             state_with_members(&[(alice.clone(), SealedBytes::public(b"NewName".to_vec()))]);
         let text = format!("hey {}", encode_mention(member_id(&alice), "OldName"));
-        assert_eq!(render_mentions_for_terminal(&state, &text), "hey @NewName");
+        assert_eq!(render_mentions_raw(&state, &text), "hey @NewName");
     }
 
     #[test]
@@ -9491,7 +9500,7 @@ mod mention_cli_tests {
         let ghost = SigningKey::from_bytes(&[9u8; 32]);
         let state = state_with_members(&[]); // ghost not present
         let text = format!("hey {}", encode_mention(member_id(&ghost), "Ghost"));
-        assert_eq!(render_mentions_for_terminal(&state, &text), "hey @Ghost");
+        assert_eq!(render_mentions_raw(&state, &text), "hey @Ghost");
     }
 
     #[test]
@@ -9499,7 +9508,7 @@ mod mention_cli_tests {
         let alice = SigningKey::from_bytes(&[1u8; 32]);
         let state = state_with_members(&[(alice.clone(), SealedBytes::public(b"Alice".to_vec()))]);
         let msg = msg_with_text(format!("hi {}", encode_mention(member_id(&alice), "Alice")));
-        // The full display path wraps render_mentions_for_terminal.
+        // The full display path wraps render_mentions_raw.
         assert_eq!(message_display_text(&state, &msg), "hi @Alice");
     }
 
@@ -9518,7 +9527,7 @@ mod mention_cli_tests {
         let state = state_with_members(&[(eve.clone(), SealedBytes::public(hostile.into()))]);
         let text = format!("hey {}", encode_mention(member_id(&eve), "OldName"));
 
-        let unescaped = render_mentions_for_terminal(&state, &text);
+        let unescaped = render_mentions_raw(&state, &text);
         assert_eq!(
             unescaped,
             format!("hey @{hostile}"),
@@ -9532,12 +9541,12 @@ mod mention_cli_tests {
         );
         assert_eq!(
             escaped,
-            format!("hey @{}", crate::deputies::display_nickname(hostile))
+            format!("hey @{}", crate::deputies::escape_nickname_inline(hostile))
         );
     }
 
     /// The snapshot-fallback branch (unknown member, or a private-room
-    /// nickname `render_mentions_for_terminal` never decrypts) is JUST AS
+    /// nickname `render_mentions_raw` never decrypts) is JUST AS
     /// attacker-controlled as the resolved-live-nickname branch above: the
     /// token's `display_name` is whatever bytes sit between `[` and `]` in
     /// the wire token, which `try_parse_token_at` accepts with no charset
@@ -9566,7 +9575,7 @@ mod mention_cli_tests {
         );
         assert_eq!(
             escaped,
-            format!("hey @{}", crate::deputies::display_nickname(hostile))
+            format!("hey @{}", crate::deputies::escape_nickname_inline(hostile))
         );
     }
 
@@ -9641,7 +9650,7 @@ mod mention_cli_tests {
         );
         assert_eq!(
             preview_for_terminal,
-            &format!("see @{}", crate::deputies::display_nickname(hostile))
+            &format!("see @{}", crate::deputies::escape_nickname_inline(hostile))
         );
     }
 
@@ -11013,6 +11022,53 @@ pub(crate) fn unseal_nickname_display(",
             "expected output_reaction_change, output_deletion, and \
              output_message to each emit the nickname raw in their JSON arm; \
              the pin would pass vacuously if this drifted to 0"
+        );
+    }
+
+    /// This PR (freenet/river#474) exists because a `println!` path was
+    /// missed reaching for a RAW (unescaped) content/nickname helper — TWICE:
+    /// once for the direct author/nickname case, once for the `@mention`
+    /// substitution case. Rather than trust that every future `Human` arm
+    /// remembers to pick the escaped sibling, scan every
+    /// `OutputFormat::Human => { ... }` arm in production `api.rs` (brace-
+    /// matched via `end_of_item`, so nested braces/strings/comments can't
+    /// desynchronize the scan) and assert NONE of them calls either RAW
+    /// helper directly.
+    #[test]
+    fn human_output_arms_never_call_a_raw_content_or_mention_helper() {
+        const ANCHOR: &str = "OutputFormat::Human => {";
+        const RAW_HELPERS: [&str; 2] =
+            ["render_mentions_raw(", "message_display_text_with_secrets("];
+
+        let p = production_source(include_str!("api.rs"));
+        assert!(p.problems.is_empty(), "{:?}", p.problems);
+        let src = &p.source;
+
+        let mut idx = 0usize;
+        let mut arms_checked = 0usize;
+        while let Some(rel) = src[idx..].find(ANCHOR) {
+            let open_brace = idx + rel + ANCHOR.len() - 1; // index of the `{`
+            let len = end_of_item(&src[open_brace..]).unwrap_or_else(|| {
+                panic!("unterminated `OutputFormat::Human` arm at byte {open_brace}; the pin cannot scan it")
+            });
+            let body = &src[open_brace..open_brace + len];
+            for helper in RAW_HELPERS {
+                assert!(
+                    !body.contains(helper),
+                    "a Human println arm calls the RAW helper `{helper}` \
+                     directly -- this exact miss is what freenet/river#474 \
+                     was about, twice. Arm body:\n{body}"
+                );
+            }
+            arms_checked += 1;
+            idx = open_brace + len;
+        }
+        assert!(
+            arms_checked >= 3,
+            "expected to find every `OutputFormat::Human` arm in api.rs \
+             (output_message, output_reaction_change, output_deletion); \
+             found {arms_checked} -- the pin may be scanning the wrong \
+             region and would pass vacuously"
         );
     }
 }
