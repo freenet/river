@@ -743,38 +743,65 @@ pub fn mark_current_room_as_read() {
     update_document_title();
 }
 
-/// Mark every room as read up to its latest currently-known message.
+/// Decide which room, if any, should be marked read on a visible->hidden
+/// transition, given a snapshot of the rooms map and the owner key of
+/// whichever room is currently on screen (or `None` if no room is selected).
 ///
-/// Called when the tab transitions from visible to hidden: the user had the
-/// chance to see anything already in state, so only messages arriving *after*
-/// this point should count as unread in the title badge.
-pub fn mark_all_rooms_as_read() {
-    let updates: Vec<(ed25519_dalek::VerifyingKey, MessageId)> = {
+/// Pulled out as a pure function so the freenet/river#446 fix boundary is
+/// directly testable without a Dioxus runtime: this is the ONE place that
+/// decides which room(s) get marked read on hide. The old
+/// `mark_all_rooms_as_read` inlined the equivalent of "return one entry per
+/// room in `rooms`" here; reintroducing that is exactly what
+/// `hiding_the_tab_only_marks_the_current_room_as_read` exists to catch.
+fn room_to_mark_read_on_hide(
+    rooms: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
+    current_owner_key: Option<ed25519_dalek::VerifyingKey>,
+) -> Option<(ed25519_dalek::VerifyingKey, MessageId)> {
+    let owner_key = current_owner_key?;
+    let room_data = rooms.get(&owner_key)?;
+    let latest = room_data
+        .room_state
+        .recent_messages
+        .display_messages()
+        .last()
+        .map(|msg| msg.id())?;
+    if room_data.last_read_message_id.as_ref() == Some(&latest) {
+        return None; // Already marked as read
+    }
+    Some((owner_key, latest))
+}
+
+/// Mark ONLY the currently-visible room as read, up to its latest
+/// currently-known message.
+///
+/// Called when the tab transitions from visible to hidden. This used to mark
+/// EVERY room as read (`mark_all_rooms_as_read`, since replaced) on the theory
+/// that the user "had the chance to see" anything already in state. That
+/// reasoning only holds for the room actually on screen — a
+/// `visibilitychange` fires just as readily from a routine mobile
+/// app-switch, which silently swept every OTHER room's unread state to zero
+/// even though the user never looked at them (freenet/river#446). Only the
+/// foregrounded room is marked; every other room's `last_read_message_id` is
+/// left untouched so its unread count survives the backgrounding.
+///
+/// Note this changes the hidden-tab title badge's meaning: it used to show
+/// only messages that arrived *after* the hide (because everything else had
+/// just been swept to read), and now shows the ACCUMULATED unread total
+/// across all rooms, matching what the room-list and hamburger badges already
+/// show. See the freenet/river#446 PR description.
+pub fn mark_current_room_as_read_on_hide() {
+    let current_owner_key = CURRENT_ROOM.read().owner_key;
+
+    let update = {
         let Ok(rooms) = ROOMS.try_read() else {
             return;
         };
-        rooms
-            .map
-            .iter()
-            .filter_map(|(owner_key, room_data)| {
-                let latest = room_data
-                    .room_state
-                    .recent_messages
-                    .display_messages()
-                    .last()
-                    .map(|msg| msg.id())?;
-                if room_data.last_read_message_id.as_ref() == Some(&latest) {
-                    None
-                } else {
-                    Some((*owner_key, latest))
-                }
-            })
-            .collect()
+        room_to_mark_read_on_hide(&rooms.map, current_owner_key)
     };
 
-    if updates.is_empty() {
+    let Some((owner_key, new_last_read_id)) = update else {
         return;
-    }
+    };
 
     // Defer the signal mutation: this function fires from the raw
     // `visibilitychange` JS event callback, which has no Dioxus scope on the
@@ -783,14 +810,12 @@ pub fn mark_all_rooms_as_read() {
     // stack so no other RefCell borrows are active when subscribers re-read.
     crate::util::defer(move || {
         ROOMS.with_mut(|rooms| {
-            for (owner_key, latest) in &updates {
-                if let Some(room_data) = rooms.map.get_mut(owner_key) {
-                    room_data.last_read_message_id = Some(latest.clone());
-                }
+            if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                room_data.last_read_message_id = Some(new_last_read_id);
             }
         });
 
-        info!("Marked {} room(s) as read on tab hide", updates.len());
+        info!("Marked current room as read on tab hide");
 
         // FLUSH, not a plain save (freenet/river#533). The tab is going away,
         // and an ordinary save may defer a cache-only change for up to
@@ -800,7 +825,7 @@ pub fn mark_all_rooms_as_read() {
         // a stale unread badge. Flushing here bypasses the debounce.
         crate::util::safe_spawn_local(async {
             if let Err(e) = flush_rooms_to_delegate().await {
-                warn!("Failed to save rooms after marking all as read: {}", e);
+                warn!("Failed to save room after marking as read on hide: {}", e);
             }
         });
     });
@@ -818,11 +843,11 @@ fn on_visibility_change() {
         // Tab became visible - mark current room as read
         mark_current_room_as_read();
     } else if was_visible {
-        // Tab is going from visible to hidden. The user just had the page
-        // active, so anything currently in state should be considered seen.
-        // Only messages that arrive *after* this point should drive the
-        // unread badge in the title.
-        mark_all_rooms_as_read();
+        // Tab is going from visible to hidden. Only the room the user was
+        // actually looking at gets marked read — see
+        // `mark_current_room_as_read_on_hide`'s doc for why sweeping every
+        // room (the old behavior) was wrong (freenet/river#446).
+        mark_current_room_as_read_on_hide();
     }
 
     update_document_title();
@@ -2073,6 +2098,71 @@ mod tests {
         assert_eq!(
             count_unread_dms_with(&map, &HashMap::new(), &HashMap::new()),
             0
+        );
+    }
+
+    /// Regression test for freenet/river#446: hiding the tab must mark ONLY
+    /// the room the user was looking at as read. The previous behavior
+    /// (`mark_all_rooms_as_read`, since replaced) swept EVERY room's
+    /// `last_read_message_id` forward on every visible->hidden transition —
+    /// harmless on desktop, but on mobile a routine app-switch fires
+    /// `visibilitychange` constantly, silently erasing unread state for
+    /// rooms the user never opened.
+    ///
+    /// This exercises `room_to_mark_read_on_hide` — the pure function
+    /// `mark_current_room_as_read_on_hide` delegates its decision to — rather
+    /// than going through the `GlobalSignal`-backed wrapper directly, which
+    /// needs a live Dioxus runtime that a native `cargo test` doesn't provide
+    /// (confirmed: calling `mark_current_room_as_read_on_hide()` from a test
+    /// panics with "Must be called from inside a Dioxus runtime").
+    ///
+    /// It puts unread messages in a NON-current room, computes the hide
+    /// decision, and asserts it names ONLY the current room. Restoring the
+    /// old logic here — return one entry per room in `rooms`, ignoring
+    /// `current_owner_key` — makes this fail: the other room would appear in
+    /// the decision even though it was never the visible room.
+    #[test]
+    fn hiding_the_tab_only_marks_the_current_room_as_read() {
+        let (self_sk, _self_vk) = keypair();
+        let (current_owner_sk, current_owner_vk) = keypair();
+        let (other_owner_sk, other_owner_vk) = keypair();
+
+        // The room the user is actually looking at: unread messages present.
+        let current_messages = vec![
+            msg(&current_owner_sk, &current_owner_vk, 1),
+            msg(&current_owner_sk, &current_owner_vk, 2),
+        ];
+        let current_latest = current_messages.last().unwrap().id();
+        let current_room_data = room(
+            self_sk.clone(),
+            current_owner_vk,
+            current_messages,
+            None, // nothing marked read yet
+        );
+
+        // A DIFFERENT room the user never opened this session, also with
+        // unread messages — this is the room the old sweep incorrectly
+        // touched.
+        let other_messages = vec![msg(&other_owner_sk, &other_owner_vk, 1)];
+        let other_room_data = room(self_sk, other_owner_vk, other_messages, None);
+
+        let mut rooms = HashMap::new();
+        rooms.insert(current_owner_vk, current_room_data);
+        rooms.insert(other_owner_vk, other_room_data);
+
+        let update = room_to_mark_read_on_hide(&rooms, Some(current_owner_vk));
+
+        assert_eq!(
+            update,
+            Some((current_owner_vk, current_latest)),
+            "hiding the tab must mark the CURRENT room read up to its \
+             latest message, and nothing else"
+        );
+        assert_ne!(
+            update.map(|(owner, _)| owner),
+            Some(other_owner_vk),
+            "a room the user never opened must NOT be the one marked as \
+             read just because the tab was hidden (freenet/river#446)"
         );
     }
 }

@@ -2,9 +2,11 @@ import { test, expect, Page } from "@playwright/test";
 
 // Regression test for: when the tab loses focus, the title incorrectly shows
 // "(N) River - …" with a non-zero unread count even though the user was just
-// active on the page. The fix marks every room as read at the moment of the
-// visible -> hidden transition, so only messages arriving *after* that point
-// drive the unread badge.
+// active on the page. The fix marks the CURRENTLY VISIBLE room as read at the
+// moment of the visible -> hidden transition (freenet/river#446: sweeping
+// EVERY room, as an earlier fix did, silently erased unread state for rooms
+// the user never looked at). These tests carry no pre-existing unread
+// messages, so the room-scoped fix still leaves the title badge-free here.
 //
 // Reported by Ian Clarke, 2026-05-06.
 
