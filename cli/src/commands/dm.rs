@@ -1441,6 +1441,14 @@ mod tests {
     /// computes AND prints the escaped nickname in the human branch) so the
     /// human/json regions cannot be confused with the unrelated Human/Json
     /// arms of other `dm` subcommands elsewhere in this file.
+    ///
+    /// The plain `.find("mod tests")` cut below (rather than the
+    /// `production_source` brace-aware stripper used elsewhere in this repo)
+    /// is only equivalent to it because this file has exactly ONE
+    /// `#[cfg(test)] mod tests` block, at the very end, with no earlier
+    /// `#[cfg(test)]` item. If an earlier `#[cfg(test)]` item is ever added
+    /// above this point, this cut would stop excluding it and the pin could
+    /// silently start matching against test-only code.
     #[test]
     fn dm_list_escapes_nickname_for_human_and_keeps_json_raw() {
         let src = include_str!("dm.rs");

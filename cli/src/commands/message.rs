@@ -614,6 +614,14 @@ mod tests {
     /// list` (verified unique in production) so the human/json regions can't
     /// be confused with each other or with the unrelated Human/Json arms of
     /// the other `message` subcommands later in this file.
+    ///
+    /// The plain `.split_once("mod tests")` cut below (rather than the
+    /// `production_source` brace-aware stripper used elsewhere in this repo)
+    /// is only equivalent to it because this file has exactly ONE
+    /// `#[cfg(test)] mod tests` block, at the very end, with no earlier
+    /// `#[cfg(test)]` item. If an earlier `#[cfg(test)]` item is ever added
+    /// above this point, this cut would stop excluding it and the pin could
+    /// silently start matching against test-only code.
     #[test]
     fn message_list_escapes_nickname_for_human_and_keeps_json_raw() {
         let source = include_str!("message.rs");
