@@ -268,8 +268,14 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             // public content like join events, and — via
                             // `secrets` — decrypted private-room bodies; only a
                             // body whose secret is unavailable renders as
-                            // "<encrypted>")
-                            let content = crate::api::message_display_text_with_secrets(
+                            // "<encrypted>"). The `_for_terminal` variant also
+                            // escapes any `@mention` nickname substituted into
+                            // the text — a mentioned member's nickname is
+                            // attacker-controlled just like the author's
+                            // (freenet/river#474). The JSON arm below keeps its
+                            // own separate `message_display_text_with_secrets`
+                            // call and stays raw.
+                            let content = crate::api::message_display_text_for_terminal(
                                 &room_state,
                                 msg,
                                 &secrets,
