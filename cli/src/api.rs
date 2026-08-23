@@ -5167,8 +5167,8 @@ impl ApiClient {
 
                 // A message can itself `@mention` someone, and that mentioned
                 // member's nickname is attacker-controlled — a SEPARATE call
-                // from the shared `content` above (which the JSON arm below
-                // still uses raw), escaping only the substituted mention name
+                // from the JSON arm's own `content` below (which still uses
+                // the raw helper), escaping only the substituted mention name
                 // for this println (freenet/river#474).
                 let content_for_terminal =
                     message_display_text_for_terminal(room_state, msg, secrets);
