@@ -728,9 +728,13 @@ async fn execute_list(
             let mut peers: Vec<_> = by_peer.keys().copied().collect();
             peers.sort();
             for peer in peers {
+                // `nicknames` is shared with the JSON branch below (and stays
+                // raw there — JSON escaping already makes it safe); escape
+                // only for this terminal line.
                 let nickname = nicknames
                     .get(&peer)
                     .cloned()
+                    .map(|n| crate::deputies::display_nickname(&n))
                     .unwrap_or_else(|| short_member_id(&peer));
                 println!("--- DM thread with {} ({}) ---", nickname, peer);
                 let mut idx = 1usize;
@@ -1422,6 +1426,54 @@ fn format_unix_local(unix_secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dm list`'s counterparty nickname is attacker-controlled (any room
+    /// member sets their own) — freenet/river#474. The HUMAN thread-header
+    /// println must escape it via `display_nickname` (ANSI/CR/bell must not
+    /// reach the terminal), while the JSON arm's `counterparty_nickname` must
+    /// stay raw: escaping it there would corrupt the value for a bridge, since
+    /// JSON's own string escaping already makes it safe. Both read the same
+    /// shared `nicknames` lookup map, so the escaping has to happen at each
+    /// print site, not at the map's construction.
+    ///
+    /// Source-scrape rather than behavioural: this file has no stdout-capture
+    /// harness. Anchored on `for peer in peers {` (unique, the loop that
+    /// computes AND prints the escaped nickname in the human branch) so the
+    /// human/json regions cannot be confused with the unrelated Human/Json
+    /// arms of other `dm` subcommands elsewhere in this file.
+    #[test]
+    fn dm_list_escapes_nickname_for_human_and_keeps_json_raw() {
+        let src = include_str!("dm.rs");
+        let production = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let after_anchor = production
+            .split_once("for peer in peers {")
+            .map(|(_, after)| after)
+            .expect("loop anchor not found; the pin would scan nothing");
+        assert_eq!(
+            after_anchor.matches("OutputFormat::Json => {").count(),
+            1,
+            "split anchor must be unique past this point or the pin scrapes \
+             the wrong region"
+        );
+        let (human_region, json_region) = after_anchor
+            .split_once("OutputFormat::Json => {")
+            .expect("anchor not found; the pin would scan nothing");
+
+        assert!(
+            human_region.contains("display_nickname("),
+            "the dm list HUMAN branch must escape the counterparty nickname"
+        );
+        assert!(
+            json_region.contains("counterparty_nickname"),
+            "the dm list JSON branch must still emit the nickname field; \
+             the pin would pass vacuously otherwise"
+        );
+        assert!(
+            !json_region.contains("display_nickname("),
+            "the dm list JSON branch's nickname must stay raw — escaping it \
+             here would corrupt the value for a bridge/consumer"
+        );
+    }
 
     /// The DM send path must NOT carry a client-side per-pair cap guard.
     ///

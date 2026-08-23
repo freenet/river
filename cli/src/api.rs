@@ -1225,7 +1225,15 @@ pub(crate) fn reply_prefix_display(ctx: &ReplyContextDisplay) -> String {
         ReplyContextDisplay::Quote {
             author, preview, ..
         } => {
-            format!("[reply to {}: {}] ", author, preview)
+            // `author` is attacker-controlled (any member sets their own
+            // nickname) and is the FAITHFUL decoded value shared with
+            // `reply_to_json` — escape only here, at the terminal print site,
+            // never at the shared source. See `display_nickname`.
+            format!(
+                "[reply to {}: {}] ",
+                crate::deputies::display_nickname(author),
+                preview
+            )
         }
         // The quoted message could not be read back — its author was banned and
         // their messages purged, it was deleted, it aged out, or (for a private
@@ -4424,6 +4432,9 @@ impl ApiClient {
         // `ReplyContentV1.target_author_name` and PERSISTS it to contract state.
         // Without decrypting here, the reply's quoted author would read
         // "[Encrypted: N bytes, vN]" to every reader (including the UI) forever.
+        // Deliberately NOT run through `display_nickname`: this value is
+        // persisted, not printed, and escaping it would corrupt the stored
+        // author name for every future reader.
         let target_author_name = room_state
             .member_info
             .canonical(target_msg.message.author)
@@ -4889,6 +4900,11 @@ impl ApiClient {
                 let display_name = nickname
                     .clone()
                     .unwrap_or_else(|| author_str.chars().take(8).collect());
+                // Escaped only for this terminal line — `nickname` itself
+                // stays raw below because the JSON branch below serializes it
+                // faithfully (attacker-controlled nickname; JSON escaping
+                // already makes it safe there).
+                let display_name = crate::deputies::display_nickname(&display_name);
                 let reactions_str = reactions
                     .map(|r| {
                         if r.is_empty() {
@@ -4972,6 +4988,9 @@ impl ApiClient {
                 let display_name = nickname
                     .clone()
                     .unwrap_or_else(|| author_str.chars().take(8).collect());
+                // Escaped only for this terminal line — see the identical
+                // comment in `output_reaction_change`.
+                let display_name = crate::deputies::display_nickname(&display_name);
                 println!(
                     "[deleted] [{} - {}]: (message deleted)",
                     local_time.format("%H:%M:%S"),
@@ -5030,12 +5049,19 @@ impl ApiClient {
                 let author_str = msg.message.author.to_string();
                 let author_short = author_str.chars().take(8).collect::<String>();
 
-                // Get nickname if available (decrypted for a private room)
+                // Get nickname if available (decrypted for a private room).
+                // Escaped for this HUMAN-only println — the JSON branch below
+                // makes its own separate `unseal_nickname_display` call and
+                // stays raw (attacker-controlled nickname; JSON escaping
+                // already makes it safe there).
                 let nickname = room_state
                     .member_info
                     .canonical(msg.message.author)
                     .map(|info| {
-                        unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
+                        crate::deputies::display_nickname(&unseal_nickname_display(
+                            &info.member_info.preferred_nickname,
+                            secrets,
+                        ))
                     })
                     .unwrap_or(author_short);
 
@@ -9704,7 +9730,9 @@ mod mention_cli_tests {
             message_id: "42".to_string(),
             preview: "hello".to_string(),
         };
-        assert_eq!(reply_prefix_display(&quote), "[reply to Alice: hello] ");
+        // Escaped and quoted for the terminal (freenet/river#474) — see
+        // `display_nickname`. The JSON author below stays the bare string.
+        assert_eq!(reply_prefix_display(&quote), "[reply to \"Alice\": hello] ");
         assert_eq!(
             reply_to_json(&quote),
             Some(json!({
@@ -9724,6 +9752,45 @@ mod mention_cli_tests {
 
         assert_eq!(reply_prefix_display(&ReplyContextDisplay::NotAReply), "");
         assert_eq!(reply_to_json(&ReplyContextDisplay::NotAReply), None);
+    }
+
+    /// A member's nickname is attacker-controlled — any room member sets
+    /// their own — so a nickname carrying ANSI escapes, a bare CR, or a bell
+    /// must not reach the terminal unescaped (freenet/river#474): unescaped,
+    /// it can rewrite prior terminal output, hide/replace text via `\r`, or
+    /// beep. `reply_prefix_display` (the terminal path) must render it
+    /// escaped, while `reply_to_json` (the JSON/bridge path, and the same
+    /// value persisted into `ReplyContentV1`) must carry the BYTE-IDENTICAL
+    /// raw value: JSON's own string escaping already makes it safe there, and
+    /// escaping it a second time would corrupt the data for any consumer.
+    #[test]
+    fn reply_author_ansi_escapes_are_escaped_for_terminal_and_raw_in_json() {
+        let hostile = "\u{1b}[2J\rEve\u{7}";
+        let quote = ReplyContextDisplay::Quote {
+            author: hostile.to_string(),
+            author_id: "EVE123".to_string(),
+            message_id: "1".to_string(),
+            preview: "hi".to_string(),
+        };
+
+        let text = reply_prefix_display(&quote);
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\r') && !text.contains('\u{7}'),
+            "raw control bytes must not reach the terminal: {text:?}"
+        );
+        assert_eq!(
+            text,
+            format!(
+                "[reply to {}: hi] ",
+                crate::deputies::display_nickname(hostile)
+            )
+        );
+
+        let json = reply_to_json(&quote).unwrap();
+        assert_eq!(
+            json["author"], hostile,
+            "the JSON path must carry the raw nickname byte-for-byte"
+        );
     }
 }
 
@@ -10673,5 +10740,49 @@ pub(crate) fn unseal_nickname_display(",
     #[test]
     fn pin_accepts_the_unmutated_source() {
         assert!(membership_guard_violations(include_str!("api.rs")).is_empty());
+    }
+
+    /// `output_reaction_change`, `output_deletion`, and `output_message` each
+    /// resolve a member's nickname (attacker-controlled — any room member sets
+    /// their own, freenet/river#474) and print it to BOTH a human terminal
+    /// line and a JSON field. The human line must escape it via
+    /// `display_nickname`; the JSON field must stay raw (JSON's own string
+    /// escaping already makes it safe there, and escaping it again would
+    /// corrupt the value for a bridge/consumer). Reuses `production_source`
+    /// (defined above in this module) so `#[cfg(test)]` content — including
+    /// this test's own literals — cannot satisfy the counts.
+    #[test]
+    fn terminal_nickname_sites_escape_human_output_and_leave_json_raw() {
+        let p = production_source(include_str!("api.rs"));
+        assert!(p.problems.is_empty(), "{:?}", p.problems);
+        let src = &p.source;
+
+        // `output_reaction_change` and `output_deletion` share the same
+        // shape: escape a *derived* `display_name`, never the shared
+        // `nickname` variable the JSON arm also reads.
+        assert_eq!(
+            src.matches("let display_name = crate::deputies::display_nickname(&display_name);")
+                .count(),
+            2,
+            "expected exactly one escaped human display_name in each of \
+             output_reaction_change and output_deletion"
+        );
+        // `output_message`'s human branch makes its own separate
+        // `unseal_nickname_display` call (distinct from the JSON branch's),
+        // so it can be escaped inline.
+        assert_eq!(
+            src.matches("crate::deputies::display_nickname(&unseal_nickname_display(")
+                .count(),
+            1,
+            "expected output_message's human branch to escape its own nickname call"
+        );
+        // All three JSON arms must still emit the nickname UNescaped.
+        assert_eq!(
+            src.matches("\"nickname\": nickname,").count(),
+            3,
+            "expected output_reaction_change, output_deletion, and \
+             output_message to each emit the nickname raw in their JSON arm; \
+             the pin would pass vacuously if this drifted to 0"
+        );
     }
 }
