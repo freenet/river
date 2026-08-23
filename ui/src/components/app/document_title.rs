@@ -749,10 +749,13 @@ pub fn mark_current_room_as_read() {
 ///
 /// Pulled out as a pure function so the freenet/river#446 fix boundary is
 /// directly testable without a Dioxus runtime: this is the ONE place that
-/// decides which room(s) get marked read on hide. The old
-/// `mark_all_rooms_as_read` inlined the equivalent of "return one entry per
-/// room in `rooms`" here; reintroducing that is exactly what
-/// `hiding_the_tab_only_marks_the_current_room_as_read` exists to catch.
+/// decides which room(s) get marked read on hide. `mark`'s return type,
+/// `Option<(VerifyingKey, MessageId)>`, structurally forecloses the old
+/// `mark_all_rooms_as_read` bug (returning one entry per room in `rooms`) —
+/// a caller can destructure only a single room, not a sweep. What
+/// `hiding_the_tab_only_marks_the_current_room_as_read` pins is the weaker,
+/// still-real claim the type doesn't cover: that the ONE room this function
+/// names is the CURRENT one, not some other room chosen by accident.
 fn room_to_mark_read_on_hide(
     rooms: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
     current_owner_key: Option<ed25519_dalek::VerifyingKey>,
@@ -771,18 +774,52 @@ fn room_to_mark_read_on_hide(
     Some((owner_key, latest))
 }
 
-/// Mark ONLY the currently-visible room as read, up to its latest
-/// currently-known message.
+/// The two independent outcomes of a visible->hidden `visibilitychange`.
+#[derive(Debug, PartialEq, Eq)]
+struct HideActions {
+    /// Which room (if any) to mark read — see [`room_to_mark_read_on_hide`].
+    mark: Option<(ed25519_dalek::VerifyingKey, MessageId)>,
+    /// Whether to flush pending room saves through the delegate.
+    flush: bool,
+}
+
+/// Decide what a visible->hidden transition should do.
 ///
-/// Called when the tab transitions from visible to hidden. This used to mark
-/// EVERY room as read (`mark_all_rooms_as_read`, since replaced) on the theory
-/// that the user "had the chance to see" anything already in state. That
-/// reasoning only holds for the room actually on screen — a
+/// `mark` and `flush` are DELIBERATELY independent — `flush` is NOT "mark is
+/// `Some`". `flush_rooms_to_delegate()` (freenet/river#533) sweeps EVERY
+/// room's pending debounced save, not just the current room's: a room the
+/// user read moments ago (its `last_read_message_id` update still sitting
+/// inside `ROOM_SNAPSHOT_MIN_INTERVAL_MS`'s debounce window) can be a
+/// DIFFERENT room than whichever is current when the tab backgrounds. An
+/// earlier draft of this fix flushed only when `room_to_mark_read_on_hide`
+/// returned `Some`, which reintroduced #533 for exactly that case: current
+/// room already read -> no mark -> no flush -> the other room's pending save
+/// is lost if the tab closes before the debounce window closes on its own.
+/// `hiding_the_tab_always_flushes_even_when_nothing_to_mark` pins that this
+/// can't happen again.
+fn hide_actions(
+    rooms: &std::collections::HashMap<ed25519_dalek::VerifyingKey, crate::room_data::RoomData>,
+    current_owner_key: Option<ed25519_dalek::VerifyingKey>,
+) -> HideActions {
+    HideActions {
+        mark: room_to_mark_read_on_hide(rooms, current_owner_key),
+        flush: true,
+    }
+}
+
+/// Mark ONLY the currently-visible room as read, up to its latest
+/// currently-known message, and flush pending room saves.
+///
+/// Called when the tab transitions from visible to hidden. Marking used to
+/// sweep EVERY room as read (`mark_all_rooms_as_read`, since replaced) on the
+/// theory that the user "had the chance to see" anything already in state.
+/// That reasoning only holds for the room actually on screen — a
 /// `visibilitychange` fires just as readily from a routine mobile
 /// app-switch, which silently swept every OTHER room's unread state to zero
 /// even though the user never looked at them (freenet/river#446). Only the
 /// foregrounded room is marked; every other room's `last_read_message_id` is
-/// left untouched so its unread count survives the backgrounding.
+/// left untouched so its unread count survives the backgrounding. See
+/// [`hide_actions`] for why the flush stays unconditional despite that.
 ///
 /// Note this changes the hidden-tab title badge's meaning: it used to show
 /// only messages that arrived *after* the hide (because everything else had
@@ -792,16 +829,16 @@ fn room_to_mark_read_on_hide(
 pub fn mark_current_room_as_read_on_hide() {
     let current_owner_key = CURRENT_ROOM.read().owner_key;
 
-    let update = {
+    let actions = {
         let Ok(rooms) = ROOMS.try_read() else {
             return;
         };
-        room_to_mark_read_on_hide(&rooms.map, current_owner_key)
+        hide_actions(&rooms.map, current_owner_key)
     };
 
-    let Some((owner_key, new_last_read_id)) = update else {
+    if actions.mark.is_none() && !actions.flush {
         return;
-    };
+    }
 
     // Defer the signal mutation: this function fires from the raw
     // `visibilitychange` JS event callback, which has no Dioxus scope on the
@@ -809,25 +846,31 @@ pub fn mark_current_room_as_read_on_hide() {
     // subscriber notifications can find a current scope, and breaks the call
     // stack so no other RefCell borrows are active when subscribers re-read.
     crate::util::defer(move || {
-        ROOMS.with_mut(|rooms| {
-            if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                room_data.last_read_message_id = Some(new_last_read_id);
-            }
-        });
+        if let Some((owner_key, new_last_read_id)) = actions.mark {
+            ROOMS.with_mut(|rooms| {
+                if let Some(room_data) = rooms.map.get_mut(&owner_key) {
+                    room_data.last_read_message_id = Some(new_last_read_id);
+                }
+            });
 
-        info!("Marked current room as read on tab hide");
+            info!("Marked current room as read on tab hide");
+        }
 
-        // FLUSH, not a plain save (freenet/river#533). The tab is going away,
-        // and an ordinary save may defer a cache-only change for up to
-        // ROOM_SNAPSHOT_MIN_INTERVAL_MS. For a quiet room the next change might
-        // never come, which would strand both the room-state snapshot and the
-        // `last_read_message_id` we just advanced — the user would come back to
-        // a stale unread badge. Flushing here bypasses the debounce.
-        crate::util::safe_spawn_local(async {
-            if let Err(e) = flush_rooms_to_delegate().await {
-                warn!("Failed to save room after marking as read on hide: {}", e);
-            }
-        });
+        if actions.flush {
+            // FLUSH, not a plain save (freenet/river#533). The tab is going
+            // away, and an ordinary save may defer a cache-only change for up
+            // to ROOM_SNAPSHOT_MIN_INTERVAL_MS. For a quiet room the next
+            // change might never come, which would strand both the
+            // room-state snapshot and any `last_read_message_id` update
+            // still pending (possibly for a DIFFERENT room than the current
+            // one — see `hide_actions`) — the user would come back to a
+            // stale unread badge. Flushing here bypasses the debounce.
+            crate::util::safe_spawn_local(async {
+                if let Err(e) = flush_rooms_to_delegate().await {
+                    warn!("Failed to flush rooms on tab hide: {}", e);
+                }
+            });
+        }
     });
 }
 
@@ -2116,16 +2159,24 @@ mod tests {
     /// (confirmed: calling `mark_current_room_as_read_on_hide()` from a test
     /// panics with "Must be called from inside a Dioxus runtime").
     ///
-    /// It puts unread messages in a NON-current room, computes the hide
-    /// decision, and asserts it names ONLY the current room. Restoring the
-    /// old logic here — return one entry per room in `rooms`, ignoring
-    /// `current_owner_key` — makes this fail: the other room would appear in
-    /// the decision even though it was never the visible room.
+    /// It puts unread messages in THREE non-current rooms plus the current
+    /// one, and asserts the decision names only the current room. The
+    /// function's return type, `Option<(VerifyingKey, MessageId)>`,
+    /// structurally forecloses the old "one entry per room" sweep — a `Vec`
+    /// swap wouldn't even compile against the caller's single destructure.
+    /// What this test pins is the weaker, still-real claim the type doesn't
+    /// cover: that the ONE room chosen is the current one, not some other
+    /// room picked by accident (e.g. "first entry in the map" — three OTHER
+    /// rooms, not one, keep that particular mistake from passing by luck of
+    /// `HashMap` iteration order: with only 2 rooms total a reviewer measured
+    /// a "return an arbitrary room" mutant passing 2/5 runs).
     #[test]
     fn hiding_the_tab_only_marks_the_current_room_as_read() {
         let (self_sk, _self_vk) = keypair();
         let (current_owner_sk, current_owner_vk) = keypair();
-        let (other_owner_sk, other_owner_vk) = keypair();
+        let (other_owner_sk_a, other_owner_vk_a) = keypair();
+        let (other_owner_sk_b, other_owner_vk_b) = keypair();
+        let (other_owner_sk_c, other_owner_vk_c) = keypair();
 
         // The room the user is actually looking at: unread messages present.
         let current_messages = vec![
@@ -2140,15 +2191,19 @@ mod tests {
             None, // nothing marked read yet
         );
 
-        // A DIFFERENT room the user never opened this session, also with
-        // unread messages — this is the room the old sweep incorrectly
+        // THREE different rooms the user never opened this session, all with
+        // unread messages — these are the rooms the old sweep incorrectly
         // touched.
-        let other_messages = vec![msg(&other_owner_sk, &other_owner_vk, 1)];
-        let other_room_data = room(self_sk, other_owner_vk, other_messages, None);
-
         let mut rooms = HashMap::new();
         rooms.insert(current_owner_vk, current_room_data);
-        rooms.insert(other_owner_vk, other_room_data);
+        for (sk, vk) in [
+            (&other_owner_sk_a, other_owner_vk_a),
+            (&other_owner_sk_b, other_owner_vk_b),
+            (&other_owner_sk_c, other_owner_vk_c),
+        ] {
+            let messages = vec![msg(sk, &vk, 1)];
+            rooms.insert(vk, room(self_sk.clone(), vk, messages, None));
+        }
 
         let update = room_to_mark_read_on_hide(&rooms, Some(current_owner_vk));
 
@@ -2158,11 +2213,47 @@ mod tests {
             "hiding the tab must mark the CURRENT room read up to its \
              latest message, and nothing else"
         );
-        assert_ne!(
-            update.map(|(owner, _)| owner),
-            Some(other_owner_vk),
-            "a room the user never opened must NOT be the one marked as \
-             read just because the tab was hidden (freenet/river#446)"
+        for other in [other_owner_vk_a, other_owner_vk_b, other_owner_vk_c] {
+            assert_ne!(
+                update.as_ref().map(|(owner, _)| *owner),
+                Some(other),
+                "a room the user never opened must NOT be the one marked as \
+                 read just because the tab was hidden (freenet/river#446)"
+            );
+        }
+    }
+
+    /// Regression test for a review finding on the freenet/river#446 fix
+    /// (PR #632): the flush that bypasses the save debounce (freenet/river#533)
+    /// must NOT be gated on whether the CURRENT room needed a read-state
+    /// update. See [`hide_actions`]'s doc for the failure this guards
+    /// against: a DIFFERENT room's pending debounced save silently dropped
+    /// because the current room happened to already be fully read.
+    #[test]
+    fn hiding_the_tab_always_flushes_even_when_nothing_to_mark() {
+        let (self_sk, _self_vk) = keypair();
+        let (current_owner_sk, current_owner_vk) = keypair();
+
+        // The current room is ALREADY fully read -> `room_to_mark_read_on_hide`
+        // returns `None` for it.
+        let messages = vec![msg(&current_owner_sk, &current_owner_vk, 1)];
+        let latest = messages.last().unwrap().id();
+        let current_room_data = room(self_sk, current_owner_vk, messages, Some(latest));
+
+        let mut rooms = HashMap::new();
+        rooms.insert(current_owner_vk, current_room_data);
+
+        let actions = hide_actions(&rooms, Some(current_owner_vk));
+
+        assert_eq!(
+            actions.mark, None,
+            "the current room is already read, so nothing should be marked"
+        );
+        assert!(
+            actions.flush,
+            "the flush must fire regardless of whether the current room \
+             needed marking (freenet/river#533) — a DIFFERENT room may have \
+             a pending debounced save that would otherwise be lost"
         );
     }
 }
