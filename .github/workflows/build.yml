@@ -278,6 +278,30 @@ jobs:
       # tool and the verifying contract agree on the parameter encoding.
       run: cargo test -p web-container-contract -p web-container-tool
 
+    - name: Test web-container publish decisions
+      # The publish path cannot be rehearsed in CI — it needs a live network,
+      # and testing against the shared production contract is out of bounds. So
+      # the decisions it turns on (which version to sign at, whether an
+      # unreadable network may be published over, whether a publish actually
+      # landed) live in scripts/web-container-publish-lib.sh with no I/O in
+      # them, and this runs every branch with stubbed inputs. Without this step
+      # the file would be exactly the "tests nothing ever runs" shape the
+      # coverage guard above exists to prevent, just outside Cargo's reach.
+      run: ./scripts/tests/web-container-publish-lib-test.sh
+
+    - name: Rehearse the web-container publish against a stub node
+      env:
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Runs the REAL publish script and the REAL web-container-tool against a
+      # throwaway repo layout, a throwaway signing key and an `fdev` that is a
+      # shell script — including the 2026-08-04 shape (a publish that reports a
+      # timeout and lands anyway). This is the only coverage of the wiring:
+      # fdev argument order, the `Contract not found` string absence is keyed
+      # off, the `version=` line the script parses, and whether the verdict
+      # comes from the read-back rather than the exit code. It never touches
+      # the network or the production key.
+      run: ./scripts/tests/web-container-publish-rehearsal.sh
+
   ui-playwright-tests:
     # Ubicloud, NOT a GitHub-hosted larger runner -- see the `build` job above.
     runs-on: ubicloud-standard-8

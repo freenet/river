@@ -179,9 +179,25 @@ cargo make publish-river                    # Publish UI release build to Freene
 The web container contract requires signed metadata with a version
 number strictly higher than the current published version. The version
 is tracked by a committed counter at
-`published-contract/contract-version.txt`; `cargo make sign-webapp`
-increments it. Commit the bumped counter alongside other publish
+`published-contract/contract-version.txt`, but the counter is bookkeeping,
+not the authority: `scripts/publish-web-container.sh` READS the version on
+the network before signing and signs at `max(counter, network) + 1`, then
+re-reads after publishing and compares the archive byte for byte before
+declaring success. Commit the bumped counter alongside other publish
 artifacts.
+
+Two things that follow from that, and matter if a publish goes wrong:
+
+- **`fdev`'s exit code decides nothing.** A publish at an already-used
+  version is a no-op *success*, and a publish that reports a timeout may
+  have landed anyway. Read the script's verdict block, not the exit status
+  of the publish inside it.
+- **Never retry a publish by re-signing at the same version, and never roll
+  the counter back.** The counter is forward-only on purpose; gaps are fine
+  (the contract enforces monotonicity, not contiguity). Reissuing a version
+  that may already be in use forked the site on 2026-08-04 — two validly
+  signed archives at version 30000377, which the update gate cannot converge
+  and anti-entropy cannot even see.
 
 **Contract ID:** `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`
 

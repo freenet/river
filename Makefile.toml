@@ -200,50 +200,29 @@ tar -cJf ../../../../../webapp/webapp.tar.xz *
 '''
 
 [tasks.sign-webapp]
-description = "Sign the compressed webapp"
+# The version counter committed at published-contract/contract-version.txt is
+# still the local bookkeeping (the previous `seconds/60` timestamp scheme was
+# abandoned after the 2026-05-16 incident: the on-network version had drifted
+# to 30000208 while the timestamp gave 29649402, so publishes were rejected
+# with no way to catch up). What changed is that the counter is no longer
+# TRUSTED. The version signed here is
+#
+#     max(local counter, version currently on the network) + 1
+#
+# with the on-network version READ from the network and verified under our own
+# contract parameters before signing. It is also forward-only — nothing rolls
+# the counter back any more, because the rollback is what caused the 2026-08-04
+# fork (River commit 1032d373): a timed-out publish that had actually landed
+# was rolled back, and the retry re-signed a DIFFERENT archive at the same
+# version. Two states at one version never converge.
+#
+# All of it, including the flock the old comment here asked for and nothing
+# ever added, lives in scripts/publish-web-container.sh. Read that file's
+# header before changing any of this.
+description = "Sign the compressed webapp at a version proven to be above the network's"
 dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
 script = '''
-# Bump the version counter committed at published-contract/contract-version.txt
-# and use that as the metadata version. The previous `seconds/60` timestamp
-# scheme was fragile — if any past publish ever ran with a clock skewed
-# ahead (or someone hand-bumped to a future round number), the on-network
-# version is stuck ahead and the timestamp-derived value can't catch up
-# without manual intervention. 2026-05-16 incident: the on-network version
-# was 30000208 while the timestamp gave 29649402, so the publish was
-# rejected.
-#
-# Counter lifecycle:
-# 1. `sign-webapp` here writes a `.prev-version` snapshot BEFORE bumping
-#    the counter file, so a downstream `publish-river` failure can roll
-#    back atomically (see [tasks.publish-river]'s `on-failure` arm).
-# 2. The counter file is bumped to `current+1` and the new metadata is
-#    signed with that value.
-# 3. After a successful `fdev publish`, the caller commits the bumped
-#    counter file (the snapshot is left for the publish task to clean
-#    up). Skeptical-review (#258) flagged that bumping before publish
-#    risks leaving the local file ahead of on-network if publish fails;
-#    the .prev-version snapshot + rollback closes that window.
-#
-# Locking: this script is NOT safe under two parallel `publish-river`
-# runs on the same workstation — they would race the read-modify-write.
-# Wrap in `flock` if you need that:
-#     flock published-contract/contract-version.txt cargo make publish-river
-version_file="published-contract/contract-version.txt"
-prev_snapshot="$version_file.prev"
-if [ ! -f "$version_file" ]; then
-    echo "ERROR: $version_file missing. Seed it with the current on-network version."
-    exit 1
-fi
-current=$(cat "$version_file" | tr -d '[:space:]')
-version=$((current + 1))
-cp "$version_file" "$prev_snapshot"
-echo "$version" > "$version_file"
-echo "Web-container version: $current -> $version (commit $version_file after a successful publish)"
-target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool sign \
-  --input target/webapp/webapp.tar.xz \
-  --output target/webapp/webapp.metadata \
-  --parameters target/webapp/webapp.parameters \
-  --version $version
+exec ./scripts/publish-web-container.sh --sign-only
 '''
 
 [tasks.build-ui-example]
@@ -328,9 +307,21 @@ cd ui/tests && npm install && npx playwright install --with-deps chromium firefo
 '''
 
 [tasks.update-published-contract]
-description = "Build, publish, and update the published contract files"
-dependencies = ["sign-webapp"]
+description = "Refresh published-contract/ (wasm, parameters, contract id)"
+# This needs the PARAMETERS (the 32-byte verifying key), not a signature, so it
+# uses `export-parameters` rather than depending on `sign-webapp`. It used to
+# depend on `sign-webapp`, which meant refreshing the committed contract files
+# silently burned a version counter value it never published — one of the
+# sources of the gaps visible in the counter's history. Since sign-webapp now
+# also reads the network before signing, that dependency would additionally
+# have made this task need a reachable node for no reason.
+dependencies = ["build-web-container", "build-web-container-tool"]
 script = '''
+set -e
+mkdir -p target/webapp
+target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool export-parameters \
+  --parameters target/webapp/webapp.parameters
+
 # Get the contract ID without publishing
 contract_id=$(fdev get-contract-id \
   --code target/wasm32-unknown-unknown/release/web_container_contract.wasm \
@@ -362,68 +353,25 @@ echo "Please commit the changes to git"
 # from main after the merge. Migration entries carry OUR users forward; the
 # pointer tells everyone ELSE where the artifact went. Same trigger, two
 # different sets of people who lose if it is skipped.
-description = "Publish River to Freenet using the committed contract version"
-dependencies = ["sign-webapp"]
+#
+# The sign-publish-verify sequence lives in scripts/publish-web-container.sh so
+# it can hold ONE lock across the whole thing and re-read the network after the
+# publish. `dependencies` deliberately no longer names `sign-webapp`: signing
+# happens inside that script, under the same lock as the publish, because the
+# gap between "sign at version N" and "publish version N" is where the
+# 2026-08-04 fork lived.
+description = "Publish River to Freenet, verifying the result against the network"
+dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
 script = '''
-if [ ! -f "published-contract/contract-id.txt" ]; then
-    echo "No published contract found"
-    exit 1
-fi
-contract_id=$(cat published-contract/contract-id.txt)
-echo "Publishing using committed contract: $contract_id"
-version_file="published-contract/contract-version.txt"
-prev_snapshot="$version_file.prev"
-if fdev network publish \
-  --code published-contract/web_container_contract.wasm \
-  --parameters published-contract/webapp.parameters \
-  contract \
-  --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata; then
-    # Publish succeeded — the bumped counter file is the new truth.
-    # Discard the snapshot. Caller must commit $version_file.
-    rm -f "$prev_snapshot"
-    echo "Publish OK. Remember to commit $version_file."
-else
-    rc=$?
-    # Publish failed — roll the counter back so subsequent retries
-    # don't accumulate a drift. The on-network version is unchanged,
-    # and our local counter is now matched to it again.
-    if [ -f "$prev_snapshot" ]; then
-        mv "$prev_snapshot" "$version_file"
-        echo "Publish failed (exit $rc); rolled $version_file back to its pre-publish value." >&2
-    fi
-    exit $rc
-fi
+exec ./scripts/publish-web-container.sh
 '''
 
 [tasks.publish-river-debug]
 description = "Publish River to Freenet in debug mode"
 env = { BUILD_PROFILE = "dev" }
-dependencies = ["sign-webapp"]
+dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
 script = '''
-if [ ! -f "published-contract/contract-id.txt" ]; then
-    echo "No published contract found"
-    exit 1
-fi
-contract_id=$(cat published-contract/contract-id.txt)
-echo "Publishing using committed contract in debug mode: $contract_id"
-version_file="published-contract/contract-version.txt"
-prev_snapshot="$version_file.prev"
-if fdev network publish \
-  --code published-contract/web_container_contract.wasm \
-  --parameters published-contract/webapp.parameters \
-  contract \
-  --webapp-archive target/webapp/webapp.tar.xz \
-  --webapp-metadata target/webapp/webapp.metadata; then
-    rm -f "$prev_snapshot"
-else
-    rc=$?
-    if [ -f "$prev_snapshot" ]; then
-        mv "$prev_snapshot" "$version_file"
-        echo "Publish failed (exit $rc); rolled $version_file back to its pre-publish value." >&2
-    fi
-    exit $rc
-fi
+exec ./scripts/publish-web-container.sh
 '''
 
 # Test publishing tasks - use separate keypair to avoid affecting production
@@ -550,6 +498,13 @@ fi
 # as the production publish (see [tasks.sign-webapp] for the 2026-05-16
 # incident). Test contract counter is NOT committed since the test
 # contract ID is regenerated freely.
+#
+# NOTE: this still uses the bump-then-roll-back scheme the PRODUCTION path
+# dropped, because rolling the counter back after a publish that had actually
+# landed is what forked the site on 2026-08-04. It is left here deliberately:
+# the test contract is throwaway, so a fork of it costs nothing, and nobody
+# reads it. Do NOT copy this pattern back to the production path — see
+# scripts/publish-web-container.sh.
 # .prev snapshot is captured here for the publish task to roll back on
 # failure — same pattern as the production sign/publish flow.
 version_file="test-contract/contract-version.txt"
@@ -659,30 +614,33 @@ echo "========================================="
 echo ""
 
 # Step 1: Build and publish River UI
-echo "▶ Step 1/5: Building River UI..."
-cargo make compress-webapp
-cargo make sign-webapp
-
-echo ""
-echo "▶ Step 2/5: Publishing River UI to Freenet..."
+#
+# One `cargo make publish-river`, not compress + sign + publish. Those two
+# extra lines used to be here and each ran in its OWN cargo-make process, so
+# `publish-river` re-ran them as dependencies: the UI was built twice and the
+# version counter was bumped TWICE for a single publish, while the rollback
+# snapshot was overwritten so a failure rolled back only one of the bumps.
+# That is where the gaps in the counter's history came from. `publish-river`
+# already depends on the build, and now does the signing itself.
+echo "▶ Step 1/4: Building and publishing River UI to Freenet..."
 cargo make publish-river
 
 # Step 2: Bump riverctl version
 echo ""
-echo "▶ Step 3/5: Bumping riverctl version..."
+echo "▶ Step 2/4: Bumping riverctl version..."
 cargo make bump-cli-version
 
 NEW_VERSION=$(grep '^version' cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 
 # Step 3: Commit the version bump
 echo ""
-echo "▶ Step 4/5: Committing version bump..."
+echo "▶ Step 3/4: Committing version bump..."
 git add cli/Cargo.toml
 git commit -m "chore: bump riverctl to v${NEW_VERSION} (WASM sync)"
 
 # Step 4: Publish to crates.io
 echo ""
-echo "▶ Step 5/5: Publishing riverctl v${NEW_VERSION} to crates.io..."
+echo "▶ Step 4/4: Publishing riverctl v${NEW_VERSION} to crates.io..."
 cd cli
 cargo publish
 cd ..

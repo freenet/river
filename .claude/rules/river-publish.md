@@ -81,17 +81,21 @@ cargo fmt
 ```bash
 git add legacy_delegates.toml ui/public/contracts/ cli/contracts/
 git commit -m "fix: <description> with delegate migration"
-cargo make build
-cargo make compress-webapp
-cargo make publish-river  # bumps published-contract/contract-version.txt
+cargo make publish-river  # builds, signs, publishes, and verifies the result
 ```
+
+`publish-river` owns the whole sequence in one process, under one lock. Do NOT
+run `cargo make compress-webapp` or `cargo make sign-webapp` beforehand: each is
+a separate `cargo make` process, so `publish-river` re-runs them as
+dependencies — rebuilding the UI (which is not reproducible, so the archive
+changes) and advancing the version counter a second time for a single publish.
+That is where the gaps in the counter's history came from.
 
 ### Step 6: Commit the version bump, verify, and push
 
 ```bash
-# `cargo make sign-webapp` (run transitively by publish-river) incremented
-# the counter. Commit it together with whatever other changes the publish
-# included.
+# The publish advanced published-contract/contract-version.txt. Commit it
+# together with whatever other changes the publish included.
 git add published-contract/contract-version.txt
 git commit -m "chore: bump web-container version after publish"
 curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | head -5
@@ -116,7 +120,11 @@ and verifies it. Do not accept "the PUT returned OK": a publish at an
 already-used version is a no-op *success*, so the network will never tell you
 it was ignored.
 
-**Version policy:** the canonical source is `published-contract/contract-version.txt`, which `cargo make sign-webapp` increments and writes back each publish. NEVER base the version on wall-clock time (`date +%s / 60`) — the previous scheme bit us 2026-05-16 when the on-network version had drifted ahead of the timestamp-derived value. The counter file makes the version a strict monotonic local invariant; gaps are fine (the contract enforces monotonicity, not contiguity).
+**Version policy:** the counter at `published-contract/contract-version.txt` is local bookkeeping; the authority is the version **on the network**. `scripts/publish-web-container.sh` (which `cargo make publish-river` and `cargo make sign-webapp` both run) reads that version, verifies it under our own contract parameters, and signs at `max(counter, network) + 1`. NEVER base the version on wall-clock time (`date +%s / 60`) — that scheme bit us 2026-05-16 when the on-network version had drifted ahead of the timestamp-derived value. Gaps are fine (the contract enforces monotonicity, not contiguity).
+
+**Never reissue a version, and never roll the counter back.** 2026-08-04 (commit `1032d373`): a publish of version 30000377 reported `put timed out after 1 peer attempt(s)`, the counter was rolled back, and the retry rebuilt the UI — a *different* archive, because the build is not reproducible — signed it 30000377 again, and published it. The first PUT had landed. Two validly signed archives now existed at one version, and they do not converge: `update_state` rejects `version <= current` in **both** directions, and `summarize_state` emits only the u32 version, so anti-entropy between two split peers sees matching summaries and never heals. The second archive spreads because a peer new to the contract takes the initial-state bypass, which runs `validate_state` only. River self-heals at the next successful publish, so exposure is one release cycle — bounded, not harmless.
+
+The counter is therefore forward-only, and the publish script re-reads the state after publishing rather than trusting `fdev`'s exit code (a publish at an already-used version is a no-op *success*; a publish that reports a timeout may have landed). If a publish reports failure, **read the verdict block** — if it says PUBLISHED despite a non-zero fdev exit, do not retry.
 
 ## Two independent release surfaces
 

@@ -27,9 +27,14 @@ River is a decentralized chat application built on Freenet with the following ke
 ## Deployment Process
 
 1. **Build the UI:** `cargo make build-ui`
-2. **Compress the webapp:** `cargo make compress-webapp`
-3. **Sign the webapp:** `cargo make sign-webapp`
-4. **Publish to Freenet:** `cargo make publish-river`
+2. **Publish to Freenet:** `cargo make publish-river`
+
+`publish-river` builds, compresses, signs and publishes in one process, then
+reads the state back off the network to check it actually landed. Do not run
+`cargo make sign-webapp` first: it is a separate `cargo make` process, so
+`publish-river` would build and sign a second time, and the version counter
+would advance twice for one publish. The full workflow, including the
+delegate-migration coupling, is in `.claude/rules/river-publish.md`.
 
 ## Testing Challenges
 

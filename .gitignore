@@ -48,11 +48,16 @@ ui/tests/test-results/
 # Manual e2e test screenshots (see #244 review feedback)
 /dm-*.png
 
-# Web-container version-counter rollback snapshot. Created by
-# `cargo make sign-webapp` BEFORE bumping the counter; removed on
-# successful publish, or moved back over the counter on failure.
-# Should never appear in commits.
+# Web-container version-counter rollback snapshot. No longer written — the
+# counter is forward-only now, because rolling it back after a publish that had
+# actually landed is what forked the site on 2026-08-04 (see
+# scripts/publish-web-container.sh). Kept ignored so a stale one left over from
+# an older checkout cannot be committed by accident.
 /published-contract/contract-version.txt.prev
+
+# Single-writer lock for the web-container publish. Two concurrent publishes
+# race the version counter.
+/published-contract/.publish.lock
 
 # Syncthing in-flight transfer files (`.syncthing.<name>.tmp` are
 # created by the syncthing daemon while a file is being received).

@@ -32,9 +32,10 @@
 #   CI fails, which is the intended outcome and not a bug in the gate.
 #
 #   `version` is a monotonic counter per record, gating the network update. It
-#   must strictly increase on every publish. Like
-#   `published-contract/contract-version.txt`, it is NOT safe under two parallel
-#   publishes on one workstation — wrap in `flock` if you need that.
+#   must strictly increase on every publish, and it is NOT safe under two
+#   parallel publishes on one workstation — wrap in `flock` if you need that.
+#   (`published-contract/contract-version.txt` used to carry the same caveat;
+#   scripts/publish-web-container.sh now takes that lock itself.)
 
 # The author identity. Also published in FREENET.md, and the gate checks the two
 # agree: an integrator takes this value from FREENET.md, so if the two ever
