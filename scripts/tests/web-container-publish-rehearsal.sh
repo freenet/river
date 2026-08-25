@@ -26,13 +26,17 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 not available"; exit 0; }
 
 # ------------------------------------------------------------------- the tool
+
+# CI sets CARGO_TARGET_DIR, so the binary is not necessarily under
+# $REPO_ROOT/target. Look where cargo will actually have put it.
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 TOOL_SRC="${RIVER_WC_TOOL:-}"
 if [ -z "$TOOL_SRC" ]; then
     for candidate in \
-        "$REPO_ROOT/target/native/x86_64-unknown-linux-gnu/release/web-container-tool" \
-        "$REPO_ROOT/target/native/x86_64-unknown-linux-gnu/debug/web-container-tool" \
-        "$REPO_ROOT/target/release/web-container-tool" \
-        "$REPO_ROOT/target/debug/web-container-tool"
+        "$TARGET_DIR/native/x86_64-unknown-linux-gnu/release/web-container-tool" \
+        "$TARGET_DIR/native/x86_64-unknown-linux-gnu/debug/web-container-tool" \
+        "$TARGET_DIR/release/web-container-tool" \
+        "$TARGET_DIR/debug/web-container-tool"
     do
         [ -x "$candidate" ] && { TOOL_SRC="$candidate"; break; }
     done
@@ -41,7 +45,7 @@ if [ -z "$TOOL_SRC" ]; then
     echo "building web-container-tool..."
     (cd "$REPO_ROOT" && cargo build -p web-container-tool) || {
         echo "FAIL: could not build web-container-tool"; exit 1; }
-    TOOL_SRC="$REPO_ROOT/target/debug/web-container-tool"
+    TOOL_SRC="$TARGET_DIR/debug/web-container-tool"
 fi
 [ -x "$TOOL_SRC" ] || { echo "FAIL: no web-container-tool at $TOOL_SRC"; exit 1; }
 
