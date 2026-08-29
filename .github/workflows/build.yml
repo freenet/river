@@ -278,6 +278,16 @@ jobs:
       # tool and the verifying contract agree on the parameter encoding.
       run: cargo test -p web-container-contract -p web-container-tool
 
+    - name: Test publish guards (forward-only counter + read-back)
+      # The publish path is shell inside cargo-make script blocks, so its
+      # tests are shell too. This asserts that no publish task rolls the
+      # web-container version counter back on a failed publish -- the step
+      # that handed a retry an already-used version and forked the site on
+      # 2026-08-04 -- and that the post-publish read-back classifies what the
+      # network answered without ever failing the publish. A guard no job runs
+      # is a guard that passes by default (freenet/river#614).
+      run: ./scripts/tests/publish-guards-test.sh
+
   ui-playwright-tests:
     # Ubicloud, NOT a GitHub-hosted larger runner -- see the `build` job above.
     runs-on: ubicloud-standard-8

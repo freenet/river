@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use river_core::crypto_values::CryptoValue;
 use river_core::web_container::WebContainerMetadata;
 use std::fs;
@@ -58,6 +58,34 @@ enum Commands {
         /// Key file to use (default: ~/.config/river/web-container-keys.toml)
         #[arg(long, short)]
         key_file: Option<String>,
+    },
+    /// Read a PACKED web-container state — the bytes `fdev execute get`
+    /// returns — and report the version it carries.
+    ///
+    /// This exists so the publish path can answer "what is actually live right
+    /// now?" after a publish. Before it, the only signal was `fdev`'s exit
+    /// code, and that is not evidence in either direction: on 2026-08-04 the
+    /// publish reported `put timed out after 1 peer attempt(s)` while the
+    /// state had in fact landed, the operator retried, and a second
+    /// non-reproducible archive was signed at the same version.
+    ///
+    /// Prints `version=<n>` on stdout so callers can
+    /// `sed -n 's/^version=//p'`.
+    Inspect {
+        /// Packed state file (`[u64 metadata_len][metadata][u64 web_len][web]`)
+        #[arg(long)]
+        state: String,
+        /// Contract parameters (the raw 32-byte verifying key). When given,
+        /// the embedded signature MUST verify under it or this fails.
+        ///
+        /// Pass it. A version read out of unverified bytes is not evidence of
+        /// anything: it is whatever the responder chose to say.
+        #[arg(long)]
+        parameters: Option<String>,
+        /// Write the embedded webapp archive here, so the caller can compare
+        /// it byte-for-byte against the archive it published.
+        #[arg(long)]
+        archive_out: Option<String>,
     },
 }
 
@@ -299,6 +327,120 @@ fn export_parameters(
     write_parameters(&signing_key, &parameters)
 }
 
+/// The parsed pieces of a packed web-container state.
+struct PackedWebApp {
+    version: u32,
+    signature: Signature,
+    archive: Vec<u8>,
+}
+
+impl PackedWebApp {
+    /// Parse the packed WebApp container:
+    /// `[metadata_len: u64 BE][metadata: CBOR][web_len: u64 BE][web]`.
+    ///
+    /// That layout is defined by `WebApp::pack` in freenet-core and read back
+    /// by this contract's own `validate_state`. Those two are the authority;
+    /// `sign_output_parses_back_and_verifies` below pins that this parser
+    /// still agrees with what `sign` produces.
+    fn parse(bytes: &[u8]) -> Result<Self, String> {
+        fn take_u64(bytes: &[u8], off: &mut usize) -> Result<u64, String> {
+            let end = off
+                .checked_add(8)
+                .ok_or_else(|| "length field offset overflows".to_string())?;
+            let slice = bytes
+                .get(*off..end)
+                .ok_or_else(|| "state truncated: no room for a length field".to_string())?;
+            *off = end;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(slice);
+            Ok(u64::from_be_bytes(buf))
+        }
+
+        fn take<'a>(bytes: &'a [u8], off: &mut usize, len: u64) -> Result<&'a [u8], String> {
+            let len =
+                usize::try_from(len).map_err(|_| "declared length exceeds usize".to_string())?;
+            let end = off
+                .checked_add(len)
+                .ok_or_else(|| "declared length overflows".to_string())?;
+            let slice = bytes.get(*off..end).ok_or_else(|| {
+                format!(
+                    "state truncated: declared {len} bytes, {} remain",
+                    bytes.len().saturating_sub(*off)
+                )
+            })?;
+            *off = end;
+            Ok(slice)
+        }
+
+        let mut off = 0usize;
+        let metadata_len = take_u64(bytes, &mut off)?;
+        let metadata_bytes = take(bytes, &mut off, metadata_len)?;
+        let metadata: WebContainerMetadata = ciborium::de::from_reader(metadata_bytes)
+            .map_err(|e| format!("metadata is not valid WebContainerMetadata CBOR: {e}"))?;
+        let web_len = take_u64(bytes, &mut off)?;
+        let archive = take(bytes, &mut off, web_len)?.to_vec();
+
+        Ok(Self {
+            version: metadata.version,
+            signature: metadata.signature,
+            archive,
+        })
+    }
+
+    /// Verify the state's signature against the contract parameters.
+    ///
+    /// The parameters file is exactly the 32-byte verifying key (see
+    /// `write_parameters`), and the contract ID is derived from
+    /// `(wasm, parameters)`. So "verifies under these parameters" means "this
+    /// state was signed by the key that owns this contract" — which is the
+    /// only reason to believe a version number that came off the network. An
+    /// unverified version is not evidence; it is whatever the responder chose
+    /// to say.
+    fn verify(&self, parameters: &[u8]) -> Result<(), String> {
+        let key_bytes: [u8; 32] = parameters
+            .try_into()
+            .map_err(|_| format!("parameters must be 32 bytes, got {}", parameters.len()))?;
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| format!("parameters are not a valid verifying key: {e}"))?;
+
+        // The signed message is `version || archive`, exactly as `sign_webapp`
+        // builds it and `validate_state` re-builds it.
+        let mut message = self.version.to_be_bytes().to_vec();
+        message.extend_from_slice(&self.archive);
+
+        verifying_key
+            .verify(&message, &self.signature)
+            .map_err(|e| format!("signature does not verify under the contract parameters: {e}"))
+    }
+}
+
+/// Report what a packed state actually holds. Purely a reader: it never
+/// contacts the network and never decides anything about a publish.
+fn inspect_state(
+    state: String,
+    parameters: Option<String>,
+    archive_out: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = fs::read(&state).map_err(|e| format!("failed to read state '{state}': {e}"))?;
+    let parsed = PackedWebApp::parse(&bytes)?;
+
+    if let Some(parameters) = parameters.as_deref() {
+        let params = fs::read(parameters)
+            .map_err(|e| format!("failed to read parameters '{parameters}': {e}"))?;
+        parsed.verify(&params)?;
+    }
+
+    // Written before the version is printed: a caller that trusts stdout must
+    // not be handed a version for a state whose archive it failed to receive.
+    if let Some(path) = archive_out.as_deref() {
+        fs::write(path, &parsed.archive)
+            .map_err(|e| format!("failed to write archive to '{path}': {e}"))?;
+    }
+
+    println!("version={}", parsed.version);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -315,6 +457,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             parameters,
             key_file,
         } => export_parameters(parameters, key_file),
+        Commands::Inspect {
+            state,
+            parameters,
+            archive_out,
+        } => inspect_state(state, parameters, archive_out),
     }
 }
 
@@ -397,5 +544,119 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pack a state the way `fdev network publish ... contract --webapp-*`
+    /// does: `[metadata_len: u64 BE][metadata][web_len: u64 BE][web]`.
+    fn pack(metadata: &[u8], web: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(metadata.len() as u64).to_be_bytes());
+        out.extend_from_slice(metadata);
+        out.extend_from_slice(&(web.len() as u64).to_be_bytes());
+        out.extend_from_slice(web);
+        out
+    }
+
+    /// The post-publish read-back is only as good as this parser: it is what
+    /// turns the bytes `fdev execute get` returns into "the network is at
+    /// version N carrying these archive bytes". Pin it against `sign`'s own
+    /// output, which is the other end of the same format, so a drift in
+    /// either direction fails here rather than misreporting a live publish.
+    #[test]
+    fn sign_output_parses_back_and_verifies() {
+        let dir = tmpdir("inspect-roundtrip");
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let key_file = write_key_file(&dir, &signing_key);
+
+        let archive_bytes = b"pretend this is webapp.tar.xz".to_vec();
+        let archive = dir.join("webapp.tar.xz");
+        fs::write(&archive, &archive_bytes).unwrap();
+
+        let metadata_path = dir.join("webapp.metadata");
+        let params_path = dir.join("webapp.parameters");
+        sign_webapp(
+            archive.to_str().unwrap().to_string(),
+            metadata_path.to_str().unwrap().to_string(),
+            params_path.to_str().unwrap().to_string(),
+            30000377,
+            Some(key_file.to_str().unwrap().to_string()),
+        )
+        .unwrap();
+
+        let state = pack(&fs::read(&metadata_path).unwrap(), &archive_bytes);
+        let parsed = PackedWebApp::parse(&state).expect("sign output must parse back");
+
+        assert_eq!(
+            parsed.version, 30000377,
+            "version must survive the round trip"
+        );
+        assert_eq!(
+            parsed.archive, archive_bytes,
+            "the archive handed back is what the caller byte-compares against \
+             the one it published; it must be exact"
+        );
+        parsed
+            .verify(&fs::read(&params_path).unwrap())
+            .expect("a state signed by this key must verify under its own parameters");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A version read out of unverified bytes is not evidence of anything.
+    /// The 2026-08-04 fork is exactly two archives sharing one version, so a
+    /// verifier that accepted the version while ignoring the archive would
+    /// report the fork as a clean landing.
+    #[test]
+    fn verify_rejects_a_state_whose_archive_was_swapped() {
+        let dir = tmpdir("inspect-swap");
+        let signing_key = SigningKey::from_bytes(&[13u8; 32]);
+        let key_file = write_key_file(&dir, &signing_key);
+
+        let archive = dir.join("webapp.tar.xz");
+        fs::write(&archive, b"the archive that was signed").unwrap();
+
+        let metadata_path = dir.join("webapp.metadata");
+        let params_path = dir.join("webapp.parameters");
+        sign_webapp(
+            archive.to_str().unwrap().to_string(),
+            metadata_path.to_str().unwrap().to_string(),
+            params_path.to_str().unwrap().to_string(),
+            42,
+            Some(key_file.to_str().unwrap().to_string()),
+        )
+        .unwrap();
+
+        // Same metadata (so same version, same signature), different archive.
+        let state = pack(
+            &fs::read(&metadata_path).unwrap(),
+            b"a DIFFERENT archive at the same version",
+        );
+        let parsed = PackedWebApp::parse(&state).unwrap();
+        assert_eq!(parsed.version, 42);
+        assert!(
+            parsed.verify(&fs::read(&params_path).unwrap()).is_err(),
+            "a signature covering a different archive must not verify"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A truncated or malformed answer must be an error, never a version. The
+    /// read-back reports "could not read the network" for these, and that is
+    /// only safe if the parser refuses to invent a number.
+    #[test]
+    fn parse_refuses_truncated_states() {
+        assert!(PackedWebApp::parse(&[]).is_err(), "empty state");
+        assert!(
+            PackedWebApp::parse(&[0u8; 4]).is_err(),
+            "too short for a length field"
+        );
+        // Declares 4096 bytes of metadata and supplies none.
+        let mut lying = 4096u64.to_be_bytes().to_vec();
+        lying.extend_from_slice(b"nope");
+        assert!(
+            PackedWebApp::parse(&lying).is_err(),
+            "declared length longer than the buffer"
+        );
     }
 }
