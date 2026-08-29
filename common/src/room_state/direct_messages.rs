@@ -261,6 +261,12 @@ pub struct AuthorizedDirectMessage {
     pub message: DirectMessage,
     /// Sender's Ed25519 signature over the bytes produced by
     /// [`build_direct_message_signed_bytes`].
+    ///
+    /// Encoded as a CBOR byte string, accepting the legacy array form on
+    /// read; see [`crate::util::sig_serde`] (freenet/river#575). Safe because
+    /// the signed bytes are hand-built by
+    /// [`build_direct_message_signed_bytes`] and never include this field.
+    #[serde(with = "crate::util::sig_serde")]
     pub sender_signature: Signature,
 }
 
@@ -290,6 +296,12 @@ pub struct AuthorizedRecipientPurges {
     pub state: RecipientPurges,
     /// Recipient's Ed25519 signature over the bytes produced by
     /// [`build_recipient_purges_signed_bytes`].
+    ///
+    /// Encoded as a CBOR byte string, accepting the legacy array form on
+    /// read; see [`crate::util::sig_serde`] (freenet/river#575). Safe because
+    /// the signed bytes are hand-built by
+    /// [`build_recipient_purges_signed_bytes`] and never include this field.
+    #[serde(with = "crate::util::sig_serde")]
     pub recipient_signature: Signature,
 }
 

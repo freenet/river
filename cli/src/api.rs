@@ -6355,7 +6355,55 @@ mod invitation_tests {
     /// deterministically, from the seeds in
     /// [`fixed_fixture_expected_invitation`] (ed25519 signing is
     /// deterministic per RFC 8032, so the bytes are reproducible).
-    const INVITATION_FIXED_FIXTURE_V302: &str = "6DdkgteQ42ZdqjP42dauXJKUPV7Pb4YG5wxPzvBDezf3pwCkWX5ENtvTM8Eb9bVzDTG986W4SEY6MVx653EuNkBYhfTx7FM7uFHy3bJng5xoq8S6gfwuau9AgvWEixELwY7Pn9hErx6rymdPeBrpBouZgKkSLCbSqteJL3r1x8adRXkJVfDd8N9P1L9Uorah6J6sxisDuBcT3TZ71zmWaHkWwEptej7DUNUxCruLXjLGcJdWUaYP2YRAP5siqbNUz1rL9Jh5ZK7t8sq2p7WBSJasSyLuSJhDDw2qmRs5nGexupvbcimptn1xQBdzNa6q3bgzt8Qka3Ror5AD7iN6UNpGQPqwgrmvX6g8q2zVMDKh1JeEP9tezNtpmige3WvwRMg2wKk7pFnLNaeGyutEVQrsrd73D9TsB1Mkz86WwxMU8pKvonLgr2TB9yJdiX1BBkDPRZ6yE2bEzxyeo3PZ6t9Nw4WVszSBnFDkAKzAnCoHdo9qpm6n4iY5R6rsANPn75WDiUM16UyqzVsYdWH2JhoVuvpz7D8HUgbGcjTDsMxi33aERdtd7vG24oDMMsKYYNP6VGdXfyRWKm7LUk9M1hFyD1Sf9FZksUxpp924mRNyaJUCniR9pY984jDUrNE3gCuK1PoF9ShtCvEd";
+    ///
+    /// **Regenerated once, for freenet/river#575** (`Signature` moved from a
+    /// CBOR array of 64 integers to a CBOR byte string). The pre-#575 value is
+    /// preserved verbatim as [`INVITATION_LEGACY_SIG_ARRAY_FIXTURE`], which is
+    /// the legacy-decode fixture for outstanding invite links.
+    const INVITATION_FIXED_FIXTURE_V302: &str = "FfR3LgsXaE6H9TFG18oBbvhAjDdaVa55etBYsykwf3wGT8ZnsVrrpG7nyf9uNYUF6AQWsUqsiCENtX8HLRph8hs824sdjpndgpA9Z1YsRpZzJGDcom4dQixzHuQsjpvTJMnD5eiwFhvfTP9gLvf8WZx4YzQ3uf5DjLVvxVeDwmAwQSJfchcbGmhc5ssYq2p2E7Hpacsr1qGWLYHCaKvZ9nfe6TKjB5szzfHXesGRXDEygrN791TMgUBkVYcCFCtwsKxARL8xXxHfxqiXtp42sx4NX978hpTAGzYVQJccB4BgXCNnXPfP9miCXXM2hgmwhUER89Jw2yPH8Zy95ki5PdqvjUyysFj4hTCyPM8WefTdGxFvDPVyYCqENXbosvKbsdHJbGA9k6d6JTLUkrFoc2dUFTuz1XTe2vjDbiFJAdrTLUZtnYjwi4zhVmxNVfPnuz8em4NhTQmMJuAHvJK6MdSeEJSzmCMzjxqy9yBF5fHXqux9BNY4EqSqHv98rg4EoMfHz1YMND9FxbNtG29UJNQm8uUWpct3235BjW8mNrR6qT8TWkA7NZQ81MidR2WgsakNoB";
+
+    /// The pre-freenet/river#575 value of [`INVITATION_FIXED_FIXTURE_V302`]:
+    /// the SAME invitation for the SAME seeds, encoded while
+    /// `AuthorizedMember::signature` still went out as a CBOR array of 64
+    /// integers. It is genuinely old-encoding because the pre-#575 code
+    /// produced it — nothing in this test could mint it today, which is what
+    /// makes the legacy assertions below non-vacuous.
+    ///
+    /// **Do NOT regenerate this string, ever.** Invitation links are
+    /// long-lived bearer artifacts that live in chat logs and bookmarks. If
+    /// this stops decoding, `river_core::util::sig_serde`'s legacy arm has
+    /// been broken and every invite link minted before #575 is dead.
+    const INVITATION_LEGACY_SIG_ARRAY_FIXTURE: &str = "6DdkgteQ42ZdqjP42dauXJKUPV7Pb4YG5wxPzvBDezf3pwCkWX5ENtvTM8Eb9bVzDTG986W4SEY6MVx653EuNkBYhfTx7FM7uFHy3bJng5xoq8S6gfwuau9AgvWEixELwY7Pn9hErx6rymdPeBrpBouZgKkSLCbSqteJL3r1x8adRXkJVfDd8N9P1L9Uorah6J6sxisDuBcT3TZ71zmWaHkWwEptej7DUNUxCruLXjLGcJdWUaYP2YRAP5siqbNUz1rL9Jh5ZK7t8sq2p7WBSJasSyLuSJhDDw2qmRs5nGexupvbcimptn1xQBdzNa6q3bgzt8Qka3Ror5AD7iN6UNpGQPqwgrmvX6g8q2zVMDKh1JeEP9tezNtpmige3WvwRMg2wKk7pFnLNaeGyutEVQrsrd73D9TsB1Mkz86WwxMU8pKvonLgr2TB9yJdiX1BBkDPRZ6yE2bEzxyeo3PZ6t9Nw4WVszSBnFDkAKzAnCoHdo9qpm6n4iY5R6rsANPn75WDiUM16UyqzVsYdWH2JhoVuvpz7D8HUgbGcjTDsMxi33aERdtd7vG24oDMMsKYYNP6VGdXfyRWKm7LUk9M1hFyD1Sf9FZksUxpp924mRNyaJUCniR9pY984jDUrNE3gCuK1PoF9ShtCvEd";
+
+    /// Pre-#575 invitation links must still decode on the CLI side too, and
+    /// must canonicalize to the current encoding on re-encode.
+    #[test]
+    fn legacy_signature_array_invitation_still_decodes_and_canonicalizes() {
+        assert_ne!(
+            INVITATION_LEGACY_SIG_ARRAY_FIXTURE, INVITATION_FIXED_FIXTURE_V302,
+            "the legacy fixture must differ from the current one, or it is not \
+             testing the legacy encoding at all"
+        );
+
+        let raw = bs58::decode(INVITATION_LEGACY_SIG_ARRAY_FIXTURE)
+            .into_vec()
+            .expect("legacy fixture must base58-decode");
+        let decoded: Invitation = ciborium::de::from_reader(&raw[..])
+            .expect("a pre-#575 invitation link must still CBOR-decode");
+        assert_eq!(
+            decoded,
+            fixed_fixture_expected_invitation(),
+            "the legacy link must decode to exactly the same invitation"
+        );
+
+        let mut reencoded_bytes = Vec::new();
+        ciborium::ser::into_writer(&decoded, &mut reencoded_bytes).expect("re-encode");
+        assert_eq!(
+            bs58::encode(reencoded_bytes).into_string(),
+            INVITATION_FIXED_FIXTURE_V302,
+            "re-encoding a legacy link must produce the current canonical form"
+        );
+    }
 
     /// The exact `Invitation` the frozen [`INVITATION_FIXED_FIXTURE_V302`]
     /// string decodes to. Reconstructs it from the same fixed seeds used to
