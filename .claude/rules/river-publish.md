@@ -91,7 +91,9 @@ cargo make publish-river  # bumps published-contract/contract-version.txt
 ```bash
 # `cargo make sign-webapp` (run transitively by publish-river) incremented
 # the counter. Commit it together with whatever other changes the publish
-# included.
+# included — and commit it EVEN IF the publish reported a failure. See
+# "Version policy" below: the counter is forward-only, because a reported
+# failure is not evidence the state did not land.
 git add published-contract/contract-version.txt
 git commit -m "chore: bump web-container version after publish"
 curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | head -5
@@ -117,6 +119,10 @@ already-used version is a no-op *success*, so the network will never tell you
 it was ignored.
 
 **Version policy:** the canonical source is `published-contract/contract-version.txt`, which `cargo make sign-webapp` increments and writes back each publish. NEVER base the version on wall-clock time (`date +%s / 60`) — the previous scheme bit us 2026-05-16 when the on-network version had drifted ahead of the timestamp-derived value. The counter file makes the version a strict monotonic local invariant; gaps are fine (the contract enforces monotonicity, not contiguity).
+
+**The counter is forward-only. Never re-use a version, and never hand-edit it downwards.** A publish that reports a failure is not evidence the state did not land — on 2026-08-04 `fdev` reported `put timed out after 1 peer attempt(s)` while the state was on the network the whole time. The old flow rolled the counter back on that exit code, the operator retried, the rebuild was not byte-reproducible, and a *different* archive got signed at the *same* version. Two states at one version never converge (the contract rejects `version <= current` in both directions, and the state summary carries only the version, so anti-entropy cannot tell them apart), and the only recovery is the next publish at a higher version. Burning a version costs a gap in the sequence and nothing else.
+
+So: **commit the bumped counter whether or not the publish reported success.** `publish-river` then reads the state back and prints an advisory report — the live version, and whether its archive is byte-for-byte the one you just published. Read it before deciding anything. It is a report, not a gate: it cannot fail a publish, and `NOT SEEN YET` means "one GET did not find it yet", which on an eventually-consistent network is not the same as "it did not land". Re-read with `fdev network execute get <contract_id> -o /tmp/state.bin` rather than republishing on a single early read.
 
 ## Two independent release surfaces
 

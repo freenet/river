@@ -181,7 +181,11 @@ number strictly higher than the current published version. The version
 is tracked by a committed counter at
 `published-contract/contract-version.txt`; `cargo make sign-webapp`
 increments it. Commit the bumped counter alongside other publish
-artifacts.
+artifacts — **including when the publish reports a failure**. The counter
+is forward-only: a reported failure is not evidence the state did not
+land, and re-using a version is what forked the site on 2026-08-04.
+`publish-river` prints an advisory read-back of what is actually live;
+read it before retrying. See `.claude/rules/river-publish.md`.
 
 **Contract ID:** `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`
 
