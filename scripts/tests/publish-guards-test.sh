@@ -124,9 +124,23 @@ else
     # task that publishes to the PRODUCTION contract and counter. The other
     # two sites are only accidentally safe (they run under the default
     # `release`), so the rule is uniform rather than per-site.
-    interpolated="$(grep -n 'web-container-tool" || true' "$makefile" |
-        grep 'BUILD_PROFILE' || true)"
-    if [[ -n "$interpolated" ]]; then
+    # Needle is the tool-path ARGUMENT line -- indented, quoted -- not
+    # `web-container-tool" || true`. The sibling scrape above deliberately
+    # tolerates `|| true` on its own continuation line, so requiring it here
+    # too would let a reformat plus a profile revert pass both checks
+    # together. The count is asserted as well: a needle that stops matching
+    # anything passes vacuously, which is the failure this whole check exists
+    # to avoid.
+    tool_needle='^[[:space:]]+"target/native/[^"]*web-container-tool"'
+    tool_lines="$(grep -nE "$tool_needle" "$makefile" || true)"
+    tool_count="$(grep -cE "$tool_needle" "$makefile" || true)"
+    interpolated="$(grep 'BUILD_PROFILE' <<<"$tool_lines" || true)"
+
+    if [[ "$tool_count" -ne 3 ]]; then
+        fail "the read-back's tool path is a literal profile" \
+            "expected 3 tool-path argument lines, found $tool_count" \
+            "(the needle no longer matches, so this check proves nothing)"
+    elif [[ -n "$interpolated" ]]; then
         mapfile -t interpolated_lines <<<"$interpolated"
         fail "the read-back's tool path is a literal profile" "${interpolated_lines[@]}"
     else
@@ -282,6 +296,25 @@ if [[ "$status" -eq 0 && "$elapsed" -lt 25 ]]; then
 else
     fail "a node that never answers is abandoned, not waited on" \
         "exited $status after ${elapsed}s (expected 0, under 25s)"
+fi
+# ...and it must SAY it timed out. Asserting only status and elapsed time
+# leaves the whole rc-124 branch deletable with the suite still green: the
+# script would fall into the generic "fdev execute get failed" arm, which is
+# the wrong report and hides that the node never answered at all.
+expect "a timed-out read says so, rather than reporting a generic failure" \
+    "Gave up reading the network back"
+
+# A junk RIVER_READBACK_TIMEOUT must not abort the script. Its first use is
+# arithmetic, so without validation `set -u` kills the run with a raw bash
+# error and no footer -- contradicting the always-exits-0-with-a-report
+# promise in the script's own header.
+STUB_VERSION=100 STUB_ARCHIVE="the archive we published" \
+    RIVER_READBACK_TIMEOUT=abc run_readback 100 0
+if [[ "$status" -eq 0 && "$out" == *"Ignoring RIVER_READBACK_TIMEOUT"* ]]; then
+    ok "a non-numeric read-back timeout falls back with a warning"
+else
+    fail "a non-numeric read-back timeout falls back with a warning" \
+        "exited $status" "$out"
 fi
 
 # A missing local archive is a LOCAL problem. Rendering it as FORKED raises

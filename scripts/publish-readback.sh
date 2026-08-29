@@ -124,15 +124,36 @@ reread_hint="    fdev network execute get $contract_id -o /tmp/river-state.bin"
 # non-zero exit. An operator left at a prompt that never returns, with the
 # counter bumped but uncommitted, is one Ctrl-C away from the `git checkout`
 # on the counter file that this whole change exists to prevent.
+
+# The timeout is validated here, at its first arithmetic use: an operator-supplied
+# RIVER_READBACK_TIMEOUT that is not a number would otherwise abort the whole
+# script with a raw bash error and no footer, which contradicts the promise at
+# the top of this file that it always exits 0 with a report.
+case "$readback_timeout" in
+    "" | *[!0-9]* | 0*)
+        echo "Ignoring RIVER_READBACK_TIMEOUT='$readback_timeout' (not a positive"
+        echo "integer); using 60s."
+        readback_timeout=60
+        ;;
+esac
+
 hard_timeout=$((readback_timeout + 10))
 get_cmd=(fdev)
 if command -v timeout >/dev/null 2>&1; then
     get_cmd=(timeout -k 5 "$hard_timeout" fdev)
 fi
+# Without timeout(1) the hang is back. Left unhandled deliberately: the tool
+# path this script is called with hard-codes x86_64-unknown-linux-gnu, so a
+# host running this without coreutils is not a case that occurs.
 
-if ! "${get_cmd[@]}" network execute get "$contract_id" \
-        --timeout "$readback_timeout" -o "$state_file" >"$log" 2>&1; then
-    get_rc=$?
+# `|| get_rc=$?` and NOT `if ! cmd; then get_rc=$?`. Inside `if !` the status
+# read by `$?` is the NEGATED one, so it is always 0 and the 124/137 branch
+# below would be dead code.
+get_rc=0
+"${get_cmd[@]}" network execute get "$contract_id" \
+    --timeout "$readback_timeout" -o "$state_file" >"$log" 2>&1 || get_rc=$?
+
+if [ "$get_rc" -ne 0 ]; then
     if [ "$get_rc" -eq 124 ] || [ "$get_rc" -eq 137 ]; then
         echo "Gave up reading the network back after ${hard_timeout}s -- the node"
         echo "did not answer. (The publish itself is unaffected by this.)"
