@@ -78,6 +78,45 @@ strip = true        # Strip symbols from binary
 [profile.release.package."*"]
 opt-level = 'z'     # Optimize all dependencies for size as well
 
+# EXCEPT the elliptic-curve arithmetic. `opt-level = 'z'` leaves
+# curve25519-dalek's field-arithmetic hot loops un-inlined, and Ed25519
+# VERIFICATION is the room contract's dominant cost — it verifies every member's
+# invite signature, every ban, every member_info record and every message on
+# each `validate_state`. Restoring `opt-level = 3` for that one crate buys 1.6x
+# on all of it (freenet/river#422).
+#
+# Measured per verification, wasm32 under wasmtime with Cranelift at
+# `OptLevel::None` — the settings freenet-core actually runs contracts under
+# (crates/core/src/wasm_runtime/engine/wasmtime_engine.rs, chosen for safety
+# against untrusted code):
+#
+#     curve25519-dalek at 'z' : 0.4224 ms      at 3 : 0.2622 ms   (1.61x)
+#
+# Do NOT quote the native figure. Natively the same change is 46x (2.27 ms ->
+# 0.05 ms), because a native build has nothing downstream to recover the lost
+# inlining, whereas Cranelift re-optimizes the module on load and recovers most
+# of it. 46x describes `cargo test --release` on the host, NOT production.
+#
+# Cost of the exception, measured with `cargo build --locked --profile release
+# --target wasm32-unknown-unknown` against origin/main:
+#
+#     room_contract.wasm  792,831 -> 808,800  (+15,969, +2.0%)
+#     chat_delegate.wasm  737,365 -> 754,652  (+17,287, +2.3%)
+#
+# BOTH artifacts move, because the delegate depends on ed25519-dalek too and
+# `Makefile.toml` builds it `--profile release`. So a publish carrying this
+# needs a `legacy_room_contracts.toml` entry AND a `legacy_delegates.toml`
+# entry — the room contract key is BLAKE3(wasm, params) and the delegate key is
+# BLAKE3(BLAKE3(wasm) || params). CI's `check-*-migration` jobs pass on the PR
+# only because they diff the COMMITTED wasm, which no source change regenerates;
+# they do not predict the next `cargo make sync-wasm`.
+#
+# Scoped to curve25519-dalek alone: that is where the arithmetic lives and it
+# carries the whole win on its own, so widening the exception to
+# ed25519-dalek/sha2 would cost size for nothing.
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+
 # Profile used by `dx build --release` for the web/WASM UI target.
 #
 # The Dioxus CLI (dx) builds the web app under a profile named `wasm-release`.
