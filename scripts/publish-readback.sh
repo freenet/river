@@ -84,13 +84,20 @@ FOOTER
 echo ""
 echo "=== post-publish read-back (advisory) ==="
 
-case "$our_version$publish_rc" in
-    *[!0-9]* | "")
-        echo "Skipped: version '$our_version' / exit code '$publish_rc' are not"
-        echo "both plain integers."
-        done_
-        ;;
-esac
+# Validated SEPARATELY, not concatenated: an empty version next to rc 0
+# concatenates to "0" and would sail through a joint check, leaving both later
+# comparisons to error out and fall through to a LANDED that was never
+# measured. A check whose own inputs are broken must report unknown, never
+# success.
+for field in "$our_version" "$publish_rc"; do
+    case "$field" in
+        *[!0-9]* | "")
+            echo "Skipped: version '$our_version' / exit code '$publish_rc' are"
+            echo "not both plain integers, so nothing here can be compared."
+            done_
+            ;;
+    esac
+done
 
 if [ ! -x "$tool" ] && ! command -v "$tool" >/dev/null 2>&1; then
     echo "Could not read the network: no web-container-tool at '$tool'."
@@ -109,10 +116,30 @@ log="$workdir/log"
 
 reread_hint="    fdev network execute get $contract_id -o /tmp/river-state.bin"
 
-if ! fdev network execute get "$contract_id" \
+# The outer timeout(1) is what makes "advisory" true by wall clock as well as
+# by exit code. `fdev --timeout` bounds only the `client.recv()` wait; the
+# WebSocket connect, the send and the close are unbounded, so a node that
+# accepts the TCP handshake but never completes the upgrade blocks here
+# forever -- and `|| true` at the call site cannot rescue a hang, only a
+# non-zero exit. An operator left at a prompt that never returns, with the
+# counter bumped but uncommitted, is one Ctrl-C away from the `git checkout`
+# on the counter file that this whole change exists to prevent.
+hard_timeout=$((readback_timeout + 10))
+get_cmd=(fdev)
+if command -v timeout >/dev/null 2>&1; then
+    get_cmd=(timeout -k 5 "$hard_timeout" fdev)
+fi
+
+if ! "${get_cmd[@]}" network execute get "$contract_id" \
         --timeout "$readback_timeout" -o "$state_file" >"$log" 2>&1; then
-    echo "Could not read the network back (fdev execute get failed):"
-    sed 's/^/    /' "$log"
+    get_rc=$?
+    if [ "$get_rc" -eq 124 ] || [ "$get_rc" -eq 137 ]; then
+        echo "Gave up reading the network back after ${hard_timeout}s -- the node"
+        echo "did not answer. (The publish itself is unaffected by this.)"
+    else
+        echo "Could not read the network back (fdev execute get failed):"
+        sed 's/^/    /' "$log"
+    fi
     echo ""
     echo "That says nothing about whether the publish landed. Re-read with"
     echo "$reread_hint"
@@ -146,16 +173,27 @@ if [ -z "$net_version" ]; then
     done_
 fi
 
+# One explicit three-way branch. LANDED is reached only by proving equality --
+# never by falling out of the bottom of a chain of failed comparisons, which
+# is the direction that hurts: false reassurance at the exact moment the
+# operator is deciding whether to retry.
 if [ "$net_version" -gt "$our_version" ]; then
     cat <<EOF
 SUPERSEDED. The network is at version $net_version, above the $our_version just
-published -- someone published after this run. Nothing to do; the newer state
-wins.
+published.
+
+Two causes, and they need different responses:
+  * Somebody else published after this run. Nothing to do; the newer state
+    wins.
+  * Your counter was BEHIND the network, so the state signed at $our_version was
+    rejected and YOUR CHANGES ARE NOT LIVE. The contract refuses any version
+    at or below what it holds.
+
+If nobody else published, it is the second: set the counter above $net_version
+and publish again.
 EOF
     done_
-fi
-
-if [ "$net_version" -lt "$our_version" ]; then
+elif [ "$net_version" -lt "$our_version" ]; then
     cat <<EOF
 NOT SEEN YET. The network answered with version $net_version, below the
 $our_version just published.
@@ -167,9 +205,38 @@ Republishing on the strength of a single early read is how the same version
 gets signed twice.
 EOF
     done_
+elif [ "$net_version" -ne "$our_version" ]; then
+    # Unreachable while both operands are validated integers. Kept so that a
+    # future change which breaks that lands here rather than in LANDED.
+    echo "Could not compare version $net_version against $our_version. Reporting"
+    echo "this as unknown rather than as a result."
+    done_
 fi
 
-if ! cmp -s "$archive_file" "$expected_archive"; then
+# `cmp` returns 0 for same, 1 for differ, and >= 2 for "could not compare" --
+# an unreadable file among them. Treating >= 2 as "differ" renders a local
+# tooling problem as FORKED, the most alarming verdict this script has.
+if [ ! -r "$expected_archive" ] || [ ! -s "$expected_archive" ]; then
+    cat <<EOF
+The network is at version $net_version, our version -- but the archive we
+published is missing or empty locally ($expected_archive), so there is nothing
+to compare it against. Reporting this as unknown: it is a local problem, and
+says nothing about what the network holds.
+EOF
+    done_
+fi
+
+cmp -s "$archive_file" "$expected_archive"
+cmp_rc=$?
+
+if [ "$cmp_rc" -ge 2 ]; then
+    echo "The network is at version $net_version, our version -- but the two"
+    echo "archives could not be compared (cmp exited $cmp_rc). Reporting this as"
+    echo "unknown rather than guessing which way it went."
+    done_
+fi
+
+if [ "$cmp_rc" -eq 1 ]; then
     cat <<EOF
 FORKED. The network is serving version $net_version -- our version -- but its
 archive is NOT the one just published.

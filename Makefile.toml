@@ -400,7 +400,7 @@ fdev network publish \
   target/webapp/webapp.tar.xz \
   "$version" \
   "$publish_rc" \
-  "target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool" || true
+  "target/native/x86_64-unknown-linux-gnu/release/web-container-tool" || true
 
 if [ "$publish_rc" -eq 0 ]; then
     echo "Publish OK. Remember to commit $version_file."
@@ -439,13 +439,20 @@ fdev network publish \
   --webapp-metadata target/webapp/webapp.metadata \
   && publish_rc=0 || publish_rc=$?
 
+# `release`, NOT ${BUILD_PROFILE}. This task sets BUILD_PROFILE=dev, and
+# cargo's `dev` profile emits into `debug/`, never `dev/` — so
+# `${BUILD_PROFILE}` here names a path that cannot exist and the read-back
+# would silently short-circuit on "no web-container-tool", on the one task
+# that publishes to the PRODUCTION contract and counter. (The tool itself is
+# always the release build: a cargo-make task's `env` does not reach its
+# dependencies, so `sign-webapp` builds it under the default profile.)
 ./scripts/publish-readback.sh \
   "$contract_id" \
   published-contract/webapp.parameters \
   target/webapp/webapp.tar.xz \
   "$version" \
   "$publish_rc" \
-  "target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool" || true
+  "target/native/x86_64-unknown-linux-gnu/release/web-container-tool" || true
 
 if [ "$publish_rc" -ne 0 ]; then
     echo "fdev network publish exited $publish_rc. $version_file stays at $version; commit it." >&2
@@ -645,7 +652,7 @@ fdev network publish \
   target/webapp/webapp-test.tar.xz \
   "$version" \
   "$publish_rc" \
-  "target/native/x86_64-unknown-linux-gnu/${BUILD_PROFILE}/web-container-tool" || true
+  "target/native/x86_64-unknown-linux-gnu/release/web-container-tool" || true
 
 if [ "$publish_rc" -ne 0 ]; then
     # Forward-only: the counter is not rolled back. See [tasks.sign-webapp].
