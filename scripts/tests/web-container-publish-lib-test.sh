@@ -103,8 +103,9 @@ check "rc!=0 but our bytes are live (the timeout that landed)" \
 check "our version, someone else's bytes" \
     "collision" "$(wc_publish_outcome 0 known 30000377 0 30000377)"
 
-# rc=0 is the no-op success: the container silently kept the older state.
-check "rc=0 but the network is still behind (no-op success)" \
+# The node we published through reported success and the network is still
+# behind: whatever it accepted, our bytes are not what is live.
+check "rc=0 but the network is still behind" \
     "not-landed" "$(wc_publish_outcome 0 known 30000376 0 30000377)"
 
 check "the network moved above us" \
@@ -117,6 +118,25 @@ check "read-back said not found" \
     "unknown" "$(wc_publish_outcome 0 absent "" na 30000377)"
 check "read-back verified but printed no version" \
     "unknown" "$(wc_publish_outcome 0 known "" na 30000377)"
+
+echo "--- wc_readback_is_final: only a settled answer stops asking"
+
+# These three are statements about a state we read. They do not un-happen, and
+# re-reading only delays a report the operator needs.
+for outcome in landed collision superseded; do
+    check "$outcome is final" "yes" "$(wc_readback_is_final "$outcome")"
+done
+
+# THE ONE THAT MATTERS. 'not-landed' says "the network is not showing our
+# state", which on an eventually-consistent network is exactly what a read
+# taken too early says. Calling it final reports a publish that LANDED as NOT
+# PUBLISHED, and that report is what invites the retry that forked the site.
+check "not-landed is NOT final" "no" "$(wc_readback_is_final not-landed)"
+check "unknown is NOT final"    "no" "$(wc_readback_is_final unknown)"
+
+# Anything unrecognised keeps asking rather than settling on a verdict nothing
+# produced.
+check "an unrecognised outcome is not final" "no" "$(wc_readback_is_final garbage)"
 
 echo "--- wc_outcome_exit_code: only a proven publish exits 0"
 

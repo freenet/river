@@ -76,11 +76,21 @@ cargo check -p river-ui --target wasm32-unknown-unknown --features no-sync
 cargo fmt
 ```
 
-### Step 5: Commit, Build, and Publish
+### Step 5: Merge, then Build and Publish from main
+
+The web container is ONE contract key serving every River user, and there is no
+per-branch address to publish to instead — so the publish runs from a green
+`main`, never from the branch. `scripts/publish-web-container.sh` enforces this
+before it signs anything: clean tracked tree, on `main`, `HEAD == origin/main`,
+and CI green on that exact SHA (an empty list of runs is *not* green). It
+refuses otherwise. `RIVER_WC_ALLOW_UNPROVEN=1` skips the gate for one run; it
+is for an emergency you can justify, not for routine convenience.
 
 ```bash
 git add legacy_delegates.toml ui/public/contracts/ cli/contracts/
 git commit -m "fix: <description> with delegate migration"
+# open the PR, get it reviewed, wait for CI green, merge
+git checkout main && git pull
 cargo make publish-river  # builds, signs, publishes, and verifies the result
 ```
 
@@ -124,7 +134,9 @@ it was ignored.
 
 **Never reissue a version, and never roll the counter back.** 2026-08-04 (commit `1032d373`): a publish of version 30000377 reported `put timed out after 1 peer attempt(s)`, the counter was rolled back, and the retry rebuilt the UI — a *different* archive, because the build is not reproducible — signed it 30000377 again, and published it. The first PUT had landed. Two validly signed archives now existed at one version, and they do not converge: `update_state` rejects `version <= current` in **both** directions, and `summarize_state` emits only the u32 version, so anti-entropy between two split peers sees matching summaries and never heals. The second archive spreads because a peer new to the contract takes the initial-state bypass, which runs `validate_state` only. River self-heals at the next successful publish, so exposure is one release cycle — bounded, not harmless.
 
-The counter is therefore forward-only, and the publish script re-reads the state after publishing rather than trusting `fdev`'s exit code (a publish at an already-used version is a no-op *success*; a publish that reports a timeout may have landed). If a publish reports failure, **read the verdict block** — if it says PUBLISHED despite a non-zero fdev exit, do not retry.
+The counter is therefore forward-only, and the publish script re-reads the state after publishing rather than trusting `fdev`'s exit code. A zero exit says the node you published *through* accepted the PUT, not that the bytes users fetch are yours; and a publish that reports a timeout may have landed anyway, which is what 2026-08-04 actually was. If a publish reports failure, **read the verdict block** — if it says PUBLISHED despite a non-zero fdev exit, do not retry.
+
+Note the web container does **not** behave like the pointer contract here. An earlier version of this file said a web-container publish at an already-used version is a "no-op success"; that is wrong. `update_state` returns `InvalidUpdateWithInfo` for `version <= current` and freenet-core surfaces a failed PutResponse as an error to the publishing node — which is how the 2026-08-04 operator saw `New state version 30000377 must be higher than current version 30000377` at all. The silent-stale-update property belongs to the **pointer** contract (step 7 above), by design, and does not carry across.
 
 ## Two independent release surfaces
 

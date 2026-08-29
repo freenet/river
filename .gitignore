@@ -55,9 +55,10 @@ ui/tests/test-results/
 # an older checkout cannot be committed by accident.
 /published-contract/contract-version.txt.prev
 
-# Single-writer lock for the web-container publish. Two concurrent publishes
-# race the version counter.
-/published-contract/.publish.lock
+# (The single-writer lock for the web-container publish is deliberately NOT
+# here. It lives at $XDG_RUNTIME_DIR/river-web-container-<contract-id>.lock,
+# outside the checkout: a lock inside the repo gives two worktrees two
+# different lock files and serialises nothing.)
 
 # Syncthing in-flight transfer files (`.syncthing.<name>.tmp` are
 # created by the syncthing daemon while a file is being received).

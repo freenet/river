@@ -110,11 +110,18 @@ wc_preflight_decision() {
 #
 # The exit code is not evidence in EITHER direction:
 #
-#   - A publish at an already-used version is a no-op SUCCESS. The container
-#     rejects it and nothing tells you.
+#   - A zero exit says the node we published THROUGH accepted the PUT. It does
+#     not say our bytes are what the network serves.
 #   - A publish that reports a timeout may still have landed. That is exactly
 #     what happened on 2026-08-04: `put timed out after 1 peer attempt(s)`,
 #     and the state was on the network the whole time.
+#
+# Do NOT restate the old "a publish at an already-used version is a no-op
+# SUCCESS" here. It is false for this contract: web-container-contract's
+# `update_state` returns `InvalidUpdateWithInfo` for `version <= current`, and
+# freenet-core maps a failed PutResponse to an error on the originating node —
+# which is how the 2026-08-04 operator saw the rejection message at all. The
+# POINTER contract is the one that accepts a stale update silently, by design.
 #
 # Prints one of: landed | collision | superseded | not-landed | unknown
 wc_publish_outcome() {
@@ -150,6 +157,29 @@ wc_publish_outcome() {
     # publish_rc is deliberately unused in the classification. It is reported
     # to the operator, but it decides nothing.
     : "$publish_rc"
+}
+
+# wc_readback_is_final <outcome>
+#
+# Prints "yes" when the read-back has settled the question and asking the
+# network again cannot change the answer; "no" when it has not.
+#
+# 'landed', 'collision' and 'superseded' are statements about a state we
+# actually read back — the network is at our version with our bytes, at our
+# version with bytes that are not ours, or above us. None of those un-happen,
+# so re-reading only delays a report the operator needs.
+#
+# 'not-landed' and 'unknown' are the same claim wearing two hats: "we have not
+# seen our state yet". Freenet is eventually consistent, so that is exactly
+# what a read taken too early looks like, and one GET is a sample rather than
+# a verdict. Treating 'not-landed' as final is how a publish that LANDED gets
+# reported as NOT PUBLISHED — and that report is what invites the retry that
+# forked the site on 2026-08-04, so it is the direction that hurts.
+wc_readback_is_final() {
+    case "$1" in
+        landed|collision|superseded) echo "yes" ;;
+        *)                           echo "no" ;;
+    esac
 }
 
 # wc_outcome_exit_code <outcome>

@@ -188,10 +188,15 @@ artifacts.
 
 Two things that follow from that, and matter if a publish goes wrong:
 
-- **`fdev`'s exit code decides nothing.** A publish at an already-used
-  version is a no-op *success*, and a publish that reports a timeout may
-  have landed anyway. Read the script's verdict block, not the exit status
-  of the publish inside it.
+- **`fdev`'s exit code decides nothing.** A zero exit says the node you
+  published *through* accepted the PUT, not that the bytes users fetch are
+  yours; and a publish that reports a timeout may have landed anyway, which
+  is what 2026-08-04 actually was. Read the script's verdict block, not the
+  exit status of the publish inside it. (The web container does **not**
+  silently accept a stale update: `update_state` returns
+  `InvalidUpdateWithInfo` for `version <= current`, which is how the
+  2026-08-04 operator saw the rejection message. That no-op-success property
+  belongs to the *pointer* contract, by design.)
 - **Never retry a publish by re-signing at the same version, and never roll
   the counter back.** The counter is forward-only on purpose; gaps are fine
   (the contract enforces monotonicity, not contiguity). Reissuing a version

@@ -219,11 +219,33 @@ tar -cJf ../../../../../webapp/webapp.tar.xz *
 # All of it, including the flock the old comment here asked for and nothing
 # ever added, lives in scripts/publish-web-container.sh. Read that file's
 # header before changing any of this.
+#
+# Signing is gated the same way publishing is (clean tree, on main, at
+# origin/main, CI green on that SHA): it burns a version and hands back an
+# artifact `fdev network publish` will take by hand, so it is a release step,
+# not a build step. RIVER_WC_ALLOW_UNPROVEN=1 skips that gate for one run.
 description = "Sign the compressed webapp at a version proven to be above the network's"
-dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
+# No `dependencies`. The script builds them itself via
+# [tasks.web-container-build-inputs], from INSIDE the publish lock — see that
+# task's comment.
 script = '''
-exec ./scripts/publish-web-container.sh --sign-only
+exec ./scripts/publish-web-container.sh --sign-only --build
 '''
+
+[tasks.web-container-build-inputs]
+# Deliberately a task with dependencies and NO script, invoked by
+# scripts/publish-web-container.sh once it holds the single-writer lock.
+#
+# These used to be `dependencies` of [tasks.publish-river] and
+# [tasks.sign-webapp]. cargo-make runs a task's dependencies to completion
+# BEFORE its script, so they ran before the script could take the lock: two
+# overlapping `cargo make publish-river` runs both executed `compress-webapp`
+# and both wrote the shared `target/webapp/webapp.tar.xz` with no lock held,
+# and the second could replace the archive while the first was signing,
+# publishing or byte-comparing it. The lock covered sign-to-verify but not the
+# artifact being verified. Do not move these back into a `dependencies` list.
+description = "Build the artifacts the web-container publish consumes"
+dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
 
 [tasks.build-ui-example]
 description = "Build the Dioxus UI with example data"
@@ -360,18 +382,26 @@ echo "Please commit the changes to git"
 # happens inside that script, under the same lock as the publish, because the
 # gap between "sign at version N" and "publish version N" is where the
 # 2026-08-04 fork lived.
+#
+# Run it from a green `main`, after the PR has merged. This contract key is
+# shared by every River user with no per-branch address to publish to instead,
+# so the script refuses a dirty tree, a branch that is not main, a HEAD that is
+# not origin/main, or CI that is not green on that exact SHA — the same
+# pre-flight scripts/publish-pointer-records.sh makes.
 description = "Publish River to Freenet, verifying the result against the network"
-dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
+# No `dependencies` — see [tasks.web-container-build-inputs].
 script = '''
-exec ./scripts/publish-web-container.sh
+exec ./scripts/publish-web-container.sh --build
 '''
 
 [tasks.publish-river-debug]
 description = "Publish River to Freenet in debug mode"
 env = { BUILD_PROFILE = "dev" }
-dependencies = ["compress-webapp", "build-web-container-tool", "build-web-container"]
+# No `dependencies` — see [tasks.web-container-build-inputs]. The script passes
+# BUILD_PROFILE through with `cargo make --env`, because a cargo-make [env]
+# block overrides an inherited variable of the same name.
 script = '''
-exec ./scripts/publish-web-container.sh
+exec ./scripts/publish-web-container.sh --build
 '''
 
 # Test publishing tasks - use separate keypair to avoid affecting production
@@ -635,7 +665,13 @@ NEW_VERSION=$(grep '^version' cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/
 # Step 3: Commit the version bump
 echo ""
 echo "▶ Step 3/4: Committing version bump..."
-git add cli/Cargo.toml
+# published-contract/contract-version.txt was advanced by step 1 and is
+# committed HERE. It used to be left dirty, which quietly undoes the reason the
+# counter is forward-only: a stray `git checkout`, `git stash` or discarded
+# working-tree change restores a version that has already been published, and
+# reissuing a used version is the 2026-08-04 fork. `git add` on it is a no-op
+# if step 1 refused before signing.
+git add cli/Cargo.toml published-contract/contract-version.txt
 git commit -m "chore: bump riverctl to v${NEW_VERSION} (WASM sync)"
 
 # Step 4: Publish to crates.io
