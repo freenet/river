@@ -118,6 +118,7 @@ mod volatile_value_binding_audit {
         r#"components/members/invite_member_modal.rs <input> invitation_code"#,
         r#"components/members/invite_member_modal.rs <input> invitation_url"#,
         r#"components/members/member_info_modal.rs <input> "{member_id_str}""#,
+        r#"components/members/member_info_modal.rs <input> "{vk_str}""#,
         r#"components/room_list/edit_room_modal.rs <input> "{bs58::encode(room_data.owner_vk.as_bytes()).into_string()}""#,
         r#"components/room_list/edit_room_modal.rs <input> "{room_data.contract_key.id()}""#,
         r#"components/room_list/edit_room_modal.rs <input> "{secret_version}""#,
