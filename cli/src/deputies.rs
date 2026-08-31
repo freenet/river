@@ -233,9 +233,9 @@ impl<'a> RoomDeputies<'a> {
 
     /// The member's ed25519 verifying key — their cryptographic identity — when
     /// this room state carries it: the room owner, or a current member of
-    /// `members.members`. Returns `None` for a member named only by a
-    /// deputizer's signed record (e.g. one pruned for inactivity), for whom no
-    /// key is stored.
+    /// `members.members`. Returns `None` for any other id — for example one that
+    /// appears only in a deputizer's signed `deputies` record with no member of
+    /// its own — for whom no key is stored.
     ///
     /// This is the collision-PROOF identifier. The `member_id` label printed
     /// elsewhere is a 40-bit truncation of a 64-bit non-cryptographic hash, so

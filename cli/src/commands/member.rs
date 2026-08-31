@@ -128,9 +128,12 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                     let granted_by: Vec<MemberId> =
                         deputized_by.get(&id).cloned().unwrap_or_default();
                     // The full verifying key — the collision-proof identity to
-                    // compare when trusting a member (the `member_id` label is a
-                    // 40-bit truncation). `None` for a member with no key in
-                    // state (e.g. a pruned deputy named only by a signed grant).
+                    // compare when trusting a member (the `member_id` label is
+                    // only a 40-bit truncation). Every id iterated here holds a
+                    // `member_info` record, and `MemberInfoV1::verify` requires
+                    // such a record's member to be the owner or a current
+                    // member, so on verified state this is always `Some`; the
+                    // `None` arm below is defensive.
                     let verifying_key = deputies
                         .verifying_key(id)
                         .map(|vk| bs58::encode(vk.as_bytes()).into_string());
@@ -168,9 +171,13 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                                 print!("{}", format!("  deputy of: {}", names.join(", ")).yellow());
                             }
                             println!();
-                            // The collision-proof identifier. Printed plain (no
-                            // colour) so it copies cleanly into an allow-list;
-                            // absent only for a member with no key in state.
+                            // Shown for every member by default (deliberately
+                            // not behind a flag): the point is to make the
+                            // collision-proof identity visible so people stop
+                            // trusting the 40-bit short id. Printed plain (no
+                            // colour) so it copies cleanly into an allow-list.
+                            // On verified state the key is always present (see
+                            // the map closure above); this guard is defensive.
                             if let Some(vk) = verifying_key {
                                 println!("      key: {}", vk);
                             }
