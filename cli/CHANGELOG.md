@@ -2,6 +2,16 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.13] - 2026-08-31
+
+### Added
+- `member list` now shows each member's full ed25519 verifying key (base58) —
+  in human output as an indented `key:` line, and in `--format json` as a
+  `verifying_key` field. The 8-character short id is only a 40-bit truncation
+  and is cheap to collide on a targeted basis, so use the full verifying key
+  (which matches `identity whoami`'s `verifying_key`) as the collision-proof
+  identity when trusting a member, e.g. a bot allow-list.
+
 ## [0.1.8] - 2025-08-09
 
 ### Fixed
