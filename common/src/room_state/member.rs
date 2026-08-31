@@ -689,8 +689,28 @@ impl fmt::Debug for Member {
 }
 
 /*
-Finding a VerifyingKey that would have a MemberId collision would require approximately
-3 * 10^59 years on current hardware.
+`MemberId` is a 64-bit *non-cryptographic* `FastHash` (a Java-style `h*31 + byte`
+polynomial hash) of the member's `VerifyingKey`, NOT a cryptographic digest. The
+8-char base32 `Display` label is lossier still — only 40 of those 64 bits.
+
+Collision cost is therefore modest, not astronomical (an earlier version of this
+comment claimed ~3 * 10^59 years, which was wrong):
+  - 40-bit `Display` label, targeted second-preimage: ~2^40 keypair generations
+    (hours on a GPU / small cluster). Any-collision (birthday): ~2^20, seconds.
+  - Full 64-bit id, targeted: ~2^64 (large but finite brute force over keypairs,
+    not 10^59 years). Any-collision (birthday): ~2^32, ~hours single-core.
+The one thing that keeps this from being trivial is that a usable member needs a
+real keypair (to sign), so the weak hash can't be inverted algebraically — an
+attacker must brute-force by generating ed25519 keypairs and hashing the pubkey.
+
+Why a collision is not a full compromise: authorization is anchored on the full
+ed25519 keys and signatures. `member_vk` carries the full key, and the invite
+chain verifies signatures against the looked-up member's real `member_vk`; a
+member colliding with the owner's id (or full key) is rejected in `verify`. A
+`MemberId` collision buys identity confusion / member-map shadowing (bans,
+invite refs and the member map are keyed by the 64-bit id), NOT signature
+forgery. The cheap 40-bit label is UI/mention-token only and never keys these
+maps. See `mention.rs` for the label's lossy round-trip handling.
 */
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Ord, PartialOrd, Copy)]
 pub struct MemberId(pub FastHash);
