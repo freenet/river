@@ -19,7 +19,7 @@ jobs:
     # at $0.022/min even on public repos. See .github/workflows/build.yml.
     runs-on: ubicloud-standard-8
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
       with:
         submodules: recursive
         fetch-depth: 0
