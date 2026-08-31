@@ -5430,34 +5430,23 @@ impl ApiClient {
         let my_member_id: MemberId = signing_key.verifying_key().into();
         let owner_member_id: MemberId = room_owner_key.into();
 
-        // Resolve the member to ban. A full base58 verifying key (from
-        // `member list`'s `verifying_key`) matches its exact derived id; anything
-        // else is matched by the 8-char short ID (prefix / first-8, first-match).
+        // Resolve the member to ban via the same shared resolver the deputy
+        // commands use: a full base58 verifying key (from `member list`) matches
+        // its exact derived id, anything else the 8-char short ID (prefix /
+        // first-8, first-match). No deputy fallback for a ban target.
         let key_target = crate::deputies::member_id_from_key_input(member_id_short);
-        let target_member = room_state
-            .member_info
-            .member_info
-            .iter()
-            .find(|info| {
-                let member_id = info.member_info.member_id;
-                match key_target {
-                    Some(target) => member_id == target,
-                    None => {
-                        let member_id_str = member_id.to_string();
-                        member_id_str.starts_with(member_id_short)
-                            || member_id_str[..8.min(member_id_str.len())]
-                                .eq_ignore_ascii_case(member_id_short)
-                    }
-                }
-            })
-            .ok_or_else(|| {
-                anyhow!(
-                    "Member '{}' not found. Use 'member list' to see member IDs.",
-                    member_id_short
-                )
-            })?;
-
-        let banned_member_id = target_member.member_info.member_id;
+        let banned_member_id = resolve_deputy_target(
+            &room_state.member_info.member_info,
+            &[],
+            member_id_short,
+            false,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "Member '{}' not found. Use 'member list' to see member IDs.",
+                member_id_short
+            )
+        })?;
 
         // A full-key input already names the exact member, so it satisfies the
         // require-exact preflight by construction; only a short-id input can be

@@ -47,8 +47,9 @@ End-to-end-encrypted one-to-one messages between two members of the same room.
 They travel inside the room's contract state, so both people must already be
 members — there is no cross-room DM.
 
-The recipient is a member ID: either the short 8-character form that
-`riverctl member list` prints, or the full ID.
+The recipient is a member: either the short 8-character ID that
+`riverctl member list` prints, or the member's full verifying key (also from
+`member list`), which names them unambiguously.
 
 ```bash
 riverctl member list <room-owner-vk>             # Find the recipient's member ID.
@@ -124,6 +125,12 @@ riverctl message stream <room-owner-vk> --format json --no-version-check |
   jq -c --arg me "$me" 'select(.author != $me)'
 ```
 
+`message list --format json` also carries `author_verifying_key` — the author's
+full base58 key (or `null` when the author is no longer in the room). The
+`author` short id can be filtered on cheaply as above, but a bot deciding
+whether to *trust* a command should compare this full key, since the short id is
+a 40-bit truncation. Get the trusted keys from `member list`'s `verifying_key`.
+
 (The `author` inside `reply_to` is a display nickname, not a member ID — only
 the top-level `author` is comparable.)
 
@@ -177,6 +184,14 @@ riverctl member ban          <room-owner-vk> <member-id>
 member banning within their own invite subtree, or a deputy of such a member
 (see below).
 
+Wherever a command takes `<member-id>` (`ban`, `deputize`, `revoke-deputy`,
+`deputies`, `deputized-by`, and `dm send`'s recipient), you can pass either the
+8-character short ID or the member's full **verifying key** — the base58 key
+`member list` prints. The short ID is a 40-bit truncation that two members can
+share (so it can be ambiguous); the full key names exactly one member. Compare
+the full `verifying_key` whenever you must be sure who a member is — for example
+a bot allow-listing which members may issue commands.
+
 ### Deputies
 
 A deputy can ban within their deputizer's invite subtree. Deputies are
@@ -226,9 +241,10 @@ themselves and are printed next to an authority claim, so an unescaped one could
 forge a line that reads as a real deputy grant. The `-f json` output carries the
 faithful nickname.
 
-`member list --format json` gains `deputies` (who this member deputized) and
-`deputized_by` (who deputized them) alongside the existing `member_id` and
-`nickname`. `debug room-state` gains `deputy_grant_count` and `deputy_grants`.
+`member list --format json` carries `member_id`, `nickname`, `verifying_key`
+(the member's full base58 ed25519 key, or `null` when unknown), and the deputy
+fields `deputies` (who this member deputized) and `deputized_by` (who deputized
+them). `debug room-state` gains `deputy_grant_count` and `deputy_grants`.
 
 Two caveats worth knowing:
 

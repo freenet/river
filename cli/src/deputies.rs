@@ -515,6 +515,23 @@ fn invite_subtrees(state: &ChatRoomStateV1) -> HashMap<MemberId, HashSet<MemberI
     subtrees
 }
 
+/// If `input` is a full base58-encoded 32-byte ed25519 verifying key, the
+/// [`MemberId`] it derives to; otherwise `None`.
+///
+/// This is the precise way to name a member on the command line: unlike the
+/// 8-character short id (a 40-bit truncation that two members can share), a full
+/// verifying key resolves via its derived 64-bit `MemberId` — the same id the
+/// room keys every member by, so it names exactly one member of any given room
+/// (two distinct members cannot occupy one `MemberId`). A caller uses this as a
+/// fast path and falls back to short-id matching when it returns `None`. The
+/// base58 form matches what `member list` / `identity whoami` print as
+/// `verifying_key`, so a key copied from either resolves here.
+pub fn member_id_from_key_input(input: &str) -> Option<MemberId> {
+    let bytes = bs58::decode(input.trim()).into_vec().ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    VerifyingKey::from_bytes(&arr).ok().map(MemberId::from)
+}
+
 /// Everyone a ban of `target` would remove from the room: `target` themselves
 /// PLUS their entire transitive invite subtree — exactly what the contract's
 /// `check_banned_members` inserts (the banned user) and then extends with
@@ -524,21 +541,6 @@ fn invite_subtrees(state: &ChatRoomStateV1) -> HashMap<MemberId, HashSet<MemberI
 /// the already-tested walk, carries the cycle guard the contract omits, and a
 /// room is small enough that a one-off single-root variant would only be a
 /// second thing to keep correct.
-/// If `input` is a full base58-encoded 32-byte ed25519 verifying key, the
-/// [`MemberId`] it derives to; otherwise `None`.
-///
-/// This is the exact, collision-proof way to name a member on the command line:
-/// unlike the 8-character short id (a 40-bit truncation that two members can
-/// share), a full verifying key identifies exactly one member. A caller uses
-/// this as a fast path and falls back to short-id matching when it returns
-/// `None`. The base58 form matches what `member list` / `identity whoami` print
-/// as `verifying_key`, so a key copied from either resolves here.
-pub fn member_id_from_key_input(input: &str) -> Option<MemberId> {
-    let bytes = bs58::decode(input.trim()).into_vec().ok()?;
-    let arr: [u8; 32] = bytes.try_into().ok()?;
-    VerifyingKey::from_bytes(&arr).ok().map(MemberId::from)
-}
-
 pub fn ban_removal_set(state: &ChatRoomStateV1, target: MemberId) -> HashSet<MemberId> {
     let mut removed = invite_subtrees(state).remove(&target).unwrap_or_default();
     removed.insert(target);
