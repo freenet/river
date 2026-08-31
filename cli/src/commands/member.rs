@@ -127,7 +127,19 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                     let party = deputies.party(id);
                     let granted_by: Vec<MemberId> =
                         deputized_by.get(&id).cloned().unwrap_or_default();
-                    (party, deputies.deputies_of(id).to_vec(), granted_by)
+                    // The full verifying key — the collision-proof identity to
+                    // compare when trusting a member (the `member_id` label is a
+                    // 40-bit truncation). `None` for a member with no key in
+                    // state (e.g. a pruned deputy named only by a signed grant).
+                    let verifying_key = deputies
+                        .verifying_key(id)
+                        .map(|vk| bs58::encode(vk.as_bytes()).into_string());
+                    (
+                        party,
+                        deputies.deputies_of(id).to_vec(),
+                        granted_by,
+                        verifying_key,
+                    )
                 })
                 .collect();
 
@@ -137,7 +149,7 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                         println!("No members found in room.");
                     } else {
                         println!("\n{} member(s) found:\n", members.len());
-                        for (party, _own_deputies, granted_by) in &members {
+                        for (party, _own_deputies, granted_by, verifying_key) in &members {
                             // Escaped and quoted: an unescaped nickname can
                             // forge a row that reads as a real deputy grant,
                             // and `colored` drops the colour that would
@@ -156,6 +168,12 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                                 print!("{}", format!("  deputy of: {}", names.join(", ")).yellow());
                             }
                             println!();
+                            // The collision-proof identifier. Printed plain (no
+                            // colour) so it copies cleanly into an allow-list;
+                            // absent only for a member with no key in state.
+                            if let Some(vk) = verifying_key {
+                                println!("      key: {}", vk);
+                            }
                         }
                         println!();
                     }
@@ -163,8 +181,13 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                 OutputFormat::Json => {
                     let json_members: Vec<_> = members
                         .into_iter()
-                        .map(|(party, own_deputies, granted_by)| {
-                            member_list_json(&party, &own_deputies, &granted_by)
+                        .map(|(party, own_deputies, granted_by, verifying_key)| {
+                            member_list_json(
+                                &party,
+                                &own_deputies,
+                                &granted_by,
+                                verifying_key.as_deref(),
+                            )
                         })
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&json_members)?);
@@ -484,9 +507,15 @@ fn member_list_json(
     party: &DeputyParty,
     own_deputies: &[MemberId],
     granted_by: &[MemberId],
+    verifying_key: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "member_id": party.member_id,
+        // The base58 ed25519 public key — the collision-proof identity, matching
+        // `identity whoami`'s `verifying_key` field. `null` (not "") when no key
+        // is in state for this member, since absence of a key is meaningful (a
+        // consumer must not treat a missing key as an empty string to compare).
+        "verifying_key": verifying_key,
         "nickname": party.nickname.clone().unwrap_or_default(),
         "deputies": ids_to_strings(own_deputies),
         "deputized_by": ids_to_strings(granted_by),
@@ -668,7 +697,7 @@ mod tests {
             is_owner: false,
             in_room: true,
         };
-        let json = member_list_json(&party, &[b], &[]);
+        let json = member_list_json(&party, &[b], &[], Some("SoMeBaSe58Key"));
         assert_eq!(json["member_id"], a.to_string());
         assert_eq!(json["nickname"], "Alice");
         assert_eq!(json["deputies"][0], b.to_string());
@@ -676,6 +705,9 @@ mod tests {
             json["deputized_by"].as_array().unwrap().is_empty(),
             "an empty list, not null"
         );
+        // The collision-proof identity is surfaced as base58, mirroring
+        // `whoami`'s `verifying_key` field.
+        assert_eq!(json["verifying_key"], "SoMeBaSe58Key");
 
         // A member with no readable nickname renders as an empty string, not
         // null, matching the pre-deputy-command behaviour.
@@ -685,10 +717,13 @@ mod tests {
             is_owner: false,
             in_room: true,
         };
-        let json = member_list_json(&anonymous, &[], &[a]);
+        let json = member_list_json(&anonymous, &[], &[a], None);
         assert_eq!(json["nickname"], "");
         assert!(!json["nickname"].is_null());
         assert_eq!(json["deputized_by"][0], a.to_string());
+        // No key in state for this member => explicit null (a consumer must be
+        // able to tell "no key known" from an empty string it might compare).
+        assert!(json["verifying_key"].is_null());
     }
 
     #[test]
