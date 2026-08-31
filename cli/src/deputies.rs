@@ -159,6 +159,10 @@ pub struct RoomDeputies<'a> {
     subtrees: HashMap<MemberId, HashSet<MemberId>>,
     /// Index required by `MembersV1::is_ban_authorized`, built once.
     members_by_id: HashMap<MemberId, &'a AuthorizedMember>,
+    /// The room owner's verifying key. The owner is never in `members_by_id`
+    /// (they are not in `members.members`), so their key is held separately to
+    /// answer [`Self::verifying_key`] for the owner.
+    owner_vk: VerifyingKey,
 }
 
 impl<'a> RoomDeputies<'a> {
@@ -223,6 +227,26 @@ impl<'a> RoomDeputies<'a> {
             known_ids,
             subtrees,
             members_by_id,
+            owner_vk: *owner_vk,
+        }
+    }
+
+    /// The member's ed25519 verifying key — their cryptographic identity — when
+    /// this room state carries it: the room owner, or a current member of
+    /// `members.members`. Returns `None` for any other id — for example one that
+    /// appears only in a deputizer's signed `deputies` record with no member of
+    /// its own — for whom no key is stored.
+    ///
+    /// This is the collision-PROOF identifier. The `member_id` label printed
+    /// elsewhere is a 40-bit truncation of a 64-bit non-cryptographic hash, so
+    /// anything making a trust decision about a member (e.g. a bot allow-list)
+    /// MUST compare this key, never the short label. See the note on
+    /// `MemberId` in `river-core` (`room_state::member`).
+    pub fn verifying_key(&self, id: MemberId) -> Option<VerifyingKey> {
+        if id == self.owner_id {
+            Some(self.owner_vk)
+        } else {
+            self.members_by_id.get(&id).map(|m| m.member.member_vk)
         }
     }
 
@@ -740,6 +764,25 @@ mod tests {
 
     fn no_secrets() -> HashMap<u32, [u8; 32]> {
         HashMap::new()
+    }
+
+    #[test]
+    fn verifying_key_resolves_owner_and_members_and_is_none_for_unknown() {
+        let owner = key(1);
+        let alice = key(2);
+        let bob = key(3);
+        let stranger = key(9); // never a member of this room
+        let state = room(&owner, &[&alice, &bob]);
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+
+        // Owner: keyed separately since the owner is never in `members.members`.
+        assert_eq!(d.verifying_key(id(&owner)), Some(owner.verifying_key()));
+        // Current members resolve to their real signing identity.
+        assert_eq!(d.verifying_key(id(&alice)), Some(alice.verifying_key()));
+        assert_eq!(d.verifying_key(id(&bob)), Some(bob.verifying_key()));
+        // An id with no member/owner record yields None, never a wrong key.
+        assert_eq!(d.verifying_key(id(&stranger)), None);
     }
 
     #[test]
