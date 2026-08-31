@@ -5430,16 +5430,25 @@ impl ApiClient {
         let my_member_id: MemberId = signing_key.verifying_key().into();
         let owner_member_id: MemberId = room_owner_key.into();
 
-        // Find the member to ban by their short ID (first 8 chars of member_id string)
+        // Resolve the member to ban. A full base58 verifying key (from
+        // `member list`'s `verifying_key`) matches its exact derived id; anything
+        // else is matched by the 8-char short ID (prefix / first-8, first-match).
+        let key_target = crate::deputies::member_id_from_key_input(member_id_short);
         let target_member = room_state
             .member_info
             .member_info
             .iter()
             .find(|info| {
-                let member_id_str = info.member_info.member_id.to_string();
-                member_id_str.starts_with(member_id_short)
-                    || member_id_str[..8.min(member_id_str.len())]
-                        .eq_ignore_ascii_case(member_id_short)
+                let member_id = info.member_info.member_id;
+                match key_target {
+                    Some(target) => member_id == target,
+                    None => {
+                        let member_id_str = member_id.to_string();
+                        member_id_str.starts_with(member_id_short)
+                            || member_id_str[..8.min(member_id_str.len())]
+                                .eq_ignore_ascii_case(member_id_short)
+                    }
+                }
             })
             .ok_or_else(|| {
                 anyhow!(
@@ -5450,7 +5459,13 @@ impl ApiClient {
 
         let banned_member_id = target_member.member_info.member_id;
 
-        if safety.require_exact_member_id && banned_member_id.to_string() != member_id_short {
+        // A full-key input already names the exact member, so it satisfies the
+        // require-exact preflight by construction; only a short-id input can be
+        // a non-exact (prefix) match that this guard must reject.
+        if safety.require_exact_member_id
+            && key_target.is_none()
+            && banned_member_id.to_string() != member_id_short
+        {
             return Err(anyhow!(
                 "Safety preflight refused: '{}' is not the exact current member ID '{}'.",
                 member_id_short,
@@ -6147,6 +6162,17 @@ fn resolve_deputy_target(
     member_id_short: &str,
     allow_deputy_fallback: bool,
 ) -> Option<MemberId> {
+    // Exact, collision-proof fast path: a full base58 verifying key names one
+    // member directly, so match its derived id exactly rather than by prefix.
+    if let Some(target) = crate::deputies::member_id_from_key_input(member_id_short) {
+        let present = member_infos
+            .iter()
+            .any(|info| info.member_info.member_id == target);
+        if present || (allow_deputy_fallback && own_deputies.contains(&target)) {
+            return Some(target);
+        }
+        return None;
+    }
     let matches = |id: &MemberId| {
         let s = id.to_string();
         s.starts_with(member_id_short) || s[..8.min(s.len())].eq_ignore_ascii_case(member_id_short)
@@ -6223,6 +6249,41 @@ mod deputy_resolve_tests {
         assert_eq!(
             resolve_deputy_target(&member_infos, &own_deputies, "zzzzzzzz", true),
             None
+        );
+    }
+
+    /// A full base58 verifying key names one member exactly, so it resolves the
+    /// same targets as the short id would — present member in either mode, a
+    /// pruned deputy only under the revoke fallback, a stranger never.
+    #[test]
+    fn resolve_deputy_target_accepts_a_full_verifying_key() {
+        let present = SigningKey::from_bytes(&[7u8; 32]);
+        let pruned_deputy = SigningKey::from_bytes(&[9u8; 32]);
+        let stranger = SigningKey::from_bytes(&[11u8; 32]);
+        let present_id: MemberId = present.verifying_key().into();
+        let pruned_id: MemberId = pruned_deputy.verifying_key().into();
+        let member_infos = vec![info(&present)];
+        let own_deputies = vec![pruned_id];
+        let key = |sk: &SigningKey| bs58::encode(sk.verifying_key().as_bytes()).into_string();
+
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &key(&present), false),
+            Some(present_id)
+        );
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &key(&pruned_deputy), true),
+            Some(pruned_id),
+            "revoke resolves a pruned deputy by full key via the fallback"
+        );
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &key(&pruned_deputy), false),
+            None,
+            "deputize must not resolve a non-member by full key"
+        );
+        assert_eq!(
+            resolve_deputy_target(&member_infos, &own_deputies, &key(&stranger), true),
+            None,
+            "a stranger's key resolves to nobody"
         );
     }
 }

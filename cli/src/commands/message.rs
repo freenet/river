@@ -5,6 +5,7 @@ use base64::Engine;
 use chrono::{DateTime, Local, Utc};
 use clap::Subcommand;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use river_core::room_state::member::MemberId;
 use river_core::room_state::message::MessageId;
 use serde_json::json;
 
@@ -330,6 +331,23 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                     }
                 }
                 OutputFormat::Json => {
+                    // Resolve an author's full verifying key (base58) — the
+                    // collision-proof identity, matching `member list`'s
+                    // `verifying_key`. `None` when the author is neither the
+                    // owner nor a current member (e.g. a since-departed author of
+                    // an older message), since their key is no longer in state.
+                    // JSON only: a bot reading messages allow-lists on this key,
+                    // whereas the human chat view stays terse.
+                    let owner_id = MemberId::from(&room_owner_key);
+                    let members_by_id = room_state.members.members_by_member_id();
+                    let author_verifying_key = |author: MemberId| -> Option<String> {
+                        let vk = if author == owner_id {
+                            Some(room_owner_key)
+                        } else {
+                            members_by_id.get(&author).map(|m| m.member.member_vk)
+                        };
+                        vk.map(|k| bs58::encode(k.as_bytes()).into_string())
+                    };
                     let json_messages: Vec<_> = messages
                         .iter()
                         .map(|msg| {
@@ -406,6 +424,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             json!({
                                 "message_id": message_id_str,
                                 "author": author_str,
+                                "author_verifying_key": author_verifying_key(msg.message.author),
                                 "nickname": nickname,
                                 "content": content,
                                 "timestamp": datetime.to_rfc3339(),

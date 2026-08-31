@@ -267,6 +267,15 @@ impl<'a> RoomDeputies<'a> {
         if short.is_empty() {
             return Err(ResolveError::NotFound);
         }
+        // Exact, collision-proof fast path: a full base58 verifying key resolves
+        // directly to its member, bypassing the ambiguous 8-char prefix match.
+        if let Some(target) = member_id_from_key_input(short) {
+            return if self.known_ids.contains(&target) {
+                Ok(target)
+            } else {
+                Err(ResolveError::NotFound)
+            };
+        }
         let matches: Vec<MemberId> = self
             .known_ids
             .iter()
@@ -515,6 +524,21 @@ fn invite_subtrees(state: &ChatRoomStateV1) -> HashMap<MemberId, HashSet<MemberI
 /// the already-tested walk, carries the cycle guard the contract omits, and a
 /// room is small enough that a one-off single-root variant would only be a
 /// second thing to keep correct.
+/// If `input` is a full base58-encoded 32-byte ed25519 verifying key, the
+/// [`MemberId`] it derives to; otherwise `None`.
+///
+/// This is the exact, collision-proof way to name a member on the command line:
+/// unlike the 8-character short id (a 40-bit truncation that two members can
+/// share), a full verifying key identifies exactly one member. A caller uses
+/// this as a fast path and falls back to short-id matching when it returns
+/// `None`. The base58 form matches what `member list` / `identity whoami` print
+/// as `verifying_key`, so a key copied from either resolves here.
+pub fn member_id_from_key_input(input: &str) -> Option<MemberId> {
+    let bytes = bs58::decode(input.trim()).into_vec().ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    VerifyingKey::from_bytes(&arr).ok().map(MemberId::from)
+}
+
 pub fn ban_removal_set(state: &ChatRoomStateV1, target: MemberId) -> HashSet<MemberId> {
     let mut removed = invite_subtrees(state).remove(&target).unwrap_or_default();
     removed.insert(target);
@@ -783,6 +807,44 @@ mod tests {
         assert_eq!(d.verifying_key(id(&bob)), Some(bob.verifying_key()));
         // An id with no member/owner record yields None, never a wrong key.
         assert_eq!(d.verifying_key(id(&stranger)), None);
+    }
+
+    #[test]
+    fn member_id_from_key_input_parses_full_keys_and_rejects_non_keys() {
+        let alice = key(2);
+        let alice_key = bs58::encode(alice.verifying_key().as_bytes()).into_string();
+        // A full base58 verifying key derives its member id.
+        assert_eq!(member_id_from_key_input(&alice_key), Some(id(&alice)));
+        // The 8-char short id, empty input, and non-base58 garbage are not keys.
+        assert_eq!(member_id_from_key_input(&id(&alice).to_string()), None);
+        assert_eq!(member_id_from_key_input(""), None);
+        assert_eq!(member_id_from_key_input("not a key 0OIl"), None);
+        // A base58 blob of the wrong length is not a 32-byte key.
+        assert_eq!(
+            member_id_from_key_input(&bs58::encode([1u8; 31]).into_string()),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_short_id_accepts_a_full_verifying_key_exactly() {
+        let owner = key(1);
+        let alice = key(2);
+        let bob = key(3);
+        let stranger = key(9);
+        let state = room(&owner, &[&alice, &bob]);
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        let full = |sk: &SigningKey| bs58::encode(sk.verifying_key().as_bytes()).into_string();
+
+        // A member's full key resolves to their exact id (owner included).
+        assert_eq!(d.resolve_short_id(&full(&alice)), Ok(id(&alice)));
+        assert_eq!(d.resolve_short_id(&full(&owner)), Ok(id(&owner)));
+        // A well-formed key for a non-member is NotFound, never a wrong member.
+        assert_eq!(
+            d.resolve_short_id(&full(&stranger)),
+            Err(ResolveError::NotFound)
+        );
     }
 
     #[test]
