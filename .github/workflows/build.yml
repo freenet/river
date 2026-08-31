@@ -47,7 +47,7 @@ jobs:
         targets: wasm32-unknown-unknown
     
     - name: Cache cargo
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -58,7 +58,7 @@ jobs:
           ${{ runner.os }}-cargo-
     
     - name: Cache cargo-make
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/bin/cargo-make
         key: ${{ runner.os }}-cargo-make
@@ -74,7 +74,7 @@ jobs:
 
     - name: Cache Dioxus CLI
       id: cache-dioxus-cli
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/bin/dx
         # Re-key on ui/Cargo.toml so a dioxus version bump invalidates the
@@ -303,7 +303,7 @@ jobs:
         targets: wasm32-unknown-unknown
 
     - name: Cache cargo
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -314,7 +314,7 @@ jobs:
           ${{ runner.os }}-cargo-
 
     - name: Cache cargo-make
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/bin/cargo-make
         key: ${{ runner.os }}-cargo-make
@@ -330,7 +330,7 @@ jobs:
 
     - name: Cache Dioxus CLI
       id: cache-dioxus-cli
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/bin/dx
         # Re-key on ui/Cargo.toml so a dioxus version bump invalidates the
