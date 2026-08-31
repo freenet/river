@@ -26,7 +26,8 @@ pub enum MemberCommands {
     Ban {
         /// Room ID (owner key in base58)
         room_id: String,
-        /// Member ID to ban (8-character short ID from member list)
+        /// Member to ban: an 8-character short ID, or the member's full verifying
+        /// key (from `member list`) to name one exactly.
         member_id: String,
         /// Refuse prefix/case-folded resolution; the supplied ID must match exactly.
         #[arg(long)]
@@ -42,14 +43,16 @@ pub enum MemberCommands {
     Deputize {
         /// Room ID (owner key in base58)
         room_id: String,
-        /// Member ID to deputize (8-character short ID from member list)
+        /// Member to deputize: an 8-character short ID, or the member's full verifying
+        /// key (from `member list`) to name one exactly.
         member_id: String,
     },
     /// Revoke a member's deputy authority (their prior bans stop enforcing)
     RevokeDeputy {
         /// Room ID (owner key in base58)
         room_id: String,
-        /// Member ID whose deputy authority to revoke (8-character short ID)
+        /// Member whose deputy authority to revoke: an 8-character short ID, or
+        /// the member's full verifying key (from `member list`).
         member_id: String,
     },
     /// Show the deputies a member has appointed ("who has X deputized?")
@@ -63,8 +66,9 @@ pub enum MemberCommands {
     Deputies {
         /// Room ID (owner key in base58)
         room_id: String,
-        /// Member ID whose deputies to list (8-character short ID from member
-        /// list). Defaults to your own identity in this room.
+        /// Member whose deputies to list: an 8-character short ID, or the
+        /// member's full verifying key (from `member list`). Defaults to your
+        /// own identity in this room.
         member_id: Option<String>,
     },
     /// Show who has deputized a member ("is X a deputy of anyone?")
@@ -76,7 +80,8 @@ pub enum MemberCommands {
     DeputizedBy {
         /// Room ID (owner key in base58)
         room_id: String,
-        /// Member ID to look up (8-character short ID from member list)
+        /// Member to look up: an 8-character short ID, or the member's full verifying
+        /// key (from `member list`) to name one exactly.
         member_id: String,
     },
 }
@@ -549,7 +554,8 @@ fn resolve_or_explain(deputies: &RoomDeputies<'_>, short: &str) -> Result<Member
             short
         ),
         ResolveError::Ambiguous(ids) => anyhow!(
-            "Member ID '{}' is ambiguous: it matches {}. Pass the full 8-character ID.",
+            "Member ID '{}' is ambiguous: it matches {}. Pass the full 8-character ID, \
+             or the member's full verifying key (from 'member list') to name one exactly.",
             short,
             ids.join(", ")
         ),

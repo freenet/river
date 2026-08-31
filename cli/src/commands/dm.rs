@@ -1190,6 +1190,27 @@ fn resolve_recipient_vk(
     // error even though both matches resolve to the same destination
     // key (Skeptical-review #4 on pass 3).
     let owner_id = MemberId::from(room_owner_key);
+
+    // Exact fast path: a full base58 verifying key (from `member list`) names one
+    // recipient directly, so resolve it without the ambiguous prefix match.
+    if let Some(target) = crate::deputies::member_id_from_key_input(needle) {
+        if target == owner_id {
+            return Ok(*room_owner_key);
+        }
+        if let Some(m) = state
+            .members
+            .members
+            .iter()
+            .find(|m| m.member.id() == target)
+        {
+            return Ok(m.member.member_vk);
+        }
+        return Err(anyhow!(
+            "No member with verifying key '{}' is in this room (try `riverctl member list`).",
+            needle
+        ));
+    }
+
     let mut matches: Vec<(MemberId, VerifyingKey)> = state
         .members
         .members
@@ -1683,6 +1704,52 @@ mod tests {
                 .to_string();
             assert!(err.contains("ambiguous"), "got: {err}");
         }
+    }
+
+    #[test]
+    fn resolve_recipient_vk_accepts_a_full_verifying_key() {
+        use ed25519_dalek::SigningKey;
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use river_core::room_state::member::{AuthorizedMember, Member, MembersV1};
+        use river_core::ChatRoomStateV1;
+
+        let owner_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let alice_sk = SigningKey::from_bytes(&[2u8; 32]);
+        let stranger_sk = SigningKey::from_bytes(&[9u8; 32]);
+
+        let alice = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: alice_sk.verifying_key(),
+            },
+            &owner_sk,
+        );
+        let state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(Configuration::default(), &owner_sk),
+            members: MembersV1 {
+                members: vec![alice],
+            },
+            ..Default::default()
+        };
+        let full = |sk: &SigningKey| bs58::encode(sk.verifying_key().as_bytes()).into_string();
+
+        // A member's full key resolves to their vk exactly; the owner's too.
+        assert_eq!(
+            resolve_recipient_vk(&state, &owner_vk, &full(&alice_sk)).unwrap(),
+            alice_sk.verifying_key()
+        );
+        assert_eq!(
+            resolve_recipient_vk(&state, &owner_vk, &full(&owner_sk)).unwrap(),
+            owner_vk
+        );
+        // A well-formed key for a non-member errors, never a wrong recipient.
+        let err = resolve_recipient_vk(&state, &owner_vk, &full(&stranger_sk))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("verifying key"), "got: {err}");
     }
 
     /// `apply_per_pair_cap` must drop the oldest entries for any

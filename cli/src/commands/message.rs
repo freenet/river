@@ -5,6 +5,7 @@ use base64::Engine;
 use chrono::{DateTime, Local, Utc};
 use clap::Subcommand;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use river_core::room_state::member::MemberId;
 use river_core::room_state::message::MessageId;
 use serde_json::json;
 
@@ -330,6 +331,23 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                     }
                 }
                 OutputFormat::Json => {
+                    // Resolve an author's full verifying key (base58) — the
+                    // collision-proof identity, matching `member list`'s
+                    // `verifying_key`. `None` when the author is neither the
+                    // owner nor a current member (e.g. a since-departed author of
+                    // an older message), since their key is no longer in state.
+                    // JSON only: a bot reading messages allow-lists on this key,
+                    // whereas the human chat view stays terse.
+                    // Reuse the same owner/member resolution as `member list`
+                    // (`RoomDeputies::verifying_key`) rather than reimplementing
+                    // it, so the two cannot drift.
+                    let deputies =
+                        crate::deputies::RoomDeputies::new(&room_state, &room_owner_key, &secrets);
+                    let author_verifying_key = |author: MemberId| -> Option<String> {
+                        deputies
+                            .verifying_key(author)
+                            .map(|k| bs58::encode(k.as_bytes()).into_string())
+                    };
                     let json_messages: Vec<_> = messages
                         .iter()
                         .map(|msg| {
@@ -406,6 +424,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                             json!({
                                 "message_id": message_id_str,
                                 "author": author_str,
+                                "author_verifying_key": author_verifying_key(msg.message.author),
                                 "nickname": nickname,
                                 "content": content,
                                 "timestamp": datetime.to_rfc3339(),
@@ -700,6 +719,31 @@ mod tests {
         assert!(
             squashed.contains(r#""reactors":reactors,"#),
             "message list must expose who reacted, not only a count"
+        );
+    }
+
+    #[test]
+    fn message_list_json_exposes_author_verifying_key() {
+        let source = include_str!("message.rs");
+        // Scan production only (see the cut rationale above), else the needle
+        // matches its own literal here and the pin passes vacuously.
+        let production = source
+            .split_once("mod tests")
+            .map(|(before, _)| before)
+            .expect("test module marker missing; the cut would scan everything");
+        let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // The author's full key is the collision-proof identity a bot allow-lists
+        // on; it must be in the JSON, resolved via the shared RoomDeputies helper
+        // (whose owner/member/None behaviour is unit-tested in `deputies`).
+        assert!(
+            squashed
+                .contains(r#""author_verifying_key":author_verifying_key(msg.message.author),"#),
+            "message list JSON must expose the author's verifying key"
+        );
+        assert!(
+            squashed.contains("RoomDeputies::new(&room_state,&room_owner_key,&secrets)"),
+            "author key must resolve via the shared RoomDeputies helper, not a re-implementation"
         );
     }
 

@@ -2,6 +2,19 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.14] - 2026-08-31
+
+### Added
+- Member-targeting commands (`member ban`, `member deputize`,
+  `member revoke-deputy`, `member deputies`, `member deputized-by`) now accept a
+  member's full base58 verifying key in place of the 8-character short ID. A
+  full key names exactly one member (the short ID is a 40-bit truncation that
+  two members can share), so it resolves unambiguously and satisfies
+  `--require-exact-member-id` by construction.
+- `message list --format json` now includes an `author_verifying_key` field
+  (base58, or `null` when the author is no longer in room state), so a bot can
+  identify a message's author by their collision-proof key.
+
 ## [0.2.13] - 2026-08-31
 
 ### Added
