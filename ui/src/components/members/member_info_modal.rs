@@ -425,6 +425,18 @@ pub fn MemberInfoModal() -> Element {
         // Get the member ID string to display
         let member_id_str = member_id.to_string();
 
+        // The member's full ed25519 verifying key (base58) — the collision-proof
+        // identity, matching what riverctl's `member list` / `identity whoami`
+        // print as `verifying_key`. The short "Member ID" above is only a 40-bit
+        // truncation two members can share; this key names exactly one member,
+        // so it is what to compare when you must be sure who a member is. For the
+        // owner it's the room key; otherwise the member's own key.
+        let verifying_key_str = if is_owner {
+            owner_key_signal().map(|vk| bs58::encode(vk.as_bytes()).into_string())
+        } else {
+            member.map(|m| bs58::encode(m.member.member_vk.as_bytes()).into_string())
+        };
+
         rsx! {
             // Modal backdrop
             div {
@@ -597,6 +609,26 @@ pub fn MemberInfoModal() -> Element {
                                 class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text font-mono text-sm",
                                 value: "{member_id_str}",
                                 readonly: true
+                            }
+                        }
+
+                        // The full verifying key — the collision-proof identity.
+                        // Shown as its own read-only field so it can be copied
+                        // into an allow-list; the short Member ID above is a
+                        // 40-bit truncation and should not be trusted for that.
+                        if let Some(vk_str) = verifying_key_str.as_ref() {
+                            div {
+                                class: "mb-4",
+                                label {
+                                    class: "block text-sm font-medium text-text-muted mb-2",
+                                    "Verifying key"
+                                }
+                                input {
+                                    "data-testid": "member-info-verifying-key-input",
+                                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-text font-mono text-sm",
+                                    value: "{vk_str}",
+                                    readonly: true
+                                }
                             }
                         }
 
