@@ -38,7 +38,7 @@ integration-test = ["net"]
 
 [dev-dependencies]
 anyhow = "1.0"
-freenet = "0.1.179"
+freenet = "0.2.113"
 once_cell.workspace = true
 rand.workspace = true
 tempfile = "3.0"
