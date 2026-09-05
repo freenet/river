@@ -160,11 +160,22 @@ pub fn App() -> Element {
     //   processes again). Project rule "Never defer signal clears in
     //   `use_effect`" is explicit about this.
     use_effect(move || {
+        // freenet/river#559: anchor before the fallible try_read below — this
+        // effect's ONLY read is `INTERCEPTED_INVITATION_CODE`, so a contended
+        // pass would otherwise come out with zero subscriptions and never
+        // re-run for the rest of the session (same defect as #555, but for
+        // `use_effect`'s `reset_and_run_in`, not `Memo`'s).
+        crate::util::signal_guard::anchor();
         let pending = {
-            let g = crate::components::invite_click_interceptor::INTERCEPTED_INVITATION_CODE
+            match crate::components::invite_click_interceptor::INTERCEPTED_INVITATION_CODE
                 .try_read()
-                .ok();
-            g.and_then(|opt| opt.clone())
+            {
+                Ok(opt) => opt.clone(),
+                Err(_) => {
+                    crate::util::signal_guard::schedule_nudge();
+                    None
+                }
+            }
         };
         let Some(code) = pending else {
             return;
@@ -312,9 +323,18 @@ pub fn App() -> Element {
     // the Err path can mask a present invitation for a render tick; pin
     // the "writes always defer" invariant via grep when extending callers.
     use_effect(move || {
+        // freenet/river#559: anchor before the fallible try_read below — same
+        // single-fallible-dependency latch risk as the click-interceptor
+        // bridge above.
+        crate::util::signal_guard::anchor();
         let pending = {
-            let g = PRESENT_INVITATION_REQUEST.try_read().ok();
-            g.and_then(|opt| opt.clone())
+            match PRESENT_INVITATION_REQUEST.try_read() {
+                Ok(opt) => opt.clone(),
+                Err(_) => {
+                    crate::util::signal_guard::schedule_nudge();
+                    None
+                }
+            }
         };
         let Some(inv) = pending else {
             return;
@@ -414,9 +434,20 @@ pub fn App() -> Element {
     // auto-seeded as already-read (Codex / Skeptical found that the
     // previous always-run version defeated the unread feature).
     use_effect(|| {
+        // freenet/river#559: anchor before the fallible ROOMS read below —
+        // this effect's only read is ROOMS, so a contended pass would
+        // otherwise leave it with zero subscriptions and it would never
+        // re-run, silently defeating the seeding this comment describes.
+        crate::util::signal_guard::anchor();
         // Touch ROOMS to register a subscription so this effect re-runs
         // on hydration.
-        let _hydration_marker = ROOMS.try_read().map(|r| r.map.len()).unwrap_or(0);
+        let _hydration_marker = match ROOMS.try_read() {
+            Ok(r) => r.map.len(),
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                0
+            }
+        };
         crate::components::direct_messages::seed_dm_last_seen_if_needed();
     });
 
@@ -428,7 +459,17 @@ pub fn App() -> Element {
     // We deliberately do NOT subscribe to OUTBOUND_DMS here — that
     // would loop, since prune mutates OUTBOUND_DMS.
     use_effect(|| {
-        let _rooms_marker = ROOMS.try_read().map(|r| r.map.len()).unwrap_or(0);
+        // freenet/river#559: anchor before the fallible ROOMS read below —
+        // same single-fallible-dependency latch risk as the DM-seed effect
+        // above (this effect's only read is ROOMS too).
+        crate::util::signal_guard::anchor();
+        let _rooms_marker = match ROOMS.try_read() {
+            Ok(r) => r.map.len(),
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                0
+            }
+        };
         crate::components::app::chat_delegate::prune_outbound_dms_for_purges();
     });
 
@@ -439,6 +480,13 @@ pub fn App() -> Element {
         // Watch NEEDS_SYNC signal for USER-initiated changes only
         // This prevents infinite loops from network response updates to ROOMS
         use_effect(move || {
+            // freenet/river#559: anchor before the fallible ROOMS read below.
+            // This effect also unconditionally reads NEEDS_SYNC above, so a
+            // contended ROOMS pass degrades (it stays subscribed to
+            // NEEDS_SYNC) rather than latching — but nudge anyway so a
+            // dropped `has_rooms` doesn't wait on the next unrelated
+            // NEEDS_SYNC write to retry.
+            crate::util::signal_guard::anchor();
             let rooms_needing_sync = NEEDS_SYNC.read().clone();
 
             if !rooms_needing_sync.is_empty() {
@@ -449,7 +497,13 @@ pub fn App() -> Element {
 
                 // Get all the data we need upfront to avoid nested borrows
                 let message_sender = SYNCHRONIZER.read().get_message_sender();
-                let has_rooms = ROOMS.try_read().map(|r| !r.map.is_empty()).unwrap_or(false);
+                let has_rooms = match ROOMS.try_read() {
+                    Ok(r) => !r.map.is_empty(),
+                    Err(_) => {
+                        crate::util::signal_guard::schedule_nudge();
+                        false
+                    }
+                };
                 let has_invitations = !PENDING_INVITES.read().map.is_empty();
 
                 // Save and clear NEEDS_SYNC synchronously to prevent infinite re-runs

@@ -647,8 +647,19 @@ pub fn count_unread_behind_rooms_panel() -> usize {
     // silently stuck. The non-try read first guarantees at least the
     // CURRENT_ROOM subscription always survives (same pattern as
     // `current_room_label` in conversation.rs).
+    //
+    // This function is called as `use_memo(count_unread_behind_rooms_panel)`
+    // (`conversation.rs`'s `panel_unread`) — the fallible read lives OUTSIDE
+    // the `use_memo(...)` body text, so `signal_guard`'s source-scrape pin
+    // (which only scans inside `use_memo(...)` parens) cannot see it. Anchor
+    // and nudge here anyway (freenet/river#559): CURRENT_ROOM already
+    // degrades safely, but nudging lets a contended pass retry promptly
+    // instead of waiting on an unrelated CURRENT_ROOM change. See
+    // `count_unread_behind_rooms_panel_anchors_and_nudges` below for the pin.
+    crate::util::signal_guard::anchor();
     let current = CURRENT_ROOM.read().owner_key;
     let Ok(rooms) = ROOMS.try_read() else {
+        crate::util::signal_guard::schedule_nudge();
         return 0;
     };
     count_unread_excluding_room(&rooms.map, &rooms.notification_modes, current.as_ref())
@@ -1019,6 +1030,65 @@ mod tests {
                  is freenet/river#500"
             );
         }
+    }
+
+    /// freenet/river#559: `count_unread_behind_rooms_panel` is called as
+    /// `use_memo(count_unread_behind_rooms_panel)` in `conversation.rs`'s
+    /// `panel_unread` — the fallible `ROOMS.try_read()` lives in THIS
+    /// function, outside the `use_memo(...)` body text, so
+    /// `signal_guard`'s pin (which only scans inside `use_memo(...)`
+    /// parens) cannot see it. Pin it here instead: a contended pass that
+    /// drops the anchor/nudge would leave `panel_unread` degraded, only
+    /// re-evaluating on an unrelated `CURRENT_ROOM` change.
+    #[test]
+    fn count_unread_behind_rooms_panel_anchors_and_nudges() {
+        let source = include_str!("document_title.rs");
+        let prod = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("document_title.rs should have a `#[cfg(test)] mod tests` block")];
+        let code: String = prod
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+        let marker = "pubfncount_unread_behind_rooms_panel()->usize{";
+        let start = squashed.find(marker).unwrap_or_else(|| {
+            panic!(
+                "count_unread_behind_rooms_panel's signature changed shape — \
+                 re-anchor this pin, do not delete it"
+            )
+        });
+        let body = &squashed[start..];
+        let end = body[marker.len()..]
+            .find("pubfn")
+            .map(|i| i + marker.len())
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let anchor = body.find("signal_guard::anchor()").unwrap_or_else(|| {
+            panic!(
+                "count_unread_behind_rooms_panel reads ROOMS with try_read() but \
+                 never calls signal_guard::anchor() before it. Called as \
+                 `use_memo(count_unread_behind_rooms_panel)` in conversation.rs, \
+                 a contended pass can leave that memo without the guard \
+                 (freenet/river#559)."
+            )
+        });
+        let first_try = body
+            .find("try_read(")
+            .expect("count_unread_behind_rooms_panel should still call ROOMS.try_read()");
+        assert!(
+            anchor < first_try,
+            "signal_guard::anchor() must be called BEFORE the first try_read() \
+             in count_unread_behind_rooms_panel"
+        );
+        assert!(
+            body.contains("signal_guard::schedule_nudge()"),
+            "count_unread_behind_rooms_panel must call schedule_nudge() on the \
+             ROOMS.try_read() Err branch (freenet/river#559)"
+        );
     }
 
     use crate::constants::ROOM_CONTRACT_WASM;
