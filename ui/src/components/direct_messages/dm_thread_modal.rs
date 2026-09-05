@@ -141,10 +141,22 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
     //    correct semantics regardless: we only ever want to merge
     //    once per DM_DRAFT arrival.
     use_effect(move || {
+        // freenet/river#559: anchor before the fallible try_read below —
+        // `room`/`peer` are plain captured props (not signals) and `draft`
+        // is read via `peek()` further down (deliberately non-reactive), so
+        // DM_DRAFT is this effect's ONLY subscription. A contended pass would
+        // otherwise leave it with zero subscriptions and it would never
+        // re-fire, permanently breaking the invite-via-DM draft merge for
+        // this thread.
+        crate::util::signal_guard::anchor();
         let pending = {
-            let g = DM_DRAFT.try_read().ok();
-            g.and_then(|opt| opt.clone())
-                .filter(|(r, p, _)| *r == room && *p == peer)
+            match DM_DRAFT.try_read() {
+                Ok(opt) => opt.clone().filter(|(r, p, _)| *r == room && *p == peer),
+                Err(_) => {
+                    crate::util::signal_guard::schedule_nudge();
+                    None
+                }
+            }
         };
         if let Some((_, _, body)) = pending {
             // Clear DM_DRAFT SYNCHRONOUSLY before any further state

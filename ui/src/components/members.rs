@@ -1712,9 +1712,18 @@ fn ExportIdentityModal(is_active: Signal<bool>) -> Element {
     // Generate the export token when modal opens
     use_effect(move || {
         if *is_active.read() {
+            // freenet/river#559: anchor before the fallible ROOMS read below.
+            // `is_active` and `CURRENT_ROOM` are both read infallibly first,
+            // so a contended pass degrades rather than latches — but anchor
+            // and nudge anyway for the same reason as the `use_memo` sites
+            // this mirrors (freenet/river#555): consistency, and so a
+            // contended pass retries promptly instead of waiting on an
+            // unrelated `is_active`/`CURRENT_ROOM` change.
+            crate::util::signal_guard::anchor();
             let room_owner = CURRENT_ROOM.read().owner_key;
             if let Some(owner_key) = room_owner {
                 let Ok(rooms_read) = ROOMS.try_read() else {
+                    crate::util::signal_guard::schedule_nudge();
                     return;
                 };
                 if let Some(room_data) = rooms_read.map.get(&owner_key) {

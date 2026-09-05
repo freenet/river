@@ -161,6 +161,24 @@ mod tests {
         ),
     ];
 
+    /// Same requirement as [`GUARDED_MEMO_SITES`], for `use_effect(...)`
+    /// bodies (freenet/river#559). `use_effect` rebuilds its dependency set
+    /// on every pass via the same `reset_and_run_in` primitive `Memo` uses
+    /// (`dioxus-hooks-0.7.9/src/use_effect.rs:34`), so an effect that
+    /// early-returns on a contended `try_read()` and reads nothing else is
+    /// subscribed to nothing and dead for the rest of the session.
+    const GUARDED_EFFECT_SITES: &[(&str, &str)] = &[
+        ("app.rs", include_str!("../components/app.rs")),
+        (
+            "members.rs ExportIdentityModal",
+            include_str!("../components/members.rs"),
+        ),
+        (
+            "dm_thread_modal.rs DM_DRAFT merge",
+            include_str!("../components/direct_messages/dm_thread_modal.rs"),
+        ),
+    ];
+
     /// Cut production source at the test module so a needle appearing only in a
     /// test cannot satisfy the pin. Splits on `mod tests`, not
     /// `#[cfg(test)]`, because attributes also decorate non-test items.
@@ -184,21 +202,22 @@ mod tests {
             .join("\n")
     }
 
-    /// Body of each `use_memo(...)`, delimited by balancing the parenthesis the
-    /// call opens. Whole-file scanning is not good enough: these files also
-    /// `try_read()` from event handlers, which is legitimate and unrelated, and a
-    /// naive "first try_read in the file" check flags it.
+    /// Body of each `<prefix>(...)` call (e.g. `use_memo(` or `use_effect(`),
+    /// delimited by balancing the parenthesis the call opens. Whole-file
+    /// scanning is not good enough: these files also `try_read()` from event
+    /// handlers, which is legitimate and unrelated, and a naive "first
+    /// try_read in the file" check flags it.
     /// Scans BYTES, not chars: these files contain non-ASCII (em dashes and the
     /// like), so char indices and byte offsets diverge, and mixing them silently
     /// slices the wrong region — which made an earlier version of this pin report
     /// "no memo reads fallibly" for a file with four of them. `(` and `)` are
     /// ASCII, so byte scanning is exact here.
-    fn memo_bodies(src: &str) -> Vec<(usize, &str)> {
+    fn hook_bodies<'a>(src: &'a str, prefix: &str) -> Vec<(usize, &'a str)> {
         let bytes = src.as_bytes();
         let mut out = Vec::new();
         let mut search = 0usize;
-        while let Some(rel) = src[search..].find("use_memo(") {
-            let open = search + rel + "use_memo(".len() - 1; // byte offset of '('
+        while let Some(rel) = src[search..].find(prefix) {
+            let open = search + rel + prefix.len() - 1; // byte offset of '('
             let start_line = src[..open].matches('\n').count() + 1;
             let mut depth = 0i32;
             let mut end = None;
@@ -221,6 +240,18 @@ mod tests {
             search = open + 1;
         }
         out
+    }
+
+    fn memo_bodies(src: &str) -> Vec<(usize, &str)> {
+        hook_bodies(src, "use_memo(")
+    }
+
+    /// Same shape as [`memo_bodies`], for `use_effect(...)` (freenet/river#559:
+    /// `use_effect` rebuilds its dependency set on every pass via the same
+    /// `reset_and_run_in` primitive as `Memo`, so it has the identical
+    /// contended-`try_read` latch risk).
+    fn effect_bodies(src: &str) -> Vec<(usize, &str)> {
+        hook_bodies(src, "use_effect(")
     }
 
     /// Every memo that reads a signal fallibly must read the anchor FIRST and
@@ -294,6 +325,77 @@ mod tests {
              {checked}. If you added or removed a fallible memo, update this \
              number deliberately; if you did not, the matcher has stopped \
              finding memo bodies and this pin has gone vacuous."
+        );
+    }
+
+    /// Same requirement as [`every_fallible_memo_anchors_before_its_first_try_read_and_nudges`],
+    /// for `use_effect(...)` bodies (freenet/river#559). Checked per effect
+    /// body, not per file: each effect rebuilds its own dependency set, so an
+    /// anchor in a sibling effect (or in a memo elsewhere in the same file)
+    /// protects nothing.
+    #[test]
+    fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
+        let mut checked = 0usize;
+        for (name, src) in GUARDED_EFFECT_SITES {
+            let prod = strip_line_comments(production_only(src));
+            let bodies = effect_bodies(&prod);
+            assert!(
+                !bodies.is_empty(),
+                "{name}: no use_effect found; the brace matcher or the file \
+                 changed shape. Fix the pin rather than deleting it."
+            );
+            let mut fallible_in_file = 0usize;
+            for (line, body) in bodies {
+                let Some(first_try) = body.find("try_read(") else {
+                    continue;
+                };
+                fallible_in_file += 1;
+                checked += 1;
+                let anchor = body.find("signal_guard::anchor").unwrap_or_else(|| {
+                    panic!(
+                        "{name}: use_effect at line {line} reads a signal with \
+                         try_read() but never calls signal_guard::anchor(). A \
+                         contended pass can leave it with zero subscriptions and \
+                         it will never re-run for the rest of the session \
+                         (freenet/river#559)."
+                    )
+                });
+                assert!(
+                    anchor < first_try,
+                    "{name}: use_effect at line {line} calls \
+                     signal_guard::anchor() AFTER its first try_read( — on the \
+                     Err path the anchor is never reached, so it registers \
+                     nothing (freenet/river#559)."
+                );
+                let reads = body.matches("try_read(").count();
+                let nudges = body.matches("signal_guard::schedule_nudge").count();
+                assert!(
+                    nudges >= reads,
+                    "{name}: use_effect at line {line} has {reads} fallible \
+                     read(s) but only {nudges} schedule_nudge() call(s). Every \
+                     read that can fail needs a nudge on its own failure \
+                     branch, or that signal's subscription is dropped with \
+                     nothing to restore it (freenet/river#559)."
+                );
+            }
+            assert!(
+                fallible_in_file > 0,
+                "{name}: listed in GUARDED_EFFECT_SITES but no use_effect reads \
+                 fallibly. Remove the entry rather than leaving a vacuous pin."
+            );
+        }
+        // EXACT count, not a floor — see the sibling memo test's comment for
+        // why: a floor would stay green even if the matcher stopped finding
+        // some of app.rs's five fallible effects. Seven fallible use_effect
+        // reads across the three files (app.rs has five, members.rs and
+        // dm_thread_modal.rs one each) is the full set freenet/river#559
+        // identified.
+        assert_eq!(
+            checked, 7,
+            "expected to check exactly the 7 known fallible effects, checked \
+             {checked}. If you added or removed a fallible effect, update this \
+             number deliberately; if you did not, the matcher has stopped \
+             finding effect bodies and this pin has gone vacuous."
         );
     }
 
