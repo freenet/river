@@ -4064,6 +4064,22 @@ mod tests {
              shortcut — an early Ok(()) reintroduces the LiveImportSeam::flush \
              durability bug this PR's redesign closes (freenet/river#530)"
         );
+        // `!body.contains("return Ok")` alone doesn't catch a conditional
+        // TAIL expression bypassing the real write with no `return` keyword
+        // at all, e.g. `if cond { Ok(()) } else { coalesce_save(...).await }`
+        // — both anchor strings below would still appear, in order, while
+        // the real control flow skips the write (testing-review, round 2).
+        // The correct body is a flat two-statement sequence with no
+        // branching at all, so also require there be no `if` in it.
+        assert!(
+            !body.contains("if "),
+            "save_outbound_dms_to_delegate must be an unconditional sequence \
+             — hydrate, then always save. A conditional here (even one that \
+             still textually mentions both the hydration wait and \
+             coalesce_save) could skip the real write on some branch, \
+             reintroducing the LiveImportSeam::flush durability bug \
+             (freenet/river#530)"
+        );
         let await_hydration = body
             .find("await_outbound_dms_hydration().await")
             .expect("must await the hydration latch");
@@ -7407,6 +7423,18 @@ static OUTBOUND_DMS_HYDRATED: AtomicBool = AtomicBool::new(false);
 /// new user. A LEGACY delegate's response must NOT call this: its data still
 /// needs merging into the current-delegate baseline, and marking hydrated
 /// early would let a save land before that baseline is known.
+///
+/// **Always call this via `crate::util::defer`, never bare/synchronously**
+/// (round-2 skeptical review on PR #670). `handle_outbound_dms_get_response`
+/// registers this AFTER `hydrate_hidden_dm_threads` / `hydrate_outbound_dms_cache`,
+/// whose own signal writes are themselves scheduled via `defer`. Deferring
+/// this call too means it can only run — and the latch can only become
+/// `true` — once those macrotasks have already executed (`setTimeout(0)`
+/// tasks run FIFO). Calling it bare would flip the latch synchronously,
+/// before the merge it depends on has actually landed; a caller resumed via
+/// a MICROTASK (not gated by macrotask FIFO at all) could then observe
+/// `true` and read the signals early, reproducing the #530 truncation bug in
+/// a rarer, timing-dependent form.
 pub(crate) fn mark_outbound_dms_hydrated() {
     OUTBOUND_DMS_HYDRATED.store(true, Ordering::Release);
 }
@@ -7431,6 +7459,18 @@ const OUTBOUND_DMS_HYDRATION_POLL_INTERVAL: std::time::Duration =
 /// silent data loss for the rest of the session (skeptical review on PR
 /// #670): without a bound, every subsequent archive/DM-send would await
 /// forever instead of eventually completing (with a logged warning).
+///
+/// **Accepted residual (skeptical review, round 2):** if the wait genuinely
+/// times out — the `GetResponse` never arrives at all within 15s — the save
+/// that follows IS the original #530 truncation bug, just gated behind a
+/// much rarer trigger (total silence from the delegate for 15s, vs. any
+/// user action landing in a normally-sub-second window). This is a
+/// deliberate trade-off, not an oversight: the alternative (waiting forever)
+/// converts a rare truncation into a certain, permanent, silent no-op for
+/// the rest of the session, which is worse. Closing this residual fully
+/// would mean re-firing `fire_load_outbound_dms_request` on timeout rather
+/// than giving up — out of scope for this fix; tracked as a follow-up
+/// consideration, not a blocking gap.
 const OUTBOUND_DMS_HYDRATION_MAX_POLLS: u32 = 300;
 
 /// Poll `flag` every `interval` (yielding via [`crate::util::sleep`] between

@@ -2014,20 +2014,36 @@ fn hydrate_loaded_rooms_with_authority(
 /// under the current delegate's key.
 ///
 /// **Marks the hydration latch for the CURRENT delegate (freenet/river#530).**
-/// Every return path for `!is_legacy_delegate` calls
-/// [`mark_outbound_dms_hydrated`] — including "no blob" (an empty disk is
-/// still an authoritative baseline for a new user) and a deserialize failure
-/// (the blob is unreadable either way; the alternative is a save path stuck
-/// waiting forever). `save_outbound_dms_to_delegate` polls this latch with a
-/// real yield between checks (see `await_flag_with_bound`), so any caller
-/// that observes the latch flip has necessarily yielded back to the event
-/// loop at least once first — by which point this function's own
-/// `hydrate_hidden_dm_threads` / `hydrate_outbound_dms_cache` calls (issued
-/// synchronously, earlier in this same call) have already had their
-/// deferred signal writes run. The exact position of the `mark_outbound_dms_hydrated`
-/// call relative to those two calls is therefore NOT load-bearing — only
-/// that all three happen within this one synchronous invocation, which they
-/// do.
+/// Every return path for `!is_legacy_delegate` schedules
+/// [`mark_outbound_dms_hydrated`] via [`crate::util::defer`] — including
+/// "no blob" (an empty disk is still an authoritative baseline for a new
+/// user) and a deserialize failure (the blob is unreadable either way; the
+/// alternative is a save path stuck waiting forever).
+///
+/// **Why deferred, not called synchronously (skeptical review, round 2 on PR
+/// #670).** An earlier version set the latch SYNCHRONOUSLY here, reasoning
+/// that any caller checking it would necessarily do so only after yielding
+/// back to the event loop, by which point this function's own
+/// `hydrate_hidden_dm_threads` / `hydrate_outbound_dms_cache` calls (which
+/// only SCHEDULE their real signal writes via their own `defer`, rather than
+/// performing them inline) would have already run. That reasoning was
+/// unsound: "yielded back to the event loop" does not imply "after every
+/// already-scheduled MACROTASK" — a caller resumed via a MICROTASK (e.g. a
+/// `LiveImportSeam::flush` continuation already suspended on an `.await`)
+/// could observe the latch as `true` and read the signals before the merge
+/// macrotasks had actually executed, reproducing #530 in a rarer,
+/// timing-dependent form. Deferring the latch flip itself into its own
+/// macrotask fixes this structurally: since it is `defer()`-ed AFTER
+/// `hydrate_hidden_dm_threads` / `hydrate_outbound_dms_cache` in the `Ok`
+/// branch, `setTimeout(0)` macrotasks run FIFO, so this macrotask cannot
+/// execute — and therefore the latch cannot become `true` — until AFTER
+/// those two have already run their merges. No caller, microtask- or
+/// macrotask-scheduled, can observe `true` before the merge has happened,
+/// because the merge is a precondition of the flip existing at all. The
+/// "no blob" / parse-failure branches defer for the same reason, uniformly,
+/// even though they have no merge to wait for — so the invariant "the latch
+/// is only ever flipped from inside a deferred macrotask" holds without a
+/// branch-specific exception to remember.
 fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: bool) {
     let Some(bytes) = value else {
         info!(
@@ -2039,7 +2055,7 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: 
             }
         );
         if !is_legacy_delegate {
-            mark_outbound_dms_hydrated();
+            crate::util::defer(mark_outbound_dms_hydrated);
         }
         return;
     };
@@ -2059,7 +2075,7 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: 
                 }
             );
             if !is_legacy_delegate {
-                mark_outbound_dms_hydrated();
+                crate::util::defer(mark_outbound_dms_hydrated);
             }
             if is_legacy_delegate && (count > 0 || hidden_count > 0) {
                 // Persist the merged cache under the current delegate
@@ -2095,7 +2111,7 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: 
         Err(e) => {
             error!("Failed to deserialize outbound-DMs blob: {}", e);
             if !is_legacy_delegate {
-                mark_outbound_dms_hydrated();
+                crate::util::defer(mark_outbound_dms_hydrated);
             }
         }
     }
@@ -2501,8 +2517,8 @@ mod tests {
         );
     }
 
-    /// freenet/river#530: `handle_outbound_dms_get_response` must mark the
-    /// hydration latch on EVERY return path for the CURRENT (non-legacy)
+    /// freenet/river#530: `handle_outbound_dms_get_response` must schedule the
+    /// hydration latch flip on EVERY return path for the CURRENT (non-legacy)
     /// delegate — no blob present, a successfully parsed blob, and a
     /// deserialize failure — and NEVER for a legacy delegate's response
     /// (whose data still needs merging into the current baseline first; see
@@ -2510,20 +2526,42 @@ mod tests {
     /// tell "gated by `!is_legacy_delegate`" apart from "gated the wrong way
     /// / not gated at all" — inverting or deleting the guard leaves the count
     /// at 3 either way — so this additionally requires each call to be
-    /// immediately preceded by the guard.
+    /// immediately preceded by the guard. Known limitation (testing-review,
+    /// round 2): this is a text scan, not a parser — it does not strip
+    /// comments, so a guard reduced to `// if !is_legacy_delegate {` would
+    /// still satisfy it. Accepted: that shape is not idiomatic Rust and
+    /// would itself look wrong on any human read of the diff.
+    ///
+    /// Also pins the round-2 skeptical-review fix: the latch must be flipped
+    /// from WITHIN a deferred macrotask (`crate::util::defer(mark_outbound_dms_hydrated)`),
+    /// never called bare/synchronously — a bare synchronous call let a
+    /// microtask-scheduled caller (e.g. `LiveImportSeam::flush`) observe the
+    /// latch as `true` before `hydrate_hidden_dm_threads` /
+    /// `hydrate_outbound_dms_cache`'s own deferred merges had actually run,
+    /// reproducing #530 in a rarer, timing-dependent form.
     #[test]
     fn outbound_dms_hydration_latch_is_marked_on_every_current_delegate_return_path() {
         let src = include_str!("response_handler.rs");
         let prod = src.split("mod tests {").next().unwrap_or(src);
+        let deferred_call = "crate::util::defer(mark_outbound_dms_hydrated);";
         assert_eq!(
-            prod.matches("mark_outbound_dms_hydrated();").count(),
+            prod.matches(deferred_call).count(),
             3,
-            "handle_outbound_dms_get_response must call mark_outbound_dms_hydrated() \
-             exactly 3 times: no-blob, parsed-ok, and parse-failure"
+            "handle_outbound_dms_get_response must schedule mark_outbound_dms_hydrated() \
+             via crate::util::defer exactly 3 times: no-blob, parsed-ok, and \
+             parse-failure"
+        );
+        assert!(
+            !prod.contains("mark_outbound_dms_hydrated();"),
+            "mark_outbound_dms_hydrated must never be called bare/synchronously \
+             in this file — it must always be scheduled via crate::util::defer, \
+             or a microtask-scheduled caller could observe the latch flip \
+             before the merge it depends on has actually run (round-2 \
+             skeptical review, freenet/river#530)"
         );
         let guarded = "if !is_legacy_delegate {";
         let guarded_call_count = prod
-            .match_indices("mark_outbound_dms_hydrated();")
+            .match_indices(deferred_call)
             .filter(|(idx, _)| {
                 // The guard's `{` must be the nearest preceding `{` — i.e. no
                 // OTHER brace opens in between — so this can't be fooled by
@@ -2537,10 +2575,10 @@ mod tests {
             .count();
         assert_eq!(
             guarded_call_count, 3,
-            "every mark_outbound_dms_hydrated() call must be the first statement \
-             inside an `if !is_legacy_delegate {{` block — a flipped or missing \
-             guard would let a legacy delegate's response mark hydration early \
-             and reintroduce the #530 truncation bug"
+            "every deferred mark_outbound_dms_hydrated scheduling must be the \
+             first statement inside an `if !is_legacy_delegate {{` block — a \
+             flipped or missing guard would let a legacy delegate's response \
+             mark hydration early and reintroduce the #530 truncation bug"
         );
     }
 
