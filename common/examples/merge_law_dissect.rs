@@ -61,11 +61,7 @@ struct Traced {
 
 /// Hand-rolled equivalent of the generated `ChatRoomStateV1::apply_delta`,
 /// stopping just before `post_apply_cleanup`.
-fn merge_traced(
-    a: &ChatRoomStateV1,
-    b: &ChatRoomStateV1,
-    p: &ChatRoomParametersV1,
-) -> Traced {
+fn merge_traced(a: &ChatRoomStateV1, b: &ChatRoomStateV1, p: &ChatRoomParametersV1) -> Traced {
     let parent = a.clone();
     let my_summary = a.summarize(&parent, p);
     let delta_in = b.delta(&parent, p, &my_summary);
@@ -198,8 +194,7 @@ fn retention(s: &ChatRoomStateV1, p: &ChatRoomParametersV1) -> Retention {
     // Closure, tracking which seed reached each added ancestor.
     let mut required = seeds.clone();
     let mut witnesses: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
-    let mut to_process: Vec<(MemberId, MemberId)> =
-        seeds.iter().map(|s| (*s, *s)).collect();
+    let mut to_process: Vec<(MemberId, MemberId)> = seeds.iter().map(|s| (*s, *s)).collect();
     while let Some((id, seed)) = to_process.pop() {
         if let Some(m) = members_by_id.get(&id) {
             let inv = m.member.invited_by;
@@ -304,7 +299,10 @@ fn main() {
         println!("\n================ merge({tag}) ================");
         let t = merge_traced(x, y, &p);
         println!("delta was None: {}", t.delta_was_none);
-        println!("receiver held {} DMs, horizon={:?}", t.dm_in_receiver, t.receiver_horizon);
+        println!(
+            "receiver held {} DMs, horizon={:?}",
+            t.dm_in_receiver, t.receiver_horizon
+        );
         println!("delta offered {} new DMs", t.delta_dm_offered);
         println!(
             "after DM field apply_delta: {} DMs (receiver {} + offered {} = {} before caps/drops)",
@@ -334,7 +332,10 @@ fn main() {
                 .collect();
             println!("     members_at_dm_apply contains {pref}: {:?}", hit);
         }
-        println!("     members_at_dm_apply.len()={}", t.members_at_dm_apply.len());
+        println!(
+            "     members_at_dm_apply.len()={}",
+            t.members_at_dm_apply.len()
+        );
         println!(
             "  held-but-absent after apply: {} (receiver DMs the apply removed)",
             t.held_but_absent.len()
@@ -384,9 +385,7 @@ fn main() {
             }
             // step 0: ban enforcement
             let mut st = s0.clone();
-            let enforced =
-                st.members
-                    .banned_member_ids(&st.bans, &st.member_info, &p);
+            let enforced = st.members.banned_member_ids(&st.bans, &st.member_info, &p);
             for id in &watch {
                 println!("     enforced_banned({id:?})={}", enforced.contains(id));
             }
@@ -455,7 +454,10 @@ fn main() {
                 println!(
                     "     LOST {} sig={:02x}{:02x}{:02x}{:02x} in_A={} in_B={}",
                     dm_key(m),
-                    sig[0], sig[1], sig[2], sig[3],
+                    sig[0],
+                    sig[1],
+                    sig[2],
+                    sig[3],
                     ka.contains(&sig),
                     kb.contains(&sig),
                 );

@@ -80,12 +80,20 @@ fn main() {
 
     let ab = merge(&sa, &sb, &params);
     let ba = merge(&sb, &sa, &params);
-    println!("\nmerge(A,B): members={} msgs={} dms={} bytes={}",
-        ab.members.members.len(), ab.recent_messages.messages.len(),
-        ab.direct_messages.messages.len(), ser(&ab).len());
-    println!("merge(B,A): members={} msgs={} dms={} bytes={}",
-        ba.members.members.len(), ba.recent_messages.messages.len(),
-        ba.direct_messages.messages.len(), ser(&ba).len());
+    println!(
+        "\nmerge(A,B): members={} msgs={} dms={} bytes={}",
+        ab.members.members.len(),
+        ab.recent_messages.messages.len(),
+        ab.direct_messages.messages.len(),
+        ser(&ab).len()
+    );
+    println!(
+        "merge(B,A): members={} msgs={} dms={} bytes={}",
+        ba.members.members.len(),
+        ba.recent_messages.messages.len(),
+        ba.direct_messages.messages.len(),
+        ser(&ba).len()
+    );
     println!("equal = {}", ser(&ab) == ser(&ba));
 
     let (ia, ib) = (ids(&ab), ids(&ba));
@@ -117,7 +125,10 @@ fn main() {
         ser(&ab2) == ser(&ab),
         ser(&ba2) == ser(&ba)
     );
-    println!("after one extra cleanup each, equal = {}", ser(&ab2) == ser(&ba2));
+    println!(
+        "after one extra cleanup each, equal = {}",
+        ser(&ab2) == ser(&ba2)
+    );
 
     // How many cleanup passes until a fixpoint, and do the two orders meet there?
     let fix = |mut s: ChatRoomStateV1| -> (ChatRoomStateV1, usize) {
@@ -144,24 +155,35 @@ fn main() {
     let r2 = merge(&ba, &ab, &params);
     println!(
         "\nround 2: merge(AB,BA) members={} dms={} bytes={}",
-        r1.members.members.len(), r1.direct_messages.messages.len(), ser(&r1).len()
+        r1.members.members.len(),
+        r1.direct_messages.messages.len(),
+        ser(&r1).len()
     );
     println!(
         "round 2: merge(BA,AB) members={} dms={} bytes={}",
-        r2.members.members.len(), r2.direct_messages.messages.len(), ser(&r2).len()
+        r2.members.members.len(),
+        r2.direct_messages.messages.len(),
+        ser(&r2).len()
     );
     println!("round-2 equal = {}", ser(&r1) == ser(&r2));
 
     // DM symmetric difference between the two orders.
     let dm_key = |m: &river_core::room_state::direct_messages::AuthorizedDirectMessage| {
-        format!("{:?}->{:?}@{:?}", m.message.sender, m.message.recipient, m.message.timestamp)
+        format!(
+            "{:?}->{:?}@{:?}",
+            m.message.sender, m.message.recipient, m.message.timestamp
+        )
     };
     let dab: HashSet<String> = ab.direct_messages.messages.iter().map(dm_key).collect();
     let dba: HashSet<String> = ba.direct_messages.messages.iter().map(dm_key).collect();
     println!("\nDMs only in merge(A,B): {}", dab.difference(&dba).count());
-    for k in dab.difference(&dba).take(8) { println!("   {k}"); }
+    for k in dab.difference(&dba).take(8) {
+        println!("   {k}");
+    }
     println!("DMs only in merge(B,A): {}", dba.difference(&dab).count());
-    for k in dba.difference(&dab).take(8) { println!("   {k}"); }
+    for k in dba.difference(&dab).take(8) {
+        println!("   {k}");
+    }
 
     // MECHANISM: on the non-idempotent side, what changes between cleanup pass
     // 1 and pass 2? Report bans / members / dms after each pass.
@@ -169,8 +191,12 @@ fn main() {
     let mut s = ba.clone();
     let target: Vec<MemberId> = only_ba.iter().cloned().collect();
     let report = |tag: &str, s: &ChatRoomStateV1| {
-        let authors: HashSet<MemberId> =
-            s.recent_messages.messages.iter().map(|m| m.message.author).collect();
+        let authors: HashSet<MemberId> = s
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| m.message.author)
+            .collect();
         let dmp = s.direct_messages.active_participants();
         let cur = s.secrets.current_version;
         let secr: HashSet<MemberId> = s
@@ -183,8 +209,12 @@ fn main() {
         let banners: HashSet<MemberId> = s.bans.0.iter().map(|b| b.banned_by).collect();
         println!(
             "  {tag}: members={} bans={} msgs={} dms={} secrets@cur={} distinct_authors={}",
-            s.members.members.len(), s.bans.0.len(), s.recent_messages.messages.len(),
-            s.direct_messages.messages.len(), secr.len(), authors.len()
+            s.members.members.len(),
+            s.bans.0.len(),
+            s.recent_messages.messages.len(),
+            s.direct_messages.messages.len(),
+            secr.len(),
+            authors.len()
         );
         for id in &target {
             let present = s.members.members.iter().any(|m| m.member.id() == *id);
@@ -229,11 +259,18 @@ fn main() {
         .filter(|m| !dba.contains(&dm_key(m)))
         .flat_map(|m| [m.message.sender, m.message.recipient])
         .collect();
-    println!("participants of the DMs swept in merge(B,A): {:?}", swept_participants);
+    println!(
+        "participants of the DMs swept in merge(B,A): {:?}",
+        swept_participants
+    );
     for pid in &swept_participants {
         let c = chain(*pid);
         let hits: Vec<_> = c.iter().filter(|x| target.contains(x)).collect();
-        println!("  chain({pid:?}) len={} contains leftover member: {:?}", c.len(), hits);
+        println!(
+            "  chain({pid:?}) len={} contains leftover member: {:?}",
+            c.len(),
+            hits
+        );
         // also: is this participant still a member in each order?
         println!(
             "     member in merge(A,B)={} in merge(B,A)={}",

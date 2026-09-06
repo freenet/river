@@ -114,12 +114,19 @@ fn main() {
                 }
                 (x, y) => {
                     if x.is_err() != y.is_err() {
-                        println!("ASYMMETRIC ERROR {na} x {nb}: {:?} / {:?}", x.err(), y.err());
+                        println!(
+                            "ASYMMETRIC ERROR {na} x {nb}: {:?} / {:?}",
+                            x.err(),
+                            y.err()
+                        );
                     }
                 }
             }
         }
     }
-    println!("\ncommutativity: {comm_fail} failing pairs out of {} ", states.len() * (states.len() - 1) / 2);
+    println!(
+        "\ncommutativity: {comm_fail} failing pairs out of {} ",
+        states.len() * (states.len() - 1) / 2
+    );
     println!("differing-field tally: {field_tally:?}");
 }
