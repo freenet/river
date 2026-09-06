@@ -110,6 +110,18 @@ impl ChatRoomStateV1 {
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
         let owner_id = MemberId::from(&parameters.owner);
 
+        // Snapshot for the equality assert below. Taken HERE, before step 0-cap
+        // mutates `self.bans`, because this is the one point where `self` still
+        // holds exactly what `parent_state` held when the `direct_messages`
+        // field applied — the four inputs `enforced_ban_set_of` reads
+        // (`configuration`, `bans`, `members`, `member_info`) are all final by
+        // then and none is touched between there and here.
+        #[cfg(debug_assertions)]
+        let dm_apply_time_ban_set = {
+            let snapshot = self.clone();
+            crate::room_state::direct_messages::enforced_ban_set_of(&snapshot, parameters)
+        };
+
         // 0-cap. Enforce `max_user_bans` FIRST — BEFORE ban enforcement (step 0)
         //     and the banner inactivity-prune exemption (step 2) — so both read
         //     the FINAL surviving (post-cap) ban set (#411 round 7 / Codex P1
@@ -197,6 +209,30 @@ impl ChatRoomStateV1 {
         let enforced_banned_ids =
             self.members
                 .banned_member_ids(&self.bans, &self.member_info, parameters);
+
+        // THE load-bearing invariant of the freenet/river#675 remedy: the ban
+        // set `DirectMessagesV1::apply_delta` derived, before this function
+        // ran, must EQUAL the one step 0 computes here. The apply-time sweep
+        // deletes DMs against its set and step 6 re-tests against this one; if
+        // they diverge, the apply-time sweep can delete a DM step 6 would have
+        // kept, which is permanent user data loss with no error anywhere.
+        //
+        // Asserted rather than argued, because this PR's whole thesis is that
+        // predicate agreement must not be left to two copies agreeing in
+        // comments. `dm_ban_derivation_must_apply_the_user_ban_cap` catches the
+        // known way to break it at one explicit site; this catches ANY way, at
+        // every site the existing suite already exercises — including a future
+        // change to field-application order, or to when `member_info`
+        // converges, which no test would otherwise notice.
+        //
+        // `debug_assert` so the release WASM pays nothing.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            dm_apply_time_ban_set, enforced_banned_ids,
+            "enforced_ban_set_of (at DM apply) diverged from step 0's enforced_banned_ids; \
+             the apply-time DM sweep and the step-6 sweep are no longer the same predicate \
+             (freenet/river#675)"
+        );
         self.members
             .members
             .retain(|m| !enforced_banned_ids.contains(&m.member.id()));
@@ -1691,16 +1727,26 @@ mod tests {
     /// of being it; this one has a milder version of that shape, so the gap is
     /// stated rather than left for a reader to assume away.
     ///
-    /// Coincidental coverage is broader than it looks: the field-reorder
-    /// mutation fails FOUR tests — this one,
+    /// Coincidental coverage exists but is SHRINKING, which is the argument for
+    /// keeping this pin rather than against it. The field-reorder mutation
+    /// currently fails three tests: this one,
     /// `pruned_sender_can_dm_when_bundling_rejoin_delta` (the #291 rejoin pin),
-    /// and two of this PR's own,
-    /// `global_cap_must_not_evict_legitimate_dms_for_doomed_ones` and
-    /// `whole_state_merge_is_associative_for_the_671_shape`. That argues FOR
-    /// keeping this one rather than against: all three others depend on a
-    /// particular DM shape that a future author could legitimately rework, and
-    /// this is the only one whose failure message names the reason and the
-    /// issue number.
+    /// and `whole_state_merge_is_associative_for_the_671_shape`.
+    ///
+    /// It was FOUR before the #675 remedy.
+    /// `global_cap_must_not_evict_legitimate_dms_for_doomed_ones` stopped
+    /// detecting the reorder, and the reason is worth recording rather than
+    /// treating as loss: its doomed DMs have an OWNER-banned endpoint, and the
+    /// now-ban-aware apply-time sweep removes those on the ban axis whether or
+    /// not `parent_state.members` is the updated set. The remedy made that
+    /// test robust to field order, so it stopped being a witness to it. The
+    /// member axis still depends on declaration order — which is why the other
+    /// two still fire, and why this pin is not redundant.
+    ///
+    /// That is exactly the drift this pin exists for: every other detector is
+    /// incidental to some particular DM shape a future author may legitimately
+    /// rework, and one of them already has. This is the only one whose failure
+    /// message names the reason and the issue number.
     #[test]
     fn field_declaration_order_puts_members_before_direct_messages() {
         let mut bytes = Vec::new();

@@ -859,7 +859,7 @@ fn member_ids_of(members_by_id: &HashMap<MemberId, &AuthorizedMember>) -> HashSe
 /// knowable here" and treated membership-only as forced. It was not knowable
 /// only in the sense that nobody had computed it; the claim was wrong and is
 /// recorded here so it is not re-derived.
-fn enforced_ban_set_of(
+pub(crate) fn enforced_ban_set_of(
     parent_state: &ChatRoomStateV1,
     parameters: &ChatRoomParametersV1,
 ) -> HashSet<MemberId> {

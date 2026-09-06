@@ -1011,3 +1011,254 @@ fn deputy_ban_must_not_let_a_doomed_dm_evict_a_legitimate_one() {
         );
     }
 }
+
+/// PROPOSED GUARD (reviewer-authored): the DM path's enforced-ban derivation
+/// must apply the `max_user_bans` cap exactly as step 0-cap does.
+///
+/// Shape: 3 bans against a cap of 2, and Q's is the OLDEST so the cap evicts
+/// it. Q's ban must be DEPUTY-issued, because an owner/ancestor ban removes Q
+/// during `MembersV1::apply_delta` and the membership half of the sweep then
+/// masks the divergence — the deputy case is the only one where Q is still a
+/// member when the DM field applies.
+///
+/// Correct: the capped surviving set does not contain Q's ban, so Q is not
+/// enforced-banned, stays a member, and its DMs survive. Skip the cap
+/// replication and the DM path reads the raw over-cap `parent_state.bans`,
+/// sees Q as banned, and deletes Q's DMs at apply time — on the far side of
+/// the step-6 sweep that would have kept them. Data loss.
+#[test]
+fn dm_ban_derivation_must_apply_the_user_ban_cap() {
+    const CAP: usize = 20;
+    let owner = Peer::new(1);
+    let (a, b, q) = (Peer::new(10), Peer::new(11), Peer::new(20));
+    let d = Peer::new(13); // deputy
+    let (t1, t2) = (Peer::new(21), Peer::new(22));
+    let p = params(&owner);
+
+    let ban_at = |target: MemberId, banner: &Peer, secs: u64| {
+        AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner.id,
+                banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                banned_user: target,
+            },
+            banner.id,
+            &banner.sk,
+        )
+    };
+
+    let cfg = AuthorizedConfigurationV1::new(
+        Configuration {
+            max_members: 1000,
+            max_user_bans: 2,
+            max_direct_messages: Some(CAP),
+            ..Default::default()
+        },
+        &owner.sk,
+    );
+
+    let mut owner_info = MemberInfo::new_public(owner.id, 1, "owner".to_string());
+    owner_info.deputies = vec![d.id];
+
+    let q_dms: Vec<AuthorizedDirectMessage> =
+        (0..3u64).map(|i| dm(&a, &q, &owner, 100 + i)).collect();
+    let legit: Vec<AuthorizedDirectMessage> = (0..3u64).map(|i| dm(&a, &b, &owner, i)).collect();
+
+    let mut state = ChatRoomStateV1 {
+        configuration: cfg,
+        members: MembersV1 {
+            members: vec![
+                member(&a, &owner),
+                member(&b, &owner),
+                member(&d, &owner),
+                member(&q, &owner),
+                member(&t1, &owner),
+                member(&t2, &owner),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![
+                info(&a),
+                info(&b),
+                info(&d),
+                info(&q),
+                info(&t1),
+                info(&t2),
+                AuthorizedMemberInfo::new(owner_info, &owner.sk),
+            ],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![
+                join_msg(&a, owner.id),
+                join_msg(&b, owner.id),
+                join_msg(&d, owner.id),
+                join_msg(&q, owner.id),
+                join_msg(&t1, owner.id),
+                join_msg(&t2, owner.id),
+            ],
+            ..Default::default()
+        },
+        bans: BansV1(vec![
+            ban_at(q.id, &d, 1_000), // DEPUTY-issued, oldest -> evicted by the cap
+            ban_at(t1.id, &owner, 2_000),
+            ban_at(t2.id, &owner, 3_000),
+        ]),
+        direct_messages: DirectMessagesV1 {
+            messages: legit.iter().chain(&q_dms).cloned().collect(),
+            purges: vec![],
+        },
+        ..Default::default()
+    };
+
+    let delta = ChatRoomStateV1Delta {
+        member_info: Some(vec![info(&a)]),
+        direct_messages: None,
+        ..Default::default()
+    };
+    let parent = state.clone();
+    state.apply_delta(&parent, &p, &Some(delta)).expect("apply");
+
+    assert_eq!(
+        state.bans.0.len(),
+        2,
+        "test premise: the ban cap must actually bite"
+    );
+    assert!(
+        !state.bans.0.iter().any(|x| x.ban.banned_user == q.id),
+        "test premise: the cap must be what evicts Q's ban"
+    );
+    assert!(
+        member_ids(&state).contains(&q.id),
+        "test premise: with its ban evicted, Q must still be a member"
+    );
+    let held: HashSet<[u8; 64]> = state
+        .direct_messages
+        .messages
+        .iter()
+        .map(|m| m.sender_signature.to_bytes())
+        .collect();
+    let lost: Vec<u64> = legit
+        .iter()
+        .chain(&q_dms)
+        .filter(|m| !held.contains(&m.sender_signature.to_bytes()))
+        .map(|m| m.message.timestamp - BASE_TS)
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "DMs at offsets {lost:?} were deleted at apply time against an UNCAPPED ban \
+         set, though step 0-cap evicts that ban and step 6 would have kept them; \
+         held now = {:?}",
+        held_offsets(&state)
+    );
+}
+
+/// PROPOSED GUARD 2 (reviewer-authored): the `delta == None` arm's sweep must be
+/// BAN-AWARE, not merely membership-aware.
+///
+/// `none_delta_path_sweeps_before_the_cap` covers only the membership half of
+/// that arm's sweep (a ghost endpoint that was never a member). Passing an
+/// empty ban set at that call site alone — leaving the main arm ban-aware —
+/// currently fails NOTHING in the suite.
+///
+/// Same deputy shape as `deputy_ban_must_not_let_a_doomed_dm_evict_a_legitimate_one`,
+/// but reached through the arm where the DM sub-delta is None: the ban rides in
+/// on the top-level delta while the DM field has nothing of its own.
+#[test]
+fn none_delta_path_sweep_is_ban_aware() {
+    const CAP: usize = 20;
+    const K: usize = 5;
+    let owner = Peer::new(1);
+    let (a, b, c) = (Peer::new(10), Peer::new(11), Peer::new(12));
+    let d = Peer::new(13); // deputy
+    let q = Peer::new(20); // banned BY the deputy, invited by the OWNER
+    let p = params(&owner);
+
+    let legit: Vec<AuthorizedDirectMessage> = (0..CAP as u64)
+        .map(|i| {
+            if i % 2 == 0 {
+                dm(&a, &b, &owner, i)
+            } else {
+                dm(&c, &d, &owner, i)
+            }
+        })
+        .collect();
+    let doomed: Vec<AuthorizedDirectMessage> =
+        (0..K as u64).map(|i| dm(&a, &q, &owner, 100 + i)).collect();
+
+    let mut owner_info = MemberInfo::new_public(owner.id, 1, "owner".to_string());
+    owner_info.deputies = vec![d.id];
+
+    let mut state = ChatRoomStateV1 {
+        configuration: config(&owner, Some(CAP)),
+        members: MembersV1 {
+            members: vec![
+                member(&a, &owner),
+                member(&b, &owner),
+                member(&c, &owner),
+                member(&d, &owner),
+                member(&q, &owner),
+            ],
+        },
+        member_info: MemberInfoV1 {
+            member_info: vec![
+                info(&a),
+                info(&b),
+                info(&c),
+                info(&d),
+                info(&q),
+                AuthorizedMemberInfo::new(owner_info, &owner.sk),
+            ],
+        },
+        recent_messages: MessagesV1 {
+            messages: vec![
+                join_msg(&a, owner.id),
+                join_msg(&b, owner.id),
+                join_msg(&c, owner.id),
+                join_msg(&d, owner.id),
+                join_msg(&q, owner.id),
+            ],
+            ..Default::default()
+        },
+        direct_messages: DirectMessagesV1 {
+            messages: legit.iter().chain(&doomed).cloned().collect(),
+            purges: vec![],
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        state.direct_messages.messages.len(),
+        CAP + K,
+        "test premise: the held set must start OVER cap, or the trim cannot bite"
+    );
+
+    // The ban arrives, the DM field has NO sub-delta of its own.
+    let delta = ChatRoomStateV1Delta {
+        bans: Some(vec![deputy_ban(q.id, &d, owner.id)]),
+        direct_messages: None,
+        ..Default::default()
+    };
+    let parent = state.clone();
+    state.apply_delta(&parent, &p, &Some(delta)).expect("apply");
+
+    assert!(
+        !member_ids(&state).contains(&q.id),
+        "test premise: the DEPUTY ban must be enforced by cleanup, or the shape is wrong"
+    );
+    let held: HashSet<[u8; 64]> = state
+        .direct_messages
+        .messages
+        .iter()
+        .map(|m| m.sender_signature.to_bytes())
+        .collect();
+    let lost: Vec<u64> = legit
+        .iter()
+        .filter(|m| !held.contains(&m.sender_signature.to_bytes()))
+        .map(|m| m.message.timestamp - BASE_TS)
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "legitimate DMs at offsets {lost:?} were trimmed to make room for DMs a DEPUTY \
+         ban dooms: the None-delta arm's sweep is not ban-aware; held now = {:?}",
+        held_offsets(&state)
+    );
+}
