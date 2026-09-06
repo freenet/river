@@ -1351,29 +1351,33 @@ pub(crate) fn reply_to_json(ctx: &ReplyContextDisplay) -> Option<serde_json::Val
     }
 }
 
-/// Resolve a message author's full base58 verifying key — the collision-proof
-/// identity a bot allow-lists on, as opposed to the 8-character `author` short
-/// id (40 bits of a 64-bit hash, so two members CAN print the same one) or the
-/// member-controlled `nickname`.
+/// Resolve a message author's full base58 verifying key — the identity a bot
+/// makes a trust decision on, as opposed to the 8-character `author` short id
+/// (40 bits of a 64-bit NON-cryptographic hash, so two members CAN print the
+/// same one) or the member-controlled `nickname`.
 ///
 /// `None` when the author is neither the owner nor a current member (e.g. the
 /// since-departed author of an older message), since their key is no longer in
-/// room state. Same resolution and the same `None` semantics as `message
-/// list`'s `author_verifying_key`: both go through `RoomDeputies::verifying_key`
-/// so the backfill and the live stream cannot drift (freenet/river#679).
+/// room state — never a *wrong* key.
 ///
-/// Built per emitted event rather than once per poll: `RoomDeputies::new` walks
-/// the room's member lists, while a stream polls every second and emits at human
-/// rate — so paying on emission is much the cheaper of the two, and the JSON arms
-/// that call this are the only ones that need it.
+/// `None` does NOT mean "not banned". Ban enforcement runs in
+/// `post_apply_cleanup`, not in `verify`, so a state riverctl holds can still
+/// list a member against whom an authorizing ban exists, and this reports their
+/// key. It answers "whose key signed this", not "should you trust them" — a
+/// moderation consumer needs the ban list as well.
+///
+/// The single definition of this field for BOTH `message list` and `message
+/// stream`, resolution (`deputies::verifying_key_of`) and base58 encoding
+/// together, so the backfill and the live feed cannot drift (freenet/river#679).
+/// Resolution is a scan of `members.members` rather than an index build, so
+/// calling it once per emitted event — including in a `--initial-messages`
+/// backfill burst — costs no more than the lookup itself.
 pub(crate) fn author_verifying_key_b58(
     room_state: &ChatRoomStateV1,
     room_owner_key: &VerifyingKey,
-    secrets: &HashMap<u32, [u8; 32]>,
     author: MemberId,
 ) -> Option<String> {
-    crate::deputies::RoomDeputies::new(room_state, room_owner_key, secrets)
-        .verifying_key(author)
+    crate::deputies::verifying_key_of(room_state, room_owner_key, author)
         .map(|k| bs58::encode(k.as_bytes()).into_string())
 }
 
@@ -1429,7 +1433,6 @@ pub(crate) fn message_event_json(
         "author_verifying_key": author_verifying_key_b58(
             room_state,
             room_owner_key,
-            secrets,
             msg.message.author,
         ),
         "nickname": nickname,
@@ -1494,7 +1497,6 @@ pub(crate) fn reaction_event_json(
         "author_verifying_key": author_verifying_key_b58(
             room_state,
             room_owner_key,
-            secrets,
             msg.message.author,
         ),
         "nickname": nickname,
@@ -1527,7 +1529,6 @@ pub(crate) fn deletion_event_json(
         "author_verifying_key": author_verifying_key_b58(
             room_state,
             room_owner_key,
-            secrets,
             msg.message.author,
         ),
         "nickname": nickname,
@@ -5153,24 +5154,42 @@ impl ApiClient {
         format: &OutputFormat,
         secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
-        let msg_id = msg.id();
-        let reactions = room_state.recent_messages.reactions(&msg_id);
-        let author_str = msg.message.author.to_string();
-        let nickname = room_state
-            .member_info
-            .canonical(msg.message.author)
-            .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
-        let datetime: DateTime<Utc> = msg.message.time.into();
+        println!(
+            "{}",
+            Self::reaction_event_line(room_state, msg, room_owner_key, format, secrets)?
+        );
+        std::io::stdout().flush()?;
+        Ok(())
+    }
 
-        match format {
+    /// The exact line `output_reaction_change` prints. Separated from the
+    /// `println!` so a test can assert on what a stream consumer actually
+    /// receives — the seam that pins the JSON arm to its payload builder, which
+    /// is where freenet/river#679's missing field lived.
+    fn reaction_event_line(
+        room_state: &ChatRoomStateV1,
+        msg: &river_core::room_state::message::AuthorizedMessageV1,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+        secrets: &HashMap<u32, [u8; 32]>,
+    ) -> Result<String> {
+        Ok(match format {
             OutputFormat::Human => {
+                let msg_id = msg.id();
+                let reactions = room_state.recent_messages.reactions(&msg_id);
+                let author_str = msg.message.author.to_string();
+                let datetime: DateTime<Utc> = msg.message.time.into();
                 let local_time: DateTime<Local> = datetime.into();
-                let display_name = nickname
-                    .clone()
+                let display_name = room_state
+                    .member_info
+                    .canonical(msg.message.author)
+                    .map(|info| {
+                        unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
+                    })
                     .unwrap_or_else(|| author_str.chars().take(8).collect());
-                // Escaped only for this terminal line — `nickname` itself
-                // stays raw below because the JSON branch below serializes it
-                // faithfully (attacker-controlled nickname; JSON escaping
+                // Escaped only for this terminal line. The JSON payload builder
+                // makes its own separate `unseal_nickname_display` call and keeps
+                // the value RAW (attacker-controlled nickname; JSON escaping
                 // already makes it safe there).
                 let display_name = crate::deputies::display_nickname(&display_name);
                 let reactions_str = reactions
@@ -5186,20 +5205,20 @@ impl ApiClient {
                         }
                     })
                     .unwrap_or_else(|| "(none)".to_string());
-                println!(
+                format!(
                     "[reaction] [{} - {}]: {}",
                     local_time.format("%H:%M:%S"),
                     display_name,
                     reactions_str
-                );
+                )
             }
-            OutputFormat::Json => {
-                let json_msg = reaction_event_json(room_state, msg, room_owner_key, secrets);
-                println!("{}", serde_json::to_string(&json_msg)?);
-            }
-        }
-        std::io::stdout().flush()?;
-        Ok(())
+            OutputFormat::Json => serde_json::to_string(&reaction_event_json(
+                room_state,
+                msg,
+                room_owner_key,
+                secrets,
+            ))?,
+        })
     }
 
     /// Emit a deletion event (the message's content is gone, so only its
@@ -5212,35 +5231,51 @@ impl ApiClient {
         format: &OutputFormat,
         secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
-        let author_str = msg.message.author.to_string();
-        let nickname = room_state
-            .member_info
-            .canonical(msg.message.author)
-            .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
-        let datetime: DateTime<Utc> = msg.message.time.into();
+        println!(
+            "{}",
+            Self::deletion_event_line(room_state, msg, room_owner_key, format, secrets)?
+        );
+        std::io::stdout().flush()?;
+        Ok(())
+    }
 
-        match format {
+    /// The exact line `output_deletion` prints — see `reaction_event_line` for
+    /// why this is separated from the `println!`.
+    fn deletion_event_line(
+        room_state: &ChatRoomStateV1,
+        msg: &river_core::room_state::message::AuthorizedMessageV1,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+        secrets: &HashMap<u32, [u8; 32]>,
+    ) -> Result<String> {
+        Ok(match format {
             OutputFormat::Human => {
+                let author_str = msg.message.author.to_string();
+                let datetime: DateTime<Utc> = msg.message.time.into();
                 let local_time: DateTime<Local> = datetime.into();
-                let display_name = nickname
-                    .clone()
+                let display_name = room_state
+                    .member_info
+                    .canonical(msg.message.author)
+                    .map(|info| {
+                        unseal_nickname_display(&info.member_info.preferred_nickname, secrets)
+                    })
                     .unwrap_or_else(|| author_str.chars().take(8).collect());
                 // Escaped only for this terminal line — see the identical
-                // comment in `output_reaction_change`.
+                // comment in `reaction_event_line`.
                 let display_name = crate::deputies::display_nickname(&display_name);
-                println!(
+                format!(
                     "[deleted] [{} - {}]: (message deleted)",
                     local_time.format("%H:%M:%S"),
                     display_name
-                );
+                )
             }
-            OutputFormat::Json => {
-                let json_msg = deletion_event_json(room_state, msg, room_owner_key, secrets);
-                println!("{}", serde_json::to_string(&json_msg)?);
-            }
-        }
-        std::io::stdout().flush()?;
-        Ok(())
+            OutputFormat::Json => serde_json::to_string(&deletion_event_json(
+                room_state,
+                msg,
+                room_owner_key,
+                secrets,
+            ))?,
+        })
     }
 
     /// Helper function to output a message in the requested format.
@@ -5263,19 +5298,40 @@ impl ApiClient {
         is_edit: bool,
         secrets: &HashMap<u32, [u8; 32]>,
     ) -> Result<()> {
-        // Get message ID for checking edited status and reactions
-        let msg_id = msg.id();
-        let edited = room_state.recent_messages.is_edited(&msg_id);
-        let reactions = room_state.recent_messages.reactions(&msg_id);
-        let reply = reply_context_display_with_secrets(room_state, msg, secrets);
+        println!(
+            "{}",
+            Self::message_event_line(room_state, msg, room_owner_key, format, is_edit, secrets)?
+        );
+        // Flush stdout immediately for real-time output
+        std::io::stdout().flush()?;
+        Ok(())
+    }
 
-        match format {
+    /// The exact line `output_message` prints — see `reaction_event_line` for
+    /// why this is separated from the `println!`.
+    fn message_event_line(
+        room_state: &ChatRoomStateV1,
+        msg: &river_core::room_state::message::AuthorizedMessageV1,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+        is_edit: bool,
+        secrets: &HashMap<u32, [u8; 32]>,
+    ) -> Result<String> {
+        Ok(match format {
             OutputFormat::Human => {
+                // Computed in this arm, not before the `match`: the JSON payload
+                // builder recomputes what it needs, and hoisting these would make
+                // the JSON path decrypt a private-room reply and unseal a nickname
+                // for values it never reads.
+                let msg_id = msg.id();
+                let edited = room_state.recent_messages.is_edited(&msg_id);
+                let reactions = room_state.recent_messages.reactions(&msg_id);
+                let reply = reply_context_display_with_secrets(room_state, msg, secrets);
                 let author_str = msg.message.author.to_string();
                 let author_short = author_str.chars().take(8).collect::<String>();
 
                 // Get nickname if available (decrypted for a private room).
-                // Escaped for this HUMAN-only println — the JSON branch below
+                // Escaped for this HUMAN-only line — the JSON payload builder
                 // makes its own separate `unseal_nickname_display` call and
                 // stays raw (attacker-controlled nickname; JSON escaping
                 // already makes it safe there).
@@ -5314,13 +5370,13 @@ impl ApiClient {
 
                 // A message can itself `@mention` someone, and that mentioned
                 // member's nickname is attacker-controlled — a SEPARATE call
-                // from the JSON arm's own `content` below (which still uses
-                // the raw helper), escaping only the substituted mention name
-                // for this println (freenet/river#474).
+                // from the JSON payload builder's own `content` (which still
+                // uses the raw helper), escaping only the substituted mention
+                // name for this line (freenet/river#474).
                 let content_for_terminal =
                     message_display_text_for_terminal(room_state, msg, secrets);
 
-                println!(
+                format!(
                     "{}[{} - {}]: {}{}{}{}",
                     edit_prefix,
                     local_time.format("%H:%M:%S"),
@@ -5329,18 +5385,16 @@ impl ApiClient {
                     content_for_terminal,
                     edited_indicator,
                     reactions_str
-                );
+                )
             }
-            OutputFormat::Json => {
-                let json_msg =
-                    message_event_json(room_state, msg, room_owner_key, is_edit, secrets);
-                println!("{}", serde_json::to_string(&json_msg)?);
-            }
-        }
-
-        // Flush stdout immediately for real-time output
-        std::io::stdout().flush()?;
-        Ok(())
+            OutputFormat::Json => serde_json::to_string(&message_event_json(
+                room_state,
+                msg,
+                room_owner_key,
+                is_edit,
+                secrets,
+            ))?,
+        })
     }
 
     /// Set the current user's nickname in a room
@@ -8882,15 +8936,24 @@ mod monitor_tests {
     use std::time::SystemTime;
 
     fn authored(body: RoomMessageBody) -> AuthorizedMessageV1 {
-        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        authored_by(&SigningKey::from_bytes(&[5u8; 32]), body)
+    }
+
+    /// `authored`, but signed by a caller-chosen key — so a test can build a
+    /// message from the room OWNER, who is structurally absent from
+    /// `members.members` and is therefore the identity resolution is most likely
+    /// to get wrong.
+    fn authored_by(sk: &SigningKey, body: RoomMessageBody) -> AuthorizedMessageV1 {
         let owner = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
         let m = MessageV1 {
             room_owner: MemberId::from(owner),
             author: MemberId::from(&sk.verifying_key()),
             content: body,
-            time: SystemTime::UNIX_EPOCH,
+            // A distinct time per author so two fixture messages never collide
+            // on the (author, time)-derived message id.
+            time: SystemTime::UNIX_EPOCH + Duration::from_secs(sk.to_bytes()[0] as u64),
         };
-        AuthorizedMessageV1::new(m, &sk)
+        AuthorizedMessageV1::new(m, sk)
     }
 
     /// A reply message yields its target author and a preview truncated to 50
@@ -9128,9 +9191,10 @@ mod monitor_tests {
         }
     }
 
-    /// The author key of the messages `authored()` builds, and the owner key
-    /// `authored()`/`reaction_action()` name as `room_owner`. Kept as one place
-    /// so a fixture change cannot leave a test asserting against a stale key.
+    /// The signing key `authored()` signs its messages with, and the owner key
+    /// it and `reaction_action()` name as `room_owner`. Derived from the same
+    /// seeds those helpers use; `fixtures_agree_on_their_keys` below fails if
+    /// either helper is ever changed to a different seed.
     fn author_sk() -> SigningKey {
         SigningKey::from_bytes(&[5u8; 32])
     }
@@ -9171,13 +9235,55 @@ mod monitor_tests {
         bs58::encode(vk.as_bytes()).into_string()
     }
 
+    /// Every event the stream can emit, as the JSON object a consumer receives —
+    /// parsed back from the LINE the output function prints, not from the payload
+    /// builder. That is the seam that matters: freenet/river#679 was a missing
+    /// field at the emission site, so a test that only exercised the builder
+    /// would pass against a version that resolved the key correctly and then
+    /// dropped it on the way to stdout.
+    fn emitted_events(
+        state: &ChatRoomStateV1,
+        msg: &AuthorizedMessageV1,
+        owner_vk: &VerifyingKey,
+        secrets: &HashMap<u32, [u8; 32]>,
+    ) -> Vec<(&'static str, serde_json::Value)> {
+        let f = OutputFormat::Json;
+        let lines = [
+            (
+                "message",
+                ApiClient::message_event_line(state, msg, owner_vk, &f, false, secrets).unwrap(),
+            ),
+            (
+                "edit",
+                ApiClient::message_event_line(state, msg, owner_vk, &f, true, secrets).unwrap(),
+            ),
+            (
+                "reaction",
+                ApiClient::reaction_event_line(state, msg, owner_vk, &f, secrets).unwrap(),
+            ),
+            (
+                "delete",
+                ApiClient::deletion_event_line(state, msg, owner_vk, &f, secrets).unwrap(),
+            ),
+        ];
+        lines
+            .into_iter()
+            .map(|(label, line)| {
+                let v: serde_json::Value = serde_json::from_str(&line)
+                    .unwrap_or_else(|e| panic!("the `{label}` line must be JSON: {e}: {line}"));
+                assert_eq!(v["type"], label, "each line must carry its own event type");
+                (label, v)
+            })
+            .collect()
+    }
+
     /// freenet/river#679: `message list --format json` carried
     /// `author_verifying_key` while `message stream --format json` did not, so a
     /// bot reading the live stream had only the 8-character `author` short id (a
     /// 40-bit truncation two members can share) or the member-controlled
     /// `nickname` to identify a sender by.
     ///
-    /// Asserts on the emitted JSON of EVERY stream event type, and that the key
+    /// Asserts on the emitted line of EVERY stream event type, and that the key
     /// is the author's real one — not merely present.
     #[test]
     fn every_stream_json_event_carries_the_authors_full_verifying_key() {
@@ -9199,24 +9305,7 @@ mod monitor_tests {
             "fixture precondition: the short id must differ from the full key"
         );
 
-        for (label, event) in [
-            (
-                "message",
-                message_event_json(&state, &original, &owner_vk, false, &secrets),
-            ),
-            (
-                "edit",
-                message_event_json(&state, &original, &owner_vk, true, &secrets),
-            ),
-            (
-                "reaction",
-                reaction_event_json(&state, &original, &owner_vk, &secrets),
-            ),
-            (
-                "delete",
-                deletion_event_json(&state, &original, &owner_vk, &secrets),
-            ),
-        ] {
+        for (label, event) in emitted_events(&state, &original, &owner_vk, &secrets) {
             assert_eq!(
                 event["author_verifying_key"],
                 serde_json::Value::String(expected.clone()),
@@ -9226,60 +9315,179 @@ mod monitor_tests {
     }
 
     /// The stream's key must be the SAME value `message list` emits for the same
-    /// author — that parity is the whole point of #679, and both resolve through
-    /// `RoomDeputies::verifying_key` so they cannot drift. Also covers the owner,
-    /// who is structurally absent from `members.members` and so is the case a
-    /// naive members-only lookup would get wrong.
+    /// author — that parity is the whole point of #679. Both now call
+    /// `author_verifying_key_b58`, so this pins the shared function's answer
+    /// against an INDEPENDENT expectation (the fixture's own signing keys),
+    /// rather than restating its body. Covers the owner too, who is structurally
+    /// absent from `members.members` and so is the case a members-only lookup
+    /// would get wrong.
     #[test]
-    fn stream_author_key_matches_what_message_list_resolves_including_the_owner() {
-        let original = authored(RoomMessageBody::public("hello".to_string()));
-        let state = state_with_members(&original, vec![], &[&author_sk()]);
+    fn the_emitted_key_is_the_authors_real_key_for_a_member_and_for_the_owner() {
+        let by_member = authored(RoomMessageBody::public("from a member".to_string()));
+        let by_owner = authored_by(
+            &owner_sk(),
+            RoomMessageBody::public("from the owner".into()),
+        );
         let owner_vk = owner_sk().verifying_key();
         let secrets = HashMap::new();
-        let deputies = crate::deputies::RoomDeputies::new(&state, &owner_vk, &secrets);
+        let state = state_with_members(&by_member, vec![by_owner.clone()], &[&author_sk()]);
 
-        for (label, member_sk) in [("author", author_sk()), ("owner", owner_sk())] {
-            let id = MemberId::from(&member_sk.verifying_key());
-            let from_list = deputies.verifying_key(id).map(|k| b58(&k));
-            assert_eq!(
-                from_list,
-                Some(b58(&member_sk.verifying_key())),
-                "fixture precondition: `message list` resolves the {label}'s key"
-            );
-            assert_eq!(
-                author_verifying_key_b58(&state, &owner_vk, &secrets, id),
-                from_list,
-                "the stream's {label} key must equal what `message list` emits"
-            );
+        for (label, msg, signer) in [
+            ("member", &by_member, author_sk()),
+            ("owner", &by_owner, owner_sk()),
+        ] {
+            for (event_label, event) in emitted_events(&state, msg, &owner_vk, &secrets) {
+                assert_eq!(
+                    event["author_verifying_key"],
+                    serde_json::Value::String(b58(&signer.verifying_key())),
+                    "the {label}'s key must be emitted on the `{event_label}` event"
+                );
+            }
         }
     }
 
     /// An author who is no longer in room state (banned, or pruned for
     /// inactivity) has no key to report, and the stream must say so with `null`
-    /// rather than inventing one — matching `message list`'s documented
-    /// behaviour. A test that only ever saw a resolvable author would pass just
-    /// as well against a version that returned some other member's key.
+    /// rather than inventing one — matching `message list`. A test that only ever
+    /// saw a resolvable author would pass just as well against a version that
+    /// returned some other member's key.
     #[test]
     fn a_departed_authors_key_is_null_not_a_wrong_key() {
         let original = authored(RoomMessageBody::public("hello".to_string()));
-        // The room lists a DIFFERENT member; the author is not in it.
-        let state = state_with_members(&original, vec![], &[&SigningKey::from_bytes(&[9u8; 32])]);
+        let target = original.id();
+        // The room lists a DIFFERENT member; the author is not in it. The
+        // stranger is the reactor, so a reaction event has a resolvable member
+        // to hand and must still report the (absent) AUTHOR's key as null.
+        let stranger = SigningKey::from_bytes(&[9u8; 32]);
+        let state = state_with_members(
+            &original,
+            vec![reaction_action(9, &target, "\u{1f44d}", false)],
+            &[&stranger],
+        );
         let owner_vk = owner_sk().verifying_key();
         let secrets = HashMap::new();
 
-        let event = message_event_json(&state, &original, &owner_vk, false, &secrets);
-        // `get`, not `event["..."]`: indexing yields Null for an ABSENT key too,
-        // so the bug this whole change fixes (no field at all) would satisfy the
-        // indexed form and the test would pass vacuously.
-        assert_eq!(
-            event.get("author_verifying_key"),
-            Some(&serde_json::Value::Null),
-            "a departed author's key must be present and null, not absent"
+        for (label, event) in emitted_events(&state, &original, &owner_vk, &secrets) {
+            // `get`, not `event["..."]`: indexing yields Null for an ABSENT key
+            // too, so the bug this change fixes (no field at all) would satisfy
+            // the indexed form and the test would pass vacuously.
+            assert_eq!(
+                event.get("author_verifying_key"),
+                Some(&serde_json::Value::Null),
+                "the `{label}` event must report a departed author's key as \
+                 present-and-null, not absent"
+            );
+            assert_eq!(
+                event["author"],
+                serde_json::Value::String(MemberId::from(&author_sk().verifying_key()).to_string()),
+                "the `{label}` event still reports the short id"
+            );
+            assert_ne!(
+                event["author_verifying_key"],
+                serde_json::Value::String(b58(&stranger.verifying_key())),
+                "a present member's key must never stand in for the author's"
+            );
+        }
+    }
+
+    /// The extraction of each payload out of its `OutputFormat::Json` arm must
+    /// not have dropped or renamed anything. Pins the full field set of every
+    /// event type, so a future edit to a builder cannot silently change the wire
+    /// shape a bridge parses — the seam made this testable and nothing was
+    /// asserting it.
+    #[test]
+    fn each_event_type_emits_its_documented_field_set() {
+        let original = authored(RoomMessageBody::public("hello".to_string()));
+        let target = original.id();
+        let state = state_with_members(
+            &original,
+            vec![reaction_action(7, &target, "\u{1f44d}", false)],
+            &[&author_sk(), &SigningKey::from_bytes(&[7u8; 32])],
         );
-        // The short id is still reported — only the key is unavailable.
+        let owner_vk = owner_sk().verifying_key();
+        let secrets = HashMap::new();
+
+        let common = [
+            "type",
+            "message_id",
+            "room",
+            "author",
+            "author_verifying_key",
+            "nickname",
+            "timestamp",
+        ];
+        for (label, event) in emitted_events(&state, &original, &owner_vk, &secrets) {
+            let mut expected: Vec<&str> = common.to_vec();
+            match label {
+                "message" | "edit" => {
+                    expected.extend(["content", "edited", "reply_to", "reactions"])
+                }
+                "reaction" => expected.extend(["reactions", "reactors"]),
+                "delete" => {}
+                other => panic!("unhandled event type {other}"),
+            }
+            let mut got: Vec<String> = event
+                .as_object()
+                .expect("each event is a JSON object")
+                .keys()
+                .cloned()
+                .collect();
+            got.sort();
+            expected.sort();
+            assert_eq!(
+                got,
+                expected.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                "the `{label}` event's field set changed"
+            );
+        }
+
+        // Spot-check the VALUES the extraction had to carry across, not just the
+        // key names: a builder that emitted every documented key with the wrong
+        // content would satisfy the check above.
+        let by_type: HashMap<&str, serde_json::Value> =
+            emitted_events(&state, &original, &owner_vk, &secrets)
+                .into_iter()
+                .collect();
+        let message = &by_type["message"];
         assert_eq!(
-            event["author"],
-            serde_json::Value::String(MemberId::from(&author_sk().verifying_key()).to_string()),
+            message["content"],
+            serde_json::Value::String("hello".into())
+        );
+        assert_eq!(message["edited"], serde_json::Value::Bool(false));
+        assert_eq!(message["reply_to"], serde_json::Value::Null);
+        assert_eq!(message["reactions"]["\u{1f44d}"], serde_json::json!(1));
+        assert_eq!(
+            message["room"],
+            serde_json::Value::String(b58(&owner_vk)),
+            "every event names the room it came from"
+        );
+        // `reactors` names WHO reacted — the reactor, who is deliberately not
+        // the message author here, so a builder reading the wrong member would
+        // show up.
+        assert_eq!(
+            by_type["reaction"]["reactors"]["\u{1f44d}"],
+            serde_json::json!([MemberId::from(
+                &SigningKey::from_bytes(&[7u8; 32]).verifying_key()
+            )
+            .to_string()]),
+        );
+        assert_eq!(by_type["edit"]["content"], message["content"]);
+    }
+
+    /// The fixtures hardcode their seeds in three places (`authored`,
+    /// `reaction_action`, `author_sk`/`owner_sk`). If any of them is changed
+    /// independently, the key assertions above would be comparing against a key
+    /// nobody signed with — so pin the agreement rather than trusting it.
+    #[test]
+    fn fixtures_agree_on_their_keys() {
+        let msg = authored(RoomMessageBody::public("x".to_string()));
+        assert_eq!(
+            msg.message.author,
+            MemberId::from(&author_sk().verifying_key())
+        );
+        assert_eq!(
+            msg.message.room_owner,
+            MemberId::from(&owner_sk().verifying_key())
         );
     }
 
@@ -11305,9 +11513,10 @@ pub(crate) fn unseal_nickname_display(",
         assert!(p.problems.is_empty(), "{:?}", p.problems);
         let src = &p.source;
 
-        // `output_reaction_change` and `output_deletion` share the same
-        // shape: escape a *derived* `display_name`, never the shared
-        // `nickname` variable the JSON arm also reads.
+        // `reaction_event_line` and `deletion_event_line` share the same shape:
+        // escape a *derived* `display_name`. Their JSON arms delegate to a
+        // payload builder that unseals its own nickname and keeps it raw, so the
+        // escaped value can never reach the JSON.
         assert_eq!(
             src.matches("let display_name = crate::deputies::display_nickname(&display_name);")
                 .count(),
