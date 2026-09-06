@@ -2,6 +2,20 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.15] - 2026-09-06
+
+### Fixed
+- `message stream --format json` now includes `author_verifying_key` on every
+  event (`message`, `edit`, `delete`, `reaction`), matching `message list`.
+  Previously only the backfill carried the author's collision-proof key, so a
+  bot driven off the live stream had to fall back to a `message list` call per
+  event to recover it, or trust the 8-character `author` short id (a 40-bit
+  truncation two members can share) or the member-controlled `nickname`. Both
+  stream modes are covered (polling and `--subscribe`). The value is resolved
+  through the same helper `message list` uses, and is `null` for an author who
+  is no longer the owner or a current member. On a `reaction` event it names the
+  author of the message reacted to, not the reactor. (freenet/river#679)
+
 ## [0.2.14] - 2026-08-31
 
 ### Added

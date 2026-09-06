@@ -125,11 +125,12 @@ riverctl message stream <room-owner-vk> --format json --no-version-check |
   jq -c --arg me "$me" 'select(.author != $me)'
 ```
 
-`message list --format json` also carries `author_verifying_key` — the author's
-full base58 key (or `null` when the author is no longer in the room). The
-`author` short id can be filtered on cheaply as above, but a bot deciding
-whether to *trust* a command should compare this full key, since the short id is
-a 40-bit truncation. Get the trusted keys from `member list`'s `verifying_key`.
+`message list` and `message stream --format json` both carry
+`author_verifying_key` — the author's full base58 key (or `null` when the author
+is no longer in the room). The `author` short id can be filtered on cheaply as
+above, but a bot deciding whether to *trust* a command should compare this full
+key, since the short id is a 40-bit truncation. Get the trusted keys from
+`member list`'s `verifying_key`.
 
 (The `author` inside `reply_to` is a display nickname, not a member ID — only
 the top-level `author` is comparable.)
@@ -275,9 +276,14 @@ Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags.
 
 | `type` | Meaning | Fields |
 |--------|---------|--------|
-| `message` | A new message | `message_id`, `room`, `author`, `nickname`, `content`, `timestamp`, `edited`, `reply_to`, `reactions` |
+| `message` | A new message | `message_id`, `room`, `author`, `author_verifying_key`, `nickname`, `content`, `timestamp`, `edited`, `reply_to`, `reactions` |
 | `edit` | A previously-streamed message's content changed | same as `message` (with the new `content` and `edited: true`) |
-| `delete` | A previously-streamed message was deleted | `message_id`, `room`, `author`, `nickname`, `timestamp` (no `content`) |
+| `delete` | A previously-streamed message was deleted | `message_id`, `room`, `author`, `author_verifying_key`, `nickname`, `timestamp` (no `content`) |
+| `reaction` | A surfaced message's reactions changed | `message_id`, `room`, `author`, `author_verifying_key`, `nickname`, `timestamp`, `reactions` (emoji → count), `reactors` (emoji → member IDs) |
+
+On a `reaction` event, `author` and `author_verifying_key` identify the author of
+the message that was **reacted to**, not the person who reacted — read `reactors`
+for that.
 
 `reply_to` is `{ "author", "preview" }` only when the quoted message could be read back from live room state. It is `null` both for non-replies **and** for a reply whose quoted message could not be verified — its author was banned (which purges their messages), it was deleted, it aged out of the room's `max_recent_messages` window, or it could not be decrypted. The quoted author and preview stored in a reply are a snapshot written by the *replier* and validated by nothing, so riverctl never emits them unverified; a bridge would otherwise republish a banned member's text after the ban. The human-readable output marks a reply it could not verify with a `[reply to an unavailable message]` prefix; the JSON deliberately does not distinguish it from a non-reply, so no existing consumer breaks on a new shape. The one exception is a private room `riverctl` holds no secrets for at all: there it emits no marker either, since it cannot read any of the room's messages and every body already renders `<encrypted>`.
 
