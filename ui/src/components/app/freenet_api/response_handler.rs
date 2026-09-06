@@ -2580,6 +2580,42 @@ mod tests {
              flipped or missing guard would let a legacy delegate's response \
              mark hydration early and reintroduce the #530 truncation bug"
         );
+
+        // Round-3 skeptical + big-picture review: the three checks above
+        // don't verify RELATIVE order within the `Ok` arm — a future edit
+        // that hoists the `if !is_legacy_delegate { defer(...) }` block
+        // above the two `hydrate_*` calls (e.g. "for readability") would
+        // pass every check above unchanged while reintroducing the round-2
+        // race, because `defer()`'s macrotask would then be registered
+        // BEFORE the merges' own macrotasks rather than after. Scope this
+        // to just the `Ok` arm (between "Ok(store) => {" and "Err(e) => {")
+        // since that's the only branch with merges to order against.
+        let ok_arm_start = prod
+            .find("Ok(store) => {")
+            .expect("the parsed-blob match arm must exist");
+        let ok_arm_end = prod[ok_arm_start..]
+            .find("Err(e) => {")
+            .map(|i| ok_arm_start + i)
+            .expect("the match must have an Err arm");
+        let ok_arm = &prod[ok_arm_start..ok_arm_end];
+        let hidden_pos = ok_arm
+            .find("hydrate_hidden_dm_threads(")
+            .expect("Ok arm must hydrate hidden threads");
+        let outbound_pos = ok_arm
+            .find("hydrate_outbound_dms_cache(")
+            .expect("Ok arm must hydrate the outbound cache");
+        let defer_pos = ok_arm
+            .find(deferred_call)
+            .expect("Ok arm must defer-mark hydration");
+        assert!(
+            hidden_pos < defer_pos && outbound_pos < defer_pos,
+            "in the Ok arm, both hydrate_hidden_dm_threads and \
+             hydrate_outbound_dms_cache must be called BEFORE \
+             crate::util::defer(mark_outbound_dms_hydrated) — the fix's \
+             correctness depends on setTimeout(0) FIFO ordering registering \
+             their merge macrotasks ahead of the latch-flip macrotask \
+             (round-3 skeptical review, freenet/river#530)"
+        );
     }
 
     use super::*;

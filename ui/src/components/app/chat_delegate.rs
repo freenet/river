@@ -4058,38 +4058,40 @@ mod tests {
             .map(|i| i + "\n}\n".len())
             .expect("function must have a closing brace");
         let body = &after[..fn_end];
-        assert!(
-            !body.contains("return Ok"),
-            "save_outbound_dms_to_delegate must not have an early-return \
-             shortcut — an early Ok(()) reintroduces the LiveImportSeam::flush \
-             durability bug this PR's redesign closes (freenet/river#530)"
+        // A blacklist approach (banning `return Ok`, then `if `) was tried
+        // across rounds 1-2 and each version was defeated by a shape it
+        // didn't anticipate — round 2's `!body.contains("if ")` still lets a
+        // `match` arm skip the real write with no `if` and no `return`
+        // anywhere (testing-review, round 3):
+        //
+        //   match cond {
+        //       true => Ok(()),
+        //       false => coalesce_save(&OUTBOUND_DMS_SAVE_STATE, "Outbound-Dms", do_save_outbound_dms_to_delegate).await,
+        //   }
+        //
+        // Blacklisting keywords is an open-ended arms race. Whitelist
+        // instead: normalize whitespace and require the body be BYTE-EQUAL
+        // to the one known-correct unconditional shape. Any control-flow
+        // construct at all — `if`, `match`, `?`, a second `return` — changes
+        // the normalized text and fails the comparison, regardless of what
+        // form it takes.
+        let normalized_body: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected_body = format!(
+            "{} {{ {}().await; coalesce_save( &OUTBOUND_DMS_SAVE_STATE, \"Outbound-DMs\", {}, ) .await }}",
+            signature.trim_end_matches(" {"),
+            "await_outbound_dms_hydration",
+            "do_save_outbound_dms_to_delegate",
         );
-        // `!body.contains("return Ok")` alone doesn't catch a conditional
-        // TAIL expression bypassing the real write with no `return` keyword
-        // at all, e.g. `if cond { Ok(()) } else { coalesce_save(...).await }`
-        // — both anchor strings below would still appear, in order, while
-        // the real control flow skips the write (testing-review, round 2).
-        // The correct body is a flat two-statement sequence with no
-        // branching at all, so also require there be no `if` in it.
-        assert!(
-            !body.contains("if "),
-            "save_outbound_dms_to_delegate must be an unconditional sequence \
-             — hydrate, then always save. A conditional here (even one that \
-             still textually mentions both the hydration wait and \
-             coalesce_save) could skip the real write on some branch, \
-             reintroducing the LiveImportSeam::flush durability bug \
-             (freenet/river#530)"
-        );
-        let await_hydration = body
-            .find("await_outbound_dms_hydration().await")
-            .expect("must await the hydration latch");
-        let coalesce_call = body
-            .find("coalesce_save(")
-            .expect("must still coalesce the real save");
-        assert!(
-            await_hydration < coalesce_call,
-            "the hydration wait must run BEFORE coalesce_save, or a \
-             pre-hydration caller could still reach the network write early"
+        assert_eq!(
+            normalized_body, expected_body,
+            "save_outbound_dms_to_delegate must be EXACTLY the two-statement \
+             unconditional sequence \"await hydration, then always save\" — \
+             any other shape (a conditional, an early return, a `?`, a \
+             `match`) can skip the real write on some path, reintroducing \
+             the LiveImportSeam::flush durability bug this PR's redesign \
+             closes (freenet/river#530). If this function's SHAPE \
+             legitimately needs to change, update `expected_body` here \
+             deliberately — don't just relax the check."
         );
     }
 
