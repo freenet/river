@@ -68,17 +68,17 @@ wasm_path = "ui/public/contracts/room_contract.wasm"
 # (author_verifying_key ‖ app_id); recorded here so a human can check it and
 # so the gate can catch a derivation that has drifted.
 pointer_key = "Ai4VLoC2jGdhpcB2UU8VPo3efUoxjm1Ju9VKXqRC63Az"
-version = 1
-code_hash = "e765339ba3039f937256f4b6f7e8683d43f90e158f5d80f0dd45afdca69911e5"
-state = "00000001e765339ba3039f937256f4b6f7e8683d43f90e158f5d80f0dd45afdca69911e5626b9b5565ee3f6c17d45f50fcc79f88a5b49233669fdd8bec396f89ee891dd88a2b083f6072fe1ab1ae0dc420ae4b0b2ed5f391f95d495e9d8ad0327f13280a"
+version = 2
+code_hash = "4a518b835cc0d790d14292150cc484e2438018c95c6bff927ff0ab0506675188"
+state = "000000024a518b835cc0d790d14292150cc484e2438018c95c6bff927ff0ab05066751884d97949e9abf03a7fbf4ff5eb594bdd78cf1c6573df67a18214508a632924644cd66a36568259b44578ffb6cab391eb135855c8c33e9ded6514d76baf152c30d"
 
 [[record]]
 app_id = "river.chat-delegate"
 wasm_path = "ui/public/contracts/chat_delegate.wasm"
 pointer_key = "6qF2H5JRPBxbKC45UtPnzdDzyfsejYFW1UwDLGDU66mu"
-version = 1
-code_hash = "a44c64014d60fd245fe8fb5172f8fd7397039b248b3b6a8e95e89a0bb539fb5e"
-state = "00000001a44c64014d60fd245fe8fb5172f8fd7397039b248b3b6a8e95e89a0bb539fb5e94857075de1c9d70377fd4929ba5eeedfb00685c11be3940fa9a16ba493f6deda2e6af94d787532332b0f00d30ac89415b822e6bef4e8259264bb51b862cbe0e"
+version = 2
+code_hash = "8a39ab73369fb2aced36cb787e2ca31b7b57dffcdd905c282091aa40e22ca78d"
+state = "000000028a39ab73369fb2aced36cb787e2ca31b7b57dffcdd905c282091aa40e22ca78df46b730e4d7bbd96479a737f6995524fcb5e323a279e00cecec7acc824ec60d5874f8675a7400c01ec0e0000cc9a72163a217dc75cb1d9183a3da64151360b0c"
 # SCOPE, and it matters most here. Resolving this pointer correctly tells you
 # the delegate's current key. It does NOT tell you that the user's secrets came
 # with it: delegate secrets only move when River's own UI has run on that user's

@@ -2266,4 +2266,91 @@ mod tests {
             "deputies_of agrees with the deduped canonical record"
         );
     }
+
+    /// Regression test for freenet/river#423: a full state carrying a
+    /// `MemberInfo` (and a message) for a member absent from `members` must
+    /// still pass the TOP-LEVEL composed `verify()` — the exact call
+    /// `validate_state` makes on a PUT / full-state resync. Before this fix
+    /// `MemberInfoV1::verify` (and `MessagesV1::verify`) hard-rejected such a
+    /// state with "MemberInfo exists for non-existent member" /
+    /// "Message author not found", so a peer whose fork had already pruned a
+    /// member could never accept a full-state PUT/resync from a peer whose
+    /// fork still carried them (or vice versa) — the two forks rejected each
+    /// other's states forever instead of converging.
+    ///
+    /// This is deliberately checked at the `ChatRoomStateV1` level (not just
+    /// the sub-field level) because that is what the contract's
+    /// `validate_state` actually calls, and because the fix must survive the
+    /// composed macro's field-by-field `verify_impl` (member_info's fix alone
+    /// would be masked if `bans`, `messages`, or another field still hard-
+    /// rejected on the same orphaned member).
+    #[test]
+    fn orphaned_member_info_and_message_do_not_reject_full_state() {
+        use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+
+        let (mut state, parameters, _owner_signing_key) = create_empty_chat_room_state();
+        assert!(
+            state.verify(&state, &parameters).is_ok(),
+            "baseline empty room state should verify"
+        );
+
+        // A member absent from `state.members` — simulating a fork that has
+        // already pruned/banned them while another fork still carries their
+        // MemberInfo and a message from them.
+        let orphan_sk = SigningKey::generate(&mut rand::thread_rng());
+        let orphan_vk = orphan_sk.verifying_key();
+        let orphan_id = MemberId::from(&orphan_vk);
+        let owner_id = MemberId::from(&parameters.owner);
+
+        let orphan_info = MemberInfo::new_public(orphan_id, 1, "ghost".to_string());
+        let orphan_authorized_info =
+            AuthorizedMemberInfo::new_with_member_key(orphan_info, &orphan_sk);
+        state.member_info.member_info.push(orphan_authorized_info);
+
+        let orphan_message = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: orphan_id,
+                time: SystemTime::now(),
+                content: RoomMessageBody::public("hi from a pruned fork".to_string()),
+            },
+            &orphan_sk,
+        );
+        state.recent_messages.messages.push(orphan_message);
+
+        assert!(
+            state.verify(&state, &parameters).is_ok(),
+            "a full state carrying an orphaned MemberInfo/message must still verify: {:?}",
+            state.verify(&state, &parameters)
+        );
+
+        // And the orphan self-heals on the next real delta: applying a no-op
+        // delta still runs `post_apply_cleanup`, which prunes both the
+        // orphaned MemberInfo and the orphaned message, restoring the state
+        // to one that a peer without the fork already agrees with.
+        let mut healed = state.clone();
+        healed
+            .apply_delta(&state, &parameters, &Some(ChatRoomStateV1Delta::default()))
+            .expect("applying an empty delta must succeed");
+        assert!(
+            healed
+                .member_info
+                .member_info
+                .iter()
+                .all(|i| i.member_info.member_id != orphan_id),
+            "the orphaned MemberInfo must be pruned by the next apply_delta/cleanup pass"
+        );
+        assert!(
+            healed
+                .recent_messages
+                .messages
+                .iter()
+                .all(|m| m.message.author != orphan_id),
+            "the orphaned message must be pruned by the next apply_delta/cleanup pass"
+        );
+        assert!(
+            healed.verify(&healed, &parameters).is_ok(),
+            "the healed state must verify"
+        );
+    }
 }
