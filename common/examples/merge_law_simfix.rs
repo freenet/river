@@ -164,7 +164,39 @@ fn main() {
         .collect();
     println!("loaded {} states", base.len());
 
+    // Announce the plan BEFORE running it, so a section that does not run is
+    // visibly missing rather than silently absent.
+    //
+    // This is not cosmetic. A stale copy of this file (one predating the
+    // associativity sweep below) exits cleanly after the commutativity lines,
+    // printing no error and no associativity section — which is
+    // indistinguishable, to a reader tailing the log, from the sweep still
+    // being in progress. That cost a real investigation: two runs were waited
+    // on for tens of minutes before anyone noticed the harness could not have
+    // produced the number being waited for. Naming the checks up front turns
+    // "absent" into "started and never finished", which is a question someone
+    // asks rather than one they wait out.
+    let plan = [
+        "commutativity + idempotence (baseline)",
+        "commutativity + idempotence (sim-fix)",
+        "associativity (baseline)",
+        "associativity (sim-fix)",
+    ];
+    println!("plan: {} checks", plan.len());
+    for (i, what) in plan.iter().enumerate() {
+        println!("  [{}/{}] {what}", i + 1, plan.len());
+    }
+    println!();
+
+    println!(
+        "== [1/{}] commutativity + idempotence (baseline) ==",
+        plan.len()
+    );
     run("baseline", &base, &params, false);
+    println!(
+        "== [2/{}] commutativity + idempotence (sim-fix) ==",
+        plan.len()
+    );
     run("sim-fix", &base, &params, true);
 
     // ASSOCIATIVITY: merge(merge(A,B),C) vs merge(A,merge(B,C)).
@@ -219,6 +251,10 @@ fn main() {
             println!("[{tag}] differing-field tally: {tally:?}");
         }
     };
+    println!("== [3/{}] associativity (baseline) ==", plan.len());
     assoc("baseline-assoc", &base, false);
+    println!("== [4/{}] associativity (sim-fix) ==", plan.len());
     assoc("sim-fix-assoc", &base, true);
+
+    println!("\nall {} checks complete", plan.len());
 }
