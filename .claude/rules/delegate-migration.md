@@ -139,6 +139,40 @@ rest of this file is about.
 | `scripts/sync-wasm.sh` | Builds all WASMs and copies to committed locations |
 | `common/tests/migration_test.rs` / `common/tests/room_contract_migration_test.rs` | Validate TOML entries are well-formed |
 
+## Comment-only edits re-key the room contract
+
+**Measured, 2026-09-06.** Same canonical co-build, same absolute path, a single
+`// probe` comment line at the top of `direct_messages.rs` as the only variable:
+
+```
+unmodified                       room_contract.wasm = 0ab72165…
++ one comment line               room_contract.wasm = 237a17ba…
+```
+
+The contract WASM embeds panic `Location` records, which carry file **and
+line** — `strings` on the artifact shows `common/src/room_state/direct_messages.rs`,
+`configuration.rs`, `member_info.rs` and `util.rs`. Inserting or deleting a
+comment line in any of those shifts every `panic!`/`expect`/`assert` site below
+it and changes the code hash, hence the contract key. The chat delegate is
+usually unaffected because dead-code elimination drops those paths from it.
+
+So **"it's only a comment" is not a reason to skip the migration ritual.** If
+you edit one of those files at all, either rebuild and record the entry, or keep
+the edit LINE-NEUTRAL (each replacement block the same line count as the text it
+replaces) and prove it by rebuilding and comparing hashes.
+
+Two related things worth keeping straight:
+
+- **`check-wasm-sync` will NOT catch a source/artifact mismatch.** It compares
+  `ui/public/contracts/` against `cli/contracts/` — the two committed copies —
+  not against a build of the source. A docs-only push without a rebuild ships an
+  artifact that is not the build of its own tree, and every gate stays green.
+- **Registry edits ARE hash-neutral**, and that is a narrower result than it
+  looks. Appending to `common/legacy_room_contracts.toml` leaves both WASMs
+  byte-identical because the generated table sits behind
+  `#[cfg(feature = "migration")]` (`common/src/lib.rs`), which the contract build
+  does not enable — not because non-code changes are free. Do not generalise it.
+
 ## Technical Details
 
 - **Delegate key formula**: `BLAKE3(BLAKE3(wasm) || params)` — both steps use BLAKE3
