@@ -3927,6 +3927,121 @@ mod tests {
         );
     }
 
+    // ===== A save before hydration must not truncate the delegate blob
+    // (freenet/river#530) =====
+    //
+    // `do_save_outbound_dms_to_delegate` snapshots and fully overwrites the
+    // `OutboundDmStore` blob. Before the CURRENT delegate's
+    // `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` lands, `OUTBOUND_DMS` /
+    // `HIDDEN_DM_THREADS` haven't merged whatever is already on disk, so a
+    // save that races ahead of hydration would persist a truncated view and
+    // permanently destroy every entry the in-memory signals don't know about
+    // yet. `save_outbound_dms_to_delegate` now gates on
+    // `OUTBOUND_DMS_HYDRATED` and records a pending save instead;
+    // `mark_outbound_dms_hydrated` (called from the current-delegate
+    // `GetResponse` handler in `response_handler.rs`) drains it once the
+    // disk baseline is known.
+
+    /// Serializes the tests below that mutate the process-global
+    /// `OUTBOUND_DMS_HYDRATED` / `OUTBOUND_DMS_SAVE_PENDING_PRE_HYDRATION`
+    /// statics, mirroring `DEDUP_TEST_LOCK`'s rationale.
+    static OUTBOUND_DMS_HYDRATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A save requested before hydration must be a harmless no-op — it must
+    /// NOT reach `do_save_outbound_dms_to_delegate` (the real network write) —
+    /// and must record that a save is owed, or the mutation it was meant to
+    /// persist is silently lost forever.
+    #[test]
+    fn outbound_dms_save_defers_before_hydration_and_marks_pending() {
+        let _guard = OUTBOUND_DMS_HYDRATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_outbound_dms_hydration_state_for_test();
+
+        let result = futures::executor::block_on(save_outbound_dms_to_delegate());
+        assert!(
+            result.is_ok(),
+            "a pre-hydration save must be a harmless no-op, not an error: {:?}",
+            result
+        );
+        assert!(
+            OUTBOUND_DMS_SAVE_PENDING_PRE_HYDRATION.load(Ordering::SeqCst),
+            "a save requested before hydration must be recorded as owed"
+        );
+
+        reset_outbound_dms_hydration_state_for_test();
+    }
+
+    /// Once hydration completes, a save that was deferred pre-hydration must
+    /// be drained — otherwise a user action taken before hydration (e.g.
+    /// archiving a thread) is remembered in memory but never reaches the
+    /// delegate, and the next reload reads the stale disk copy.
+    #[test]
+    fn mark_hydrated_drains_a_pending_pre_hydration_save() {
+        let _guard = OUTBOUND_DMS_HYDRATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_outbound_dms_hydration_state_for_test();
+        OUTBOUND_DMS_SAVE_PENDING_PRE_HYDRATION.store(true, Ordering::SeqCst);
+
+        mark_outbound_dms_hydrated();
+
+        assert!(
+            OUTBOUND_DMS_HYDRATED.load(Ordering::SeqCst),
+            "the hydration latch must be set"
+        );
+        assert!(
+            !OUTBOUND_DMS_SAVE_PENDING_PRE_HYDRATION.load(Ordering::SeqCst),
+            "the pending flag must be drained so the deferred save doesn't replay twice"
+        );
+
+        reset_outbound_dms_hydration_state_for_test();
+    }
+
+    /// Marking hydrated with nothing pending must not schedule a spurious
+    /// save — the common case (no user action before hydration completes).
+    #[test]
+    fn mark_hydrated_is_a_noop_when_nothing_is_pending() {
+        let _guard = OUTBOUND_DMS_HYDRATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_outbound_dms_hydration_state_for_test();
+
+        mark_outbound_dms_hydrated();
+
+        assert!(OUTBOUND_DMS_HYDRATED.load(Ordering::SeqCst));
+        assert!(!OUTBOUND_DMS_SAVE_PENDING_PRE_HYDRATION.load(Ordering::SeqCst));
+
+        reset_outbound_dms_hydration_state_for_test();
+    }
+
+    /// Source-order pin: the hydration check inside
+    /// `save_outbound_dms_to_delegate` must run BEFORE the `coalesce_save`
+    /// call that reaches the real network write. Without this ordering a
+    /// pre-hydration caller could still fall through to the delegate write
+    /// this issue is about. (The end-to-end network path isn't
+    /// unit-testable off-WASM — see the `WEB_API` note elsewhere in this
+    /// file — so this pins the guard's position in the source instead.)
+    #[test]
+    fn outbound_dms_save_checks_hydration_before_coalescing() {
+        let src = include_str!("chat_delegate.rs");
+        let fn_start = src
+            .find("pub async fn save_outbound_dms_to_delegate")
+            .expect("save_outbound_dms_to_delegate must exist");
+        let body = &src[fn_start..];
+        let hydrated_check = body
+            .find("OUTBOUND_DMS_HYDRATED.load")
+            .expect("must check the hydration latch");
+        let coalesce_call = body
+            .find("&OUTBOUND_DMS_SAVE_STATE")
+            .expect("must still coalesce the real save once hydrated");
+        assert!(
+            hydrated_check < coalesce_call,
+            "the hydration check must run BEFORE coalesce_save, or a \
+             pre-hydration caller could still reach the network write"
+        );
+    }
+
     // ===== Outbound DM revives hidden thread (Codex P1 fix) =====
     // The testing-reviewer's BLOCKING #3 on PR #265. The "explicit
     // unhide on outbound" path lives in `dm_thread_modal::do_send` /
@@ -7240,11 +7355,66 @@ pub fn unhide_dm_thread_if_dm_is_newer(
 /// (freenet/river#246 extracted the shared primitive).
 static OUTBOUND_DMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 
+/// Set once the CURRENT (non-legacy) chat delegate's `OUTBOUND_DMS_STORAGE_KEY`
+/// `GetResponse` has been processed — see [`mark_outbound_dms_hydrated`] and
+/// freenet/river#530. Before this point, `OUTBOUND_DMS`/`HIDDEN_DM_THREADS`
+/// have not yet merged whatever is already on disk, so a save would
+/// overwrite the persisted blob with a truncated view (permanently losing
+/// every archive/plaintext entry the in-memory signals don't know about yet).
+static OUTBOUND_DMS_HYDRATED: AtomicBool = AtomicBool::new(false);
+
+/// Set by [`save_outbound_dms_to_delegate`] when a save was requested before
+/// hydration completed, so [`mark_outbound_dms_hydrated`] can replay it once
+/// the disk baseline is known. freenet/river#530.
+static OUTBOUND_DMS_SAVE_PENDING_PRE_HYDRATION: AtomicBool = AtomicBool::new(false);
+
+/// Mark the outbound-DM store hydrated from the CURRENT delegate, and replay
+/// any save that [`save_outbound_dms_to_delegate`] deferred while waiting
+/// (freenet/river#530).
+///
+/// Call exactly once per session, from the CURRENT (non-legacy) delegate's
+/// `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` — regardless of whether a blob was
+/// present, since "no blob" is itself the authoritative disk baseline for a
+/// new user. A LEGACY delegate's response must NOT call this: its data still
+/// needs merging into the current-delegate baseline, and marking hydrated
+/// early would let a save land before that baseline is known.
+pub(crate) fn mark_outbound_dms_hydrated() {
+    OUTBOUND_DMS_HYDRATED.store(true, Ordering::Release);
+    if OUTBOUND_DMS_SAVE_PENDING_PRE_HYDRATION.swap(false, Ordering::AcqRel) {
+        info!("Replaying outbound-DM save that was deferred pending hydration (freenet/river#530)");
+        crate::util::safe_spawn_local(async {
+            if let Err(e) = save_outbound_dms_to_delegate().await {
+                warn!(
+                    "Failed to persist outbound-DM save deferred pending hydration: {}",
+                    e
+                );
+            }
+        });
+    }
+}
+
+/// Reset the hydration latch. For tests only; production sets it exactly
+/// once per session via [`mark_outbound_dms_hydrated`].
+#[cfg(test)]
+pub(crate) fn reset_outbound_dms_hydration_state_for_test() {
+    OUTBOUND_DMS_HYDRATED.store(false, Ordering::SeqCst);
+    OUTBOUND_DMS_SAVE_PENDING_PRE_HYDRATION.store(false, Ordering::SeqCst);
+}
+
 /// Serialize the current [`OUTBOUND_DMS`] cache and persist it via the
 /// chat delegate. Caller is responsible for having already mutated the
 /// cache before invoking this. Fire-and-forget at most call sites —
 /// the StoreResponse comes back through the normal message loop and is
 /// logged but not awaited on the hot path.
+///
+/// **Defers until hydration completes (freenet/river#530).** Before the
+/// CURRENT delegate's `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` has been
+/// processed, `OUTBOUND_DMS`/`HIDDEN_DM_THREADS` may not yet reflect
+/// whatever is already persisted. Writing now would publish a truncated
+/// snapshot that permanently overwrites the disk copy — the mechanism
+/// behind the #530 archive/plaintext loss. Instead, record that a save is
+/// owed; [`mark_outbound_dms_hydrated`] replays it once the baseline is
+/// known, so the eventual write is over the fully-merged state.
 ///
 /// Coalesced via [`coalesce_save`] (was a hand-rolled copy of the same
 /// pattern until freenet/river#246 extracted the primitive): a chain
@@ -7253,6 +7423,11 @@ static OUTBOUND_DMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 /// authoritative result of the catch-up save that covered its
 /// mutation.
 pub async fn save_outbound_dms_to_delegate() -> Result<(), String> {
+    if !OUTBOUND_DMS_HYDRATED.load(Ordering::Acquire) {
+        OUTBOUND_DMS_SAVE_PENDING_PRE_HYDRATION.store(true, Ordering::Release);
+        info!("Outbound-DMs save deferred until delegate hydration completes (freenet/river#530)");
+        return Ok(());
+    }
     coalesce_save(
         &OUTBOUND_DMS_SAVE_STATE,
         "Outbound-DMs",

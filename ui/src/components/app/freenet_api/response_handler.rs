@@ -18,9 +18,9 @@ use crate::components::app::chat_delegate::{
     fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
     is_legacy_delegate_key, is_legacy_migration_in_progress, legacy_scoped_correlation,
     load_state_after_probe_legacy, mark_legacy_migration_done, mark_legacy_migration_in_progress,
-    parse_room_storage_key, per_room_terminal, prune_outbound_dms_for_purges,
-    request_legacy_seal_on_quiescence, response_correlation_base, room_storage_key,
-    save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
+    mark_outbound_dms_hydrated, parse_room_storage_key, per_room_terminal,
+    prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, response_correlation_base,
+    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
     send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
     LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
     OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
@@ -2012,6 +2012,17 @@ fn hydrate_loaded_rooms_with_authority(
 /// serialized `OutboundDmStore`, and — when the response came from a
 /// legacy delegate — schedules a save so the migrated entries land
 /// under the current delegate's key.
+///
+/// **Marks the hydration latch for the CURRENT delegate (freenet/river#530).**
+/// Every return path for `!is_legacy_delegate` calls
+/// [`mark_outbound_dms_hydrated`] — including "no blob" (an empty disk is
+/// still an authoritative baseline for a new user) and a deserialize failure
+/// (the blob is unreadable either way; the alternative is a save path stuck
+/// deferring forever). The call sits AFTER `hydrate_hidden_dm_threads` /
+/// `hydrate_outbound_dms_cache` in the `Ok` branch so the `setTimeout(0)`
+/// macrotask it may schedule (replaying a save deferred pre-hydration) is
+/// enqueued FIFO-after theirs, and therefore runs after their own deferred
+/// signal writes have landed — see `mark_outbound_dms_hydrated`'s doc.
 fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: bool) {
     let Some(bytes) = value else {
         info!(
@@ -2022,6 +2033,9 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: 
                 "current"
             }
         );
+        if !is_legacy_delegate {
+            mark_outbound_dms_hydrated();
+        }
         return;
     };
 
@@ -2039,6 +2053,9 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: 
                     "current"
                 }
             );
+            if !is_legacy_delegate {
+                mark_outbound_dms_hydrated();
+            }
             if is_legacy_delegate && (count > 0 || hidden_count > 0) {
                 // Persist the merged cache under the current delegate
                 // key so subsequent loads find the data without
@@ -2072,6 +2089,9 @@ fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: 
         }
         Err(e) => {
             error!("Failed to deserialize outbound-DMs blob: {}", e);
+            if !is_legacy_delegate {
+                mark_outbound_dms_hydrated();
+            }
         }
     }
 }
@@ -2473,6 +2493,24 @@ mod tests {
         assert!(
             prod.contains("Failed to deserialize chat delegate response \\\n"),
             "the deser-failure log should carry a hex head"
+        );
+    }
+
+    /// freenet/river#530: `handle_outbound_dms_get_response` must mark the
+    /// hydration latch on EVERY return path for the CURRENT (non-legacy)
+    /// delegate — no blob present, a successfully parsed blob, and a
+    /// deserialize failure. Missing any one of these leaves
+    /// `save_outbound_dms_to_delegate` stuck deferring forever for that
+    /// session, silently dropping every subsequent archive/DM-send.
+    #[test]
+    fn outbound_dms_hydration_latch_is_marked_on_every_current_delegate_return_path() {
+        let src = include_str!("response_handler.rs");
+        let prod = src.split("mod tests {").next().unwrap_or(src);
+        assert_eq!(
+            prod.matches("mark_outbound_dms_hydrated();").count(),
+            3,
+            "handle_outbound_dms_get_response must call mark_outbound_dms_hydrated() \
+             exactly 3 times: no-blob, parsed-ok, and parse-failure"
         );
     }
 
