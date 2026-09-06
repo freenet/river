@@ -223,3 +223,10 @@ description = "Before the member_info summary digest (freenet/river#571): last c
 date = "2026-07-30"
 delegate_key = "c3624f29fdfdb1ca3473a3d4b11c83b635cb98bf6d89e1b5114c003e1d1c485a"
 code_hash = "6f65e45cd8b903374b4ac7c9c916e4fe9f9403660e7391c9192ea8378933a1b4"
+
+[[entry]]
+version = "V31"
+description = "Fix freenet/river#423: MemberInfoV1::verify and MessagesV1::verify no longer hard-reject an entry whose member is absent from the local member set (orphaned MemberInfo/message), which previously made a two-fork divergence permanent"
+date = "2026-09-05"
+delegate_key = "cc312ac16dd5abe75ebc28e8483b0d2a6593457bf8030a20d0d640d10150eafc"
+code_hash = "a44c64014d60fd245fe8fb5172f8fd7397039b248b3b6a8e95e89a0bb539fb5e"

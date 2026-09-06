@@ -3268,7 +3268,7 @@ mod tests {
     /// delegate, and that is enough to require an entry.
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
-        assert_eq!(legacy_set_fingerprint(), "c43e66ee147e3739");
+        assert_eq!(legacy_set_fingerprint(), "c32c326c1328de9a");
     }
 
     /// The "migration in progress" and "migration done" localStorage keys MUST
@@ -4773,7 +4773,7 @@ mod tests {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "a44c64014d60fd245fe8fb5172f8fd7397039b248b3b6a8e95e89a0bb539fb5e",
+            "8a39ab73369fb2aced36cb787e2ca31b7b57dffcdd905c282091aa40e22ca78d",
             "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
              if the change is intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"

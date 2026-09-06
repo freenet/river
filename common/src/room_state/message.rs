@@ -136,10 +136,19 @@ impl ComposableState for MessagesV1 {
                 // Regular member messages are validated against their member key
                 &member.member.member_vk
             } else {
-                return Err(format!(
-                    "Message author not found: {:?}",
-                    message.message.author
-                ));
+                // The author is absent from this side's `members` list (pruned
+                // for inactivity, banned, or not yet arrived here). We can't
+                // re-check the signature without their key, and — mirroring
+                // `MemberInfoV1::verify`'s identical fix for freenet/river#423
+                // — rejecting the WHOLE state here is what makes a two-fork
+                // divergence permanent: a peer that still has this author's
+                // message can never successfully PUT/resync its state to a
+                // peer that already pruned them. `apply_delta`'s unconditional
+                // retain-sweep and `post_apply_cleanup` step 4b already drop
+                // exactly this orphaned message on the very next applied
+                // delta, so tolerating it here just lets that self-healing
+                // convergence run instead of being blocked before it starts.
+                continue;
             };
 
             if message.validate(verifying_key).is_err() {
@@ -1319,19 +1328,25 @@ mod tests {
             "Messages with invalid signature should fail verification"
         );
 
-        // Test with non-existent author
+        // A message whose author is absent from `parent_state.members` must
+        // NOT reject the whole state (freenet/river#423) — mirroring
+        // `MemberInfoV1::verify`'s identical fix, this lets a full-state
+        // PUT/resync carrying such an orphan converge instead of being
+        // permanently rejected. `apply_delta` + `post_apply_cleanup` already
+        // prune the orphaned message on the next applied delta.
         let non_existent_author_id =
             MemberId::from(&SigningKey::generate(&mut OsRng).verifying_key());
-        let invalid_message = create_test_message(owner_id, non_existent_author_id);
-        let invalid_authorized_message =
-            AuthorizedMessageV1::new(invalid_message, &author_signing_key);
-        let invalid_messages = MessagesV1 {
-            messages: vec![invalid_authorized_message],
+        let orphaned_message = create_test_message(owner_id, non_existent_author_id);
+        let orphaned_authorized_message =
+            AuthorizedMessageV1::new(orphaned_message, &author_signing_key);
+        let orphaned_messages = MessagesV1 {
+            messages: vec![orphaned_authorized_message],
             ..Default::default()
         };
         assert!(
-            invalid_messages.verify(&parent_state, &parameters).is_err(),
-            "Messages with non-existent author should fail verification"
+            orphaned_messages.verify(&parent_state, &parameters).is_ok(),
+            "Expected verification to tolerate a message from a non-existent author: {:?}",
+            orphaned_messages.verify(&parent_state, &parameters)
         );
     }
 

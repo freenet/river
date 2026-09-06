@@ -351,14 +351,31 @@ impl ComposableState for MemberInfoV1 {
             if member_id == owner_id {
                 // If this is the owner's member info, verify against owner's key
                 member_info.verify_signature(parameters)?;
-            } else {
-                // For non-owner members, verify they exist in members list
-                let member = members_by_id.get(&member_id).ok_or_else(|| {
-                    format!("MemberInfo exists for non-existent member: {:?}", member_id)
-                })?;
-
+            } else if let Some(member) = members_by_id.get(&member_id) {
                 // Verify the signature with member's key
                 member_info.verify_signature_with_key(&member.member.member_vk)?;
+            } else {
+                // The member is absent from this side's `members` list (they
+                // were pruned for inactivity, banned, or simply never
+                // arrived here yet). We can't re-check the signature without
+                // the member's key, and — as with `BansV1::verify_excluding_cap`'s
+                // identical "banning member not in current members list" case
+                // — the record was already signature-checked when it was
+                // created and carries no authority for a non-current member
+                // (`deputies_of` and nickname rendering are only consulted
+                // for ids present in `parent_state.members`).
+                //
+                // Rejecting the WHOLE state here is what makes a two-fork
+                // divergence permanent (freenet/river#423): fork A prunes a
+                // member fork B still has, and every full-state PUT/resync
+                // of B's (or the correctly-converged) state to A is refused
+                // outright with "MemberInfo exists for non-existent member",
+                // so the two forks can never reconcile. `apply_delta`'s
+                // unconditional retain-sweep and `post_apply_cleanup` step 4
+                // already prune exactly this orphan on the very next applied
+                // delta — tolerating it here just lets that self-healing
+                // convergence path run instead of being blocked before it
+                // gets a chance to.
             }
         }
         Ok(())
@@ -1031,7 +1048,13 @@ mod tests {
             result.unwrap_err()
         );
 
-        // Test with non-existent member
+        // MemberInfo for a member absent from `parent_state.members` must NOT
+        // reject the whole state (freenet/river#423) — a full-state PUT/resync
+        // carrying such an orphan (e.g. from a peer that hasn't yet pruned a
+        // member this side already removed) must still be accepted, so the
+        // two sides can converge instead of permanently rejecting each
+        // other's states. `apply_delta` + `post_apply_cleanup` already prune
+        // the orphan on the next applied delta.
         let non_existent_member_id = SigningKey::generate(&mut OsRng).verifying_key().into();
         let non_existent_member_info = create_test_member_info(non_existent_member_id);
         let non_existent_authorized_member_info =
@@ -1042,16 +1065,10 @@ mod tests {
 
         let verify_result = member_info_v1.verify(&parent_state, &parameters);
         assert!(
-            verify_result.is_err(),
-            "Expected verification to fail, but it succeeded"
+            verify_result.is_ok(),
+            "Expected verification to tolerate an orphaned MemberInfo, but it failed: {}",
+            verify_result.unwrap_err()
         );
-        if let Err(err) = verify_result {
-            assert!(
-                err.contains("MemberInfo exists for non-existent member"),
-                "Unexpected error message: {}",
-                err
-            );
-        }
 
         // Test with invalid signature
         let invalid_authorized_member_info = authorized_member_info.with_invalid_signature();
