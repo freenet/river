@@ -166,4 +166,59 @@ fn main() {
 
     run("baseline", &base, &params, false);
     run("sim-fix", &base, &params, true);
+
+    // ASSOCIATIVITY: merge(merge(A,B),C) vs merge(A,merge(B,C)).
+    // The commutativity runs above never exercised this, and the verifier
+    // reported 5 associativity violations alongside the 12 commutativity ones,
+    // so "one change closes both defects" is unproven until this is measured.
+    let assoc = |tag: &str, states: &[(String, ChatRoomStateV1)], simfix: bool| {
+        let mut fails = 0usize;
+        let mut trips = 0usize;
+        let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
+        let n = states.len();
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    if i == j || j == k || i == k {
+                        continue;
+                    }
+                    let (mut a, mut b, mut c) = (
+                        states[i].1.clone(),
+                        states[j].1.clone(),
+                        states[k].1.clone(),
+                    );
+                    if simfix {
+                        // Same stand-in as above, using the A-B merged context.
+                        let (active, banned) = merged_context(&a, &b, &params);
+                        sweep_with(&mut a, &params, &active, &banned);
+                        sweep_with(&mut b, &params, &active, &banned);
+                        sweep_with(&mut c, &params, &active, &banned);
+                    }
+                    trips += 1;
+                    let ab = match merge(&a, &b, &params) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let bc = match merge(&b, &c, &params) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let left = merge(&ab, &c, &params);
+                    let right = merge(&a, &bc, &params);
+                    if let (Ok(l), Ok(r)) = (left, right) {
+                        if ser(&l) != ser(&r) {
+                            fails += 1;
+                            *tally.entry(diff_fields(&l, &r).join("+")).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        println!("[{tag}] associativity: {fails} failing / {trips} ordered triples");
+        if !tally.is_empty() {
+            println!("[{tag}] differing-field tally: {tally:?}");
+        }
+    };
+    assoc("baseline-assoc", &base, false);
+    assoc("sim-fix-assoc", &base, true);
 }
