@@ -115,21 +115,28 @@ riverctl identity whoami <room-owner-vk>         # Your member ID in one room.
 riverctl identity whoami                         # Every room you're in.
 ```
 
-The `member_id` it reports is exactly the top-level `author` value your own
-messages carry in `message list` / `message stream --format json`, which is what
-a bridge needs to filter out its own echo:
+`whoami` reports both identifiers, and they pair with two different fields — a
+bridge filtering out its own echo should use the full key:
 
 ```bash
-me=$(riverctl identity whoami <room-owner-vk> --format json | jq -r .member_id)
+me=$(riverctl identity whoami <room-owner-vk> --format json | jq -r .verifying_key)
 riverctl message stream <room-owner-vk> --format json --no-version-check |
-  jq -c --arg me "$me" 'select(.author != $me)'
+  jq -c --arg me "$me" 'select(.author_verifying_key != $me)'
 ```
 
-`message list --format json` also carries `author_verifying_key` — the author's
-full base58 key (or `null` when the author is no longer in the room). The
-`author` short id can be filtered on cheaply as above, but a bot deciding
-whether to *trust* a command should compare this full key, since the short id is
-a 40-bit truncation. Get the trusted keys from `member list`'s `verifying_key`.
+`message list` and `message stream --format json` both carry
+`author_verifying_key` — the author's full base58 key, comparable to `whoami`'s
+`verifying_key` and to `member list`'s. It is `null` when the author is no longer
+in the room, so a `select` on it drops nothing you wanted to keep.
+
+**Pair the two halves correctly.** `whoami`'s `member_id` compares against the
+event's `author`; its `verifying_key` compares against `author_verifying_key`.
+Crossing them (`member_id` against `author_verifying_key`) is never equal, which
+silently disables an echo filter and can put a bridge in a feedback loop.
+
+The short id is fine for recognising your own messages if you pair it correctly,
+but a bot deciding whether to *trust* a member must compare the full key: the
+short id is a 40-bit truncation of a 64-bit non-cryptographic hash.
 
 (The `author` inside `reply_to` is a display nickname, not a member ID — only
 the top-level `author` is comparable.)
@@ -275,17 +282,30 @@ Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags.
 
 | `type` | Meaning | Fields |
 |--------|---------|--------|
-| `message` | A new message | `message_id`, `room`, `author`, `nickname`, `content`, `timestamp`, `edited`, `reply_to`, `reactions` |
+| `message` | A new message | `message_id`, `room`, `author`, `author_verifying_key`, `nickname`, `content`, `timestamp`, `edited`, `reply_to`, `reactions` |
 | `edit` | A previously-streamed message's content changed | same as `message` (with the new `content` and `edited: true`) |
-| `delete` | A previously-streamed message was deleted | `message_id`, `room`, `author`, `nickname`, `timestamp` (no `content`) |
+| `delete` | A previously-streamed message was deleted | `message_id`, `room`, `author`, `author_verifying_key`, `nickname`, `timestamp` (no `content`) |
+| `reaction` | A surfaced message's reactions changed | `message_id`, `room`, `author`, `author_verifying_key`, `nickname`, `timestamp`, `reactions` (emoji → count), `reactors` (emoji → member IDs) |
 
-`reply_to` is `{ "author", "preview" }` only when the quoted message could be read back from live room state. It is `null` both for non-replies **and** for a reply whose quoted message could not be verified — its author was banned (which purges their messages), it was deleted, it aged out of the room's `max_recent_messages` window, or it could not be decrypted. The quoted author and preview stored in a reply are a snapshot written by the *replier* and validated by nothing, so riverctl never emits them unverified; a bridge would otherwise republish a banned member's text after the ban. The human-readable output marks a reply it could not verify with a `[reply to an unavailable message]` prefix; the JSON deliberately does not distinguish it from a non-reply, so no existing consumer breaks on a new shape. The one exception is a private room `riverctl` holds no secrets for at all: there it emits no marker either, since it cannot read any of the room's messages and every body already renders `<encrypted>`.
+On a `reaction` event, `author` and `author_verifying_key` identify the author of
+the message that was **reacted to**, not the person who reacted — read `reactors`
+for that.
 
-`edit`/`delete` events are emitted only for messages the stream actually surfaced. Bridges should key off `type` and tolerate unknown future types.
+**`reactors` carries short ids only.** So a bot that acts on *who reacted* — a
+moderation sweep, an "admin reacted ✅ to approve" flow — is deciding on 40 bits,
+and must resolve those ids through `member list`'s `verifying_key` before
+treating one as an identity. Do not substitute the event's
+`author_verifying_key`: on a reaction event it names an uninvolved party.
 
-The top-level `author` is the sending member's ID; get your own with `riverctl
-identity whoami <room-owner-vk>` and compare against it to recognise your own
-messages. (`reply_to.author` is a display nickname, not an ID.)
+`reply_to` is `{ "author", "author_id", "message_id", "preview" }` only when the quoted message could be read back from live room state. It is `null` both for non-replies **and** for a reply whose quoted message could not be verified — its author was banned (which purges their messages), it was deleted, it aged out of the room's `max_recent_messages` window, or it could not be decrypted. The quoted author and preview stored in a reply are a snapshot written by the *replier* and validated by nothing, so riverctl never emits them unverified; a bridge would otherwise republish a banned member's text after the ban. The human-readable output marks a reply it could not verify with a `[reply to an unavailable message]` prefix; the JSON deliberately does not distinguish it from a non-reply, so no existing consumer breaks on a new shape. The one exception is a private room `riverctl` holds no secrets for at all: there it emits no marker either, since it cannot read any of the room's messages and every body already renders `<encrypted>`.
+
+`edit`/`delete` events are emitted only for messages the stream actually surfaced. Bridges should key off `type` and tolerate unknown future types **and unknown fields** — new fields are added to these events (this table has grown twice), so a strict schema that rejects them will break on an ordinary riverctl upgrade.
+
+The top-level `author` is the sending member's ID and `author_verifying_key` is
+their full key; get your own with `riverctl identity whoami <room-owner-vk>` and
+compare like against like (see "Managing your identity" above). Inside `reply_to`,
+`author` is a display **nickname**, not an ID — the id there is `author_id`, and
+it has no full-key sibling, so it is not something to trust on.
 
 ## Configuration
 

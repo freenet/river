@@ -338,15 +338,12 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                     // an older message), since their key is no longer in state.
                     // JSON only: a bot reading messages allow-lists on this key,
                     // whereas the human chat view stays terse.
-                    // Reuse the same owner/member resolution as `member list`
-                    // (`RoomDeputies::verifying_key`) rather than reimplementing
-                    // it, so the two cannot drift.
-                    let deputies =
-                        crate::deputies::RoomDeputies::new(&room_state, &room_owner_key, &secrets);
+                    // Call the SHARED helper `message stream` emits with, rather
+                    // than resolving and encoding here, so the backfill and the
+                    // live feed cannot drift — not even in the base58 encoding
+                    // (freenet/river#679).
                     let author_verifying_key = |author: MemberId| -> Option<String> {
-                        deputies
-                            .verifying_key(author)
-                            .map(|k| bs58::encode(k.as_bytes()).into_string())
+                        crate::api::author_verifying_key_b58(&room_state, &room_owner_key, author)
                     };
                     let json_messages: Vec<_> = messages
                         .iter()
@@ -733,17 +730,25 @@ mod tests {
             .expect("test module marker missing; the cut would scan everything");
         let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
 
-        // The author's full key is the collision-proof identity a bot allow-lists
-        // on; it must be in the JSON, resolved via the shared RoomDeputies helper
-        // (whose owner/member/None behaviour is unit-tested in `deputies`).
+        // The author's full key is the identity a bot allow-lists on; it must be
+        // in the JSON, produced by the SAME helper `message stream` emits with
+        // (freenet/river#679). Pinning the shared call, not just "some key is
+        // emitted": before #679 both surfaces resolved through `RoomDeputies`
+        // yet each did its own base58 encoding, so "cannot drift" was only half
+        // true. `author_verifying_key_b58`'s own behaviour — owner, member,
+        // departed-author `None`, and the emitted value — is tested in `api`.
         assert!(
             squashed
                 .contains(r#""author_verifying_key":author_verifying_key(msg.message.author),"#),
             "message list JSON must expose the author's verifying key"
         );
         assert!(
-            squashed.contains("RoomDeputies::new(&room_state,&room_owner_key,&secrets)"),
-            "author key must resolve via the shared RoomDeputies helper, not a re-implementation"
+            squashed.contains(
+                "crate::api::author_verifying_key_b58(&room_state,&room_owner_key,author)"
+            ),
+            "author key must come from the shared helper the stream uses, not a \
+             re-implementation — that shared call is what keeps list and stream \
+             in step"
         );
     }
 

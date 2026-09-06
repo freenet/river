@@ -165,6 +165,39 @@ pub struct RoomDeputies<'a> {
     owner_vk: VerifyingKey,
 }
 
+/// Resolve a member id to the ed25519 verifying key this room state carries for
+/// it: the room owner, or a current member of `members.members`. `None` for any
+/// other id — a since-departed author, or an id appearing only in a deputizer's
+/// signed `deputies` record — for whom no key is stored. Never a *wrong* key.
+///
+/// The single definition of this resolution. [`RoomDeputies::verifying_key`]
+/// delegates here, and so does riverctl's JSON output (`message list`'s and
+/// `message stream`'s `author_verifying_key`), so the backfill and the live
+/// stream cannot drift apart.
+///
+/// Scans rather than indexing a map, so a caller emitting one event at a time
+/// pays no index-construction. It walks in REVERSE deliberately: the map form
+/// (`members_by_member_id`) is a `collect()` into a `HashMap`, where a duplicate
+/// id is won by the LAST entry, and this must answer identically to it.
+pub(crate) fn verifying_key_of(
+    state: &ChatRoomStateV1,
+    owner_vk: &VerifyingKey,
+    id: MemberId,
+) -> Option<VerifyingKey> {
+    if id == MemberId::from(owner_vk) {
+        // The owner is never in `members.members`, so they are resolved here or
+        // not at all.
+        return Some(*owner_vk);
+    }
+    state
+        .members
+        .members
+        .iter()
+        .rev()
+        .find(|m| m.member.id() == id)
+        .map(|m| m.member.member_vk)
+}
+
 impl<'a> RoomDeputies<'a> {
     pub fn new(
         state: &'a ChatRoomStateV1,
@@ -237,17 +270,23 @@ impl<'a> RoomDeputies<'a> {
     /// appears only in a deputizer's signed `deputies` record with no member of
     /// its own — for whom no key is stored.
     ///
-    /// This is the collision-PROOF identifier. The `member_id` label printed
-    /// elsewhere is a 40-bit truncation of a 64-bit non-cryptographic hash, so
-    /// anything making a trust decision about a member (e.g. a bot allow-list)
-    /// MUST compare this key, never the short label. See the note on
-    /// `MemberId` in `river-core` (`room_state::member`).
+    /// This is the identifier to make a trust decision on. The `member_id` label
+    /// printed elsewhere is a 40-bit truncation of a 64-bit NON-cryptographic
+    /// hash, so anything trusting a member (e.g. a bot allow-list) MUST compare
+    /// this key, never the short label. See the note on `MemberId` in
+    /// `river-core` (`room_state::member`).
+    ///
+    /// What makes the answer trustworthy is not that the lookup key is unguessable
+    /// — it is a 64-bit FastHash and a determined attacker can collide it. It is
+    /// that `MessagesV1::verify` checks each message's signature against an entry
+    /// from *this same* member map, so the key reported here is provably the key
+    /// the message was verified under, collision or not.
+    ///
+    /// Delegates to [`verifying_key_of`], the single definition of this
+    /// resolution, so a caller that has no [`RoomDeputies`] to hand cannot end up
+    /// with a second, subtly different one.
     pub fn verifying_key(&self, id: MemberId) -> Option<VerifyingKey> {
-        if id == self.owner_id {
-            Some(self.owner_vk)
-        } else {
-            self.members_by_id.get(&id).map(|m| m.member.member_vk)
-        }
+        verifying_key_of(self.state, &self.owner_vk, id)
     }
 
     fn member_info(&self) -> &MemberInfoV1 {
