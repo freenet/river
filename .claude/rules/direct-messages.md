@@ -135,6 +135,18 @@ plaintext in the chat delegate.
   delegate writes. `save_outbound_dms_to_delegate` and
   `save_rooms_to_delegate` both share the helper — grep `CoalesceState`
   to find every caller.
+  **Hydration gate (freenet/river#530):** before that, `save_outbound_dms_to_delegate`
+  awaits the `OUTBOUND_DMS_HYDRATED` latch (bounded by `await_flag_with_bound`,
+  15s worst case), so a save can never read `OUTBOUND_DMS`/`HIDDEN_DM_THREADS`
+  before they've merged whatever the CURRENT delegate already has on disk —
+  otherwise the save's full-blob overwrite would truncate it. The latch is set
+  by `mark_outbound_dms_hydrated()`, called only from the CURRENT (non-legacy)
+  delegate's `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` handler in
+  `response_handler.rs`, on every return path (no blob / parsed / parse
+  failure). `Ok(())` from `save_outbound_dms_to_delegate` always means the
+  write was actually attempted — this is load-bearing for
+  `LiveImportSeam::flush` in `freenet_api/delegate_migration.rs`, which seals
+  a predecessor as migrated on `Ok`.
 - **Prune path**: `prune_outbound_dms_for_purges` (UI) and
   `prune_outbound_cache_for_room` (CLI) act ONLY on entries whose
   `(room, recipient, token)` appears in some recipient's

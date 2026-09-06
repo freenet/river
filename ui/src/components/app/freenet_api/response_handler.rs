@@ -2018,11 +2018,16 @@ fn hydrate_loaded_rooms_with_authority(
 /// [`mark_outbound_dms_hydrated`] — including "no blob" (an empty disk is
 /// still an authoritative baseline for a new user) and a deserialize failure
 /// (the blob is unreadable either way; the alternative is a save path stuck
-/// deferring forever). The call sits AFTER `hydrate_hidden_dm_threads` /
-/// `hydrate_outbound_dms_cache` in the `Ok` branch so the `setTimeout(0)`
-/// macrotask it may schedule (replaying a save deferred pre-hydration) is
-/// enqueued FIFO-after theirs, and therefore runs after their own deferred
-/// signal writes have landed — see `mark_outbound_dms_hydrated`'s doc.
+/// waiting forever). `save_outbound_dms_to_delegate` polls this latch with a
+/// real yield between checks (see `await_flag_with_bound`), so any caller
+/// that observes the latch flip has necessarily yielded back to the event
+/// loop at least once first — by which point this function's own
+/// `hydrate_hidden_dm_threads` / `hydrate_outbound_dms_cache` calls (issued
+/// synchronously, earlier in this same call) have already had their
+/// deferred signal writes run. The exact position of the `mark_outbound_dms_hydrated`
+/// call relative to those two calls is therefore NOT load-bearing — only
+/// that all three happen within this one synchronous invocation, which they
+/// do.
 fn handle_outbound_dms_get_response(value: Option<Vec<u8>>, is_legacy_delegate: bool) {
     let Some(bytes) = value else {
         info!(
@@ -2499,9 +2504,13 @@ mod tests {
     /// freenet/river#530: `handle_outbound_dms_get_response` must mark the
     /// hydration latch on EVERY return path for the CURRENT (non-legacy)
     /// delegate — no blob present, a successfully parsed blob, and a
-    /// deserialize failure. Missing any one of these leaves
-    /// `save_outbound_dms_to_delegate` stuck deferring forever for that
-    /// session, silently dropping every subsequent archive/DM-send.
+    /// deserialize failure — and NEVER for a legacy delegate's response
+    /// (whose data still needs merging into the current baseline first; see
+    /// `mark_outbound_dms_hydrated`'s doc). A plain call-count check can't
+    /// tell "gated by `!is_legacy_delegate`" apart from "gated the wrong way
+    /// / not gated at all" — inverting or deleting the guard leaves the count
+    /// at 3 either way — so this additionally requires each call to be
+    /// immediately preceded by the guard.
     #[test]
     fn outbound_dms_hydration_latch_is_marked_on_every_current_delegate_return_path() {
         let src = include_str!("response_handler.rs");
@@ -2511,6 +2520,27 @@ mod tests {
             3,
             "handle_outbound_dms_get_response must call mark_outbound_dms_hydrated() \
              exactly 3 times: no-blob, parsed-ok, and parse-failure"
+        );
+        let guarded = "if !is_legacy_delegate {";
+        let guarded_call_count = prod
+            .match_indices("mark_outbound_dms_hydrated();")
+            .filter(|(idx, _)| {
+                // The guard's `{` must be the nearest preceding `{` — i.e. no
+                // OTHER brace opens in between — so this can't be fooled by
+                // an unrelated `if !is_legacy_delegate {` earlier in the file
+                // whose block contains unrelated code before our call.
+                let before = &prod[..*idx];
+                let guard_brace_pos = before.rfind(guarded).map(|p| p + guarded.len() - 1);
+                let last_brace_pos = before.rfind('{');
+                matches!((guard_brace_pos, last_brace_pos), (Some(a), Some(b)) if a == b)
+            })
+            .count();
+        assert_eq!(
+            guarded_call_count, 3,
+            "every mark_outbound_dms_hydrated() call must be the first statement \
+             inside an `if !is_legacy_delegate {{` block — a flipped or missing \
+             guard would let a legacy delegate's response mark hydration early \
+             and reintroduce the #530 truncation bug"
         );
     }
 
