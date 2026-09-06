@@ -3927,6 +3927,174 @@ mod tests {
         );
     }
 
+    // ===== A save before hydration must not truncate the delegate blob
+    // (freenet/river#530) =====
+    //
+    // `do_save_outbound_dms_to_delegate` snapshots and fully overwrites the
+    // `OutboundDmStore` blob. Before the CURRENT delegate's
+    // `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` lands, `OUTBOUND_DMS` /
+    // `HIDDEN_DM_THREADS` haven't merged whatever is already on disk, so a
+    // save that races ahead of hydration would persist a truncated view and
+    // permanently destroy every entry the in-memory signals don't know about
+    // yet. `save_outbound_dms_to_delegate` now WAITS for
+    // `OUTBOUND_DMS_HYDRATED` (bounded, so a lost `GetResponse` can't hang
+    // forever) before reading the signals, so `Ok(())` always means the
+    // write was actually attempted — never a silent, unwritten success. That
+    // matters beyond user-triggered saves: `LiveImportSeam::flush` (in
+    // `freenet_api/delegate_migration.rs`) treats `Ok` from this function as
+    // proof of durability before sealing a predecessor as migrated (code-first
+    // review on PR #670) — an early no-op `Ok` there would have reproduced
+    // exactly the "sealed Done over data never saved" bug that file's own
+    // `merge_outbound_dms` comment (lines ~816-837) was written to prevent.
+
+    /// Serializes the tests below that mutate the process-global
+    /// `OUTBOUND_DMS_HYDRATED` static, mirroring `DEDUP_TEST_LOCK`'s
+    /// rationale.
+    static OUTBOUND_DMS_HYDRATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Already-set fast path: no polling, returns essentially immediately.
+    #[test]
+    fn await_flag_with_bound_returns_immediately_when_already_set() {
+        static FLAG: AtomicBool = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        futures::executor::block_on(await_flag_with_bound(
+            &FLAG,
+            std::time::Duration::from_secs(5),
+            1,
+        ));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "an already-set flag must not wait a single poll interval"
+        );
+    }
+
+    /// If the flag flips while a wait is in progress, the wait must return as
+    /// soon as it's observed — not sit out the full `max_polls` budget. Proven
+    /// by racing a flipper (no delay) against the waiter (a real, larger poll
+    /// interval + generous max_polls) and asserting the combined wait
+    /// completes far under the full budget.
+    #[test]
+    fn await_flag_with_bound_returns_once_flag_set_mid_wait() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        FLAG.store(false, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let waiter = await_flag_with_bound(&FLAG, std::time::Duration::from_millis(20), 100);
+        let flipper = async {
+            FLAG.store(true, Ordering::SeqCst);
+        };
+        futures::executor::block_on(futures::future::join(waiter, flipper));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "must return on the first poll after the flag flips, not exhaust \
+             the full 100*20ms=2s budget: took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A flag that never flips must still return (not hang) once `max_polls`
+    /// is exhausted — the whole point of bounding the wait.
+    #[test]
+    fn await_flag_with_bound_gives_up_after_max_polls_when_never_set() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        FLAG.store(false, Ordering::SeqCst);
+        // Small bound so the test itself stays fast; the production bound
+        // (300 * 50ms = 15s) is a separate, deliberate constant.
+        futures::executor::block_on(await_flag_with_bound(
+            &FLAG,
+            std::time::Duration::from_millis(1),
+            3,
+        ));
+        assert!(
+            !FLAG.load(Ordering::SeqCst),
+            "sanity: this test doesn't set the flag"
+        );
+        // Reaching this point at all is the assertion — a bug that removed
+        // the `max_polls` bound would hang the test instead of failing it.
+    }
+
+    /// `mark_outbound_dms_hydrated` sets the latch.
+    #[test]
+    fn mark_outbound_dms_hydrated_sets_the_latch() {
+        let _guard = OUTBOUND_DMS_HYDRATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_outbound_dms_hydration_state_for_test();
+
+        mark_outbound_dms_hydrated();
+        assert!(OUTBOUND_DMS_HYDRATED.load(Ordering::SeqCst));
+
+        reset_outbound_dms_hydration_state_for_test();
+    }
+
+    /// Source-order pin: `save_outbound_dms_to_delegate` must (a) have NO
+    /// early-return shortcut — `Ok(())` must always mean the write was
+    /// attempted, never a silent no-op — and (b) await hydration BEFORE
+    /// calling `coalesce_save`, the real write path. (The end-to-end
+    /// behavior isn't unit-testable off-WASM: `do_save_outbound_dms_to_delegate`
+    /// reads `OUTBOUND_DMS`/`HIDDEN_DM_THREADS` `GlobalSignal`s, which panic
+    /// with "Must be called from inside a Dioxus runtime" outside one — see
+    /// the `WEB_API` unit-testability note elsewhere in this file for the
+    /// same limitation on the network side.)
+    #[test]
+    fn outbound_dms_save_awaits_hydration_unconditionally_before_coalescing() {
+        let src = include_str!("chat_delegate.rs");
+        // The needle is assembled at runtime so this test's own source does
+        // NOT contain the contiguous signature string (else `find` would
+        // match this test's own needle literal, being earlier in the file,
+        // instead of the real function — see `late_dm_hydration_persists_sanitized_store`
+        // for the same pattern).
+        let signature = format!(
+            "pub async fn {}() -> Result<(), String> {{",
+            "save_outbound_dms_to_delegate"
+        );
+        let fn_start = src
+            .find(&signature)
+            .expect("save_outbound_dms_to_delegate must exist");
+        let after = &src[fn_start..];
+        // The function body is short; its closing brace is the first
+        // column-0 `}` after the opening one.
+        let fn_end = after
+            .find("\n}\n")
+            .map(|i| i + "\n}\n".len())
+            .expect("function must have a closing brace");
+        let body = &after[..fn_end];
+        // A blacklist approach (banning `return Ok`, then `if `) was tried
+        // across rounds 1-2 and each version was defeated by a shape it
+        // didn't anticipate — round 2's `!body.contains("if ")` still lets a
+        // `match` arm skip the real write with no `if` and no `return`
+        // anywhere (testing-review, round 3):
+        //
+        //   match cond {
+        //       true => Ok(()),
+        //       false => coalesce_save(&OUTBOUND_DMS_SAVE_STATE, "Outbound-Dms", do_save_outbound_dms_to_delegate).await,
+        //   }
+        //
+        // Blacklisting keywords is an open-ended arms race. Whitelist
+        // instead: normalize whitespace and require the body be BYTE-EQUAL
+        // to the one known-correct unconditional shape. Any control-flow
+        // construct at all — `if`, `match`, `?`, a second `return` — changes
+        // the normalized text and fails the comparison, regardless of what
+        // form it takes.
+        let normalized_body: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected_body = format!(
+            "{} {{ {}().await; coalesce_save( &OUTBOUND_DMS_SAVE_STATE, \"Outbound-DMs\", {}, ) .await }}",
+            signature.trim_end_matches(" {"),
+            "await_outbound_dms_hydration",
+            "do_save_outbound_dms_to_delegate",
+        );
+        assert_eq!(
+            normalized_body, expected_body,
+            "save_outbound_dms_to_delegate must be EXACTLY the two-statement \
+             unconditional sequence \"await hydration, then always save\" — \
+             any other shape (a conditional, an early return, a `?`, a \
+             `match`) can skip the real write on some path, reintroducing \
+             the LiveImportSeam::flush durability bug this PR's redesign \
+             closes (freenet/river#530). If this function's SHAPE \
+             legitimately needs to change, update `expected_body` here \
+             deliberately — don't just relax the check."
+        );
+    }
+
     // ===== Outbound DM revives hidden thread (Codex P1 fix) =====
     // The testing-reviewer's BLOCKING #3 on PR #265. The "explicit
     // unhide on outbound" path lives in `dm_thread_modal::do_send` /
@@ -7240,11 +7408,126 @@ pub fn unhide_dm_thread_if_dm_is_newer(
 /// (freenet/river#246 extracted the shared primitive).
 static OUTBOUND_DMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 
+/// Set once the CURRENT (non-legacy) chat delegate's `OUTBOUND_DMS_STORAGE_KEY`
+/// `GetResponse` has been processed — see [`mark_outbound_dms_hydrated`] and
+/// freenet/river#530. Before this point, `OUTBOUND_DMS`/`HIDDEN_DM_THREADS`
+/// have not yet merged whatever is already on disk, so a save would
+/// overwrite the persisted blob with a truncated view (permanently losing
+/// every archive/plaintext entry the in-memory signals don't know about yet).
+static OUTBOUND_DMS_HYDRATED: AtomicBool = AtomicBool::new(false);
+
+/// Mark the outbound-DM store hydrated from the CURRENT delegate
+/// (freenet/river#530).
+///
+/// Call exactly once per session, from the CURRENT (non-legacy) delegate's
+/// `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` — regardless of whether a blob was
+/// present, since "no blob" is itself the authoritative disk baseline for a
+/// new user. A LEGACY delegate's response must NOT call this: its data still
+/// needs merging into the current-delegate baseline, and marking hydrated
+/// early would let a save land before that baseline is known.
+///
+/// **Always call this via `crate::util::defer`, never bare/synchronously**
+/// (round-2 skeptical review on PR #670). `handle_outbound_dms_get_response`
+/// registers this AFTER `hydrate_hidden_dm_threads` / `hydrate_outbound_dms_cache`,
+/// whose own signal writes are themselves scheduled via `defer`. Deferring
+/// this call too means it can only run — and the latch can only become
+/// `true` — once those macrotasks have already executed (`setTimeout(0)`
+/// tasks run FIFO). Calling it bare would flip the latch synchronously,
+/// before the merge it depends on has actually landed; a caller resumed via
+/// a MICROTASK (not gated by macrotask FIFO at all) could then observe
+/// `true` and read the signals early, reproducing the #530 truncation bug in
+/// a rarer, timing-dependent form.
+pub(crate) fn mark_outbound_dms_hydrated() {
+    OUTBOUND_DMS_HYDRATED.store(true, Ordering::Release);
+}
+
+/// Reset the hydration latch. For tests only; production sets it exactly
+/// once per session via [`mark_outbound_dms_hydrated`].
+#[cfg(test)]
+pub(crate) fn reset_outbound_dms_hydration_state_for_test() {
+    OUTBOUND_DMS_HYDRATED.store(false, Ordering::SeqCst);
+}
+
+/// Interval between hydration-latch polls in [`await_flag_with_bound`].
+const OUTBOUND_DMS_HYDRATION_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(50);
+
+/// How many times [`save_outbound_dms_to_delegate`] polls for hydration before
+/// giving up and proceeding anyway (freenet/river#530). `50ms * 300 == 15s`:
+/// the delegate is local (the room-load round-trip caps itself at 10s in
+/// [`await_delegate_response_outcome`]), so this is a generous margin for the
+/// rare case where the initial `GetResponse` is lost or badly delayed.
+/// Bounding it is what stops a lost response from turning into permanent
+/// silent data loss for the rest of the session (skeptical review on PR
+/// #670): without a bound, every subsequent archive/DM-send would await
+/// forever instead of eventually completing (with a logged warning).
+///
+/// **Accepted residual (skeptical review, round 2):** if the wait genuinely
+/// times out — the `GetResponse` never arrives at all within 15s — the save
+/// that follows IS the original #530 truncation bug, just gated behind a
+/// much rarer trigger (total silence from the delegate for 15s, vs. any
+/// user action landing in a normally-sub-second window). This is a
+/// deliberate trade-off, not an oversight: the alternative (waiting forever)
+/// converts a rare truncation into a certain, permanent, silent no-op for
+/// the rest of the session, which is worse. Closing this residual fully
+/// would mean re-firing `fire_load_outbound_dms_request` on timeout rather
+/// than giving up — out of scope for this fix; tracked as a follow-up
+/// consideration, not a blocking gap.
+const OUTBOUND_DMS_HYDRATION_MAX_POLLS: u32 = 300;
+
+/// Poll `flag` every `interval` (yielding via [`crate::util::sleep`] between
+/// checks) until it is `true` or `max_polls` checks have elapsed, whichever
+/// comes first. Returns once either condition is met — never hangs.
+///
+/// Extracted as a pure/generic helper (rather than inlined into
+/// [`save_outbound_dms_to_delegate`]) so it's unit-testable with small,
+/// fast intervals instead of the real 15s production bound.
+async fn await_flag_with_bound(flag: &AtomicBool, interval: std::time::Duration, max_polls: u32) {
+    if flag.load(Ordering::Acquire) {
+        return;
+    }
+    for _ in 0..max_polls {
+        crate::util::sleep(interval).await;
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+    }
+    warn!(
+        "Outbound-DMs hydration wait timed out after {} polls — proceeding with the save \
+         anyway using whatever state is currently in memory (freenet/river#530)",
+        max_polls
+    );
+}
+
+/// Wait for [`OUTBOUND_DMS_HYDRATED`], bounded by
+/// [`OUTBOUND_DMS_HYDRATION_MAX_POLLS`] so a lost `GetResponse` can't hang
+/// forever. See [`await_flag_with_bound`].
+async fn await_outbound_dms_hydration() {
+    await_flag_with_bound(
+        &OUTBOUND_DMS_HYDRATED,
+        OUTBOUND_DMS_HYDRATION_POLL_INTERVAL,
+        OUTBOUND_DMS_HYDRATION_MAX_POLLS,
+    )
+    .await
+}
+
 /// Serialize the current [`OUTBOUND_DMS`] cache and persist it via the
 /// chat delegate. Caller is responsible for having already mutated the
 /// cache before invoking this. Fire-and-forget at most call sites —
 /// the StoreResponse comes back through the normal message loop and is
 /// logged but not awaited on the hot path.
+///
+/// **Waits for hydration to complete first (freenet/river#530).** Before the
+/// CURRENT delegate's `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` has been
+/// processed, `OUTBOUND_DMS`/`HIDDEN_DM_THREADS` may not yet reflect
+/// whatever is already persisted. Writing now would publish a truncated
+/// snapshot that permanently overwrites the disk copy — the mechanism
+/// behind the #530 archive/plaintext loss. `Ok(())` from this function always
+/// means the delegate write was actually attempted (and, barring a
+/// transport error, completed) — callers that depend on that durability
+/// contract (e.g. the crate-migration walk's `LiveImportSeam::flush`, which
+/// seals a predecessor as migrated on `Ok`) are not lied to by an early,
+/// unwritten return.
 ///
 /// Coalesced via [`coalesce_save`] (was a hand-rolled copy of the same
 /// pattern until freenet/river#246 extracted the primitive): a chain
@@ -7253,6 +7536,7 @@ static OUTBOUND_DMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 /// authoritative result of the catch-up save that covered its
 /// mutation.
 pub async fn save_outbound_dms_to_delegate() -> Result<(), String> {
+    await_outbound_dms_hydration().await;
     coalesce_save(
         &OUTBOUND_DMS_SAVE_STATE,
         "Outbound-DMs",

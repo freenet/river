@@ -295,3 +295,44 @@ re-renders when the signal driving its open/close state changes), or
 reset per-open `use_signal` scratch state with a `use_effect` keyed on
 that open/close signal. freenet/river#291 (the invite-via-DM picker
 showing the previous invitee's name) was exactly this bug.
+
+## A readiness latch must flip from inside the same macrotask as the work it certifies
+
+A boolean "is X ready" flag that gates a later read of some state MUST be
+set from WITHIN the same deferred macrotask that actually performs the
+write making X ready — never set synchronously alongside code that only
+SCHEDULES that write via `defer()`/`safe_spawn_local()`.
+
+`defer()`'s `setTimeout(0)` guarantees FIFO ordering only among macrotasks
+registered against the SAME event-loop queue. It says nothing about a
+MICROTASK-resumed continuation (an already-suspended `.await` on a channel,
+a promise, another future) — that can run in between "a macrotask was
+registered" and "that macrotask actually executed," because microtasks
+drain before the next macrotask, not before the current synchronous call
+returns. Setting the flag synchronously, "because anything checking it must
+run later," conflates "runs later" with "runs after every already-scheduled
+macrotask" — those are not the same thing.
+
+The fix: schedule the flag-flip itself via `defer()`, positioned textually
+AFTER the `defer()` calls whose work it depends on, in the same synchronous
+function. Then the flag literally cannot become `true` until those merges
+have executed — the invariant is structural (a precondition of the flip
+existing at all), not an argument about scheduling order that has to be
+re-derived by every future reader.
+
+freenet/river#530 (PR #670, round 2 of review) hit exactly this: an
+outbound-DM hydration latch was set synchronously in
+`handle_outbound_dms_get_response`, in the same call as merely scheduling
+(not performing) the disk-baseline merge. `LiveImportSeam::flush` — already
+suspended on an unrelated `.await` — could resume via a microtask, observe
+the latch as `true`, and read the signals before the merge had landed,
+truncating the saved blob. See `direct-messages.md`'s "Hydration gate"
+section for the concrete fix and `chat_delegate.rs`'s
+`mark_outbound_dms_hydrated` doc comment for the full reasoning.
+
+**Test consequence:** a source-scrape pin that only checks a flag-setting
+call EXISTS and is gated correctly is not enough — also check it is
+scheduled via `defer()` (not called bare) AND that, textually, it comes
+AFTER the `defer()` calls for the work it depends on. A pin that misses the
+ordering check passes even after the ordering is silently broken by a later
+edit (e.g. hoisting the flag-flip above the merge calls "for readability").

@@ -135,6 +135,28 @@ plaintext in the chat delegate.
   delegate writes. `save_outbound_dms_to_delegate` and
   `save_rooms_to_delegate` both share the helper — grep `CoalesceState`
   to find every caller.
+  **Hydration gate (freenet/river#530):** before that, `save_outbound_dms_to_delegate`
+  awaits the `OUTBOUND_DMS_HYDRATED` latch (bounded by `await_flag_with_bound`,
+  15s worst case), so a save can never read `OUTBOUND_DMS`/`HIDDEN_DM_THREADS`
+  before they've merged whatever the CURRENT delegate already has on disk —
+  otherwise the save's full-blob overwrite would truncate it. The latch is set
+  by `mark_outbound_dms_hydrated()`, called only from the CURRENT (non-legacy)
+  delegate's `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` handler in
+  `response_handler.rs`, on every return path (no blob / parsed / parse
+  failure). `Ok(())` from `save_outbound_dms_to_delegate` always means the
+  write was actually attempted — this is load-bearing for
+  `LiveImportSeam::flush` in `freenet_api/delegate_migration.rs`, which seals
+  a predecessor as migrated on `Ok`. **The latch flip itself must go through
+  `crate::util::defer`, never a bare synchronous call** — it is registered
+  AFTER `hydrate_hidden_dm_threads` / `hydrate_outbound_dms_cache` in the
+  same synchronous handler call, so `setTimeout(0)` FIFO ordering guarantees
+  it can't run (and the latch can't become `true`) until those two have
+  already executed their merges. A synchronous flip let a MICROTASK-resumed
+  caller (e.g. `LiveImportSeam::flush`, which awaits this function directly)
+  observe the latch as `true` before the merge had landed — reproducing the
+  truncation bug in a rarer, timing-dependent form (round-2/3 review on
+  PR #670; see `dioxus-signal-safety.md`'s readiness-latch rule for the
+  general pattern).
 - **Prune path**: `prune_outbound_dms_for_purges` (UI) and
   `prune_outbound_cache_for_room` (CLI) act ONLY on entries whose
   `(room, recipient, token)` appears in some recipient's
