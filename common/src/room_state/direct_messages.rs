@@ -102,7 +102,7 @@
 //!   for freenet/river#519: the per-pair cap below bounds any one
 //!   conversation but nothing bounded the set as a whole, and because
 //!   `ChatRoomStateV1::post_apply_cleanup` exempts every DM participant from
-//!   inactivity-prune (via [`DirectMessagesV1::active_participants`]), an
+//!   inactivity-prune (via [`DirectMessagesV1::participants_of_surviving_dms`]), an
 //!   unbounded DM set pinned an unbounded member set. Enforced in
 //!   `apply_delta` only, NEVER in `verify` — see the note on
 //!   [`DmRetentionHorizon`] and `trim_to_global_cap`.
@@ -115,6 +115,7 @@
 //!   [`check_dm_future_skew`]). Not enforced inside `verify` (would be
 //!   self-DoS for already-stored state).
 
+use crate::room_state::ban::{AuthorizedUserBan, BansV1};
 use crate::room_state::member::{AuthorizedMember, MemberId};
 use crate::room_state::ChatRoomParametersV1;
 use crate::ChatRoomStateV1;
@@ -680,24 +681,49 @@ impl AuthorizedRecipientPurges {
 // ---------------------------------------------------------------------------
 
 impl DirectMessagesV1 {
-    /// Set of member IDs that appear as a sender or recipient of any
-    /// currently-held DM, OR as the recipient of any currently-held
-    /// purge envelope. Used by `ChatRoomStateV1::post_apply_cleanup` to
-    /// keep DM participants AND purge-envelope holders in the active
-    /// members list. The latter is required so a recipient's purge
-    /// envelope is not swept along with the recipient as soon as they
-    /// have purged their last DM (and have no recent room messages):
-    /// dropping the envelope would re-enable a stale peer to re-merge
-    /// the original signed DM, undermining the tombstone-as-block
-    /// guarantee.
-    pub fn active_participants(&self) -> HashSet<MemberId> {
+    /// Set of member IDs that appear as a sender or recipient of a DM — or as
+    /// the recipient of a purge envelope — that would SURVIVE
+    /// [`Self::sweep_after_membership_change`] called with the same arguments.
+    ///
+    /// Used by `ChatRoomStateV1::post_apply_cleanup` step 1 to keep DM
+    /// participants AND purge-envelope holders in the active members list. The
+    /// latter is required so a recipient's purge envelope is not swept along
+    /// with the recipient as soon as they have purged their last DM (and have
+    /// no recent room messages): dropping the envelope would re-enable a stale
+    /// peer to re-merge the original signed DM, undermining the
+    /// tombstone-as-block guarantee.
+    ///
+    /// IDEMPOTENCE (freenet/river#671): the filter is not optional. This used
+    /// to be an unfiltered `active_participants()` walk over EVERY held DM,
+    /// which made the step-1 exemption strictly weaker than the step-6 sweep
+    /// that runs later in the same pass: a member whose only claim to retention
+    /// was a DM with a banned or departed counterparty was exempted on pass 1,
+    /// had that DM swept by step 6 of the same pass, and was pruned on pass 2 —
+    /// so `cleanup(S) != cleanup(cleanup(S))`. Sharing
+    /// [`dm_endpoint_is_live`] with the sweep makes exemption ⟺ retention.
+    /// This is the same fix #411 round 4 applied to the banner exemption; see
+    /// the IDEMPOTENCE note in `ChatRoomStateV1::post_apply_cleanup`.
+    ///
+    /// Not circular: a counted participant is inserted into `required_ids`, so
+    /// it survives step 3, so step 6 sees both endpoints alive and keeps the DM.
+    pub fn participants_of_surviving_dms(
+        &self,
+        owner_id: MemberId,
+        active_member_ids: &HashSet<MemberId>,
+        banned_ids: &HashSet<MemberId>,
+    ) -> HashSet<MemberId> {
+        let alive = |id: MemberId| dm_endpoint_is_live(id, owner_id, active_member_ids, banned_ids);
         let mut out = HashSet::with_capacity(self.messages.len() * 2 + self.purges.len());
         for m in &self.messages {
-            out.insert(m.message.sender);
-            out.insert(m.message.recipient);
+            if alive(m.message.sender) && alive(m.message.recipient) {
+                out.insert(m.message.sender);
+                out.insert(m.message.recipient);
+            }
         }
         for p in &self.purges {
-            out.insert(p.recipient_id);
+            if alive(p.recipient_id) {
+                out.insert(p.recipient_id);
+            }
         }
         out
     }
@@ -786,13 +812,99 @@ impl DirectMessagesV1 {
         active_member_ids: &HashSet<MemberId>,
         banned_ids: &HashSet<MemberId>,
     ) {
-        let alive = |id: MemberId| -> bool {
-            id == owner_id || (active_member_ids.contains(&id) && !banned_ids.contains(&id))
-        };
+        let alive = |id: MemberId| dm_endpoint_is_live(id, owner_id, active_member_ids, banned_ids);
         self.messages
             .retain(|m| alive(m.message.sender) && alive(m.message.recipient));
         self.purges.retain(|p| alive(p.recipient_id));
     }
+}
+
+/// The member-id set [`DirectMessagesV1::sweep_after_membership_change`] wants,
+/// from the by-id map `apply_delta` already built for [`resolve_member_vk`].
+fn member_ids_of(members_by_id: &HashMap<MemberId, &AuthorizedMember>) -> HashSet<MemberId> {
+    members_by_id.keys().copied().collect()
+}
+
+/// The enforced-ban set `post_apply_cleanup` step 0 will compute, derived here
+/// from `parent_state` — freenet/river#675.
+///
+/// This is the SAME set, not an approximation, and that is structural rather
+/// than lucky: the `#[composable]` macro applies fields in DECLARATION order,
+/// so `configuration`, `bans`, `members` and `member_info` — every input to
+/// step 0-cap and step 0 — are already final when the `direct_messages` field
+/// applies, and no later field mutates a sibling. (That ordering is itself
+/// pinned by `field_declaration_order_puts_members_before_direct_messages`.)
+///
+/// Nothing is re-implemented: the eviction ORDERING is
+/// [`BansV1::enforce_user_ban_cap`], the one function step 0-cap also calls,
+/// and the id derivation is [`MembersV1::banned_member_ids`], which step 0 also
+/// calls. The only thing done twice is applying them to a COPY, because
+/// `apply_delta` must not mutate its parent — and the copy is taken only when
+/// the ban set is actually over cap.
+///
+/// # Why this exists
+///
+/// It is what lets the apply-time sweep use the FULL step-6 predicate instead
+/// of a membership-only approximation. Without it, a **deputy-issued** ban left
+/// its target a member through this field's apply — `MembersV1::apply_delta` is
+/// handed an empty `MemberInfoV1`, so it can only enforce owner and ancestor
+/// authority, and a deputy grant lives in `member_info.deputies` where it
+/// cannot see it. The target's DMs were therefore still ranked by
+/// [`trim_to_global_cap`] and only removed afterwards by step 6: the
+/// freenet/river#671 data loss, reachable on the flow the Official room's
+/// moderators actually use. Measured on that reproduction, five legitimate DMs
+/// were destroyed per merge; with this, zero.
+///
+/// An earlier revision of this file asserted the enforced-ban set was "not
+/// knowable here" and treated membership-only as forced. It was not knowable
+/// only in the sense that nobody had computed it; the claim was wrong and is
+/// recorded here so it is not re-derived.
+fn enforced_ban_set_of(
+    parent_state: &ChatRoomStateV1,
+    parameters: &ChatRoomParametersV1,
+) -> HashSet<MemberId> {
+    let owner_id = parameters.owner_id();
+    let max_bans = parent_state.configuration.configuration.max_user_bans;
+
+    if parent_state.bans.0.len() <= max_bans {
+        return parent_state.members.banned_member_ids(
+            &parent_state.bans,
+            &parent_state.member_info,
+            parameters,
+        );
+    }
+    let members_by_id = parent_state.members.members_by_member_id();
+    let mut capped: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
+    BansV1::enforce_user_ban_cap(
+        &mut capped,
+        max_bans,
+        &members_by_id,
+        &parent_state.member_info,
+        owner_id,
+        &parameters.owner,
+    );
+    parent_state
+        .members
+        .banned_member_ids(&BansV1(capped), &parent_state.member_info, parameters)
+}
+
+/// Whether a DM endpoint is still a live participant: the room owner (implicit,
+/// never present in `members`), or a current member who is not enforced-banned.
+///
+/// The single definition of "this DM survives cleanup", shared by
+/// [`DirectMessagesV1::sweep_after_membership_change`] (step 6, which deletes
+/// the DMs it rejects) and [`DirectMessagesV1::participants_of_surviving_dms`]
+/// (step 1, which exempts their participants from inactivity-prune). One
+/// function rather than two matching copies is what makes exemption ⟺
+/// retention hold by construction — the copies are exactly what drifted apart
+/// in freenet/river#671.
+fn dm_endpoint_is_live(
+    id: MemberId,
+    owner_id: MemberId,
+    active_member_ids: &HashSet<MemberId>,
+    banned_ids: &HashSet<MemberId>,
+) -> bool {
+    id == owner_id || (active_member_ids.contains(&id) && !banned_ids.contains(&id))
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,20 +1157,27 @@ impl ComposableState for DirectMessagesV1 {
             .configuration
             .effective_max_direct_messages();
 
+        let owner_id = parameters.owner_id();
+        let members_by_id = parent_state.members.members_by_member_id();
+
         let Some(delta) = delta else {
-            // Even when no delta arrived, enforce the caps and re-sort. The
-            // caps run unconditionally (as `MessagesV1::apply_delta` runs
-            // `max_recent_messages`) so a state that arrived over-cap by a
-            // path that skips this function — a full-state PUT, or the #292
-            // migration PUT carrying a legacy set larger than the room's
-            // current cap — converges down instead of sitting over-cap until
-            // the next DM happens to arrive.
+            // Sweep unresolvable endpoints, then enforce the caps and
+            // re-sort, even when THIS field has no delta. What that converges:
+            // a state that ARRIVED unnormalised — over-cap, or holding DMs
+            // whose endpoints `members` has since dropped — by a path that
+            // skips this function, namely a full-state PUT or the #292
+            // migration PUT. Such a PUT is how the state got IN; it is NOT how
+            // this arm is REACHED. This arm runs only when the top-level delta
+            // is present and the `direct_messages` sub-delta is None; a bare
+            // top-level None short-circuits every field. See the test.
+            self.sweep_after_membership_change(
+                owner_id,
+                &member_ids_of(&members_by_id),
+                &enforced_ban_set_of(parent_state, parameters),
+            );
             enforce_caps_and_sort(self, max_direct_messages);
             return Ok(());
         };
-
-        let owner_id = parameters.owner_id();
-        let members_by_id = parent_state.members.members_by_member_id();
 
         // ---- 1. Apply purge advances first ----
         //
@@ -1224,7 +1343,19 @@ impl ComposableState for DirectMessagesV1 {
                 .is_some_and(|set| set.contains(&m.purge_token()))
         });
 
-        // ---- 4. Enforce the caps, newest-first, then sort ----
+        // ---- 4. Drop held DMs whose endpoints are no longer members ----
+        // MUST run before the caps: a DM the room can no longer keep must not
+        // be ranked against ones it can, or it wins a slot and evicts a
+        // legitimate message before `post_apply_cleanup` step 6 deletes it
+        // anyway (freenet/river#671). Applies to the held set the same
+        // membership rule step 2 above applies to arrivals.
+        self.sweep_after_membership_change(
+            owner_id,
+            &member_ids_of(&members_by_id),
+            &enforced_ban_set_of(parent_state, parameters),
+        );
+
+        // ---- 5. Enforce the caps, newest-first, then sort ----
         enforce_caps_and_sort(self, max_direct_messages);
 
         Ok(())

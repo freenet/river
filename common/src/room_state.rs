@@ -34,6 +34,15 @@ pub struct ChatRoomStateV1 {
     // and then `recent_messages`.
     // This is due to interdependencies between the fields and the order in which they must be applied in
     // the `apply_delta` function. DO NOT reorder fields without fully understanding the implications.
+    //
+    // Pinned by `field_declaration_order_puts_members_before_direct_messages`
+    // (freenet/river#671). `direct_messages` must come AFTER `members`, because
+    // `DirectMessagesV1::apply_delta` sweeps its held set against
+    // `parent_state.members` and the macro derives its apply order from this
+    // declaration order — reorder them and the DM field would test its held set
+    // against the PRE-update member set, silently restoring the #671 data loss.
+    // The comment above has flagged this as fragile since the file was written
+    // and was never actually asserted.
     /// Configures things like maximum message length, can be updated by the owner.
     pub configuration: AuthorizedConfigurationV1,
 
@@ -77,7 +86,7 @@ impl ChatRoomStateV1 {
     ///
     /// Members are kept if they have at least one message in recent_messages,
     /// are a sender/recipient of a currently-held direct message (see
-    /// [`crate::room_state::direct_messages::DirectMessagesV1::active_participants`]),
+    /// [`crate::room_state::direct_messages::DirectMessagesV1::participants_of_surviving_dms`]),
     /// or are in the invite chain of someone who qualifies. The owner is
     /// never in the members list (they're implicit via parameters).
     ///
@@ -150,34 +159,24 @@ impl ChatRoomStateV1 {
         //     to drop bans orphaned by a banner's removal, and only removes bans,
         //     so the ban count stays <= the cap.
         let max_bans = self.configuration.configuration.max_user_bans;
-        if self.bans.0.len() > max_bans {
+        {
+            // The eviction ORDERING lives in `BansV1::enforce_user_ban_cap` —
+            // one definition, shared with `DirectMessagesV1::apply_delta`,
+            // which needs the same surviving ban set to decide which held DMs
+            // the caps may rank (freenet/river#675). A DM swept at apply time
+            // against a DIFFERENT surviving ban set than this step produces is
+            // data loss, so the two must agree by construction rather than by
+            // two copies happening to match — which is exactly what drifted in
+            // #671 and in #411 round 4.
             let members_by_id = self.members.members_by_member_id();
-            // Order so the entries to DROP come first: inert-before-enforcing,
-            // then oldest-before-newest, then ban id (fully deterministic).
-            // `sort_by_cached_key` computes `ban_is_enforcing` at most ONCE per
-            // ban (not O(n log n) times inside a comparator) — #411 round 3 C.
-            self.bans.0.sort_by_cached_key(|ban| {
-                (
-                    BansV1::ban_is_enforcing(
-                        ban,
-                        &members_by_id,
-                        &self.member_info,
-                        owner_id,
-                        &parameters.owner,
-                    ),
-                    ban.ban.banned_at,
-                    ban.id(),
-                )
-            });
-            let to_remove = self.bans.0.len() - max_bans;
-            self.bans.0.drain(0..to_remove);
-            // Restore the canonical (banned_at, id) stored order.
-            self.bans.0.sort_by(|a, b| {
-                a.ban
-                    .banned_at
-                    .cmp(&b.ban.banned_at)
-                    .then_with(|| a.id().cmp(&b.id()))
-            });
+            BansV1::enforce_user_ban_cap(
+                &mut self.bans.0,
+                max_bans,
+                &members_by_id,
+                &self.member_info,
+                owner_id,
+                &parameters.owner,
+            );
         }
 
         // 0. Enforce bans from the CONVERGED (now capped) state, deputy-aware (#410).
@@ -230,7 +229,44 @@ impl ChatRoomStateV1 {
             .iter()
             .map(|m| m.message.author)
             .collect();
-        let dm_participants: HashSet<MemberId> = self.direct_messages.active_participants();
+        // DM participants are counted only from DMs that will SURVIVE the
+        // step-6 sweep below — both endpoints a live, non-enforced-banned
+        // member (owner implicit). Counting every held DM (the old
+        // `active_participants()`) made this exemption strictly weaker than
+        // the sweep that runs later in the SAME pass, so a member held alive
+        // only by a DM with a banned counterparty was kept on pass 1 and
+        // pruned on pass 2 — `cleanup(S) != cleanup(cleanup(S))`, measured on
+        // live Official-room state in freenet/river#671. Same defect and same
+        // remedy as the banner exemption in #411 round 4: the exemption
+        // predicate must BE the sweep predicate, not merely resemble it, and
+        // both now call `dm_endpoint_is_live`. Not circular — see the note on
+        // `participants_of_surviving_dms`.
+        //
+        // The member set passed here is post-step-0 (enforced-banned members
+        // are already gone) and pre-step-3, which is exactly what step 6 will
+        // see for every id this loop can add: a counted participant lands in
+        // `required_ids` and therefore survives step 3 unchanged.
+        //
+        // `enforced_banned_ids` is passed but is PROVABLY INERT here, and that
+        // is deliberate rather than an oversight: step 0 has already removed
+        // every enforced-banned id from `self.members`, so
+        // `members_after_ban_enforcement` and `enforced_banned_ids` are
+        // disjoint and `dm_endpoint_is_live` never reaches the ban check at
+        // this site. Verified by a disjointness `debug_assert!` run in debug
+        // profile across the whole suite and all 25 captured live states — it
+        // never fired. It is kept because passing it makes this predicate
+        // IDENTICAL to step 6's by construction, which is the entire property
+        // this fix is about; dropping it would restore the two-copies shape
+        // that drifted apart in the first place. It also means this call site
+        // adds NO new coupling to freenet/river#413's cap eviction.
+        let members_after_ban_enforcement: HashSet<MemberId> =
+            self.members.members.iter().map(|m| m.member.id()).collect();
+        let dm_participants: HashSet<MemberId> =
+            self.direct_messages.participants_of_surviving_dms(
+                owner_id,
+                &members_after_ban_enforcement,
+                &enforced_banned_ids,
+            );
         let current_secret_version = self.secrets.current_version;
         let secret_recipients: HashSet<MemberId> = self
             .secrets
@@ -419,6 +455,22 @@ impl ChatRoomStateV1 {
         //    harmless and keeps the intent explicit.
         let active_member_ids_for_sweep: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
+        //    The step-1 DM exemption is only sound while steps 2-5 are
+        //    removal-only for members: it counts a DM as surviving using the
+        //    post-step-0 member set, and step 6 then re-tests the same DM
+        //    against the post-step-3 set. If anything between them ADDED a
+        //    member, step 6 could keep a DM step 1 did not count — harmless —
+        //    but the reverse reasoning (exemption ⟹ retention) would no longer
+        //    be a subset argument, and freenet/river#671 would be back. Nothing
+        //    does today; `debug_assert!` states that where an editor of steps
+        //    2-5 will read it, and compiles out of the release WASM so the
+        //    contract pays nothing. It runs across the whole existing
+        //    `post_apply_cleanup`, convergence and deputy-ban suites.
+        debug_assert!(
+            active_member_ids_for_sweep.is_subset(&members_after_ban_enforcement),
+            "steps 2-5 must be removal-only for members: the step-1 DM exemption \
+             reads the post-step-0 set and step 6 the post-step-3 one"
+        );
         self.direct_messages.sweep_after_membership_change(
             owner_id,
             &active_member_ids_for_sweep,
@@ -1513,6 +1565,163 @@ mod tests {
             };
             assert_idem(&state, "owner cascade + inert flood over cap");
         }
+
+        // State C: a member held alive ONLY by a DM with a banned counterparty.
+        // The step-1 exemption must not count it (freenet/river#671) — if it
+        // does, M is kept on pass 1 and pruned on pass 2 by step 6's sweep.
+        {
+            let m_sk = SigningKey::generate(rng);
+            let q_sk = SigningKey::generate(rng);
+            let m_id = MemberId::from(&m_sk.verifying_key());
+            let q_id = MemberId::from(&q_sk.verifying_key());
+            let state = ChatRoomStateV1 {
+                configuration: cfg(10),
+                members: MembersV1 {
+                    members: vec![
+                        owner_member(m_sk.verifying_key()),
+                        owner_member(q_sk.verifying_key()),
+                    ],
+                },
+                bans: BansV1(vec![AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner_id,
+                        banned_at: SystemTime::now(),
+                        banned_user: q_id,
+                    },
+                    owner_id,
+                    &owner_sk,
+                )]),
+                direct_messages: crate::room_state::direct_messages::DirectMessagesV1 {
+                    messages: vec![crate::room_state::direct_messages::sign_direct_message(
+                        &m_sk,
+                        m_id,
+                        q_id,
+                        &owner_vk,
+                        1_700_000_000,
+                        vec![7u8; 8],
+                    )
+                    .expect("sign dm")],
+                    purges: vec![],
+                },
+                ..Default::default()
+            };
+            assert_idem(
+                &state,
+                "member held only by a DM with a banned counterparty",
+            );
+        }
+
+        // State D: the same shape, but the counterparty is banned by a DEPUTY
+        // rather than the owner. `post_apply_cleanup` sees the converged
+        // `member_info`, so step 0 DOES enforce this ban — the deputy gap is in
+        // `MembersV1::apply_delta`, not here (freenet/river#675). Cleanup must
+        // still be a fixpoint.
+        {
+            let dep_sk = SigningKey::generate(rng);
+            let m_sk = SigningKey::generate(rng);
+            let q_sk = SigningKey::generate(rng);
+            let dep_id = MemberId::from(&dep_sk.verifying_key());
+            let m_id = MemberId::from(&m_sk.verifying_key());
+            let q_id = MemberId::from(&q_sk.verifying_key());
+            let mut owner_info = MemberInfo::new_public(owner_id, 1, "owner".to_string());
+            owner_info.deputies = vec![dep_id];
+            let state = ChatRoomStateV1 {
+                configuration: cfg(10),
+                members: MembersV1 {
+                    members: vec![
+                        owner_member(dep_sk.verifying_key()),
+                        owner_member(m_sk.verifying_key()),
+                        owner_member(q_sk.verifying_key()),
+                    ],
+                },
+                member_info: MemberInfoV1 {
+                    member_info: vec![AuthorizedMemberInfo::new(owner_info, &owner_sk)],
+                },
+                bans: BansV1(vec![AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: owner_id,
+                        banned_at: SystemTime::now(),
+                        banned_user: q_id,
+                    },
+                    dep_id,
+                    &dep_sk,
+                )]),
+                direct_messages: crate::room_state::direct_messages::DirectMessagesV1 {
+                    messages: vec![crate::room_state::direct_messages::sign_direct_message(
+                        &m_sk,
+                        m_id,
+                        q_id,
+                        &owner_vk,
+                        1_700_000_100,
+                        vec![9u8; 8],
+                    )
+                    .expect("sign dm")],
+                    purges: vec![],
+                },
+                ..Default::default()
+            };
+            assert_idem(
+                &state,
+                "member held only by a DM with a DEPUTY-banned counterparty",
+            );
+        }
+    }
+
+    /// `direct_messages` MUST be declared after `members`.
+    ///
+    /// The whole placement argument for the #671 apply-time sweep rests on
+    /// `parent_state.members` being the UPDATED member set when the DM field's
+    /// `apply_delta` runs, and that holds only because the `#[composable]`
+    /// macro applies fields in DECLARATION order. Serde emits struct fields in
+    /// declaration order and ciborium writes them as a map in that order, so
+    /// the serialized key order is a faithful proxy for it.
+    ///
+    /// Reorder the two and the DM sweep would test its held set against the
+    /// PRE-update member set — silently restoring the data loss.
+    ///
+    /// THIS ASSERTS A PROXY, and that is worth naming given what this PR is
+    /// about. The property that actually matters is the order in which
+    /// `#[composable]` emits the per-field `apply_delta` calls; what this test
+    /// reads is serialized CBOR key order. The proxy holds today because serde
+    /// emits fields in declaration order, ciborium preserves it, and the macro
+    /// derives its order from the same declaration — but it is one step
+    /// removed. **A macro change that sorted or reordered field application
+    /// would leave this test green while the invariant it guards broke.** This
+    /// whole fix exists because a guard resembled the thing it guarded instead
+    /// of being it; this one has a milder version of that shape, so the gap is
+    /// stated rather than left for a reader to assume away.
+    ///
+    /// Coincidental coverage is broader than it looks: the field-reorder
+    /// mutation fails FOUR tests — this one,
+    /// `pruned_sender_can_dm_when_bundling_rejoin_delta` (the #291 rejoin pin),
+    /// and two of this PR's own,
+    /// `global_cap_must_not_evict_legitimate_dms_for_doomed_ones` and
+    /// `whole_state_merge_is_associative_for_the_671_shape`. That argues FOR
+    /// keeping this one rather than against: all three others depend on a
+    /// particular DM shape that a future author could legitimately rework, and
+    /// this is the only one whose failure message names the reason and the
+    /// issue number.
+    #[test]
+    fn field_declaration_order_puts_members_before_direct_messages() {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&ChatRoomStateV1::default(), &mut bytes)
+            .expect("default state serializes");
+        let value: ciborium::value::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("round-trips as a CBOR value");
+        let map = value
+            .as_map()
+            .expect("ChatRoomStateV1 serializes as a CBOR map");
+        let index_of = |name: &str| {
+            map.iter()
+                .position(|(k, _)| k.as_text() == Some(name))
+                .unwrap_or_else(|| panic!("field `{name}` missing from the serialized state"))
+        };
+        assert!(
+            index_of("members") < index_of("direct_messages"),
+            "`direct_messages` must be declared AFTER `members`: the #[composable] macro \
+             applies fields in declaration order, and DirectMessagesV1::apply_delta sweeps \
+             its held set against parent_state.members (freenet/river#671)"
+        );
     }
 
     #[test]
