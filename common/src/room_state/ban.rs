@@ -232,6 +232,50 @@ impl BansV1 {
         ban.verify_signature(&vk).is_ok()
     }
 
+    /// THE single definition of the `max_user_bans` eviction (#411 round 7).
+    ///
+    /// Two sites need to know which bans survive the cap: `post_apply_cleanup`
+    /// step 0-cap, which stores the result, and
+    /// `DirectMessagesV1::apply_delta`, which needs the resulting
+    /// enforced-ban set to decide which held DMs the caps may rank
+    /// (freenet/river#675). They MUST agree exactly — a DM swept at apply time
+    /// against a different surviving ban set than step 6 uses is data loss.
+    /// One function rather than two matching copies is what makes that hold by
+    /// construction; two copies of an almost-identical predicate is precisely
+    /// what drifted in freenet/river#671 and in #411 round 4.
+    ///
+    /// Evicts inert-before-enforcing, then oldest-before-newest, then by ban
+    /// id, and restores the canonical `(banned_at, id)` stored order. A no-op
+    /// when already within the cap. `sort_by_cached_key` computes
+    /// `ban_is_enforcing` at most once per ban (#411 round 3 C).
+    pub fn enforce_user_ban_cap(
+        bans: &mut Vec<AuthorizedUserBan>,
+        max_bans: usize,
+        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        member_info: &MemberInfoV1,
+        owner_id: MemberId,
+        owner_vk: &VerifyingKey,
+    ) {
+        if bans.len() <= max_bans {
+            return;
+        }
+        bans.sort_by_cached_key(|ban| {
+            (
+                Self::ban_is_enforcing(ban, members_by_id, member_info, owner_id, owner_vk),
+                ban.ban.banned_at,
+                ban.id(),
+            )
+        });
+        let to_remove = bans.len() - max_bans;
+        bans.drain(0..to_remove);
+        bans.sort_by(|a, b| {
+            a.ban
+                .banned_at
+                .cmp(&b.ban.banned_at)
+                .then_with(|| a.id().cmp(&b.id()))
+        });
+    }
+
     /// Whether `ban` is currently ENFORCING (worth keeping under `max_user_bans`
     /// pressure) rather than INERT (evicted first). Pure function of the
     /// converged `(members + member_info)` state (#410 review round 1).

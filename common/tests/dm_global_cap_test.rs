@@ -6,7 +6,7 @@
 //! `DirectMessagesV1` bounded each ordered `(sender, recipient)` pair at
 //! `MAX_DM_MESSAGES_PER_PAIR`, but nothing bounded the set as a whole. Because
 //! `ChatRoomStateV1::post_apply_cleanup` exempts every DM sender and recipient
-//! from inactivity-prune (via `DirectMessagesV1::active_participants`), an
+//! from inactivity-prune (via `DirectMessagesV1::participants_of_surviving_dms`), an
 //! unbounded DM set pinned an unbounded MEMBER set: anyone who had ever
 //! exchanged a single DM stayed a member forever. Measured on the live official
 //! room: 181 members, 499 DMs, 129 of those members held zero messages and were
@@ -786,7 +786,7 @@ fn global_cap_bounds_the_dm_pinned_member_set() {
     );
     // Scoped to this fixture on purpose. `2 * CAP` bounds the members pinned by
     // retained MESSAGES, and this fixture has no purge envelopes — but
-    // `active_participants` ALSO pins every `purges[].recipient_id`, and nothing
+    // `participants_of_surviving_dms` ALSO pins every surviving `purges[].recipient_id`, and nothing
     // bounds the NUMBER of purge envelopes (`MAX_PURGED_TOMBSTONES_PER_RECIPIENT`
     // caps entries WITHIN one envelope, not the envelope count). So a member who
     // purges their last DM still pins themselves indefinitely. That half of the

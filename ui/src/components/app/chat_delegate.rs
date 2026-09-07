@@ -3266,9 +3266,21 @@ mod tests {
     /// published, so without the bump `cargo install riverctl` would resolve a
     /// river-core WITHOUT the new entry. So a version bump alone re-keys the
     /// delegate, and that is enough to require an entry.
+    ///
+    /// Updated for V31 (the freenet/river#671 release). Note the #671 fix
+    /// itself does NOT move the delegate WASM: rebuilding `origin/main`
+    /// unchanged on the same toolchain already produced a different hash from
+    /// the committed one, so that generation was stale before this branch
+    /// touched anything. What moves it here is that drift plus the mandatory
+    /// `river-core` 0.1.20 -> 0.1.21 bump (0.1.20 is already published, and
+    /// `release-riverctl.yml` skips publishing a version crates.io already
+    /// has — so without the bump riverctl would resolve the OLD river-core
+    /// from the registry). Either way the entry is required: the committed
+    /// bytes are what users' delegate key is derived from, whatever moved
+    /// them.
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
-        assert_eq!(legacy_set_fingerprint(), "c43e66ee147e3739");
+        assert_eq!(legacy_set_fingerprint(), "c32c326c1328de9a");
     }
 
     /// The "migration in progress" and "migration done" localStorage keys MUST
@@ -4773,7 +4785,7 @@ mod tests {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "a44c64014d60fd245fe8fb5172f8fd7397039b248b3b6a8e95e89a0bb539fb5e",
+            "c2e6063899624b65715d683fbbba04637ba89b72dc17f5b1610343922356fc46",
             "chat_delegate.wasm changed — this branch must not alter the delegate WASM; \
              if the change is intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"

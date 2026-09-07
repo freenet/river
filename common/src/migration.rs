@@ -109,8 +109,14 @@ mod tests {
         // V31 registers the pre-summary-digest generation (freenet/river#571,
         // `MemberInfoV1::Summary` carrying a raw `Signature` per member), which
         // re-keys the contract.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 31);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "b5f02d45b6370b4d");
+        //
+        // V32 registers the pre-held-set-sweep generation (freenet/river#671):
+        // `DirectMessagesV1::apply_delta` left held DMs with a non-member
+        // endpoint in the global-cap ranking, so a DM destined for deletion
+        // could evict a legitimate one. Fixing it re-keys the contract, and
+        // rooms on the old key need the backward probe to still find them.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 32);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "f6e6f99520959a6d");
     }
 
     #[test]
