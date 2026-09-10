@@ -22,7 +22,7 @@ ed25519-compact = { version = "2.1.1", default-features = false, features = ["st
 blake3 = { version = "1.5.3", features = ["serde"] }
 x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }
 curve25519-dalek = { version = "4.1.3" }
-sha2 = "0.10.8"
+sha2 = "0.11.0"
 # aes-gcm: `default-features = false` is critical — the default `getrandom`
 # feature would pull `getrandom` into the dep graph for every consumer
 # (including the chat-delegate), which on wasm32-unknown-unknown produces
