@@ -102,5 +102,11 @@ freenet-test-network = "0.1.24"
 tempfile = "3"
 assert_cmd = "2"
 # `test-util` gives `#[tokio::test(start_paused = true)]`, so the response-wait
-# tests can exercise 60-second deadlines in virtual time instead of real time.
+# tests exercise 60-second deadlines in virtual time rather than sleeping.
+#
+# It does NOT reach the shipped binary. The workspace sets `resolver = "2"`,
+# which stops dev-dependency features being unified into the normal build;
+# verified rather than assumed with
+# `cargo tree -p riverctl -e features,no-dev | grep test-util`, which finds
+# nothing, against one hit for the same command with dev edges included.
 tokio = { version = "1.42", features = ["full", "test-util"] }

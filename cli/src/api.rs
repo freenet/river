@@ -882,6 +882,20 @@ async fn await_response<T, S: ResponseSource + ?Sized>(
     };
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // Not defensive, for two reasons that both bite.
+        //
+        // `tokio::time::timeout` polls the inner future BEFORE checking its own
+        // deadline, so `timeout(ZERO, ..)` returns an immediately-available
+        // response rather than timing out: without this the loop would go on
+        // consuming and classifying messages after it had given up, for as long
+        // as they kept arriving with no delay.
+        //
+        // And `WebApi::recv` is documented as NOT cancellation-safe: dropping
+        // its future mid-reassembly loses a streamed response. Every timeout
+        // here drops one, which is unavoidable and pre-existing (every call
+        // site did it before this change, and only the LAST iteration of a wait
+        // can cancel, so the exposure is the same as it was). Constructing one
+        // more that is guaranteed to be cancelled is avoidable, so avoid it.
         if remaining.is_zero() {
             return Err(timed_out(stepped_over, last_stepped));
         }
@@ -12071,11 +12085,15 @@ mod response_multiplexing_pin {
         let problems = response_multiplexing_violations(mutated);
         // A mutation that breaks the SCAN rather than tripping the CHECK also
         // produces problems, and would let every meta-test below pass while
-        // proving nothing. Reject that shape explicitly.
-        assert!(
-            !problems.iter().any(|p| p.contains("pass vacuously")),
-            "{what}: the scan broke instead of the check firing: {problems:?}"
-        );
+        // proving nothing. Reject both shapes explicitly: the anti-vacuity
+        // guard, and check 1 failing to locate a function at all (whose message
+        // a needle naming that function would otherwise match).
+        for broken in ["pass vacuously", "could not isolate"] {
+            assert!(
+                !problems.iter().any(|p| p.contains(broken)),
+                "{what}: the scan broke ({broken}) instead of the check firing: {problems:?}"
+            );
+        }
         assert!(
             problems.iter().any(|p| p.contains(needle)),
             "{what} must be caught, got: {problems:?}"
