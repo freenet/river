@@ -930,10 +930,26 @@ async fn await_response<T, S: ResponseSource>(
         //     of budget and cancelled part-way through reassembling a streamed
         //     `GetResponse`. The old shape could not produce that.
         //
-        // Neither is a desync: the loss is bounded to the one response. Both
-        // are properties of wrapping a non-cancel-safe `recv` in a `timeout`,
-        // which every call site here did before and after; freenet/river#692
-        // is where that stops being the shape of this code at all.
+        // Neither is a REGRESSION, and that conclusion matters more than the
+        // shape, because without it this note reads like a bug someone should
+        // go and fix. The precondition for a short final budget is at least one
+        // step-over, and a step-over means a non-answer arrived first, which on
+        // every one of these call sites is precisely what made the old code
+        // return `Err` at t=0. The two conditions cannot both be exercised:
+        // there is no input on a converted path where the old code succeeds and
+        // this one fails. A GET with no interleaving is identical either way,
+        // since the first iteration gets the whole window.
+        //
+        // What changes is DIAGNOSIS, not outcome: the failure moves from "fails
+        // at once, naming the response" to "fails at the deadline", and nothing
+        // in the error says a reassembly was cut. The count and last-kind in
+        // the timeout message above are the partial answer to that.
+        //
+        // A minimum-budget floor was considered and rejected: it would make the
+        // common case worse to improve a rare one, refusing an already-available
+        // response when the remaining budget is small, and it would only move
+        // the threshold rather than remove the hazard. The loss is bounded to
+        // one response and is not a desync.
         //
         // What IS avoidable is constructing one more `recv` that is guaranteed
         // to be cancelled, so avoid that:
@@ -12050,13 +12066,25 @@ mod response_multiplexing_pin {
     /// `CONNECTION_ACQUISITIONS` counts regardless of receiver. The Arc-clone
     /// shape moves both.
     ///
+    /// Measured against evasion shapes rather than argued. Planting each into
+    /// production source and running the live pin:
+    ///
+    /// | shape | caught by |
+    /// |---|---|
+    /// | cloned `Arc`, locked under another name | field, lock |
+    /// | `try_lock()`, no await at all | field ONLY |
+    /// | `tokio::sync::Mutex::lock(&self.web_api).await` | field, recv |
+    /// | helper accessor returning the `Arc`, two users | field, lock, recv |
+    ///
+    /// The `try_lock` row is why both counts run rather than whichever looks
+    /// stronger: it moves no lock count and no recv count, and the field count
+    /// is the only thing that sees it.
+    ///
     /// Residual, since claiming completeness here is what went wrong twice
-    /// already: these are still string counts. `try_lock()` and
-    /// `blocking_lock()` would evade the second (both are absent today, and
-    /// either would still have to name the field). The counts are also NET, so
-    /// a one-for-one swap passes. The check that would actually bind this is
-    /// not a count at all: make the raw connection unreachable by wrapping it
-    /// in a type whose only methods are the waiters. That is freenet/river#692.
+    /// already: these are still string counts, and they are NET, so a
+    /// one-for-one swap passes. The check that would actually bind this is not
+    /// a count at all: make the raw connection unreachable by wrapping it in a
+    /// type whose only methods are the waiters. That is freenet/river#692.
     const CONNECTION_ACQUISITIONS: usize = 20;
 
     /// See [`CONNECTION_ACQUISITIONS`]. One higher than the lock count, because
