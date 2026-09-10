@@ -843,11 +843,25 @@ fn response_kind(response: &HostResponse) -> &'static str {
 /// connection, so an `UpdateNotification` for a room we are already subscribed
 /// to can arrive between our request and its answer. Taking the first message
 /// off the connection as the answer therefore turns an ordinary interleaving
-/// into a hard failure. That is freenet-core#4970, and it is what broke the
-/// freenet v0.2.135 release announcement: the node had restarted moments
-/// earlier, a notification landed inside the send window, and
-/// `announce-to-river.sh` exited 1 with "Unexpected response type" while every
-/// CI job reported success.
+/// into a hard failure. That is freenet-core#4970, and it is what made the
+/// freenet v0.2.135 release announcement report failure. The node had restarted
+/// moments earlier and a notification landed inside the send window, so
+/// `announce-to-river.sh` exited 1 with "Unexpected response type".
+///
+/// The message ITSELF landed. It is in the room, once, and a member replied to
+/// it half an hour later; the journal shows the send starting at 17:49:41Z, the
+/// message timestamped 17:49:43Z, and `FAILED with rc=1` at 17:49:54Z. So this
+/// is a FALSE NEGATIVE: the update was transmitted, applied and converged, and
+/// the client reported it as a failure.
+///
+/// Which direction it fails in is the whole severity argument, so it is worth
+/// being exact. This is the inverse of freenet-core#4318, where riverctl
+/// printed "Message sent successfully" while the contract silently dropped the
+/// delta and three announcements were lost. Everything in `announce-to-river.sh`
+/// guards that direction. Nothing guards this one, and this one has its own
+/// hazard: a reported failure invites a RETRY, and a retry posts a duplicate
+/// release announcement to a public room. That retry was one command away
+/// (freenet-core#5640).
 ///
 /// This exists because that bug kept coming back. It was found and fixed four
 /// times, at one call site each time, and each fix left the other sites doing
@@ -9168,8 +9182,9 @@ mod subscribe_handshake_tests {
     /// The v0.2.135 regression, one call site over from the SUBSCRIBE race
     /// above. Every riverctl send path took the FIRST message off the
     /// connection as its answer, so a notification for an already-subscribed
-    /// room made the send fail with "Unexpected response type". It broke the
-    /// release announcement while every CI job reported success.
+    /// room made the send report "Unexpected response type" and exit 1 for an
+    /// update the node had already applied. See `await_response` for why the
+    /// direction of that failure is the point.
     #[test]
     fn an_update_notification_does_not_answer_the_update() {
         assert_eq!(
@@ -12180,8 +12195,9 @@ mod response_multiplexing_pin {
                             "`{sig}` sends a contract update but does not await the \
                              answer through `await_update_response`. Reading the \
                              first message off the shared connection as the answer \
-                             is freenet-core#4970, and it is what broke the freenet \
-                             v0.2.135 release announcement."
+                             is freenet-core#4970, and it is what made the freenet \
+                             v0.2.135 release announcement report a failure for a \
+                             message that had already landed."
                         ));
                     }
                 }
