@@ -731,6 +731,49 @@ pub(crate) fn classify_update_response(
     }
 }
 
+/// How the node answered the PUT we sent.
+///
+/// A named classifier rather than a closure inside `republish_room`, for the
+/// same reason as [`UpdateAck`]: a classifier buried in a call site is one
+/// nothing can test, and a PUT has three success shapes that are easy to get
+/// wrong.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PutAck {
+    /// The node stored the contract.
+    Stored,
+    /// The node already HELD the contract and merged our state into it. It
+    /// answers with an `UpdateResponse`, not a `PutResponse` (freenet 0.1.188,
+    /// `contract/executor/runtime.rs::perform_contract_put`, both exits of its
+    /// already-exists branch). Republishing is by definition a PUT onto a
+    /// contract that already exists, so this is the COMMON answer, not an edge
+    /// case: missing it made the old code report "Unexpected response type".
+    Merged,
+    /// Some node versions answer a bare `Ok`. It carries no key, so unlike the
+    /// two above it cannot be attributed to a request; it is accepted because
+    /// this connection has only one PUT in flight.
+    Acknowledged,
+    /// Something else arrived first. Step over it and keep waiting.
+    NotYet,
+}
+
+/// Whether `response` answers the PUT we sent for `sent_key`.
+pub(crate) fn classify_put_response(sent_key: &ContractKey, response: &HostResponse) -> PutAck {
+    match response {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key })
+            if key.id() == sent_key.id() =>
+        {
+            PutAck::Stored
+        }
+        HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. })
+            if key.id() == sent_key.id() =>
+        {
+            PutAck::Merged
+        }
+        HostResponse::Ok => PutAck::Acknowledged,
+        _ => PutAck::NotYet,
+    }
+}
+
 /// Wait for the node's answer to the request we just sent, stepping over
 /// responses that are not it.
 ///
@@ -2617,49 +2660,28 @@ impl ApiClient {
         // now stepped over like any other response that is not ours, for the
         // same reason: on a multiplexed connection it belongs to somebody
         // else's request, and the answer to ours may still be behind it.
-        await_response(
+        let ack = await_response(
             &mut web_api,
             PUT_RESPONSE_TIMEOUT,
             "PUT response",
-            |response| match response {
-                HostResponse::ContractResponse(ContractResponse::PutResponse { key })
-                    if *key == contract_key =>
-                {
-                    info!(
-                        "Room republished successfully with contract key: {}",
-                        key.id()
-                    );
-                    Some(Ok(()))
-                }
-                // A PUT onto a contract the node ALREADY HOLDS is answered with
-                // an `UpdateResponse`, not a `PutResponse`: the node merges the
-                // states instead of storing them, and both exits of that branch
-                // return `UpdateResponse` (freenet 0.1.188,
-                // `contract/executor/runtime.rs::perform_contract_put`).
-                // Republishing is by definition a PUT onto a contract that
-                // already exists, so this is the COMMON answer here, not an
-                // edge case. Missing it made the old code report "Unexpected
-                // response type" and would have made this one wait out the full
-                // 60 seconds.
-                HostResponse::ContractResponse(ContractResponse::UpdateResponse {
-                    key, ..
-                }) if *key == contract_key => {
-                    info!("Room republished successfully (merged into existing contract)");
-                    Some(Ok(()))
-                }
-                // Some node versions answer a PUT with a bare `Ok`. It carries
-                // no key, so it cannot be attributed to a request; it is
-                // accepted because this connection has only one PUT in flight,
-                // which is a weaker claim than the two arms above and is why
-                // they are matched on the key and this one is not.
-                HostResponse::Ok => {
-                    info!("Room republished successfully (Ok response)");
-                    Some(Ok(()))
-                }
-                _ => None,
+            |response| match classify_put_response(&contract_key, response) {
+                PutAck::NotYet => None,
+                answered => Some(Ok(answered)),
             },
         )
-        .await
+        .await?;
+        match ack {
+            PutAck::Stored => info!(
+                "Room republished successfully with contract key: {}",
+                contract_key.id()
+            ),
+            PutAck::Merged => {
+                info!("Room republished successfully (merged into the existing contract)")
+            }
+            PutAck::Acknowledged => info!("Room republished successfully (Ok response)"),
+            PutAck::NotYet => unreachable!("NotYet is mapped to None above"),
+        }
+        Ok(())
     }
 
     /// Prepare a freshly-fetched `room_state` for **display** in a private
@@ -9048,7 +9070,7 @@ mod subscribe_handshake_tests {
         );
     }
 
-    fn other_key() -> ContractKey {
+    pub(super) fn other_key() -> ContractKey {
         ContractKey::from_params_and_code(
             freenet_stdlib::prelude::Parameters::from(vec![9u8]),
             freenet_stdlib::prelude::ContractCode::from(vec![4u8, 5, 6]),
@@ -11792,33 +11814,49 @@ pub(crate) fn unseal_nickname_display(",
 /// at one site and left every other site doing the old thing. Nothing said how
 /// many sites there were, so the class kept coming back.
 ///
-/// So this pin binds the CLASS rather than any one site, in three directions:
+/// So this pin binds the CLASS rather than any one site, in four directions:
 ///
-///   1. Every path in [`UPDATE_SEND_PATHS`] waits for its answer through
-///      `await_update_response`. That is seven of the eight production sends,
-///      not all of them: `accept_invitation_struct`'s join delta still reads
-///      raw and is freenet/river#690's.
-///   2. The number of `ContractRequest::Update` sends is the number accounted
-///      for here, so a NEW send path fails the pin until it is either routed
-///      through the waiter or listed as a deliberate exception.
-///   3. The number of production call sites that read from the connection
-///      themselves is exactly the inventory in [`DIRECT_CONNECTION_READS`].
+///   1. every path in [`UPDATE_SEND_PATHS`] waits for its answer through
+///      `await_update_response`, searched in that function's own body. That is
+///      seven of the eight production sends, not all of them:
+///      `accept_invitation_struct`'s join delta still reads raw and is
+///      freenet/river#690's;
+///   2. the number of `ContractRequest::Update` sends is accounted for;
+///   3. the number of `.recv()` calls is accounted for;
+///   4. the number of times the connection lock is TAKEN is accounted for.
 ///
-/// (2) and (3) are what make a new site fail. A pin that only banned the
-/// current error text would not: the next site would be written with different
-/// wording and pass. Same reasoning as the membership pin's counted scans.
+/// Checks 2 to 4 count occurrences of a string in the production source. They
+/// are tripwires, not proofs, and the difference is worth being exact about
+/// because an earlier version of check 3 counted the literal `web_api.recv()`
+/// and a reviewer walked a new raw read straight past it by naming the guard
+/// something else. A count keyed on a caller-chosen name is a spelling ban
+/// wearing a count's clothes.
 ///
-/// What this does NOT do, stated rather than left to be over-read: it proves
-/// nothing about whether a waiter's classifier is CORRECT, only about which
-/// code is routed through one. The classifier itself is covered by the unit
-/// tests in `subscribe_handshake_tests`.
+/// So: check 2 counts the spelling `ContractRequest::Update {`, and a send
+/// written as `Update { .. }` after a `use` import, or built by a shared
+/// helper, is invisible to it. Check 4 is the backstop for exactly that.
+/// `self.web_api` is private to this file and taking the lock is the only way
+/// to reach the connection at all, so a new site must appear there whether it
+/// reads, sends, or both.
+///
+/// Three residuals, stated rather than papered over:
+///   * the counts are NET. Converting one raw read to a waiter (a #690 fix)
+///     while adding a new raw read elsewhere leaves the total unchanged. The
+///     inventory below is prose, so nothing machine-checks WHICH site moved.
+///   * `strip_comment_lines` removes whole comment lines only, so a wait
+///     disabled with an inline `/* ... */` on a line that also carries live
+///     code still satisfies check 1. Inherited from the membership pin, which
+///     documents it; narrow because check 1 is scoped to each send path's body.
+///   * none of this says a classifier is CORRECT, only which code is routed
+///     through one. The classifiers are covered by `subscribe_handshake_tests`
+///     and the loop by `await_response_tests`.
 #[cfg(test)]
 mod response_multiplexing_pin {
     use super::authorize_send_tests::{
         method_body, production_source, squash, strip_comment_lines,
     };
 
-    /// Every production call site that reads from the shared connection.
+    /// Every production `.recv()` on the shared connection.
     ///
     /// One of them IS `await_response`, the sanctioned reader; the other ten
     /// are sites the fix has not reached. Listing all eleven rather than only
@@ -11844,12 +11882,40 @@ mod response_multiplexing_pin {
     /// 10. `ensure_room_migrated` -- #690.
     /// 11. `migrate_room_to_new_contract` -- freenet/river#689.
     ///
-    /// 6 through 11 are deliberately outside this change. Each of them folds an
-    /// unrelated response into a SUCCESS or a "not found" rather than into a
-    /// loud error, so fixing one changes what counts as success. That is a
-    /// different risk class from stepping over a message that is not ours, and
-    /// it is what #690 is for. Lowering this number is that issue's job.
+    /// 6 through 11 are deliberately outside this change, but NOT all for the
+    /// same reason, and an earlier version of this comment gave one reason for
+    /// all six.
+    ///
+    /// Four of them are TOLERANT: `put_room_state`, `try_get_state`, the join
+    /// delta and `ensure_room_migrated` fold an unrelated response into a
+    /// success or a "not found" rather than into an error, so fixing one
+    /// changes what counts as success. That is a different risk class from
+    /// stepping over a message that is not ours.
+    ///
+    /// The other two are FATAL, like the ten this change converted, and are
+    /// held back for their own reasons:
+    ///   * `create_room` errors on an unrelated response, and additionally
+    ///     reports "Contract key mismatch" for a notification carrying another
+    ///     key, which is the v0.2.135 failure shape and still live. Converting
+    ///     it means reconciling its two success arms, which persist DIFFERENT
+    ///     things (`add_room_with_invitation_secrets` versus `add_room`, which
+    ///     drops the invitation secrets), so it is a behaviour decision.
+    ///   * `migrate_room_to_new_contract` folds an `UpdateNotification` of ANY
+    ///     key into success and writes that key to local storage. That is data
+    ///     corruption rather than a tolerance bug, which is why it has its own
+    ///     issue (#689) rather than riding along here.
+    ///
+    /// Lowering this number is #690's job, and #689's.
     const DIRECT_CONNECTION_READS: usize = 11;
+
+    /// Production acquisitions of the connection lock.
+    ///
+    /// The backstop for checks 2 and 3, and the one count not keyed on a
+    /// caller-chosen name. `self.web_api` is private to this file, so
+    /// `self.web_api.lock().await` is the only way to reach the connection: a
+    /// new call site has to appear here whether it reads, sends, or both, and
+    /// whatever it calls its guard.
+    const CONNECTION_ACQUISITIONS: usize = 20;
 
     /// Production sends of a `ContractRequest::Update`: the seven routed
     /// through `await_update_response` below, plus `accept_invitation_struct`'s
@@ -11961,6 +12027,17 @@ mod response_multiplexing_pin {
             ));
         }
 
+        // 4. No unaccounted-for acquisition of the connection.
+        let locks = squash(&code).matches("self.web_api.lock().await").count();
+        if locks != CONNECTION_ACQUISITIONS {
+            problems.push(format!(
+                "expected exactly {CONNECTION_ACQUISITIONS} production acquisitions of \
+                 the connection lock, found {locks}. Every use of the shared \
+                 connection starts here, so a new one means a new call site: route \
+                 its wait through `await_response` and update this constant."
+            ));
+        }
+
         problems
     }
 
@@ -11971,19 +12048,34 @@ mod response_multiplexing_pin {
         assert!(problems.is_empty(), "{}", problems.join("\n\n"));
     }
 
-    /// Apply `mutation` to the real source, failing loudly if it does not
-    /// apply. A mutation that silently no-ops looks exactly like a working pin.
+    /// Apply a mutation to the real source, exactly once, failing loudly if it
+    /// does not apply: a mutation that silently no-ops looks exactly like a
+    /// working pin.
+    ///
+    /// `replacen(.., 1)` rather than `str::replace`: several of these targets
+    /// also occur inside the meta-tests' own string literals, so a replace-all
+    /// silently plants three copies where one was intended. Those extra copies
+    /// land inside this `#[cfg(test)]` module and are stripped before the pin
+    /// sees them, so it happened to work. "Happened to work" is the same family
+    /// of hazard as a mutation that silently no-ops.
     fn mutate(from: &str, to: &str) -> String {
         let src = include_str!("api.rs");
         assert!(
             src.contains(from),
             "mutation target not found; this meta-test is stale:\n{from}"
         );
-        src.replace(from, to)
+        src.replacen(from, to, 1)
     }
 
     fn assert_caught(mutated: &str, needle: &str, what: &str) {
         let problems = response_multiplexing_violations(mutated);
+        // A mutation that breaks the SCAN rather than tripping the CHECK also
+        // produces problems, and would let every meta-test below pass while
+        // proving nothing. Reject that shape explicitly.
+        assert!(
+            !problems.iter().any(|p| p.contains("pass vacuously")),
+            "{what}: the scan broke instead of the check firing: {problems:?}"
+        );
         assert!(
             problems.iter().any(|p| p.contains(needle)),
             "{what} must be caught, got: {problems:?}"
@@ -12049,6 +12141,22 @@ mod response_multiplexing_pin {
         assert_caught(&mutated, "found 9", "a newly-added update send");
     }
 
+    /// A new call site that only SENDS never trips checks 1 to 3: it awaits
+    /// nothing, so there is no missing waiter, no `.recv()` and no
+    /// `ContractRequest::Update`. Check 4 is the only thing that sees it.
+    #[test]
+    fn pin_catches_a_new_send_only_call_site() {
+        let mutated = mutate(
+            "    /// Republish a room contract to the network",
+            "    async fn poke(&self) {\n        let mut conn = self.web_api.lock().await;\n        let _ = conn.send(ClientRequest::Disconnect { cause: None }).await;\n    }\n\n    /// Republish a room contract to the network",
+        );
+        assert_caught(
+            &mutated,
+            "found 21",
+            "a new call site that takes the connection lock",
+        );
+    }
+
     /// And the anti-vacuity guard itself has to bite, or a rename silently
     /// turns every check above into a no-op.
     #[test]
@@ -12057,7 +12165,14 @@ mod response_multiplexing_pin {
             "async fn await_update_response",
             "async fn await_update_resp",
         );
-        assert_caught(&mutated, "pass vacuously", "the waiter being renamed away");
+        // Deliberately NOT `assert_caught`, which rejects "pass vacuously" as a
+        // broken scan. Here a broken scan is exactly the expected outcome, and
+        // the point is that it is reported rather than passed over.
+        let problems = response_multiplexing_violations(&mutated);
+        assert!(
+            problems.iter().any(|p| p.contains("pass vacuously")),
+            "renaming the waiter away must be reported as a vacuous scan, got: {problems:?}"
+        );
     }
 }
 
@@ -12081,7 +12196,7 @@ mod response_multiplexing_pin {
 /// under `start_paused` virtual time: no socket, no node, no real clock.
 #[cfg(test)]
 mod await_response_tests {
-    use super::subscribe_handshake_tests::{key, notification, update_answer};
+    use super::subscribe_handshake_tests::{key, notification, other_key, update_answer};
     use super::*;
     use std::collections::VecDeque;
 
@@ -12285,6 +12400,88 @@ mod await_response_tests {
         assert!(
             start.elapsed() < GET_STATE_TIMEOUT,
             "a NotFound must be reported when it arrives, not waited out"
+        );
+    }
+
+    /// The GET waiter must not take somebody else's `GetResponse`. Without the
+    /// key guard this returns the WRONG ROOM'S STATE, which is worse than the
+    /// failure the change set out to fix.
+    #[tokio::test(start_paused = true)]
+    async fn a_get_response_for_another_contract_does_not_answer_ours() {
+        let ours = *key().id();
+        let theirs = *other_key().id();
+        let mut conn = Scripted::new(vec![
+            Ok(HostResponse::ContractResponse(
+                ContractResponse::GetResponse {
+                    key: other_key(),
+                    contract: None,
+                    state: WrappedState::new(b"someone else's room".to_vec()),
+                },
+            )),
+            Ok(HostResponse::ContractResponse(
+                ContractResponse::GetResponse {
+                    key: key(),
+                    contract: None,
+                    state: WrappedState::new(b"ours".to_vec()),
+                },
+            )),
+        ]);
+        assert_ne!(ours, theirs);
+        let state = await_get_response(&mut conn, ours, GET_STATE_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(
+            &state[..],
+            b"ours",
+            "the GET returned another contract's state"
+        );
+    }
+
+    /// A PUT onto a contract the node already holds is answered with an
+    /// `UpdateResponse`. Republishing is always that case, so treating it as
+    /// unrelated makes `riverctl room republish` wait out its full timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_put_onto_an_existing_contract_is_answered_by_an_update_response() {
+        assert_eq!(
+            classify_put_response(&key(), &update_answer(key())),
+            PutAck::Merged
+        );
+    }
+
+    #[test]
+    fn a_put_response_answers_the_put() {
+        assert_eq!(
+            classify_put_response(
+                &key(),
+                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: key() })
+            ),
+            PutAck::Stored
+        );
+    }
+
+    /// Neither PUT success shape may be taken from another contract's answer.
+    #[test]
+    fn a_put_answer_for_another_contract_does_not_answer_ours() {
+        assert_eq!(
+            classify_put_response(
+                &key(),
+                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: other_key() })
+            ),
+            PutAck::NotYet
+        );
+        assert_eq!(
+            classify_put_response(&key(), &update_answer(other_key())),
+            PutAck::NotYet
+        );
+    }
+
+    /// And a notification is not a PUT acknowledgement, which is the whole
+    /// class this change exists for.
+    #[test]
+    fn a_notification_does_not_answer_the_put() {
+        assert_eq!(
+            classify_put_response(&key(), &notification()),
+            PutAck::NotYet
         );
     }
 
