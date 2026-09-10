@@ -101,3 +101,6 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 freenet-test-network = "0.1.24"
 tempfile = "3"
 assert_cmd = "2"
+# `test-util` gives `#[tokio::test(start_paused = true)]`, so the response-wait
+# tests can exercise 60-second deadlines in virtual time instead of real time.
+tokio = { version = "1.42", features = ["full", "test-util"] }
