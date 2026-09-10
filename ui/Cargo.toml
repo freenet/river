@@ -95,7 +95,7 @@ freenet-stdlib = { workspace = true, features = ["net"] }
 # 0.5 delegate-secret migration walk (freenet/river#398 phase 3). The `ui`
 # default profile exposes the probe/driver surface; its stdlib dep unifies with
 # the workspace's 0.8.x.
-freenet-migrate = "0.5"
+freenet-migrate = "0.6"
 
 futures = "0.3.30"
 futures-timer = "3.0.3"
