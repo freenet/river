@@ -774,43 +774,6 @@ pub(crate) fn classify_put_response(sent_key: &ContractKey, response: &HostRespo
     }
 }
 
-/// Wait for the node's answer to the request we just sent, stepping over
-/// responses that are not it.
-///
-/// The node multiplexes every response for every subscription onto ONE
-/// connection, so an `UpdateNotification` for a room we are already subscribed
-/// to can arrive between our request and its answer. Taking the first message
-/// off the connection as the answer therefore turns an ordinary interleaving
-/// into a hard failure. That is freenet-core#4970, and it is what broke the
-/// freenet v0.2.135 release announcement: the node had restarted moments
-/// earlier, a notification landed inside the send window, and
-/// `announce-to-river.sh` exited 1 with "Unexpected response type" while every
-/// CI job reported success.
-///
-/// This exists because that bug kept coming back. It was found and fixed four
-/// times, at one call site each time, and each fix left the other sites doing
-/// the old thing. Routing every wait through one function is what makes the
-/// next site inherit the fix instead of re-earning it, and
-/// `response_multiplexing_violations` pins that the sites keep using it.
-///
-/// `classify` reports one of THREE things, which is why it returns
-/// `Option<Result<T>>` and not a bool:
-///   * `Some(Ok(value))` -- this is our answer.
-///   * `Some(Err(e))`    -- the node answered, and the answer is a refusal.
-///     Definitive: stop rather than wait out the clock.
-///   * `None`            -- not our answer. Step over it and keep waiting.
-///
-/// `timeout` is the only bound, deliberately, and the reason is about the COST
-/// OF GIVING UP rather than about memory. Stepping over costs no memory here
-/// (what is stepped over is dropped, unlike [`MAX_PENDING_DURING_HANDSHAKE`]'s
-/// queue, which COLLECTS), but that alone would not justify dropping a cap:
-/// [`MAX_UNRELATED_RESPONSES_DURING_POINTER_GET`] also drops and is capped
-/// anyway. The difference is what happens when the cap is hit. The pointer GET
-/// can afford to bail early because giving up is nearly free for it: it answers
-/// `PointerFetch::Unreachable` and falls back to the bundled hash. These
-/// callers have no fallback, so a cap would only add a second way to fail a
-/// send that the deadline was going to bound regardless, and it would fire
-/// exactly when the room is busiest.
 /// The half of the shared connection [`await_response`] needs: hand me the next
 /// response.
 ///
@@ -856,6 +819,43 @@ fn response_kind(response: &HostResponse) -> &'static str {
     }
 }
 
+/// Wait for the node's answer to the request we just sent, stepping over
+/// responses that are not it.
+///
+/// The node multiplexes every response for every subscription onto ONE
+/// connection, so an `UpdateNotification` for a room we are already subscribed
+/// to can arrive between our request and its answer. Taking the first message
+/// off the connection as the answer therefore turns an ordinary interleaving
+/// into a hard failure. That is freenet-core#4970, and it is what broke the
+/// freenet v0.2.135 release announcement: the node had restarted moments
+/// earlier, a notification landed inside the send window, and
+/// `announce-to-river.sh` exited 1 with "Unexpected response type" while every
+/// CI job reported success.
+///
+/// This exists because that bug kept coming back. It was found and fixed four
+/// times, at one call site each time, and each fix left the other sites doing
+/// the old thing. Routing every wait through one function is what makes the
+/// next site inherit the fix instead of re-earning it, and
+/// `response_multiplexing_violations` pins that the sites keep using it.
+///
+/// `classify` reports one of THREE things, which is why it returns
+/// `Option<Result<T>>` and not a bool:
+///   * `Some(Ok(value))` -- this is our answer.
+///   * `Some(Err(e))`    -- the node answered, and the answer is a refusal.
+///     Definitive: stop rather than wait out the clock.
+///   * `None`            -- not our answer. Step over it and keep waiting.
+///
+/// `timeout` is the only bound, deliberately, and the reason is about the COST
+/// OF GIVING UP rather than about memory. Stepping over costs no memory here
+/// (what is stepped over is dropped, unlike [`MAX_PENDING_DURING_HANDSHAKE`]'s
+/// queue, which COLLECTS), but that alone would not justify dropping a cap:
+/// [`MAX_UNRELATED_RESPONSES_DURING_POINTER_GET`] also drops and is capped
+/// anyway. The difference is what happens when the cap is hit. The pointer GET
+/// can afford to bail early because giving up is nearly free for it: it answers
+/// `PointerFetch::Unreachable` and falls back to the bundled hash. These
+/// callers have no fallback, so a cap would only add a second way to fail a
+/// send that the deadline was going to bound regardless, and it would fire
+/// exactly when the room is busiest.
 async fn await_response<T, S: ResponseSource + ?Sized>(
     web_api: &mut S,
     timeout: Duration,
@@ -11922,14 +11922,44 @@ mod response_multiplexing_pin {
     /// Lowering this number is #690's job, and #689's.
     const DIRECT_CONNECTION_READS: usize = 11;
 
-    /// Production acquisitions of the connection lock.
+    /// Production references to the connection field, and locks taken on it.
     ///
-    /// The backstop for checks 2 and 3, and the one count not keyed on a
-    /// caller-chosen name. `self.web_api` is private to this file, so
-    /// `self.web_api.lock().await` is the only way to reach the connection: a
-    /// new call site has to appear here whether it reads, sends, or both, and
-    /// whatever it calls its guard.
+    /// TWO counts, because one is not enough and the reason is worth writing
+    /// down. An earlier version of this pin counted only
+    /// `self.web_api.lock().await` and its comment claimed that was "the one
+    /// count not keyed on a caller-chosen name", on the grounds that the field
+    /// is private. Private is not the same as unaliasable: the field is an
+    /// `Arc<Mutex<WebApi>>`, so
+    ///
+    /// ```ignore
+    /// let api = self.web_api.clone();
+    /// let mut conn = api.lock().await;
+    /// ```
+    ///
+    /// reaches the connection under a name of the writer's choosing and was
+    /// invisible to all four checks. A reviewer defeated it that way, and the
+    /// file ALREADY contains the pattern: `NodePointerIo` holds
+    /// `&'a Arc<Mutex<WebApi>>` and is handed `&self.web_api` at its
+    /// construction site.
+    ///
+    /// So: every path to the connection has to NAME THE FIELD at least once,
+    /// which `FIELD_REFERENCES` counts, and has to TAKE THE LOCK, which
+    /// `CONNECTION_ACQUISITIONS` counts regardless of receiver. The Arc-clone
+    /// shape moves both.
+    ///
+    /// Residual, since claiming completeness here is what went wrong twice
+    /// already: these are still string counts. `try_lock()` and
+    /// `blocking_lock()` would evade the second (both are absent today, and
+    /// either would still have to name the field). The counts are also NET, so
+    /// a one-for-one swap passes. The check that would actually bind this is
+    /// not a count at all: make the raw connection unreachable by wrapping it
+    /// in a type whose only methods are the waiters. That is freenet/river#692.
     const CONNECTION_ACQUISITIONS: usize = 20;
+
+    /// See [`CONNECTION_ACQUISITIONS`]. One higher than the lock count, because
+    /// `NodePointerIo` is handed a borrow of the field rather than locking it
+    /// at the construction site.
+    const FIELD_REFERENCES: usize = 21;
 
     /// Production sends of a `ContractRequest::Update`: the seven routed
     /// through `await_update_response` below, plus `accept_invitation_struct`'s
@@ -12041,14 +12071,29 @@ mod response_multiplexing_pin {
             ));
         }
 
-        // 4. No unaccounted-for acquisition of the connection.
-        let locks = squash(&code).matches("self.web_api.lock().await").count();
+        // 4. No unaccounted-for reach for the connection, counted at both
+        //    chokepoints every path has to pass: naming the field, and taking
+        //    the lock. Counting the lock ALONE misses nothing today but is
+        //    keyed on `self.web_api.lock()`; counting the field alone misses a
+        //    second lock on an alias already in scope. Together they move on
+        //    the Arc-clone shape that defeated the single-count version.
+        let sq_all = squash(&code);
+        let fields = sq_all.matches("self.web_api").count();
+        if fields != FIELD_REFERENCES {
+            problems.push(format!(
+                "expected exactly {FIELD_REFERENCES} production references to \
+                 `self.web_api`, found {fields}. Every path to the shared \
+                 connection names the field at least once, including one that \
+                 clones or borrows the `Arc` and locks it under another name."
+            ));
+        }
+        let locks = sq_all.matches(".lock().await").count();
         if locks != CONNECTION_ACQUISITIONS {
             problems.push(format!(
                 "expected exactly {CONNECTION_ACQUISITIONS} production acquisitions of \
-                 the connection lock, found {locks}. Every use of the shared \
-                 connection starts here, so a new one means a new call site: route \
-                 its wait through `await_response` and update this constant."
+                 the connection lock, found {locks}. A new one means a new call \
+                 site: route its wait through `await_response` and update this \
+                 constant."
             ));
         }
 
@@ -12172,6 +12217,33 @@ mod response_multiplexing_pin {
             &mutated,
             "found 21",
             "a new call site that takes the connection lock",
+        );
+    }
+
+    /// The shape that defeated the single-count version of check 4: clone the
+    /// `Arc` and lock it under a name of your choosing. This is the reviewer's
+    /// probe verbatim, and it sends AND reads raw, which is exactly what the
+    /// pin exists to catch.
+    #[test]
+    fn pin_catches_a_call_site_reached_through_a_cloned_arc() {
+        let mutated = mutate(
+            "    /// Republish a room contract to the network",
+            "    async fn sneak(&self, contract_key: ContractKey) {\n        let api = self.web_api.clone();\n        let mut conn = api.lock().await;\n        let _ = conn.send(ClientRequest::ContractOp(ContractRequest::Get {\n            key: *contract_key.id(),\n            return_contract_code: false,\n            subscribe: false,\n            blocking_subscribe: false,\n        })).await;\n        let _ = conn.recv().await;\n    }\n\n    /// Republish a room contract to the network",
+        );
+        let problems = response_multiplexing_violations(&mutated);
+        assert!(
+            !problems.iter().any(|p| p.contains("pass vacuously")),
+            "the scan broke instead of the check firing: {problems:?}"
+        );
+        // Both chokepoints must move: the field is named once more, and the
+        // lock is taken once more under a different receiver.
+        assert!(
+            problems.iter().any(|p| p.contains("references to")),
+            "the extra `self.web_api` reference must be counted, got: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("acquisitions of")),
+            "the lock taken under another name must be counted, got: {problems:?}"
         );
     }
 
