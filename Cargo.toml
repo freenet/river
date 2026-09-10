@@ -16,7 +16,7 @@ ciborium = "0.2.2"
 serde = { version = "1.0.130", features = ["derive"] }
 
 # Cryptography
-ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "serde"] }
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["alloc", "serde"] }
 # For WASM contracts that only need verification
 ed25519-compact = { version = "2.1.1", default-features = false, features = ["std"] }
 blake3 = { version = "1.5.3", features = ["serde"] }
