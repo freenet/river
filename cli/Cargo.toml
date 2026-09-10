@@ -104,7 +104,11 @@ assert_cmd = "2"
 # `test-util` gives `#[tokio::test(start_paused = true)]`, so the response-wait
 # tests exercise 60-second deadlines in virtual time rather than sleeping.
 #
-# It does NOT reach the shipped binary. The workspace sets `resolver = "2"`,
+# It does not reach the SHIPPED BINARY, which is a narrower claim than "is never
+# compiled into the binary": `cargo test --all-targets` does build the bin target
+# with the feature on, because test-time features unify across targets. That is
+# harmless, since `test-util` only changes behaviour when the clock is explicitly
+# paused. The workspace sets `resolver = "2"`,
 # which stops dev-dependency features being unified into the normal build;
 # verified rather than assumed with
 # `cargo tree -p riverctl -e features,no-dev | grep test-util`, which finds

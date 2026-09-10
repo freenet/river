@@ -741,16 +741,33 @@ pub(crate) fn classify_update_response(
 pub(crate) enum PutAck {
     /// The node stored the contract.
     Stored,
-    /// The node already HELD the contract and merged our state into it. It
-    /// answers with an `UpdateResponse`, not a `PutResponse` (freenet 0.1.188,
-    /// `contract/executor/runtime.rs::perform_contract_put`, both exits of its
-    /// already-exists branch). Republishing is by definition a PUT onto a
-    /// contract that already exists, so this is the COMMON answer, not an edge
-    /// case: missing it made the old code report "Unexpected response type".
+    /// The node already HELD the contract and merged our state into it,
+    /// answering with an `UpdateResponse` rather than a `PutResponse`.
+    ///
+    /// This is the LOCAL executor's answer, and only its answer. Measured in
+    /// freenet 0.2.133: `contract/executor/runtime/contract_ops.rs`
+    /// (`perform_contract_put`) returns `UpdateResponse` from both exits of its
+    /// already-exists branch, carrying the comment "Re-PUT into an existing
+    /// contract returns an UpdateResponse", while every NETWORK exit answers
+    /// `PutResponse` (`operations/put/op_ctx_task.rs`). An earlier version of
+    /// this comment called it "the COMMON answer" without that split, which is
+    /// wrong for a node in network mode, and cited a stale 0.1.188 path.
+    ///
+    /// Accepting it is still necessary: `freenet local` is the routine mode for
+    /// River development (`AGENTS.md`), and republishing is by definition a PUT
+    /// onto a contract that already exists. Missing it made the old code report
+    /// "Unexpected response type" there.
     Merged,
     /// Some node versions answer a bare `Ok`. It carries no key, so unlike the
     /// two above it cannot be attributed to a request; it is accepted because
     /// this connection has only one PUT in flight.
+    ///
+    /// Note the acceptance WINDOW widened with the step-over loop. Before it,
+    /// a bare `Ok` was only ever taken as the answer if it was the FIRST
+    /// message off the connection; now it is taken whenever it arrives inside
+    /// the deadline, after any number of stepped-over responses. Nothing
+    /// observed sends a spurious `Ok`, and an unattributable success is exactly
+    /// the shape #691 is about.
     Acknowledged,
     /// Something else arrived first. Step over it and keep waiting.
     NotYet,
@@ -856,7 +873,7 @@ fn response_kind(response: &HostResponse) -> &'static str {
 /// callers have no fallback, so a cap would only add a second way to fail a
 /// send that the deadline was going to bound regardless, and it would fire
 /// exactly when the room is busiest.
-async fn await_response<T, S: ResponseSource + ?Sized>(
+async fn await_response<T, S: ResponseSource>(
     web_api: &mut S,
     timeout: Duration,
     awaiting: &str,
@@ -892,10 +909,34 @@ async fn await_response<T, S: ResponseSource + ?Sized>(
         //
         // And `WebApi::recv` is documented as NOT cancellation-safe: dropping
         // its future mid-reassembly loses a streamed response. Every timeout
-        // here drops one, which is unavoidable and pre-existing (every call
-        // site did it before this change, and only the LAST iteration of a wait
-        // can cancel, so the exposure is the same as it was). Constructing one
-        // more that is guaranteed to be cancelled is avoidable, so avoid it.
+        // here drops one. At most ONE per wait, because a step-over can only
+        // follow an `Ok(..)`, which means the future completed, and the first
+        // `Err(Elapsed)` returns; no caller wraps a waiter in an outer
+        // `select!` or `timeout` that could add another.
+        //
+        // An earlier version of this comment said the exposure was UNCHANGED
+        // from the code this replaced. Review falsified that, twice over, and
+        // the second one is the interesting half:
+        //
+        //   * on an unrelated response the old code cancelled NOTHING. Its
+        //     `recv` completed, it read the response, and it returned
+        //     "Unexpected response type" at once. Stepping over instead means
+        //     a wait that ends in a timeout has cancelled one. That is exactly
+        //     the traffic this change exists to handle, so it is the common
+        //     case rather than a corner.
+        //   * the old code always gave its single `recv` the WHOLE window. This
+        //     gives the last one `deadline - now`, and the guard below excludes
+        //     only exactly zero, so a `recv` can be started with a millisecond
+        //     of budget and cancelled part-way through reassembling a streamed
+        //     `GetResponse`. The old shape could not produce that.
+        //
+        // Neither is a desync: the loss is bounded to the one response. Both
+        // are properties of wrapping a non-cancel-safe `recv` in a `timeout`,
+        // which every call site here did before and after; freenet/river#692
+        // is where that stops being the shape of this code at all.
+        //
+        // What IS avoidable is constructing one more `recv` that is guaranteed
+        // to be cancelled, so avoid that:
         if remaining.is_zero() {
             return Err(timed_out(stepped_over, last_stepped));
         }
@@ -921,7 +962,7 @@ async fn await_response<T, S: ResponseSource + ?Sized>(
 /// Wait for the node's `UpdateResponse` for `sent_key`.
 ///
 /// The shared tail of every riverctl path that sends a `ContractRequest::Update`.
-async fn await_update_response<S: ResponseSource + ?Sized>(
+async fn await_update_response<S: ResponseSource>(
     web_api: &mut S,
     sent_key: &ContractKey,
 ) -> Result<()> {
@@ -938,7 +979,7 @@ async fn await_update_response<S: ResponseSource + ?Sized>(
 }
 
 /// Wait for the node's `GetResponse` for `id`.
-async fn await_get_response<S: ResponseSource + ?Sized>(
+async fn await_get_response<S: ResponseSource>(
     web_api: &mut S,
     id: ContractInstanceId,
     timeout: Duration,
@@ -2693,7 +2734,17 @@ impl ApiClient {
                 info!("Room republished successfully (merged into the existing contract)")
             }
             PutAck::Acknowledged => info!("Room republished successfully (Ok response)"),
-            PutAck::NotYet => unreachable!("NotYet is mapped to None above"),
+            // Not reachable: the closure above maps `NotYet` to `None`, which
+            // keeps the waiter waiting. Reported rather than `unreachable!`,
+            // because the two are only consistent by inspection and a panic is
+            // a poor way to find that out in a user's terminal.
+            PutAck::NotYet => {
+                return Err(anyhow!(
+                    "internal error: the PUT waiter answered `NotYet`, so its \
+                     classifier and this match disagree about what counts as an \
+                     answer"
+                ))
+            }
         }
         Ok(())
     }
@@ -9141,6 +9192,54 @@ mod subscribe_handshake_tests {
         );
     }
 
+    /// A PUT onto a contract the node already holds is answered with an
+    /// `UpdateResponse`. Republishing is always that case, so treating it as
+    /// unrelated makes `riverctl room republish` wait out its full timeout.
+    #[test]
+    fn a_put_onto_an_existing_contract_is_answered_by_an_update_response() {
+        assert_eq!(
+            classify_put_response(&key(), &update_answer(key())),
+            PutAck::Merged
+        );
+    }
+
+    #[test]
+    fn a_put_response_answers_the_put() {
+        assert_eq!(
+            classify_put_response(
+                &key(),
+                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: key() })
+            ),
+            PutAck::Stored
+        );
+    }
+
+    /// Neither PUT success shape may be taken from another contract's answer.
+    #[test]
+    fn a_put_answer_for_another_contract_does_not_answer_ours() {
+        assert_eq!(
+            classify_put_response(
+                &key(),
+                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: other_key() })
+            ),
+            PutAck::NotYet
+        );
+        assert_eq!(
+            classify_put_response(&key(), &update_answer(other_key())),
+            PutAck::NotYet
+        );
+    }
+
+    /// And a notification is not a PUT acknowledgement, which is the whole
+    /// class this change exists for.
+    #[test]
+    fn a_notification_does_not_answer_the_put() {
+        assert_eq!(
+            classify_put_response(&key(), &notification()),
+            PutAck::NotYet
+        );
+    }
+
     /// Anything else the node may send is also non-fatal.
     #[test]
     fn other_responses_are_tolerated() {
@@ -11872,10 +11971,12 @@ mod response_multiplexing_pin {
 
     /// Every production `.recv()` on the shared connection.
     ///
-    /// One of them IS `await_response`, the sanctioned reader; the other ten
-    /// are sites the fix has not reached. Listing all eleven rather than only
-    /// the unreached ones is what makes the number checkable against a plain
-    /// `grep`.
+    /// One of them IS the `ResponseSource` impl `await_response` reads through;
+    /// the other ten are sites the fix has not reached. All eleven are listed
+    /// rather than only the unreached ones, so the constant can be audited by
+    /// walking the list. Note a plain `grep -c` over the file does NOT give 11:
+    /// it also counts the meta-tests' own string literals, which the pin strips
+    /// with `production_source` before counting.
     ///
     /// Listed rather than merely counted, so that the number is auditable and
     /// so that lowering it is a decision somebody made on purpose:
@@ -11911,9 +12012,11 @@ mod response_multiplexing_pin {
     ///   * `create_room` errors on an unrelated response, and additionally
     ///     reports "Contract key mismatch" for a notification carrying another
     ///     key, which is the v0.2.135 failure shape and still live. Converting
-    ///     it means reconciling its two success arms, which persist DIFFERENT
-    ///     things (`add_room_with_invitation_secrets` versus `add_room`, which
-    ///     drops the invitation secrets), so it is a behaviour decision.
+    ///     it means reconciling success arms that persist DIFFERENT things:
+    ///     the `PutResponse` arm stores invitation secrets
+    ///     (`add_room_with_invitation_secrets`) and the bare-`Ok` arm does not
+    ///     (`add_room`), so a room created down the second path silently loses
+    ///     them. That is a behaviour decision, not a mechanical conversion.
     ///   * `migrate_room_to_new_contract` folds an `UpdateNotification` of ANY
     ///     key into success and writes that key to local storage. That is data
     ///     corruption rather than a tolerance bug, which is why it has its own
@@ -11965,6 +12068,31 @@ mod response_multiplexing_pin {
     /// through `await_update_response` below, plus `accept_invitation_struct`'s
     /// join delta, which is #690's.
     const UPDATE_SENDS: usize = 8;
+
+    /// The three non-update paths this change converted, and the needle each
+    /// must still contain.
+    ///
+    /// `UPDATE_SEND_PATHS` below covers the seven update sends; these are the
+    /// PUT and the two GETs. Without them `republish_room` could be rewired to
+    /// `|_| Some(Ok(PutAck::Stored))`, accepting ANY response as a successful
+    /// republish, and every test would stay green: `classify_put_response` has
+    /// its own unit tests, but nothing said `republish_room` still calls it.
+    /// That is the same gap as the untested loop, one level along, and it is
+    /// the third time this shape has been found in this change.
+    const CLASSIFIER_WIRING: &[(&str, &str)] = &[
+        (
+            "pub async fn republish_room(",
+            "classify_put_response(&contract_key,",
+        ),
+        (
+            "async fn get_state_from_contract(",
+            "await_get_response(&mutweb_api,id,",
+        ),
+        (
+            "pub async fn accept_invitation_struct(",
+            "await_get_response(",
+        ),
+    ];
 
     /// Every path that sends a contract update and must wait for the answer
     /// through the shared waiter.
@@ -12036,6 +12164,27 @@ mod response_multiplexing_pin {
             }
         }
 
+        // 1b. The PUT and GET paths keep their wiring too. Same reasoning as
+        //     check 1: a classifier with unit tests proves nothing about a call
+        //     site that stopped calling it.
+        for (sig, needle) in CLASSIFIER_WIRING {
+            match method_body(&code, sig) {
+                Some(body) => {
+                    if !squash(body).contains(needle) {
+                        problems.push(format!(
+                            "`{sig}` no longer reaches the shared waiter through \
+                             `{needle}`. Its classifier's own unit tests would stay \
+                             green while the call site accepted anything."
+                        ));
+                    }
+                }
+                None => problems.push(format!(
+                    "could not isolate `{sig}`; re-check this pin against the \
+                     function's new shape."
+                )),
+            }
+        }
+
         // 2. No unaccounted-for update send. Without this, a NEW send path
         //    written the old way passes: check 1 only looks at the paths it
         //    already knows about, which is exactly how this class survived
@@ -12057,9 +12206,15 @@ mod response_multiplexing_pin {
         //    than a count, and a new call site that names its guard anything
         //    else would have slipped straight past -- which is the exact hole
         //    the membership pin above documents for its own scans, twenty lines
-        //    from where this was first written the wrong way. `try_recv()` does
-        //    not contain `.recv()`, so the two `shutdown_rx.try_recv()` calls
-        //    are not counted.
+        //    from where this was first written the wrong way.
+        //
+        //    Precisely: this counts EVERY `.recv()` in production `api.rs`, not
+        //    every read of the connection. Today they coincide, because the
+        //    only receiver in the file is the `WebApi` guard; add an mpsc
+        //    channel and this count moves for a reason that has nothing to do
+        //    with the connection, which is a false positive rather than a miss.
+        //    `try_recv()` does not contain `.recv()`, so the two
+        //    `shutdown_rx.try_recv()` calls are not counted.
         let reads = squash(&code).matches(".recv()").count();
         if reads != DIRECT_CONNECTION_READS {
             problems.push(format!(
@@ -12217,6 +12372,23 @@ mod response_multiplexing_pin {
             &mutated,
             "found 21",
             "a new call site that takes the connection lock",
+        );
+    }
+
+    /// `republish_room` rewired to accept ANY response as a successful
+    /// republish. This is the reviewer's mutation verbatim: before check 1b it
+    /// left 383 of 383 green, because `classify_put_response` has its own unit
+    /// tests and nothing said the call site still called it.
+    #[test]
+    fn pin_catches_a_put_path_that_stops_consulting_its_classifier() {
+        let mutated = mutate(
+            "            |response| match classify_put_response(&contract_key, response) {\n                PutAck::NotYet => None,\n                answered => Some(Ok(answered)),\n            },",
+            "            |_| Some(Ok(PutAck::Stored)),",
+        );
+        assert_caught(
+            &mutated,
+            "no longer reaches the shared waiter",
+            "a PUT path that accepts any response",
         );
     }
 
@@ -12444,8 +12616,16 @@ mod await_response_tests {
             (Duration::ZERO, Ok(notification())),
             (Duration::ZERO, Ok(update_answer(key()))),
         ]);
-        let err = await_update_response(&mut conn, &key()).await.unwrap_err();
-        assert!(err.to_string().contains("Timeout"), "{err}");
+        let outcome = await_update_response(&mut conn, &key()).await;
+        // NOT `unwrap_err()`: under the mutation this guard exists to catch,
+        // the wait SUCCEEDS by consuming the responses queued past its
+        // deadline, and `unwrap_err` would panic with its own message instead
+        // of the one written here to explain what went wrong.
+        assert!(
+            outcome.is_err(),
+            "the wait consumed a response queued past its deadline and reported \
+             success; the `remaining.is_zero()` guard is what stops that"
+        );
         assert_eq!(
             conn.reads, 2,
             "read {} responses; the wait kept going after its deadline",
@@ -12524,54 +12704,6 @@ mod await_response_tests {
             &state[..],
             b"ours",
             "the GET returned another contract's state"
-        );
-    }
-
-    /// A PUT onto a contract the node already holds is answered with an
-    /// `UpdateResponse`. Republishing is always that case, so treating it as
-    /// unrelated makes `riverctl room republish` wait out its full timeout.
-    #[tokio::test(start_paused = true)]
-    async fn a_put_onto_an_existing_contract_is_answered_by_an_update_response() {
-        assert_eq!(
-            classify_put_response(&key(), &update_answer(key())),
-            PutAck::Merged
-        );
-    }
-
-    #[test]
-    fn a_put_response_answers_the_put() {
-        assert_eq!(
-            classify_put_response(
-                &key(),
-                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: key() })
-            ),
-            PutAck::Stored
-        );
-    }
-
-    /// Neither PUT success shape may be taken from another contract's answer.
-    #[test]
-    fn a_put_answer_for_another_contract_does_not_answer_ours() {
-        assert_eq!(
-            classify_put_response(
-                &key(),
-                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: other_key() })
-            ),
-            PutAck::NotYet
-        );
-        assert_eq!(
-            classify_put_response(&key(), &update_answer(other_key())),
-            PutAck::NotYet
-        );
-    }
-
-    /// And a notification is not a PUT acknowledgement, which is the whole
-    /// class this change exists for.
-    #[test]
-    fn a_notification_does_not_answer_the_put() {
-        assert_eq!(
-            classify_put_response(&key(), &notification()),
-            PutAck::NotYet
         );
     }
 
