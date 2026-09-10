@@ -1,6 +1,6 @@
 [package]
 name = "riverctl"
-version = "0.2.16"
+version = "0.2.17"
 edition = "2021"
 authors = ["Freenet Project"]
 description = "Command-line interface for River decentralized chat on Freenet"
@@ -101,3 +101,16 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 freenet-test-network = "0.1.24"
 tempfile = "3"
 assert_cmd = "2"
+# `test-util` gives `#[tokio::test(start_paused = true)]`, so the response-wait
+# tests exercise 60-second deadlines in virtual time rather than sleeping.
+#
+# It does not reach the SHIPPED BINARY, which is a narrower claim than "is never
+# compiled into the binary": `cargo test --all-targets` does build the bin target
+# with the feature on, because test-time features unify across targets. That is
+# harmless, since `test-util` only changes behaviour when the clock is explicitly
+# paused. The workspace sets `resolver = "2"`,
+# which stops dev-dependency features being unified into the normal build;
+# verified rather than assumed with
+# `cargo tree -p riverctl -e features,no-dev | grep test-util`, which finds
+# nothing, against one hit for the same command with dev edges included.
+tokio = { version = "1.42", features = ["full", "test-util"] }

@@ -12,7 +12,7 @@ use freenet_migrate::pointer::{resolve_app_pointer, PointerFetch, PointerFloor, 
 use freenet_migrate::{NewestFirst, Outcome, ProbeDriver, ProbeStateOps, SelectionPolicy, Step};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{
-    ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
+    ClientError, ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
 };
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
@@ -64,6 +64,14 @@ const POINTER_GET_TIMEOUT: Duration = Duration::from_secs(10);
 /// we asked for (freenet-core#4970 is the same race on the SUBSCRIBE
 /// acknowledgement). Bounded so a chatty subscription cannot starve the wait.
 const MAX_UNRELATED_RESPONSES_DURING_POINTER_GET: usize = 16;
+/// How long to wait for the node to answer an update we sent.
+const UPDATE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait for the node to answer a PUT we sent.
+const PUT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait for the room-state GET behind `accept invitation`.
+const ACCEPT_INVITATION_GET_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait for a room-state GET addressed by contract id.
+const GET_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The BLAKE3 code hash of the room-contract WASM this binary bundles.
 ///
@@ -679,6 +687,344 @@ pub(crate) fn classify_subscribe_response(response: &HostResponse) -> SubscribeA
         }
         _ => SubscribeAck::NotYet,
     }
+}
+
+/// What a response received while awaiting our own `UpdateResponse` means.
+///
+/// Split out so the interleaving case is directly testable, exactly as
+/// [`SubscribeAck`] is.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UpdateAck {
+    /// The node answered the update we sent.
+    Answered,
+    /// Something else arrived first. Step over it and keep waiting.
+    NotYet,
+}
+
+/// Whether `response` is the node's answer to the update we sent for `sent_key`.
+///
+/// An `UpdateResponse` for a DIFFERENT key belongs to some other request on
+/// this shared connection, so it does not answer ours -- the same key test the
+/// pointer GET makes at `NodePointerIo::get_pointer`.
+///
+/// It does NOT close the SAME-key case, and that case is reachable rather than
+/// theoretical. Nothing on the wire carries a request id, so two answers for
+/// one key are indistinguishable. Holding the connection lock across
+/// send-and-await stops two sends OVERLAPPING, but the lock is also released
+/// when a wait FAILS, and a failed wait leaves its answer outstanding: if
+/// `heal_member_info`'s `send_delta` times out (its error is swallowed with
+/// `warn!`), its `UpdateResponse` can arrive later and be taken as the answer
+/// to the caller's own send for the SAME contract. That is pre-existing, not
+/// introduced here, and closing it needs the connection drained on a failed
+/// wait or a request id on the wire. Tracked as freenet/river#691.
+pub(crate) fn classify_update_response(
+    sent_key: &ContractKey,
+    response: &HostResponse,
+) -> UpdateAck {
+    match response {
+        HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. })
+            if key.id() == sent_key.id() =>
+        {
+            UpdateAck::Answered
+        }
+        _ => UpdateAck::NotYet,
+    }
+}
+
+/// How the node answered the PUT we sent.
+///
+/// A named classifier rather than a closure inside `republish_room`, for the
+/// same reason as [`UpdateAck`]: a classifier buried in a call site is one
+/// nothing can test, and a PUT has three success shapes that are easy to get
+/// wrong.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PutAck {
+    /// The node stored the contract.
+    Stored,
+    /// The node already HELD the contract and merged our state into it,
+    /// answering with an `UpdateResponse` rather than a `PutResponse`.
+    ///
+    /// This is the LOCAL executor's answer, and only its answer. Measured in
+    /// freenet 0.2.133: `contract/executor/runtime/contract_ops.rs`
+    /// (`perform_contract_put`) returns `UpdateResponse` from both exits of its
+    /// already-exists branch, carrying the comment "Re-PUT into an existing
+    /// contract returns an UpdateResponse", while every NETWORK exit answers
+    /// `PutResponse` (`operations/put/op_ctx_task.rs`). An earlier version of
+    /// this comment called it "the COMMON answer" without that split, which is
+    /// wrong for a node in network mode, and cited a stale 0.1.188 path.
+    ///
+    /// Accepting it is still necessary: `freenet local` is the routine mode for
+    /// River development (`AGENTS.md`), and republishing is by definition a PUT
+    /// onto a contract that already exists. Missing it made the old code report
+    /// "Unexpected response type" there.
+    Merged,
+    /// Some node versions answer a bare `Ok`. It carries no key, so unlike the
+    /// two above it cannot be attributed to a request; it is accepted because
+    /// this connection has only one PUT in flight.
+    ///
+    /// Note the acceptance WINDOW widened with the step-over loop. Before it,
+    /// a bare `Ok` was only ever taken as the answer if it was the FIRST
+    /// message off the connection; now it is taken whenever it arrives inside
+    /// the deadline, after any number of stepped-over responses. Nothing
+    /// observed sends a spurious `Ok`, and an unattributable success is exactly
+    /// the shape #691 is about.
+    Acknowledged,
+    /// Something else arrived first. Step over it and keep waiting.
+    NotYet,
+}
+
+/// Whether `response` answers the PUT we sent for `sent_key`.
+pub(crate) fn classify_put_response(sent_key: &ContractKey, response: &HostResponse) -> PutAck {
+    match response {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key })
+            if key.id() == sent_key.id() =>
+        {
+            PutAck::Stored
+        }
+        HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. })
+            if key.id() == sent_key.id() =>
+        {
+            PutAck::Merged
+        }
+        HostResponse::Ok => PutAck::Acknowledged,
+        _ => PutAck::NotYet,
+    }
+}
+
+/// The half of the shared connection [`await_response`] needs: hand me the next
+/// response.
+///
+/// It exists as a seam so the WAIT can be driven against a scripted sequence.
+/// Without it the loop is only reachable through a real `WebSocketStream`, and
+/// a loop nothing can drive is a loop nothing tests: the classifiers had unit
+/// tests and the call sites had a source pin, while the loop joining them, which
+/// is where the v0.2.135 defect actually lived, had neither.
+///
+/// Implemented for the GUARD rather than for `WebApi`, because every caller
+/// holds `self.web_api.lock().await` across send-and-await and passes the guard.
+pub(crate) trait ResponseSource {
+    fn next_response(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::result::Result<HostResponse, ClientError>>;
+}
+
+impl ResponseSource for tokio::sync::MutexGuard<'_, WebApi> {
+    fn next_response(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::result::Result<HostResponse, ClientError>> {
+        (**self).recv()
+    }
+}
+
+/// A short name for a response, for diagnostics that must not dump state bytes.
+fn response_kind(response: &HostResponse) -> &'static str {
+    match response {
+        HostResponse::ContractResponse(ContractResponse::GetResponse { .. }) => "GetResponse",
+        HostResponse::ContractResponse(ContractResponse::PutResponse { .. }) => "PutResponse",
+        HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => "UpdateResponse",
+        HostResponse::ContractResponse(ContractResponse::UpdateNotification { .. }) => {
+            "UpdateNotification"
+        }
+        HostResponse::ContractResponse(ContractResponse::SubscribeResponse { .. }) => {
+            "SubscribeResponse"
+        }
+        HostResponse::ContractResponse(ContractResponse::NotFound { .. }) => "NotFound",
+        HostResponse::DelegateResponse { .. } => "DelegateResponse",
+        HostResponse::QueryResponse(_) => "QueryResponse",
+        HostResponse::Ok => "Ok",
+        _ => "unrecognised response",
+    }
+}
+
+/// Wait for the node's answer to the request we just sent, stepping over
+/// responses that are not it.
+///
+/// The node multiplexes every response for every subscription onto ONE
+/// connection, so an `UpdateNotification` for a room we are already subscribed
+/// to can arrive between our request and its answer. Taking the first message
+/// off the connection as the answer therefore turns an ordinary interleaving
+/// into a hard failure. That is freenet-core#4970, and it is what broke the
+/// freenet v0.2.135 release announcement: the node had restarted moments
+/// earlier, a notification landed inside the send window, and
+/// `announce-to-river.sh` exited 1 with "Unexpected response type" while every
+/// CI job reported success.
+///
+/// This exists because that bug kept coming back. It was found and fixed four
+/// times, at one call site each time, and each fix left the other sites doing
+/// the old thing. Routing every wait through one function is what makes the
+/// next site inherit the fix instead of re-earning it, and
+/// `response_multiplexing_violations` pins that the sites keep using it.
+///
+/// `classify` reports one of THREE things, which is why it returns
+/// `Option<Result<T>>` and not a bool:
+///   * `Some(Ok(value))` -- this is our answer.
+///   * `Some(Err(e))`    -- the node answered, and the answer is a refusal.
+///     Definitive: stop rather than wait out the clock.
+///   * `None`            -- not our answer. Step over it and keep waiting.
+///
+/// `timeout` is the only bound, deliberately, and the reason is about the COST
+/// OF GIVING UP rather than about memory. Stepping over costs no memory here
+/// (what is stepped over is dropped, unlike [`MAX_PENDING_DURING_HANDSHAKE`]'s
+/// queue, which COLLECTS), but that alone would not justify dropping a cap:
+/// [`MAX_UNRELATED_RESPONSES_DURING_POINTER_GET`] also drops and is capped
+/// anyway. The difference is what happens when the cap is hit. The pointer GET
+/// can afford to bail early because giving up is nearly free for it: it answers
+/// `PointerFetch::Unreachable` and falls back to the bundled hash. These
+/// callers have no fallback, so a cap would only add a second way to fail a
+/// send that the deadline was going to bound regardless, and it would fire
+/// exactly when the room is busiest.
+async fn await_response<T, S: ResponseSource>(
+    web_api: &mut S,
+    timeout: Duration,
+    awaiting: &str,
+    mut classify: impl FnMut(&HostResponse) -> Option<Result<T>>,
+) -> Result<T> {
+    // ONE deadline for the whole wait, computed before the first read: a chatty
+    // subscription must not be able to extend the budget one message at a time.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stepped_over = 0usize;
+    let mut last_stepped: Option<&'static str> = None;
+    // What the caller is told when the clock runs out. It names how many
+    // responses arrived that were not the answer, because otherwise stepping
+    // over them ERASES the diagnostic the old code gave: this reports at
+    // `debug!`, riverctl's filter is `from_default_env()`, so without `RUST_LOG`
+    // a failed wait would say only "timeout" where it used to name what the
+    // node actually sent.
+    let timed_out = |n: usize, last: Option<&'static str>| match last {
+        Some(kind) => anyhow!(
+            "Timeout waiting for {awaiting} after {timeout:?}; stepped over {n} response(s) \
+             that were not it, most recently a {kind}"
+        ),
+        None => anyhow!("Timeout waiting for {awaiting} after {timeout:?}; the node sent nothing"),
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // Not defensive, for two reasons that both bite.
+        //
+        // `tokio::time::timeout` polls the inner future BEFORE checking its own
+        // deadline, so `timeout(ZERO, ..)` returns an immediately-available
+        // response rather than timing out: without this the loop would go on
+        // consuming and classifying messages after it had given up, for as long
+        // as they kept arriving with no delay.
+        //
+        // And `WebApi::recv` is documented as NOT cancellation-safe: dropping
+        // its future mid-reassembly loses a streamed response. Every timeout
+        // here drops one. At most ONE per wait, because a step-over can only
+        // follow an `Ok(..)`, which means the future completed, and the first
+        // `Err(Elapsed)` returns; no caller wraps a waiter in an outer
+        // `select!` or `timeout` that could add another.
+        //
+        // An earlier version of this comment said the exposure was UNCHANGED
+        // from the code this replaced. Review falsified that, twice over, and
+        // the second one is the interesting half:
+        //
+        //   * on an unrelated response the old code cancelled NOTHING. Its
+        //     `recv` completed, it read the response, and it returned
+        //     "Unexpected response type" at once. Stepping over instead means
+        //     a wait that ends in a timeout has cancelled one. That is exactly
+        //     the traffic this change exists to handle, so it is the common
+        //     case rather than a corner.
+        //   * the old code always gave its single `recv` the WHOLE window. This
+        //     gives the last one `deadline - now`, and the guard below excludes
+        //     only exactly zero, so a `recv` can be started with a millisecond
+        //     of budget and cancelled part-way through reassembling a streamed
+        //     `GetResponse`. The old shape could not produce that.
+        //
+        // Neither is a REGRESSION, and that conclusion matters more than the
+        // shape, because without it this note reads like a bug someone should
+        // go and fix. The precondition for a short final budget is at least one
+        // step-over, and a step-over means a non-answer arrived first, which on
+        // every one of these call sites is precisely what made the old code
+        // return `Err` at t=0. The two conditions cannot both be exercised:
+        // there is no input on a converted path where the old code succeeds and
+        // this one fails. A GET with no interleaving is identical either way,
+        // since the first iteration gets the whole window.
+        //
+        // What changes is DIAGNOSIS, not outcome: the failure moves from "fails
+        // at once, naming the response" to "fails at the deadline", and nothing
+        // in the error says a reassembly was cut. The count and last-kind in
+        // the timeout message above are the partial answer to that.
+        //
+        // A minimum-budget floor was considered and rejected: it would make the
+        // common case worse to improve a rare one, refusing an already-available
+        // response when the remaining budget is small, and it would only move
+        // the threshold rather than remove the hazard. The loss is bounded to
+        // one response and is not a desync.
+        //
+        // What IS avoidable is constructing one more `recv` that is guaranteed
+        // to be cancelled, so avoid that:
+        if remaining.is_zero() {
+            return Err(timed_out(stepped_over, last_stepped));
+        }
+        match tokio::time::timeout(remaining, web_api.next_response()).await {
+            Ok(Ok(response)) => match classify(&response) {
+                Some(outcome) => return outcome,
+                None => {
+                    let kind = response_kind(&response);
+                    stepped_over += 1;
+                    last_stepped = Some(kind);
+                    // Deliberately `debug!`: a notification arriving mid-wait is
+                    // ORDINARY, so warning on it would be noise. The count above
+                    // is what carries the signal when the wait actually fails.
+                    debug!("Stepping over a {kind} while waiting for the {awaiting}");
+                }
+            },
+            Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {e}")),
+            Err(_) => return Err(timed_out(stepped_over, last_stepped)),
+        }
+    }
+}
+
+/// Wait for the node's `UpdateResponse` for `sent_key`.
+///
+/// The shared tail of every riverctl path that sends a `ContractRequest::Update`.
+async fn await_update_response<S: ResponseSource>(
+    web_api: &mut S,
+    sent_key: &ContractKey,
+) -> Result<()> {
+    await_response(
+        web_api,
+        UPDATE_RESPONSE_TIMEOUT,
+        "update response",
+        |response| match classify_update_response(sent_key, response) {
+            UpdateAck::Answered => Some(Ok(())),
+            UpdateAck::NotYet => None,
+        },
+    )
+    .await
+}
+
+/// Wait for the node's `GetResponse` for `id`.
+async fn await_get_response<S: ResponseSource>(
+    web_api: &mut S,
+    id: ContractInstanceId,
+    timeout: Duration,
+) -> Result<WrappedState> {
+    await_response(web_api, timeout, "GET response", move |response| {
+        match response {
+            HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key, state, ..
+            }) if *key.id() == id => Some(Ok(state.clone())),
+            // The node answered, and the answer is that it could not find the
+            // contract. Definitive, and the reason the classifier reports three
+            // outcomes rather than two: stepped over, this would surface as a
+            // timeout instead of as what the node actually said.
+            //
+            // NOT read as proof the contract does not exist. On the live
+            // network a NotFound is usually a routing dead-end for a contract
+            // that does exist, which is why `NodePointerIo::get_pointer`
+            // refuses to derive absence from one.
+            HostResponse::ContractResponse(ContractResponse::NotFound { instance_id })
+                if *instance_id == id =>
+            {
+                Some(Err(anyhow!(
+                    "The node could not find contract {instance_id}"
+                )))
+            }
+            _ => None,
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -2381,34 +2727,42 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send PUT request: {}", e))?;
 
-        // Wait for response
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(result) => result.map_err(|e| anyhow!("Failed to receive response: {}", e))?,
-                Err(_) => return Err(anyhow!("Timeout waiting for PUT response after 60 seconds")),
-            };
-
-        match response {
-            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
-                info!(
-                    "Room republished successfully with contract key: {}",
-                    key.id()
-                );
-                if key != contract_key {
-                    return Err(anyhow!(
-                        "Contract key mismatch: expected {}, got {}",
-                        contract_key.id(),
-                        key.id()
-                    ));
-                }
-                Ok(())
+        // A `PutResponse` for another key used to be a hard error here. It is
+        // now stepped over like any other response that is not ours, for the
+        // same reason: on a multiplexed connection it belongs to somebody
+        // else's request, and the answer to ours may still be behind it.
+        let ack = await_response(
+            &mut web_api,
+            PUT_RESPONSE_TIMEOUT,
+            "PUT response",
+            |response| match classify_put_response(&contract_key, response) {
+                PutAck::NotYet => None,
+                answered => Some(Ok(answered)),
+            },
+        )
+        .await?;
+        match ack {
+            PutAck::Stored => info!(
+                "Room republished successfully with contract key: {}",
+                contract_key.id()
+            ),
+            PutAck::Merged => {
+                info!("Room republished successfully (merged into the existing contract)")
             }
-            HostResponse::Ok => {
-                info!("Room republished successfully (Ok response)");
-                Ok(())
+            PutAck::Acknowledged => info!("Room republished successfully (Ok response)"),
+            // Not reachable: the closure above maps `NotYet` to `None`, which
+            // keeps the waiter waiting. Reported rather than `unreachable!`,
+            // because the two are only consistent by inspection and a panic is
+            // a poor way to find that out in a user's terminal.
+            PutAck::NotYet => {
+                return Err(anyhow!(
+                    "internal error: the PUT waiter answered `NotYet`, so its \
+                     classifier and this match disagree about what counts as an \
+                     answer"
+                ))
             }
-            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
         }
+        Ok(())
     }
 
     /// Prepare a freshly-fetched `room_state` for **display** in a private
@@ -3212,242 +3566,216 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send GET request: {}", e))?;
 
-        // Wait for response with timeout
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(result) => {
-                    tracing::info!("ACCEPT: received GET response");
-                    result.map_err(|e| anyhow!("Failed to receive response: {}", e))?
-                }
-                Err(_) => return Err(anyhow!("Timeout waiting for GET response after 60 seconds")),
-            };
+        let state = await_get_response(
+            &mut web_api,
+            *contract_key.id(),
+            ACCEPT_INVITATION_GET_TIMEOUT,
+        )
+        .await?;
+        tracing::info!("ACCEPT: received GET response");
+        info!("Successfully retrieved room state");
 
-        match response {
-            HostResponse::ContractResponse(contract_response) => {
-                match contract_response {
-                    ContractResponse::GetResponse { state, .. } => {
-                        info!("Successfully retrieved room state");
+        // Parse the actual room state from the response
+        let room_state: ChatRoomStateV1 = ciborium::de::from_reader(&state[..])
+            .map_err(|e| anyhow!("Failed to deserialize room state: {}", e))?;
 
-                        // Parse the actual room state from the response
-                        let room_state: ChatRoomStateV1 = ciborium::de::from_reader(&state[..])
-                            .map_err(|e| anyhow!("Failed to deserialize room state: {}", e))?;
+        info!(
+            "Room state retrieved: name={}, members={}, messages={}",
+            room_state
+                .configuration
+                .configuration
+                .display
+                .name
+                .to_string_lossy(),
+            room_state.members.members.len(),
+            room_state.recent_messages.messages.len()
+        );
 
-                        info!(
-                            "Room state retrieved: name={}, members={}, messages={}",
-                            room_state
-                                .configuration
-                                .configuration
-                                .display
-                                .name
-                                .to_string_lossy(),
-                            room_state.members.members.len(),
-                            room_state.recent_messages.messages.len()
-                        );
-
-                        // Validate the room state is properly initialized
-                        if room_state.configuration.configuration.owner_member_id
-                            == river_core::room_state::member::MemberId(
-                                freenet_scaffold::util::FastHash(0),
-                            )
-                        {
-                            return Err(anyhow!("Room state has invalid owner_member_id"));
-                        }
-
-                        // Compute invite chain before storing (walks up from invitee
-                        // to owner through existing members — doesn't require the
-                        // invitee to be in the members list)
-                        let params = ChatRoomParametersV1 {
-                            owner: room_owner_vk,
-                        };
-                        let invite_chain = room_state
-                            .members
-                            .get_invite_chain(&invitation.invitee, &params)
-                            .unwrap_or_default();
-
-                        // Persist any invitation-carried room secrets (issue
-                        // freenet/river#302) alongside the room itself, so the
-                        // CLI can decrypt private-room content across
-                        // invocations without re-importing the invitation.
-                        //
-                        // Merge with any previously-persisted entries so a
-                        // re-accept of an older invitation does not silently
-                        // drop newer versions the CLI already holds — mirrors
-                        // the UI's `extend()` semantics (see
-                        // `crate::private_room::merge_invitation_secrets`
-                        // for the rationale and the round-2 skeptical-review
-                        // finding H1 on PR #303).
-                        let invitation_secrets_map = crate::private_room::merge_invitation_secrets(
-                            self.storage
-                                .get_invitation_secrets(&room_owner_vk)
-                                .unwrap_or_default(),
-                            &invitation.room_secrets,
-                        );
-
-                        // Store credentials locally first
-                        self.storage.add_room_with_invitation_secrets(
-                            &room_owner_vk,
-                            &invitation.invitee_signing_key,
-                            room_state.clone(),
-                            &contract_key,
-                            invitation_secrets_map.clone(),
-                        )?;
-
-                        self.storage.store_authorized_member(
-                            &room_owner_vk,
-                            &invitation.invitee,
-                            &invite_chain,
-                        )?;
-
-                        // Persist our chosen nickname so a later rejoin (after
-                        // an inactivity prune) restores it instead of "Member".
-                        self.storage
-                            .update_self_nickname(&room_owner_vk, nickname)?;
-
-                        // Immediately publish membership + join event atomically.
-                        // The join event counts as a message, preventing
-                        // post_apply_cleanup from pruning the new member.
-                        let signing_key = &invitation.invitee_signing_key;
-                        let self_id = author_member_id(signing_key);
-
-                        // Build members delta: invitee + any missing invite chain members
-                        let current_member_ids: HashSet<MemberId> = room_state
-                            .members
-                            .members
-                            .iter()
-                            .map(|m| m.member.id())
-                            .collect();
-                        let mut members_to_add = vec![invitation.invitee.clone()];
-                        for chain_member in &invite_chain {
-                            if !current_member_ids.contains(&chain_member.member.id()) {
-                                members_to_add.push(chain_member.clone());
-                            }
-                        }
-                        let members_delta = MembersDelta::new(members_to_add);
-
-                        // Seal the invitee nickname — `SealedBytes::public` for
-                        // a public room, AES-GCM at the room's current secret
-                        // for a private room. Issue freenet/river#302; mirrors
-                        // the UI's `seal_invitee_nickname` (PR #301). Returns
-                        // `None` for a private room when neither the
-                        // owner-signed contract blob nor the invitation
-                        // artifact provides a secret at the room's
-                        // `current_secret_version` — in that case we DEFER
-                        // `member_info` rather than leak a plaintext nickname
-                        // into a private room. The member surfaces as
-                        // "Unknown" to other peers until a secret is back-
-                        // filled and a future heal re-publishes member_info;
-                        // see the UI's `build_member_info_heal` in
-                        // `ui/src/room_data.rs` for the eventual remediation
-                        // path (CLI counterpart filed as freenet/river#304).
-                        let sealed_nickname = crate::private_room::seal_invitee_nickname(
-                            &room_state,
-                            signing_key,
-                            &invitation_secrets_map,
-                            nickname,
-                        );
-                        let member_info_delta = sealed_nickname.map(|sealed| {
-                            let member_info = river_core::room_state::member_info::MemberInfo {
-                                member_id: self_id,
-                                version: 0,
-                                preferred_nickname: sealed,
-                                deputies: Vec::new(),
-                            };
-                            let authorized_info = river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
-                                member_info, signing_key,
-                            );
-                            vec![authorized_info]
-                        });
-
-                        if member_info_delta.is_none() {
-                            tracing::warn!(
-                                "Private room: no secret available at current_version {} \
-                                 (owner blob not yet issued and invitation carries no matching \
-                                 secret); deferring member_info — your nickname will not appear \
-                                 to other members until a heal publishes it.",
-                                room_state.secrets.current_version
-                            );
-                        }
-
-                        // Build join event message
-                        let join_message = river_core::room_state::message::MessageV1 {
-                            room_owner: params.owner_id(),
-                            author: self_id,
-                            content: river_core::room_state::message::RoomMessageBody::join_event(),
-                            time: std::time::SystemTime::now(),
-                        };
-                        let auth_join_message =
-                            river_core::room_state::message::AuthorizedMessageV1::new(
-                                join_message,
-                                signing_key,
-                            );
-
-                        let delta = ChatRoomStateV1Delta {
-                            recent_messages: Some(vec![auth_join_message]),
-                            members: Some(members_delta),
-                            member_info: member_info_delta,
-                            ..Default::default()
-                        };
-
-                        // Apply locally for validation
-                        let mut local_state = room_state.clone();
-                        local_state
-                            .apply_delta(&room_state, &params, &Some(delta.clone()))
-                            .map_err(|e| anyhow!("Failed to apply join delta: {:?}", e))?;
-
-                        // Update stored state
-                        self.storage
-                            .update_room_state(&room_owner_vk, local_state)?;
-
-                        // Send delta to network
-                        let delta_bytes = {
-                            let mut buf = Vec::new();
-                            ciborium::ser::into_writer(&delta, &mut buf)
-                                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
-                            buf
-                        };
-
-                        let update_request = ContractRequest::Update {
-                            key: contract_key,
-                            data: UpdateData::Delta(delta_bytes.into()),
-                        };
-
-                        web_api
-                            .send(ClientRequest::ContractOp(update_request))
-                            .await
-                            .map_err(|e| anyhow!("Failed to send join delta: {}", e))?;
-
-                        // Wait for update response
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
-                            web_api.recv(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(HostResponse::ContractResponse(
-                                ContractResponse::UpdateResponse { .. },
-                            ))) => {
-                                info!("Invitation accepted and membership published");
-                            }
-                            Ok(Ok(resp)) => {
-                                tracing::warn!("Unexpected response after join delta: {:?}", resp);
-                            }
-                            Ok(Err(e)) => {
-                                tracing::warn!("Error receiving join delta response: {}", e);
-                            }
-                            Err(_) => {
-                                tracing::warn!("Timeout waiting for join delta response");
-                            }
-                        }
-
-                        drop(web_api);
-
-                        Ok((room_owner_vk, contract_key))
-                    }
-                    _ => Err(anyhow!("Unexpected contract response type")),
-                }
-            }
-            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
+        // Validate the room state is properly initialized
+        if room_state.configuration.configuration.owner_member_id
+            == river_core::room_state::member::MemberId(freenet_scaffold::util::FastHash(0))
+        {
+            return Err(anyhow!("Room state has invalid owner_member_id"));
         }
+
+        // Compute invite chain before storing (walks up from invitee
+        // to owner through existing members — doesn't require the
+        // invitee to be in the members list)
+        let params = ChatRoomParametersV1 {
+            owner: room_owner_vk,
+        };
+        let invite_chain = room_state
+            .members
+            .get_invite_chain(&invitation.invitee, &params)
+            .unwrap_or_default();
+
+        // Persist any invitation-carried room secrets (issue
+        // freenet/river#302) alongside the room itself, so the
+        // CLI can decrypt private-room content across
+        // invocations without re-importing the invitation.
+        //
+        // Merge with any previously-persisted entries so a
+        // re-accept of an older invitation does not silently
+        // drop newer versions the CLI already holds — mirrors
+        // the UI's `extend()` semantics (see
+        // `crate::private_room::merge_invitation_secrets`
+        // for the rationale and the round-2 skeptical-review
+        // finding H1 on PR #303).
+        let invitation_secrets_map = crate::private_room::merge_invitation_secrets(
+            self.storage
+                .get_invitation_secrets(&room_owner_vk)
+                .unwrap_or_default(),
+            &invitation.room_secrets,
+        );
+
+        // Store credentials locally first
+        self.storage.add_room_with_invitation_secrets(
+            &room_owner_vk,
+            &invitation.invitee_signing_key,
+            room_state.clone(),
+            &contract_key,
+            invitation_secrets_map.clone(),
+        )?;
+
+        self.storage
+            .store_authorized_member(&room_owner_vk, &invitation.invitee, &invite_chain)?;
+
+        // Persist our chosen nickname so a later rejoin (after
+        // an inactivity prune) restores it instead of "Member".
+        self.storage
+            .update_self_nickname(&room_owner_vk, nickname)?;
+
+        // Immediately publish membership + join event atomically.
+        // The join event counts as a message, preventing
+        // post_apply_cleanup from pruning the new member.
+        let signing_key = &invitation.invitee_signing_key;
+        let self_id = author_member_id(signing_key);
+
+        // Build members delta: invitee + any missing invite chain members
+        let current_member_ids: HashSet<MemberId> = room_state
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.id())
+            .collect();
+        let mut members_to_add = vec![invitation.invitee.clone()];
+        for chain_member in &invite_chain {
+            if !current_member_ids.contains(&chain_member.member.id()) {
+                members_to_add.push(chain_member.clone());
+            }
+        }
+        let members_delta = MembersDelta::new(members_to_add);
+
+        // Seal the invitee nickname — `SealedBytes::public` for
+        // a public room, AES-GCM at the room's current secret
+        // for a private room. Issue freenet/river#302; mirrors
+        // the UI's `seal_invitee_nickname` (PR #301). Returns
+        // `None` for a private room when neither the
+        // owner-signed contract blob nor the invitation
+        // artifact provides a secret at the room's
+        // `current_secret_version` — in that case we DEFER
+        // `member_info` rather than leak a plaintext nickname
+        // into a private room. The member surfaces as
+        // "Unknown" to other peers until a secret is back-
+        // filled and a future heal re-publishes member_info;
+        // see the UI's `build_member_info_heal` in
+        // `ui/src/room_data.rs` for the eventual remediation
+        // path (CLI counterpart filed as freenet/river#304).
+        let sealed_nickname = crate::private_room::seal_invitee_nickname(
+            &room_state,
+            signing_key,
+            &invitation_secrets_map,
+            nickname,
+        );
+        let member_info_delta = sealed_nickname.map(|sealed| {
+            let member_info = river_core::room_state::member_info::MemberInfo {
+                member_id: self_id,
+                version: 0,
+                preferred_nickname: sealed,
+                deputies: Vec::new(),
+            };
+            let authorized_info =
+                river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
+                    member_info,
+                    signing_key,
+                );
+            vec![authorized_info]
+        });
+
+        if member_info_delta.is_none() {
+            tracing::warn!(
+                "Private room: no secret available at current_version {} \
+                 (owner blob not yet issued and invitation carries no matching \
+                 secret); deferring member_info — your nickname will not appear \
+                 to other members until a heal publishes it.",
+                room_state.secrets.current_version
+            );
+        }
+
+        // Build join event message
+        let join_message = river_core::room_state::message::MessageV1 {
+            room_owner: params.owner_id(),
+            author: self_id,
+            content: river_core::room_state::message::RoomMessageBody::join_event(),
+            time: std::time::SystemTime::now(),
+        };
+        let auth_join_message =
+            river_core::room_state::message::AuthorizedMessageV1::new(join_message, signing_key);
+
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(vec![auth_join_message]),
+            members: Some(members_delta),
+            member_info: member_info_delta,
+            ..Default::default()
+        };
+
+        // Apply locally for validation
+        let mut local_state = room_state.clone();
+        local_state
+            .apply_delta(&room_state, &params, &Some(delta.clone()))
+            .map_err(|e| anyhow!("Failed to apply join delta: {:?}", e))?;
+
+        // Update stored state
+        self.storage
+            .update_room_state(&room_owner_vk, local_state)?;
+
+        // Send delta to network
+        let delta_bytes = {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&delta, &mut buf)
+                .map_err(|e| anyhow!("Failed to serialize delta: {}", e))?;
+            buf
+        };
+
+        let update_request = ContractRequest::Update {
+            key: contract_key,
+            data: UpdateData::Delta(delta_bytes.into()),
+        };
+
+        web_api
+            .send(ClientRequest::ContractOp(update_request))
+            .await
+            .map_err(|e| anyhow!("Failed to send join delta: {}", e))?;
+
+        // Wait for update response
+        match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }))) => {
+                info!("Invitation accepted and membership published");
+            }
+            Ok(Ok(resp)) => {
+                tracing::warn!("Unexpected response after join delta: {:?}", resp);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Error receiving join delta response: {}", e);
+            }
+            Err(_) => {
+                tracing::warn!("Timeout waiting for join delta response");
+            }
+        }
+
+        drop(web_api);
+
+        Ok((room_owner_vk, contract_key))
     }
 
     /// The room key this binary's bundled WASM derives.
@@ -3694,19 +4022,11 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send GET: {}", e))?;
 
-        match tokio::time::timeout(std::time::Duration::from_secs(30), web_api.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                state, ..
-            }))) => {
-                let mut room_state = ciborium::de::from_reader::<ChatRoomStateV1, _>(&state[..])
-                    .map_err(|e| anyhow!("Failed to deserialize state: {}", e))?;
-                room_state.recent_messages.rebuild_actions_state();
-                Ok(room_state)
-            }
-            Ok(Ok(other)) => Err(anyhow!("Unexpected response: {:?}", other)),
-            Ok(Err(e)) => Err(anyhow!("Error receiving response: {}", e)),
-            Err(_) => Err(anyhow!("Timeout getting contract state")),
-        }
+        let state = await_get_response(&mut web_api, id, GET_STATE_TIMEOUT).await?;
+        let mut room_state = ciborium::de::from_reader::<ChatRoomStateV1, _>(&state[..])
+            .map_err(|e| anyhow!("Failed to deserialize state: {}", e))?;
+        room_state.recent_messages.rebuild_actions_state();
+        Ok(room_state)
     }
 
     /// Find the freshest state to migrate forward, searching the network across
@@ -4155,6 +4475,7 @@ impl ApiClient {
             buf
         };
 
+        // `ContractKey` is `Copy`, so it stays usable for the wait below.
         let update_request = ContractRequest::Update {
             key: contract_key,
             data: UpdateData::Delta(delta_bytes.into()),
@@ -4168,26 +4489,14 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
 
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timeout waiting for update response after 60 seconds"
-                    ))
-                }
-            };
-
-        match response {
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
-                info!("Message sent successfully to contract: {}", key.id());
-                // Hand back the new message's ID so callers can act on their own
-                // message later -- editing, deleting, or checking it is still there.
-                Ok(sent_message_id)
-            }
-            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
-        }
+        await_update_response(&mut web_api, &contract_key).await?;
+        info!(
+            "Message sent successfully to contract: {}",
+            contract_key.id()
+        );
+        // Hand back the new message's ID so callers can act on their own
+        // message later -- editing, deleting, or checking it is still there.
+        Ok(sent_message_id)
     }
 
     pub async fn send_message(
@@ -4279,6 +4588,7 @@ impl ApiClient {
             buf
         };
 
+        // `ContractKey` is `Copy`, so it stays usable for the wait below.
         let update_request = ContractRequest::Update {
             key: contract_key,
             data: UpdateData::Delta(delta_bytes.into()),
@@ -4292,27 +4602,14 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
 
-        // Wait for response
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timeout waiting for update response after 60 seconds"
-                    ))
-                }
-            };
-
-        match response {
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
-                info!("Message sent successfully to contract: {}", key.id());
-                // Hand back the new message's ID so callers can act on their own
-                // message later -- editing, deleting, or checking it is still there.
-                Ok(sent_message_id)
-            }
-            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
-        }
+        await_update_response(&mut web_api, &contract_key).await?;
+        info!(
+            "Message sent successfully to contract: {}",
+            contract_key.id()
+        );
+        // Hand back the new message's ID so callers can act on their own
+        // message later -- editing, deleting, or checking it is still there.
+        Ok(sent_message_id)
     }
 
     /// Send a pre-built `ChatRoomStateV1Delta` for a room. Used by call sites
@@ -4335,6 +4632,7 @@ impl ApiClient {
             buf
         };
 
+        // `ContractKey` is `Copy`, so it stays usable for the wait below.
         let update_request = ContractRequest::Update {
             key: contract_key,
             data: UpdateData::Delta(delta_bytes.into()),
@@ -4347,21 +4645,7 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
 
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timeout waiting for update response after 60 seconds"
-                    ))
-                }
-            };
-
-        match response {
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => Ok(()),
-            other => Err(anyhow!("Unexpected response type: {:?}", other)),
-        }
+        await_update_response(&mut web_api, &contract_key).await
     }
 
     /// Edit a message you sent
@@ -4804,6 +5088,7 @@ impl ApiClient {
             buf
         };
 
+        // `ContractKey` is `Copy`, so it stays usable for the wait below.
         let update_request = ContractRequest::Update {
             key: contract_key,
             data: UpdateData::Delta(delta_bytes.into()),
@@ -4817,25 +5102,12 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
 
-        // Wait for response
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timeout waiting for update response after 60 seconds"
-                    ))
-                }
-            };
-
-        match response {
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
-                info!("Action sent successfully to contract: {}", key.id());
-                Ok(())
-            }
-            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
-        }
+        await_update_response(&mut web_api, &contract_key).await?;
+        info!(
+            "Action sent successfully to contract: {}",
+            contract_key.id()
+        );
+        Ok(())
     }
 
     /// Stream messages from a room by polling for updates
@@ -5515,6 +5787,7 @@ impl ApiClient {
             .contract_key_for(room_owner_key, KeyIntent::Write)
             .await?;
 
+        // `ContractKey` is `Copy`, so it stays usable for the wait below.
         let update_request = ContractRequest::Update {
             key: contract_key,
             data: UpdateData::Delta(delta_bytes.into()),
@@ -5528,25 +5801,12 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
 
-        // Wait for response
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timeout waiting for update response after 60 seconds"
-                    ))
-                }
-            };
-
-        match response {
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
-                info!("Nickname updated successfully for contract: {}", key.id());
-                Ok(())
-            }
-            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
-        }
+        await_update_response(&mut web_api, &contract_key).await?;
+        info!(
+            "Nickname updated successfully for contract: {}",
+            contract_key.id()
+        );
+        Ok(())
     }
 
     /// Ban a member from the room
@@ -5715,6 +5975,7 @@ impl ApiClient {
             .contract_key_for(room_owner_key, KeyIntent::Write)
             .await?;
 
+        // `ContractKey` is `Copy`, so it stays usable for the wait below.
         let update_request = ContractRequest::Update {
             key: contract_key,
             data: UpdateData::Delta(delta_bytes.into()),
@@ -5728,25 +5989,12 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
 
-        // Wait for response
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timeout waiting for update response after 60 seconds"
-                    ))
-                }
-            };
-
-        match response {
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
-                info!("Ban applied successfully for contract: {}", key.id());
-                Ok(())
-            }
-            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
-        }
+        await_update_response(&mut web_api, &contract_key).await?;
+        info!(
+            "Ban applied successfully for contract: {}",
+            contract_key.id()
+        );
+        Ok(())
     }
 
     /// Deputize a member (#410): grant them authority to ban within the
@@ -5926,6 +6174,7 @@ impl ApiClient {
             .contract_key_for(room_owner_key, KeyIntent::Write)
             .await?;
 
+        // `ContractKey` is `Copy`, so it stays usable for the wait below.
         let update_request = ContractRequest::Update {
             key: contract_key,
             data: UpdateData::Delta(delta_bytes.into()),
@@ -5939,27 +6188,12 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
 
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), web_api.recv()).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {}", e)),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timeout waiting for update response after 60 seconds"
-                    ))
-                }
-            };
-
-        match response {
-            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
-                info!(
-                    "Configuration updated successfully for contract: {}",
-                    key.id()
-                );
-                Ok(())
-            }
-            _ => Err(anyhow!("Unexpected response type: {:?}", response)),
-        }
+        await_update_response(&mut web_api, &contract_key).await?;
+        info!(
+            "Configuration updated successfully for contract: {}",
+            contract_key.id()
+        );
+        Ok(())
     }
 
     /// Subscribe to a room and stream updates using Freenet subscriptions
@@ -8847,14 +9081,14 @@ mod reaccept_guard_tests {
 mod subscribe_handshake_tests {
     use super::*;
 
-    fn key() -> ContractKey {
+    pub(super) fn key() -> ContractKey {
         ContractKey::from_params_and_code(
             freenet_stdlib::prelude::Parameters::from(vec![0u8]),
-            &freenet_stdlib::prelude::ContractCode::from(vec![1u8, 2, 3]),
+            freenet_stdlib::prelude::ContractCode::from(vec![1u8, 2, 3]),
         )
     }
 
-    fn notification() -> HostResponse {
+    pub(super) fn notification() -> HostResponse {
         HostResponse::ContractResponse(ContractResponse::UpdateNotification {
             key: key(),
             update: freenet_stdlib::prelude::UpdateData::Delta(
@@ -8914,6 +9148,111 @@ mod subscribe_handshake_tests {
             MAX_PENDING_DURING_HANDSHAKE > 0 && MAX_PENDING_DURING_HANDSHAKE <= 64,
             "handshake queue must be bounded and small; an unbounded queue fed \
              by the node is a memory amplification vector"
+        );
+    }
+
+    pub(super) fn other_key() -> ContractKey {
+        ContractKey::from_params_and_code(
+            freenet_stdlib::prelude::Parameters::from(vec![9u8]),
+            freenet_stdlib::prelude::ContractCode::from(vec![4u8, 5, 6]),
+        )
+    }
+
+    pub(super) fn update_answer(k: ContractKey) -> HostResponse {
+        HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key: k,
+            summary: freenet_stdlib::prelude::StateSummary::from(vec![]),
+        })
+    }
+
+    /// The v0.2.135 regression, one call site over from the SUBSCRIBE race
+    /// above. Every riverctl send path took the FIRST message off the
+    /// connection as its answer, so a notification for an already-subscribed
+    /// room made the send fail with "Unexpected response type". It broke the
+    /// release announcement while every CI job reported success.
+    #[test]
+    fn an_update_notification_does_not_answer_the_update() {
+        assert_eq!(
+            classify_update_response(&key(), &notification()),
+            UpdateAck::NotYet,
+            "a notification overtaking our UpdateResponse must leave us \
+             waiting, not fail the send"
+        );
+    }
+
+    #[test]
+    fn the_update_response_is_recognised() {
+        assert_eq!(
+            classify_update_response(&key(), &update_answer(key())),
+            UpdateAck::Answered
+        );
+    }
+
+    /// An `UpdateResponse` for a different contract is somebody else's answer
+    /// on this shared connection. Taking it as ours would report a send as
+    /// acknowledged when nothing acknowledged it.
+    #[test]
+    fn an_update_response_for_another_contract_does_not_answer_ours() {
+        assert_eq!(
+            classify_update_response(&key(), &update_answer(other_key())),
+            UpdateAck::NotYet
+        );
+    }
+
+    /// Anything else the node may send while we wait is also non-fatal.
+    #[test]
+    fn other_responses_do_not_answer_the_update() {
+        assert_eq!(
+            classify_update_response(&key(), &HostResponse::Ok),
+            UpdateAck::NotYet
+        );
+    }
+
+    /// A PUT onto a contract the node already holds is answered with an
+    /// `UpdateResponse`. Republishing is always that case, so treating it as
+    /// unrelated makes `riverctl room republish` wait out its full timeout.
+    #[test]
+    fn a_put_onto_an_existing_contract_is_answered_by_an_update_response() {
+        assert_eq!(
+            classify_put_response(&key(), &update_answer(key())),
+            PutAck::Merged
+        );
+    }
+
+    #[test]
+    fn a_put_response_answers_the_put() {
+        assert_eq!(
+            classify_put_response(
+                &key(),
+                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: key() })
+            ),
+            PutAck::Stored
+        );
+    }
+
+    /// Neither PUT success shape may be taken from another contract's answer.
+    #[test]
+    fn a_put_answer_for_another_contract_does_not_answer_ours() {
+        assert_eq!(
+            classify_put_response(
+                &key(),
+                &HostResponse::ContractResponse(ContractResponse::PutResponse { key: other_key() })
+            ),
+            PutAck::NotYet
+        );
+        assert_eq!(
+            classify_put_response(&key(), &update_answer(other_key())),
+            PutAck::NotYet
+        );
+    }
+
+    /// And a notification is not a PUT acknowledgement, which is the whole
+    /// class this change exists for.
+    #[test]
+    fn a_notification_does_not_answer_the_put() {
+        assert_eq!(
+            classify_put_response(&key(), &notification()),
+            PutAck::NotYet
         );
     }
 
@@ -10908,9 +11247,9 @@ mod authorize_send_tests {
 
     /// Production source, plus any structural problems found while separating
     /// it from test code.
-    struct Production {
-        source: String,
-        problems: Vec<String>,
+    pub(super) struct Production {
+        pub(super) source: String,
+        pub(super) problems: Vec<String>,
     }
 
     /// `src` with every `#[cfg(test)]` item removed, so a source pin scans
@@ -10940,7 +11279,7 @@ mod authorize_send_tests {
     /// So: lex past comments, normal strings, raw strings and char literals,
     /// tracking `{}`/`[]`/`()` depth, and end the item at its matching `}` or
     /// its top-level `;`.
-    fn production_source(src: &str) -> Production {
+    pub(super) fn production_source(src: &str) -> Production {
         let mut out = String::new();
         let mut problems = Vec::new();
         let mut rest = src;
@@ -11095,7 +11434,7 @@ mod authorize_send_tests {
     /// an INLINE block comment (`/* authorize_send(..)?; */` mid-line) would
     /// still match. Scoping the search to the send path (below) is what makes
     /// that a narrow gap rather than an open door.
-    fn strip_comment_lines(src: &str) -> String {
+    pub(super) fn strip_comment_lines(src: &str) -> String {
         let mut out: Vec<&str> = Vec::new();
         let mut in_block = false;
         for line in src.lines() {
@@ -11127,14 +11466,14 @@ mod authorize_send_tests {
     /// occurrence of the call, so lifting the guard out of the send path into
     /// an unrelated sibling left the pin green while `send_message_with_key`
     /// ran unguarded.
-    fn method_body<'a>(src: &'a str, signature: &str) -> Option<&'a str> {
+    pub(super) fn method_body<'a>(src: &'a str, signature: &str) -> Option<&'a str> {
         let start = src.find(signature)?;
         let rest = &src[start..];
         let end = rest.find("\n    }")?;
         Some(&rest[..end])
     }
 
-    fn squash(s: &str) -> String {
+    pub(super) fn squash(s: &str) -> String {
         s.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
@@ -11591,5 +11930,828 @@ pub(crate) fn unseal_nickname_display(",
              found {arms_checked} -- the pin may be scanning the wrong \
              region and would pass vacuously"
         );
+    }
+}
+
+/// The response-multiplexing pin.
+///
+/// The defect this exists for is not any one call site. riverctl and the node
+/// share one WebSocket connection and the node multiplexes every response onto
+/// it, so a response that is not the answer to the request just sent can arrive
+/// first. `send_message_with_key` was the FOURTH call site found taking that
+/// first message as its answer, and each of the three earlier fixes was written
+/// at one site and left every other site doing the old thing. Nothing said how
+/// many sites there were, so the class kept coming back.
+///
+/// So this pin binds the CLASS rather than any one site, in four directions:
+///
+///   1. every path in [`UPDATE_SEND_PATHS`] waits for its answer through
+///      `await_update_response`, searched in that function's own body. That is
+///      seven of the eight production sends, not all of them:
+///      `accept_invitation_struct`'s join delta still reads raw and is
+///      freenet/river#690's;
+///   2. the number of `ContractRequest::Update` sends is accounted for;
+///   3. the number of `.recv()` calls is accounted for;
+///   4. the number of times the connection lock is TAKEN is accounted for.
+///
+/// Checks 2 to 4 count occurrences of a string in the production source. They
+/// are tripwires, not proofs, and the difference is worth being exact about
+/// because an earlier version of check 3 counted the literal `web_api.recv()`
+/// and a reviewer walked a new raw read straight past it by naming the guard
+/// something else. A count keyed on a caller-chosen name is a spelling ban
+/// wearing a count's clothes.
+///
+/// So: check 2 counts the spelling `ContractRequest::Update {`, and a send
+/// written as `Update { .. }` after a `use` import, or built by a shared
+/// helper, is invisible to it. Check 4 is the backstop for exactly that.
+/// `self.web_api` is private to this file and taking the lock is the only way
+/// to reach the connection at all, so a new site must appear there whether it
+/// reads, sends, or both.
+///
+/// Three residuals, stated rather than papered over:
+///   * the counts are NET. Converting one raw read to a waiter (a #690 fix)
+///     while adding a new raw read elsewhere leaves the total unchanged. The
+///     inventory below is prose, so nothing machine-checks WHICH site moved.
+///   * `strip_comment_lines` removes whole comment lines only, so a wait
+///     disabled with an inline `/* ... */` on a line that also carries live
+///     code still satisfies check 1. Inherited from the membership pin, which
+///     documents it; narrow because check 1 is scoped to each send path's body.
+///   * none of this says a classifier is CORRECT, only which code is routed
+///     through one. The classifiers are covered by `subscribe_handshake_tests`
+///     and the loop by `await_response_tests`.
+#[cfg(test)]
+mod response_multiplexing_pin {
+    use super::authorize_send_tests::{
+        method_body, production_source, squash, strip_comment_lines,
+    };
+
+    /// Every production `.recv()` on the shared connection.
+    ///
+    /// One of them IS the `ResponseSource` impl `await_response` reads through;
+    /// the other ten are sites the fix has not reached. All eleven are listed
+    /// rather than only the unreached ones, so the constant can be audited by
+    /// walking the list. Note a plain `grep -c` over the file does NOT give 11:
+    /// it also counts the meta-tests' own string literals, which the pin strips
+    /// with `production_source` before counting.
+    ///
+    /// Listed rather than merely counted, so that the number is auditable and
+    /// so that lowering it is a decision somebody made on purpose:
+    ///
+    ///  1. the `ResponseSource` impl `await_response` reads through: the one
+    ///     sanctioned reader.
+    ///  2. `NodePointerIo::get_pointer` -- already loops and steps over, but
+    ///     answers `PointerFetch::Unreachable` rather than an error, so it
+    ///     cannot use a waiter whose failure mode is `Result`.
+    ///  3. `subscribe_to_contract` -- already loops on `classify_subscribe_response`.
+    ///  4. the streaming monitor's subscribe loop -- same, and it QUEUES what it
+    ///     steps over instead of dropping it.
+    ///  5. the monitor loop's 500ms drain -- deliberately reads whatever is there.
+    ///  6. `create_room` -- freenet/river#690.
+    ///  7. `put_room_state` -- #690.
+    ///  8. `try_get_state` -- #690.
+    ///  9. `accept_invitation_struct`'s join delta -- #690.
+    /// 10. `ensure_room_migrated` -- #690.
+    /// 11. `migrate_room_to_new_contract` -- freenet/river#689.
+    ///
+    /// 6 through 11 are deliberately outside this change, but NOT all for the
+    /// same reason, and an earlier version of this comment gave one reason for
+    /// all six.
+    ///
+    /// Four of them are TOLERANT: `put_room_state`, `try_get_state`, the join
+    /// delta and `ensure_room_migrated` fold an unrelated response into a
+    /// success or a "not found" rather than into an error, so fixing one
+    /// changes what counts as success. That is a different risk class from
+    /// stepping over a message that is not ours.
+    ///
+    /// The other two are FATAL, like the ten this change converted, and are
+    /// held back for their own reasons:
+    ///   * `create_room` errors on an unrelated response, and additionally
+    ///     reports "Contract key mismatch" for a notification carrying another
+    ///     key, which is the v0.2.135 failure shape and still live. Converting
+    ///     it means reconciling success arms that persist DIFFERENT things:
+    ///     the `PutResponse` arm stores invitation secrets
+    ///     (`add_room_with_invitation_secrets`) and the bare-`Ok` arm does not
+    ///     (`add_room`), so a room created down the second path silently loses
+    ///     them. That is a behaviour decision, not a mechanical conversion.
+    ///   * `migrate_room_to_new_contract` folds an `UpdateNotification` of ANY
+    ///     key into success and writes that key to local storage. That is data
+    ///     corruption rather than a tolerance bug, which is why it has its own
+    ///     issue (#689) rather than riding along here.
+    ///
+    /// Lowering this number is #690's job, and #689's.
+    const DIRECT_CONNECTION_READS: usize = 11;
+
+    /// Production references to the connection field, and locks taken on it.
+    ///
+    /// TWO counts, because one is not enough and the reason is worth writing
+    /// down. An earlier version of this pin counted only
+    /// `self.web_api.lock().await` and its comment claimed that was "the one
+    /// count not keyed on a caller-chosen name", on the grounds that the field
+    /// is private. Private is not the same as unaliasable: the field is an
+    /// `Arc<Mutex<WebApi>>`, so
+    ///
+    /// ```ignore
+    /// let api = self.web_api.clone();
+    /// let mut conn = api.lock().await;
+    /// ```
+    ///
+    /// reaches the connection under a name of the writer's choosing and was
+    /// invisible to all four checks. A reviewer defeated it that way, and the
+    /// file ALREADY contains the pattern: `NodePointerIo` holds
+    /// `&'a Arc<Mutex<WebApi>>` and is handed `&self.web_api` at its
+    /// construction site.
+    ///
+    /// So: every path to the connection has to NAME THE FIELD at least once,
+    /// which `FIELD_REFERENCES` counts, and has to TAKE THE LOCK, which
+    /// `CONNECTION_ACQUISITIONS` counts regardless of receiver. The Arc-clone
+    /// shape moves both.
+    ///
+    /// Measured against evasion shapes rather than argued. Planting each into
+    /// production source and running the live pin:
+    ///
+    /// | shape | caught by |
+    /// |---|---|
+    /// | cloned `Arc`, locked under another name | field, lock |
+    /// | `try_lock()`, no await at all | field ONLY |
+    /// | `tokio::sync::Mutex::lock(&self.web_api).await` | field, recv |
+    /// | helper accessor returning the `Arc`, two users | field, lock, recv |
+    ///
+    /// The `try_lock` row is why both counts run rather than whichever looks
+    /// stronger: it moves no lock count and no recv count, and the field count
+    /// is the only thing that sees it.
+    ///
+    /// Residual, since claiming completeness here is what went wrong twice
+    /// already: these are still string counts, and they are NET, so a
+    /// one-for-one swap passes. The check that would actually bind this is not
+    /// a count at all: make the raw connection unreachable by wrapping it in a
+    /// type whose only methods are the waiters. That is freenet/river#692.
+    const CONNECTION_ACQUISITIONS: usize = 20;
+
+    /// See [`CONNECTION_ACQUISITIONS`]. One higher than the lock count, because
+    /// `NodePointerIo` is handed a borrow of the field rather than locking it
+    /// at the construction site.
+    const FIELD_REFERENCES: usize = 21;
+
+    /// Production sends of a `ContractRequest::Update`: the seven routed
+    /// through `await_update_response` below, plus `accept_invitation_struct`'s
+    /// join delta, which is #690's.
+    const UPDATE_SENDS: usize = 8;
+
+    /// The three non-update paths this change converted, and the needle each
+    /// must still contain.
+    ///
+    /// `UPDATE_SEND_PATHS` below covers the seven update sends; these are the
+    /// PUT and the two GETs. Without them `republish_room` could be rewired to
+    /// `|_| Some(Ok(PutAck::Stored))`, accepting ANY response as a successful
+    /// republish, and every test would stay green: `classify_put_response` has
+    /// its own unit tests, but nothing said `republish_room` still calls it.
+    /// That is the same gap as the untested loop, one level along, and it is
+    /// the third time this shape has been found in this change.
+    const CLASSIFIER_WIRING: &[(&str, &str)] = &[
+        (
+            "pub async fn republish_room(",
+            "classify_put_response(&contract_key,",
+        ),
+        (
+            "async fn get_state_from_contract(",
+            "await_get_response(&mutweb_api,id,",
+        ),
+        (
+            "pub async fn accept_invitation_struct(",
+            "await_get_response(",
+        ),
+    ];
+
+    /// Every path that sends a contract update and must wait for the answer
+    /// through the shared waiter.
+    const UPDATE_SEND_PATHS: &[&str] = &[
+        "pub async fn send_message_with_key(",
+        "pub async fn send_message(",
+        "pub async fn send_state_delta(",
+        "    async fn send_delta(",
+        "pub async fn set_nickname(",
+        "pub async fn ban_member_with_safety(",
+        "pub async fn update_config(",
+    ];
+
+    /// Every multiplexing invariant `src` violates, empty when it is clean.
+    pub(super) fn response_multiplexing_violations(src: &str) -> Vec<String> {
+        let production = production_source(src);
+        let mut problems = production.problems;
+        let code = strip_comment_lines(&production.source);
+
+        // Anti-vacuity. If the stripper ever eats the waiters, or they are
+        // renamed, every check below would pass having scanned nothing.
+        // Anchors name the FUNCTION, never the shape of its signature: making
+        // the waiters generic turned `(` into `<`, and an anchor that had
+        // encoded the shape went red for a rename that never happened.
+        for anchor in [
+            "async fn await_response",
+            "async fn await_update_response",
+            "async fn await_get_response",
+            // The one sanctioned reader. Without it the count in check 3 could
+            // be satisfied by eleven UNSANCTIONED reads.
+            "impl ResponseSource for",
+        ] {
+            if !code.contains(anchor) {
+                problems.push(format!(
+                    "`{anchor}` is missing from the scanned production source, so \
+                     this pin would pass vacuously"
+                ));
+            }
+        }
+        // Returning early on purpose: if the anchors are gone the scan is
+        // broken, and checks 1 to 3 below would then report "clean" about
+        // source they never looked at. One loud problem beats three quiet
+        // passes.
+        if !problems.is_empty() {
+            return problems;
+        }
+
+        // 1. Each send path waits through the shared waiter, searched in that
+        //    function's own body: an unscoped search is satisfied by ANY
+        //    occurrence, so lifting the wait into a sibling would leave the pin
+        //    green while the send path read the connection raw.
+        for sig in UPDATE_SEND_PATHS {
+            match method_body(&code, sig) {
+                Some(body) => {
+                    if !squash(body).contains("await_update_response(&mutweb_api,&contract_key)") {
+                        problems.push(format!(
+                            "`{sig}` sends a contract update but does not await the \
+                             answer through `await_update_response`. Reading the \
+                             first message off the shared connection as the answer \
+                             is freenet-core#4970, and it is what broke the freenet \
+                             v0.2.135 release announcement."
+                        ));
+                    }
+                }
+                None => problems.push(format!(
+                    "could not isolate `{sig}`; re-check this pin against the \
+                     function's new shape."
+                )),
+            }
+        }
+
+        // 1b. The PUT and GET paths keep their wiring too. Same reasoning as
+        //     check 1: a classifier with unit tests proves nothing about a call
+        //     site that stopped calling it.
+        for (sig, needle) in CLASSIFIER_WIRING {
+            match method_body(&code, sig) {
+                Some(body) => {
+                    if !squash(body).contains(needle) {
+                        problems.push(format!(
+                            "`{sig}` no longer reaches the shared waiter through \
+                             `{needle}`. Its classifier's own unit tests would stay \
+                             green while the call site accepted anything."
+                        ));
+                    }
+                }
+                None => problems.push(format!(
+                    "could not isolate `{sig}`; re-check this pin against the \
+                     function's new shape."
+                )),
+            }
+        }
+
+        // 2. No unaccounted-for update send. Without this, a NEW send path
+        //    written the old way passes: check 1 only looks at the paths it
+        //    already knows about, which is exactly how this class survived
+        //    three previous fixes.
+        let sends = squash(&code).matches("ContractRequest::Update{").count();
+        if sends != UPDATE_SENDS {
+            problems.push(format!(
+                "expected exactly {UPDATE_SENDS} production sends of \
+                 `ContractRequest::Update`, found {sends}. A new send path must \
+                 either await its answer through `await_update_response` and be \
+                 added to UPDATE_SEND_PATHS, or be justified here."
+            ));
+        }
+
+        // 3. No unaccounted-for read of the connection.
+        //
+        //    Counts `.recv()` and NOT `web_api.recv()`. Binding the needle to
+        //    that one variable name would have made this a spelling ban rather
+        //    than a count, and a new call site that names its guard anything
+        //    else would have slipped straight past -- which is the exact hole
+        //    the membership pin above documents for its own scans, twenty lines
+        //    from where this was first written the wrong way.
+        //
+        //    Precisely: this counts EVERY `.recv()` in production `api.rs`, not
+        //    every read of the connection. Today they coincide, because the
+        //    only receiver in the file is the `WebApi` guard; add an mpsc
+        //    channel and this count moves for a reason that has nothing to do
+        //    with the connection, which is a false positive rather than a miss.
+        //    `try_recv()` does not contain `.recv()`, so the two
+        //    `shutdown_rx.try_recv()` calls are not counted.
+        let reads = squash(&code).matches(".recv()").count();
+        if reads != DIRECT_CONNECTION_READS {
+            problems.push(format!(
+                "expected exactly {DIRECT_CONNECTION_READS} production call sites \
+                 reading the shared connection directly, found {reads}. If you \
+                 added one, route it through `await_response` instead; if you \
+                 removed one (freenet/river#690), lower the constant and strike \
+                 it off the inventory."
+            ));
+        }
+
+        // 4. No unaccounted-for reach for the connection, counted at both
+        //    chokepoints every path has to pass: naming the field, and taking
+        //    the lock. Counting the lock ALONE misses nothing today but is
+        //    keyed on `self.web_api.lock()`; counting the field alone misses a
+        //    second lock on an alias already in scope. Together they move on
+        //    the Arc-clone shape that defeated the single-count version.
+        let sq_all = squash(&code);
+        let fields = sq_all.matches("self.web_api").count();
+        if fields != FIELD_REFERENCES {
+            problems.push(format!(
+                "expected exactly {FIELD_REFERENCES} production references to \
+                 `self.web_api`, found {fields}. Every path to the shared \
+                 connection names the field at least once, including one that \
+                 clones or borrows the `Arc` and locks it under another name."
+            ));
+        }
+        let locks = sq_all.matches(".lock().await").count();
+        if locks != CONNECTION_ACQUISITIONS {
+            problems.push(format!(
+                "expected exactly {CONNECTION_ACQUISITIONS} production acquisitions of \
+                 the connection lock, found {locks}. A new one means a new call \
+                 site: route its wait through `await_response` and update this \
+                 constant."
+            ));
+        }
+
+        problems
+    }
+
+    /// The live pin: production `api.rs` routes every wait through the waiters.
+    #[test]
+    fn api_source_routes_every_wait_through_a_shared_waiter() {
+        let problems = response_multiplexing_violations(include_str!("api.rs"));
+        assert!(problems.is_empty(), "{}", problems.join("\n\n"));
+    }
+
+    /// Apply a mutation to the real source, exactly once, failing loudly if it
+    /// does not apply: a mutation that silently no-ops looks exactly like a
+    /// working pin.
+    ///
+    /// `replacen(.., 1)` rather than `str::replace`: several of these targets
+    /// also occur inside the meta-tests' own string literals, so a replace-all
+    /// silently plants three copies where one was intended. Those extra copies
+    /// land inside this `#[cfg(test)]` module and are stripped before the pin
+    /// sees them, so it happened to work. "Happened to work" is the same family
+    /// of hazard as a mutation that silently no-ops.
+    fn mutate(from: &str, to: &str) -> String {
+        let src = include_str!("api.rs");
+        assert!(
+            src.contains(from),
+            "mutation target not found; this meta-test is stale:\n{from}"
+        );
+        src.replacen(from, to, 1)
+    }
+
+    fn assert_caught(mutated: &str, needle: &str, what: &str) {
+        let problems = response_multiplexing_violations(mutated);
+        // A mutation that breaks the SCAN rather than tripping the CHECK also
+        // produces problems, and would let every meta-test below pass while
+        // proving nothing. Reject both shapes explicitly: the anti-vacuity
+        // guard, and check 1 failing to locate a function at all (whose message
+        // a needle naming that function would otherwise match).
+        for broken in ["pass vacuously", "could not isolate"] {
+            assert!(
+                !problems.iter().any(|p| p.contains(broken)),
+                "{what}: the scan broke ({broken}) instead of the check firing: {problems:?}"
+            );
+        }
+        assert!(
+            problems.iter().any(|p| p.contains(needle)),
+            "{what} must be caught, got: {problems:?}"
+        );
+    }
+
+    /// The regression itself: a send path put back the way it was.
+    #[test]
+    fn pin_catches_a_send_path_reverting_to_a_direct_read() {
+        let mutated = mutate(
+            "        await_update_response(&mut web_api, &contract_key).await?;\n        info!(\n            \"Action sent successfully",
+            "        let _response = web_api.recv().await;\n        info!(\n            \"Action sent successfully",
+        );
+        assert_caught(
+            &mutated,
+            "async fn send_delta(",
+            "a send path that reads the connection directly",
+        );
+    }
+
+    /// Commenting the wait out IN PLACE must not satisfy the needle. This is
+    /// the shape that defeated an earlier version of the membership pin.
+    #[test]
+    fn pin_catches_a_commented_out_wait() {
+        let mutated = mutate(
+            "        await_update_response(&mut web_api, &contract_key).await?;\n        info!(\n            \"Configuration updated",
+            "        // await_update_response(&mut web_api, &contract_key).await?;\n        info!(\n            \"Configuration updated",
+        );
+        assert_caught(
+            &mutated,
+            "pub async fn update_config(",
+            "a commented-out wait",
+        );
+    }
+
+    /// A brand-new call site reading the connection raw: the failure that
+    /// survived three earlier fixes, and the reason this pin counts.
+    ///
+    /// The planted read binds the guard to `conn`, NOT to `web_api`, on
+    /// purpose. An earlier version of check 3 searched for the literal
+    /// `web_api.recv()`, so this exact mutation walked straight through it
+    /// while the pin reported clean. A spelling ban is not a count.
+    #[test]
+    fn pin_catches_a_new_direct_read_under_a_different_variable_name() {
+        let mutated = mutate(
+            "        let state = await_get_response(&mut web_api, id, GET_STATE_TIMEOUT).await?;",
+            "        let mut conn = self.web_api.lock().await;\n        let _ = conn.recv().await;\n        let state = await_get_response(&mut web_api, id, GET_STATE_TIMEOUT).await?;",
+        );
+        assert_caught(
+            &mutated,
+            "found 12",
+            "a newly-added direct read whose guard is not called `web_api`",
+        );
+    }
+
+    /// A brand-new update send that never waits for its answer.
+    #[test]
+    fn pin_catches_a_new_update_send() {
+        let mutated = mutate(
+            "    /// Republish a room contract to the network",
+            "    async fn nudge(&self, contract_key: ContractKey) {\n        let _ = ContractRequest::Update {\n            key: contract_key,\n            data: (),\n        };\n    }\n\n    /// Republish a room contract to the network",
+        );
+        assert_caught(&mutated, "found 9", "a newly-added update send");
+    }
+
+    /// A new call site that only SENDS never trips checks 1 to 3: it awaits
+    /// nothing, so there is no missing waiter, no `.recv()` and no
+    /// `ContractRequest::Update`. Check 4 is the only thing that sees it.
+    #[test]
+    fn pin_catches_a_new_send_only_call_site() {
+        let mutated = mutate(
+            "    /// Republish a room contract to the network",
+            "    async fn poke(&self) {\n        let mut conn = self.web_api.lock().await;\n        let _ = conn.send(ClientRequest::Disconnect { cause: None }).await;\n    }\n\n    /// Republish a room contract to the network",
+        );
+        assert_caught(
+            &mutated,
+            "found 21",
+            "a new call site that takes the connection lock",
+        );
+    }
+
+    /// `republish_room` rewired to accept ANY response as a successful
+    /// republish. This is the reviewer's mutation verbatim: before check 1b it
+    /// left 383 of 383 green, because `classify_put_response` has its own unit
+    /// tests and nothing said the call site still called it.
+    #[test]
+    fn pin_catches_a_put_path_that_stops_consulting_its_classifier() {
+        let mutated = mutate(
+            "            |response| match classify_put_response(&contract_key, response) {\n                PutAck::NotYet => None,\n                answered => Some(Ok(answered)),\n            },",
+            "            |_| Some(Ok(PutAck::Stored)),",
+        );
+        assert_caught(
+            &mutated,
+            "no longer reaches the shared waiter",
+            "a PUT path that accepts any response",
+        );
+    }
+
+    /// The shape that defeated the single-count version of check 4: clone the
+    /// `Arc` and lock it under a name of your choosing. This is the reviewer's
+    /// probe verbatim, and it sends AND reads raw, which is exactly what the
+    /// pin exists to catch.
+    #[test]
+    fn pin_catches_a_call_site_reached_through_a_cloned_arc() {
+        let mutated = mutate(
+            "    /// Republish a room contract to the network",
+            "    async fn sneak(&self, contract_key: ContractKey) {\n        let api = self.web_api.clone();\n        let mut conn = api.lock().await;\n        let _ = conn.send(ClientRequest::ContractOp(ContractRequest::Get {\n            key: *contract_key.id(),\n            return_contract_code: false,\n            subscribe: false,\n            blocking_subscribe: false,\n        })).await;\n        let _ = conn.recv().await;\n    }\n\n    /// Republish a room contract to the network",
+        );
+        let problems = response_multiplexing_violations(&mutated);
+        assert!(
+            !problems.iter().any(|p| p.contains("pass vacuously")),
+            "the scan broke instead of the check firing: {problems:?}"
+        );
+        // Both chokepoints must move: the field is named once more, and the
+        // lock is taken once more under a different receiver.
+        assert!(
+            problems.iter().any(|p| p.contains("references to")),
+            "the extra `self.web_api` reference must be counted, got: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("acquisitions of")),
+            "the lock taken under another name must be counted, got: {problems:?}"
+        );
+    }
+
+    /// And the anti-vacuity guard itself has to bite, or a rename silently
+    /// turns every check above into a no-op.
+    #[test]
+    fn pin_catches_the_waiter_disappearing() {
+        let mutated = mutate(
+            "async fn await_update_response",
+            "async fn await_update_resp",
+        );
+        // Deliberately NOT `assert_caught`, which rejects "pass vacuously" as a
+        // broken scan. Here a broken scan is exactly the expected outcome, and
+        // the point is that it is reported rather than passed over.
+        let problems = response_multiplexing_violations(&mutated);
+        assert!(
+            problems.iter().any(|p| p.contains("pass vacuously")),
+            "renaming the waiter away must be reported as a vacuous scan, got: {problems:?}"
+        );
+    }
+}
+
+/// Tests for the WAIT ITSELF, as distinct from the classifiers it calls.
+///
+/// This module exists because of a gap found in review, and the gap is worth
+/// recording because the fix had already been through one full review round
+/// without it being spotted. The classifier tests in `subscribe_handshake_tests`
+/// bind the PREDICATE. `response_multiplexing_pin` binds the ROUTING, which call
+/// sites go through a waiter. Nothing bound the LOOP joining them, and the loop
+/// is where the v0.2.135 defect actually lived: replacing `await_response`'s
+/// step-over arm with the old `return Err(anyhow!("Unexpected response type"))`
+/// left all 368 tests green while undoing the entire point of the change.
+///
+/// Consolidating ten call sites into one waiter made that WORSE rather than
+/// better. The bug went from having ten places to live to having one, and that
+/// one place was as unguarded as the ten had been, so a single line could
+/// reinstate it everywhere at once.
+///
+/// These run against a scripted connection through the [`ResponseSource`] seam,
+/// under `start_paused` virtual time: no socket, no node, no real clock.
+#[cfg(test)]
+mod await_response_tests {
+    use super::subscribe_handshake_tests::{key, notification, other_key, update_answer};
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// A connection that hands back a scripted sequence and then goes quiet.
+    ///
+    /// `gap` is how much time passes before each response arrives, which is
+    /// what lets a test tell a single whole-wait deadline apart from one that
+    /// restarts per message.
+    struct Scripted {
+        /// Each entry is how long the response takes to arrive, and the
+        /// response. Per-entry rather than one rate, so a test can put a
+        /// zero-latency message immediately AFTER the deadline has passed.
+        responses: VecDeque<(Duration, std::result::Result<HostResponse, ClientError>)>,
+        reads: usize,
+    }
+
+    impl Scripted {
+        /// Responses that all arrive instantly.
+        fn new(responses: Vec<std::result::Result<HostResponse, ClientError>>) -> Self {
+            Self {
+                responses: responses.into_iter().map(|r| (Duration::ZERO, r)).collect(),
+                reads: 0,
+            }
+        }
+
+        /// The same responses, each `gap` after the last.
+        fn with_gap(mut self, gap: Duration) -> Self {
+            for entry in &mut self.responses {
+                entry.0 = gap;
+            }
+            self
+        }
+
+        /// Responses with individually chosen arrival delays.
+        fn timed(
+            responses: Vec<(Duration, std::result::Result<HostResponse, ClientError>)>,
+        ) -> Self {
+            Self {
+                responses: responses.into(),
+                reads: 0,
+            }
+        }
+    }
+
+    impl ResponseSource for Scripted {
+        async fn next_response(&mut self) -> std::result::Result<HostResponse, ClientError> {
+            match self.responses.pop_front() {
+                Some((gap, r)) => {
+                    if !gap.is_zero() {
+                        tokio::time::sleep(gap).await;
+                    }
+                    self.reads += 1;
+                    r
+                }
+                // Silence, so the deadline is what ends the wait.
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// THE v0.2.135 REGRESSION, end to end. A notification for a room we are
+    /// already subscribed to lands between our update and its answer. The send
+    /// must still succeed, and the notification must actually have been read
+    /// and stepped over rather than never delivered.
+    #[tokio::test(start_paused = true)]
+    async fn a_notification_arriving_first_does_not_fail_the_send() {
+        let mut conn = Scripted::new(vec![Ok(notification()), Ok(update_answer(key()))]);
+        await_update_response(&mut conn, &key())
+            .await
+            .expect("a notification overtaking our UpdateResponse must be stepped over");
+        assert_eq!(
+            conn.reads, 2,
+            "the notification must be READ and stepped over, not skipped by luck"
+        );
+    }
+
+    /// And it must keep stepping, rather than step over exactly one.
+    #[tokio::test(start_paused = true)]
+    async fn several_unrelated_responses_are_all_stepped_over() {
+        let mut conn = Scripted::new(vec![
+            Ok(notification()),
+            Ok(HostResponse::Ok),
+            Ok(notification()),
+            Ok(update_answer(key())),
+        ]);
+        await_update_response(&mut conn, &key()).await.unwrap();
+        assert_eq!(conn.reads, 4);
+    }
+
+    /// Silence ends at the deadline rather than hanging, and not before it.
+    #[tokio::test(start_paused = true)]
+    async fn silence_ends_at_the_deadline() {
+        let start = tokio::time::Instant::now();
+        let mut conn = Scripted::new(vec![Ok(notification())]);
+        let err = await_update_response(&mut conn, &key()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Timeout waiting for update response"),
+            "{err}"
+        );
+        assert!(
+            start.elapsed() >= UPDATE_RESPONSE_TIMEOUT,
+            "gave up early, after {:?}",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed() < UPDATE_RESPONSE_TIMEOUT + Duration::from_secs(1),
+            "waited {:?}, well past one timeout: the deadline is wrong",
+            start.elapsed()
+        );
+    }
+
+    /// A chatty subscription must not extend the budget one message at a time.
+    ///
+    /// Twenty notifications ten seconds apart against a sixty-second budget: with
+    /// ONE deadline for the whole wait this gives up at sixty seconds having read
+    /// about six. If the deadline were recomputed per message it would read all
+    /// twenty first, which is what the elapsed-time bound catches.
+    #[tokio::test(start_paused = true)]
+    async fn stepping_over_does_not_restart_the_clock() {
+        let start = tokio::time::Instant::now();
+        let mut conn = Scripted::new((0..20).map(|_| Ok(notification())).collect())
+            .with_gap(Duration::from_secs(10));
+        let err = await_update_response(&mut conn, &key()).await.unwrap_err();
+        assert!(err.to_string().contains("Timeout"), "{err}");
+        assert!(
+            start.elapsed() <= UPDATE_RESPONSE_TIMEOUT + Duration::from_secs(10),
+            "the wait ran {:?}, so the clock restarted per message",
+            start.elapsed()
+        );
+        assert!(
+            conn.reads <= 7,
+            "read {} responses inside a 60s budget at 10s apart; the clock restarted",
+            conn.reads
+        );
+    }
+
+    /// Once the deadline has passed, nothing more is read.
+    ///
+    /// This binds the `remaining.is_zero()` guard, which is easy to read as
+    /// belt-and-braces and is not: `tokio::time::timeout` polls the inner
+    /// future BEFORE checking its own deadline, so with zero remaining an
+    /// immediately-available response is returned rather than timed out. Drop
+    /// the guard and the loop goes on consuming and classifying messages after
+    /// it has given up, for as long as they keep arriving with no delay.
+    ///
+    /// Two responses thirty seconds apart use up the sixty-second budget
+    /// exactly; the third is waiting with no delay at all. It must not be read.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_read_after_the_deadline_passes() {
+        let half = UPDATE_RESPONSE_TIMEOUT / 2;
+        let mut conn = Scripted::timed(vec![
+            (half, Ok(notification())),
+            (half, Ok(notification())),
+            (Duration::ZERO, Ok(notification())),
+            (Duration::ZERO, Ok(update_answer(key()))),
+        ]);
+        let outcome = await_update_response(&mut conn, &key()).await;
+        // NOT `unwrap_err()`: under the mutation this guard exists to catch,
+        // the wait SUCCEEDS by consuming the responses queued past its
+        // deadline, and `unwrap_err` would panic with its own message instead
+        // of the one written here to explain what went wrong.
+        assert!(
+            outcome.is_err(),
+            "the wait consumed a response queued past its deadline and reported \
+             success; the `remaining.is_zero()` guard is what stops that"
+        );
+        assert_eq!(
+            conn.reads, 2,
+            "read {} responses; the wait kept going after its deadline",
+            conn.reads
+        );
+    }
+
+    /// A transport error is an answer too: stop, do not wait it out.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_error_stops_the_wait() {
+        let start = tokio::time::Instant::now();
+        let mut conn = Scripted::new(vec![Err(ClientError::from("socket died"))]);
+        let err = await_update_response(&mut conn, &key()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to receive response"),
+            "{err}"
+        );
+        assert!(
+            start.elapsed() < UPDATE_RESPONSE_TIMEOUT,
+            "a dead socket must not cost the full timeout"
+        );
+    }
+
+    /// A `NotFound` is a definitive answer. This is the `Some(Err(_))` outcome,
+    /// and the whole reason the classifier reports three things rather than two:
+    /// stepped over, this would surface as a timeout instead of as what the node
+    /// said, thirty seconds later.
+    #[tokio::test(start_paused = true)]
+    async fn a_not_found_is_reported_rather_than_waited_out() {
+        let start = tokio::time::Instant::now();
+        let id = *key().id();
+        let mut conn = Scripted::new(vec![
+            Ok(notification()),
+            Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                instance_id: id,
+            })),
+        ]);
+        let err = await_get_response(&mut conn, id, GET_STATE_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("could not find contract"), "{err}");
+        assert!(
+            start.elapsed() < GET_STATE_TIMEOUT,
+            "a NotFound must be reported when it arrives, not waited out"
+        );
+    }
+
+    /// The GET waiter must not take somebody else's `GetResponse`. Without the
+    /// key guard this returns the WRONG ROOM'S STATE, which is worse than the
+    /// failure the change set out to fix.
+    #[tokio::test(start_paused = true)]
+    async fn a_get_response_for_another_contract_does_not_answer_ours() {
+        let ours = *key().id();
+        let theirs = *other_key().id();
+        let mut conn = Scripted::new(vec![
+            Ok(HostResponse::ContractResponse(
+                ContractResponse::GetResponse {
+                    key: other_key(),
+                    contract: None,
+                    state: WrappedState::new(b"someone else's room".to_vec()),
+                },
+            )),
+            Ok(HostResponse::ContractResponse(
+                ContractResponse::GetResponse {
+                    key: key(),
+                    contract: None,
+                    state: WrappedState::new(b"ours".to_vec()),
+                },
+            )),
+        ]);
+        assert_ne!(ours, theirs);
+        let state = await_get_response(&mut conn, ours, GET_STATE_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(
+            &state[..],
+            b"ours",
+            "the GET returned another contract's state"
+        );
+    }
+
+    /// The diagnostic the step-over would otherwise erase: stepping over is
+    /// logged at `debug!`, and riverctl logs nothing by default, so a failed
+    /// wait has to say for itself that the node WAS talking.
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_says_what_it_stepped_over() {
+        let mut conn = Scripted::new(vec![Ok(notification()), Ok(notification())]);
+        let err = await_update_response(&mut conn, &key()).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("stepped over 2 response(s)"), "{text}");
+        assert!(text.contains("UpdateNotification"), "{text}");
+    }
+
+    /// And when the node really did say nothing, it says that instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_on_silence_says_the_node_sent_nothing() {
+        let mut conn = Scripted::new(vec![]);
+        let err = await_update_response(&mut conn, &key()).await.unwrap_err();
+        assert!(err.to_string().contains("the node sent nothing"), "{err}");
     }
 }
