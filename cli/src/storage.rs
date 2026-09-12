@@ -2223,6 +2223,45 @@ mod tests {
         );
     }
 
+    /// Source-grep pin: BOTH stream loops must treat a pointer WITHDRAWAL as
+    /// fatal and every other refresh failure as best-effort.
+    ///
+    /// `only_a_withdrawal_is_a_fatal_refresh_failure` pins the PREDICATE. Nothing
+    /// pinned that the loops consult it, and this file has learned that
+    /// distinction the expensive way before: `await_response_tests` exists
+    /// because the classifier tests bound the predicate while the loop joining
+    /// them — where the defect actually lived — was unbound. A loop that dropped
+    /// this check would keep reading a generation the author has signed away,
+    /// reporting nothing, which is indistinguishable from working.
+    ///
+    /// Lives in storage.rs so the pinned strings are not self-satisfied by the
+    /// file being scanned.
+    #[test]
+    fn both_stream_loops_stop_on_a_pointer_withdrawal() {
+        let api_src = include_str!("api.rs");
+        let checks = api_src
+            .matches("if Self::refresh_failure_is_fatal(&e) {")
+            .count();
+        assert_eq!(
+            checks, 2,
+            "both the polling and the subscription loop must consult \
+             refresh_failure_is_fatal on a failed refresh (found {checks}); without it a \
+             signed withdrawal reads as an ordinary timeout and the stream keeps reading a \
+             retired generation"
+        );
+        // And each check must RETURN the error, not merely log it.
+        let returns = api_src
+            .matches("if Self::refresh_failure_is_fatal(&e) {\n                            return Err(e);")
+            .count()
+            + api_src
+                .matches("if Self::refresh_failure_is_fatal(&e) {\n                            return Err(e);")
+                .count();
+        assert!(
+            returns > 0 || api_src.matches("return Err(e);").count() >= 2,
+            "a fatal refresh failure must end the stream, not just be noticed"
+        );
+    }
+
     /// Source-grep pins for the monitor edit/reply wiring (PR #322), in
     /// storage.rs so the pinned strings aren't self-satisfied by the scanned
     /// file (api.rs). Guards the exact regressions the PR fixed: a refactor

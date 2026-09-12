@@ -152,16 +152,18 @@ impl PointerIo for NodePointerIo<'_> {
         }
         // Falling out of the loop means the answer never arrived: either the
         // deadline passed or `MAX_UNRELATED_RESPONSES_DURING_POINTER_GET` frames
-        // were stepped over first. On a busy room the second is reachable, and
-        // it is the one path where a re-key can be missed for a whole refresh
-        // cycle with nothing an operator can see — the advisory says nothing,
-        // because the anchor did not change. So say it here rather than leaving
-        // it to a `debug!` that release builds drop.
-        warn!(
-            "Could not read River's room-contract pointer this cycle (no answer within \
-             {POINTER_GET_TIMEOUT:?}, after stepping over up to \
-             {MAX_UNRELATED_RESPONSES_DURING_POINTER_GET} unrelated responses); \
-             continuing on the generation already in use and retrying next cycle"
+        // were stepped over first. On a busy room the second is reachable.
+        //
+        // Logged at `debug!` and no higher, deliberately. `resolve_app_pointer`
+        // calls this up to twice per resolution, so anything louder would
+        // double-report; and the operator-facing consequence — that this run
+        // could not confirm its generation — is what `AnchorSource::Unverified`
+        // carries to `announce_anchor`, which reaches stderr. Raising the level
+        // here would not help anyway: riverctl's `EnvFilter` has no default
+        // directive, so with `RUST_LOG` unset NOTHING is emitted at any level.
+        debug!(
+            "Pointer GET produced no answer within {POINTER_GET_TIMEOUT:?} (after stepping over \
+             up to {MAX_UNRELATED_RESPONSES_DURING_POINTER_GET} unrelated responses)"
         );
 
         // NEVER `PointerFetch::Absent`. `Absent` is the only answer that can
@@ -693,6 +695,120 @@ pub(crate) enum SubscribeAck {
     Refused,
     /// Not the acknowledgement — keep waiting, and do not discard this.
     NotYet,
+}
+
+/// A piece of stream work that is armed, then retried on a cadence until it
+/// succeeds.
+///
+/// Both of a stream's deferred jobs have this shape: the catch-up fetch and the
+/// mid-run re-SUBSCRIBE. Each was a `bool` plus an `Option<Instant>` held side by
+/// side in the loop, which made two wrong states representable — armed with no
+/// cadence, and a stale timestamp left behind after a success — and left the
+/// cadence logic with nowhere to be tested. Both defects this PR had to fix in
+/// review were in exactly this bookkeeping: a job that cleared itself without
+/// covering the window it existed to cover, and one that retried on the loop's
+/// 500ms tick instead of its own interval.
+///
+/// `Instant` is passed in rather than read from the clock so every transition is
+/// testable without sleeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Retry {
+    /// `None` = nothing to do. `Some(None)` = armed, never attempted, so the
+    /// next attempt is immediate. `Some(Some(t))` = armed, last attempted at `t`.
+    state: Option<Option<std::time::Instant>>,
+    /// Consecutive attempts that have not succeeded, used to widen the gap.
+    failures: u32,
+}
+
+/// How far a [`Retry`]'s interval may be widened by repeated failure.
+///
+/// A catch-up that keeps failing is usually a node that does not hold the
+/// generation yet, and each attempt is a full-state GET plus, on a miss, a sweep
+/// of every legacy generation. Retrying that at a fixed cadence turns one
+/// unlucky moment into a sustained load from every bot at once; doubling up to
+/// this cap keeps the first few retries prompt and the rest cheap.
+const RETRY_MAX_BACKOFF_MULTIPLIER: u32 = 16;
+
+impl Retry {
+    /// Arm the work, with the next attempt due immediately.
+    ///
+    /// Deliberately resets the cadence: re-arming means something new happened
+    /// (a re-key, a fresh refresh), and making that wait out the previous
+    /// failure's backoff would delay the very work the new event asked for.
+    fn arm(&mut self) {
+        self.state = Some(None);
+        self.failures = 0;
+    }
+
+    /// Whether an attempt should run now: armed, and either never attempted or
+    /// last attempted at least `interval` ago.
+    fn due(&self, now: std::time::Instant, interval: std::time::Duration) -> bool {
+        match self.state {
+            None => false,
+            Some(None) => true,
+            Some(Some(last)) => now.duration_since(last) >= self.backoff(interval),
+        }
+    }
+
+    /// `interval`, doubled once per consecutive failure, capped.
+    fn backoff(&self, interval: std::time::Duration) -> std::time::Duration {
+        let multiplier = 1u32
+            .checked_shl(self.failures.saturating_sub(1))
+            .unwrap_or(RETRY_MAX_BACKOFF_MULTIPLIER)
+            .min(RETRY_MAX_BACKOFF_MULTIPLIER);
+        interval.saturating_mul(multiplier.max(1))
+    }
+
+    /// Record that an attempt is being made now. Leaves the work armed — only
+    /// [`Self::succeeded`] disarms it, which is what makes a transient failure
+    /// retry instead of being forgotten.
+    fn attempted(&mut self, now: std::time::Instant) {
+        if self.state.is_some() {
+            self.state = Some(Some(now));
+            self.failures = self.failures.saturating_add(1);
+        }
+    }
+
+    /// Record success: disarm, and drop the cadence so a later re-arm is
+    /// immediate rather than shadowed by this attempt's timestamp.
+    fn succeeded(&mut self) {
+        self.state = None;
+        self.failures = 0;
+    }
+}
+
+/// The higher of a remembered floor and the one just read from disk.
+///
+/// Pure so the rule is testable without a node or a filesystem. "Higher" is by
+/// version, except that at EQUAL versions a withdrawal wins: a tombstone is the
+/// author saying there is no current code, and dropping it because a
+/// non-withdrawn record shares its version would resurrect exactly what was
+/// retired.
+pub(crate) fn highest_floor(
+    remembered: Option<PointerFloor>,
+    on_disk: PointerFloor,
+) -> PointerFloor {
+    match remembered {
+        Some(mem) if mem.version() > on_disk.version() => mem,
+        Some(mem) if mem.version() == on_disk.version() && mem.is_withdrawn() => mem,
+        _ => on_disk,
+    }
+}
+
+/// Whether a legacy-recovery fetch may republish what it recovered.
+///
+/// Recovering older state and PUTting it onto the current generation is the
+/// point of recovery for a command a user invoked. It is not the point for a
+/// long-running stream's repeated fetch, which must be able to READ state the
+/// current generation does not hold yet — that is what makes a catch-up
+/// straight after a re-key return anything at all — while neither publishing on
+/// a timer nor blocking on the PUT's 60-second timeout to do it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryWrites {
+    /// A user-invoked command: republish the recovered state forward.
+    Allowed,
+    /// A repeated stream fetch: return the recovered state, publish nothing.
+    Suppressed,
 }
 
 /// Cap on responses buffered while awaiting the SUBSCRIBE acknowledgement.
@@ -2515,6 +2631,25 @@ pub struct ApiClient {
     /// that was live when it started (freenet/river#694). One-shot commands are
     /// unaffected — they resolve once and never refresh, exactly as before.
     room_anchor: tokio::sync::RwLock<Option<RoomAnchor>>,
+    /// The highest anti-rollback floor this PROCESS has verified.
+    ///
+    /// The floor's job is to make a validly-signed OLDER record unusable, and
+    /// until now it was read fresh from disk on every resolution. That is fine
+    /// when resolution happens once. It is not fine once a stream re-resolves on
+    /// a timer, because persisting the floor is best-effort (`save_pointer_floor`
+    /// warns and continues — a read-only config directory is enough): the cache
+    /// could hold a record at version 10 while the next refresh reloads an older
+    /// or absent on-disk floor, and a peer serving a genuine version 9 would then
+    /// resolve as `AnchorSource::Pointer` and be accepted, moving the stream back
+    /// onto the generation the author had already superseded.
+    ///
+    /// **A signature establishes authenticity, not freshness.** This field is
+    /// what supplies freshness when the disk cannot.
+    /// A `std::sync::Mutex` and never held across an await: the critical sections
+    /// are one copy and one assignment. An async mutex here would add a third
+    /// lock to the ordering story for no benefit, and would be counted by the
+    /// connection-acquisition pin as if it were a reach for the shared socket.
+    pointer_floor: std::sync::Mutex<Option<PointerFloor>>,
 }
 
 impl ApiClient {
@@ -2557,7 +2692,24 @@ impl ApiClient {
             config,
             storage,
             room_anchor: tokio::sync::RwLock::new(None),
+            pointer_floor: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The highest floor this process has verified, if any.
+    fn remembered_floor(&self) -> Option<PointerFloor> {
+        *self
+            .pointer_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Record `floor` as verified by this process.
+    fn remember_floor(&self, floor: PointerFloor) {
+        *self
+            .pointer_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(floor);
     }
 
     /// River's room-contract generation for this run, resolved once.
@@ -2579,9 +2731,22 @@ impl ApiClient {
         if let Some(anchor) = slot.clone() {
             return Ok(anchor);
         }
-        let anchor = self.resolve_room_anchor(None).await?;
+        let anchor = self.resolve_room_anchor().await?;
+        Self::announce_anchor(&anchor, None);
         self.install_room_anchor(&mut slot, anchor.clone());
         Ok(anchor)
+    }
+
+    /// Say, once, what the operator needs to know about the generation now in
+    /// force — on stderr, so it survives a pipeline whose stdout is parsed.
+    ///
+    /// stderr rather than `warn!` on purpose: riverctl's `EnvFilter` has no
+    /// default directive, so with `RUST_LOG` unset the log macros emit NOTHING.
+    /// A line that exists to be read by a human cannot go through them.
+    fn announce_anchor(anchor: &RoomAnchor, previous: Option<&RoomAnchor>) {
+        if let Some(advisory) = crate::pointer::advisory_after(anchor, previous) {
+            eprintln!("{advisory}");
+        }
     }
 
     /// Install `anchor` as this run's generation: cache it, and point the local
@@ -2636,7 +2801,7 @@ impl ApiClient {
     pub async fn refresh_room_anchor(&self) -> Result<AnchorRefresh> {
         let mut slot = self.room_anchor.write().await;
         let previous = slot.clone();
-        let resolved = self.resolve_room_anchor(previous.as_ref()).await?;
+        let resolved = self.resolve_room_anchor().await?;
 
         // Only a signature-verified record may move this run off a generation it
         // is already using, and the gate is on the INSTALL rather than only on
@@ -2644,17 +2809,22 @@ impl ApiClient {
         let accepted = match crate::pointer::decide_refresh(previous.as_ref(), resolved) {
             crate::pointer::RefreshDecision::Accept(anchor) => anchor,
             crate::pointer::RefreshDecision::Decline { keep, rejected } => {
-                warn!(
-                    "Keeping room-contract generation {} : an unverified re-check named {} \
-                     instead ({:?}), which is not evidence enough to move off a generation \
-                     already in use",
-                    crate::pointer::code_hash_b58(keep.code_hash()),
-                    crate::pointer::code_hash_b58(rejected.code_hash()),
-                    rejected.source(),
-                );
+                // stderr, not `warn!` — see `announce_anchor`. And said only when
+                // the decision CHANGES, so a pointer that stays unreachable does
+                // not reprint this every few minutes.
+                if previous.as_ref().map(|p| p.source()) != Some(keep.source()) {
+                    eprintln!(
+                        "note: keeping room-contract generation {}. An unverified re-check named \
+                         {} instead, which is not evidence enough to move off a generation \
+                         already in use.",
+                        crate::pointer::code_hash_b58(keep.code_hash()),
+                        crate::pointer::code_hash_b58(rejected.code_hash()),
+                    );
+                }
                 keep
             }
         };
+        Self::announce_anchor(&accepted, previous.as_ref());
 
         self.install_room_anchor(&mut slot, accepted.clone());
         Ok(AnchorRefresh::new(accepted, previous))
@@ -2663,13 +2833,13 @@ impl ApiClient {
     /// Resolve River's room-contract pointer, persist the anti-rollback floor,
     /// and announce anything the user needs to know.
     ///
-    /// `previous` is the anchor this run was already using, when there is one.
-    /// It exists solely to suppress a repeat of an advisory the user has already
-    /// been shown: a refresh runs every few minutes, and re-printing the same
-    /// "could not verify" warning on each one would train them to ignore it —
-    /// the same reasoning that makes the advisory once-per-run rather than
-    /// once-per-key.
-    async fn resolve_room_anchor(&self, previous: Option<&RoomAnchor>) -> Result<RoomAnchor> {
+    async fn resolve_room_anchor(&self) -> Result<RoomAnchor> {
+        // NOTE: this function does not ANNOUNCE anything. The advisory describes
+        // the generation a run is using, and a refresh can decline the anchor it
+        // just resolved (see `decide_refresh`) — announcing here printed
+        // "Continuing with generation X" naming a hash that was about to be
+        // rejected, i.e. a statement that was simply false. The announcement
+        // belongs with the decision, so both callers make it after deciding.
         let bundled = bundled_room_code_hash();
         let author_vk = river_author_vk()?;
         let key = floor_key(&author_vk, ROOM_CONTRACT_APP_ID);
@@ -2678,12 +2848,18 @@ impl ApiClient {
         // `StoredFloor::to_floor`: `never_resolved` is the one state that
         // re-enables the build-time key, so "recovering" into it is the
         // downgrade the floor exists to prevent.
-        let floor = match self.storage.load_pointer_floor(&key)? {
+        let on_disk = match self.storage.load_pointer_floor(&key)? {
             Some(stored) => stored.to_floor().with_context(|| {
                 crate::pointer::floor_corruption_hint(self.storage.pointer_floors_path())
             })?,
             None => PointerFloor::never_resolved(),
         };
+
+        // Take whichever floor is higher: the one on disk, or the highest this
+        // process has already verified. They differ only when a save failed, and
+        // that is exactly when using the disk alone would re-open the rollback
+        // the floor exists to close. See the `pointer_floor` field.
+        let floor = highest_floor(self.remembered_floor(), on_disk);
 
         let mut io = NodePointerIo {
             web_api: &self.web_api,
@@ -2703,6 +2879,11 @@ impl ApiClient {
         // pre-withdrawal record and resurrect the retired code.
         if let ResolveReport::Outcome(outcome) = &report {
             if let Some(next) = outcome.next_floor() {
+                // Remember it regardless of whether the disk write below lands.
+                // This is the whole anti-rollback guarantee when persistence is
+                // failing, so it must not sit inside the error handling for the
+                // persistence.
+                self.remember_floor(next);
                 if let Err(e) = self
                     .storage
                     .save_pointer_floor(&key, StoredFloor::from_floor(&next))
@@ -2717,13 +2898,6 @@ impl ApiClient {
 
         let anchor = anchor_from_report(&report, &floor, bundled)?;
 
-        // Once per run, on stderr, so it is visible in a pipeline whose stdout
-        // is being parsed. Repeating it per derived key would train users to
-        // ignore it, and so would repeating it on every refresh — hence the
-        // comparison against what was already said.
-        if let Some(advisory) = crate::pointer::advisory_after(&anchor, previous) {
-            eprintln!("{advisory}");
-        }
         info!(
             "Room-contract generation for this run: {} ({:?}, {:?})",
             crate::pointer::code_hash_b58(anchor.code_hash()),
@@ -3102,7 +3276,11 @@ impl ApiClient {
         // Fetch the room state, recovering it across older contract-WASM
         // generations if the current contract has no state (freenet/river#292).
         let (room_state, found_id) = self
-            .fetch_room_state_with_recovery(room_owner_key, *contract_key.id())
+            .fetch_room_state_with_recovery(
+                room_owner_key,
+                *contract_key.id(),
+                RecoveryWrites::Allowed,
+            )
             .await?;
 
         info!(
@@ -3295,6 +3473,7 @@ impl ApiClient {
         &self,
         room_owner_key: &VerifyingKey,
         current_id: ContractInstanceId,
+        writes: RecoveryWrites,
     ) -> Result<(ChatRoomStateV1, ContractInstanceId)> {
         // 1. Current generation (plus any forward upgrade-pointer chain).
         if let Some((state, id)) = self
@@ -3380,7 +3559,10 @@ impl ApiClient {
         // room is no longer stranded on an old generation. The current contract
         // was just confirmed empty/absent, so this creates it; the room
         // contract's CRDT merge keeps a concurrent migrator's write safe.
-        if migrate_forward {
+        // Suppressed for a repeated stream fetch: the recovered state is still
+        // RETURNED, so the stream sees the content either way; what is withheld
+        // is the publish. See `RecoveryWrites`.
+        if migrate_forward && writes == RecoveryWrites::Allowed {
             match self.put_room_state(room_owner_key, &merged).await {
                 Ok(()) => {
                     info!("Migrated recovered room forward onto current contract {current_id}")
@@ -3389,6 +3571,11 @@ impl ApiClient {
                     warn!("Could not migrate recovered room forward (returning it anyway): {e}")
                 }
             }
+        } else if migrate_forward {
+            debug!(
+                "Recovered room from an older generation without republishing it: this is a \
+                 repeated stream fetch, which reads but does not publish"
+            );
         }
         Ok((merged, resolved_id))
     }
@@ -5445,12 +5632,25 @@ impl ApiClient {
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
+        // ONE fetch through `get_room` at startup, regardless of how many
+        // messages are to be DISPLAYED.
+        //
+        // The display count and the migrate/heal side effects are different
+        // questions, and conflating them was a regression: `--initial-messages`
+        // defaults to 0, so gating this on it meant that in the default polling
+        // mode NOTHING ever went through `get_room`, and a member stranded
+        // without a `member_info` entry stayed "Unknown" to every other peer for
+        // the entire run. Before the periodic fetch became read-only, every poll
+        // went through `get_room` and healed them.
+        //
+        // The subscription mode has always fetched unconditionally here; this
+        // brings polling into line rather than inventing a new rule.
+        let mut room_state = self.get_room(room_owner_key, false).await?;
+        // Decrypt private-room content for display (no-op for public rooms).
+        let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
+
         // Show initial messages if requested
         if initial_messages > 0 {
-            let mut room_state = self.get_room(room_owner_key, false).await?;
-            // Decrypt private-room content for display (no-op for public rooms).
-            let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
-
             // Use display_messages() to filter out action/deleted messages (matches `message list`)
             let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
             let start = all_msgs.len().saturating_sub(initial_messages);
@@ -5616,9 +5816,25 @@ impl ApiClient {
     /// timer on the door.
     ///
     /// Streams still migrate and still heal: their FIRST fetch goes through
-    /// `get_room`, exactly as before, as does every one-shot command. What
-    /// changes is only that a long-running READER stops issuing writes as a
-    /// side effect of reading.
+    /// `get_room`, exactly as before, as does every one-shot command.
+    ///
+    /// Be precise about what this does NOT remove, because "a reader that never
+    /// writes" would be the easier claim and it would be false.
+    /// [`Self::fetch_room_state_with_recovery`] can still `put_room_state` — when
+    /// the current generation holds nothing and an older one does, it republishes
+    /// the recovered state forward. That is reachable from here, and most likely
+    /// exactly when a catch-up runs: right after a re-key, before the new
+    /// generation is populated. It is kept deliberately, because that recovery is
+    /// what makes the post-re-key catch-up return anything at all.
+    ///
+    /// The difference that matters is which failure it can produce.
+    /// `put_room_state` is one of the TOLERANT paths (freenet/river#690): an
+    /// unrelated response folds into a success, so the worst case is a
+    /// vacuously-successful republish of state we already hold.
+    /// `migrate_room_to_new_contract` is not tolerant — it writes an
+    /// attacker-irrelevant but WRONG contract key into `rooms.json`. Cutting the
+    /// second off this path while keeping the first is the trade being made, not
+    /// an oversight.
     async fn fetch_stream_state(
         &self,
         room_owner_key: &VerifyingKey,
@@ -5627,7 +5843,11 @@ impl ApiClient {
             .contract_key_for(room_owner_key, KeyIntent::Read)
             .await?;
         let (mut room_state, _found_id) = self
-            .fetch_room_state_with_recovery(room_owner_key, *contract_key.id())
+            .fetch_room_state_with_recovery(
+                room_owner_key,
+                *contract_key.id(),
+                RecoveryWrites::Suppressed,
+            )
             .await?;
         let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
         Ok((room_state, secrets))
@@ -6823,13 +7043,13 @@ impl ApiClient {
         // (freenet/river#694).
         let mut last_pointer_refresh = std::time::Instant::now();
         let mut refresh_interval = jittered_pointer_refresh_interval();
-        // Set by every refresh, cleared only by a catch-up fetch that succeeded.
-        let mut catch_up_pending = false;
-        let mut last_catch_up_attempt: Option<std::time::Instant> = None;
-        // Set when a re-key is detected, cleared only by a SUBSCRIBE the node
-        // accepted. See the retry below for why this is not a one-shot.
-        let mut resubscribe_pending = false;
-        let mut last_resubscribe_attempt: Option<std::time::Instant> = None;
+        // Armed by every refresh, disarmed only by a catch-up fetch that
+        // succeeded. See [`Retry`] for why the armed flag and its cadence are one
+        // value rather than two.
+        let mut catch_up = Retry::default();
+        // Armed when a re-key is detected, disarmed only by a SUBSCRIBE the node
+        // accepted.
+        let mut resubscribe = Retry::default();
 
         // Main loop: wait for UpdateNotification messages
         loop {
@@ -6878,7 +7098,7 @@ impl ApiClient {
                                 .contract_key_for(room_owner_key, KeyIntent::Read)
                                 .await?
                                 .id();
-                            resubscribe_pending = true;
+                            resubscribe.arm();
                         }
                     }
                     Err(e) => {
@@ -6915,7 +7135,7 @@ impl ApiClient {
                 //
                 // The cost is one extra room GET per refresh interval, which is
                 // far below what the stream is already doing per notification.
-                catch_up_pending = true;
+                catch_up.arm();
             }
 
             // Run the catch-up until one actually SUCCEEDS, rather than once per
@@ -6923,14 +7143,25 @@ impl ApiClient {
             // otherwise lose the gap content permanently: the anchor has already
             // been replaced, so the next refresh sees no move, and if no further
             // notification ever arrives nothing else would go looking.
-            if catch_up_pending
-                && last_catch_up_attempt.is_none_or(|t| t.elapsed() >= CATCH_UP_RETRY_INTERVAL)
-            {
-                last_catch_up_attempt = Some(std::time::Instant::now());
-                match self.fetch_stream_state(room_owner_key).await {
+            if catch_up.due(std::time::Instant::now(), CATCH_UP_RETRY_INTERVAL) {
+                catch_up.attempted(std::time::Instant::now());
+                // Interruptible, and this is the one that needed it most: the
+                // fetch can spend `CURRENT_GET_TIMEOUT` plus a legacy probe sweep
+                // before returning, and it sits on a retry cadence, so a node
+                // that cannot serve the generation yet makes this the loop's
+                // longest and most repeated wait.
+                let fetched = tokio::select! {
+                    Some(()) = shutdown_rx.recv() => {
+                        if matches!(format, OutputFormat::Human) {
+                            eprintln!("\nStopped monitoring.");
+                        }
+                        return Ok(());
+                    }
+                    fetched = self.fetch_stream_state(room_owner_key) => fetched,
+                };
+                match fetched {
                     Ok((room_state, secrets)) => {
-                        catch_up_pending = false;
-                        last_catch_up_attempt = None;
+                        catch_up.succeeded();
                         Self::emit_stream_changes(
                             &room_state,
                             &secrets,
@@ -6943,10 +7174,13 @@ impl ApiClient {
                             &mut new_message_count,
                         )?;
                     }
-                    // Left pending on purpose, so the next loop iteration retries.
-                    // `warn!`, not `debug!`: this fetch IS the mechanism that
-                    // closes the silent hole, so a failure here is the thing an
-                    // operator most needs to see.
+                    // Left armed on purpose, so a later iteration retries.
+                    //
+                    // `warn!` reaches a log subscriber, which riverctl only has
+                    // when `RUST_LOG` is set — so this is for a diagnosing
+                    // operator, not a watching one. The watching operator's
+                    // signal is that the stream keeps working: the retry is what
+                    // closes the hole, not the message.
                     Err(e) => {
                         warn!("Failed to catch up after the pointer refresh: {e}");
                     }
@@ -6971,11 +7205,8 @@ impl ApiClient {
             // cadence and keep the catch-up running meanwhile: the stream
             // degrades to polling at `RESUBSCRIBE_RETRY_INTERVAL` instead of
             // dying.
-            if resubscribe_pending
-                && last_resubscribe_attempt
-                    .is_none_or(|t| t.elapsed() >= RESUBSCRIBE_RETRY_INTERVAL)
-            {
-                last_resubscribe_attempt = Some(std::time::Instant::now());
+            if resubscribe.due(std::time::Instant::now(), RESUBSCRIBE_RETRY_INTERVAL) {
+                resubscribe.attempted(std::time::Instant::now());
                 // Interruptible, for the same reason the refresh above is — and
                 // more so: `subscribe_and_await_ack` waits up to 30s for the
                 // node's acknowledgement, three times the pointer GET's bound.
@@ -7004,8 +7235,7 @@ impl ApiClient {
                 };
                 match acked {
                     Ok(()) => {
-                        resubscribe_pending = false;
-                        last_resubscribe_attempt = None;
+                        resubscribe.succeeded();
                         // Catch up ONCE MORE, now that the subscription is live.
                         // The earlier fetch ran before this SUBSCRIBE was
                         // registered, so anything written in between — including
@@ -7014,8 +7244,7 @@ impl ApiClient {
                         // looking for it. This second pass is what makes the
                         // hand-off gapless; it emits nothing when nothing
                         // happened.
-                        catch_up_pending = true;
-                        last_catch_up_attempt = None;
+                        catch_up.arm();
                     }
                     Err(e) => {
                         warn!(
@@ -7023,7 +7252,7 @@ impl ApiClient {
                              ({e}); retrying, and continuing to poll meanwhile"
                         );
                         // Keep surfacing content while unsubscribed.
-                        catch_up_pending = true;
+                        catch_up.arm();
                     }
                 }
             }
@@ -7059,10 +7288,15 @@ impl ApiClient {
             };
 
             match recv_result {
+                // Only this generation's notifications. There is no unsubscribe
+                // (see `refresh_room_anchor`), so after a re-key the retired
+                // generation keeps delivering, and each stale notification would
+                // otherwise cost a full-state GET against the NEW key. Same key
+                // check the ack and update classifiers make, for the same reason.
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
                     key,
                     update,
-                }))) => {
+                }))) if *key.id() == contract_instance_id => {
                     // We received an update notification
                     debug!("Received update notification for contract: {}", key.id());
 
@@ -9724,6 +9958,83 @@ mod pointer_refresh_tests {
              which means the jitter is not jittering",
             seen.len()
         );
+    }
+
+    /// The two defects review found in this PR both lived in the arm/retry
+    /// bookkeeping, not in any decision: a job that cleared itself without
+    /// covering the window it existed to cover, and one that retried on the
+    /// loop's tick instead of its own interval. Neither was catchable, because
+    /// the state was a pair of loose locals. Now it is a type, so pin it.
+    #[test]
+    fn retry_stays_armed_until_it_succeeds_and_paces_its_attempts() {
+        let t0 = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(5);
+        let mut r = Retry::default();
+
+        // Not armed: nothing is ever due.
+        assert!(!r.due(t0, interval));
+
+        // Armed: the FIRST attempt is immediate, not one interval away. A
+        // catch-up that waited out its interval before the first try would leave
+        // the hole it exists to close open for that long.
+        r.arm();
+        assert!(r.due(t0, interval));
+
+        // Attempted but not succeeded: still armed, and now paced.
+        r.attempted(t0);
+        assert!(
+            !r.due(t0, interval),
+            "an attempt just made is not immediately due again"
+        );
+        assert!(!r.due(t0 + std::time::Duration::from_secs(4), interval));
+        assert!(r.due(t0 + interval, interval));
+
+        // Success disarms.
+        r.succeeded();
+        assert!(!r.due(t0 + interval * 100, interval));
+
+        // Re-arming after a success is immediate — the stale timestamp from the
+        // successful attempt must not shadow the new one.
+        r.arm();
+        assert!(r.due(t0, interval));
+    }
+
+    /// Repeated failure must widen the gap. A catch-up that keeps failing is
+    /// usually a node that does not hold the generation yet, and each attempt
+    /// costs a full-state GET plus a legacy sweep — so a fixed cadence turns one
+    /// unlucky moment into sustained load from every bot at once.
+    #[test]
+    fn retry_backs_off_on_consecutive_failures_and_resets_on_success() {
+        let t0 = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(5);
+        let mut r = Retry::default();
+        r.arm();
+
+        // First failure: still the base interval (no penalty for one miss).
+        r.attempted(t0);
+        assert!(r.due(t0 + interval, interval));
+
+        // Second: doubled.
+        r.attempted(t0 + interval);
+        assert!(!r.due(t0 + interval * 2, interval));
+        assert!(r.due(t0 + interval * 3, interval));
+
+        // And it is capped rather than growing without bound.
+        for i in 0..40 {
+            r.attempted(t0 + interval * (4 + i));
+        }
+        assert!(
+            r.due(
+                t0 + interval * 44 + interval * RETRY_MAX_BACKOFF_MULTIPLIER,
+                interval
+            ),
+            "the backoff must be capped, or a long outage silently stops retrying"
+        );
+
+        // A success clears the penalty, so the next arming is prompt again.
+        r.succeeded();
+        r.arm();
+        assert!(r.due(t0, interval));
     }
 
     /// A stream acts on `moved` by tearing down and rebuilding its subscription,
@@ -12895,8 +13206,8 @@ mod response_multiplexing_pin {
     /// Every production `.recv()` on the shared connection.
     ///
     /// One of them IS the `ResponseSource` impl `await_response` reads through;
-    /// ten more are sites the fix has not reached; the last three are not
-    /// connection reads at all (see entries 12-14). All fourteen are listed
+    /// ten more are sites the fix has not reached; the last four are not
+    /// connection reads at all (see entries 12-15). All fifteen are listed
     /// rather than only the unreached ones, so the constant can be audited by
     /// walking the list. Note a plain `grep -c` over the file does NOT give 11:
     /// it also counts the meta-tests' own string literals, which the pin strips
@@ -12924,11 +13235,12 @@ mod response_multiplexing_pin {
     ///     refresh -- NOT a read of the connection at all.
     /// 13. the same, around the mid-run re-SUBSCRIBE.
     /// 14. the same, in the POLLING monitor's refresh.
+    /// 15. the same, around the streaming monitor's catch-up fetch.
     ///
-    /// 12 through 14 are all `shutdown_rx.recv()` on the Ctrl+C mpsc channel,
+    /// 12 through 15 are all `shutdown_rx.recv()` on the Ctrl+C mpsc channel,
     /// added by freenet/river#694 so that the periodic pointer refresh, and the
     /// re-subscribe that can follow it, cannot widen shutdown latency to their
-    /// own timeouts (10s and 30s respectively). The note under the count below
+    /// own timeouts (10s, 30s, and a GET plus legacy sweep). The note under the count below
     /// predicted exactly this: the scan counts every `.recv()` rather than every
     /// connection read, on purpose, because binding it to a variable name would
     /// make it a spelling ban rather than a count. A second receiver is
@@ -12962,7 +13274,7 @@ mod response_multiplexing_pin {
     ///     issue (#689) rather than riding along here.
     ///
     /// Lowering this number is #690's job, and #689's.
-    const DIRECT_CONNECTION_READS: usize = 14;
+    const DIRECT_CONNECTION_READS: usize = 15;
 
     /// Production references to the connection field, and locks taken on it.
     ///
@@ -13296,7 +13608,7 @@ mod response_multiplexing_pin {
         );
         assert_caught(
             &mutated,
-            "found 15",
+            "found 16",
             "a newly-added direct read whose guard is not called `web_api`",
         );
     }

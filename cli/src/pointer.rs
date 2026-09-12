@@ -138,12 +138,46 @@ pub enum AnchorSource {
     /// a build-time key is legitimate.
     NeverPublished,
     /// The pointer could not be consulted, or answered something that moves
-    /// nothing (unreachable, stale, a competing record at the floor version, a
-    /// transport abort). The hash is whatever was last resolved on this install,
-    /// or the bundled one if nothing ever was. Carries the reason, which the
-    /// caller must make visible: this is exactly today's un-anchored behaviour,
-    /// so it is not a regression, but it must not be silent either.
-    Unverified(String),
+    /// nothing. The hash is whatever was last resolved on this install, or the
+    /// bundled one if nothing ever was. Carries the reason, which the caller
+    /// must make visible: this is exactly today's un-anchored behaviour, so it
+    /// is not a regression, but it must not be silent either.
+    ///
+    /// `kind` exists separately from `detail` because the two are used for
+    /// different things and collapsing them loses one of them. `detail` is the
+    /// sentence a human reads. `kind` is what deduplication compares, so that a
+    /// timeout repeating every few minutes stays quiet while a genuinely
+    /// different condition still gets through — and in particular so that
+    /// [`UnverifiedKind::CompetingRecord`], which is a fork or author-key
+    /// signal rather than a hiccup, is never suppressed by an ordinary timeout
+    /// that happened to precede it.
+    Unverified {
+        kind: UnverifiedKind,
+        detail: String,
+    },
+}
+
+/// The deduplication key for an advisory: the provenance, with `Unverified`
+/// split by kind so distinct conditions are not collapsed into one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorCondition {
+    Pointer,
+    NeverPublished,
+    Unverified(UnverifiedKind),
+}
+
+/// Why an anchor is unverified — the part worth deduplicating on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnverifiedKind {
+    /// Nothing was learned: a timeout, an unreachable node, a transport abort,
+    /// or a resolver outcome this binary does not understand.
+    Unavailable,
+    /// A validly-signed record OLDER than the floor this install already
+    /// verified. Routine — a freshly-bootstrapped peer can serve one.
+    RolledBack,
+    /// Two different valid records exist at one version. Not routine: it means
+    /// a fork, or an author key producing conflicting statements.
+    CompetingRecord,
 }
 
 /// The room-contract code hash this run will derive keys from, and the
@@ -303,8 +337,15 @@ impl RoomAnchor {
     /// This is the unit [`advisory_after`] deduplicates on, so it must not carry
     /// the `Unverified` reason string: two consecutive timeouts phrased slightly
     /// differently are the same thing to a reader.
-    fn condition(&self) -> (Generation, std::mem::Discriminant<AnchorSource>) {
-        (self.generation, std::mem::discriminant(&self.source))
+    fn condition(&self) -> (Generation, AnchorCondition) {
+        let source = match &self.source {
+            AnchorSource::Pointer => AnchorCondition::Pointer,
+            AnchorSource::NeverPublished => AnchorCondition::NeverPublished,
+            // The KIND, never the detail: the detail embeds version numbers that
+            // differ between attempts at the same condition.
+            AnchorSource::Unverified { kind, .. } => AnchorCondition::Unverified(*kind),
+        };
+        (self.generation, source)
     }
 
     /// The line to put on stderr once, at resolution time, or `None` when there
@@ -329,9 +370,9 @@ impl RoomAnchor {
                 self.behind_network_summary()
             )),
             (AnchorSource::NeverPublished, _) => None,
-            (AnchorSource::Unverified(reason), _) => Some(format!(
+            (AnchorSource::Unverified { detail, .. }, _) => Some(format!(
                 "warning: could not verify that riverctl's room-contract generation is current \
-                 ({reason}). Continuing with generation {}. If River has re-keyed since this \
+                 ({detail}). Continuing with generation {}. If River has re-keyed since this \
                  build, room operations will address the wrong contract.",
                 code_hash_b58(&self.code_hash),
             )),
@@ -473,7 +514,10 @@ pub fn anchor_from_report(
             return Ok(RoomAnchor::unvouched(
                 last_known(),
                 bundled,
-                AnchorSource::Unverified(reason.clone()),
+                AnchorSource::Unverified {
+                    kind: UnverifiedKind::Unavailable,
+                    detail: reason.clone(),
+                },
             ));
         }
         ResolveReport::Outcome(o) => o,
@@ -505,10 +549,13 @@ pub fn anchor_from_report(
         PointerOutcome::Stale { served, floor: f } => Ok(RoomAnchor::unvouched(
             last_known(),
             bundled,
-            AnchorSource::Unverified(format!(
-                "a peer served pointer version {served}, older than the version {f} this install \
-                 already verified; the rollback was refused"
-            )),
+            AnchorSource::Unverified {
+                kind: UnverifiedKind::RolledBack,
+                detail: format!(
+                    "a peer served pointer version {served}, older than the version {f} this \
+                     install already verified; the rollback was refused"
+                ),
+            },
         )),
 
         // Two valid records at one version; ours won the tiebreak. The resolver
@@ -520,10 +567,13 @@ pub fn anchor_from_report(
         PointerOutcome::CompetingRecord { version, .. } => Ok(RoomAnchor::unvouched(
             last_known(),
             bundled,
-            AnchorSource::Unverified(format!(
-                "a second, different pointer record exists at version {version}; keeping the one \
-                 already verified here rather than choosing between them"
-            )),
+            AnchorSource::Unverified {
+                kind: UnverifiedKind::CompetingRecord,
+                detail: format!(
+                    "a second, different pointer record exists at version {version}; keeping the \
+                     one already verified here rather than choosing between them"
+                ),
+            },
         )),
 
         // Nothing could be learned. This is today's behaviour, so continuing is
@@ -532,10 +582,12 @@ pub fn anchor_from_report(
         PointerOutcome::Unavailable => Ok(RoomAnchor::unvouched(
             last_known(),
             bundled,
-            AnchorSource::Unverified(
-                "the pointer record could not be fetched (timeout, or the node had no answer)"
+            AnchorSource::Unverified {
+                kind: UnverifiedKind::Unavailable,
+                detail: "the pointer record could not be fetched (timeout, or the node had no \
+                         answer)"
                     .to_string(),
-            ),
+            },
         )),
 
         // `PointerOutcome` is `#[non_exhaustive]`. A future arm is not something
@@ -544,10 +596,13 @@ pub fn anchor_from_report(
         other => Ok(RoomAnchor::unvouched(
             last_known(),
             bundled,
-            AnchorSource::Unverified(format!(
-                "the pointer resolver returned an outcome this riverctl does not understand \
-                 ({other:?}); upgrade riverctl"
-            )),
+            AnchorSource::Unverified {
+                kind: UnverifiedKind::Unavailable,
+                detail: format!(
+                    "the pointer resolver returned an outcome this riverctl does not understand \
+                     ({other:?}); upgrade riverctl"
+                ),
+            },
         )),
     }
 }
@@ -785,7 +840,7 @@ pub(crate) mod test_support {
             bundled,
         )
         .expect("an unreachable pointer stays best-effort");
-        assert!(matches!(anchor.source(), AnchorSource::Unverified(_)));
+        assert!(matches!(anchor.source(), AnchorSource::Unverified { .. }));
         anchor
     }
 }
