@@ -2364,6 +2364,14 @@ const POINTER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// the only thing surfacing content is the catch-up fetch that runs beside it.
 const RESUBSCRIBE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long to wait before retrying a catch-up fetch that failed.
+///
+/// The first attempt after a refresh is immediate; only RETRIES are spaced. The
+/// loop wakes every 500 ms, so without a floor here a generation the node cannot
+/// serve yet — the normal state for a few moments after River publishes one —
+/// would draw two full-state GETs per second from every bot at once.
+const CATCH_UP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// [`POINTER_REFRESH_INTERVAL`] with ±20% jitter.
 ///
 /// Without it every bot started by one restart wave shares a refresh phase, so a
@@ -2538,8 +2546,23 @@ impl ApiClient {
             return Ok(anchor);
         }
         let anchor = self.resolve_room_anchor(None).await?;
-        *slot = Some(anchor.clone());
+        self.install_room_anchor(&mut slot, anchor.clone());
         Ok(anchor)
+    }
+
+    /// Install `anchor` as this run's generation: cache it, and point the local
+    /// room store at the same generation the network paths will derive from.
+    ///
+    /// One function because the two must not drift: a cache holding one
+    /// generation while `Storage` regenerates keys against another is a way to
+    /// address two different contracts in one run.
+    fn install_room_anchor(
+        &self,
+        slot: &mut tokio::sync::RwLockWriteGuard<'_, Option<RoomAnchor>>,
+        anchor: RoomAnchor,
+    ) {
+        self.storage.set_room_code_hash(*anchor.code_hash());
+        **slot = Some(anchor);
     }
 
     /// How a long-running stream should react to a failed pointer refresh.
@@ -2579,9 +2602,28 @@ impl ApiClient {
     pub async fn refresh_room_anchor(&self) -> Result<AnchorRefresh> {
         let mut slot = self.room_anchor.write().await;
         let previous = slot.clone();
-        let anchor = self.resolve_room_anchor(previous.as_ref()).await?;
-        *slot = Some(anchor.clone());
-        Ok(AnchorRefresh::new(anchor, previous))
+        let resolved = self.resolve_room_anchor(previous.as_ref()).await?;
+
+        // Only a signature-verified record may move this run off a generation it
+        // is already using, and the gate is on the INSTALL rather than only on
+        // the announcement. `decide_refresh` carries the full argument.
+        let accepted = match crate::pointer::decide_refresh(previous.as_ref(), resolved) {
+            crate::pointer::RefreshDecision::Accept(anchor) => anchor,
+            crate::pointer::RefreshDecision::Decline { keep, rejected } => {
+                warn!(
+                    "Keeping room-contract generation {} : an unverified re-check named {} \
+                     instead ({:?}), which is not evidence enough to move off a generation \
+                     already in use",
+                    crate::pointer::code_hash_b58(keep.code_hash()),
+                    crate::pointer::code_hash_b58(rejected.code_hash()),
+                    rejected.source(),
+                );
+                keep
+            }
+        };
+
+        self.install_room_anchor(&mut slot, accepted.clone());
+        Ok(AnchorRefresh::new(accepted, previous))
     }
 
     /// Resolve River's room-contract pointer, persist the anti-rollback floor,
@@ -2655,9 +2697,11 @@ impl ApiClient {
             anchor.source(),
         );
 
-        // Let the local room cache regenerate its keys against the same
-        // generation the network paths use, instead of against the bundled WASM.
-        self.storage.set_room_code_hash(*anchor.code_hash());
+        // NOTE: installing this generation into `Storage` is deliberately NOT
+        // done here. A refresh may decline the anchor it just resolved (see
+        // `refresh_room_anchor`), and writing the code hash from inside the
+        // resolver would apply a generation the caller is about to reject — the
+        // decision and its side effect have to sit together.
         Ok(anchor)
     }
 
@@ -5418,7 +5462,21 @@ impl ApiClient {
             if last_pointer_refresh.elapsed() >= refresh_interval {
                 last_pointer_refresh = std::time::Instant::now();
                 refresh_interval = jittered_pointer_refresh_interval();
-                match self.refresh_room_anchor().await {
+                // Interruptible, exactly as in the subscription loop. Polling's
+                // Ctrl+C granularity is its poll interval (1s by default); a bare
+                // await here would stretch that to the pointer GET's 10s timeout
+                // once every refresh. Fixing one loop and not the other would
+                // leave the same hazard behind in the quieter half.
+                let resolved = tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        if matches!(format, OutputFormat::Human) {
+                            eprintln!("\nStopped monitoring.");
+                        }
+                        return Ok(());
+                    }
+                    resolved = self.refresh_room_anchor() => resolved,
+                };
+                match resolved {
                     Ok(refresh) => {
                         if let Some(notice) = refresh.move_notice() {
                             eprintln!("{notice}");
@@ -6695,6 +6753,7 @@ impl ApiClient {
         let mut refresh_interval = jittered_pointer_refresh_interval();
         // Set by every refresh, cleared only by a catch-up fetch that succeeded.
         let mut catch_up_pending = false;
+        let mut last_catch_up_attempt: Option<std::time::Instant> = None;
         // Set when a re-key is detected, cleared only by a SUBSCRIBE the node
         // accepted. See the retry below for why this is not a one-shot.
         let mut resubscribe_pending = false;
@@ -6784,10 +6843,14 @@ impl ApiClient {
             // otherwise lose the gap content permanently: the anchor has already
             // been replaced, so the next refresh sees no move, and if no further
             // notification ever arrives nothing else would go looking.
-            if catch_up_pending {
+            if catch_up_pending
+                && last_catch_up_attempt.is_none_or(|t| t.elapsed() >= CATCH_UP_RETRY_INTERVAL)
+            {
+                last_catch_up_attempt = Some(std::time::Instant::now());
                 match self.fetch_stream_state(room_owner_key).await {
                     Ok((room_state, secrets)) => {
                         catch_up_pending = false;
+                        last_catch_up_attempt = None;
                         Self::emit_stream_changes(
                             &room_state,
                             &secrets,
@@ -6833,13 +6896,38 @@ impl ApiClient {
                     .is_none_or(|t| t.elapsed() >= RESUBSCRIBE_RETRY_INTERVAL)
             {
                 last_resubscribe_attempt = Some(std::time::Instant::now());
-                match self
-                    .subscribe_and_await_ack(contract_instance_id, &format, &mut pending)
-                    .await
-                {
+                // Interruptible, for the same reason the refresh above is — and
+                // more so: `subscribe_and_await_ack` waits up to 30s for the
+                // node's acknowledgement, three times the pointer GET's bound.
+                // That wait was a one-time startup cost before this change; it is
+                // now on a path an ordinary long-running stream re-enters after
+                // every re-key, so leaving it unraced would make Ctrl+C hang for
+                // half a minute at exactly the busiest moment.
+                let acked = tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        if matches!(format, OutputFormat::Human) {
+                            eprintln!("\nStopped monitoring.");
+                        }
+                        return Ok(());
+                    }
+                    acked = self
+                        .subscribe_and_await_ack(contract_instance_id, &format, &mut pending)
+                        => acked,
+                };
+                match acked {
                     Ok(()) => {
                         resubscribe_pending = false;
                         last_resubscribe_attempt = None;
+                        // Catch up ONCE MORE, now that the subscription is live.
+                        // The earlier fetch ran before this SUBSCRIBE was
+                        // registered, so anything written in between — including
+                        // across a 30s retry delay — is in neither the fetch nor
+                        // the notification stream, and nothing else would ever go
+                        // looking for it. This second pass is what makes the
+                        // hand-off gapless; it emits nothing when nothing
+                        // happened.
+                        catch_up_pending = true;
+                        last_catch_up_attempt = None;
                     }
                     Err(e) => {
                         warn!(
@@ -12660,10 +12748,10 @@ mod response_multiplexing_pin {
     /// Every production `.recv()` on the shared connection.
     ///
     /// One of them IS the `ResponseSource` impl `await_response` reads through;
-    /// ten more are sites the fix has not reached; the twelfth is not a
-    /// connection read at all (see entry 12). All twelve are listed rather than
-    /// only the unreached ones, so the constant can be audited by walking the
-    /// list. Note a plain `grep -c` over the file does NOT give 11:
+    /// ten more are sites the fix has not reached; the last three are not
+    /// connection reads at all (see entries 12-14). All fourteen are listed
+    /// rather than only the unreached ones, so the constant can be audited by
+    /// walking the list. Note a plain `grep -c` over the file does NOT give 11:
     /// it also counts the meta-tests' own string literals, which the pin strips
     /// with `production_source` before counting.
     ///
@@ -12685,16 +12773,21 @@ mod response_multiplexing_pin {
     ///  9. `accept_invitation_struct`'s join delta -- #690.
     /// 10. `ensure_room_migrated` -- #690.
     /// 11. `migrate_room_to_new_contract` -- freenet/river#689.
-    /// 12. the streaming monitor's shutdown `select!` -- NOT a read of the
-    ///     connection at all. It is `shutdown_rx.recv()` on the Ctrl+C mpsc
-    ///     channel, added by freenet/river#694 so a five-minute pointer refresh
-    ///     cannot widen shutdown latency to the pointer GET's timeout. The note
-    ///     under the count below predicted exactly this: the scan counts every
-    ///     `.recv()` rather than every connection read, on purpose, because
-    ///     binding it to a variable name would make it a spelling ban. A second
-    ///     mpsc receiver is therefore a FALSE POSITIVE to be recorded here, not
-    ///     a call site to route through `await_response` -- which could not
-    ///     accept it anyway, since it does not read the connection.
+    /// 12. the streaming monitor's shutdown `select!` around the pointer
+    ///     refresh -- NOT a read of the connection at all.
+    /// 13. the same, around the mid-run re-SUBSCRIBE.
+    /// 14. the same, in the POLLING monitor's refresh.
+    ///
+    /// 12 through 14 are all `shutdown_rx.recv()` on the Ctrl+C mpsc channel,
+    /// added by freenet/river#694 so that the periodic pointer refresh, and the
+    /// re-subscribe that can follow it, cannot widen shutdown latency to their
+    /// own timeouts (10s and 30s respectively). The note under the count below
+    /// predicted exactly this: the scan counts every `.recv()` rather than every
+    /// connection read, on purpose, because binding it to a variable name would
+    /// make it a spelling ban rather than a count. A second receiver is
+    /// therefore a FALSE POSITIVE to be recorded here, not a call site to route
+    /// through `await_response` -- which could not accept it anyway, since it
+    /// does not read the connection.
     ///
     /// 6 through 11 are deliberately outside this change, but NOT all for the
     /// same reason, and an earlier version of this comment gave one reason for
@@ -12722,7 +12815,7 @@ mod response_multiplexing_pin {
     ///     issue (#689) rather than riding along here.
     ///
     /// Lowering this number is #690's job, and #689's.
-    const DIRECT_CONNECTION_READS: usize = 12;
+    const DIRECT_CONNECTION_READS: usize = 14;
 
     /// Production references to the connection field, and locks taken on it.
     ///
@@ -13056,7 +13149,7 @@ mod response_multiplexing_pin {
         );
         assert_caught(
             &mutated,
-            "found 13",
+            "found 15",
             "a newly-added direct read whose guard is not called `web_api`",
         );
     }

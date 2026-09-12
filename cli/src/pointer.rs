@@ -344,6 +344,55 @@ impl RoomAnchor {
 #[error("{0}")]
 pub struct PointerWithdrawn(pub String);
 
+/// What a mid-run refresh should do with the anchor it just resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshDecision {
+    /// Install it: either it is signature-verified, or it names the generation
+    /// already in use and so changes nothing about what is addressed.
+    Accept(RoomAnchor),
+    /// Keep what was already in force. Carries both so the caller can say which
+    /// generation it is staying on and what it declined.
+    Decline {
+        keep: RoomAnchor,
+        rejected: RoomAnchor,
+    },
+}
+
+/// Decide whether a refreshed anchor may replace the one in force.
+///
+/// The rule is one sentence: **only a signature-verified record may move a run
+/// off a generation it is already using.**
+///
+/// Why it has to gate the INSTALL and not merely the announcement: a failed
+/// resolution still produces an anchor, sitting on `last_known()` — the floor's
+/// hash, or the BUNDLED hash when the floor has never been persisted, and
+/// persisting it is best-effort. So a read-only config directory plus one
+/// timeout is enough to resolve a hash that is not where the room is. Declaring
+/// that "not a move" keeps the stream from re-subscribing, but if the anchor is
+/// installed anyway then every later derivation — the polling loop's `get_room`,
+/// the catch-up fetch, the local room store's key regeneration — comes off the
+/// wrong hash, and the stream reads a retired generation while reporting nothing
+/// wrong. That is the silence this whole module exists to remove, arriving
+/// through a second door.
+///
+/// A first resolution (`previous` is `None`) is always accepted: there is
+/// nothing to protect yet, and refusing would leave the run with no anchor at
+/// all.
+pub fn decide_refresh(previous: Option<&RoomAnchor>, resolved: RoomAnchor) -> RefreshDecision {
+    match previous {
+        Some(prev)
+            if resolved.code_hash() != prev.code_hash()
+                && !matches!(resolved.source(), AnchorSource::Pointer) =>
+        {
+            RefreshDecision::Decline {
+                keep: prev.clone(),
+                rejected: resolved,
+            }
+        }
+        _ => RefreshDecision::Accept(resolved),
+    }
+}
+
 /// The advisory to print for `anchor`, given what has already been printed for
 /// `previous` in this same run.
 ///
@@ -840,6 +889,55 @@ mod tests {
         )
         .expect("an unreachable pointer stays best-effort");
         assert_eq!(unreachable.code_hash(), &bundled());
+    }
+
+    /// The install gate, which is a different question from whether to announce a
+    /// move: an unverified anchor that is installed anyway sends every later key
+    /// derivation to the wrong generation, silently.
+    #[test]
+    fn only_a_verified_record_may_replace_the_generation_in_force() {
+        use super::test_support::{pointer_anchor, unverified_anchor};
+        let live = [0x11; 32];
+        let other = [0xBB; 32];
+        let b = bundled();
+
+        let in_force = pointer_anchor(live, b);
+
+        // A verified record naming a new generation: accepted, and it is what
+        // gets installed.
+        let verified_move = pointer_anchor(other, b);
+        assert_eq!(
+            decide_refresh(Some(&in_force), verified_move.clone()),
+            RefreshDecision::Accept(verified_move),
+        );
+
+        // An UNVERIFIED anchor naming a different generation: declined, and the
+        // generation in force is what stays.
+        let fallback = unverified_anchor(b, b);
+        assert_ne!(fallback.code_hash(), in_force.code_hash());
+        match decide_refresh(Some(&in_force), fallback.clone()) {
+            RefreshDecision::Decline { keep, rejected } => {
+                assert_eq!(keep.code_hash(), in_force.code_hash());
+                assert_eq!(rejected.code_hash(), fallback.code_hash());
+            }
+            other => panic!("an unverified hash change must be declined, got {other:?}"),
+        }
+
+        // An unverified anchor naming the SAME generation is harmless — it
+        // addresses the same contract — so it is accepted rather than declined.
+        let same_hash_unverified = unverified_anchor(live, b);
+        assert!(matches!(
+            decide_refresh(Some(&in_force), same_hash_unverified),
+            RefreshDecision::Accept(_)
+        ));
+
+        // A first resolution has nothing to protect and must never be declined,
+        // or a run whose first pointer GET times out would have no anchor at all.
+        let first = unverified_anchor(b, b);
+        assert!(matches!(
+            decide_refresh(None, first),
+            RefreshDecision::Accept(_)
+        ));
     }
 
     #[test]
