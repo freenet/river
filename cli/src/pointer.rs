@@ -329,6 +329,24 @@ impl RoomAnchor {
     }
 }
 
+/// The advisory to print for `anchor`, given what has already been printed for
+/// `previous` in this same run.
+///
+/// Split out from the printing so the suppression rule is testable without a
+/// node. The rule is deliberately narrow: an advisory is withheld only when it
+/// is character-identical to one the user has already seen, so a refresh that
+/// changes what they need to know always says so, and a refresh that changes
+/// nothing stays quiet. A long-running stream re-resolves every few minutes
+/// (freenet/river#694), and re-printing the same "could not verify" warning on
+/// each pass is how a real warning gets trained into background noise.
+pub fn advisory_after(anchor: &RoomAnchor, previous: Option<&RoomAnchor>) -> Option<String> {
+    let advisory = anchor.advisory()?;
+    match previous.and_then(|p| p.advisory()) {
+        Some(already) if already == advisory => None,
+        _ => Some(advisory),
+    }
+}
+
 /// What a resolution attempt produced, flattened so the arm-by-arm mapping
 /// below is a pure function that needs no node and no generic error type.
 #[derive(Debug, Clone)]
@@ -679,6 +697,61 @@ mod tests {
             "the author key and app_id in this module no longer derive the pointer address \
              published in FREENET.md"
         );
+    }
+
+    /// A refresh must not re-print an advisory the user has already seen, or a
+    /// long-running stream turns a real warning into noise — but it MUST print
+    /// one that has changed, which is the whole point of re-checking.
+    #[test]
+    fn advisory_is_printed_once_per_distinct_condition() {
+        let author = SigningKey::from_bytes(&[3u8; 32]);
+        let live = [0x11; 32];
+
+        // An unknown generation: this one has something to say.
+        let unknown = anchor_from_report(
+            &ResolveReport::Outcome(outcome_for(
+                &author,
+                PointerFloor::never_resolved(),
+                4,
+                live,
+            )),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        assert!(unknown.advisory().is_some());
+
+        // First time: printed.
+        assert!(advisory_after(&unknown, None).is_some());
+        // Re-resolved to the very same condition: withheld.
+        assert_eq!(advisory_after(&unknown, Some(&unknown)), None);
+
+        // A DIFFERENT condition after the same run: printed, even though the
+        // previous pass also had something to say.
+        let unverified = anchor_from_report(
+            &ResolveReport::Failed("node unreachable".to_string()),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        let printed = advisory_after(&unverified, Some(&unknown))
+            .expect("a changed condition must not be suppressed by the previous one");
+        assert!(printed.contains("could not verify"), "{printed}");
+
+        // An anchor with nothing to say stays silent regardless of history.
+        let quiet = anchor_from_report(
+            &ResolveReport::Outcome(outcome_for(
+                &author,
+                PointerFloor::never_resolved(),
+                4,
+                bundled(),
+            )),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        assert_eq!(quiet.advisory(), None);
+        assert_eq!(advisory_after(&quiet, Some(&unknown)), None);
     }
 
     #[test]

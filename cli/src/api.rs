@@ -2333,6 +2333,79 @@ impl std::fmt::Debug for Invitation {
     }
 }
 
+/// How often a long-running command re-resolves River's room-contract pointer.
+///
+/// A refresh is one GET of a fixed address, so five minutes is far below the
+/// cost of the traffic such a command is already handling, while bounding how
+/// long a bot can keep talking to a retired generation after a re-key. It is not
+/// user-configurable on purpose: the right value is a property of how River
+/// releases, not of any one deployment, and a knob here would mostly be a way to
+/// turn the protection off by accident.
+const POINTER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The outcome of re-resolving River's room-contract pointer mid-run.
+///
+/// `moved` is the field callers act on, and it is deliberately narrower than
+/// "the anchor changed": an anchor whose provenance went from verified to
+/// unverified while naming the SAME code hash addresses the same contract, so a
+/// stream must not tear down a healthy subscription over it.
+#[derive(Debug, Clone)]
+pub struct AnchorRefresh {
+    anchor: RoomAnchor,
+    previous: Option<RoomAnchor>,
+    moved: bool,
+}
+
+impl AnchorRefresh {
+    /// Build a refresh result, deciding `moved` from the two code hashes.
+    ///
+    /// The comparison is on the CODE HASH, not on the whole anchor: a run whose
+    /// provenance went from verified to unverified while naming the same hash is
+    /// still addressing the same contract, and tearing down a healthy
+    /// subscription over it would be a self-inflicted outage.
+    fn new(anchor: RoomAnchor, previous: Option<RoomAnchor>) -> Self {
+        // False when nothing was cached: a first resolution is not a move, and
+        // reporting one would make an ordinary startup look like a re-key.
+        let moved = matches!(&previous, Some(p) if p.code_hash() != anchor.code_hash());
+        Self {
+            anchor,
+            previous,
+            moved,
+        }
+    }
+
+    /// The anchor in force after the refresh.
+    pub fn anchor(&self) -> &RoomAnchor {
+        &self.anchor
+    }
+
+    /// Whether the room-contract generation actually moved. False on a first
+    /// resolution, and false when the same hash was re-confirmed.
+    pub fn moved(&self) -> bool {
+        self.moved
+    }
+
+    /// The human-readable line describing the move, or `None` if nothing moved.
+    ///
+    /// Names both generations because that is what makes a bug report actionable
+    /// without a follow-up question, and says what riverctl is doing about it so
+    /// the operator does not have to infer whether their bot is still working.
+    pub fn move_notice(&self) -> Option<String> {
+        if !self.moved {
+            return None;
+        }
+        let from = self
+            .previous
+            .as_ref()
+            .map(|p| crate::pointer::code_hash_b58(p.code_hash()))
+            .unwrap_or_else(|| "(none)".to_string());
+        Some(format!(
+            "River re-keyed the room contract while this command was running.\n               was: {from}\n  now: {}\n             Re-subscribing to the new generation; no restart needed.",
+            crate::pointer::code_hash_b58(self.anchor.code_hash()),
+        ))
+    }
+}
+
 pub struct ApiClient {
     web_api: Arc<Mutex<WebApi>>,
     #[allow(dead_code)]
@@ -2345,7 +2418,13 @@ pub struct ApiClient {
     /// connection but never touches a room key pays nothing, and so the one GET
     /// happens where its failure can be reported against the operation that
     /// needed it.
-    room_anchor: tokio::sync::OnceCell<RoomAnchor>,
+    ///
+    /// A `RwLock` rather than a `OnceCell` because a long-running command must
+    /// be able to REPLACE it: River can re-key the room contract while a stream
+    /// is running, and a write-once cell pinned that stream to the generation
+    /// that was live when it started (freenet/river#694). One-shot commands are
+    /// unaffected — they resolve once and never refresh, exactly as before.
+    room_anchor: tokio::sync::RwLock<Option<RoomAnchor>>,
 }
 
 impl ApiClient {
@@ -2387,23 +2466,62 @@ impl ApiClient {
             web_api: Arc::new(Mutex::new(web_api)),
             config,
             storage,
-            room_anchor: tokio::sync::OnceCell::new(),
+            room_anchor: tokio::sync::RwLock::new(None),
         })
     }
 
     /// River's room-contract generation for this run, resolved once.
     ///
     /// Resolution is one GET of a fixed address, so the cost is a single short
-    /// round trip per riverctl invocation that touches a room.
-    pub async fn room_anchor(&self) -> Result<&RoomAnchor> {
-        self.room_anchor
-            .get_or_try_init(|| self.resolve_room_anchor())
-            .await
+    /// round trip per riverctl invocation that touches a room. Returned by value
+    /// rather than by reference because the cache is now replaceable (see
+    /// [`Self::refresh_room_anchor`]); a [`RoomAnchor`] is two 32-byte hashes and
+    /// a short string, so cloning it is cheaper than holding a lock across the
+    /// caller's work.
+    pub async fn room_anchor(&self) -> Result<RoomAnchor> {
+        if let Some(anchor) = self.room_anchor.read().await.clone() {
+            return Ok(anchor);
+        }
+        // Resolve under the WRITE lock, and re-check after taking it: two tasks
+        // can both miss the read above, and resolving twice would mean two GETs
+        // and two advisories for one run.
+        let mut slot = self.room_anchor.write().await;
+        if let Some(anchor) = slot.clone() {
+            return Ok(anchor);
+        }
+        let anchor = self.resolve_room_anchor(None).await?;
+        *slot = Some(anchor.clone());
+        Ok(anchor)
+    }
+
+    /// Re-resolve River's room-contract pointer, replacing the cached anchor.
+    ///
+    /// For long-running commands only. A re-key moves every room's contract key
+    /// at once, and a stream that resolved at startup stays bound to the retired
+    /// key forever — the node has nothing left to send it, which is
+    /// indistinguishable from a quiet room (freenet/river#694). Refreshing on a
+    /// cadence is what lets such a command notice and follow the move.
+    ///
+    /// Returns what is in force afterwards and whether the generation actually
+    /// moved, so the caller can re-subscribe only when it did.
+    pub async fn refresh_room_anchor(&self) -> Result<AnchorRefresh> {
+        let mut slot = self.room_anchor.write().await;
+        let previous = slot.clone();
+        let anchor = self.resolve_room_anchor(previous.as_ref()).await?;
+        *slot = Some(anchor.clone());
+        Ok(AnchorRefresh::new(anchor, previous))
     }
 
     /// Resolve River's room-contract pointer, persist the anti-rollback floor,
     /// and announce anything the user needs to know.
-    async fn resolve_room_anchor(&self) -> Result<RoomAnchor> {
+    ///
+    /// `previous` is the anchor this run was already using, when there is one.
+    /// It exists solely to suppress a repeat of an advisory the user has already
+    /// been shown: a refresh runs every few minutes, and re-printing the same
+    /// "could not verify" warning on each one would train them to ignore it —
+    /// the same reasoning that makes the advisory once-per-run rather than
+    /// once-per-key.
+    async fn resolve_room_anchor(&self, previous: Option<&RoomAnchor>) -> Result<RoomAnchor> {
         let bundled = bundled_room_code_hash();
         let author_vk = river_author_vk()?;
         let key = floor_key(&author_vk, ROOM_CONTRACT_APP_ID);
@@ -2453,8 +2571,9 @@ impl ApiClient {
 
         // Once per run, on stderr, so it is visible in a pipeline whose stdout
         // is being parsed. Repeating it per derived key would train users to
-        // ignore it.
-        if let Some(advisory) = anchor.advisory() {
+        // ignore it, and so would repeating it on every refresh — hence the
+        // comparison against what was already said.
+        if let Some(advisory) = crate::pointer::advisory_after(&anchor, previous) {
             eprintln!("{advisory}");
         }
         info!(
@@ -3048,7 +3167,8 @@ impl ApiClient {
         //    that River has moved past searches a set that cannot contain the
         //    live room, and can surface an ancient copy and republish it onto a
         //    retired key.
-        let candidate_ids = match probe_plan(room_owner_key, self.room_anchor().await?) {
+        let anchor = self.room_anchor().await?;
+        let candidate_ids = match probe_plan(room_owner_key, &anchor) {
             ProbePlan::Probe(ids) => ids,
             ProbePlan::Refuse(message) => return Err(anyhow!(message)),
         };
@@ -3256,7 +3376,11 @@ impl ApiClient {
         // Read the ALREADY-resolved anchor rather than re-resolving: every path
         // that reaches here went through `room_anchor()` first, so the value is
         // cached and this performs no I/O and can swallow no transport error.
-        match self.room_anchor.get() {
+        // `read().await` is the cache read, not a resolution — it blocks only for
+        // as long as a concurrent refresh holds the write lock, which is the
+        // correct behaviour here: taking the pre-refresh value would build
+        // `known_keys` against a generation that is no longer current.
+        match self.room_anchor.read().await.clone() {
             Some(anchor) => {
                 known_keys.insert(*anchor.contract_key(room_owner_key).id());
             }
@@ -5208,8 +5332,31 @@ impl ApiClient {
             let _ = shutdown_tx.send(()).await;
         });
 
+        // When the pointer was last re-checked. The polling loop re-derives the
+        // room key from the anchor on every poll, so refreshing the anchor is by
+        // itself enough to follow a re-key here — but without the refresh every
+        // poll keeps hitting the retired generation, which still EXISTS and still
+        // answers, so the loop never errors and never sees another message
+        // (freenet/river#694).
+        let mut last_pointer_refresh = std::time::Instant::now();
+
         // Main polling loop
         loop {
+            if last_pointer_refresh.elapsed() >= POINTER_REFRESH_INTERVAL {
+                last_pointer_refresh = std::time::Instant::now();
+                match self.refresh_room_anchor().await {
+                    Ok(refresh) => {
+                        if let Some(notice) = refresh.move_notice() {
+                            eprintln!("{notice}");
+                        }
+                    }
+                    // Best-effort, exactly as in the subscription loop.
+                    Err(e) => {
+                        warn!("Could not re-check River's room-contract pointer: {e}");
+                    }
+                }
+            }
+
             // Check for shutdown signal
             if shutdown_rx.try_recv().is_ok() {
                 if matches!(format, OutputFormat::Human) {
@@ -5233,12 +5380,11 @@ impl ApiClient {
             // Poll for new + edited messages. emit_new_and_edited re-emits a
             // message whose effective content changed (an edit) and emits ones
             // not seen before; it respects max_messages for NEW messages.
-            match self.get_room(room_owner_key, false).await {
-                Ok(mut room_state) => {
-                    // Decrypt private-room content for display (no-op for public rooms).
-                    let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
-                    Self::emit_new_and_edited(
+            match self.fetch_stream_state(room_owner_key).await {
+                Ok((room_state, secrets)) => {
+                    Self::emit_stream_changes(
                         &room_state,
+                        &secrets,
                         &mut seen_messages,
                         &mut deleted_emitted,
                         &mut seen_reactions,
@@ -5246,25 +5392,6 @@ impl ApiClient {
                         &format,
                         max_messages,
                         &mut new_message_count,
-                        &secrets,
-                    )?;
-                    Self::emit_deletions(
-                        &room_state,
-                        &seen_messages,
-                        &mut deleted_emitted,
-                        room_owner_key,
-                        &format,
-                        &secrets,
-                    )?;
-                    // Surface reactions added/removed since a message was already
-                    // streamed. Runs AFTER emit_new_and_edited so a brand-new
-                    // message is seeded (not re-emitted) on the same poll.
-                    Self::emit_reaction_changes(
-                        &room_state,
-                        &mut seen_reactions,
-                        room_owner_key,
-                        &format,
-                        &secrets,
                     )?;
                     if max_messages > 0 && new_message_count >= max_messages {
                         return Ok(());
@@ -5279,6 +5406,66 @@ impl ApiClient {
             // Wait for next poll interval
             tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
         }
+    }
+
+    /// Fetch authoritative room state for a stream, with private-room content
+    /// decrypted for display (a no-op for public rooms).
+    ///
+    /// Split from [`Self::emit_stream_changes`] so the caller keeps the
+    /// distinction both stream loops have always drawn: a FETCH failure is
+    /// transient and the loop logs it and carries on, while an EMIT failure
+    /// (a closed stdout, say) ends the stream. Collapsing the two into one
+    /// `Result` would silently convert the second into the first.
+    async fn fetch_stream_state(
+        &self,
+        room_owner_key: &VerifyingKey,
+    ) -> Result<(ChatRoomStateV1, HashMap<u32, [u8; 32]>)> {
+        let mut room_state = self.get_room(room_owner_key, false).await?;
+        let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
+        Ok((room_state, secrets))
+    }
+
+    /// Emit everything that changed since the previous fetch.
+    ///
+    /// The order is load-bearing: `emit_reaction_changes` must run AFTER
+    /// `emit_new_and_edited` so a brand-new message is seeded rather than
+    /// re-emitted as a reaction change. Shared by the polling loop, the
+    /// subscription's notification handler, and the catch-up that follows a
+    /// mid-run re-subscribe, so the three cannot drift apart on what counts as a
+    /// reportable change.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_stream_changes(
+        room_state: &ChatRoomStateV1,
+        secrets: &HashMap<u32, [u8; 32]>,
+        seen_messages: &mut HashMap<String, String>,
+        deleted_emitted: &mut HashSet<String>,
+        seen_reactions: &mut HashMap<String, String>,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+        max_messages: usize,
+        new_message_count: &mut usize,
+    ) -> Result<()> {
+        Self::emit_new_and_edited(
+            room_state,
+            seen_messages,
+            deleted_emitted,
+            seen_reactions,
+            room_owner_key,
+            format,
+            max_messages,
+            new_message_count,
+            secrets,
+        )?;
+        Self::emit_deletions(
+            room_state,
+            seen_messages,
+            deleted_emitted,
+            room_owner_key,
+            format,
+            secrets,
+        )?;
+        Self::emit_reaction_changes(room_state, seen_reactions, room_owner_key, format, secrets)?;
+        Ok(())
     }
 
     /// Scan the room's display messages and emit any that are NEW or whose
@@ -6214,6 +6401,87 @@ impl ApiClient {
     ///
     /// Unlike `stream_messages` which polls, this method subscribes to the contract
     /// and receives push notifications when the contract state changes.
+    /// SUBSCRIBE to `contract_instance_id` and block until the node
+    /// acknowledges, queueing into `pending` anything that overtakes the ack.
+    ///
+    /// A method rather than an inline block because a stream re-subscribes when
+    /// River re-keys the room contract mid-run (freenet/river#694), and the
+    /// ack-race handling below is precisely the part that must not be
+    /// reimplemented slightly differently at a second call site.
+    async fn subscribe_and_await_ack(
+        &self,
+        contract_instance_id: ContractInstanceId,
+        format: &OutputFormat,
+        pending: &mut std::collections::VecDeque<HostResponse>,
+    ) -> Result<()> {
+        let subscribe_request = ContractRequest::Subscribe {
+            key: contract_instance_id, // Subscribe uses ContractInstanceId
+            summary: None,
+        };
+
+        let client_request = ClientRequest::ContractOp(subscribe_request);
+
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(client_request)
+            .await
+            .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
+
+        // The node's responses share one multiplexed connection, so an
+        // UpdateNotification for a contract we are already watching can
+        // arrive between our SUBSCRIBE and its acknowledgement. Treating
+        // the first message as the answer made that race fatal: the
+        // session died with "Unexpected response to SUBSCRIBE request",
+        // reconnected, and raced again. On 2026-07-27 that produced 299
+        // failures in four hours and up to 184 reconnects in a single
+        // hour against the official room (freenet-core#4970), and each
+        // reconnect dragged a catch-up batch behind it.
+        //
+        // So read until the acknowledgement actually arrives, and keep
+        // anything that overtakes it. The PUT path above already tolerates
+        // an interleaved UpdateNotification the same way.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("Timeout waiting for SUBSCRIBE response"));
+            }
+            let response = match tokio::time::timeout(remaining, web_api.recv()).await {
+                Ok(result) => result.map_err(|e| anyhow!("Failed to receive response: {}", e))?,
+                Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response")),
+            };
+            match classify_subscribe_response(&response) {
+                SubscribeAck::Subscribed => {
+                    if matches!(format, OutputFormat::Human) {
+                        eprintln!("Successfully subscribed. Waiting for updates...\n");
+                    }
+                    break;
+                }
+                SubscribeAck::Refused => return Err(anyhow!("Failed to subscribe to contract")),
+                // Queued rather than dropped: this is a real state change,
+                // and the main loop below drains `pending` before reading
+                // the socket, so it goes through exactly the same handling
+                // it would have had if it arrived a moment later.
+                SubscribeAck::NotYet => {
+                    // Bounded because the node feeds this queue and a busy
+                    // room can emit a lot inside the handshake window; an
+                    // unbounded queue here would be a memory amplification
+                    // vector. Collapsing is lossless: the handler below
+                    // discards the delta (`let _ = update;`) and re-fetches
+                    // authoritative full state, so N queued notifications
+                    // produce exactly the same result as one.
+                    if pending.len() < MAX_PENDING_DURING_HANDSHAKE {
+                        debug!("Response overtook the SUBSCRIBE ack, queuing it");
+                        pending.push_back(response);
+                    } else {
+                        debug!("Response overtook the SUBSCRIBE ack; queue full, collapsing");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn subscribe_and_stream(
         &self,
         room_owner_key: &VerifyingKey,
@@ -6258,7 +6526,7 @@ impl ApiClient {
         let contract_key = self
             .contract_key_for(room_owner_key, KeyIntent::Read)
             .await?;
-        let contract_instance_id = *contract_key.id();
+        let mut contract_instance_id = *contract_key.id();
         {
             let mut room_state = self.get_room(room_owner_key, false).await?;
             // Decrypt private-room content for display (no-op for public rooms).
@@ -6329,77 +6597,8 @@ impl ApiClient {
             std::collections::VecDeque::new();
 
         // Subscribe to the contract
-        {
-            let subscribe_request = ContractRequest::Subscribe {
-                key: contract_instance_id, // Subscribe uses ContractInstanceId
-                summary: None,
-            };
-
-            let client_request = ClientRequest::ContractOp(subscribe_request);
-
-            let mut web_api = self.web_api.lock().await;
-            web_api
-                .send(client_request)
-                .await
-                .map_err(|e| anyhow!("Failed to send SUBSCRIBE request: {}", e))?;
-
-            // The node's responses share one multiplexed connection, so an
-            // UpdateNotification for a contract we are already watching can
-            // arrive between our SUBSCRIBE and its acknowledgement. Treating
-            // the first message as the answer made that race fatal: the
-            // session died with "Unexpected response to SUBSCRIBE request",
-            // reconnected, and raced again. On 2026-07-27 that produced 299
-            // failures in four hours and up to 184 reconnects in a single
-            // hour against the official room (freenet-core#4970), and each
-            // reconnect dragged a catch-up batch behind it.
-            //
-            // So read until the acknowledgement actually arrives, and keep
-            // anything that overtakes it. The PUT path above already tolerates
-            // an interleaved UpdateNotification the same way.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(anyhow!("Timeout waiting for SUBSCRIBE response"));
-                }
-                let response = match tokio::time::timeout(remaining, web_api.recv()).await {
-                    Ok(result) => {
-                        result.map_err(|e| anyhow!("Failed to receive response: {}", e))?
-                    }
-                    Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response")),
-                };
-                match classify_subscribe_response(&response) {
-                    SubscribeAck::Subscribed => {
-                        if matches!(format, OutputFormat::Human) {
-                            eprintln!("Successfully subscribed. Waiting for updates...\n");
-                        }
-                        break;
-                    }
-                    SubscribeAck::Refused => {
-                        return Err(anyhow!("Failed to subscribe to contract"))
-                    }
-                    // Queued rather than dropped: this is a real state change,
-                    // and the main loop below drains `pending` before reading
-                    // the socket, so it goes through exactly the same handling
-                    // it would have had if it arrived a moment later.
-                    SubscribeAck::NotYet => {
-                        // Bounded because the node feeds this queue and a busy
-                        // room can emit a lot inside the handshake window; an
-                        // unbounded queue here would be a memory amplification
-                        // vector. Collapsing is lossless: the handler below
-                        // discards the delta (`let _ = update;`) and re-fetches
-                        // authoritative full state, so N queued notifications
-                        // produce exactly the same result as one.
-                        if pending.len() < MAX_PENDING_DURING_HANDSHAKE {
-                            debug!("Response overtook the SUBSCRIBE ack, queuing it");
-                            pending.push_back(response);
-                        } else {
-                            debug!("Response overtook the SUBSCRIBE ack; queue full, collapsing");
-                        }
-                    }
-                }
-            }
-        }
+        self.subscribe_and_await_ack(contract_instance_id, &format, &mut pending)
+            .await?;
 
         // Set up Ctrl+C handler
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -6409,8 +6608,74 @@ impl ApiClient {
             let _ = shutdown_tx.send(()).await;
         });
 
+        // When the pointer was last re-checked. A long-running subscription is
+        // bound to ONE contract instance id, so a re-key leaves it attached to a
+        // generation nobody writes to any more and the node simply stops having
+        // anything to send — indistinguishable from a quiet room
+        // (freenet/river#694).
+        let mut last_pointer_refresh = std::time::Instant::now();
+
         // Main loop: wait for UpdateNotification messages
         loop {
+            // Follow a mid-run re-key before doing anything else this iteration,
+            // and before taking the `web_api` lock the refresh needs for its own
+            // GET.
+            if last_pointer_refresh.elapsed() >= POINTER_REFRESH_INTERVAL {
+                last_pointer_refresh = std::time::Instant::now();
+                match self.refresh_room_anchor().await {
+                    Ok(refresh) => {
+                        if let Some(notice) = refresh.move_notice() {
+                            eprintln!("{notice}");
+                            // Re-derive through the anchor choke point, so the new
+                            // id comes from the same place every other key does.
+                            contract_instance_id = *self
+                                .contract_key_for(room_owner_key, KeyIntent::Read)
+                                .await?
+                                .id();
+                            self.subscribe_and_await_ack(
+                                contract_instance_id,
+                                &format,
+                                &mut pending,
+                            )
+                            .await?;
+                            // Catch up explicitly. The node only notifies about
+                            // changes that happen AFTER a subscription, so
+                            // everything written to the new generation between the
+                            // re-key and this moment would otherwise be a silent
+                            // hole — the very failure this refresh exists to close.
+                            match self.fetch_stream_state(room_owner_key).await {
+                                Ok((room_state, secrets)) => {
+                                    Self::emit_stream_changes(
+                                        &room_state,
+                                        &secrets,
+                                        &mut seen_messages,
+                                        &mut deleted_emitted,
+                                        &mut seen_reactions,
+                                        room_owner_key,
+                                        &format,
+                                        max_messages,
+                                        &mut new_message_count,
+                                    )?;
+                                }
+                                Err(e) => {
+                                    debug!("Failed to catch up after re-subscribing: {}", e);
+                                }
+                            }
+                            if max_messages > 0 && new_message_count >= max_messages {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    // Never fatal. A refresh is a best-effort currency check, and
+                    // tearing down a working stream because one pointer GET timed
+                    // out would be a worse failure than the staleness it guards
+                    // against. The next interval tries again.
+                    Err(e) => {
+                        warn!("Could not re-check River's room-contract pointer: {e}");
+                    }
+                }
+            }
+
             // Check for shutdown signal
             if shutdown_rx.try_recv().is_ok() {
                 if matches!(format, OutputFormat::Human) {
@@ -6459,13 +6724,11 @@ impl ApiClient {
                     // still holds. The delta payload itself is advisory here.
                     let _ = update;
                     drop(web_api); // get_room needs the web_api lock
-                    match self.get_room(room_owner_key, false).await {
-                        Ok(mut room_state) => {
-                            // Decrypt private-room content for display (no-op for public rooms).
-                            let secrets =
-                                self.room_display_secrets(room_owner_key, &mut room_state);
-                            Self::emit_new_and_edited(
+                    match self.fetch_stream_state(room_owner_key).await {
+                        Ok((room_state, secrets)) => {
+                            Self::emit_stream_changes(
                                 &room_state,
+                                &secrets,
                                 &mut seen_messages,
                                 &mut deleted_emitted,
                                 &mut seen_reactions,
@@ -6473,25 +6736,6 @@ impl ApiClient {
                                 &format,
                                 max_messages,
                                 &mut new_message_count,
-                                &secrets,
-                            )?;
-                            Self::emit_deletions(
-                                &room_state,
-                                &seen_messages,
-                                &mut deleted_emitted,
-                                room_owner_key,
-                                &format,
-                                &secrets,
-                            )?;
-                            // Surface reactions added/removed since a message was
-                            // already streamed. Runs AFTER emit_new_and_edited so a
-                            // brand-new message is seeded (not re-emitted) here.
-                            Self::emit_reaction_changes(
-                                &room_state,
-                                &mut seen_reactions,
-                                room_owner_key,
-                                &format,
-                                &secrets,
                             )?;
                         }
                         Err(e) => {
@@ -9088,6 +9332,100 @@ mod reaccept_guard_tests {
             "the re-accept guard must run BEFORE the network GET so a refused re-accept \
              does no network or storage work"
         );
+    }
+}
+
+#[cfg(test)]
+mod pointer_refresh_tests {
+    use super::*;
+
+    /// A stream acts on `moved` by tearing down and rebuilding its subscription,
+    /// so a false positive is a self-inflicted outage and a false negative is the
+    /// freenet/river#694 silence. Pin both directions.
+    #[test]
+    fn anchor_refresh_reports_only_a_real_generation_move() {
+        use crate::pointer::{anchor_from_report, code_hash_b58, ResolveReport};
+        use freenet_migrate::pointer::PointerFloor;
+
+        // `Failed` against a never-resolved floor yields an anchor sitting on the
+        // bundled hash, so varying `bundled` is how this test varies the
+        // generation without needing a node or a signed record.
+        let anchor_for = |bundled: [u8; 32]| {
+            anchor_from_report(
+                &ResolveReport::Failed("node unreachable".to_string()),
+                &PointerFloor::never_resolved(),
+                bundled,
+            )
+            .expect("an unreachable pointer is a usable anchor, not an error")
+        };
+        let before = anchor_for([0xAA; 32]);
+        let after = anchor_for([0xBB; 32]);
+
+        // A first resolution is not a move.
+        let first = AnchorRefresh::new(before.clone(), None);
+        assert!(!first.moved());
+        assert_eq!(first.move_notice(), None);
+
+        // The same generation re-confirmed is not a move either.
+        let same = AnchorRefresh::new(before.clone(), Some(before.clone()));
+        assert!(!same.moved());
+        assert_eq!(same.move_notice(), None);
+
+        // A different generation is.
+        let moved = AnchorRefresh::new(after.clone(), Some(before.clone()));
+        assert!(moved.moved());
+        assert_eq!(moved.anchor().code_hash(), after.code_hash());
+        let notice = moved.move_notice().expect("a move must be announced");
+        // Both generations are named, so a bug report is actionable without a
+        // follow-up question.
+        assert!(
+            notice.contains(&code_hash_b58(before.code_hash())),
+            "{notice}"
+        );
+        assert!(
+            notice.contains(&code_hash_b58(after.code_hash())),
+            "{notice}"
+        );
+        // And it says what riverctl is doing about it, because the operator's
+        // first question is whether their bot is still working.
+        assert!(notice.contains("no restart needed"), "{notice}");
+    }
+
+    /// A re-key that riverctl is too old to write to must still be FOLLOWED for
+    /// reading. A stream that refused to move would stay on the retired
+    /// generation, which is the original bug wearing a safety justification.
+    #[test]
+    fn a_move_to_an_unknown_generation_is_still_a_move() {
+        use crate::pointer::{anchor_from_report, Generation, ResolveReport};
+        use freenet_migrate::pointer::PointerFloor;
+
+        let bundled = bundled_room_code_hash();
+        let before = anchor_from_report(
+            &ResolveReport::Failed("node unreachable".to_string()),
+            &PointerFloor::never_resolved(),
+            bundled,
+        )
+        .unwrap();
+        // An anchor whose hash is neither the bundled one nor any this binary
+        // knows: River has re-keyed past us. The hash has to come from the FLOOR
+        // rather than from `bundled`, or `classify` would call it `Bundled` by
+        // construction and the test would pin nothing.
+        let live = [0x11; 32];
+        let after = anchor_from_report(
+            &ResolveReport::Failed("node unreachable".to_string()),
+            &PointerFloor::at(4, live).expect("a floor at a real code hash"),
+            bundled,
+        )
+        .unwrap();
+        assert_eq!(after.code_hash(), &live);
+        assert_eq!(after.generation(), Generation::Unknown);
+
+        let refresh = AnchorRefresh::new(after, Some(before));
+        assert!(refresh.moved());
+        refresh
+            .anchor()
+            .authorize(KeyIntent::Read)
+            .expect("reads must follow the move even when writes cannot");
     }
 }
 

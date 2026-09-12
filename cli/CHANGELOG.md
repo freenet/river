@@ -2,6 +2,22 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- `message stream` (both `--subscribe` and polling modes) now re-checks River's
+  room-contract pointer every five minutes instead of once at startup, and
+  follows a re-key while running. Previously a long-running bot resolved the
+  pointer once, stayed bound to the retired contract for the life of the
+  process, and went silently deaf: the node has nothing left to send for a
+  generation nobody writes to, and a poll against the retired contract still
+  succeeds because that contract still exists. Neither mode surfaced any error,
+  so the only symptom was a busy room appearing to go quiet, and the only fix
+  was restarting the bot. On a re-key the subscription now re-subscribes to the
+  new generation, prints a stderr notice naming both generations, and catches up
+  on anything written during the gap. Reads follow the move even when the new
+  generation is one this riverctl is too old to write to. (freenet/river#694)
+
 ## [0.2.15] - 2026-09-06
 
 ### Fixed

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::RwLock;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,11 +316,16 @@ pub struct Storage {
     /// key regeneration falls back to the bundled WASM, which is exactly the behaviour
     /// riverctl has always had, and the only behaviour available offline.
     ///
-    /// A `OnceLock` rather than a constructor argument because resolution needs
-    /// a live connection and must stay lazy: `Storage` is built before the
-    /// first GET, and offline commands must not pay for a resolution they will
-    /// never use.
-    room_code_hash: OnceLock<[u8; 32]>,
+    /// Not a constructor argument because resolution needs a live connection
+    /// and must stay lazy: `Storage` is built before the first GET, and offline
+    /// commands must not pay for a resolution they will never use.
+    ///
+    /// A `RwLock` rather than a `OnceLock` because River can re-key the room
+    /// contract while a long-running stream is running, and that stream
+    /// re-resolves the pointer on a cadence (freenet/river#694). A write-once
+    /// cell would pin key regeneration to the generation that was live when the
+    /// process started, which is the staleness the refresh exists to remove.
+    room_code_hash: RwLock<Option<[u8; 32]>>,
 }
 
 impl Storage {
@@ -359,15 +364,37 @@ impl Storage {
             lock_path,
             signing_key_override,
             pointer_floors_path,
-            room_code_hash: OnceLock::new(),
+            room_code_hash: RwLock::new(None),
         })
     }
 
     /// Record the room-contract code hash resolved from River's pointer record,
     /// so key regeneration in [`Self::load_rooms`] agrees with the keys the
-    /// network paths are deriving. Idempotent; a second call is ignored.
+    /// network paths are deriving.
+    ///
+    /// Last write wins. A later call REPLACES an earlier one, because a
+    /// long-running stream re-resolves the pointer and must be able to install a
+    /// generation published after the process started (freenet/river#694).
     pub fn set_room_code_hash(&self, code_hash: [u8; 32]) {
-        let _ = self.room_code_hash.set(code_hash);
+        *self.room_code_hash_slot() = Some(code_hash);
+    }
+
+    /// The code hash recorded so far, or `None` if nothing has been resolved.
+    fn room_code_hash(&self) -> Option<[u8; 32]> {
+        *self
+            .room_code_hash
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Write guard for the code-hash cell, recovering from poisoning rather than
+    /// panicking: the critical section is a single assignment that cannot fail,
+    /// so a poisoned lock can only mean an unrelated panic elsewhere, and
+    /// refusing to store the hash would strand this run on a stale generation.
+    fn room_code_hash_slot(&self) -> std::sync::RwLockWriteGuard<'_, Option<[u8; 32]>> {
+        self.room_code_hash
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Where the anti-rollback floor store lives, so an error can name the file
@@ -605,7 +632,7 @@ impl Storage {
         // it waits for it. Every path that migrates or addresses a contract calls
         // `room_anchor()` first, which sets the hash before touching storage, so
         // nothing that needs the regeneration loses it.
-        let Some(code_hash) = self.room_code_hash.get() else {
+        let Some(code_hash) = self.room_code_hash() else {
             return Ok(storage);
         };
         let mut updated = false;
@@ -622,7 +649,7 @@ impl Storage {
                 Ok(vk) => vk,
                 Err(_) => continue,
             };
-            let new_key = river_core::migration::contract_key_for_code_hash(&owner_vk, code_hash);
+            let new_key = river_core::migration::contract_key_for_code_hash(&owner_vk, &code_hash);
             let new_key_str = new_key.id().to_string();
             if room_info.contract_key != new_key_str {
                 info!(
@@ -2196,18 +2223,41 @@ mod tests {
     /// file (api.rs). Guards the exact regressions the PR fixed: a refactor
     /// reverting a monitor path to identity-only dedup (losing edits) or back to
     /// the colliding author:time key.
+    ///
+    /// The shape of the pin changed with freenet/river#694. It used to count two
+    /// call sites per emitter, one per monitor loop. Both loops now route through
+    /// `emit_stream_changes`, so counting emitter call sites would find ONE and
+    /// read as a regression while the property is in fact better enforced than
+    /// before. So pin the two halves separately: every monitor path reaches the
+    /// shared step, and the shared step still runs all three emitters. That also
+    /// covers the third caller the same change added (the catch-up after a
+    /// mid-run re-subscribe), which the old per-loop count would have missed.
     #[test]
     fn monitor_edit_detection_wiring_pinned() {
         let api_src = include_str!("api.rs");
-        // Both monitor paths (polling + subscribe) must route through the shared
-        // scan helper so edit detection applies to both.
-        let routed = api_src.matches("Self::emit_new_and_edited(").count();
+        // Every monitor path (polling, subscribe notification, and the catch-up
+        // after a re-key) must route through the one shared step.
+        let routed = api_src.matches("Self::emit_stream_changes(").count();
         assert!(
-            routed >= 2,
-            "both monitor paths must call emit_new_and_edited (found {routed}); \
-             do not inline identity-only dedup in either loop or edits stop \
+            routed >= 3,
+            "every monitor path must call emit_stream_changes (found {routed}); \
+             do not inline identity-only dedup in any loop or edits stop \
              surfacing again"
         );
+        // And that shared step must still run all three emitters, or routing
+        // through it would be a way to lose them all at once.
+        for emitter in [
+            "Self::emit_new_and_edited(",
+            "Self::emit_deletions(",
+            "Self::emit_reaction_changes(",
+        ] {
+            assert!(
+                api_src.contains(emitter),
+                "emit_stream_changes must still call {emitter}; dropping one \
+                 silently stops that event kind surfacing on every monitor path \
+                 at once"
+            );
+        }
         // The dedup key must be the stable signature-derived id, not author:time.
         assert!(
             api_src.contains("monitor_seen_key(msg)"),
@@ -2215,19 +2265,13 @@ mod tests {
              author:time lets a same-author same-timestamp collision flip-flop \
              as a spurious edit"
         );
-        // Both monitor paths must also surface deletions (#323).
-        let deletes = api_src.matches("Self::emit_deletions(").count();
-        assert!(
-            deletes >= 2,
-            "both monitor paths must call emit_deletions so deletions surface \
-             as events (found {deletes})"
-        );
-        // Both monitor paths must also surface live reaction changes (#325).
+        // Retained so the reasons the three emitters exist stay recorded here:
+        // deletions (#323) and live reaction changes (#325).
         let reactions = api_src.matches("Self::emit_reaction_changes(").count();
         assert!(
-            reactions >= 2,
-            "both monitor paths must call emit_reaction_changes so reactions \
-             added/removed after a message was streamed surface as events \
+            reactions >= 1,
+            "the shared monitor step must surface reactions \
+             added/removed after a message was streamed as events \
              (found {reactions})"
         );
     }
@@ -2299,6 +2343,60 @@ mod tests {
         assert_eq!(
             retrieved_state.configuration.configuration.max_members,
             state.configuration.configuration.max_members
+        );
+    }
+
+    /// The regression behind freenet/river#694: a long-running stream re-resolves
+    /// River's pointer and must be able to install a generation published AFTER
+    /// the process started. While this cell was a `OnceLock` the second call was
+    /// silently dropped, so key regeneration stayed pinned to whatever was live
+    /// at startup and every subsequent lookup addressed the retired contract.
+    #[test]
+    fn a_second_resolved_generation_replaces_the_first() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+
+        let first_hash = crate::api::bundled_room_code_hash();
+        storage.set_room_code_hash(first_hash);
+        storage
+            .add_room(
+                &owner_vk,
+                &owner_sk,
+                state,
+                &river_core::migration::contract_key_for_code_hash(&owner_vk, &first_hash),
+            )
+            .unwrap();
+
+        // A generation this binary has never seen — exactly what a re-key looks
+        // like to a riverctl that is already running.
+        let second_hash = [0x5Au8; 32];
+        assert_ne!(first_hash, second_hash);
+        storage.set_room_code_hash(second_hash);
+
+        let rooms = storage.load_rooms().unwrap();
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let room = &rooms.rooms[&owner_key_str];
+
+        assert_eq!(
+            room.contract_key,
+            river_core::migration::contract_key_for_code_hash(&owner_vk, &second_hash)
+                .id()
+                .to_string(),
+            "the room must follow the generation resolved most recently, not the one \
+             resolved first"
+        );
+        assert_eq!(
+            room.previous_contract_key.as_deref(),
+            Some(
+                river_core::migration::contract_key_for_code_hash(&owner_vk, &first_hash)
+                    .id()
+                    .to_string()
+                    .as_str()
+            ),
+            "the superseded key must be demoted so the migration probe can find state \
+             left behind on it"
         );
     }
 
