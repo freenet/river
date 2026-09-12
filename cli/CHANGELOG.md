@@ -2,6 +2,57 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- `message stream` (both `--subscribe` and polling modes) now re-checks River's
+  room-contract pointer every five minutes instead of once at startup, and
+  follows a re-key while running. Previously a long-running bot resolved the
+  pointer once, stayed bound to the retired contract for the life of the
+  process, and went silently deaf: the node has nothing left to send for a
+  generation nobody writes to, and a poll against the retired contract still
+  succeeds because that contract still exists. Neither mode surfaced any error,
+  so the only symptom was a busy room appearing to go quiet, and the only fix
+  was restarting the bot. On a re-key the subscription now re-subscribes to the
+  new generation, prints a stderr notice naming both generations, and catches up
+  on anything written during the gap. Reads follow the move even when the new
+  generation is one this riverctl is too old to write to. (freenet/river#694)
+
+  Details worth knowing if you run a bot:
+  - The catch-up fetch runs after **every** refresh, not only after a re-key,
+    because the pointer GET shares the node connection with the subscription and
+    steps over (discarding) frames while it waits for its own answer. One of
+    those can be an update notification for the room being streamed.
+  - A re-SUBSCRIBE the node will not yet accept is **not** fatal. The node most
+    likely to refuse is one that does not hold the newly-published generation
+    yet, so riverctl retries every 30s and keeps polling meanwhile rather than
+    exiting.
+  - A stream moves only when the move is both **evidenced and actionable**. A
+    refresh that merely timed out can name a different hash, and acting on that
+    would announce a re-key that never happened and re-subscribe to a retired
+    generation. And a *verified* re-key to a generation this riverctl does not
+    know is reported but **not** followed: the new key holds nothing this binary
+    can reach (the backward probe will not search from a generation it does not
+    know, and writing is refused), so following it would trade a subscription
+    that is still delivering for a key it cannot act on — leaving the stream
+    silent on both. In that case riverctl stays where the data is and tells you
+    to run `cargo install riverctl --force`.
+  - A signed **withdrawal** of the pointer record ends the stream, rather than
+    being swallowed as a transient failure like every other resolution error.
+  - The interval carries ±20% jitter, so a fleet of bots started together does
+    not hit the network in one synchronised burst after a re-key.
+  - The stream's **periodic** fetch no longer writes: it does not migrate the
+    room, does not self-heal `member_info`, and does not republish state it
+    recovered from an older generation. All three still happen on the stream's
+    first fetch and in every one-shot command. Issuing them on a timer as a side
+    effect of reading was surprising, and — because of a known hazard when a
+    migration's GET races a live notification — unsafe. The periodic fetch still
+    READS across older generations, which is what makes a catch-up straight
+    after a re-key return anything at all.
+  - `message stream` without `--subscribe` now does one full fetch at startup
+    regardless of `--initial-messages`, so migration and the `member_info`
+    self-heal still run in the default polling mode.
+
 ## [0.2.15] - 2026-09-06
 
 ### Fixed

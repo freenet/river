@@ -138,12 +138,37 @@ pub enum AnchorSource {
     /// a build-time key is legitimate.
     NeverPublished,
     /// The pointer could not be consulted, or answered something that moves
-    /// nothing (unreachable, stale, a competing record at the floor version, a
-    /// transport abort). The hash is whatever was last resolved on this install,
-    /// or the bundled one if nothing ever was. Carries the reason, which the
-    /// caller must make visible: this is exactly today's un-anchored behaviour,
-    /// so it is not a regression, but it must not be silent either.
-    Unverified(String),
+    /// nothing. The hash is whatever was last resolved on this install, or the
+    /// bundled one if nothing ever was. Carries the reason, which the caller
+    /// must make visible: this is exactly today's un-anchored behaviour, so it
+    /// is not a regression, but it must not be silent either.
+    ///
+    /// `kind` exists separately from `detail` because the two are used for
+    /// different things and collapsing them loses one of them. `detail` is the
+    /// sentence a human reads. `kind` is what deduplication compares, so that a
+    /// timeout repeating every few minutes stays quiet while a genuinely
+    /// different condition still gets through — and in particular so that
+    /// [`UnverifiedKind::CompetingRecord`], which is a fork or author-key
+    /// signal rather than a hiccup, is never suppressed by an ordinary timeout
+    /// that happened to precede it.
+    Unverified {
+        kind: UnverifiedKind,
+        detail: String,
+    },
+}
+
+/// Why an anchor is unverified — the part worth deduplicating on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnverifiedKind {
+    /// Nothing was learned: a timeout, an unreachable node, a transport abort,
+    /// or a resolver outcome this binary does not understand.
+    Unavailable,
+    /// A validly-signed record OLDER than the floor this install already
+    /// verified. Routine — a freshly-bootstrapped peer can serve one.
+    RolledBack,
+    /// Two different valid records exist at one version. Not routine: it means
+    /// a fork, or an author key producing conflicting statements.
+    CompetingRecord,
 }
 
 /// The room-contract code hash this run will derive keys from, and the
@@ -319,14 +344,170 @@ impl RoomAnchor {
                 self.behind_network_summary()
             )),
             (AnchorSource::NeverPublished, _) => None,
-            (AnchorSource::Unverified(reason), _) => Some(format!(
+            (AnchorSource::Unverified { detail, .. }, _) => Some(format!(
                 "warning: could not verify that riverctl's room-contract generation is current \
-                 ({reason}). Continuing with generation {}. If River has re-keyed since this \
+                 ({detail}). Continuing with generation {}. If River has re-keyed since this \
                  build, room operations will address the wrong contract.",
                 code_hash_b58(&self.code_hash),
             )),
         }
     }
+}
+
+/// The author has signed a statement that there is no current room-contract
+/// code.
+///
+/// A distinct type rather than a plain message because a caller MUST be able to
+/// tell it apart from "we could not reach the pointer". Every other resolution
+/// failure is an absence of knowledge and is safely treated as best-effort — a
+/// long-running stream carries on with what it last verified. A withdrawal is
+/// the opposite: a positive, signature-verified fact that the generation the
+/// stream is using has been retired. Continuing to read from it on the strength
+/// of a cached anchor is exactly the "absence must be proven, not inferred"
+/// mistake this module makes everywhere else, run backwards.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PointerWithdrawn(pub String);
+
+/// What a mid-run refresh should do with the anchor it just resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshDecision {
+    /// Install it: either it is signature-verified, or it names the generation
+    /// already in use and so changes nothing about what is addressed.
+    Accept(RoomAnchor),
+    /// Keep what was already in force. Carries both anchors so the caller can
+    /// say which generation it is staying on and what it declined, and the
+    /// reason, because the two reasons call for very different advice.
+    Decline {
+        keep: RoomAnchor,
+        rejected: RoomAnchor,
+        reason: DeclineReason,
+    },
+}
+
+/// Why a refreshed anchor was not installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The new hash came from something that is not a signature-verified record,
+    /// so it is not evidence of anything. Usually a timeout whose fallback hash
+    /// differs from the one in force because the floor could not be persisted.
+    UnverifiedDisagreement,
+    /// The new hash IS verified, and names a generation this binary does not
+    /// know. River has re-keyed past this riverctl.
+    UnknownGeneration,
+}
+
+impl DeclineReason {
+    /// The line the operator sees. Both name the two generations; they differ in
+    /// what they ask for, and that difference is the point of the enum.
+    pub fn describe(&self, keep: &RoomAnchor, rejected: &RoomAnchor) -> String {
+        let (from, to) = (
+            code_hash_b58(keep.code_hash()),
+            code_hash_b58(rejected.code_hash()),
+        );
+        match self {
+            Self::UnverifiedDisagreement => format!(
+                "note: keeping room-contract generation {from}. An unverified re-check named \
+                 {to} instead, which is not evidence enough to move off a generation already \
+                 in use."
+            ),
+            Self::UnknownGeneration => format!(
+                "warning: River re-keyed the room contract while this command was running, to a \
+                 generation this riverctl does not know.\n                   was: {from}\n  now: {to}\n\
+                 Staying on the generation already in use. The new one holds nothing this \
+                 riverctl can reach — the backward probe refuses to search from a generation \
+                 it does not know, and writing to it is refused — so following it would mean \
+                 giving up a working subscription for a key this binary cannot act on. Run \
+                 `cargo install riverctl --force` and restart to follow it."
+            ),
+        }
+    }
+}
+
+/// Decide whether a refreshed anchor may replace the one in force.
+///
+/// Two rules, and both are about the same thing: a run only moves off a
+/// generation it is already using when the move is both EVIDENCED and ACTIONABLE.
+///
+/// 1. **Only a signature-verified record may move a run.** Anything else is an
+///    absence of knowledge wearing a hash.
+/// 2. **Only a generation this binary knows may be moved TO.** A verified re-key
+///    past this riverctl is real and is reported, but following it trades a
+///    subscription that is still delivering for a key this binary can do nothing
+///    with: the new generation typically holds no state until a newer client
+///    migrates the room, the backward probe refuses to search from an unknown
+///    anchor (see [`probe_plan`]), and writing is refused. Following it would
+///    leave the stream deaf on BOTH generations while announcing that no restart
+///    was needed — the exact silence this module exists to remove, produced by
+///    the mechanism meant to remove it.
+///
+/// The second rule is NOT the stale-anchor bug returning. The anchor is still
+/// resolved, the operator is still told, and a one-shot command still addresses
+/// the live generation. What is declined is only the mid-run TEARDOWN.
+///
+/// Why it has to gate the INSTALL and not merely the announcement: a failed
+/// resolution still produces an anchor, sitting on `last_known()` — the floor's
+/// hash, or the BUNDLED hash when the floor has never been persisted, and
+/// persisting it is best-effort. So a read-only config directory plus one
+/// timeout is enough to resolve a hash that is not where the room is. Declaring
+/// that "not a move" keeps the stream from re-subscribing, but if the anchor is
+/// installed anyway then every later derivation — the polling loop's `get_room`,
+/// the catch-up fetch, the local room store's key regeneration — comes off the
+/// wrong hash, and the stream reads a retired generation while reporting nothing
+/// wrong. That is the silence this whole module exists to remove, arriving
+/// through a second door.
+///
+/// A first resolution (`previous` is `None`) is always accepted: there is
+/// nothing to protect yet, and refusing would leave the run with no anchor at
+/// all.
+pub fn decide_refresh(previous: Option<&RoomAnchor>, resolved: RoomAnchor) -> RefreshDecision {
+    let Some(prev) = previous else {
+        // A first resolution has nothing to protect, and refusing would leave the
+        // run with no anchor at all.
+        return RefreshDecision::Accept(resolved);
+    };
+    if resolved.code_hash() == prev.code_hash() {
+        return RefreshDecision::Accept(resolved);
+    }
+    if !matches!(resolved.source(), AnchorSource::Pointer) {
+        return RefreshDecision::Decline {
+            keep: prev.clone(),
+            rejected: resolved,
+            reason: DeclineReason::UnverifiedDisagreement,
+        };
+    }
+    if resolved.generation() == Generation::Unknown {
+        return RefreshDecision::Decline {
+            keep: prev.clone(),
+            rejected: resolved,
+            reason: DeclineReason::UnknownGeneration,
+        };
+    }
+    RefreshDecision::Accept(resolved)
+}
+
+/// A stable key for the CONDITION an advisory describes, or `None` when there is
+/// nothing to say.
+///
+/// Callers deduplicate on this rather than on the rendered text, and remember
+/// every key they have printed rather than only the previous one. Both halves
+/// matter and each was wrong once:
+///
+///   * comparing the TEXT reprinted a condition whose wording embeds a version
+///     number that changes between attempts;
+///   * comparing only against the PREVIOUS anchor reprinted a condition that
+///     merely alternates — reachable → unreachable → reachable is a *changed*
+///     condition every time, so a flapping node produced a warning every few
+///     minutes, which is the alarm fatigue the deduplication exists to prevent.
+pub fn advisory_key(anchor: &RoomAnchor) -> Option<String> {
+    anchor.advisory()?;
+    let source = match &anchor.source {
+        AnchorSource::Pointer => "pointer".to_string(),
+        AnchorSource::NeverPublished => "never-published".to_string(),
+        // The KIND, never the detail.
+        AnchorSource::Unverified { kind, .. } => format!("unverified:{kind:?}"),
+    };
+    Some(format!("{:?}/{source}", anchor.generation))
 }
 
 /// What a resolution attempt produced, flattened so the arm-by-arm mapping
@@ -360,7 +541,7 @@ pub fn anchor_from_report(
     // superseded would resurrect, out of our own memory, exactly the code the
     // author retired.
     if floor.is_withdrawn() {
-        bail!(withdrawn_message(floor.version()));
+        return Err(PointerWithdrawn(withdrawn_message(floor.version())).into());
     }
 
     // What to use when nothing was learned: the last hash this install verified,
@@ -375,7 +556,10 @@ pub fn anchor_from_report(
             return Ok(RoomAnchor::unvouched(
                 last_known(),
                 bundled,
-                AnchorSource::Unverified(reason.clone()),
+                AnchorSource::Unverified {
+                    kind: UnverifiedKind::Unavailable,
+                    detail: reason.clone(),
+                },
             ));
         }
         ResolveReport::Outcome(o) => o,
@@ -390,7 +574,9 @@ pub fn anchor_from_report(
 
         // The author says there is no current code. Not "the old code is
         // current again", so there is nothing to fall back to.
-        PointerOutcome::Withdrawn { version, .. } => bail!(withdrawn_message(*version)),
+        PointerOutcome::Withdrawn { version, .. } => {
+            Err(PointerWithdrawn(withdrawn_message(*version)).into())
+        }
 
         // The only arm in which a build-time key is legitimate.
         PointerOutcome::NeverPublished => Ok(RoomAnchor::unvouched(
@@ -405,10 +591,13 @@ pub fn anchor_from_report(
         PointerOutcome::Stale { served, floor: f } => Ok(RoomAnchor::unvouched(
             last_known(),
             bundled,
-            AnchorSource::Unverified(format!(
-                "a peer served pointer version {served}, older than the version {f} this install \
-                 already verified; the rollback was refused"
-            )),
+            AnchorSource::Unverified {
+                kind: UnverifiedKind::RolledBack,
+                detail: format!(
+                    "a peer served pointer version {served}, older than the version {f} this \
+                     install already verified; the rollback was refused"
+                ),
+            },
         )),
 
         // Two valid records at one version; ours won the tiebreak. The resolver
@@ -420,10 +609,13 @@ pub fn anchor_from_report(
         PointerOutcome::CompetingRecord { version, .. } => Ok(RoomAnchor::unvouched(
             last_known(),
             bundled,
-            AnchorSource::Unverified(format!(
-                "a second, different pointer record exists at version {version}; keeping the one \
-                 already verified here rather than choosing between them"
-            )),
+            AnchorSource::Unverified {
+                kind: UnverifiedKind::CompetingRecord,
+                detail: format!(
+                    "a second, different pointer record exists at version {version}; keeping the \
+                     one already verified here rather than choosing between them"
+                ),
+            },
         )),
 
         // Nothing could be learned. This is today's behaviour, so continuing is
@@ -432,10 +624,12 @@ pub fn anchor_from_report(
         PointerOutcome::Unavailable => Ok(RoomAnchor::unvouched(
             last_known(),
             bundled,
-            AnchorSource::Unverified(
-                "the pointer record could not be fetched (timeout, or the node had no answer)"
+            AnchorSource::Unverified {
+                kind: UnverifiedKind::Unavailable,
+                detail: "the pointer record could not be fetched (timeout, or the node had no \
+                         answer)"
                     .to_string(),
-            ),
+            },
         )),
 
         // `PointerOutcome` is `#[non_exhaustive]`. A future arm is not something
@@ -444,10 +638,13 @@ pub fn anchor_from_report(
         other => Ok(RoomAnchor::unvouched(
             last_known(),
             bundled,
-            AnchorSource::Unverified(format!(
-                "the pointer resolver returned an outcome this riverctl does not understand \
-                 ({other:?}); upgrade riverctl"
-            )),
+            AnchorSource::Unverified {
+                kind: UnverifiedKind::Unavailable,
+                detail: format!(
+                    "the pointer resolver returned an outcome this riverctl does not understand \
+                     ({other:?}); upgrade riverctl"
+                ),
+            },
         )),
     }
 }
@@ -616,31 +813,29 @@ pub fn floor_corruption_hint(path: &std::path::Path) -> String {
     )
 }
 
+/// Helpers shared by this module's tests and `crate::api`'s.
+///
+/// Lives outside `mod tests` so `api` can build anchors the same way this module
+/// does — through a real signed record and the real resolver. An `api` test that
+/// hand-built an anchor instead could pin behaviour against a provenance the
+/// resolver never produces, which is exactly the class of test this codebase
+/// avoids elsewhere.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use freenet_migrate::pointer::{
-        pointer_contract_id, pointer_params, pointer_signing_message, PointerRecord,
-        PointerResolver,
+        pointer_params, pointer_signing_message, PointerRecord, PointerResolver,
     };
     use freenet_migrate::Step;
 
-    fn bundled() -> [u8; 32] {
-        [0xAA; 32]
-    }
-
-    fn owner() -> VerifyingKey {
-        SigningKey::from_bytes(&[7u8; 32]).verifying_key()
-    }
-
-    /// Drive a real resolver against a canned record so the tests below act on
-    /// genuine `PointerOutcome` values rather than hand-built ones. Hand-built
-    /// outcomes would let a test pass against an outcome the resolver can never
-    /// actually produce, and `Withdrawn` / `CompetingRecord` cannot be built
-    /// by hand at all, being `#[non_exhaustive]` variants, which is exactly the
-    /// boundary this helper respects rather than works around.
-    fn outcome_for(
+    /// Drive a real resolver against a canned record so tests act on genuine
+    /// `PointerOutcome` values rather than hand-built ones. Hand-built outcomes
+    /// would let a test pass against an outcome the resolver can never actually
+    /// produce, and `Withdrawn` / `CompetingRecord` cannot be built by hand at
+    /// all, being `#[non_exhaustive]` variants, which is exactly the boundary
+    /// this helper respects rather than works around.
+    pub(crate) fn outcome_for(
         author: &SigningKey,
         floor: PointerFloor,
         version: u32,
@@ -664,6 +859,49 @@ mod tests {
         r.take_outcome().unwrap().unwrap()
     }
 
+    /// An anchor whose provenance is a signature-verified pointer record naming
+    /// `code_hash`. The only provenance permitted to declare a generation move,
+    /// so any test about moves needs this rather than a fallback anchor.
+    pub(crate) fn pointer_anchor(code_hash: [u8; 32], bundled: [u8; 32]) -> RoomAnchor {
+        let author = SigningKey::from_bytes(&[3u8; 32]);
+        let floor = PointerFloor::never_resolved();
+        let outcome = outcome_for(&author, floor, 4, code_hash);
+        let anchor = anchor_from_report(&ResolveReport::Outcome(outcome), &floor, bundled)
+            .expect("a verified record is a usable anchor");
+        assert_eq!(anchor.source(), &AnchorSource::Pointer);
+        anchor
+    }
+
+    /// An anchor that no pointer vouched for, sitting on `code_hash`. The
+    /// contrast case: same shape, provenance that must NOT move a stream.
+    pub(crate) fn unverified_anchor(code_hash: [u8; 32], bundled: [u8; 32]) -> RoomAnchor {
+        let floor = PointerFloor::at(4, code_hash).expect("a floor at a real code hash");
+        let anchor = anchor_from_report(
+            &ResolveReport::Failed("node unreachable".to_string()),
+            &floor,
+            bundled,
+        )
+        .expect("an unreachable pointer stays best-effort");
+        assert!(matches!(anchor.source(), AnchorSource::Unverified { .. }));
+        anchor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::outcome_for;
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use freenet_migrate::pointer::pointer_contract_id;
+
+    fn bundled() -> [u8; 32] {
+        [0xAA; 32]
+    }
+
+    fn owner() -> VerifyingKey {
+        SigningKey::from_bytes(&[7u8; 32]).verifying_key()
+    }
+
     /// The documented pointer address in `FREENET.md` must be exactly what the
     /// documented author key and app_id derive to. If this fails, one of the two
     /// constants was edited without the other and every resolution would GET the
@@ -679,6 +917,190 @@ mod tests {
             "the author key and app_id in this module no longer derive the pointer address \
              published in FREENET.md"
         );
+    }
+
+    /// Advisories are deduplicated on the CONDITION, and a caller remembers every
+    /// condition it has announced. Both halves were wrong once: comparing the
+    /// rendered text reprinted a condition whose wording embeds a changing
+    /// version number, and comparing only against the previous anchor reprinted a
+    /// condition that merely alternates.
+    #[test]
+    fn the_advisory_key_identifies_the_condition_not_its_wording() {
+        let author = SigningKey::from_bytes(&[3u8; 32]);
+        let live = [0x11; 32];
+
+        let unknown = anchor_from_report(
+            &ResolveReport::Outcome(outcome_for(
+                &author,
+                PointerFloor::never_resolved(),
+                4,
+                live,
+            )),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        assert!(unknown.advisory().is_some());
+        assert!(advisory_key(&unknown).is_some());
+
+        // Two unverified conditions whose WORDING differs but whose condition is
+        // the same share a key, so the second is never reprinted.
+        let a = anchor_from_report(
+            &ResolveReport::Failed("timed out".to_string()),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        let b = anchor_from_report(
+            &ResolveReport::Failed("transport aborted".to_string()),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        assert_ne!(a.advisory(), b.advisory(), "the wording must differ");
+        assert_eq!(advisory_key(&a), advisory_key(&b), "the condition does not");
+
+        // A genuinely different condition gets a different key.
+        assert_ne!(advisory_key(&unknown), advisory_key(&a));
+
+        // An anchor with nothing to say has no key, so it can never be announced.
+        let quiet = anchor_from_report(
+            &ResolveReport::Outcome(outcome_for(
+                &author,
+                PointerFloor::never_resolved(),
+                4,
+                bundled(),
+            )),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        assert_eq!(quiet.advisory(), None);
+        assert_eq!(advisory_key(&quiet), None);
+    }
+
+    #[test]
+    fn a_withdrawal_is_distinguishable_from_an_unreachable_pointer() {
+        let author = SigningKey::from_bytes(&[3u8; 32]);
+        let floor = PointerFloor::never_resolved();
+        let tombstone = outcome_for(&author, floor, 9, [0u8; 32]);
+        assert!(matches!(tombstone, PointerOutcome::Withdrawn { .. }));
+
+        let err = anchor_from_report(&ResolveReport::Outcome(tombstone), &floor, bundled())
+            .expect_err("a withdrawal is not a usable anchor");
+        assert!(
+            err.downcast_ref::<PointerWithdrawn>().is_some(),
+            "a withdrawal must be recognisable by TYPE, not by matching its text: {err}"
+        );
+
+        // The contrast case: an unreachable pointer is not an error at all, so a
+        // caller that only checks for `PointerWithdrawn` cannot confuse the two.
+        let unreachable = anchor_from_report(
+            &ResolveReport::Failed("node unreachable".to_string()),
+            &floor,
+            bundled(),
+        )
+        .expect("an unreachable pointer stays best-effort");
+        assert_eq!(unreachable.code_hash(), &bundled());
+    }
+
+    /// The install gate, which is a different question from whether to announce a
+    /// move: an unverified anchor that is installed anyway sends every later key
+    /// derivation to the wrong generation, silently.
+    #[test]
+    fn only_a_verified_record_may_replace_the_generation_in_force() {
+        use super::test_support::{pointer_anchor, unverified_anchor};
+        let b = bundled();
+        // A generation this binary knows: the destination of a move it can act on.
+        let known = river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES[3];
+
+        let in_force = pointer_anchor(b, b);
+
+        // A verified record naming a generation we know: accepted, and it is what
+        // gets installed.
+        let verified_move = pointer_anchor(known, b);
+        assert_eq!(verified_move.generation(), Generation::Legacy(3));
+        assert_eq!(
+            decide_refresh(Some(&in_force), verified_move.clone()),
+            RefreshDecision::Accept(verified_move),
+        );
+
+        // An UNVERIFIED anchor naming a different generation: declined, and the
+        // generation in force is what stays.
+        let fallback = unverified_anchor(known, b);
+        assert_ne!(fallback.code_hash(), in_force.code_hash());
+        match decide_refresh(Some(&in_force), fallback.clone()) {
+            RefreshDecision::Decline {
+                keep,
+                rejected,
+                reason,
+            } => {
+                assert_eq!(reason, DeclineReason::UnverifiedDisagreement);
+                assert_eq!(keep.code_hash(), in_force.code_hash());
+                assert_eq!(rejected.code_hash(), fallback.code_hash());
+            }
+            other => panic!("an unverified hash change must be declined, got {other:?}"),
+        }
+
+        // An unverified anchor naming the SAME generation is harmless — it
+        // addresses the same contract — so it is accepted rather than declined.
+        let same_hash_unverified = unverified_anchor(b, b);
+        assert!(matches!(
+            decide_refresh(Some(&in_force), same_hash_unverified),
+            RefreshDecision::Accept(_)
+        ));
+
+        // A first resolution has nothing to protect and must never be declined,
+        // or a run whose first pointer GET times out would have no anchor at all.
+        let first = unverified_anchor(b, b);
+        assert!(matches!(
+            decide_refresh(None, first),
+            RefreshDecision::Accept(_)
+        ));
+    }
+
+    /// The second rule, and the one that is counter-intuitive: a VERIFIED re-key
+    /// to a generation this binary does not know is declined too.
+    ///
+    /// Following it reads as strictly better — reads are permitted against any
+    /// generation — and is in fact how a running stream goes deaf on BOTH. The
+    /// new key holds nothing this binary can reach (the backward probe refuses to
+    /// search from an unknown anchor, and writing is refused), and the stream
+    /// would have given up a subscription that was still delivering to get there.
+    #[test]
+    fn a_verified_rekey_past_this_binary_is_reported_but_not_followed() {
+        use super::test_support::pointer_anchor;
+        let b = bundled();
+        let in_force = pointer_anchor(b, b);
+        let past_us = pointer_anchor([0x11; 32], b);
+        assert_eq!(past_us.generation(), Generation::Unknown);
+        assert_eq!(past_us.source(), &AnchorSource::Pointer, "it IS verified");
+
+        match decide_refresh(Some(&in_force), past_us.clone()) {
+            RefreshDecision::Decline {
+                keep,
+                rejected,
+                reason,
+            } => {
+                assert_eq!(reason, DeclineReason::UnknownGeneration);
+                assert_eq!(keep.code_hash(), in_force.code_hash());
+                // And the operator is told to upgrade, not reassured.
+                let msg = reason.describe(&keep, &rejected);
+                assert!(msg.contains("cargo install riverctl"), "{msg}");
+                assert!(
+                    !msg.contains("no restart needed"),
+                    "an unfollowable move must not claim a restart is unnecessary: {msg}"
+                );
+            }
+            other => panic!("a re-key past this binary must not be followed, got {other:?}"),
+        }
+
+        // A one-shot command is unaffected: with nothing in force there is no
+        // subscription to protect, so the live generation is still adopted.
+        assert!(matches!(
+            decide_refresh(None, past_us),
+            RefreshDecision::Accept(_)
+        ));
     }
 
     #[test]

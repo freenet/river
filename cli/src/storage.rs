@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::RwLock;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,11 +316,16 @@ pub struct Storage {
     /// key regeneration falls back to the bundled WASM, which is exactly the behaviour
     /// riverctl has always had, and the only behaviour available offline.
     ///
-    /// A `OnceLock` rather than a constructor argument because resolution needs
-    /// a live connection and must stay lazy: `Storage` is built before the
-    /// first GET, and offline commands must not pay for a resolution they will
-    /// never use.
-    room_code_hash: OnceLock<[u8; 32]>,
+    /// Not a constructor argument because resolution needs a live connection
+    /// and must stay lazy: `Storage` is built before the first GET, and offline
+    /// commands must not pay for a resolution they will never use.
+    ///
+    /// A `RwLock` rather than a `OnceLock` because River can re-key the room
+    /// contract while a long-running stream is running, and that stream
+    /// re-resolves the pointer on a cadence (freenet/river#694). A write-once
+    /// cell would pin key regeneration to the generation that was live when the
+    /// process started, which is the staleness the refresh exists to remove.
+    room_code_hash: RwLock<Option<[u8; 32]>>,
 }
 
 impl Storage {
@@ -359,15 +364,42 @@ impl Storage {
             lock_path,
             signing_key_override,
             pointer_floors_path,
-            room_code_hash: OnceLock::new(),
+            room_code_hash: RwLock::new(None),
         })
     }
 
     /// Record the room-contract code hash resolved from River's pointer record,
     /// so key regeneration in [`Self::load_rooms`] agrees with the keys the
-    /// network paths are deriving. Idempotent; a second call is ignored.
+    /// network paths are deriving.
+    ///
+    /// Last write wins. A later call REPLACES an earlier one, because a
+    /// long-running stream re-resolves the pointer and must be able to install a
+    /// generation published after the process started (freenet/river#694).
     pub fn set_room_code_hash(&self, code_hash: [u8; 32]) {
-        let _ = self.room_code_hash.set(code_hash);
+        *self.room_code_hash_slot() = Some(code_hash);
+    }
+
+    /// The code hash recorded so far, or `None` if nothing has been resolved.
+    fn room_code_hash(&self) -> Option<[u8; 32]> {
+        *self
+            .room_code_hash
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Write guard for the code-hash cell.
+    ///
+    /// Poisoning is per-lock and happens only when a thread panics while holding
+    /// THIS lock's write guard. The sole critical section is one assignment, so
+    /// that cannot happen and the recovery arm is unreachable. It is spelled
+    /// `unwrap_or_else` rather than `unwrap` anyway, because the failure it would
+    /// otherwise cause — an abort while installing a freshly-resolved generation
+    /// — is far worse than proceeding, and a future edit that does something
+    /// fallible in here should degrade rather than kill a running stream.
+    fn room_code_hash_slot(&self) -> std::sync::RwLockWriteGuard<'_, Option<[u8; 32]>> {
+        self.room_code_hash
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Where the anti-rollback floor store lives, so an error can name the file
@@ -605,7 +637,7 @@ impl Storage {
         // it waits for it. Every path that migrates or addresses a contract calls
         // `room_anchor()` first, which sets the hash before touching storage, so
         // nothing that needs the regeneration loses it.
-        let Some(code_hash) = self.room_code_hash.get() else {
+        let Some(code_hash) = self.room_code_hash() else {
             return Ok(storage);
         };
         let mut updated = false;
@@ -622,7 +654,7 @@ impl Storage {
                 Ok(vk) => vk,
                 Err(_) => continue,
             };
-            let new_key = river_core::migration::contract_key_for_code_hash(&owner_vk, code_hash);
+            let new_key = river_core::migration::contract_key_for_code_hash(&owner_vk, &code_hash);
             let new_key_str = new_key.id().to_string();
             if room_info.contract_key != new_key_str {
                 info!(
@@ -2191,22 +2223,170 @@ mod tests {
         );
     }
 
+    /// Source-grep pin: BOTH stream loops must treat a pointer WITHDRAWAL as
+    /// fatal and every other refresh failure as best-effort.
+    ///
+    /// `only_a_withdrawal_is_a_fatal_refresh_failure` pins the PREDICATE. Nothing
+    /// pinned that the loops consult it, and this file has learned that
+    /// distinction the expensive way before: `await_response_tests` exists
+    /// because the classifier tests bound the predicate while the loop joining
+    /// them — where the defect actually lived — was unbound. A loop that dropped
+    /// this check would keep reading a generation the author has signed away,
+    /// reporting nothing, which is indistinguishable from working.
+    ///
+    /// Lives in storage.rs so the pinned strings are not self-satisfied by the
+    /// file being scanned.
+    #[test]
+    fn both_stream_loops_stop_on_a_pointer_withdrawal() {
+        let api_src = include_str!("api.rs");
+        let checks = api_src
+            .matches("if Self::refresh_failure_is_fatal(&e) {")
+            .count();
+        assert_eq!(
+            checks, 2,
+            "both the polling and the subscription loop must consult \
+             refresh_failure_is_fatal on a failed refresh (found {checks}); without it a \
+             signed withdrawal reads as an ordinary timeout and the stream keeps reading a \
+             retired generation"
+        );
+        // And each check must RETURN, not merely notice. Scanned by slicing a
+        // window after each occurrence rather than matching a fixed indentation:
+        // the two call sites are nested at different depths, so an
+        // indentation-sensitive literal could only ever match one of them — which
+        // is what an earlier version of this guard did, alongside an `||`
+        // fallback (`"return Err(e);" appears at least twice in the file`) that
+        // no realistic edit could fail. Between them, half this test was
+        // decoration.
+        for (i, at) in api_src.match_indices("Self::refresh_failure_is_fatal(&e)") {
+            let _ = at;
+            let window = &api_src[i..api_src.len().min(i + 200)];
+            assert!(
+                window.contains("return Err(e);"),
+                "a fatal refresh failure must END the stream; the check at byte {i} notices \
+                 it without returning, which leaves the stream reading a generation the \
+                 author has signed away"
+            );
+        }
+    }
+
+    /// Source-grep pins for the two invariants review had to restore in #696,
+    /// both of which were silent when broken.
+    ///
+    /// They are here because nothing else would notice a refactor undoing them:
+    /// the behaviour they protect only shows up against a live node, mid-re-key.
+    #[test]
+    fn the_stream_fetch_stays_read_only_and_the_startup_fetch_stays_unconditional() {
+        let api_src = include_str!("api.rs");
+
+        // 1. The PERIODIC fetch must not go through `get_room`, which migrates
+        //    and self-heals — writes, on a timer, one of them into a path that
+        //    mis-reads an interleaved notification (freenet/river#689).
+        let fetch_body = api_src
+            .split_once("    async fn fetch_stream_state(")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .expect("fetch_stream_state must exist as a 4-space-indented method");
+        assert!(
+            !fetch_body.contains("self.get_room("),
+            "fetch_stream_state must not call get_room: it runs on a timer, and get_room \
+             migrates and heals, which are writes"
+        );
+        assert!(
+            fetch_body.contains("RecoveryWrites::Suppressed"),
+            "the periodic fetch must suppress the recovery republish, or it publishes state \
+             on a timer as a side effect of reading"
+        );
+
+        // 2. The polling loop's startup fetch must NOT be gated on how many
+        //    messages are to be displayed. `--initial-messages` defaults to 0, so
+        //    gating it there meant the default invocation never migrated and
+        //    never healed — a member stayed "Unknown" to every peer for the life
+        //    of the stream.
+        let polling = api_src
+            .split_once("    pub async fn stream_messages(")
+            .and_then(|(_, rest)| rest.split_once("        // Set up Ctrl+C handler"))
+            .map(|(body, _)| body)
+            .expect("stream_messages must exist and set up a Ctrl+C handler");
+        let fetch_at = polling
+            .find("self.get_room(room_owner_key, false)")
+            .expect("the polling stream must fetch once at startup");
+        let gate_at = polling.find("if initial_messages > 0");
+        assert!(
+            gate_at.is_none_or(|g| fetch_at < g),
+            "the startup fetch must come BEFORE the display gate; behind it, the default \
+             `--initial-messages=0` means it never runs at all"
+        );
+    }
+
     /// Source-grep pins for the monitor edit/reply wiring (PR #322), in
     /// storage.rs so the pinned strings aren't self-satisfied by the scanned
     /// file (api.rs). Guards the exact regressions the PR fixed: a refactor
     /// reverting a monitor path to identity-only dedup (losing edits) or back to
     /// the colliding author:time key.
+    ///
+    /// The shape of the pin changed with freenet/river#694. It used to count two
+    /// call sites per emitter, one per monitor loop. Both loops now route through
+    /// `emit_stream_changes`, so counting emitter call sites would find ONE and
+    /// read as a regression while the property is in fact better enforced than
+    /// before. So pin the two halves separately: every monitor path reaches the
+    /// shared step, and the shared step still runs all three emitters. That also
+    /// covers the third caller the same change added (the catch-up after a
+    /// mid-run re-subscribe), which the old per-loop count would have missed.
     #[test]
     fn monitor_edit_detection_wiring_pinned() {
         let api_src = include_str!("api.rs");
-        // Both monitor paths (polling + subscribe) must route through the shared
-        // scan helper so edit detection applies to both.
-        let routed = api_src.matches("Self::emit_new_and_edited(").count();
+        // Every monitor path (polling, subscribe notification, and the catch-up
+        // after a re-key) must route through the one shared step.
+        let routed = api_src.matches("Self::emit_stream_changes(").count();
         assert!(
-            routed >= 2,
-            "both monitor paths must call emit_new_and_edited (found {routed}); \
-             do not inline identity-only dedup in either loop or edits stop \
+            routed >= 3,
+            "every monitor path must call emit_stream_changes (found {routed}); \
+             do not inline identity-only dedup in any loop or edits stop \
              surfacing again"
+        );
+        // And that shared step must still run all three emitters, or routing
+        // through it would be a way to lose them all at once.
+        //
+        // Sliced to the body of `emit_stream_changes` rather than searched over
+        // the whole file, because a bare `contains` is satisfiable WITHOUT the
+        // property holding: delete the call from the shared step, add one back in
+        // a single loop, and a whole-file search still finds the string while
+        // deletions have silently stopped surfacing on the other two paths. That
+        // is not hypothetical — it was demonstrated against the first version of
+        // this guard during review of freenet/river#696.
+        let shared_step = api_src
+            .split_once("    fn emit_stream_changes(")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .expect(
+                "emit_stream_changes must exist as a 4-space-indented method; if it was \
+                 renamed or reshaped, re-point this guard rather than deleting it",
+            );
+        for emitter in [
+            "Self::emit_new_and_edited(",
+            "Self::emit_deletions(",
+            "Self::emit_reaction_changes(",
+        ] {
+            assert!(
+                shared_step.contains(emitter),
+                "emit_stream_changes must itself call {emitter}; dropping it there \
+                 silently stops that event kind surfacing on every monitor path at \
+                 once, and a call left elsewhere in the file does not restore it"
+            );
+        }
+        // The order is load-bearing: emit_reaction_changes must see a brand-new
+        // message already seeded by emit_new_and_edited, or it re-emits it as a
+        // reaction change.
+        let new_at = shared_step
+            .find("Self::emit_new_and_edited(")
+            .expect("checked above");
+        let reactions_at = shared_step
+            .find("Self::emit_reaction_changes(")
+            .expect("checked above");
+        assert!(
+            new_at < reactions_at,
+            "emit_new_and_edited must run BEFORE emit_reaction_changes, or a \
+             brand-new message is re-emitted as a reaction change"
         );
         // The dedup key must be the stable signature-derived id, not author:time.
         assert!(
@@ -2215,19 +2395,13 @@ mod tests {
              author:time lets a same-author same-timestamp collision flip-flop \
              as a spurious edit"
         );
-        // Both monitor paths must also surface deletions (#323).
-        let deletes = api_src.matches("Self::emit_deletions(").count();
-        assert!(
-            deletes >= 2,
-            "both monitor paths must call emit_deletions so deletions surface \
-             as events (found {deletes})"
-        );
-        // Both monitor paths must also surface live reaction changes (#325).
+        // Retained so the reasons the three emitters exist stay recorded here:
+        // deletions (#323) and live reaction changes (#325).
         let reactions = api_src.matches("Self::emit_reaction_changes(").count();
         assert!(
-            reactions >= 2,
-            "both monitor paths must call emit_reaction_changes so reactions \
-             added/removed after a message was streamed surface as events \
+            reactions >= 1,
+            "the shared monitor step must surface reactions \
+             added/removed after a message was streamed as events \
              (found {reactions})"
         );
     }
@@ -2299,6 +2473,60 @@ mod tests {
         assert_eq!(
             retrieved_state.configuration.configuration.max_members,
             state.configuration.configuration.max_members
+        );
+    }
+
+    /// The regression behind freenet/river#694: a long-running stream re-resolves
+    /// River's pointer and must be able to install a generation published AFTER
+    /// the process started. While this cell was a `OnceLock` the second call was
+    /// silently dropped, so key regeneration stayed pinned to whatever was live
+    /// at startup and every subsequent lookup addressed the retired contract.
+    #[test]
+    fn a_second_resolved_generation_replaces_the_first() {
+        let (storage, _temp_dir) = create_test_storage();
+        let owner_sk = create_test_signing_key();
+        let owner_vk = owner_sk.verifying_key();
+        let state = create_test_state(&owner_sk);
+
+        let first_hash = crate::api::bundled_room_code_hash();
+        storage.set_room_code_hash(first_hash);
+        storage
+            .add_room(
+                &owner_vk,
+                &owner_sk,
+                state,
+                &river_core::migration::contract_key_for_code_hash(&owner_vk, &first_hash),
+            )
+            .unwrap();
+
+        // A generation this binary has never seen — exactly what a re-key looks
+        // like to a riverctl that is already running.
+        let second_hash = [0x5Au8; 32];
+        assert_ne!(first_hash, second_hash);
+        storage.set_room_code_hash(second_hash);
+
+        let rooms = storage.load_rooms().unwrap();
+        let owner_key_str = bs58::encode(owner_vk.as_bytes()).into_string();
+        let room = &rooms.rooms[&owner_key_str];
+
+        assert_eq!(
+            room.contract_key,
+            river_core::migration::contract_key_for_code_hash(&owner_vk, &second_hash)
+                .id()
+                .to_string(),
+            "the room must follow the generation resolved most recently, not the one \
+             resolved first"
+        );
+        assert_eq!(
+            room.previous_contract_key.as_deref(),
+            Some(
+                river_core::migration::contract_key_for_code_hash(&owner_vk, &first_hash)
+                    .id()
+                    .to_string()
+                    .as_str()
+            ),
+            "the superseded key must be demoted so the migration probe can find state \
+             left behind on it"
         );
     }
 
