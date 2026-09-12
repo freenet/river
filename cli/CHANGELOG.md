@@ -35,6 +35,11 @@ All notable changes to riverctl will be documented in this file.
     being swallowed as a transient failure like every other resolution error.
   - The interval carries ±20% jitter, so a fleet of bots started together does
     not hit the network in one synchronised burst after a re-key.
+  - The stream's **periodic** fetch no longer migrates the room or self-heals
+    `member_info`. Those are writes, they still happen on the stream's first
+    fetch and in every one-shot command, and issuing them on a timer as a side
+    effect of reading was both surprising and — because of a known hazard when a
+    migration's GET races a live notification — unsafe.
 
 ## [0.2.15] - 2026-09-06
 

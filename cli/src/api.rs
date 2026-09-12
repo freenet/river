@@ -150,6 +150,20 @@ impl PointerIo for NodePointerIo<'_> {
                 }
             }
         }
+        // Falling out of the loop means the answer never arrived: either the
+        // deadline passed or `MAX_UNRELATED_RESPONSES_DURING_POINTER_GET` frames
+        // were stepped over first. On a busy room the second is reachable, and
+        // it is the one path where a re-key can be missed for a whole refresh
+        // cycle with nothing an operator can see — the advisory says nothing,
+        // because the anchor did not change. So say it here rather than leaving
+        // it to a `debug!` that release builds drop.
+        warn!(
+            "Could not read River's room-contract pointer this cycle (no answer within \
+             {POINTER_GET_TIMEOUT:?}, after stepping over up to \
+             {MAX_UNRELATED_RESPONSES_DURING_POINTER_GET} unrelated responses); \
+             continuing on the generation already in use and retrying next cycle"
+        );
+
         // NEVER `PointerFetch::Absent`. `Absent` is the only answer that can
         // unlock a baked-in build-time key, and this transport cannot produce a
         // trustworthy one: the node reports a missing contract as a
@@ -688,11 +702,31 @@ pub(crate) enum SubscribeAck {
 /// queue fed by the node would be a memory amplification vector.
 pub(crate) const MAX_PENDING_DURING_HANDSHAKE: usize = 16;
 
-pub(crate) fn classify_subscribe_response(response: &HostResponse) -> SubscribeAck {
+/// Classify a response received while awaiting the SUBSCRIBE acknowledgement for
+/// `sent_key`.
+///
+/// The key is checked, for the same reason [`classify_update_response`] checks
+/// it: the node multiplexes every response onto one connection, so a
+/// `SubscribeResponse` for a DIFFERENT contract belongs to some other request
+/// and must be stepped over rather than taken as our answer.
+///
+/// That mattered little while a stream subscribed exactly once, at startup.
+/// Since freenet/river#694 a stream re-subscribes mid-run, concurrently with
+/// traffic that also produces subscribe acknowledgements — `Put { subscribe:
+/// true }` on the migration path, and `get_room(.., true)`. Accepting a stray
+/// ack would clear the pending re-subscribe and leave the stream believing it is
+/// subscribed to the new generation when it is not: straight back to the silence
+/// #694 exists to remove, with only the catch-up surfacing anything.
+pub(crate) fn classify_subscribe_response(
+    response: &HostResponse,
+    sent_key: &ContractInstanceId,
+) -> SubscribeAck {
     match response {
         HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
-            subscribed, ..
-        }) => {
+            key,
+            subscribed,
+            ..
+        }) if key.id() == sent_key => {
             if *subscribed {
                 SubscribeAck::Subscribed
             } else {
@@ -3620,7 +3654,7 @@ impl ApiClient {
                 ));
             }
             match tokio::time::timeout(remaining, web_api.recv()).await {
-                Ok(Ok(response)) => match classify_subscribe_response(&response) {
+                Ok(Ok(response)) => match classify_subscribe_response(&response, &id) {
                     SubscribeAck::Subscribed => {
                         info!("Successfully subscribed to contract");
                         return Ok(());
@@ -5468,7 +5502,15 @@ impl ApiClient {
                 // once every refresh. Fixing one loop and not the other would
                 // leave the same hazard behind in the quieter half.
                 let resolved = tokio::select! {
-                    _ = shutdown_rx.recv() => {
+                    // `Some(())`, not `_`: a CLOSED channel is not a shutdown
+                    // REQUEST, and the sibling `try_recv().is_ok()` check in
+                    // this same loop already reads it that way. Two checks
+                    // disagreeing about what a closed channel means is how a
+                    // later edit to the Ctrl+C task turns into a silent exit
+                    // with status 0 five minutes after start. An unmatched
+                    // pattern disables the branch, so closure just leaves the
+                    // refresh to finish.
+                    Some(()) = shutdown_rx.recv() => {
                         if matches!(format, OutputFormat::Human) {
                             eprintln!("\nStopped monitoring.");
                         }
@@ -5544,19 +5586,49 @@ impl ApiClient {
         }
     }
 
-    /// Fetch authoritative room state for a stream, with private-room content
-    /// decrypted for display (a no-op for public rooms).
+    /// Fetch authoritative room state for a stream's REPEATED reads, with
+    /// private-room content decrypted for display (a no-op for public rooms).
     ///
     /// Split from [`Self::emit_stream_changes`] so the caller keeps the
     /// distinction both stream loops have always drawn: a FETCH failure is
     /// transient and the loop logs it and carries on, while an EMIT failure
     /// (a closed stdout, say) ends the stream. Collapsing the two into one
     /// `Result` would silently convert the second into the first.
+    ///
+    /// Deliberately NOT [`Self::get_room`], which is the command-shaped entry
+    /// point and carries two WRITE side effects: it migrates the room onto the
+    /// bundled generation when one is pending (a PUT plus a signed
+    /// upgrade-pointer UPDATE), and it self-heals a missing `member_info` entry
+    /// (issue freenet/river#304, another publish). Both are right for a command
+    /// a user just typed. Neither is right on a timer.
+    ///
+    /// The sharp edge, and the reason this is a correctness fix rather than
+    /// tidiness: `migrate_room_to_new_contract` folds an `UpdateNotification` of
+    /// ANY key into success and writes that key into `rooms.json` — pinned
+    /// elsewhere in this file as data corruption rather than a tolerance bug
+    /// (freenet/river#689). Its GET takes the FIRST response as its answer, and
+    /// inside a live subscription the first response is very likely a
+    /// notification for this very room. Before pointer refreshing existed, a
+    /// migration could only be triggered by a `previous_contract_key` that was
+    /// already set when the process started, so a stream that got past its first
+    /// fetch never re-entered this path. A mid-run re-key sets that key again
+    /// (`Storage::load_rooms` demotes the superseded key), which would put a
+    /// timer on the door.
+    ///
+    /// Streams still migrate and still heal: their FIRST fetch goes through
+    /// `get_room`, exactly as before, as does every one-shot command. What
+    /// changes is only that a long-running READER stops issuing writes as a
+    /// side effect of reading.
     async fn fetch_stream_state(
         &self,
         room_owner_key: &VerifyingKey,
     ) -> Result<(ChatRoomStateV1, HashMap<u32, [u8; 32]>)> {
-        let mut room_state = self.get_room(room_owner_key, false).await?;
+        let contract_key = self
+            .contract_key_for(room_owner_key, KeyIntent::Read)
+            .await?;
+        let (mut room_state, _found_id) = self
+            .fetch_room_state_with_recovery(room_owner_key, *contract_key.id())
+            .await?;
         let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
         Ok((room_state, secrets))
     }
@@ -6586,7 +6658,7 @@ impl ApiClient {
                 Ok(result) => result.map_err(|e| anyhow!("Failed to receive response: {}", e))?,
                 Err(_) => return Err(anyhow!("Timeout waiting for SUBSCRIBE response")),
             };
-            match classify_subscribe_response(&response) {
+            match classify_subscribe_response(&response, &contract_instance_id) {
                 SubscribeAck::Subscribed => {
                     if matches!(format, OutputFormat::Human) {
                         eprintln!("Successfully subscribed. Waiting for updates...\n");
@@ -6774,7 +6846,15 @@ impl ApiClient {
                 // `mpsc::Receiver::recv` is cancellation-safe, so losing this
                 // race drops nothing.
                 let resolved = tokio::select! {
-                    _ = shutdown_rx.recv() => {
+                    // `Some(())`, not `_`: a CLOSED channel is not a shutdown
+                    // REQUEST, and the sibling `try_recv().is_ok()` check in
+                    // this same loop already reads it that way. Two checks
+                    // disagreeing about what a closed channel means is how a
+                    // later edit to the Ctrl+C task turns into a silent exit
+                    // with status 0 five minutes after start. An unmatched
+                    // pattern disables the branch, so closure just leaves the
+                    // refresh to finish.
+                    Some(()) = shutdown_rx.recv() => {
                         if matches!(format, OutputFormat::Human) {
                             eprintln!("\nStopped monitoring.");
                         }
@@ -6904,7 +6984,15 @@ impl ApiClient {
                 // every re-key, so leaving it unraced would make Ctrl+C hang for
                 // half a minute at exactly the busiest moment.
                 let acked = tokio::select! {
-                    _ = shutdown_rx.recv() => {
+                    // `Some(())`, not `_`: a CLOSED channel is not a shutdown
+                    // REQUEST, and the sibling `try_recv().is_ok()` check in
+                    // this same loop already reads it that way. Two checks
+                    // disagreeing about what a closed channel means is how a
+                    // later edit to the Ctrl+C task turns into a silent exit
+                    // with status 0 five minutes after start. An unmatched
+                    // pattern disables the branch, so closure just leaves the
+                    // refresh to finish.
+                    Some(()) = shutdown_rx.recv() => {
                         if matches!(format, OutputFormat::Human) {
                             eprintln!("\nStopped monitoring.");
                         }
@@ -9612,6 +9700,32 @@ mod pointer_refresh_tests {
         bundled_room_code_hash()
     }
 
+    /// The CHANGELOG advertises ±20% jitter, and its whole purpose is that a
+    /// fleet restarted together does not hit the network in one synchronised
+    /// burst after a re-key. Nothing else would catch an edit that made the
+    /// factor constant, so pin both the bounds and the SPREAD — a jitter
+    /// function that always returned the same value would sit inside the bounds
+    /// and defeat the point entirely.
+    #[test]
+    fn the_refresh_interval_is_jittered_within_twenty_percent() {
+        let base = POINTER_REFRESH_INTERVAL.as_secs_f64();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let d = jittered_pointer_refresh_interval().as_secs_f64();
+            assert!(
+                d >= base * 0.8 && d < base * 1.2,
+                "jittered interval {d} outside ±20% of {base}"
+            );
+            seen.insert(d.to_bits());
+        }
+        assert!(
+            seen.len() > 100,
+            "the interval must actually vary; got {} distinct values in 200 draws, \
+             which means the jitter is not jittering",
+            seen.len()
+        );
+    }
+
     /// A stream acts on `moved` by tearing down and rebuilding its subscription,
     /// so a false positive is a self-inflicted outage and a false negative is the
     /// freenet/river#694 silence. Pin both directions.
@@ -9758,11 +9872,44 @@ mod subscribe_handshake_tests {
         })
     }
 
+    /// The instance id the handshake under test asked for.
+    pub(super) fn expected_id() -> ContractInstanceId {
+        *key().id()
+    }
+
+    /// A subscribe acknowledgement for some OTHER contract on the shared
+    /// connection.
+    fn ack_for_another_contract(subscribed: bool) -> HostResponse {
+        HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key: other_key(),
+            subscribed,
+        })
+    }
+
     fn ack(subscribed: bool) -> HostResponse {
         HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
             key: key(),
             subscribed,
         })
+    }
+
+    /// A subscribe acknowledgement for a DIFFERENT contract is somebody else's
+    /// answer. Taking it would clear a pending re-subscribe and leave a stream
+    /// believing it is attached to a generation it never subscribed to — the
+    /// freenet/river#694 silence, re-entered through the fix for it.
+    #[test]
+    fn an_ack_for_another_contract_does_not_answer_our_subscribe() {
+        assert_eq!(
+            classify_subscribe_response(&ack_for_another_contract(true), &expected_id()),
+            SubscribeAck::NotYet,
+            "a subscribe ack for another key belongs to another request"
+        );
+        // Including a REFUSAL: a refusal for somebody else's contract must not
+        // fail our subscription either.
+        assert_eq!(
+            classify_subscribe_response(&ack_for_another_contract(false), &expected_id()),
+            SubscribeAck::NotYet,
+        );
     }
 
     /// The regression (freenet-core#4970): the node multiplexes its responses,
@@ -9773,7 +9920,7 @@ mod subscribe_handshake_tests {
     #[test]
     fn an_update_notification_does_not_answer_the_subscribe() {
         assert_eq!(
-            classify_subscribe_response(&notification()),
+            classify_subscribe_response(&notification(), &expected_id()),
             SubscribeAck::NotYet,
             "a notification overtaking the ack must leave us waiting, not fail \
              the subscription"
@@ -9783,7 +9930,7 @@ mod subscribe_handshake_tests {
     #[test]
     fn the_acknowledgement_is_recognised() {
         assert_eq!(
-            classify_subscribe_response(&ack(true)),
+            classify_subscribe_response(&ack(true), &expected_id()),
             SubscribeAck::Subscribed
         );
     }
@@ -9794,7 +9941,7 @@ mod subscribe_handshake_tests {
     #[test]
     fn a_refusal_is_an_answer_not_a_reason_to_keep_waiting() {
         assert_eq!(
-            classify_subscribe_response(&ack(false)),
+            classify_subscribe_response(&ack(false), &expected_id()),
             SubscribeAck::Refused
         );
     }
@@ -9922,7 +10069,7 @@ mod subscribe_handshake_tests {
     #[test]
     fn other_responses_are_tolerated() {
         assert_eq!(
-            classify_subscribe_response(&HostResponse::Ok),
+            classify_subscribe_response(&HostResponse::Ok, &expected_id()),
             SubscribeAck::NotYet
         );
     }

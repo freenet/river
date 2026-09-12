@@ -297,6 +297,16 @@ impl RoomAnchor {
         )
     }
 
+    /// What this anchor's advisory is ABOUT: the generation class, and the kind
+    /// of provenance behind it — never the detail that varies between attempts.
+    ///
+    /// This is the unit [`advisory_after`] deduplicates on, so it must not carry
+    /// the `Unverified` reason string: two consecutive timeouts phrased slightly
+    /// differently are the same thing to a reader.
+    fn condition(&self) -> (Generation, std::mem::Discriminant<AnchorSource>) {
+        (self.generation, std::mem::discriminant(&self.source))
+    }
+
     /// The line to put on stderr once, at resolution time, or `None` when there
     /// is nothing worth saying.
     ///
@@ -397,16 +407,22 @@ pub fn decide_refresh(previous: Option<&RoomAnchor>, resolved: RoomAnchor) -> Re
 /// `previous` in this same run.
 ///
 /// Split out from the printing so the suppression rule is testable without a
-/// node. The rule is deliberately narrow: an advisory is withheld only when it
-/// is character-identical to one the user has already seen, so a refresh that
-/// changes what they need to know always says so, and a refresh that changes
-/// nothing stays quiet. A long-running stream re-resolves every few minutes
-/// (freenet/river#694), and re-printing the same "could not verify" warning on
-/// each pass is how a real warning gets trained into background noise.
+/// node.
+///
+/// Compared on the CONDITION — the generation class plus the kind of provenance
+/// — rather than on the rendered text. An earlier version compared the strings,
+/// which looks equivalent and is not: an `Unverified` advisory embeds the detail
+/// that varies between attempts (`"a peer served pointer version 7…"`), so a
+/// condition that merely flaps produced a fresh warning every few minutes. A
+/// long-running stream re-resolves on a timer (freenet/river#694), and repeating
+/// a warning on that cadence is how a real warning gets trained into background
+/// noise — the precise outcome this function exists to avoid.
+///
+/// A genuine change of condition is still always printed.
 pub fn advisory_after(anchor: &RoomAnchor, previous: Option<&RoomAnchor>) -> Option<String> {
     let advisory = anchor.advisory()?;
-    match previous.and_then(|p| p.advisory()) {
-        Some(already) if already == advisory => None,
+    match previous {
+        Some(prev) if prev.advisory().is_some() && prev.condition() == anchor.condition() => None,
         _ => Some(advisory),
     }
 }
@@ -844,6 +860,32 @@ mod tests {
         let printed = advisory_after(&unverified, Some(&unknown))
             .expect("a changed condition must not be suppressed by the previous one");
         assert!(printed.contains("could not verify"), "{printed}");
+
+        // Two UNVERIFIED conditions whose reason strings differ are the same
+        // condition to a reader, and must not reprint every few minutes. This is
+        // the case the string comparison got wrong.
+        let unverified_a = anchor_from_report(
+            &ResolveReport::Failed("timed out".to_string()),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        let unverified_b = anchor_from_report(
+            &ResolveReport::Failed("transport aborted".to_string()),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        assert_ne!(
+            unverified_a.advisory(),
+            unverified_b.advisory(),
+            "the two advisories must differ in wording, or this pins nothing"
+        );
+        assert_eq!(
+            advisory_after(&unverified_b, Some(&unverified_a)),
+            None,
+            "a flapping unverified condition must not reprint on every refresh"
+        );
 
         // An anchor with nothing to say stays silent regardless of history.
         let quiet = anchor_from_report(
