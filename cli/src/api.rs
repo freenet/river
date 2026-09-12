@@ -2670,6 +2670,11 @@ pub struct ApiClient {
     /// The generation named by the last refresh this run declined, so the note
     /// about declining is said when it changes rather than on every cycle.
     last_declined: std::sync::Mutex<Option<[u8; 32]>>,
+    /// Advisory conditions already announced this run. A set, not a last-value:
+    /// a condition that ALTERNATES is a changed condition every time, so
+    /// comparing against the previous one alone reprinted a flapping warning on
+    /// every refresh.
+    announced: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl ApiClient {
@@ -2714,6 +2719,7 @@ impl ApiClient {
             room_anchor: tokio::sync::RwLock::new(None),
             pointer_floor: std::sync::Mutex::new(None),
             last_declined: std::sync::Mutex::new(None),
+            announced: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -2772,7 +2778,7 @@ impl ApiClient {
             return Ok(anchor);
         }
         let anchor = self.resolve_room_anchor().await?;
-        Self::announce_anchor(&anchor, None);
+        self.announce_anchor(&anchor);
         self.install_room_anchor(&mut slot, anchor.clone());
         Ok(anchor)
     }
@@ -2783,8 +2789,19 @@ impl ApiClient {
     /// stderr rather than `warn!` on purpose: riverctl's `EnvFilter` has no
     /// default directive, so with `RUST_LOG` unset the log macros emit NOTHING.
     /// A line that exists to be read by a human cannot go through them.
-    fn announce_anchor(anchor: &RoomAnchor, previous: Option<&RoomAnchor>) {
-        if let Some(advisory) = crate::pointer::advisory_after(anchor, previous) {
+    fn announce_anchor(&self, anchor: &RoomAnchor) {
+        let Some(key) = crate::pointer::advisory_key(anchor) else {
+            return;
+        };
+        let mut seen = self
+            .announced
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !seen.insert(key) {
+            return;
+        }
+        drop(seen);
+        if let Some(advisory) = anchor.advisory() {
             eprintln!("{advisory}");
         }
     }
@@ -2864,7 +2881,7 @@ impl ApiClient {
                 keep
             }
         };
-        Self::announce_anchor(&accepted, previous.as_ref());
+        self.announce_anchor(&accepted);
 
         self.install_room_anchor(&mut slot, accepted.clone());
         Ok(AnchorRefresh::new(accepted, previous))
@@ -5685,12 +5702,24 @@ impl ApiClient {
         //
         // The subscription mode has always fetched unconditionally here; this
         // brings polling into line rather than inventing a new rule.
-        let mut room_state = self.get_room(room_owner_key, false).await?;
-        // Decrypt private-room content for display (no-op for public rooms).
-        let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
+        // Not `?`: before this fetch existed unconditionally, a polling stream
+        // with the default `--initial-messages=0` never touched the node at
+        // startup, so a node that was briefly unreachable meant a slow first poll
+        // rather than an exit. Propagating here would turn that into a non-zero
+        // exit for the DEFAULT invocation. The loop retries; the migrate-and-heal
+        // this fetch also performs is best-effort by nature.
+        let startup = match self.get_room(room_owner_key, false).await {
+            Ok(state) => Some(state),
+            Err(e) => {
+                warn!("Could not fetch room state at startup (will keep polling): {e}");
+                None
+            }
+        };
 
         // Show initial messages if requested
-        if initial_messages > 0 {
+        if let (Some(mut room_state), true) = (startup, initial_messages > 0) {
+            // Decrypt private-room content for display (no-op for public rooms).
+            let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
             // Use display_messages() to filter out action/deleted messages (matches `message list`)
             let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
             let start = all_msgs.len().saturating_sub(initial_messages);
@@ -7090,6 +7119,9 @@ impl ApiClient {
         // Armed when a re-key is detected, disarmed only by a SUBSCRIBE the node
         // accepted.
         let mut resubscribe = Retry::default();
+        // Reset on each detected move, so every re-key gets one visible report if
+        // its re-subscribe does not land immediately.
+        let mut first_resubscribe_failure = true;
 
         // Main loop: wait for UpdateNotification messages
         loop {
@@ -7142,6 +7174,7 @@ impl ApiClient {
                                 .await?
                                 .id();
                             resubscribe.arm();
+                            first_resubscribe_failure = true;
                         }
                     }
                     Err(e) => {
@@ -7301,10 +7334,24 @@ impl ApiClient {
                         catch_up.arm();
                     }
                     Err(e) => {
-                        warn!(
-                            "Could not subscribe to the new room-contract generation yet \
-                             ({e}); retrying, and continuing to poll meanwhile"
+                        // The FIRST failure goes to stderr, because the operator
+                        // has just been told "Re-subscribing to the new
+                        // generation; no restart needed" and this is that claim
+                        // not holding yet. Later attempts stay in the log: the
+                        // point is to correct the record once, not to narrate
+                        // every retry.
+                        let msg = format!(
+                            "note: the node has not accepted a subscription to the new \
+                             room-contract generation yet ({e}). Retrying every {}s, and \
+                             polling meanwhile — messages will still appear.",
+                            RESUBSCRIBE_RETRY_INTERVAL.as_secs()
                         );
+                        if first_resubscribe_failure {
+                            first_resubscribe_failure = false;
+                            eprintln!("{msg}");
+                        } else {
+                            warn!("{msg}");
+                        }
                         // Keep surfacing content while unsubscribed.
                         catch_up.arm();
                     }

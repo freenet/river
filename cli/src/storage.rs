@@ -2249,16 +2249,72 @@ mod tests {
              signed withdrawal reads as an ordinary timeout and the stream keeps reading a \
              retired generation"
         );
-        // And each check must RETURN the error, not merely log it.
-        let returns = api_src
-            .matches("if Self::refresh_failure_is_fatal(&e) {\n                            return Err(e);")
-            .count()
-            + api_src
-                .matches("if Self::refresh_failure_is_fatal(&e) {\n                            return Err(e);")
-                .count();
+        // And each check must RETURN, not merely notice. Scanned by slicing a
+        // window after each occurrence rather than matching a fixed indentation:
+        // the two call sites are nested at different depths, so an
+        // indentation-sensitive literal could only ever match one of them — which
+        // is what an earlier version of this guard did, alongside an `||`
+        // fallback (`"return Err(e);" appears at least twice in the file`) that
+        // no realistic edit could fail. Between them, half this test was
+        // decoration.
+        for (i, at) in api_src.match_indices("Self::refresh_failure_is_fatal(&e)") {
+            let _ = at;
+            let window = &api_src[i..api_src.len().min(i + 200)];
+            assert!(
+                window.contains("return Err(e);"),
+                "a fatal refresh failure must END the stream; the check at byte {i} notices \
+                 it without returning, which leaves the stream reading a generation the \
+                 author has signed away"
+            );
+        }
+    }
+
+    /// Source-grep pins for the two invariants review had to restore in #696,
+    /// both of which were silent when broken.
+    ///
+    /// They are here because nothing else would notice a refactor undoing them:
+    /// the behaviour they protect only shows up against a live node, mid-re-key.
+    #[test]
+    fn the_stream_fetch_stays_read_only_and_the_startup_fetch_stays_unconditional() {
+        let api_src = include_str!("api.rs");
+
+        // 1. The PERIODIC fetch must not go through `get_room`, which migrates
+        //    and self-heals — writes, on a timer, one of them into a path that
+        //    mis-reads an interleaved notification (freenet/river#689).
+        let fetch_body = api_src
+            .split_once("    async fn fetch_stream_state(")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .expect("fetch_stream_state must exist as a 4-space-indented method");
         assert!(
-            returns > 0 || api_src.matches("return Err(e);").count() >= 2,
-            "a fatal refresh failure must end the stream, not just be noticed"
+            !fetch_body.contains("self.get_room("),
+            "fetch_stream_state must not call get_room: it runs on a timer, and get_room \
+             migrates and heals, which are writes"
+        );
+        assert!(
+            fetch_body.contains("RecoveryWrites::Suppressed"),
+            "the periodic fetch must suppress the recovery republish, or it publishes state \
+             on a timer as a side effect of reading"
+        );
+
+        // 2. The polling loop's startup fetch must NOT be gated on how many
+        //    messages are to be displayed. `--initial-messages` defaults to 0, so
+        //    gating it there meant the default invocation never migrated and
+        //    never healed — a member stayed "Unknown" to every peer for the life
+        //    of the stream.
+        let polling = api_src
+            .split_once("    pub async fn stream_messages(")
+            .and_then(|(_, rest)| rest.split_once("        // Set up Ctrl+C handler"))
+            .map(|(body, _)| body)
+            .expect("stream_messages must exist and set up a Ctrl+C handler");
+        let fetch_at = polling
+            .find("self.get_room(room_owner_key, false)")
+            .expect("the polling stream must fetch once at startup");
+        let gate_at = polling.find("if initial_messages > 0");
+        assert!(
+            gate_at.is_none_or(|g| fetch_at < g),
+            "the startup fetch must come BEFORE the display gate; behind it, the default \
+             `--initial-messages=0` means it never runs at all"
         );
     }
 

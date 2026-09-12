@@ -157,15 +157,6 @@ pub enum AnchorSource {
     },
 }
 
-/// The deduplication key for an advisory: the provenance, with `Unverified`
-/// split by kind so distinct conditions are not collapsed into one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnchorCondition {
-    Pointer,
-    NeverPublished,
-    Unverified(UnverifiedKind),
-}
-
 /// Why an anchor is unverified — the part worth deduplicating on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnverifiedKind {
@@ -329,23 +320,6 @@ impl RoomAnchor {
             code_hash_b58(&self.code_hash),
             river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES.len(),
         )
-    }
-
-    /// What this anchor's advisory is ABOUT: the generation class, and the kind
-    /// of provenance behind it — never the detail that varies between attempts.
-    ///
-    /// This is the unit [`advisory_after`] deduplicates on, so it must not carry
-    /// the `Unverified` reason string: two consecutive timeouts phrased slightly
-    /// differently are the same thing to a reader.
-    fn condition(&self) -> (Generation, AnchorCondition) {
-        let source = match &self.source {
-            AnchorSource::Pointer => AnchorCondition::Pointer,
-            AnchorSource::NeverPublished => AnchorCondition::NeverPublished,
-            // The KIND, never the detail: the detail embeds version numbers that
-            // differ between attempts at the same condition.
-            AnchorSource::Unverified { kind, .. } => AnchorCondition::Unverified(*kind),
-        };
-        (self.generation, source)
     }
 
     /// The line to put on stderr once, at resolution time, or `None` when there
@@ -512,28 +486,28 @@ pub fn decide_refresh(previous: Option<&RoomAnchor>, resolved: RoomAnchor) -> Re
     RefreshDecision::Accept(resolved)
 }
 
-/// The advisory to print for `anchor`, given what has already been printed for
-/// `previous` in this same run.
+/// A stable key for the CONDITION an advisory describes, or `None` when there is
+/// nothing to say.
 ///
-/// Split out from the printing so the suppression rule is testable without a
-/// node.
+/// Callers deduplicate on this rather than on the rendered text, and remember
+/// every key they have printed rather than only the previous one. Both halves
+/// matter and each was wrong once:
 ///
-/// Compared on the CONDITION — the generation class plus the kind of provenance
-/// — rather than on the rendered text. An earlier version compared the strings,
-/// which looks equivalent and is not: an `Unverified` advisory embeds the detail
-/// that varies between attempts (`"a peer served pointer version 7…"`), so a
-/// condition that merely flaps produced a fresh warning every few minutes. A
-/// long-running stream re-resolves on a timer (freenet/river#694), and repeating
-/// a warning on that cadence is how a real warning gets trained into background
-/// noise — the precise outcome this function exists to avoid.
-///
-/// A genuine change of condition is still always printed.
-pub fn advisory_after(anchor: &RoomAnchor, previous: Option<&RoomAnchor>) -> Option<String> {
-    let advisory = anchor.advisory()?;
-    match previous {
-        Some(prev) if prev.advisory().is_some() && prev.condition() == anchor.condition() => None,
-        _ => Some(advisory),
-    }
+///   * comparing the TEXT reprinted a condition whose wording embeds a version
+///     number that changes between attempts;
+///   * comparing only against the PREVIOUS anchor reprinted a condition that
+///     merely alternates — reachable → unreachable → reachable is a *changed*
+///     condition every time, so a flapping node produced a warning every few
+///     minutes, which is the alarm fatigue the deduplication exists to prevent.
+pub fn advisory_key(anchor: &RoomAnchor) -> Option<String> {
+    anchor.advisory()?;
+    let source = match &anchor.source {
+        AnchorSource::Pointer => "pointer".to_string(),
+        AnchorSource::NeverPublished => "never-published".to_string(),
+        // The KIND, never the detail.
+        AnchorSource::Unverified { kind, .. } => format!("unverified:{kind:?}"),
+    };
+    Some(format!("{:?}/{source}", anchor.generation))
 }
 
 /// What a resolution attempt produced, flattened so the arm-by-arm mapping
@@ -945,15 +919,16 @@ mod tests {
         );
     }
 
-    /// A refresh must not re-print an advisory the user has already seen, or a
-    /// long-running stream turns a real warning into noise — but it MUST print
-    /// one that has changed, which is the whole point of re-checking.
+    /// Advisories are deduplicated on the CONDITION, and a caller remembers every
+    /// condition it has announced. Both halves were wrong once: comparing the
+    /// rendered text reprinted a condition whose wording embeds a changing
+    /// version number, and comparing only against the previous anchor reprinted a
+    /// condition that merely alternates.
     #[test]
-    fn advisory_is_printed_once_per_distinct_condition() {
+    fn the_advisory_key_identifies_the_condition_not_its_wording() {
         let author = SigningKey::from_bytes(&[3u8; 32]);
         let live = [0x11; 32];
 
-        // An unknown generation: this one has something to say.
         let unknown = anchor_from_report(
             &ResolveReport::Outcome(outcome_for(
                 &author,
@@ -966,51 +941,29 @@ mod tests {
         )
         .unwrap();
         assert!(unknown.advisory().is_some());
+        assert!(advisory_key(&unknown).is_some());
 
-        // First time: printed.
-        assert!(advisory_after(&unknown, None).is_some());
-        // Re-resolved to the very same condition: withheld.
-        assert_eq!(advisory_after(&unknown, Some(&unknown)), None);
-
-        // A DIFFERENT condition after the same run: printed, even though the
-        // previous pass also had something to say.
-        let unverified = anchor_from_report(
-            &ResolveReport::Failed("node unreachable".to_string()),
-            &PointerFloor::never_resolved(),
-            bundled(),
-        )
-        .unwrap();
-        let printed = advisory_after(&unverified, Some(&unknown))
-            .expect("a changed condition must not be suppressed by the previous one");
-        assert!(printed.contains("could not verify"), "{printed}");
-
-        // Two UNVERIFIED conditions whose reason strings differ are the same
-        // condition to a reader, and must not reprint every few minutes. This is
-        // the case the string comparison got wrong.
-        let unverified_a = anchor_from_report(
+        // Two unverified conditions whose WORDING differs but whose condition is
+        // the same share a key, so the second is never reprinted.
+        let a = anchor_from_report(
             &ResolveReport::Failed("timed out".to_string()),
             &PointerFloor::never_resolved(),
             bundled(),
         )
         .unwrap();
-        let unverified_b = anchor_from_report(
+        let b = anchor_from_report(
             &ResolveReport::Failed("transport aborted".to_string()),
             &PointerFloor::never_resolved(),
             bundled(),
         )
         .unwrap();
-        assert_ne!(
-            unverified_a.advisory(),
-            unverified_b.advisory(),
-            "the two advisories must differ in wording, or this pins nothing"
-        );
-        assert_eq!(
-            advisory_after(&unverified_b, Some(&unverified_a)),
-            None,
-            "a flapping unverified condition must not reprint on every refresh"
-        );
+        assert_ne!(a.advisory(), b.advisory(), "the wording must differ");
+        assert_eq!(advisory_key(&a), advisory_key(&b), "the condition does not");
 
-        // An anchor with nothing to say stays silent regardless of history.
+        // A genuinely different condition gets a different key.
+        assert_ne!(advisory_key(&unknown), advisory_key(&a));
+
+        // An anchor with nothing to say has no key, so it can never be announced.
         let quiet = anchor_from_report(
             &ResolveReport::Outcome(outcome_for(
                 &author,
@@ -1023,14 +976,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(quiet.advisory(), None);
-        assert_eq!(advisory_after(&quiet, Some(&unknown)), None);
+        assert_eq!(advisory_key(&quiet), None);
     }
 
-    /// A withdrawal and an unreachable pointer must not look alike to a caller.
-    /// A long-running stream carries on through the second and MUST stop on the
-    /// first (freenet/river#694 review, Codex P1): continuing to read a
-    /// generation the author has signed away, on the strength of a cached
-    /// anchor, is inferring presence from a fact that says the opposite.
     #[test]
     fn a_withdrawal_is_distinguishable_from_an_unreachable_pointer() {
         let author = SigningKey::from_bytes(&[3u8; 32]);
