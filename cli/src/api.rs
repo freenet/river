@@ -775,6 +775,23 @@ impl Retry {
         self.state = None;
         self.failures = 0;
     }
+
+    fn is_armed(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// Keep the work armed, but with the cadence starting from `now` and the
+    /// failure penalty cleared — "succeeded, and needed again one interval from
+    /// now" rather than "succeeded, stop".
+    ///
+    /// Distinct from [`Self::arm`], which makes the next attempt IMMEDIATE.
+    /// Using `arm` here would poll on the loop's 500ms tick; using nothing would
+    /// let the work idle. This is the steady-state case: a job that has to keep
+    /// running on its own schedule for as long as something else is unfinished.
+    fn rearm_paced(&mut self, now: std::time::Instant) {
+        self.state = Some(Some(now));
+        self.failures = 0;
+    }
 }
 
 /// The higher of a remembered floor and the one just read from disk.
@@ -2650,6 +2667,9 @@ pub struct ApiClient {
     /// lock to the ordering story for no benefit, and would be counted by the
     /// connection-acquisition pin as if it were a reach for the shared socket.
     pointer_floor: std::sync::Mutex<Option<PointerFloor>>,
+    /// The generation named by the last refresh this run declined, so the note
+    /// about declining is said when it changes rather than on every cycle.
+    last_declined: std::sync::Mutex<Option<[u8; 32]>>,
 }
 
 impl ApiClient {
@@ -2693,7 +2713,27 @@ impl ApiClient {
             storage,
             room_anchor: tokio::sync::RwLock::new(None),
             pointer_floor: std::sync::Mutex::new(None),
+            last_declined: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Record that a refresh was declined in favour of `rejected`, returning
+    /// whether this is new information worth printing.
+    ///
+    /// True the first time, and again whenever the rejected generation CHANGES.
+    /// A pointer that stays unreachable names the same fallback hash every
+    /// cycle, and repeating that every few minutes is the alarm fatigue the
+    /// advisory suppression exists to avoid.
+    fn note_declined(&self, rejected: &[u8; 32]) -> bool {
+        let mut last = self
+            .last_declined
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.as_ref() == Some(rejected) {
+            return false;
+        }
+        *last = Some(*rejected);
+        true
     }
 
     /// The highest floor this process has verified, if any.
@@ -2809,10 +2849,12 @@ impl ApiClient {
         let accepted = match crate::pointer::decide_refresh(previous.as_ref(), resolved) {
             crate::pointer::RefreshDecision::Accept(anchor) => anchor,
             crate::pointer::RefreshDecision::Decline { keep, rejected } => {
-                // stderr, not `warn!` — see `announce_anchor`. And said only when
-                // the decision CHANGES, so a pointer that stays unreachable does
-                // not reprint this every few minutes.
-                if previous.as_ref().map(|p| p.source()) != Some(keep.source()) {
+                // stderr, not `warn!` — see `announce_anchor`. Deduplicated on
+                // the REJECTED hash, which is the only thing here that can
+                // actually differ between refreshes: `keep` is by construction a
+                // clone of `previous`, so an earlier version of this compared a
+                // value with itself and could never fire at all.
+                if self.note_declined(rejected.code_hash()) {
                     eprintln!(
                         "note: keeping room-contract generation {}. An unverified re-check named \
                          {} instead, which is not evidence enough to move off a generation \
@@ -7162,6 +7204,17 @@ impl ApiClient {
                 match fetched {
                     Ok((room_state, secrets)) => {
                         catch_up.succeeded();
+                        // While the re-subscribe is still pending there is no
+                        // live subscription, so this fetch is the ONLY thing
+                        // surfacing content. Keep it on its own cadence instead
+                        // of letting it idle until the next re-subscribe failure
+                        // re-arms it: that failure backs off exponentially, so
+                        // polling would decay with it — to 480s at the cap, long
+                        // enough for a busy room to roll past its bounded history
+                        // and lose those events for good.
+                        if resubscribe.is_armed() {
+                            catch_up.rearm_paced(std::time::Instant::now());
+                        }
                         Self::emit_stream_changes(
                             &room_state,
                             &secrets,
@@ -9994,6 +10047,47 @@ mod pointer_refresh_tests {
             highest_floor(Some(live_at_9), tombstone).is_withdrawn(),
             "a withdrawal on disk must survive a same-version memory"
         );
+    }
+
+    /// `rearm_paced` is what keeps fallback polling alive while a re-subscribe is
+    /// still being refused, and it has to sit exactly between the two obvious
+    /// options. `succeeded()` alone would let polling idle until the next
+    /// re-subscribe failure re-armed it — and that failure backs off
+    /// exponentially, so polling would decay to the cap (480s at a 30s base),
+    /// long enough for a busy room to roll past its bounded history and lose
+    /// events permanently. `arm()` would make it due immediately and poll on the
+    /// loop's 500ms tick.
+    #[test]
+    fn rearm_paced_keeps_polling_without_idling_or_spinning() {
+        let t0 = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(5);
+        let mut r = Retry::default();
+
+        r.arm();
+        r.attempted(t0);
+        r.rearm_paced(t0);
+
+        // Still armed — it has NOT gone idle.
+        assert!(r.is_armed());
+        // But not due immediately — it is not spinning either.
+        assert!(!r.due(t0, interval));
+        assert!(!r.due(t0 + std::time::Duration::from_secs(4), interval));
+        // Due one plain interval later, with no accumulated backoff penalty.
+        assert!(r.due(t0 + interval, interval));
+
+        // And the penalty really is cleared: a job that had been failing does not
+        // carry that backoff into its steady-state polling.
+        let mut failing = Retry::default();
+        failing.arm();
+        for i in 0..6 {
+            failing.attempted(t0 + interval * i);
+        }
+        assert!(
+            !failing.due(t0 + interval * 7, interval),
+            "six failures must have widened the gap, or the next assertion proves nothing"
+        );
+        failing.rearm_paced(t0 + interval * 7);
+        assert!(failing.due(t0 + interval * 8, interval));
     }
 
     /// The two defects review found in this PR both lived in the arm/retry
