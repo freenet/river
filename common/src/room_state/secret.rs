@@ -280,6 +280,9 @@ pub struct SecretVersionRecordV1 {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedSecretVersionRecord {
     pub record: SecretVersionRecordV1,
+    /// Encoded as a CBOR byte string, accepting the legacy array form on
+    /// read; see [`crate::util::sig_serde`] (freenet/river#575).
+    #[serde(with = "crate::util::sig_serde")]
     pub owner_signature: Signature,
 }
 
@@ -322,6 +325,9 @@ pub struct EncryptedSecretForMemberV1 {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AuthorizedEncryptedSecretForMember {
     pub secret: EncryptedSecretForMemberV1,
+    /// Encoded as a CBOR byte string, accepting the legacy array form on
+    /// read; see [`crate::util::sig_serde`] (freenet/river#575).
+    #[serde(with = "crate::util::sig_serde")]
     pub owner_signature: Signature,
 }
 
