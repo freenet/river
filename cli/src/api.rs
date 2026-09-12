@@ -9960,6 +9960,42 @@ mod pointer_refresh_tests {
         );
     }
 
+    /// The anti-rollback floor is re-read from disk on every resolution, and
+    /// persisting it is best-effort. So when a save fails, the disk can be BEHIND
+    /// what this process has already verified — and a validly-signed older record
+    /// would then be accepted, moving the run back onto a generation the author
+    /// had superseded. A signature establishes authenticity, not freshness.
+    #[test]
+    fn the_remembered_floor_beats_a_disk_that_fell_behind() {
+        use freenet_migrate::pointer::PointerFloor;
+
+        let old = PointerFloor::at(3, [0xAA; 32]).unwrap();
+        let new = PointerFloor::at(9, [0xBB; 32]).unwrap();
+
+        // Nothing remembered yet: the disk is all there is.
+        assert_eq!(highest_floor(None, old).version(), 3);
+
+        // The disk fell behind what we verified: keep ours.
+        assert_eq!(highest_floor(Some(new), old).version(), 9);
+
+        // The disk is ahead (another riverctl advanced it): take the disk's.
+        assert_eq!(highest_floor(Some(old), new).version(), 9);
+
+        // Equal versions, and ONE of them is a withdrawal: the withdrawal wins
+        // whichever side it is on. Forgetting a tombstone because a non-withdrawn
+        // record shares its version would resurrect exactly what was retired.
+        let tombstone = PointerFloor::withdrawn_at(9).unwrap();
+        let live_at_9 = PointerFloor::at(9, [0xCC; 32]).unwrap();
+        assert!(
+            highest_floor(Some(tombstone), live_at_9).is_withdrawn(),
+            "a remembered withdrawal must not be dropped for a same-version record"
+        );
+        assert!(
+            highest_floor(Some(live_at_9), tombstone).is_withdrawn(),
+            "a withdrawal on disk must survive a same-version memory"
+        );
+    }
+
     /// The two defects review found in this PR both lived in the arm/retry
     /// bookkeeping, not in any decision: a job that cleared itself without
     /// covering the window it existed to cover, and one that retried on the
