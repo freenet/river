@@ -329,6 +329,21 @@ impl RoomAnchor {
     }
 }
 
+/// The author has signed a statement that there is no current room-contract
+/// code.
+///
+/// A distinct type rather than a plain message because a caller MUST be able to
+/// tell it apart from "we could not reach the pointer". Every other resolution
+/// failure is an absence of knowledge and is safely treated as best-effort — a
+/// long-running stream carries on with what it last verified. A withdrawal is
+/// the opposite: a positive, signature-verified fact that the generation the
+/// stream is using has been retired. Continuing to read from it on the strength
+/// of a cached anchor is exactly the "absence must be proven, not inferred"
+/// mistake this module makes everywhere else, run backwards.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PointerWithdrawn(pub String);
+
 /// The advisory to print for `anchor`, given what has already been printed for
 /// `previous` in this same run.
 ///
@@ -378,7 +393,7 @@ pub fn anchor_from_report(
     // superseded would resurrect, out of our own memory, exactly the code the
     // author retired.
     if floor.is_withdrawn() {
-        bail!(withdrawn_message(floor.version()));
+        return Err(PointerWithdrawn(withdrawn_message(floor.version())).into());
     }
 
     // What to use when nothing was learned: the last hash this install verified,
@@ -408,7 +423,9 @@ pub fn anchor_from_report(
 
         // The author says there is no current code. Not "the old code is
         // current again", so there is nothing to fall back to.
-        PointerOutcome::Withdrawn { version, .. } => bail!(withdrawn_message(*version)),
+        PointerOutcome::Withdrawn { version, .. } => {
+            Err(PointerWithdrawn(withdrawn_message(*version)).into())
+        }
 
         // The only arm in which a build-time key is legitimate.
         PointerOutcome::NeverPublished => Ok(RoomAnchor::unvouched(
@@ -634,31 +651,29 @@ pub fn floor_corruption_hint(path: &std::path::Path) -> String {
     )
 }
 
+/// Helpers shared by this module's tests and `crate::api`'s.
+///
+/// Lives outside `mod tests` so `api` can build anchors the same way this module
+/// does — through a real signed record and the real resolver. An `api` test that
+/// hand-built an anchor instead could pin behaviour against a provenance the
+/// resolver never produces, which is exactly the class of test this codebase
+/// avoids elsewhere.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use freenet_migrate::pointer::{
-        pointer_contract_id, pointer_params, pointer_signing_message, PointerRecord,
-        PointerResolver,
+        pointer_params, pointer_signing_message, PointerRecord, PointerResolver,
     };
     use freenet_migrate::Step;
 
-    fn bundled() -> [u8; 32] {
-        [0xAA; 32]
-    }
-
-    fn owner() -> VerifyingKey {
-        SigningKey::from_bytes(&[7u8; 32]).verifying_key()
-    }
-
-    /// Drive a real resolver against a canned record so the tests below act on
-    /// genuine `PointerOutcome` values rather than hand-built ones. Hand-built
-    /// outcomes would let a test pass against an outcome the resolver can never
-    /// actually produce, and `Withdrawn` / `CompetingRecord` cannot be built
-    /// by hand at all, being `#[non_exhaustive]` variants, which is exactly the
-    /// boundary this helper respects rather than works around.
-    fn outcome_for(
+    /// Drive a real resolver against a canned record so tests act on genuine
+    /// `PointerOutcome` values rather than hand-built ones. Hand-built outcomes
+    /// would let a test pass against an outcome the resolver can never actually
+    /// produce, and `Withdrawn` / `CompetingRecord` cannot be built by hand at
+    /// all, being `#[non_exhaustive]` variants, which is exactly the boundary
+    /// this helper respects rather than works around.
+    pub(crate) fn outcome_for(
         author: &SigningKey,
         floor: PointerFloor,
         version: u32,
@@ -680,6 +695,49 @@ mod tests {
         };
         assert!(r.on_response(id, &state));
         r.take_outcome().unwrap().unwrap()
+    }
+
+    /// An anchor whose provenance is a signature-verified pointer record naming
+    /// `code_hash`. The only provenance permitted to declare a generation move,
+    /// so any test about moves needs this rather than a fallback anchor.
+    pub(crate) fn pointer_anchor(code_hash: [u8; 32], bundled: [u8; 32]) -> RoomAnchor {
+        let author = SigningKey::from_bytes(&[3u8; 32]);
+        let floor = PointerFloor::never_resolved();
+        let outcome = outcome_for(&author, floor, 4, code_hash);
+        let anchor = anchor_from_report(&ResolveReport::Outcome(outcome), &floor, bundled)
+            .expect("a verified record is a usable anchor");
+        assert_eq!(anchor.source(), &AnchorSource::Pointer);
+        anchor
+    }
+
+    /// An anchor that no pointer vouched for, sitting on `code_hash`. The
+    /// contrast case: same shape, provenance that must NOT move a stream.
+    pub(crate) fn unverified_anchor(code_hash: [u8; 32], bundled: [u8; 32]) -> RoomAnchor {
+        let floor = PointerFloor::at(4, code_hash).expect("a floor at a real code hash");
+        let anchor = anchor_from_report(
+            &ResolveReport::Failed("node unreachable".to_string()),
+            &floor,
+            bundled,
+        )
+        .expect("an unreachable pointer stays best-effort");
+        assert!(matches!(anchor.source(), AnchorSource::Unverified(_)));
+        anchor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::outcome_for;
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use freenet_migrate::pointer::pointer_contract_id;
+
+    fn bundled() -> [u8; 32] {
+        [0xAA; 32]
+    }
+
+    fn owner() -> VerifyingKey {
+        SigningKey::from_bytes(&[7u8; 32]).verifying_key()
     }
 
     /// The documented pointer address in `FREENET.md` must be exactly what the
@@ -752,6 +810,36 @@ mod tests {
         .unwrap();
         assert_eq!(quiet.advisory(), None);
         assert_eq!(advisory_after(&quiet, Some(&unknown)), None);
+    }
+
+    /// A withdrawal and an unreachable pointer must not look alike to a caller.
+    /// A long-running stream carries on through the second and MUST stop on the
+    /// first (freenet/river#694 review, Codex P1): continuing to read a
+    /// generation the author has signed away, on the strength of a cached
+    /// anchor, is inferring presence from a fact that says the opposite.
+    #[test]
+    fn a_withdrawal_is_distinguishable_from_an_unreachable_pointer() {
+        let author = SigningKey::from_bytes(&[3u8; 32]);
+        let floor = PointerFloor::never_resolved();
+        let tombstone = outcome_for(&author, floor, 9, [0u8; 32]);
+        assert!(matches!(tombstone, PointerOutcome::Withdrawn { .. }));
+
+        let err = anchor_from_report(&ResolveReport::Outcome(tombstone), &floor, bundled())
+            .expect_err("a withdrawal is not a usable anchor");
+        assert!(
+            err.downcast_ref::<PointerWithdrawn>().is_some(),
+            "a withdrawal must be recognisable by TYPE, not by matching its text: {err}"
+        );
+
+        // The contrast case: an unreachable pointer is not an error at all, so a
+        // caller that only checks for `PointerWithdrawn` cannot confuse the two.
+        let unreachable = anchor_from_report(
+            &ResolveReport::Failed("node unreachable".to_string()),
+            &floor,
+            bundled(),
+        )
+        .expect("an unreachable pointer stays best-effort");
+        assert_eq!(unreachable.code_hash(), &bundled());
     }
 
     #[test]

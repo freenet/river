@@ -387,10 +387,15 @@ impl Storage {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Write guard for the code-hash cell, recovering from poisoning rather than
-    /// panicking: the critical section is a single assignment that cannot fail,
-    /// so a poisoned lock can only mean an unrelated panic elsewhere, and
-    /// refusing to store the hash would strand this run on a stale generation.
+    /// Write guard for the code-hash cell.
+    ///
+    /// Poisoning is per-lock and happens only when a thread panics while holding
+    /// THIS lock's write guard. The sole critical section is one assignment, so
+    /// that cannot happen and the recovery arm is unreachable. It is spelled
+    /// `unwrap_or_else` rather than `unwrap` anyway, because the failure it would
+    /// otherwise cause — an abort while installing a freshly-resolved generation
+    /// — is far worse than proceeding, and a future edit that does something
+    /// fallible in here should degrade rather than kill a running stream.
     fn room_code_hash_slot(&self) -> std::sync::RwLockWriteGuard<'_, Option<[u8; 32]>> {
         self.room_code_hash
             .write()
@@ -2246,18 +2251,48 @@ mod tests {
         );
         // And that shared step must still run all three emitters, or routing
         // through it would be a way to lose them all at once.
+        //
+        // Sliced to the body of `emit_stream_changes` rather than searched over
+        // the whole file, because a bare `contains` is satisfiable WITHOUT the
+        // property holding: delete the call from the shared step, add one back in
+        // a single loop, and a whole-file search still finds the string while
+        // deletions have silently stopped surfacing on the other two paths. That
+        // is not hypothetical — it was demonstrated against the first version of
+        // this guard during review of freenet/river#696.
+        let shared_step = api_src
+            .split_once("    fn emit_stream_changes(")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .expect(
+                "emit_stream_changes must exist as a 4-space-indented method; if it was \
+                 renamed or reshaped, re-point this guard rather than deleting it",
+            );
         for emitter in [
             "Self::emit_new_and_edited(",
             "Self::emit_deletions(",
             "Self::emit_reaction_changes(",
         ] {
             assert!(
-                api_src.contains(emitter),
-                "emit_stream_changes must still call {emitter}; dropping one \
-                 silently stops that event kind surfacing on every monitor path \
-                 at once"
+                shared_step.contains(emitter),
+                "emit_stream_changes must itself call {emitter}; dropping it there \
+                 silently stops that event kind surfacing on every monitor path at \
+                 once, and a call left elsewhere in the file does not restore it"
             );
         }
+        // The order is load-bearing: emit_reaction_changes must see a brand-new
+        // message already seeded by emit_new_and_edited, or it re-emits it as a
+        // reaction change.
+        let new_at = shared_step
+            .find("Self::emit_new_and_edited(")
+            .expect("checked above");
+        let reactions_at = shared_step
+            .find("Self::emit_reaction_changes(")
+            .expect("checked above");
+        assert!(
+            new_at < reactions_at,
+            "emit_new_and_edited must run BEFORE emit_reaction_changes, or a \
+             brand-new message is re-emitted as a reaction change"
+        );
         // The dedup key must be the stable signature-derived id, not author:time.
         assert!(
             api_src.contains("monitor_seen_key(msg)"),

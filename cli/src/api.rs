@@ -124,8 +124,22 @@ impl PointerIo for NodePointerIo<'_> {
                     state,
                     ..
                 }))) if *key.id() == id => return Ok(PointerFetch::State(state.to_vec())),
-                // Something else on the shared connection. Keep waiting.
-                Ok(Ok(_)) => continue,
+                // Something else on the shared connection. Keep waiting — and
+                // note that stepping over it DISCARDS it. That was free while
+                // resolution only ever ran before anything was subscribed; since
+                // freenet/river#694 a long-running stream re-resolves mid-run, so
+                // the discarded frame can be an `UpdateNotification` for that very
+                // subscription. The stream compensates by re-fetching full state
+                // after every refresh rather than by requeueing here, because this
+                // adapter has no access to the stream's queue and a full fetch
+                // supersedes any delta it could have replayed.
+                Ok(Ok(other)) => {
+                    debug!(
+                        "Stepping over {} while awaiting the pointer GET",
+                        response_kind(&other)
+                    );
+                    continue;
+                }
                 Ok(Err(e)) => {
                     debug!("Pointer GET failed: {e}");
                     break;
@@ -2343,6 +2357,26 @@ impl std::fmt::Debug for Invitation {
 /// turn the protection off by accident.
 const POINTER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How long to wait before retrying a re-SUBSCRIBE the node would not accept.
+///
+/// Shorter than the refresh interval because a refused re-subscribe leaves the
+/// stream with no live subscription to the new generation, so until it succeeds
+/// the only thing surfacing content is the catch-up fetch that runs beside it.
+const RESUBSCRIBE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`POINTER_REFRESH_INTERVAL`] with ±20% jitter.
+///
+/// Without it every bot started by one restart wave shares a refresh phase, so a
+/// re-key produces a synchronised burst of pointer GET + SUBSCRIBE + full-state
+/// GET from the whole fleet at once — against a network that has, by definition,
+/// just published something. Same reasoning as the jitter requirement on retry
+/// and backoff loops in the ecosystem's bug-prevention rules.
+fn jittered_pointer_refresh_interval() -> std::time::Duration {
+    let base = POINTER_REFRESH_INTERVAL.as_secs_f64();
+    let factor = 0.8 + rand::Rng::gen::<f64>(&mut rand::thread_rng()) * 0.4;
+    std::time::Duration::from_secs_f64(base * factor)
+}
+
 /// The outcome of re-resolving River's room-contract pointer mid-run.
 ///
 /// `moved` is the field callers act on, and it is deliberately narrower than
@@ -2364,9 +2398,23 @@ impl AnchorRefresh {
     /// still addressing the same contract, and tearing down a healthy
     /// subscription over it would be a self-inflicted outage.
     fn new(anchor: RoomAnchor, previous: Option<RoomAnchor>) -> Self {
+        // Two conditions, and the SECOND is the one that is easy to leave out.
+        //
         // False when nothing was cached: a first resolution is not a move, and
         // reporting one would make an ordinary startup look like a re-key.
-        let moved = matches!(&previous, Some(p) if p.code_hash() != anchor.code_hash());
+        //
+        // False unless a signature-verified record named the new hash. A failed
+        // resolution still yields an anchor — on `last_known()`, which is the
+        // floor's hash or, if the floor has never been written, the BUNDLED one.
+        // Persisting the floor is best-effort (a read-only config dir is enough
+        // to skip it), so a refresh that merely timed out can hand back a
+        // different hash from the one in force. Without this clause that reads as
+        // a re-key: the stream would announce a move that never happened, tear
+        // down a healthy subscription, re-subscribe to a RETIRED generation, and
+        // flap back five minutes later — every cycle rewriting rooms.json.
+        // A teardown is only ever justified by positive evidence.
+        let moved = matches!(&previous, Some(p) if p.code_hash() != anchor.code_hash())
+            && matches!(anchor.source(), crate::pointer::AnchorSource::Pointer);
         Self {
             anchor,
             previous,
@@ -2494,7 +2542,31 @@ impl ApiClient {
         Ok(anchor)
     }
 
+    /// How a long-running stream should react to a failed pointer refresh.
+    ///
+    /// Every ordinary failure is an absence of knowledge — a timeout, an
+    /// unreachable node, a record that lost a tiebreak — and a stream carries on
+    /// with what it last verified, because tearing down a working subscription
+    /// over one bad round trip is a worse outcome than the staleness it avoids.
+    ///
+    /// A WITHDRAWAL is not that. It is a signature-verified statement by River's
+    /// author that the generation this stream is reading has been retired, so
+    /// continuing to read it would be inferring presence from the one fact that
+    /// says otherwise. It ends the stream, loudly, with the author's own message.
+    fn refresh_failure_is_fatal(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<crate::pointer::PointerWithdrawn>()
+            .is_some()
+    }
+
     /// Re-resolve River's room-contract pointer, replacing the cached anchor.
+    ///
+    /// Note what this deliberately does NOT do: it cannot cancel the caller's
+    /// existing subscription to the superseded generation, because
+    /// `freenet-stdlib`'s `ContractRequest` has no unsubscribe variant (checked
+    /// against 0.8.5). A stream that follows several re-keys therefore leaves one
+    /// idle subscription per retired generation for the life of the process. They
+    /// cost the node a little bookkeeping and deliver nothing, since the retired
+    /// contracts are frozen — an accepted leak rather than an overlooked one.
     ///
     /// For long-running commands only. A re-key moves every room's contract key
     /// at once, and a stream that resolved at startup stays bound to the retired
@@ -5339,19 +5411,25 @@ impl ApiClient {
         // answers, so the loop never errors and never sees another message
         // (freenet/river#694).
         let mut last_pointer_refresh = std::time::Instant::now();
+        let mut refresh_interval = jittered_pointer_refresh_interval();
 
         // Main polling loop
         loop {
-            if last_pointer_refresh.elapsed() >= POINTER_REFRESH_INTERVAL {
+            if last_pointer_refresh.elapsed() >= refresh_interval {
                 last_pointer_refresh = std::time::Instant::now();
+                refresh_interval = jittered_pointer_refresh_interval();
                 match self.refresh_room_anchor().await {
                     Ok(refresh) => {
                         if let Some(notice) = refresh.move_notice() {
                             eprintln!("{notice}");
                         }
                     }
-                    // Best-effort, exactly as in the subscription loop.
                     Err(e) => {
+                        // Withdrawal ends the stream; everything else is
+                        // best-effort. Exactly as in the subscription loop.
+                        if Self::refresh_failure_is_fatal(&e) {
+                            return Err(e);
+                        }
                         warn!("Could not re-check River's room-contract pointer: {e}");
                     }
                 }
@@ -6614,64 +6692,162 @@ impl ApiClient {
         // anything to send — indistinguishable from a quiet room
         // (freenet/river#694).
         let mut last_pointer_refresh = std::time::Instant::now();
+        let mut refresh_interval = jittered_pointer_refresh_interval();
+        // Set by every refresh, cleared only by a catch-up fetch that succeeded.
+        let mut catch_up_pending = false;
+        // Set when a re-key is detected, cleared only by a SUBSCRIBE the node
+        // accepted. See the retry below for why this is not a one-shot.
+        let mut resubscribe_pending = false;
+        let mut last_resubscribe_attempt: Option<std::time::Instant> = None;
 
         // Main loop: wait for UpdateNotification messages
         loop {
             // Follow a mid-run re-key before doing anything else this iteration,
             // and before taking the `web_api` lock the refresh needs for its own
             // GET.
-            if last_pointer_refresh.elapsed() >= POINTER_REFRESH_INTERVAL {
+            if last_pointer_refresh.elapsed() >= refresh_interval {
                 last_pointer_refresh = std::time::Instant::now();
-                match self.refresh_room_anchor().await {
+                refresh_interval = jittered_pointer_refresh_interval();
+                // Interruptible. The pointer GET can take up to
+                // `POINTER_GET_TIMEOUT`, and the loop's Ctrl+C check is only
+                // reached between iterations, so awaiting it bare would widen
+                // shutdown latency from the loop's 500 ms to ten seconds.
+                // `mpsc::Receiver::recv` is cancellation-safe, so losing this
+                // race drops nothing.
+                let resolved = tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        if matches!(format, OutputFormat::Human) {
+                            eprintln!("\nStopped monitoring.");
+                        }
+                        return Ok(());
+                    }
+                    resolved = self.refresh_room_anchor() => resolved,
+                };
+                match resolved {
+                    // Gated on `moved()`, never on `move_notice()`. The notice is
+                    // a presentation string, and gating control flow on whether
+                    // something is worth PRINTING is how a later "do not repeat
+                    // this line" tweak silently disables re-subscription.
                     Ok(refresh) => {
-                        if let Some(notice) = refresh.move_notice() {
-                            eprintln!("{notice}");
+                        if refresh.moved() {
+                            if let Some(notice) = refresh.move_notice() {
+                                eprintln!("{notice}");
+                            }
                             // Re-derive through the anchor choke point, so the new
                             // id comes from the same place every other key does.
                             contract_instance_id = *self
                                 .contract_key_for(room_owner_key, KeyIntent::Read)
                                 .await?
                                 .id();
-                            self.subscribe_and_await_ack(
-                                contract_instance_id,
-                                &format,
-                                &mut pending,
-                            )
-                            .await?;
-                            // Catch up explicitly. The node only notifies about
-                            // changes that happen AFTER a subscription, so
-                            // everything written to the new generation between the
-                            // re-key and this moment would otherwise be a silent
-                            // hole — the very failure this refresh exists to close.
-                            match self.fetch_stream_state(room_owner_key).await {
-                                Ok((room_state, secrets)) => {
-                                    Self::emit_stream_changes(
-                                        &room_state,
-                                        &secrets,
-                                        &mut seen_messages,
-                                        &mut deleted_emitted,
-                                        &mut seen_reactions,
-                                        room_owner_key,
-                                        &format,
-                                        max_messages,
-                                        &mut new_message_count,
-                                    )?;
-                                }
-                                Err(e) => {
-                                    debug!("Failed to catch up after re-subscribing: {}", e);
-                                }
-                            }
-                            if max_messages > 0 && new_message_count >= max_messages {
-                                return Ok(());
-                            }
+                            resubscribe_pending = true;
                         }
                     }
-                    // Never fatal. A refresh is a best-effort currency check, and
-                    // tearing down a working stream because one pointer GET timed
-                    // out would be a worse failure than the staleness it guards
-                    // against. The next interval tries again.
                     Err(e) => {
+                        // A withdrawal ends the stream; see
+                        // `refresh_failure_is_fatal`. Everything else is
+                        // best-effort — tearing down a working subscription
+                        // because one pointer GET timed out would be a worse
+                        // failure than the staleness it guards against, and the
+                        // next interval tries again.
+                        if Self::refresh_failure_is_fatal(&e) {
+                            return Err(e);
+                        }
                         warn!("Could not re-check River's room-contract pointer: {e}");
+                    }
+                }
+
+                // Catch up after EVERY refresh, not only after a move, for two
+                // independent reasons — and the second is the one that is easy to
+                // miss:
+                //
+                //  * After a move, the node only notifies about changes that
+                //    happen AFTER a subscription, so anything written to the new
+                //    generation before this re-subscribe would be a silent hole —
+                //    the very failure this refresh exists to close.
+                //  * After ANY refresh, including one that moved nothing and one
+                //    that failed, the pointer GET has just read from the same
+                //    multiplexed connection this subscription uses, stepping over
+                //    (and discarding) up to `MAX_UNRELATED_RESPONSES_DURING_
+                //    POINTER_GET` frames. One of those can be an
+                //    `UpdateNotification` for this room. A full re-fetch
+                //    supersedes whatever was dropped, so doing it unconditionally
+                //    is what makes re-resolving safe to run alongside a live
+                //    subscription at all.
+                //
+                // The cost is one extra room GET per refresh interval, which is
+                // far below what the stream is already doing per notification.
+                catch_up_pending = true;
+            }
+
+            // Run the catch-up until one actually SUCCEEDS, rather than once per
+            // refresh. A transient fetch failure immediately after a re-key would
+            // otherwise lose the gap content permanently: the anchor has already
+            // been replaced, so the next refresh sees no move, and if no further
+            // notification ever arrives nothing else would go looking.
+            if catch_up_pending {
+                match self.fetch_stream_state(room_owner_key).await {
+                    Ok((room_state, secrets)) => {
+                        catch_up_pending = false;
+                        Self::emit_stream_changes(
+                            &room_state,
+                            &secrets,
+                            &mut seen_messages,
+                            &mut deleted_emitted,
+                            &mut seen_reactions,
+                            room_owner_key,
+                            &format,
+                            max_messages,
+                            &mut new_message_count,
+                        )?;
+                    }
+                    // Left pending on purpose, so the next loop iteration retries.
+                    // `warn!`, not `debug!`: this fetch IS the mechanism that
+                    // closes the silent hole, so a failure here is the thing an
+                    // operator most needs to see.
+                    Err(e) => {
+                        warn!("Failed to catch up after the pointer refresh: {e}");
+                    }
+                }
+                if max_messages > 0 && new_message_count >= max_messages {
+                    return Ok(());
+                }
+            }
+
+            // Re-SUBSCRIBE after a re-key — AFTER the catch-up above, and never
+            // fatally.
+            //
+            // Ordering: the catch-up is a plain GET that needs no subscription,
+            // so sequencing it first means a node that will not accept the
+            // SUBSCRIBE cannot also cost us the fetch that would have worked.
+            //
+            // Non-fatal: the node most likely to refuse a SUBSCRIBE for a
+            // generation is one that does not hold it YET — which is exactly the
+            // node state just after River publishes a re-key. Propagating that
+            // would make the first bot to notice a re-key the one that exits,
+            // one line after printing "no restart needed". So retry on a short
+            // cadence and keep the catch-up running meanwhile: the stream
+            // degrades to polling at `RESUBSCRIBE_RETRY_INTERVAL` instead of
+            // dying.
+            if resubscribe_pending
+                && last_resubscribe_attempt
+                    .is_none_or(|t| t.elapsed() >= RESUBSCRIBE_RETRY_INTERVAL)
+            {
+                last_resubscribe_attempt = Some(std::time::Instant::now());
+                match self
+                    .subscribe_and_await_ack(contract_instance_id, &format, &mut pending)
+                    .await
+                {
+                    Ok(()) => {
+                        resubscribe_pending = false;
+                        last_resubscribe_attempt = None;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Could not subscribe to the new room-contract generation yet \
+                             ({e}); retrying, and continuing to poll meanwhile"
+                        );
+                        // Keep surfacing content while unsubscribed.
+                        catch_up_pending = true;
                     }
                 }
             }
@@ -9338,28 +9514,23 @@ mod reaccept_guard_tests {
 #[cfg(test)]
 mod pointer_refresh_tests {
     use super::*;
+    use crate::pointer::test_support::{pointer_anchor, unverified_anchor};
+    use crate::pointer::{code_hash_b58, Generation};
+
+    const LIVE: [u8; 32] = [0x11; 32];
+    const OTHER: [u8; 32] = [0xBB; 32];
+
+    fn bundled() -> [u8; 32] {
+        bundled_room_code_hash()
+    }
 
     /// A stream acts on `moved` by tearing down and rebuilding its subscription,
     /// so a false positive is a self-inflicted outage and a false negative is the
     /// freenet/river#694 silence. Pin both directions.
     #[test]
     fn anchor_refresh_reports_only_a_real_generation_move() {
-        use crate::pointer::{anchor_from_report, code_hash_b58, ResolveReport};
-        use freenet_migrate::pointer::PointerFloor;
-
-        // `Failed` against a never-resolved floor yields an anchor sitting on the
-        // bundled hash, so varying `bundled` is how this test varies the
-        // generation without needing a node or a signed record.
-        let anchor_for = |bundled: [u8; 32]| {
-            anchor_from_report(
-                &ResolveReport::Failed("node unreachable".to_string()),
-                &PointerFloor::never_resolved(),
-                bundled,
-            )
-            .expect("an unreachable pointer is a usable anchor, not an error")
-        };
-        let before = anchor_for([0xAA; 32]);
-        let after = anchor_for([0xBB; 32]);
+        let before = pointer_anchor(LIVE, bundled());
+        let after = pointer_anchor(OTHER, bundled());
 
         // A first resolution is not a move.
         let first = AnchorRefresh::new(before.clone(), None);
@@ -9371,7 +9542,7 @@ mod pointer_refresh_tests {
         assert!(!same.moved());
         assert_eq!(same.move_notice(), None);
 
-        // A different generation is.
+        // A different generation, verified, is.
         let moved = AnchorRefresh::new(after.clone(), Some(before.clone()));
         assert!(moved.moved());
         assert_eq!(moved.anchor().code_hash(), after.code_hash());
@@ -9391,33 +9562,63 @@ mod pointer_refresh_tests {
         assert!(notice.contains("no restart needed"), "{notice}");
     }
 
-    /// A re-key that riverctl is too old to write to must still be FOLLOWED for
+    /// Same hash, WEAKER provenance. The anchors differ as values, so an
+    /// implementation comparing whole structs would call this a move and tear
+    /// down a subscription that is addressing exactly the right contract.
+    /// `AnchorRefresh` must compare the code hash, and only the code hash.
+    #[test]
+    fn degraded_provenance_at_the_same_hash_is_not_a_move() {
+        let verified = pointer_anchor(LIVE, bundled());
+        let degraded = unverified_anchor(LIVE, bundled());
+        assert_ne!(
+            verified, degraded,
+            "the two anchors must differ as values, or this test pins nothing"
+        );
+        assert_eq!(verified.code_hash(), degraded.code_hash());
+
+        let refresh = AnchorRefresh::new(degraded, Some(verified));
+        assert!(
+            !refresh.moved(),
+            "a provenance downgrade at the same hash still addresses the same \
+             contract; tearing down over it is a self-inflicted outage"
+        );
+        assert_eq!(refresh.move_notice(), None);
+    }
+
+    /// The mirror image, and the one that bites in the field: an UNVERIFIED
+    /// anchor naming a different hash must NOT be treated as a re-key.
+    ///
+    /// A failed refresh still produces an anchor — on the floor's hash, or the
+    /// BUNDLED hash when the floor has never been written, and persisting the
+    /// floor is best-effort. So a plain timeout can hand back a hash that differs
+    /// from the one in force. Acting on that would announce a re-key that never
+    /// happened and re-subscribe to a RETIRED generation, flapping every refresh.
+    #[test]
+    fn an_unverified_hash_change_is_never_a_move() {
+        let verified_live = pointer_anchor(LIVE, bundled());
+        // What a failed refresh looks like when the floor never persisted: the
+        // anchor falls back to the bundled hash, which is not where the room is.
+        let fallback = unverified_anchor(bundled(), bundled());
+        assert_ne!(verified_live.code_hash(), fallback.code_hash());
+
+        let refresh = AnchorRefresh::new(fallback, Some(verified_live));
+        assert!(
+            !refresh.moved(),
+            "only a signature-verified record may move a stream off the \
+             generation it is reading"
+        );
+        assert_eq!(refresh.move_notice(), None);
+    }
+
+    /// A re-key that riverctl is too old to WRITE to must still be followed for
     /// reading. A stream that refused to move would stay on the retired
     /// generation, which is the original bug wearing a safety justification.
     #[test]
     fn a_move_to_an_unknown_generation_is_still_a_move() {
-        use crate::pointer::{anchor_from_report, Generation, ResolveReport};
-        use freenet_migrate::pointer::PointerFloor;
-
-        let bundled = bundled_room_code_hash();
-        let before = anchor_from_report(
-            &ResolveReport::Failed("node unreachable".to_string()),
-            &PointerFloor::never_resolved(),
-            bundled,
-        )
-        .unwrap();
-        // An anchor whose hash is neither the bundled one nor any this binary
-        // knows: River has re-keyed past us. The hash has to come from the FLOOR
-        // rather than from `bundled`, or `classify` would call it `Bundled` by
-        // construction and the test would pin nothing.
-        let live = [0x11; 32];
-        let after = anchor_from_report(
-            &ResolveReport::Failed("node unreachable".to_string()),
-            &PointerFloor::at(4, live).expect("a floor at a real code hash"),
-            bundled,
-        )
-        .unwrap();
-        assert_eq!(after.code_hash(), &live);
+        let before = pointer_anchor(bundled(), bundled());
+        assert_eq!(before.generation(), Generation::Bundled);
+        // Neither the bundled hash nor any generation this binary knows.
+        let after = pointer_anchor(LIVE, bundled());
         assert_eq!(after.generation(), Generation::Unknown);
 
         let refresh = AnchorRefresh::new(after, Some(before));
@@ -9426,6 +9627,26 @@ mod pointer_refresh_tests {
             .anchor()
             .authorize(KeyIntent::Read)
             .expect("reads must follow the move even when writes cannot");
+        refresh
+            .anchor()
+            .authorize(KeyIntent::Write)
+            .expect_err("writes against an unknown generation stay refused (#695)");
+    }
+
+    /// A withdrawal must end a stream; an unreachable pointer must not. The
+    /// loops distinguish them through this predicate, so pin it here rather than
+    /// trusting that the two error paths stay recognisable by eye.
+    #[test]
+    fn only_a_withdrawal_is_a_fatal_refresh_failure() {
+        let withdrawn: anyhow::Error =
+            crate::pointer::PointerWithdrawn("retired".to_string()).into();
+        assert!(ApiClient::refresh_failure_is_fatal(&withdrawn));
+
+        let transient = anyhow!("the pointer record could not be fetched (timeout)");
+        assert!(
+            !ApiClient::refresh_failure_is_fatal(&transient),
+            "a transient failure must never tear down a working stream"
+        );
     }
 }
 
@@ -10300,6 +10521,104 @@ mod monitor_tests {
     /// `emit_reaction_changes` over the post-reaction state then advances the
     /// stored fingerprint (and prints the event); the text fingerprint is
     /// identical across both states, proving text-only detection misses it.
+    /// The catch-up that follows every pointer refresh (freenet/river#694) feeds a
+    /// freshly-fetched state through `emit_stream_changes` using the SAME tracking
+    /// maps the stream has been accumulating. Both directions matter and both are
+    /// silent when wrong: if the carried-over state were ignored the stream would
+    /// re-emit the whole room every five minutes forever, and if new content were
+    /// missed the catch-up would not close the hole it exists to close.
+    ///
+    /// This is the behaviour a live bot operator notices first, and it is what the
+    /// re-key path does at the moment the generation changes, so pin it directly
+    /// rather than trusting the source-grep wiring guard alone.
+    #[test]
+    fn a_catch_up_emits_only_what_is_new() {
+        let first = authored(RoomMessageBody::public("first".to_string()));
+        let second = authored(RoomMessageBody::public("second".to_string()));
+        let owner_vk = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+        let secrets: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        // Before the refresh: the room as the stream has already displayed it.
+        let before = state_with_reactions(&first, vec![]);
+        // The catch-up fetch: same message, plus one written since.
+        let after = {
+            let mut recent = MessagesV1 {
+                messages: vec![first.clone(), second.clone()],
+                ..Default::default()
+            };
+            recent.rebuild_actions_state();
+            ChatRoomStateV1 {
+                recent_messages: recent,
+                ..Default::default()
+            }
+        };
+
+        let mut seen_messages: HashMap<String, String> = HashMap::new();
+        let mut deleted_emitted: HashSet<String> = HashSet::new();
+        let mut seen_reactions: HashMap<String, String> = HashMap::new();
+        let mut new_message_count = 0usize;
+
+        let emit = |state: &ChatRoomStateV1,
+                    seen_messages: &mut HashMap<String, String>,
+                    deleted_emitted: &mut HashSet<String>,
+                    seen_reactions: &mut HashMap<String, String>,
+                    new_message_count: &mut usize| {
+            ApiClient::emit_stream_changes(
+                state,
+                &secrets,
+                seen_messages,
+                deleted_emitted,
+                seen_reactions,
+                &owner_vk,
+                &OutputFormat::Json,
+                0,
+                new_message_count,
+            )
+            .unwrap();
+        };
+
+        emit(
+            &before,
+            &mut seen_messages,
+            &mut deleted_emitted,
+            &mut seen_reactions,
+            &mut new_message_count,
+        );
+        assert_eq!(
+            new_message_count, 1,
+            "the pre-existing message is surfaced once"
+        );
+
+        // The catch-up: exactly one new message, and the carried-over one is NOT
+        // re-counted.
+        emit(
+            &after,
+            &mut seen_messages,
+            &mut deleted_emitted,
+            &mut seen_reactions,
+            &mut new_message_count,
+        );
+        assert_eq!(
+            new_message_count, 2,
+            "the catch-up must emit the message written during the gap, and must \
+             NOT re-emit one the stream already showed"
+        );
+
+        // A refresh that finds nothing new must say nothing — otherwise every
+        // five-minute refresh is duplicate spam.
+        emit(
+            &after,
+            &mut seen_messages,
+            &mut deleted_emitted,
+            &mut seen_reactions,
+            &mut new_message_count,
+        );
+        assert_eq!(
+            new_message_count, 2,
+            "a catch-up over unchanged state must emit nothing"
+        );
+    }
+
     #[test]
     fn live_reaction_change_is_detected_when_text_is_unchanged() {
         let original = authored(RoomMessageBody::public("hello".to_string()));
@@ -12341,9 +12660,10 @@ mod response_multiplexing_pin {
     /// Every production `.recv()` on the shared connection.
     ///
     /// One of them IS the `ResponseSource` impl `await_response` reads through;
-    /// the other ten are sites the fix has not reached. All eleven are listed
-    /// rather than only the unreached ones, so the constant can be audited by
-    /// walking the list. Note a plain `grep -c` over the file does NOT give 11:
+    /// ten more are sites the fix has not reached; the twelfth is not a
+    /// connection read at all (see entry 12). All twelve are listed rather than
+    /// only the unreached ones, so the constant can be audited by walking the
+    /// list. Note a plain `grep -c` over the file does NOT give 11:
     /// it also counts the meta-tests' own string literals, which the pin strips
     /// with `production_source` before counting.
     ///
@@ -12365,6 +12685,16 @@ mod response_multiplexing_pin {
     ///  9. `accept_invitation_struct`'s join delta -- #690.
     /// 10. `ensure_room_migrated` -- #690.
     /// 11. `migrate_room_to_new_contract` -- freenet/river#689.
+    /// 12. the streaming monitor's shutdown `select!` -- NOT a read of the
+    ///     connection at all. It is `shutdown_rx.recv()` on the Ctrl+C mpsc
+    ///     channel, added by freenet/river#694 so a five-minute pointer refresh
+    ///     cannot widen shutdown latency to the pointer GET's timeout. The note
+    ///     under the count below predicted exactly this: the scan counts every
+    ///     `.recv()` rather than every connection read, on purpose, because
+    ///     binding it to a variable name would make it a spelling ban. A second
+    ///     mpsc receiver is therefore a FALSE POSITIVE to be recorded here, not
+    ///     a call site to route through `await_response` -- which could not
+    ///     accept it anyway, since it does not read the connection.
     ///
     /// 6 through 11 are deliberately outside this change, but NOT all for the
     /// same reason, and an earlier version of this comment gave one reason for
@@ -12392,7 +12722,7 @@ mod response_multiplexing_pin {
     ///     issue (#689) rather than riding along here.
     ///
     /// Lowering this number is #690's job, and #689's.
-    const DIRECT_CONNECTION_READS: usize = 11;
+    const DIRECT_CONNECTION_READS: usize = 12;
 
     /// Production references to the connection field, and locks taken on it.
     ///
@@ -12726,7 +13056,7 @@ mod response_multiplexing_pin {
         );
         assert_caught(
             &mutated,
-            "found 12",
+            "found 13",
             "a newly-added direct read whose guard is not called `web_api`",
         );
     }

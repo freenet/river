@@ -18,6 +18,24 @@ All notable changes to riverctl will be documented in this file.
   on anything written during the gap. Reads follow the move even when the new
   generation is one this riverctl is too old to write to. (freenet/river#694)
 
+  Details worth knowing if you run a bot:
+  - The catch-up fetch runs after **every** refresh, not only after a re-key,
+    because the pointer GET shares the node connection with the subscription and
+    steps over (discarding) frames while it waits for its own answer. One of
+    those can be an update notification for the room being streamed.
+  - A re-SUBSCRIBE the node will not yet accept is **not** fatal. The node most
+    likely to refuse is one that does not hold the newly-published generation
+    yet, so riverctl retries every 30s and keeps polling meanwhile rather than
+    exiting.
+  - Only a signature-verified pointer record can move a stream. A refresh that
+    merely timed out can name a different hash (the fallback is whatever was
+    last persisted, or the bundled one), and acting on that would announce a
+    re-key that never happened and re-subscribe to a retired generation.
+  - A signed **withdrawal** of the pointer record ends the stream, rather than
+    being swallowed as a transient failure like every other resolution error.
+  - The interval carries ±20% jitter, so a fleet of bots started together does
+    not hit the network in one synchronised burst after a re-key.
+
 ## [0.2.15] - 2026-09-06
 
 ### Fixed
