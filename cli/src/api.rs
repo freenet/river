@@ -2848,20 +2848,18 @@ impl ApiClient {
         // the announcement. `decide_refresh` carries the full argument.
         let accepted = match crate::pointer::decide_refresh(previous.as_ref(), resolved) {
             crate::pointer::RefreshDecision::Accept(anchor) => anchor,
-            crate::pointer::RefreshDecision::Decline { keep, rejected } => {
+            crate::pointer::RefreshDecision::Decline {
+                keep,
+                rejected,
+                reason,
+            } => {
                 // stderr, not `warn!` — see `announce_anchor`. Deduplicated on
                 // the REJECTED hash, which is the only thing here that can
                 // actually differ between refreshes: `keep` is by construction a
                 // clone of `previous`, so an earlier version of this compared a
                 // value with itself and could never fire at all.
                 if self.note_declined(rejected.code_hash()) {
-                    eprintln!(
-                        "note: keeping room-contract generation {}. An unverified re-check named \
-                         {} instead, which is not evidence enough to move off a generation \
-                         already in use.",
-                        crate::pointer::code_hash_b58(keep.code_hash()),
-                        crate::pointer::code_hash_b58(rejected.code_hash()),
-                    );
+                    eprintln!("{}", reason.describe(&keep, &rejected));
                 }
                 keep
             }
@@ -7130,6 +7128,9 @@ impl ApiClient {
                     // something is worth PRINTING is how a later "do not repeat
                     // this line" tweak silently disables re-subscription.
                     Ok(refresh) => {
+                        // A move only reaches here if `decide_refresh` accepted
+                        // it — a re-key this riverctl cannot act on is declined
+                        // there, so the subscription is never torn down for one.
                         if refresh.moved() {
                             if let Some(notice) = refresh.move_notice() {
                                 eprintln!("{notice}");
@@ -10253,23 +10254,27 @@ mod pointer_refresh_tests {
         assert_eq!(refresh.move_notice(), None);
     }
 
-    /// A re-key that riverctl is too old to WRITE to must still be followed for
-    /// reading. A stream that refused to move would stay on the retired
-    /// generation, which is the original bug wearing a safety justification.
+    /// `AnchorRefresh` reports the FACT of a move; whether to act on it is
+    /// `decide_refresh`'s call, and a re-key past this binary never reaches here
+    /// as a move at all. What this pins is the division of labour: the type
+    /// reports what it is given, and does not quietly filter.
     #[test]
-    fn a_move_to_an_unknown_generation_is_still_a_move() {
+    fn anchor_refresh_reports_what_it_is_given() {
         let before = pointer_anchor(bundled(), bundled());
-        assert_eq!(before.generation(), Generation::Bundled);
-        // Neither the bundled hash nor any generation this binary knows.
         let after = pointer_anchor(LIVE, bundled());
         assert_eq!(after.generation(), Generation::Unknown);
 
         let refresh = AnchorRefresh::new(after, Some(before));
-        assert!(refresh.moved());
+        assert!(
+            refresh.moved(),
+            "the move is a fact even when it is not acted on"
+        );
+        // Reads against it would be permitted — the refusal to follow is about
+        // what is USEFUL there, not about what is authorized.
         refresh
             .anchor()
             .authorize(KeyIntent::Read)
-            .expect("reads must follow the move even when writes cannot");
+            .expect("reads are permitted against any generation");
         refresh
             .anchor()
             .authorize(KeyIntent::Write)

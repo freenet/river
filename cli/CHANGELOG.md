@@ -27,10 +27,16 @@ All notable changes to riverctl will be documented in this file.
     likely to refuse is one that does not hold the newly-published generation
     yet, so riverctl retries every 30s and keeps polling meanwhile rather than
     exiting.
-  - Only a signature-verified pointer record can move a stream. A refresh that
-    merely timed out can name a different hash (the fallback is whatever was
-    last persisted, or the bundled one), and acting on that would announce a
-    re-key that never happened and re-subscribe to a retired generation.
+  - A stream moves only when the move is both **evidenced and actionable**. A
+    refresh that merely timed out can name a different hash, and acting on that
+    would announce a re-key that never happened and re-subscribe to a retired
+    generation. And a *verified* re-key to a generation this riverctl does not
+    know is reported but **not** followed: the new key holds nothing this binary
+    can reach (the backward probe will not search from a generation it does not
+    know, and writing is refused), so following it would trade a subscription
+    that is still delivering for a key it cannot act on — leaving the stream
+    silent on both. In that case riverctl stays where the data is and tells you
+    to run `cargo install riverctl --force`.
   - A signed **withdrawal** of the pointer record ends the stream, rather than
     being swallowed as a transient failure like every other resolution error.
   - The interval carries ±20% jitter, so a fleet of bots started together does

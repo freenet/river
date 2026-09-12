@@ -401,18 +401,75 @@ pub enum RefreshDecision {
     /// Install it: either it is signature-verified, or it names the generation
     /// already in use and so changes nothing about what is addressed.
     Accept(RoomAnchor),
-    /// Keep what was already in force. Carries both so the caller can say which
-    /// generation it is staying on and what it declined.
+    /// Keep what was already in force. Carries both anchors so the caller can
+    /// say which generation it is staying on and what it declined, and the
+    /// reason, because the two reasons call for very different advice.
     Decline {
         keep: RoomAnchor,
         rejected: RoomAnchor,
+        reason: DeclineReason,
     },
+}
+
+/// Why a refreshed anchor was not installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The new hash came from something that is not a signature-verified record,
+    /// so it is not evidence of anything. Usually a timeout whose fallback hash
+    /// differs from the one in force because the floor could not be persisted.
+    UnverifiedDisagreement,
+    /// The new hash IS verified, and names a generation this binary does not
+    /// know. River has re-keyed past this riverctl.
+    UnknownGeneration,
+}
+
+impl DeclineReason {
+    /// The line the operator sees. Both name the two generations; they differ in
+    /// what they ask for, and that difference is the point of the enum.
+    pub fn describe(&self, keep: &RoomAnchor, rejected: &RoomAnchor) -> String {
+        let (from, to) = (
+            code_hash_b58(keep.code_hash()),
+            code_hash_b58(rejected.code_hash()),
+        );
+        match self {
+            Self::UnverifiedDisagreement => format!(
+                "note: keeping room-contract generation {from}. An unverified re-check named \
+                 {to} instead, which is not evidence enough to move off a generation already \
+                 in use."
+            ),
+            Self::UnknownGeneration => format!(
+                "warning: River re-keyed the room contract while this command was running, to a \
+                 generation this riverctl does not know.\n                   was: {from}\n  now: {to}\n\
+                 Staying on the generation already in use. The new one holds nothing this \
+                 riverctl can reach — the backward probe refuses to search from a generation \
+                 it does not know, and writing to it is refused — so following it would mean \
+                 giving up a working subscription for a key this binary cannot act on. Run \
+                 `cargo install riverctl --force` and restart to follow it."
+            ),
+        }
+    }
 }
 
 /// Decide whether a refreshed anchor may replace the one in force.
 ///
-/// The rule is one sentence: **only a signature-verified record may move a run
-/// off a generation it is already using.**
+/// Two rules, and both are about the same thing: a run only moves off a
+/// generation it is already using when the move is both EVIDENCED and ACTIONABLE.
+///
+/// 1. **Only a signature-verified record may move a run.** Anything else is an
+///    absence of knowledge wearing a hash.
+/// 2. **Only a generation this binary knows may be moved TO.** A verified re-key
+///    past this riverctl is real and is reported, but following it trades a
+///    subscription that is still delivering for a key this binary can do nothing
+///    with: the new generation typically holds no state until a newer client
+///    migrates the room, the backward probe refuses to search from an unknown
+///    anchor (see [`probe_plan`]), and writing is refused. Following it would
+///    leave the stream deaf on BOTH generations while announcing that no restart
+///    was needed — the exact silence this module exists to remove, produced by
+///    the mechanism meant to remove it.
+///
+/// The second rule is NOT the stale-anchor bug returning. The anchor is still
+/// resolved, the operator is still told, and a one-shot command still addresses
+/// the live generation. What is declined is only the mid-run TEARDOWN.
 ///
 /// Why it has to gate the INSTALL and not merely the announcement: a failed
 /// resolution still produces an anchor, sitting on `last_known()` — the floor's
@@ -430,18 +487,29 @@ pub enum RefreshDecision {
 /// nothing to protect yet, and refusing would leave the run with no anchor at
 /// all.
 pub fn decide_refresh(previous: Option<&RoomAnchor>, resolved: RoomAnchor) -> RefreshDecision {
-    match previous {
-        Some(prev)
-            if resolved.code_hash() != prev.code_hash()
-                && !matches!(resolved.source(), AnchorSource::Pointer) =>
-        {
-            RefreshDecision::Decline {
-                keep: prev.clone(),
-                rejected: resolved,
-            }
-        }
-        _ => RefreshDecision::Accept(resolved),
+    let Some(prev) = previous else {
+        // A first resolution has nothing to protect, and refusing would leave the
+        // run with no anchor at all.
+        return RefreshDecision::Accept(resolved);
+    };
+    if resolved.code_hash() == prev.code_hash() {
+        return RefreshDecision::Accept(resolved);
     }
+    if !matches!(resolved.source(), AnchorSource::Pointer) {
+        return RefreshDecision::Decline {
+            keep: prev.clone(),
+            rejected: resolved,
+            reason: DeclineReason::UnverifiedDisagreement,
+        };
+    }
+    if resolved.generation() == Generation::Unknown {
+        return RefreshDecision::Decline {
+            keep: prev.clone(),
+            rejected: resolved,
+            reason: DeclineReason::UnknownGeneration,
+        };
+    }
+    RefreshDecision::Accept(resolved)
 }
 
 /// The advisory to print for `anchor`, given what has already been printed for
@@ -994,15 +1062,16 @@ mod tests {
     #[test]
     fn only_a_verified_record_may_replace_the_generation_in_force() {
         use super::test_support::{pointer_anchor, unverified_anchor};
-        let live = [0x11; 32];
-        let other = [0xBB; 32];
         let b = bundled();
+        // A generation this binary knows: the destination of a move it can act on.
+        let known = river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES[3];
 
-        let in_force = pointer_anchor(live, b);
+        let in_force = pointer_anchor(b, b);
 
-        // A verified record naming a new generation: accepted, and it is what
+        // A verified record naming a generation we know: accepted, and it is what
         // gets installed.
-        let verified_move = pointer_anchor(other, b);
+        let verified_move = pointer_anchor(known, b);
+        assert_eq!(verified_move.generation(), Generation::Legacy(3));
         assert_eq!(
             decide_refresh(Some(&in_force), verified_move.clone()),
             RefreshDecision::Accept(verified_move),
@@ -1010,10 +1079,15 @@ mod tests {
 
         // An UNVERIFIED anchor naming a different generation: declined, and the
         // generation in force is what stays.
-        let fallback = unverified_anchor(b, b);
+        let fallback = unverified_anchor(known, b);
         assert_ne!(fallback.code_hash(), in_force.code_hash());
         match decide_refresh(Some(&in_force), fallback.clone()) {
-            RefreshDecision::Decline { keep, rejected } => {
+            RefreshDecision::Decline {
+                keep,
+                rejected,
+                reason,
+            } => {
+                assert_eq!(reason, DeclineReason::UnverifiedDisagreement);
                 assert_eq!(keep.code_hash(), in_force.code_hash());
                 assert_eq!(rejected.code_hash(), fallback.code_hash());
             }
@@ -1022,7 +1096,7 @@ mod tests {
 
         // An unverified anchor naming the SAME generation is harmless — it
         // addresses the same contract — so it is accepted rather than declined.
-        let same_hash_unverified = unverified_anchor(live, b);
+        let same_hash_unverified = unverified_anchor(b, b);
         assert!(matches!(
             decide_refresh(Some(&in_force), same_hash_unverified),
             RefreshDecision::Accept(_)
@@ -1033,6 +1107,50 @@ mod tests {
         let first = unverified_anchor(b, b);
         assert!(matches!(
             decide_refresh(None, first),
+            RefreshDecision::Accept(_)
+        ));
+    }
+
+    /// The second rule, and the one that is counter-intuitive: a VERIFIED re-key
+    /// to a generation this binary does not know is declined too.
+    ///
+    /// Following it reads as strictly better — reads are permitted against any
+    /// generation — and is in fact how a running stream goes deaf on BOTH. The
+    /// new key holds nothing this binary can reach (the backward probe refuses to
+    /// search from an unknown anchor, and writing is refused), and the stream
+    /// would have given up a subscription that was still delivering to get there.
+    #[test]
+    fn a_verified_rekey_past_this_binary_is_reported_but_not_followed() {
+        use super::test_support::pointer_anchor;
+        let b = bundled();
+        let in_force = pointer_anchor(b, b);
+        let past_us = pointer_anchor([0x11; 32], b);
+        assert_eq!(past_us.generation(), Generation::Unknown);
+        assert_eq!(past_us.source(), &AnchorSource::Pointer, "it IS verified");
+
+        match decide_refresh(Some(&in_force), past_us.clone()) {
+            RefreshDecision::Decline {
+                keep,
+                rejected,
+                reason,
+            } => {
+                assert_eq!(reason, DeclineReason::UnknownGeneration);
+                assert_eq!(keep.code_hash(), in_force.code_hash());
+                // And the operator is told to upgrade, not reassured.
+                let msg = reason.describe(&keep, &rejected);
+                assert!(msg.contains("cargo install riverctl"), "{msg}");
+                assert!(
+                    !msg.contains("no restart needed"),
+                    "an unfollowable move must not claim a restart is unnecessary: {msg}"
+                );
+            }
+            other => panic!("a re-key past this binary must not be followed, got {other:?}"),
+        }
+
+        // A one-shot command is unaffected: with nothing in force there is no
+        // subscription to protect, so the live generation is still adopted.
+        assert!(matches!(
+            decide_refresh(None, past_us),
             RefreshDecision::Accept(_)
         ));
     }
