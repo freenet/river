@@ -56,11 +56,12 @@ mod imp {
                 base_url
             };
 
-            info!("Connecting to Freenet node at: {}", websocket_url);
+            let log_url = websocket_url.split('?').next().unwrap_or(&websocket_url);
+            info!("Connecting to Freenet node at: {}", log_url);
             *SYNC_STATUS.write() = SynchronizerStatus::Connecting;
             self.connected = false;
 
-            info!("Connecting to WebSocket URL: {}", websocket_url);
+            info!("Connecting to WebSocket URL: {}", log_url);
             let websocket = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
                 let error_msg = format!("Failed to create WebSocket: {:?}", e);
                 error!("{}", error_msg);
