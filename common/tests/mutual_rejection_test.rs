@@ -172,18 +172,42 @@ fn member_ids(s: &ChatRoomStateV1) -> Vec<MemberId> {
     s.members.members.iter().map(|m| m.member.id()).collect()
 }
 
+/// Gossip full states both ways until the peers agree, as nodes do. Every
+/// merge must SUCCEED: a rejection is what made #423 permanent. Returns the
+/// number of exchanges it took.
+fn gossip_until_equal(
+    a: &ChatRoomStateV1,
+    b: &ChatRoomStateV1,
+    p: &ChatRoomParametersV1,
+    max_exchanges: usize,
+) -> (ChatRoomStateV1, usize) {
+    let (mut x, mut y) = (a.clone(), b.clone());
+    for n in 1..=max_exchanges {
+        let nx = merge(&x, &y, p).unwrap_or_else(|e| panic!("exchange {n}: merge rejected: {e}"));
+        let ny = merge(&y, &x, p).unwrap_or_else(|e| panic!("exchange {n}: merge rejected: {e}"));
+        x = nx;
+        y = ny;
+        if ser(&x) == ser(&y) {
+            return (x, n);
+        }
+    }
+    panic!("peers still differ after {max_exchanges} exchanges");
+}
+
 /// The permanent fork, minimised. Both states are valid.
 ///
 /// * Peer B holds X, Y and T, and two inert bans: Y bans X and X bans T.
 ///   Inert because neither banner is the target's ancestor or deputy, so
-///   neither removes anyone. `verify` accepts inert bans by design (#410): a
-///   member can sign one at any time.
+///   neither removes anyone. `verify` accepts inert bans by design (#410).
 /// * Peer A holds Y and T. X was pruned for inactivity there.
 ///
 /// When A merges B, `bans` applies before `members`, so it sees A's member
 /// set, where X is absent and banned (by Y) and T is present. On `main` that
 /// matched the orphaned-ban rule and the WHOLE merge was rejected. B has
-/// nothing to learn from A, so B never changes, and A rejects B forever.
+/// nothing to learn from A, so B never changes, and A rejected B forever.
+///
+/// Now A drops just X's ban on the first exchange (X is not yet a member
+/// there), takes everything else including X, and accepts the ban on the next.
 #[test]
 fn a_pruned_banner_does_not_fork_the_room() {
     let room = Room::new();
@@ -196,34 +220,30 @@ fn a_pruned_banner_does_not_fork_the_room() {
     );
     let a = room.state(&[&t, &y], vec![], vec![room.msg(&t, 1), room.msg(&y, 3)]);
 
-    let ab = merge(&a, &b, &room.params).expect("A must accept B's valid state (#423)");
-    let ba = merge(&b, &a, &room.params).expect("B must accept A's valid state");
+    let (agreed, exchanges) = gossip_until_equal(&a, &b, &room.params, 3);
     assert_eq!(
-        ser(&ab),
-        ser(&ba),
-        "the two peers must converge on one state"
-    );
-    assert_eq!(
-        ser(&ab),
+        ser(&agreed),
         ser(&b),
         "A learns everything B has; B already had everything A has"
     );
+    assert!(exchanges <= 2, "took {exchanges} exchanges");
 }
 
-/// The fix must not let an orphaned ban ACT or PERSIST. X is banned by the
-/// owner and absent everywhere; X's ban on T arrives anyway (X can sign it at
-/// any time). T must stay, X's ban must be swept, and the owner's ban must
-/// stay.
+/// A delta that carries an orphaned ban is not rejected: the ban is dropped
+/// and the rest of the delta lands. X is banned by the owner and absent; X's
+/// ban on T arrives in the same delta as an unrelated message.
 #[test]
-fn an_orphaned_ban_is_accepted_but_inert_and_swept() {
+fn a_delta_carrying_an_orphaned_ban_still_applies_the_rest() {
     let room = Room::new();
     let (t, x) = (room.person(), room.person());
     let a = room.state(&[&t], vec![], vec![room.msg(&t, 1)]);
 
     let owner_bans_x = room.owner_ban(&x, 5);
     let x_bans_t = room.ban(&x, &t, 6);
+    let later_msg = room.msg(&t, 7);
     let delta = ChatRoomStateV1Delta {
         bans: Some(vec![owner_bans_x.clone(), x_bans_t.clone()]),
+        recent_messages: Some(vec![later_msg.clone()]),
         ..Default::default()
     };
     let mut after = a.clone();
@@ -234,17 +254,83 @@ fn an_orphaned_ban_is_accepted_but_inert_and_swept() {
         .verify(&after, &room.params)
         .expect("result must verify");
 
-    assert!(
-        member_ids(&after).contains(&t.id),
-        "an orphaned ban must not remove its target"
-    );
+    assert!(member_ids(&after).contains(&t.id), "T must stay");
     assert!(
         !after.bans.0.iter().any(|b| b.id() == x_bans_t.id()),
-        "an orphaned ban must be swept by post_apply_cleanup, not stored"
+        "the orphaned ban must not be stored"
     );
     assert!(
         after.bans.0.iter().any(|b| b.id() == owner_bans_x.id()),
         "the owner's ban is legitimate and must be kept"
+    );
+    assert!(
+        after
+            .recent_messages
+            .messages
+            .iter()
+            .any(|m| m.id() == later_msg.id()),
+        "the rest of the delta must land"
+    );
+}
+
+/// A moderator banned by another moderator must not regain ban authority by
+/// being re-added in the same delta as one of their own bans (found in
+/// review of #702's first revision).
+///
+/// B and D are both owner-appointed moderators (listed in the owner's
+/// `deputies`). D banned B, so B was removed. B's public `AuthorizedMember`
+/// can be replayed by anyone. One delta carries it together with a ban B
+/// signed on T. `bans` applies before `members`, so B is absent at that point
+/// and the ban is orphaned. If it were stored, the `members` step would re-add
+/// B (it cannot evaluate deputy authority), and cleanup step 0 would see B as
+/// a current moderator with a matching signature and remove T and T's whole
+/// subtree in the same pass that removes B.
+#[test]
+fn a_banned_moderator_cannot_act_through_a_same_delta_re_add() {
+    let room = Room::new();
+    let (t, d, b) = (room.person(), room.person(), room.person());
+
+    let mut owner_info = MemberInfo::new_public(room.owner_id, 1, "owner".into());
+    owner_info.deputies = vec![d.id, b.id];
+    let owner_info = AuthorizedMemberInfo::new(owner_info, &room.owner_sk);
+
+    let d_bans_b = room.ban(&d, &b, 5);
+    let mut a = room.state(
+        &[&t, &d],
+        vec![d_bans_b.clone()],
+        vec![room.msg(&t, 1), room.msg(&d, 2)],
+    );
+    a.member_info = MemberInfoV1 {
+        member_info: vec![owner_info],
+    };
+    a.verify(&a, &room.params).expect("fixture must be valid");
+
+    let b_bans_t = room.ban(&b, &t, 10);
+    let delta = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![b.auth.clone()])),
+        bans: Some(vec![b_bans_t.clone()]),
+        recent_messages: Some(vec![room.msg(&b, 11)]),
+        ..Default::default()
+    };
+    let mut after = a.clone();
+    after
+        .apply_delta(&a, &room.params, &Some(delta))
+        .expect("the delta must not be rejected wholesale (#423)");
+    after
+        .verify(&after, &room.params)
+        .expect("result must verify");
+
+    assert!(
+        member_ids(&after).contains(&t.id),
+        "a banned moderator's stale ban must not remove anyone"
+    );
+    assert!(
+        !member_ids(&after).contains(&b.id),
+        "D's ban on B is enforced"
+    );
+    assert!(
+        !after.bans.0.iter().any(|x| x.id() == b_bans_t.id()),
+        "the orphaned ban must not be stored"
     );
 }
 

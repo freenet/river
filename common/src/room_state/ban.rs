@@ -171,30 +171,8 @@ impl BansV1 {
     /// Signature checks only: every ban whose banner is the owner or a member
     /// of `parent_state` must verify against that banner's key. A ban whose
     /// banner is not a member is skipped, because the key is not available
-    /// here (see the loop body).
-    ///
-    /// This is ALL that `apply_delta` checks per ban. It deliberately does not
-    /// run [`Self::get_invalid_bans`]' orphaned-ban rule (banner absent AND
-    /// itself banned, target present), for two reasons:
-    ///
-    /// * **It is evaluated against the wrong member set.** `bans` is applied
-    ///   before `members` in field order, so here `parent_state.members` is the
-    ///   receiver's PRE-update set. Whether a banner is absent at that point
-    ///   says nothing about the state the delta produces.
-    /// * **Rejecting forks the room permanently (freenet/river#423).** The rule
-    ///   rejects the WHOLE delta. A peer holding a perfectly valid state (one
-    ///   where the banner is a member, or the target is gone) can then never
-    ///   merge into a peer where the banner was pruned and the target is still
-    ///   present, and nothing on either side ever changes that. Measured with
-    ///   `tests/membership_fork_merge_test.rs`: permanent forks on `main` that
-    ///   this removes entirely.
-    ///
-    /// Dropping the rule here does not let an orphaned ban act or persist. An
-    /// orphaned ban's banner is by definition not a member, so
-    /// [`Self::ban_is_enforcing`] classifies it inert (it removes nobody) and
-    /// `post_apply_cleanup` step 5 sweeps it against the CONVERGED member set,
-    /// in the same apply. `verify` keeps the rule for stored state, where it is
-    /// evaluated against the state's own members and is correct.
+    /// here (see the loop body). `verify` runs this after the orphaned-ban
+    /// rule; `apply_delta` runs it after FILTERING by that rule instead.
     fn verify_ban_signatures(
         &self,
         parent_state: &ChatRoomStateV1,
@@ -218,8 +196,8 @@ impl BansV1 {
                 // 2. The banner was pruned for inactivity (no recent messages)
                 // In both cases, skip signature verification — we can't verify
                 // without the banner's key, and the signature was verified when
-                // the ban was first created. post_apply_cleanup will remove
-                // truly orphaned bans (where the banner was banned, not pruned).
+                // the ban was first created. post_apply_cleanup step 5 sweeps
+                // every ban whose banner is not a current member.
             }
         }
 
@@ -235,7 +213,7 @@ impl BansV1 {
     /// This closes the SAME-DELTA replay bypass. Field order applies `bans`
     /// before `members`, so `verify` SKIPS the signature check for a banner that
     /// is absent from the parent state at bans-apply time (see
-    /// `verify_excluding_cap`). A single delta that re-adds a pruned deputy via
+    /// `verify_ban_signatures`). A single delta that re-adds a pruned deputy via
     /// their PUBLIC, replayable `AuthorizedMember` AND carries a garbage-signature
     /// ban attributed to that deputy would otherwise have the ban ENFORCED by
     /// `post_apply_cleanup` once the deputy is a current member (the retained
@@ -434,9 +412,10 @@ impl ComposableState for BansV1 {
     ///
     /// This method:
     /// - Checks for duplicate bans
-    /// - Verifies the signatures of all new bans whose banner is known here,
-    ///   EXCLUDING the `max_user_bans` ceiling and the orphaned-ban rule (both
-    ///   judged by `post_apply_cleanup` against converged state)
+    /// - Drops orphaned bans (banner absent and itself banned, target present)
+    ///   rather than rejecting the delta for them (#423)
+    /// - Verifies the signatures of the remaining bans whose banner is known
+    ///   here, EXCLUDING the `max_user_bans` ceiling
     /// - Adds the new bans to the collection
     ///
     /// It deliberately does NOT enforce `max_user_bans` here. The cap is
@@ -491,13 +470,32 @@ impl ComposableState for BansV1 {
                 }
             }
 
-            // Create a temporary BansV1 with the new bans and check their
-            // signatures, WITHOUT the max-cap ceiling (deferred to
-            // post_apply_cleanup) and WITHOUT the orphaned-ban rule (deferred
-            // to post_apply_cleanup step 5, which judges it against the
-            // converged member set; see `verify_ban_signatures`, #423).
+            // Create a temporary BansV1 with the new bans, WITHOUT the max-cap
+            // ceiling (deferred to post_apply_cleanup).
+            //
+            // An orphaned ban (banner absent AND itself banned, target
+            // present) is DROPPED here, not a reason to reject the delta
+            // (freenet/river#423). The rule is judged against
+            // `parent_state.members`, which at this point in field order is
+            // the receiver's PRE-update set, so it depends on whom this peer
+            // happened to have pruned. Rejecting the WHOLE delta on it let a
+            // peer that had pruned a banner refuse every merge from a peer
+            // holding a perfectly valid state, forever: a permanent fork.
+            //
+            // Dropping only the ban keeps the per-ban authorization exactly as
+            // it was: a delta minus its orphaned bans is precisely what the old
+            // code accepted. In particular a dropped ban cannot act through a
+            // banner the SAME delta re-adds. `members` applies after `bans`, so
+            // a banned moderator re-added that way would otherwise be a current
+            // member with a matching signature when post_apply_cleanup step 0
+            // evaluates their stale ban. Skipping the rule instead of filtering
+            // by it opened exactly that hole (#702 review). If the sender is
+            // right and the banner is a member, the next exchange re-offers the
+            // ban and it lands then.
             let mut temp_bans = self.clone();
             temp_bans.0.extend(delta.iter().cloned());
+            let orphaned = temp_bans.get_invalid_bans(parent_state, parameters);
+            temp_bans.0.retain(|ban| !orphaned.contains_key(&ban.id()));
             if let Err(e) = temp_bans.verify_ban_signatures(parent_state, parameters) {
                 return Err(format!("Invalid delta: {}", e));
             }
