@@ -38,6 +38,7 @@ use std::time::SystemTime;
 ///    single junk ban against an absent target — that ban is "enforcing", so it
 ///    survives both the non-member-banner sweep and the `max_user_bans`
 ///    eviction, and inactivity-prune can no longer reclaim their member slot.
+///
 /// Both are pre-existing/emergent and self-limiting the same way: the flooder /
 /// squatter is a current member, identifiable on every junk ban, and only an
 /// explicit OWNER ban reclaims the slot — banning them makes their bans inert
@@ -164,6 +165,41 @@ impl BansV1 {
             return Err(format!("Invalid bans: {}", error_messages.join(", ")));
         }
 
+        self.verify_ban_signatures(parent_state, parameters)
+    }
+
+    /// Signature checks only: every ban whose banner is the owner or a member
+    /// of `parent_state` must verify against that banner's key. A ban whose
+    /// banner is not a member is skipped, because the key is not available
+    /// here (see the loop body).
+    ///
+    /// This is ALL that `apply_delta` checks per ban. It deliberately does not
+    /// run [`Self::get_invalid_bans`]' orphaned-ban rule (banner absent AND
+    /// itself banned, target present), for two reasons:
+    ///
+    /// * **It is evaluated against the wrong member set.** `bans` is applied
+    ///   before `members` in field order, so here `parent_state.members` is the
+    ///   receiver's PRE-update set. Whether a banner is absent at that point
+    ///   says nothing about the state the delta produces.
+    /// * **Rejecting forks the room permanently (freenet/river#423).** The rule
+    ///   rejects the WHOLE delta. A peer holding a perfectly valid state (one
+    ///   where the banner is a member, or the target is gone) can then never
+    ///   merge into a peer where the banner was pruned and the target is still
+    ///   present, and nothing on either side ever changes that. Measured with
+    ///   `tests/membership_fork_merge_test.rs`: permanent forks on `main` that
+    ///   this removes entirely.
+    ///
+    /// Dropping the rule here does not let an orphaned ban act or persist. An
+    /// orphaned ban's banner is by definition not a member, so
+    /// [`Self::ban_is_enforcing`] classifies it inert (it removes nobody) and
+    /// `post_apply_cleanup` step 5 sweeps it against the CONVERGED member set,
+    /// in the same apply. `verify` keeps the rule for stored state, where it is
+    /// evaluated against the state's own members and is correct.
+    fn verify_ban_signatures(
+        &self,
+        parent_state: &ChatRoomStateV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> Result<(), String> {
         let members_by_id = parent_state.members.members_by_member_id();
         let owner_vk = parameters.owner;
         let owner_id = parameters.owner_id();
@@ -398,8 +434,9 @@ impl ComposableState for BansV1 {
     ///
     /// This method:
     /// - Checks for duplicate bans
-    /// - Verifies all new bans are valid (per-ban + signatures), EXCLUDING the
-    ///   `max_user_bans` ceiling
+    /// - Verifies the signatures of all new bans whose banner is known here,
+    ///   EXCLUDING the `max_user_bans` ceiling and the orphaned-ban rule (both
+    ///   judged by `post_apply_cleanup` against converged state)
     /// - Adds the new bans to the collection
     ///
     /// It deliberately does NOT enforce `max_user_bans` here. The cap is
@@ -454,11 +491,14 @@ impl ComposableState for BansV1 {
                 }
             }
 
-            // Create a temporary BansV1 with the new bans and validate WITHOUT
-            // the max-cap ceiling (deferred to post_apply_cleanup).
+            // Create a temporary BansV1 with the new bans and check their
+            // signatures, WITHOUT the max-cap ceiling (deferred to
+            // post_apply_cleanup) and WITHOUT the orphaned-ban rule (deferred
+            // to post_apply_cleanup step 5, which judges it against the
+            // converged member set; see `verify_ban_signatures`, #423).
             let mut temp_bans = self.clone();
             temp_bans.0.extend(delta.iter().cloned());
-            if let Err(e) = temp_bans.verify_excluding_cap(parent_state, parameters) {
+            if let Err(e) = temp_bans.verify_ban_signatures(parent_state, parameters) {
                 return Err(format!("Invalid delta: {}", e));
             }
             self.0 = temp_bans.0;
