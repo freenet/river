@@ -229,3 +229,9 @@ version = "V32"
 description = "Before the DM held-set membership sweep (freenet/river#671): last generation whose DirectMessagesV1::apply_delta left held DMs with a non-member endpoint in the global-cap ranking, and whose post_apply_cleanup step 1 counted them as retention evidence"
 date = "2026-09-06"
 code_hash = "e765339ba3039f937256f4b6f7e8683d43f90e158f5d80f0dd45afdca69911e5"
+
+[[entry]]
+version = "V33"
+description = "Before the apply-time orphaned-ban fix (freenet/river#423): last generation whose BansV1::apply_delta rejected a WHOLE delta on the orphaned-ban rule, judged against the receiver's pre-update member set, so a peer that had pruned a banner permanently rejected merges from valid states"
+date = "2026-09-22"
+code_hash = "a3e63c8c0426255376f9f6f00948512e185bd0961875e43cd9e3e479ccaa0ce1"
