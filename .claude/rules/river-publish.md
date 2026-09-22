@@ -86,19 +86,29 @@ cargo make compress-webapp
 cargo make publish-river  # bumps published-contract/contract-version.txt
 ```
 
-### Step 6: Commit the version bump, verify, and push
+### Step 6: Commit the version bump through a PR, and verify
+
+`main` is protected by a ruleset requiring four status checks (`build`,
+`check-delegate-migration`, `check-room-contract-migration`,
+`check-pointer-freshness`), so `git push origin main` is rejected with `GH013`.
+The bumped counter lands through a small PR, like #686 and #701.
 
 ```bash
 # `cargo make sign-webapp` (run transitively by publish-river) incremented
-# the counter. Commit it together with whatever other changes the publish
-# included — and commit it EVEN IF the publish reported a failure. See
+# the counter. Commit it — EVEN IF the publish reported a failure. See
 # "Version policy" below: the counter is forward-only, because a reported
 # failure is not evidence the state did not land.
-git add published-contract/contract-version.txt
-git commit -m "chore: bump web-container version after publish"
 curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | head -5
-git push origin main
+git switch -c chore/publish-counter-$(cat published-contract/contract-version.txt)
+git add published-contract/contract-version.txt
+git commit -m "chore(publish): bump webapp contract version to $(cat published-contract/contract-version.txt)"
+git push -u origin HEAD
+gh pr create --fill   # merge once the four required checks are green
 ```
+
+Open that PR promptly. Until it merges, `main` holds a counter at or below the
+version now live, and the next publish from `main` would sign a version the
+network already has: a silent no-op, or a fork if the archive differs.
 
 ### Step 7: Publish the pointer records (only if step 3b re-signed any)
 
