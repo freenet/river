@@ -421,3 +421,92 @@ fn an_unsigned_member_info_riding_a_re_add_is_rejected() {
         "the attacker must not have gained deputy authority over the victim"
     );
 }
+
+/// Only VERIFIABLE bans may mark a banner as banned for the drop (#702
+/// review, round 2). A full-state PUT or migration can leave the receiver
+/// holding X's genuine ban on T while X, pruned, is absent. A crafted delta
+/// re-adds X (public record) and carries a forged "Z bans X" from an absent Z,
+/// whose signature cannot be checked here. The forgery must not delete X's
+/// real ban.
+#[test]
+fn a_forged_ban_on_the_banner_cannot_delete_a_stored_ban() {
+    let room = Room::new();
+    let (t, x, z) = (room.person(), room.person(), room.person());
+    let x_bans_t = room.ban(&x, &t, 5);
+    let a = room.state(&[&t], vec![x_bans_t.clone()], vec![room.msg(&t, 1)]);
+
+    let mut forged = room.ban(&z, &x, 6);
+    forged.signature = Signature::from_bytes(&[9u8; 64]);
+    let delta = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![x.auth.clone()])),
+        bans: Some(vec![forged]),
+        recent_messages: Some(vec![room.msg(&x, 7)]),
+        ..Default::default()
+    };
+    let mut after = a.clone();
+    after
+        .apply_delta(&a, &room.params, &Some(delta))
+        .expect("delta must apply");
+    after
+        .verify(&after, &room.params)
+        .expect("result must verify");
+
+    assert!(member_ids(&after).contains(&x.id), "X is re-added");
+    assert!(
+        after.bans.0.iter().any(|b| b.id() == x_bans_t.id()),
+        "X's genuine ban must survive a forged ban on X"
+    );
+}
+
+/// The drop also applies to a ban already STORED, when a verifiable ban on
+/// its banner arrives in the same delta that re-adds the banner. X and D are
+/// owner-appointed moderators. The receiver holds X's ban on T while X is
+/// absent (a full-state PUT can leave that). One delta re-adds X and carries
+/// D's ban on X. X's stored ban must not act: T stays, X is removed.
+#[test]
+fn a_stored_ban_cannot_act_through_a_same_delta_re_add_of_its_banned_banner() {
+    let room = Room::new();
+    let (t, d, x) = (room.person(), room.person(), room.person());
+
+    let mut owner_info = MemberInfo::new_public(room.owner_id, 1, "owner".into());
+    owner_info.deputies = vec![d.id, x.id];
+    let owner_info = AuthorizedMemberInfo::new(owner_info, &room.owner_sk);
+
+    let x_bans_t = room.ban(&x, &t, 5);
+    let mut a = room.state(
+        &[&t, &d],
+        vec![x_bans_t.clone()],
+        vec![room.msg(&t, 1), room.msg(&d, 2)],
+    );
+    a.member_info = MemberInfoV1 {
+        member_info: vec![owner_info],
+    };
+    a.verify(&a, &room.params).expect("fixture must be valid");
+
+    let delta = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![x.auth.clone()])),
+        bans: Some(vec![room.ban(&d, &x, 10)]),
+        recent_messages: Some(vec![room.msg(&x, 11)]),
+        ..Default::default()
+    };
+    let mut after = a.clone();
+    after
+        .apply_delta(&a, &room.params, &Some(delta))
+        .expect("the delta must not be rejected wholesale (#423)");
+    after
+        .verify(&after, &room.params)
+        .expect("result must verify");
+
+    assert!(
+        member_ids(&after).contains(&t.id),
+        "a banned moderator's stored ban must not remove anyone"
+    );
+    assert!(
+        !member_ids(&after).contains(&x.id),
+        "D's ban on X is enforced"
+    );
+    assert!(
+        !after.bans.0.iter().any(|b| b.id() == x_bans_t.id()),
+        "the orphaned stored ban must not survive"
+    );
+}

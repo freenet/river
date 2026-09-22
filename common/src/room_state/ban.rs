@@ -168,6 +168,55 @@ impl BansV1 {
         self.verify_ban_signatures(parent_state, parameters)
     }
 
+    /// Ids of the bans in `self` that are orphaned for `apply_delta`'s
+    /// purposes: the banner is neither the owner nor a member of
+    /// `parent_state`, the target IS a member, and some ban in `self` that
+    /// can be VERIFIED here (owner-issued, or by a current member with a
+    /// matching signature) targets the banner. See the comment at the call
+    /// site in `apply_delta` for why only verified bans count.
+    fn orphaned_by_verified_bans(
+        &self,
+        parent_state: &ChatRoomStateV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> HashSet<BanId> {
+        let members_by_id = parent_state.members.members_by_member_id();
+        let owner_id = parameters.owner_id();
+        let candidates: Vec<&AuthorizedUserBan> = self
+            .0
+            .iter()
+            .filter(|ban| {
+                ban.banned_by != owner_id
+                    && !members_by_id.contains_key(&ban.banned_by)
+                    && members_by_id.contains_key(&ban.ban.banned_user)
+            })
+            .collect();
+        if candidates.is_empty() {
+            return HashSet::new();
+        }
+        let absent_banners: HashSet<MemberId> = candidates.iter().map(|b| b.banned_by).collect();
+        // Only verify the bans that could matter: those targeting a candidate
+        // banner. Each verification is an ed25519 check.
+        let verified_banned: HashSet<MemberId> = self
+            .0
+            .iter()
+            .filter(|ban| absent_banners.contains(&ban.ban.banned_user))
+            .filter(|ban| {
+                Self::ban_signature_matches_current_key(
+                    ban,
+                    &members_by_id,
+                    owner_id,
+                    &parameters.owner,
+                )
+            })
+            .map(|ban| ban.ban.banned_user)
+            .collect();
+        candidates
+            .into_iter()
+            .filter(|ban| verified_banned.contains(&ban.banned_by))
+            .map(|ban| ban.id())
+            .collect()
+    }
+
     /// Signature checks only: every ban whose banner is the owner or a member
     /// of `parent_state` must verify against that banner's key. A ban whose
     /// banner is not a member is skipped, because the key is not available
@@ -412,8 +461,8 @@ impl ComposableState for BansV1 {
     ///
     /// This method:
     /// - Checks for duplicate bans
-    /// - Drops orphaned bans (banner absent and itself banned, target present)
-    ///   rather than rejecting the delta for them (#423)
+    /// - Drops orphaned bans (banner absent and banned by a verifiable ban,
+    ///   target present) rather than rejecting the delta for them (#423)
     /// - Verifies the signatures of the remaining bans whose banner is known
     ///   here, EXCLUDING the `max_user_bans` ceiling
     /// - Adds the new bans to the collection
@@ -473,29 +522,40 @@ impl ComposableState for BansV1 {
             // Create a temporary BansV1 with the new bans, WITHOUT the max-cap
             // ceiling (deferred to post_apply_cleanup).
             //
-            // An orphaned ban (banner absent AND itself banned, target
-            // present) is DROPPED here, not a reason to reject the delta
-            // (freenet/river#423). The rule is judged against
+            // An orphaned ban (banner absent AND banned by a VERIFIED ban,
+            // target present) is DROPPED here, not a reason to reject the
+            // delta (freenet/river#423). The rule is judged against
             // `parent_state.members`, which at this point in field order is
             // the receiver's PRE-update set, so it depends on whom this peer
             // happened to have pruned. Rejecting the WHOLE delta on it let a
             // peer that had pruned a banner refuse every merge from a peer
             // holding a perfectly valid state, forever: a permanent fork.
             //
-            // Dropping only the ban keeps the per-ban authorization exactly as
-            // it was: a delta minus its orphaned bans is precisely what the old
-            // code accepted. In particular a dropped ban cannot act through a
-            // banner the SAME delta re-adds. `members` applies after `bans`, so
-            // a banned moderator re-added that way would otherwise be a current
-            // member with a matching signature when post_apply_cleanup step 0
-            // evaluates their stale ban. Skipping the rule instead of filtering
-            // by it opened exactly that hole (#702 review). If the sender is
-            // right and the banner is a member, the next exchange re-offers the
-            // ban and it lands then.
+            // Why drop rather than skip the rule: a dropped ban cannot act
+            // through a banner the SAME delta re-adds. `members` applies after
+            // `bans`, so a banned moderator re-added that way would otherwise
+            // be a current member with a matching signature when
+            // post_apply_cleanup step 0 evaluates their stale ban, and would
+            // remove its target in the same pass that removes them. Skipping
+            // the rule opened exactly that hole (#702 review, round 1).
+            //
+            // Why only VERIFIED bans count as "banned" here (owner-issued, or
+            // by a current member with a matching signature): a ban whose
+            // banner is absent cannot be signature-checked at this point, so
+            // it must not be able to delete a legitimate ban. Otherwise a
+            // crafted delta carrying a forged "Z bans X" (Z absent) would drop
+            // X's real ban (#702 review, round 2). An unverifiable ban is never
+            // enforcing at step 0 either, so not counting it here cannot let a
+            // ban act that should not.
+            //
+            // If the sender is right and the banner is a member, the delta
+            // re-adds the banner and the next exchange re-offers the ban. It
+            // lands then unless the banner is pruned again in the meantime; see
+            // freenet/river#703 for that residual.
             let mut temp_bans = self.clone();
             temp_bans.0.extend(delta.iter().cloned());
-            let orphaned = temp_bans.get_invalid_bans(parent_state, parameters);
-            temp_bans.0.retain(|ban| !orphaned.contains_key(&ban.id()));
+            let orphaned = temp_bans.orphaned_by_verified_bans(parent_state, parameters);
+            temp_bans.0.retain(|ban| !orphaned.contains(&ban.id()));
             if let Err(e) = temp_bans.verify_ban_signatures(parent_state, parameters) {
                 return Err(format!("Invalid delta: {}", e));
             }
