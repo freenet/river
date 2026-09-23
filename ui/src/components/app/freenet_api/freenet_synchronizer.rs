@@ -25,6 +25,24 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
+/// Returns true when an API-response error's message indicates the delegate
+/// a legacy-migration probe targeted does not exist on this node.
+///
+/// freenet/river#705: this used to require BOTH "delegate" and "not found",
+/// which matches freenet-core's internal `wasm_runtime::Error` wording
+/// ("delegate {0} not found in store", `crates/core/src/wasm_runtime/error.rs`)
+/// but NOT freenet-stdlib's `DelegateError::Missing` Display ("missing
+/// delegate {0}"). `freenet local` already answers a probe of a
+/// never-registered delegate with `DelegateError::Missing`, and
+/// freenet/freenet-core#5729 makes network-mode nodes do the same (they used
+/// to answer with an empty success instead) — so this branch must also
+/// recognize that wording, or the migration probe is retried forever instead
+/// of being sealed (see `request_legacy_seal_on_quiescence` below).
+fn is_missing_delegate_error(message: &str) -> bool {
+    (message.contains("delegate") && message.contains("not found"))
+        || message.contains("missing delegate")
+}
+
 /// Compute reconnection delay with exponential backoff and ±20% jitter.
 /// `consecutive_failures` is the number of failed attempts so far (0-indexed).
 fn reconnect_delay_ms(consecutive_failures: u32) -> u64 {
@@ -763,13 +781,12 @@ impl FreenetSynchronizer {
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
 
-                                // "delegate X not found in store" errors from legacy migration
-                                // requests should permanently mark migration as done. The old
-                                // delegate WASM was never installed on this node, so retrying
-                                // across sessions will never succeed.
-                                if e.to_string().contains("delegate")
-                                    && e.to_string().contains("not found")
-                                {
+                                // Errors indicating a probed legacy delegate does not exist
+                                // on this node (see `is_missing_delegate_error`) should
+                                // permanently mark migration as done. The old delegate WASM
+                                // was never installed on this node, so retrying across
+                                // sessions will never succeed.
+                                if is_missing_delegate_error(&e.to_string()) {
                                     info!("Delegate not found error (likely legacy migration) - requesting migration seal on quiescence");
                                     // Quiescence-gated, NOT immediate
                                     // (freenet/river#527). The fan-out probes ~26
@@ -952,6 +969,30 @@ impl FreenetSynchronizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_delegate_error_matches_old_and_new_display_forms() {
+        use freenet_stdlib::client_api::DelegateError;
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
+
+        // Old wording: freenet-core's internal `wasm_runtime::Error`
+        // ("delegate {0} not found in store",
+        // crates/core/src/wasm_runtime/error.rs) surfaced as an error string.
+        let old = "delegate 3iBW6WHwxAeGr5jhFHM9k1YAbYSoUvKm not found in store";
+        assert!(is_missing_delegate_error(old));
+
+        // New wording: freenet-stdlib's `DelegateError::Missing` Display
+        // ("missing delegate {0}") — what `freenet local` already returns,
+        // and what freenet-core#5729 makes network-mode nodes return too.
+        // This exact string is what freenet/river#705 was about: the old
+        // check above never matched it.
+        let key = DelegateKey::new([0xAA; 32], CodeHash::new([0xAB; 32]));
+        let new = DelegateError::Missing(key).to_string();
+        assert!(is_missing_delegate_error(&new));
+
+        // A same-shaped but unrelated error must not be misclassified.
+        assert!(!is_missing_delegate_error("contract abc123 not found"));
+    }
 
     #[test]
     fn backoff_increases_exponentially() {

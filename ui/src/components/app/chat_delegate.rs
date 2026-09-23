@@ -1006,10 +1006,13 @@ mod tests {
     /// strand rooms that live in a generation which had not replied yet.
     ///
     /// There were FOUR such doors, all sealing inline. The loudest was in
-    /// `freenet_synchronizer.rs`: it seals on any "delegate not found" API
-    /// error, which the fan-out itself provokes within milliseconds on every
-    /// node where some legacy delegate WASM was never installed — so one absent
-    /// generation spoke for all the others.
+    /// `freenet_synchronizer.rs`: it seals on any delegate-missing-shaped API
+    /// error (`is_missing_delegate_error` — freenet/river#705: it must match
+    /// both freenet-core's legacy "delegate ... not found" wording and
+    /// freenet-stdlib's `DelegateError::Missing` "missing delegate ..."
+    /// wording), which the fan-out itself provokes within milliseconds on
+    /// every node where some legacy delegate WASM was never installed — so
+    /// one absent generation spoke for all the others.
     ///
     /// They now all route through `request_legacy_seal_on_quiescence`, leaving
     /// exactly ONE writer. This pin fails any future fifth door.
@@ -1049,10 +1052,10 @@ mod tests {
         );
 
         // freenet_synchronizer.rs must NEVER seal inline. This is the door that
-        // caused the harm: it seals on any "delegate not found" API error, which
-        // the fan-out itself provokes within milliseconds on any node missing an
-        // old delegate WASM — so it could fire before any generation holding
-        // data had answered.
+        // caused the harm: it seals on any delegate-missing-shaped API error
+        // (is_missing_delegate_error), which the fan-out itself provokes within
+        // milliseconds on any node missing an old delegate WASM — so it could
+        // fire before any generation holding data had answered.
         let sync_src = include_str!("freenet_api/freenet_synchronizer.rs");
         let sync_production = sync_src
             .split("mod tests {")
