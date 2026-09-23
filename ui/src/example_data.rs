@@ -378,6 +378,56 @@ fn create_room(
             &impostor_sk,
         ));
 
+    // Named members who only react, so self's "That was out of line." gets an overflowing
+    // reaction row from distinct users. Fixed names outside the random pools, so none can
+    // collide with the deputy's and raise a spurious ⚠.
+    let reactor_keys: Vec<(MemberId, SigningKey)> = if self_is == SelfIs::Owner {
+        [
+            "Priya Okafor",
+            "Mateo Lindqvist",
+            "Sofia Nakamura",
+            "Omar Haddad",
+            "Lena Kowalski",
+            "Tariq Mensah",
+            "Ingrid Solberg",
+            "Rafael Duarte",
+            "Aiko Tanaka",
+            "Bruno Keller",
+            "Chiara Rossi",
+            "Dmitri Volkov",
+        ]
+        .iter()
+        .map(|name| {
+            let sk = SigningKey::generate(&mut csprng);
+            let id = MemberId::from(&sk.verifying_key());
+            members.members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: inviter_id,
+                    member_vk: sk.verifying_key(),
+                },
+                inviter_sk,
+            ));
+            member_info
+                .member_info
+                .push(AuthorizedMemberInfo::new_with_member_key(
+                    MemberInfo {
+                        member_id: id,
+                        version: 0,
+                        preferred_nickname: SealedBytes::public(
+                            format!("{name} (Member)").into_bytes(),
+                        ),
+                        deputies: Vec::new(),
+                    },
+                    &sk,
+                ));
+            (id, sk)
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+
     // Add members to the room
     room_state.members = members.clone();
     room_state.member_info = member_info.clone();
@@ -398,6 +448,7 @@ fn create_room(
         &member_keys,
         other_member_id,
         impostor_id,
+        &reactor_keys,
         history_depth,
     );
 
@@ -458,6 +509,8 @@ fn add_example_messages(
     // guaranteed message for the same reason: the ⚠ on an author line must not
     // depend on the random author picks above.
     impostor_id: MemberId,
+    // Members who react to self's "That was out of line." (empty outside "Your Private Room").
+    reactor_keys: &[(MemberId, SigningKey)],
     history_depth: HistoryDepth,
 ) {
     // Use a timestamp 24 hours ago as base time for messages
@@ -690,7 +743,7 @@ fn add_example_messages(
     // replier-authored snapshot, which the UI deliberately refuses to render
     // (see `resolve_reply_strip`). A fabricated target id reproduces that
     // end state without having to simulate a ban, and is deterministic.
-    {
+    let out_of_line = {
         // Authored by the OWNER (i.e. self) so the placeholder's `is_self`
         // styling branch is the one Playwright exercises, deterministically —
         // `authors[0]` comes from a HashMap iteration and is not stable.
@@ -711,8 +764,10 @@ fn add_example_messages(
             },
             owner_key,
         );
+        let target = (orphan_reply.id(), orphan_reply.message.time);
         messages.messages.push(orphan_reply);
-    }
+        target
+    };
 
     // Add a message containing an unbreakable long URL so the bubble width
     // regression for #212 is exercised by Playwright.
@@ -736,7 +791,7 @@ fn add_example_messages(
     // A SELF (owner-authored) reply whose quoted preview is the long URL above.
     // The reply strip renders its preview with `white-space: nowrap`, so an
     // unbreakable long URL in the preview drives the bubble to its full
-    // `max-w-prose` width. On a self (right-aligned) message that used to
+    // `.msg-bubble` width cap. On a self (right-aligned) message that used to
     // overflow the viewport on narrow mobile screens, clipping the bubble off
     // both edges. Kept in example data so the mobile-overflow Playwright
     // regression test has a self bubble that WOULD overflow without the
@@ -784,36 +839,73 @@ fn add_example_messages(
         messages.messages.push(self_reply_to_long_url);
     }
 
-    // Add reactions to messages from OTHER members (not owner)
-    // Rule: One reaction per user per message
-    // In "Your Private Room" the owner IS self, so this shows self reacting to others
-    let non_owner_messages: Vec<_> = messages
-        .messages
-        .iter()
-        .filter(|m| m.message.author != *owner_id)
-        .collect();
+    // Reactions are signed action messages, as a client sends them, so they survive the
+    // actions_state rebuild every new delta triggers. Standard rooms only: the deep and
+    // at-cap rooms are sized to their message cap. One reaction per user per message.
+    if history_depth == HistoryDepth::Standard {
+        let non_owner: Vec<(MessageId, SystemTime)> = messages
+            .messages
+            .iter()
+            .filter(|m| m.message.author != *owner_id)
+            .map(|m| (m.id(), m.message.time))
+            .collect();
+        let other_member_id = member_keys.keys().find(|id| *id != owner_id).cloned();
+        // Each reaction lands just after its target, keeping the history in time order and
+        // leaving the room's tail (which the autoscroll specs rely on) unchanged.
+        let mut offset_ms = 0;
+        let mut react = |(target, target_time): &(MessageId, SystemTime),
+                         emoji: &str,
+                         author: MemberId,
+                         key: &SigningKey| {
+            offset_ms += 1;
+            let time = *target_time + Duration::from_millis(offset_ms);
+            let at = messages
+                .messages
+                .iter()
+                .position(|m| m.message.time > time)
+                .unwrap_or(messages.messages.len());
+            messages.messages.insert(
+                at,
+                AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: *owner_id,
+                        author,
+                        time,
+                        content: RoomMessageBody::reaction(target.clone(), emoji.to_string()),
+                    },
+                    key,
+                ),
+            );
+        };
 
-    // Get a non-owner member ID for multi-user reaction demo
-    let other_member_id = member_keys.keys().find(|id| *id != owner_id).cloned();
-
-    if non_owner_messages.len() >= 1 {
-        // First non-owner message: owner reacts with thumbs up, other member with heart
-        let msg_id = non_owner_messages[0].id();
-        let mut reactions = HashMap::new();
-        reactions.insert("👍".to_string(), vec![*owner_id]);
-        if let Some(other_id) = other_member_id {
-            reactions.insert("❤️".to_string(), vec![other_id]);
+        // In "Your Private Room" the owner IS self, so this shows self reacting to others.
+        if let Some(first) = non_owner.first() {
+            react(first, "👍", *owner_id, owner_key);
+            if let Some(other_id) = other_member_id {
+                react(first, "❤️", other_id, &member_keys[&other_id]);
+            }
         }
-        messages.actions_state.reactions.insert(msg_id, reactions);
-    }
+        if let Some(second) = non_owner.get(1) {
+            react(second, "🎉", *owner_id, owner_key);
+        }
 
-    if non_owner_messages.len() >= 2 {
-        // Second non-owner message: owner reacts with celebration
-        let msg_id = non_owner_messages[1].id();
-        let mut reactions = HashMap::new();
-        reactions.insert("🎉".to_string(), vec![*owner_id]);
-        messages.actions_state.reactions.insert(msg_id, reactions);
+        // Enough reactions on self's "That was out of line." to overflow its reaction row.
+        if !reactor_keys.is_empty() {
+            let reactors = [
+                (deputy_id, &member_keys[&deputy_id]),
+                (impostor_id, &member_keys[&impostor_id]),
+            ]
+            .into_iter()
+            .chain(reactor_keys.iter().map(|(id, sk)| (*id, sk)));
+            let emojis = [
+                "👍", "❤️", "👍", "👍", "😂", "🎉", "🎉", "😮", "😢", "👀", "🙏", "💯", "💯", "🚀",
+            ];
+            for ((author, key), emoji) in reactors.zip(emojis) {
+                react(&out_of_line, emoji, author, key);
+            }
+        }
     }
+    messages.rebuild_actions_state();
 
     room_state.recent_messages = messages;
 }

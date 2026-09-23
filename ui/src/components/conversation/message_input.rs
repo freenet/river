@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 
 use super::emoji_picker::EmojiPicker;
+use super::inline_icons::ReplyIcon;
 use super::mention::{
     apply_mention_selection, handle_mention_keydown, update_mention_from_input,
     MentionAutocomplete, MentionDropdown,
@@ -29,12 +30,13 @@ fn measure_draft(text: &str, reply: Option<&ReplyContext>, is_private: bool) -> 
     }
 }
 
-/// Height ceiling for the composer, in px (~7 lines). Kept in step with the
-/// textarea's `max-height`: this clamp is what stops the growth, the CSS is
-/// what leaves the overflow scrollable.
-const MAX_COMPOSER_HEIGHT: i32 = 168;
-
-/// Size the composer to its content, clamped to [`MAX_COMPOSER_HEIGHT`].
+/// Size the composer to fit its content, with no ceiling.
+///
+/// The composer never scrolls inside itself: it grows by as many lines as the
+/// draft has, and because its bar is a `flex-shrink-0` sibling of the history's
+/// `flex-1 min-h-0` container, the history gives up the height. There is
+/// deliberately no clamp, so a very long draft can squeeze the history down to
+/// nothing; growth is bounded only by the conversation column.
 ///
 /// This runs on every keystroke, so the DOM access pattern is the whole cost.
 /// Collapsing to `height: auto` before every measurement — the obvious
@@ -53,13 +55,22 @@ const MAX_COMPOSER_HEIGHT: i32 = 168;
 /// measures in place: no collapse, and no write at all while the height is
 /// unchanged.
 ///
+/// That shortfall is the border width (2px), and it comes out of the bottom
+/// padding (`py-2.5`), never out of a line of text, so the last line is always
+/// fully visible. It is still a real scroll range, though, which is why the
+/// textarea is `overflow-y-hidden`: under `overflow-y-auto` those 2px would be
+/// reachable by wheel or touch, and a classic scrollbar would be drawn for them.
+/// With no ceiling there is no other overflow for `hidden` to cut off.
+///
 /// `scrollHeight == clientHeight` means the content stopped overflowing, i.e.
 /// it shrank below the box. That is the one case where the measurement carries
 /// no information and the collapse has to be paid for.
 ///
 /// Note the asymmetry that makes the fast path safe: it is taken only when the
 /// content overflows, i.e. only when the box is too SHORT, so it can never
-/// leave a stale too-tall composer behind.
+/// leave a stale too-tall composer behind. Deleting text or sending (which
+/// defers this call until the cleared value is in the DOM) lands in the
+/// collapse branch, so the composer shrinks back down.
 ///
 /// # This is a trade, not a free win
 ///
@@ -88,7 +99,8 @@ const MAX_COMPOSER_HEIGHT: i32 = 168;
 /// clientHeight` before relying on it — pinning one viewport is what let the
 /// mobile regression through, since `test.use({viewport})` overrides the
 /// project's device viewport and so varies the engine without varying the
-/// layout regime.
+/// layout regime. `Composer grows without scrolling` pins the no-ceiling
+/// behaviour; both live in `ui/tests/message-layout.spec.ts`.
 fn auto_resize_message_input() {
     let Some(el) = get_message_textarea() else {
         return;
@@ -104,7 +116,7 @@ fn auto_resize_message_input() {
         el.scroll_height()
     };
 
-    let target = format!("{}px", content_height.min(MAX_COMPOSER_HEIGHT));
+    let target = format!("{content_height}px");
     // Skip a no-op write: its style invalidation is the bulk of the
     // per-keystroke cost. After a collapse the inline value is `auto`, so that
     // branch always writes.
@@ -168,6 +180,18 @@ pub fn MessageInput(
         message_text.set(format!("{}{}", current, emoji));
     };
 
+    // One measurement for this render: the counter and the Send button both
+    // read it. Sending still measures again, at the click.
+    // `/ 5 * 4` (not `* 4 / 5`): max_message_size is room-config-controlled,
+    // so multiply-first can overflow on a hostile/corrupt config.
+    let encoded_bytes = measure_draft(
+        &message_text.read(),
+        replying_to.read().as_ref(),
+        is_private,
+    );
+    let over_limit = encoded_bytes > max_message_size;
+    let near_message_limit = encoded_bytes > max_message_size / 5 * 4;
+
     rsx! {
         // Backdrop for emoji picker - outside the message bar to avoid z-index issues
         if show_emoji_picker() {
@@ -187,7 +211,9 @@ pub fn MessageInput(
                 onclick: move |_| crate::util::defer(move || mention.set(None)),
             }
         }
-        div { class: "flex-shrink-0 border-t border-border bg-panel relative z-50",
+        div {
+            class: "flex-shrink-0 border-t border-border bg-panel relative z-50",
+            "data-testid": "message-composer",
             div { class: "max-w-4xl mx-auto px-4 py-3",
                 // Reply preview strip
                 {
@@ -198,7 +224,7 @@ pub fn MessageInput(
                         rsx! {
                             div { class: "flex items-center gap-2 mb-2 px-3 py-1.5 bg-surface border-l-2 border-accent rounded text-sm text-text-muted",
                                 span { class: "flex-1 truncate",
-                                    span { class: "font-medium", "\u{21a9} @{author}: " }
+                                    span { class: "font-medium", ReplyIcon { size: 14 } " @{author}: " }
                                     "{preview}"
                                 }
                                 button {
@@ -269,8 +295,15 @@ pub fn MessageInput(
                             // takes over the box, and the in-place measurement stops
                             // working — costing an EXTRA forced layout per keystroke
                             // instead of saving one.
-                            class: "w-full px-4 py-2.5 leading-6 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors resize-none min-h-[44px] overflow-y-auto",
-                            style: "max-height: {MAX_COMPOSER_HEIGHT}px;",
+                            //
+                            // Focus is shown by the border turning `--color-text`
+                            // (dark on light, light on dark), with no ring. That
+                            // border change is the keyboard focus indicator, so
+                            // keep it. `outline-hidden` rather than `outline-none`:
+                            // it looks identical, but restores an outline under
+                            // forced-colors, where the border colour is overridden
+                            // and would no longer show focus.
+                            class: "w-full px-4 py-2.5 leading-6 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-hidden focus:border-text transition-colors resize-none min-h-[44px] overflow-y-hidden",
                             placeholder: "Type your message...",
                             value: "{message_text}",
                             rows: "1",
@@ -310,43 +343,22 @@ pub fn MessageInput(
                         // Counts ENCODED bytes (what the contract enforces), so
                         // it stays truthful for replies, private rooms, and
                         // multi-byte characters.
-                        {
-                            let encoded_bytes = measure_draft(
-                                &message_text.read(),
-                                replying_to.read().as_ref(),
-                                is_private,
-                            );
-                            // `/ 5 * 4` (not `* 4 / 5`): max_message_size is
-                            // room-config-controlled, so multiply-first can
-                            // overflow on a hostile/corrupt config.
-                            let threshold = max_message_size / 5 * 4; // 80%
-                            if encoded_bytes > threshold {
-                                let over = encoded_bytes > max_message_size;
-                                if over {
-                                    rsx! {
-                                        div { class: "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium",
-                                            "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
-                                        }
-                                    }
+                        if near_message_limit {
+                            div {
+                                class: if over_limit {
+                                    "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium"
                                 } else {
-                                    rsx! {
-                                        div { class: "text-xs text-right mt-1 pr-1 text-text-muted",
-                                            "{encoded_bytes}/{max_message_size}"
-                                        }
-                                    }
+                                    "text-xs text-right mt-1 pr-1 text-text-muted"
+                                },
+                                if over_limit {
+                                    "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
+                                } else {
+                                    "{encoded_bytes}/{max_message_size}"
                                 }
-                            } else {
-                                rsx! {}
                             }
                         }
                     }
                     {
-                        let encoded_bytes = measure_draft(
-                            &message_text.read(),
-                            replying_to.read().as_ref(),
-                            is_private,
-                        );
-                        let over_limit = encoded_bytes > max_message_size;
                         let btn_class = if over_limit {
                             "px-5 py-2.5 bg-gray-400 dark:bg-gray-600 text-white font-medium rounded-xl opacity-50 cursor-not-allowed"
                         } else {

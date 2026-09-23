@@ -43,7 +43,7 @@ async function openRoomDetails(page: Page) {
   await roomBtn.click();
   await expect(page.getByRole("heading", { name: OWNED_ROOM })).toBeVisible({ timeout: 5_000 });
 
-  await page.getByTitle("Room details").click();
+  await page.getByTestId("room-title-button").click();
   await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
 }
 
@@ -192,7 +192,7 @@ test.describe("Room Details: in-progress typing survives room-state updates", ()
     await page.getByTestId("edit-room-close-button").click();
     await expect(page.getByTestId("edit-room-modal")).toBeHidden({ timeout: 5_000 });
 
-    await page.getByTitle("Room details").click();
+    await page.getByTestId("room-title-button").click();
     await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
     await expect(page.getByTestId("room-description-input")).toHaveValue(DRAFT, {
       timeout: 10_000,

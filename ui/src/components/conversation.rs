@@ -22,19 +22,21 @@ use crate::util::{
     get_current_system_time, local_message_date, local_today,
 };
 mod emoji_picker;
+mod inline_icons;
 mod mention;
-mod message_actions;
 mod message_input;
 mod not_member_notification;
+mod reaction_order;
+mod reply_highlight;
 use self::emoji_picker::FREQUENT_EMOJIS;
+use self::inline_icons::{DeleteIcon, EditIcon, ReplyIcon, SmileyIcon};
 use self::not_member_notification::NotMemberNotification;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile,
-    FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -143,12 +145,6 @@ struct MessageGroup {
     author_impersonation: Option<ImpersonationWarning>,
     is_self: bool,
     first_time: DateTime<Utc>,
-    /// True if any message in this group carried a sender timestamp later than
-    /// when we received it, by more than [`CLOCK_SKEW_TOLERANCE_SECS`], and was
-    /// therefore clamped back to its arrival time.
-    time_clamped: bool,
-    /// Propagation delay for the first message in the group (shown in header)
-    first_delay_secs: Option<i64>,
     messages: Vec<GroupedMessage>,
 }
 
@@ -156,23 +152,23 @@ struct MessageGroup {
 struct GroupedMessage {
     content_text: String,
     content_html: String,
-    #[allow(dead_code)]
     time: DateTime<Utc>,
     /// True if the sender's timestamp ran ahead of when we received this
     /// message and was clamped back to that arrival time. (It is clamped to
     /// ARRIVAL, not to "now": see [`MessageClock`] for why the render's wall
     /// clock cannot be the target.)
-    #[allow(dead_code)]
     time_clamped: bool,
     id: String,
     message_id: MessageId,
     edited: bool,
-    reactions: HashMap<String, Vec<MemberId>>,
+    /// `(emoji, reactors)` in chip order: by when each emoji's earliest
+    /// standing reaction was added, so a new emoji appends at the right. See
+    /// [`reaction_order`].
+    reactions: Vec<(String, Vec<MemberId>)>,
     /// What the reply-quote strip should render, already resolved against live
     /// room state — see [`ReplyStrip`] and [`resolve_reply_strip`].
     reply_strip: ReplyStrip,
     /// Propagation delay in seconds (send → receive), if known and significant
-    #[allow(dead_code)]
     receive_delay_secs: Option<i64>,
 }
 
@@ -564,6 +560,9 @@ fn group_messages(
     let members_fp = member_names_fingerprint(member_names);
     let mut seen_message_ids: std::collections::HashSet<MessageId> =
         std::collections::HashSet::new();
+    // When each message's reaction emojis were first added, for chip order.
+    // One replay of the action messages for the whole pass, not per message.
+    let reaction_times = reaction_order::reaction_order_for(messages_state, secrets);
 
     // Only iterate over displayable messages (non-deleted, non-action)
     for message in messages_state.display_messages() {
@@ -624,7 +623,9 @@ fn group_messages(
         let edited = messages_state.is_edited(&message_id);
         let reactions = messages_state
             .reactions(&message_id)
-            .cloned()
+            .map(|reactions| {
+                reaction_order::order_reactions(reactions, reaction_times.get(&message_id))
+            })
             .unwrap_or_default();
 
         // Resolve the reply quote (if any) against live room state.
@@ -668,9 +669,6 @@ fn group_messages(
 
         if should_group {
             if let Some(DisplayItem::Messages(ref mut group)) = items.last_mut() {
-                if time_clamped {
-                    group.time_clamped = true;
-                }
                 group.messages.push(grouped_message);
             }
         } else {
@@ -696,8 +694,6 @@ fn group_messages(
                 author_impersonation,
                 is_self,
                 first_time: message_time,
-                time_clamped,
-                first_delay_secs: receive_delay_secs,
                 messages: vec![grouped_message],
             }));
         }
@@ -1827,6 +1823,19 @@ fn chat_scroll_container() -> Option<web_sys::Element> {
         .and_then(|d| d.get_element_by_id("chat-scroll-container"))
 }
 
+/// Publish the history column's content width as `--chat-col` on `#chat-content`,
+/// which the message width caps in main.css read.
+fn publish_chat_column_width(width: f64) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(el) =
+        chat_content_wrapper().and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        let _ = el.style().set_property("--chat-col", &format!("{width}px"));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = width;
+}
+
 /// Read the wrapper the history's rows are laid out in.
 #[cfg(target_arch = "wasm32")]
 fn chat_content_wrapper() -> Option<web_sys::Element> {
@@ -1916,7 +1925,38 @@ fn first_history_row_identity() -> Option<(String, i32)> {
 #[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
-/// Has the view moved ABOVE the offset `last_top` records?
+/// Where the view was last accounted for: our own scrolls record where they
+/// asked to land, and every settle records where the view came to rest. Both
+/// edges, not just `scrollTop` — see [`reader_moved_up_since`] for why.
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct ScrollMark {
+    top: std::cell::Cell<i32>,
+    height: std::cell::Cell<i32>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ScrollMark {
+    fn top(&self) -> i32 {
+        self.top.get()
+    }
+
+    fn bottom(&self) -> i32 {
+        self.top.get() + self.height.get()
+    }
+
+    fn record(&self, top: i32, height: i32) {
+        self.top.set(top);
+        self.height.set(height);
+    }
+
+    /// Content ABOVE the view moved by `delta`: both edges move with it.
+    fn shift(&self, delta: i32) {
+        self.top.set(self.top.get() + delta);
+    }
+}
+
+/// Has the view moved ABOVE where `last_top` last saw it?
 ///
 /// `pinned_to_bottom` is only re-measured when a scroll SETTLES, so between the
 /// reader moving the view and their `scrollend` arriving it is stale by design.
@@ -1932,6 +1972,14 @@ const SCROLL_TOP_SLACK_PX: i32 = 2;
 /// "has the position moved since we last knew what it was", which cannot latch,
 /// because every settle refreshes `last_top`.
 ///
+/// "Moved" means BOTH edges of the window went up. A reader scroll moves them
+/// together; a resize moves only one. The composer growing raises the bottom
+/// edge. The composer collapsing makes the browser clamp `scrollTop` down while
+/// the bottom edge stays on the last message. Judging `scrollTop` alone read
+/// that clamp as the reader whenever an arrival landed in the same frame, before
+/// anything re-recorded the mark: the arrival lifted `max_scroll_top` back over
+/// the clamped offset and both follow paths stood down (9 WebKit runs in 40).
+///
 /// Known limit: `last_top` records the offset a scroll ASKED for, so while the
 /// scroll-to-latest button's smooth scroll is animating this reports true and
 /// stands both follow paths down. A message arriving inside that ~300ms window
@@ -1939,15 +1987,18 @@ const SCROLL_TOP_SLACK_PX: i32 = 2;
 /// the button animates; every automatic scroll is instant and lands within the
 /// same task.
 #[cfg(target_arch = "wasm32")]
-fn reader_moved_up_since(last_top: &Rc<std::cell::Cell<i32>>) -> bool {
+fn reader_moved_up_since(last_top: &Rc<ScrollMark>) -> bool {
     let Some(container) = chat_scroll_container() else {
         return false;
     };
-    // Never judge against an offset the container can no longer reach: if the
+    let top = container.scroll_top();
+    let bottom = top + container.client_height();
+    // Never judge against an edge the container can no longer reach: if the
     // history shrank, the browser clamped the position down on its own and that
     // is not the reader moving.
-    let reference = last_top.get().min(max_scroll_top(&container));
-    container.scroll_top() + SCROLL_TOP_SLACK_PX < reference
+    let top_was = last_top.top().min(max_scroll_top(&container));
+    let bottom_was = last_top.bottom().min(container.scroll_height());
+    top + SCROLL_TOP_SLACK_PX < top_was && bottom + SCROLL_TOP_SLACK_PX < bottom_was
 }
 
 /// Snap the history to its newest message.
@@ -1962,7 +2013,7 @@ fn reader_moved_up_since(last_top: &Rc<std::cell::Cell<i32>>) -> bool {
 #[cfg(target_arch = "wasm32")]
 fn scroll_history_to_bottom(
     pinned: &Rc<std::cell::Cell<bool>>,
-    last_top: &Rc<std::cell::Cell<i32>>,
+    last_top: &Rc<ScrollMark>,
     behavior: web_sys::ScrollBehavior,
 ) {
     let Some(container) = chat_scroll_container() else {
@@ -1970,7 +2021,7 @@ fn scroll_history_to_bottom(
         return;
     };
     pinned.set(true);
-    last_top.set(max_scroll_top(&container));
+    last_top.record(max_scroll_top(&container), container.client_height());
     let opts = web_sys::ScrollToOptions::new();
     opts.set_top(container.scroll_height() as f64);
     opts.set_behavior(behavior);
@@ -2014,7 +2065,7 @@ fn scroll_history_to_bottom(
 #[must_use]
 fn install_scroll_pin_listeners(
     pinned: Rc<std::cell::Cell<bool>>,
-    last_top: Rc<std::cell::Cell<i32>>,
+    last_top: Rc<ScrollMark>,
     window_items: Signal<usize>,
     window_anchor: Rc<std::cell::RefCell<Option<WindowAnchor>>>,
     window_overgrown: Rc<std::cell::Cell<bool>>,
@@ -2044,13 +2095,13 @@ fn install_scroll_pin_listeners(
                 return;
             };
             let settled_at = container.scroll_top();
-            let ours = (settled_at - last_top.get()).abs() <= SCROLL_TOP_SLACK_PX;
+            let ours = (settled_at - last_top.top()).abs() <= SCROLL_TOP_SLACK_PX;
             // Where the view ended up is a fact whoever caused it, and it is
             // what everything else compares against. Recorded before the
             // `ours` early-out on purpose: the version that only recorded it
             // for reader settles is what let a stale offset suppress the
             // follow indefinitely.
-            last_top.set(settled_at);
+            last_top.record(settled_at, container.client_height());
             let distance = container.scroll_height() as f64
                 - settled_at as f64
                 - container.client_height() as f64;
@@ -2332,7 +2383,7 @@ pub fn Conversation() -> Element {
     // until the settle lands. Only the browser has scroll positions, hence the
     // gate. See `install_scroll_pin_listeners`.
     #[cfg(target_arch = "wasm32")]
-    let last_scroll_top = use_hook(|| Rc::new(std::cell::Cell::new(0i32)));
+    let last_scroll_top = use_hook(|| Rc::new(ScrollMark::default()));
 
     // Re-window when the reader opens a DIFFERENT room. The window means "how
     // far back have I looked in THIS room", so carrying it across rooms would
@@ -2475,15 +2526,11 @@ pub fn Conversation() -> Element {
                 // follow paths drag them to the bottom (#505 delta review).
                 // Relative keeps the gap, and keeps this settle readable as
                 // the reader's so the pin resolves honestly.
-                last_scroll_top.set(last_scroll_top.get() + shift);
+                last_scroll_top.shift(shift);
                 container.set_scroll_top(target);
             }
         });
     }
-    // Which message's touch action menu (kebab) is open, by message ID string.
-    // Owned by Conversation (not per message group) so only ONE menu is open at
-    // a time across the whole history — opening one closes any other (#402).
-    let open_action_menu: Signal<Option<String>> = use_signal(|| None);
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
 
     // State for delete confirmation modal
@@ -2853,7 +2900,7 @@ pub fn Conversation() -> Element {
             // `pinned == false` no animation can be in flight, so an unpinned
             // reader whose patch pulled `max_scroll_top` under their recorded
             // offset still gets compensated.
-            if pinned_to_bottom.get() && last_scroll_top.get() >= max_scroll_top(&container) {
+            if pinned_to_bottom.get() && last_scroll_top.top() >= max_scroll_top(&container) {
                 return;
             }
             let Some(post_top) = history_row_offset_top(&key) else {
@@ -2883,7 +2930,7 @@ pub fn Conversation() -> Element {
                 // whose settle already landed the two move together, so it
                 // reads as ours and leaves their (already correct) pin
                 // alone.
-                last_scroll_top.set(last_scroll_top.get() + shift);
+                last_scroll_top.shift(shift);
                 container.set_scroll_top(target);
             }
         });
@@ -2996,8 +3043,8 @@ pub fn Conversation() -> Element {
     //   image, a web font swapping in, a markdown block rewrapping on a
     //   narrower screen;
     // * the WINDOW shrinks over fixed content — which is what growing the
-    //   composer does. That is freenet/river#486's third cause: the composer
-    //   reaching its 168px maximum takes more than the observer's 100px margin
+    //   composer does. That is freenet/river#486's third cause: a multi-line
+    //   paste into the composer takes more than the observer's 100px margin
     //   off the history in one step, with no network activity at all.
     //   De-latching the gate stops that freezing auto-scroll for good, but on
     //   its own it still leaves the newest message below the fold until
@@ -3100,7 +3147,7 @@ pub fn Conversation() -> Element {
                 // read it as "the reader has scrolled up" and stand the follow
                 // down. Zero is the "no constraint yet" value it starts at.
                 #[cfg(target_arch = "wasm32")]
-                last_scroll_top.set(0);
+                last_scroll_top.record(0, 0);
             }
         });
     }
@@ -3805,9 +3852,22 @@ pub fn Conversation() -> Element {
             // Room header
             {
                 current_room_data.as_ref().map(|_room_data| {
+                    // One handler for both room-details affordances (title and (i)).
+                    // It captures nothing, so it is `Copy`.
+                    let open_room_details = move || {
+                        crate::util::defer(move || {
+                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                EDIT_ROOM_MODAL.with_mut(|modal| {
+                                    modal.room = Some(current_room);
+                                });
+                            }
+                        });
+                    };
                     rsx! {
                         div { class: "flex-shrink-0 px-3 md:px-6 py-3 border-b border-border bg-panel",
-                            div { class: "flex items-center justify-between gap-2 md:gap-3 max-w-4xl mx-auto",
+                            div {
+                                class: "flex items-center justify-between gap-2 md:gap-3 max-w-4xl mx-auto",
+                                "data-testid": "room-header-row",
                                 // Mobile: hamburger to open rooms panel. `mr-1` plus the row
                                 // `gap-2` keep this switch-rooms button clear of the room-name
                                 // tap target so a touch user does not open the room-details
@@ -3838,107 +3898,34 @@ pub fn Conversation() -> Element {
                                         }
                                     }
                                 }
+                                // Left: room title over the description. `flex-1` takes all
+                                // the free width, which is what pushes the action group
+                                // below to the right edge; `min-w-0` lets it shrink so a
+                                // long name truncates instead of shoving the icons off-row.
                                 // Description is a sibling of the title button, not a child:
                                 // `<a>` is interactive content and cannot be nested inside
                                 // `<button>` per the HTML spec. Nesting also bubbles link
                                 // clicks to the modal-opening onclick handler.
                                 div { class: "min-w-0 flex-1",
-                                    // Room title + notification bell on one line, so the bell
-                                    // sits right after the (i) and vertically centred with it —
-                                    // NOT at the header's far edge. The bell is a SIBLING of the
-                                    // room-details button (a <button> can't nest another
-                                    // <button>). The title button is content-sized (no `w-full`)
-                                    // so the bell hugs the (i); a long name still truncates via
-                                    // `min-w-0` + `truncate`.
-                                    div { class: "flex items-center gap-1 min-w-0",
+                                    // The flex wrapper is what lets the title button shrink
+                                    // (`min-w-0`) so the `h2` can truncate. The button is
+                                    // content-sized (no `w-full`), so the hover pill hugs the
+                                    // name and the empty space to its right is not a click
+                                    // target.
+                                    div { class: "flex items-center min-w-0",
                                         button {
-                                            // `md:-ml-3` pulls only the LEFT hover edge outward on
-                                            // desktop (no adjacent hamburger there); the right edge
-                                            // stays put so the bell sits close to the (i). On mobile
+                                            // `md:-ml-3` cancels this button's own `px-3` on
+                                            // desktop so the title text lines up with the
+                                            // description below, while the hover pill bleeds into
+                                            // the header padding (no hamburger there). On mobile
                                             // the negative margin is dropped so this room-details
                                             // target stays clear of the hamburger (#402).
-                                            class: "flex items-center gap-2 px-3 py-1.5 md:-ml-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0",
+                                            class: "flex items-center px-3 py-1.5 md:-ml-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0",
+                                            "data-testid": "room-title-button",
                                             title: "Room details",
-                                            onclick: move |_| {
-                                                crate::util::defer(move || {
-                                                    if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                                        EDIT_ROOM_MODAL.with_mut(|modal| {
-                                                            modal.room = Some(current_room);
-                                                        });
-                                                    }
-                                                });
-                                            },
+                                            onclick: move |_| open_room_details(),
                                             h2 { class: "text-lg font-semibold text-text truncate",
                                                 "{current_room_label}"
-                                            }
-                                            span {
-                                                class: "text-text-muted flex-shrink-0",
-                                                Icon { icon: FaCircleInfo, width: 16, height: 16 }
-                                            }
-                                        }
-                                        // Per-room notification preference. Icon reflects state:
-                                        // bell = notifying, bell-slash = muted; the tooltip names
-                                        // the exact mode. Opens the compact NotificationModal.
-                                        // Sized to 16px to pair with the adjacent (i) icon.
-                                        {
-                                            let mode = *current_notification_mode.read();
-                                            let mode_title = match mode {
-                                                NotificationMode::All => "Notifications: All messages",
-                                                NotificationMode::MentionsAndReplies => "Notifications: Mentions & replies only",
-                                                NotificationMode::Muted => "Notifications: Muted",
-                                            };
-                                            // The browser may be refusing to deliver, which makes
-                                            // every mode above inert (freenet/river#510).
-                                            let blocked = crate::components::app::notifications::delivery_is_blocked(
-                                                mode,
-                                                crate::components::app::notifications::current_notification_status(),
-                                            );
-                                            rsx! {
-                                        button {
-                                            "data-testid": "notification-bell-button",
-                                            class: "relative flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
-                                            // `title` stays the MODE alone. The blocked state rides
-                                            // on `aria-label` and the dot instead, so the tooltip
-                                            // keeps naming exactly one thing.
-                                            title: mode_title,
-                                            "aria-label": if blocked {
-                                                format!("{mode_title} (your browser is not delivering notifications)")
-                                            } else {
-                                                mode_title.to_string()
-                                            },
-                                            onclick: move |_| {
-                                                crate::util::defer(move || {
-                                                    if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                                        NOTIFICATION_MODAL.with_mut(|modal| {
-                                                            modal.room = Some(current_room);
-                                                        });
-                                                    }
-                                                });
-                                            },
-                                            if mode == NotificationMode::Muted {
-                                                Icon { icon: FaBellSlash, width: 16, height: 16 }
-                                            } else {
-                                                Icon { icon: FaBell, width: 16, height: 16 }
-                                            }
-                                            if blocked {
-                                                // Decorative: `aria-hidden` keeps it out of the
-                                                // button's accessible name, which the `aria-label`
-                                                // above already carries in full. A badge that
-                                                // announced itself separately would append to the
-                                                // button's name instead of replacing it.
-                                                span {
-                                                    "data-testid": "notification-blocked-badge",
-                                                    "aria-hidden": "true",
-                                                    // `ring-panel` needs the hand-written
-                                                    // `@utility` in tailwind.css: `--color-panel` is
-                                                    // declared on `:root`, outside `@theme`, so
-                                                    // Tailwind v4 generates no colour utility for it
-                                                    // and `ring-1` would fall back to `currentColor`
-                                                    // — a grey ring that turns blue on hover.
-                                                    class: "absolute top-0.5 right-0.5 h-2 w-2 rounded-full bg-red-500 ring-1 ring-panel",
-                                                }
-                                            }
-                                        }
                                             }
                                         }
                                     }
@@ -3950,9 +3937,91 @@ pub fn Conversation() -> Element {
                                         }
                                     }
                                 }
-                                // Mobile: button to open members panel
+                                // Right: (i) then bell, `flex-shrink-0` so a long title can
+                                // never squeeze them.
+                                div { class: "flex items-center gap-1 flex-shrink-0",
+                                    // Room details (i): the same modal as the title, through
+                                    // the same handler. Sized and styled to match the bell so
+                                    // the two read as a pair.
+                                    button {
+                                        "data-testid": "room-info-button",
+                                        class: "flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                        title: "Room details",
+                                        "aria-label": "Room details",
+                                        onclick: move |_| open_room_details(),
+                                        Icon { icon: FaCircleInfo, width: 16, height: 16 }
+                                    }
+                                    // Per-room notification preference. Icon reflects state:
+                                    // bell = notifying, bell-slash = muted; the tooltip names
+                                    // the exact mode. Opens the compact NotificationModal.
+                                    // Sized to 16px to pair with the (i) beside it.
+                                    {
+                                        let mode = *current_notification_mode.read();
+                                        let mode_title = match mode {
+                                            NotificationMode::All => "Notifications: All messages",
+                                            NotificationMode::MentionsAndReplies => "Notifications: Mentions & replies only",
+                                            NotificationMode::Muted => "Notifications: Muted",
+                                        };
+                                        // The browser may be refusing to deliver, which makes
+                                        // every mode above inert (freenet/river#510).
+                                        let blocked = crate::components::app::notifications::delivery_is_blocked(
+                                            mode,
+                                            crate::components::app::notifications::current_notification_status(),
+                                        );
+                                        rsx! {
+                                            button {
+                                                "data-testid": "notification-bell-button",
+                                                class: "relative flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                                // `title` stays the MODE alone. The blocked state rides
+                                                // on `aria-label` and the dot instead, so the tooltip
+                                                // keeps naming exactly one thing.
+                                                title: mode_title,
+                                                "aria-label": if blocked {
+                                                    format!("{mode_title} (your browser is not delivering notifications)")
+                                                } else {
+                                                    mode_title.to_string()
+                                                },
+                                                onclick: move |_| {
+                                                    crate::util::defer(move || {
+                                                        if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                                            NOTIFICATION_MODAL.with_mut(|modal| {
+                                                                modal.room = Some(current_room);
+                                                            });
+                                                        }
+                                                    });
+                                                },
+                                                if mode == NotificationMode::Muted {
+                                                    Icon { icon: FaBellSlash, width: 16, height: 16 }
+                                                } else {
+                                                    Icon { icon: FaBell, width: 16, height: 16 }
+                                                }
+                                                if blocked {
+                                                    // Decorative: `aria-hidden` keeps it out of the
+                                                    // button's accessible name, which the `aria-label`
+                                                    // above already carries in full. A badge that
+                                                    // announced itself separately would append to the
+                                                    // button's name instead of replacing it.
+                                                    span {
+                                                        "data-testid": "notification-blocked-badge",
+                                                        "aria-hidden": "true",
+                                                        // `ring-panel` needs the hand-written
+                                                        // `@utility` in tailwind.css: `--color-panel` is
+                                                        // declared on `:root`, outside `@theme`, so
+                                                        // Tailwind v4 generates no colour utility for it
+                                                        // and `ring-1` would fall back to `currentColor`
+                                                        // — a grey ring that turns blue on hover.
+                                                        class: "absolute top-0.5 right-0.5 h-2 w-2 rounded-full bg-red-500 ring-1 ring-panel",
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Mobile: button to open members panel. Stays the LAST
+                                // button in the header (responsive-layout.spec relies on it).
                                 button {
                                     class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors flex-shrink-0",
+                                    "data-testid": "header-members-button",
                                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Members),
                                     Icon { icon: FaUsers, width: 18, height: 18 }
                                 }
@@ -3983,13 +4052,21 @@ pub fn Conversation() -> Element {
                     // adjustment to the reader and stands the follow down —
                     // freenet/river#501. With anchoring off, `scrollTop` only
                     // changes through our own scrolls, the reader's, or the
-                    // browser's shrink clamp, which the guard's
-                    // `.min(max_scroll_top(..))` already accounts for. Inline
+                    // browser's clamp when the content shrinks or the window
+                    // grows, which the guard already accounts for. Inline
                     // style, not a Tailwind arbitrary class, so it cannot depend
                     // on the class scanner seeing it.
                     style: "overflow-anchor:none;",
                     id: "chat-scroll-container",
+                    // Measured on resize rather than a `cqw` size container: `container-type`
+                    // here made WebKit leave the room list unlaid (0x0) after a
+                    // narrow-to-wide resize until the next DOM change.
                     div { class: "max-w-4xl mx-auto px-4 py-4", id: "chat-content",
+                    onresize: move |evt: ResizeEvent| {
+                        if let Ok(size) = evt.get_content_box_size() {
+                            publish_chat_column_width(size.width);
+                        }
+                    },
                     {
                         // Use memoized message groups to avoid expensive re-computation on keystrokes
                         if current_room_data.is_some() {
@@ -4154,13 +4231,15 @@ pub fn Conversation() -> Element {
                                         // fully-read room behaves exactly as
                                         // before.
                                         //
-                                        // Deliberately OUTSIDE the `space-y-4`
-                                        // list: as a child it would take the
-                                        // first row's place, pushing that row
-                                        // down by the 1rem gap and shifting the
-                                        // history by that much every time the
-                                        // sentinel appeared or (on the last
-                                        // backfill) disappeared.
+                                        // Deliberately OUTSIDE the history
+                                        // list, which holds only rows (the
+                                        // specs count its children). It adds
+                                        // no height, so the history does not
+                                        // shift when the sentinel appears or
+                                        // (on the last backfill) disappears.
+                                        // Under the old `space-y-4` list, a
+                                        // child sentinel shifted it by the
+                                        // 1rem gap.
                                         // Gated on the opening snap having
                                         // landed as well: a >window room's
                                         // first render sits at `scrollTop = 0`
@@ -4249,7 +4328,19 @@ pub fn Conversation() -> Element {
                                             }
                                         }
                                         div {
-                                            class: "space-y-4",
+                                            // No gap between rows: each row
+                                            // pads its own share, so a message
+                                            // row's hover band covers it (main.css
+                                            // `.msg-row`: 8px at a group's top and
+                                            // bottom). Date separators (`py-4`)
+                                            // and event rows (`py-3`) keep the
+                                            // distance to their neighbours they
+                                            // had under the old `space-y-4`.
+                                            // `-my-2` bleeds the first and last
+                                            // row's 8px into `#chat-content`'s
+                                            // `py-4`, so the history starts and
+                                            // ends where it did.
+                                            class: "-my-2",
                                             // Stable automation hook for the
                                             // history rows (AGENTS.md test-id
                                             // rule); additive markup only.
@@ -4265,7 +4356,7 @@ pub fn Conversation() -> Element {
                                                     DisplayRow::DateSeparator { key, label } => rsx! {
                                                         div {
                                                             key: "{key}",
-                                                            class: "flex justify-center py-2",
+                                                            class: "flex justify-center py-4",
                                                             span {
                                                                 class: "text-xs font-medium text-text-muted bg-surface px-3 py-1 rounded-full",
                                                                 "{label}"
@@ -4282,7 +4373,7 @@ pub fn Conversation() -> Element {
                                                                 // head-reposition machinery
                                                                 // (`history_row_offset_top`).
                                                                 "data-item-key": "{key}",
-                                                                class: "flex justify-center py-1",
+                                                                class: "flex justify-center py-3",
                                                                 span {
                                                                     class: "text-xs text-text-muted italic",
                                                                     "{text}"
@@ -4300,8 +4391,9 @@ pub fn Conversation() -> Element {
                                                             // component cannot carry a DOM
                                                             // attribute directly. It is the
                                                             // keyed list child, so diffing
-                                                            // and `space-y-4` spacing are
-                                                            // unchanged.
+                                                            // is unchanged. It adds no
+                                                            // spacing: the group's rows pad
+                                                            // themselves (see the list above).
                                                             div {
                                                                 key: "{key}",
                                                                 "data-item-key": "{key}",
@@ -4333,7 +4425,6 @@ pub fn Conversation() -> Element {
                                                                         }
                                                                     }
                                                                 },
-                                                                open_action_menu: open_action_menu,
                                                                 }
                                                             }
                                                         }
@@ -4710,6 +4801,31 @@ pub fn Conversation() -> Element {
     }
 }
 
+/// Short time label (`~`-prefixed when clamped) and its full tooltip (clock-skew
+/// clamp or propagation delay noted).
+fn time_labels(time: DateTime<Utc>, clamped: bool, delay_secs: Option<i64>) -> (String, String) {
+    let timestamp_ms = time.timestamp_millis();
+    let clamp_mark = if clamped { "~" } else { "" };
+    let short = format!("{clamp_mark}{}", format_utc_as_local_time(timestamp_ms));
+    let full = if clamped {
+        format!(
+            "{} (sender's clock may be ahead of yours — their timestamp was later \
+             than when this message reached you, so the time shown is when it \
+             arrived)",
+            format_utc_as_full_datetime(timestamp_ms)
+        )
+    } else if let Some(secs) = delay_secs {
+        format!(
+            "{} (received after {} delay)",
+            format_utc_as_full_datetime(timestamp_ms),
+            format_delay(secs)
+        )
+    } else {
+        format_utc_as_full_datetime(timestamp_ms)
+    };
+    (short, full)
+}
+
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -4729,58 +4845,15 @@ fn MessageGroupComponent(
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
     on_reply: EventHandler<ReplyContext>,
-    // Shared across all groups so only one action menu is open at a time (#402).
-    open_action_menu: Signal<Option<String>>,
 ) -> Element {
-    let mut open_action_menu = open_action_menu;
-    // Per-group: at most one picker per group, and while a picker is open its
-    // raised (z-[60]) backdrop covers every other group's kebabs and "+"
-    // buttons, so tapping one dismisses the picker rather than stacking a
-    // second popover — the single-popover guarantee comes from the z-order, not
-    // a shared signal (#402).
+    // Per-group; an open picker's fixed backdrop covers every other group's buttons (#402).
     let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
-    let timestamp_ms = group.first_time.timestamp_millis();
-    let time_str = format_utc_as_local_time(timestamp_ms);
-    let delay_suffix = group
-        .first_delay_secs
-        .map(|s| format!(" (received after {} delay)", format_delay(s)));
-    let full_time_str = if group.time_clamped {
-        format!(
-            "{} (sender's clock may be ahead of yours — their timestamp was later \
-             than when this message reached you, so the time shown is when it \
-             arrived)",
-            format_utc_as_full_datetime(timestamp_ms)
-        )
-    } else if let Some(ref suffix) = delay_suffix {
-        format!("{}{}", format_utc_as_full_datetime(timestamp_ms), suffix)
-    } else {
-        format_utc_as_full_datetime(timestamp_ms)
-    };
-    let time_clamped = group.time_clamped;
     let is_self = group.is_self;
-
-    // Whether the kebab action menu should open above (true) or below (false)
-    // the kebab. Set from the tap position so the menu for a message near the
-    // bottom of the viewport flips upward instead of being clipped by the
-    // composer — mirrors `picker_show_above` for the emoji picker (#402).
-    let mut menu_show_above: Signal<bool> = use_signal(|| false);
-
-    // Whether the kebab action menu should be left-anchored (open rightward) or
-    // right-anchored (open leftward). Chosen from the tap's horizontal position
-    // so the menu always opens toward the viewport centre regardless of
-    // self/other side or bubble width, and never clips its content off a narrow
-    // screen edge (#402 review).
-    let mut menu_align_left: Signal<bool> = use_signal(|| false);
-
-    // Max height (px) for the kebab action menu, measured at tap time as the
-    // actual space available on the chosen side within the chat scrollport. The
-    // menu is `overflow-y-auto`, so on a very short/landscape viewport where it
-    // fits neither side fully it scrolls internally instead of being clipped by
-    // the scroll container with Edit/Delete unreachable (#402 review).
-    let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
 
     // Track if emoji picker should appear above (true) or below (false) the button
     let mut picker_show_above: Signal<bool> = use_signal(|| false);
+    // Whether the emoji picker opens rightward (left-anchored), set when it opens
+    let mut picker_align_left: Signal<bool> = use_signal(|| true);
 
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
@@ -4829,914 +4902,713 @@ fn MessageGroupComponent(
                 if is_self { "justify-end" } else { "justify-start" }
             ),
             div {
-                class: format!(
-                    "max-w-[75%] {}",
-                    if is_self { "items-end" } else { "items-start" }
-                ),
-                // Header with name and time (only for others)
-                if !is_self {
-                    div { class: "flex items-baseline gap-2 mb-1 px-1",
-                        span {
-                            class: "text-sm font-medium text-text cursor-pointer hover:text-accent transition-colors",
-                            title: "Member ID: {group.author_id}",
-                            onclick: move |_| {
-                                crate::util::defer(move || {
-                                    MEMBER_INFO_MODAL.with_mut(|signal| {
-                                        signal.member = Some(group.author_id);
-                                    });
-                                });
-                            },
-                            "{group.author_name}"
-                        }
-                        // Impersonation warning. Sits immediately after the
-                        // name, before the shield slot. The two are NOT
-                        // mutually exclusive — two deputies whose names collide
-                        // each carry a shield AND a warning — so these really
-                        // are two badge positions and both can be filled at
-                        // once. Do not collapse them into one slot, and do not
-                        // suppress the warning when a shield is present: a
-                        // deputised sockpuppet carries a genuine shield, and
-                        // suppressing on it is the exact immunity
-                        // `a_deputised_sockpuppet_cannot_suppress_its_own_warning`
-                        // denies.
-                        //
-                        // The nickname above cannot forge this glyph: U+26A0 is
-                        // inside the range `display_name::is_display_hidden`
-                        // strips, so it can never survive into a rendered
-                        // nickname. `the_warning_glyph_cannot_appear_in_a_nickname`
-                        // pins that.
-                        if let Some(warning) = group.author_impersonation.as_ref() {
-                            {
-                                let tooltip = warning.tooltip();
-                                rsx! {
-                                    span {
-                                        "data-testid": "message-author-impersonation-warning",
-                                        class: "text-sm cursor-default",
-                                        title: "{tooltip}",
-                                        "aria-label": "{tooltip}",
-                                        {crate::util::confusable::WARNING_GLYPH}
-                                    }
-                                }
-                            }
-                        }
-                        // Deputy shield. Same glyph, same visibility rule and
-                        // the same tooltip as the member-list row and the
-                        // member-info modal chip, so the three read as one
-                        // badge. The nickname above cannot forge it: nicknames
-                        // are stripped of emoji by `crate::util::display_name`.
-                        if let Some(badge) = group.author_badge.as_ref() {
-                            {
-                                let tooltip = badge.tooltip();
-                                rsx! {
-                                    span {
-                                        "data-testid": "message-author-deputy-badge",
-                                        class: "text-sm cursor-default",
-                                        title: "{tooltip}",
-                                        "aria-label": "{tooltip}",
-                                        "🛡"
-                                    }
-                                }
-                            }
-                        }
-                        span {
-                            class: if time_clamped {
-                                "text-xs text-text-muted cursor-default italic opacity-70"
-                            } else {
-                                "text-xs text-text-muted cursor-default"
-                            },
-                            title: "{full_time_str}",
-                            if time_clamped { "~{time_str}" } else { "{time_str}" }
-                        }
-                    }
-                }
-
-                // Message bubbles
+                class: "msg-group w-full",
+                // Message bubbles. No `space-y`: the rows' own padding spaces them
+                // (main.css `.msg-row`), so the hover band leaves no gap between rows.
                 div {
-                    class: format!(
-                        "space-y-1 {}",
-                        if is_self { "flex flex-col items-end" } else { "" }
-                    ),
+                    class: "msg-bubbles",
                     {
                         let messages_len = group.messages.len();
                         group.messages.into_iter().enumerate().map(move |(idx, msg)| {
                         let is_last = idx == messages_len - 1;
                         let is_first = idx == 0;
                         let has_reactions = !msg.reactions.is_empty();
-                        let reply_strip_val = msg.reply_strip.clone();
+                        let reply_strip = msg.reply_strip.clone();
 
                         rsx! {
-                            // `min-w-0 max-w-full` clamps this per-message wrapper to
-                            // its column (`max-w-[75%]`) width. For a SELF message the
-                            // enclosing bubbles wrapper is `flex flex-col items-end`, so
-                            // without this the wrapper is a non-stretched flex item that
-                            // sizes to the bubble's `max-w-prose` (65ch) content width and
-                            // escapes the column. A self reply whose nowrap reply-strip
-                            // preview holds a long URL then overflows both edges of a
-                            // narrow mobile viewport (clipped, text cut off). `min-w-0`
-                            // lets the flex item shrink below its content's min-size so
-                            // `max-w-full` can actually take effect.
                             div {
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
-                                class: "flex flex-col group min-w-0 max-w-full",
-                                // Container for message bubble + hover actions
-                                div {
-                                    class: "relative",
-                                    // Message bubble (or edit form if editing)
-                                    {
-                                        let is_editing = editing_message.read().as_ref() == Some(&msg.id);
-                                        let msg_id_for_save = msg.message_id.clone();
-                                        let original_text = msg.content_text.clone();
-                                        if is_editing {
-                                            let save_msg_id = msg_id_for_save.clone();
-                                            let save_original = original_text.clone();
-                                            // Unique DOM id so the @mention caret math targets THIS
-                                            // edit textarea (multiple groups can theoretically edit).
-                                            let edit_id = format!("edit-msg-{}", msg.id);
-                                            let pick_id = edit_id.clone();
-                                            let kd_id = edit_id.clone();
-                                            let input_id = edit_id.clone();
-                                            let input_members = edit_mention_members.clone();
-                                            rsx! {
-                                                div {
-                                                    class: format!(
-                                                        "p-3 rounded-2xl {}",
-                                                        if is_self { "bg-accent" } else { "bg-surface" }
-                                                    ),
-                                                    style: "width: 100%; max-width: 550px; overflow: visible;",
-                                                    tabindex: "0",
-                                                    // Scroll into view when edit dialog appears (#93)
-                                                    onmounted: move |cx| {
-                                                        let el = cx.data();
-                                                        wasm_bindgen_futures::spawn_local(async move {
-                                                            let _ = el.scroll_to(ScrollBehavior::Smooth).await;
-                                                        });
-                                                    },
-                                                    // Global key bindings on the container (#94): Esc cancels,
-                                                    // Enter saves. Kept here (not solely on the textarea) so the
-                                                    // "(Esc)"/"(Enter)" button shortcuts work when keyboard focus
-                                                    // is on a button. The textarea's @mention handler calls
-                                                    // stop_propagation when it consumes a key, so these never
-                                                    // double-fire with mention navigation.
-                                                    onkeydown: {
-                                                        let msg_id = msg_id_for_save.clone();
-                                                        let original = original_text.clone();
-                                                        move |e: KeyboardEvent| {
-                                                            if e.key() == Key::Escape {
-                                                                editing_message.set(None);
-                                                            } else if e.key() == Key::Enter && !e.modifiers().shift() {
-                                                                e.prevent_default();
-                                                                let new_text = edit_text.read().clone();
-                                                                // Encoded-size gate: keep the form open so the
-                                                                // over-limit edit isn't silently discarded.
-                                                                if RoomMessageBody::measure_edit(
-                                                                    msg_id.clone(),
-                                                                    &new_text,
-                                                                    is_private,
-                                                                ) > max_message_size
-                                                                {
-                                                                    return;
-                                                                }
-                                                                if !new_text.is_empty() && new_text != original {
-                                                                    on_edit.call((msg_id.clone(), new_text));
-                                                                }
-                                                                editing_message.set(None);
-                                                            }
-                                                        }
-                                                    },
-                                                    // `relative` anchors the @mention autocomplete
-                                                    // dropdown to the textarea.
-                                                    div { class: "relative",
-                                                        // @mention autocomplete dropdown (floats above the textarea)
-                                                        mention::MentionDropdown {
-                                                            mention: edit_mention,
-                                                            on_pick: move |i| mention::apply_mention_selection(
-                                                                pick_id.clone(),
-                                                                edit_text,
-                                                                edit_mention,
-                                                                i,
-                                                                || {},
-                                                            ),
-                                                        }
-                                                        textarea {
-                                                            id: "{edit_id}",
-                                                            class: format!(
-                                                                "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none {}",
-                                                                if is_self { "bg-white/10 text-white placeholder-white/50 border border-white/20" } else { "bg-bg text-text border border-border" }
-                                                            ),
-                                                            value: "{edit_text}",
-                                                            onmounted: move |cx| {
-                                                                let element = cx.data();
-                                                                wasm_bindgen_futures::spawn_local(async move {
-                                                                    let _ = element.set_focus(true).await;
-                                                                });
-                                                            },
-                                                            oninput: move |e| {
-                                                                let value = e.value().to_string();
-                                                                edit_text.set(value.clone());
-                                                                // Detect / update the @mention autocomplete.
-                                                                mention::update_mention_from_input(
-                                                                    &input_id, &value, &input_members, edit_mention,
-                                                                );
-                                                            },
-                                                            // @mention navigation (Arrow/Enter/Tab/Esc) takes
-                                                            // precedence while the dropdown is open. When it
-                                                            // consumes the key, stop_propagation keeps the
-                                                            // container's Esc-cancel / Enter-save (above) from
-                                                            // also firing for that same key. Non-mention keys
-                                                            // bubble up to the container handler unchanged.
-                                                            onkeydown: move |e: KeyboardEvent| {
-                                                                if mention::handle_mention_keydown(
-                                                                    &kd_id, &e, edit_text, edit_mention, || {},
-                                                                ) {
-                                                                    e.stop_propagation();
-                                                                }
-                                                            },
-                                                            // Dismiss the dropdown when focus leaves the textarea
-                                                            // (click elsewhere). Dropdown rows use mousedown +
-                                                            // preventDefault, so picking one does not blur first.
-                                                            onfocusout: move |_| {
-                                                                crate::util::defer(move || edit_mention.set(None));
-                                                            },
-                                                        }
-                                                    }
-                                                    // Encoded-size gate for the edit action: same
-                                                    // measure the contract enforces. Without it an
-                                                    // over-limit edit is signed, sent, and silently
-                                                    // pruned by the contract validation.
-                                                    {
-                                                        let encoded_bytes = RoomMessageBody::measure_edit(
-                                                            msg_id_for_save.clone(),
-                                                            &edit_text.read(),
-                                                            is_private,
-                                                        );
-                                                        let over_limit = encoded_bytes > max_message_size;
-                                                        // `/ 5 * 4` (not `* 4 / 5`): max_message_size is
-                                                        // room-config-controlled and falls back to
-                                                        // usize::MAX with no room, so multiply-first
-                                                        // overflows.
-                                                        let near_limit = encoded_bytes > max_message_size / 5 * 4;
-                                                        rsx! {
-                                                            if near_limit {
-                                                                div {
-                                                                    class: if over_limit {
-                                                                        "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium"
-                                                                    } else if is_self {
-                                                                        "text-xs text-right mt-1 pr-1 text-white/70"
-                                                                    } else {
-                                                                        "text-xs text-right mt-1 pr-1 text-text-muted"
-                                                                    },
-                                                                    if over_limit {
-                                                                        "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
-                                                                    } else {
-                                                                        "{encoded_bytes}/{max_message_size}"
-                                                                    }
-                                                                }
-                                                            }
-                                                            div { class: "flex justify-end gap-3 mt-3",
-                                                                style: "overflow: visible;",
-                                                                button {
-                                                                    class: if is_self {
-                                                                        "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"
-                                                                    } else {
-                                                                        "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border"
-                                                                    },
-                                                                    onclick: move |_| editing_message.set(None),
-                                                                    "Cancel (Esc)"
-                                                                }
-                                                                button {
-                                                                    class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-medium hover:opacity-90",
-                                                                    style: if over_limit {
-                                                                        "background-color: #9ca3af; color: white; cursor: not-allowed; opacity: 0.6;"
-                                                                    } else {
-                                                                        "background-color: #2563eb; color: white;"
-                                                                    },
-                                                                    disabled: over_limit,
-                                                                    title: if over_limit {
-                                                                        format!("Edited message exceeds the {} byte limit", max_message_size)
-                                                                    } else {
-                                                                        String::new()
-                                                                    },
-                                                                    onclick: move |_| {
-                                                                        let new_text = edit_text.read().clone();
-                                                                        // Same guard as Enter-save: `disabled` should
-                                                                        // make this unreachable when over, but a
-                                                                        // render-lag click must keep the form open
-                                                                        // rather than fall through to the silent
-                                                                        // safety-net drop.
-                                                                        if RoomMessageBody::measure_edit(
-                                                                            save_msg_id.clone(),
-                                                                            &new_text,
-                                                                            is_private,
-                                                                        ) > max_message_size
-                                                                        {
-                                                                            return;
-                                                                        }
-                                                                        if !new_text.is_empty() && new_text != save_original {
-                                                                            on_edit.call((save_msg_id.clone(), new_text));
-                                                                        }
-                                                                        editing_message.set(None);
-                                                                    },
-                                                                    "Save (Enter)"
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            let reply_strip_inner = reply_strip_val.clone();
-                                            rsx! {
-                                                // Message bubble. The reply strip (if any) is rendered as
-                                                // the first child INSIDE the bubble so it shares the
-                                                // bubble's width and its intrinsic size cannot reflow
-                                                // the parent (fixes #206 and #207).
-                                                div {
-                                                    class: format!(
-                                                        "flex flex-col text-sm overflow-hidden {} {} {}",
-                                                        if is_self {
-                                                            "bg-accent text-white"
-                                                        } else {
-                                                            "bg-surface text-text"
-                                                        },
-                                                        // Rounded corners based on position
-                                                        if is_self {
-                                                            if is_first && is_last && !has_reactions {
-                                                                "rounded-2xl"
-                                                            } else if is_first {
-                                                                "rounded-t-2xl rounded-bl-2xl rounded-br-md"
-                                                            } else if is_last && !has_reactions {
-                                                                "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
-                                                            } else {
-                                                                "rounded-l-2xl rounded-r-md"
-                                                            }
-                                                        } else if is_first && is_last && !has_reactions {
-                                                            "rounded-2xl"
-                                                        } else if is_first {
-                                                            "rounded-t-2xl rounded-br-2xl rounded-bl-md"
-                                                        } else if is_last && !has_reactions {
-                                                            "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
-                                                        } else {
-                                                            "rounded-r-2xl rounded-l-md"
-                                                        },
-                                                        // Max width for readability; overflow-hidden on
-                                                        // parent + min-w-0 on the reply strip prevents
-                                                        // the nowrap strip from widening the bubble.
-                                                        "max-w-prose"
-                                                    ),
-                                                    // Reply-quote strip (inside bubble, first child).
-                                                    // Exactly one arm renders, enforced by the type: an
-                                                    // unverifiable quote is `Unavailable`, which carries no
-                                                    // author or preview to render.
-                                                    //
-                                                    // Self bubbles use a white-tinted overlay so the strip
-                                                    // stays legible against the accent background; other
-                                                    // bubbles use a dark-tinted overlay against the surface
-                                                    // background. The previous `bg-accent/40 text-accent`
-                                                    // was invisible on self bubbles because the strip
-                                                    // composited to the same colour as the bubble.
-                                                    {
-                                                        match reply_strip_inner {
-                                                            ReplyStrip::NotAReply => rsx! {},
-                                                            // Deliberately inert — no `role`/`tabindex`/
-                                                            // `onclick` — because there is no original
-                                                            // message to scroll to. It therefore carries
-                                                            // its own class rather than `reply-strip`,
-                                                            // whose hover/focus-expand rules assume a
-                                                            // focusable element with ellipsized text.
-                                                            //
-                                                            // The wording stays neutral: absence cannot
-                                                            // distinguish a ban from an ordinary aged-out
-                                                            // message, so claiming "banned" here would
-                                                            // mislabel the common case.
-                                                            ReplyStrip::Unavailable => rsx! {
-                                                                div {
-                                                                    "data-testid": "reply-strip-unavailable",
-                                                                    class: format!(
-                                                                        "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 italic {}",
-                                                                        if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
-                                                                    ),
-                                                                    // The arrow is decorative; the sentence
-                                                                    // after it is what a screen reader needs.
-                                                                    span { "aria-hidden": "true", "\u{21a9} " }
-                                                                    "Original message unavailable"
-                                                                }
-                                                            },
-                                                            ReplyStrip::Quote { author, preview, target_id } => {
-                                                                let target_id_str = format!("{:?}", target_id.0);
-                                                                // Clone the target id so we can own one copy in the
-                                                                // onclick handler and one in the onkeydown handler.
-                                                                let target_id_for_key = target_id_str.clone();
-                                                                rsx! {
-                                                                    div {
-                                                                        "data-testid": "reply-strip",
-                                                                        class: format!(
-                                                                            "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
-                                                                            if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
-                                                                        ),
-                                                                        title: "Scroll to original message (Enter or Space to activate)",
-                                                                        role: "button",
-                                                                        tabindex: "0",
-                                                                        "aria-label": "Scroll to the message this is a reply to",
-                                                                        onclick: move |_| {
-                                                                            if let Some(window) = web_sys::window() {
-                                                                                if let Some(doc) = window.document() {
-                                                                                    if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
-                                                                                        el.scroll_into_view();
-                                                                                        let _ = el.class_list().add_1("reply-highlight");
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        },
-                                                                        onkeydown: move |e: KeyboardEvent| {
-                                                                            // Activate the same scroll-to-original
-                                                                            // behaviour via Enter or Space so keyboard
-                                                                            // users can reach it without a mouse.
-                                                                            if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
-                                                                                e.prevent_default();
-                                                                                if let Some(window) = web_sys::window() {
-                                                                                    if let Some(doc) = window.document() {
-                                                                                        if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_for_key)) {
-                                                                                            el.scroll_into_view();
-                                                                                            let _ = el.class_list().add_1("reply-highlight");
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        },
-                                                                        span { class: "font-medium", "\u{21a9} @{author}: " }
-                                                                        span { "{preview}" }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    // Message body, wrapped in a padding container so the
-                                                    // "(edited)" indicator can sit inline at the trailing
-                                                    // edge of the body text rather than as a separate
-                                                    // flex-column row. `[overflow-wrap:anywhere]` ensures
-                                                    // long URLs and unbreakable tokens wrap instead of
-                                                    // forcing the bubble past `max-w-prose`. `anywhere` is
-                                                    // stricter than `break-word`: it also lowers the
-                                                    // element's min-content so flex/grid parents can shrink
-                                                    // the bubble to fit.
-                                                    div {
-                                                        class: "px-3 py-2 min-w-0",
-                                                        div {
-                                                            class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
-                                                            dangerous_inner_html: "{msg.content_html}"
-                                                        }
-                                                        if msg.edited {
-                                                            span {
-                                                                class: format!(
-                                                                    "text-xs ml-2 {}",
-                                                                    if is_self { "text-white/70" } else { "text-text-muted" }
-                                                                ),
-                                                                "(edited)"
-                                                            }
-                                                        }
+                                // Full column width plus 8px each side: hovering anywhere on it
+                                // reveals the buttons and fills it with the band (main.css `.msg-row`).
+                                class: if is_self { "msg-row group flex flex-col items-end" } else { "msg-row group flex flex-col items-start" },
+                                // Author name and badges, on a group's first row only (not our own), so
+                                // the row's hover and reply-jump band covers them too.
+                                if is_first && !is_self {
+                                    div { class: "msg-group-header flex items-baseline gap-2 pb-1 px-1",
+                                        span {
+                                            class: "text-sm font-medium text-text cursor-pointer hover:text-accent transition-colors",
+                                            title: "Member ID: {group.author_id}",
+                                            onclick: move |_| {
+                                                crate::util::defer(move || {
+                                                    MEMBER_INFO_MODAL.with_mut(|signal| {
+                                                        signal.member = Some(group.author_id);
+                                                    });
+                                                });
+                                            },
+                                            "{group.author_name}"
+                                        }
+                                        // Impersonation warning. Sits immediately after the
+                                        // name, before the shield slot. The two are NOT
+                                        // mutually exclusive — two deputies whose names collide
+                                        // each carry a shield AND a warning — so these really
+                                        // are two badge positions and both can be filled at
+                                        // once. Do not collapse them into one slot, and do not
+                                        // suppress the warning when a shield is present: a
+                                        // deputised sockpuppet carries a genuine shield, and
+                                        // suppressing on it is the exact immunity
+                                        // `a_deputised_sockpuppet_cannot_suppress_its_own_warning`
+                                        // denies.
+                                        //
+                                        // The nickname above cannot forge this glyph: U+26A0 is
+                                        // inside the range `display_name::is_display_hidden`
+                                        // strips, so it can never survive into a rendered
+                                        // nickname. `the_warning_glyph_cannot_appear_in_a_nickname`
+                                        // pins that.
+                                        if let Some(warning) = group.author_impersonation.as_ref() {
+                                            {
+                                                let tooltip = warning.tooltip();
+                                                rsx! {
+                                                    span {
+                                                        "data-testid": "message-author-impersonation-warning",
+                                                        class: "text-sm cursor-default",
+                                                        title: "{tooltip}",
+                                                        "aria-label": "{tooltip}",
+                                                        {crate::util::confusable::WARNING_GLYPH}
                                                     }
                                                 }
                                             }
                                         }
-                                    }
-                                    // Hover action bar (reply for all, edit/delete for own)
-                                    {
-                                        let msg_id_str_for_edit = msg.id.clone();
-                                        let msg_id_for_delete = msg.message_id.clone();
-                                        let msg_id_for_reply = msg.message_id.clone();
-                                        let current_text = msg.content_text.clone();
-                                        // Clean the snapshot (mentions -> @name, markdown stripped)
-                                        // BEFORE truncating, so the stored preview is plain text and
-                                        // no consumer (UI, CLI, old client) ever sees a raw token —
-                                        // even one that would have crossed the truncation boundary.
-                                        let reply_text_preview = clean_reply_preview(&msg.content_text, &member_names)
-                                            .chars()
-                                            .take(100)
-                                            .collect::<String>();
-                                        let reply_author_name = group.author_name.clone();
-                                        rsx! {
-                                            div {
-                                                // `.hover-actions` (main.css) makes this invisible
-                                                // (opacity-0) bar `pointer-events:none` ONLY on touch
-                                                // devices (@media hover:none), so it can't intercept a
-                                                // gutter tap there — while leaving it fully hit-testable on
-                                                // desktop, where the pointer must cross an empty gap to
-                                                // reach it (a Tailwind `group-hover:pointer-events` gate
-                                                // would drop hover mid-gap and make it unreachable). #402.
-                                                class: format!(
-                                                    "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 {} {}",
-                                                    if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" },
-                                                    ""
-                                                ),
-                                                // Reply button - available for all messages
-                                                button {
-                                                    class: "text-xs text-text-muted hover:text-accent transition-colors",
-                                                    title: "Reply",
-                                                    onclick: move |_| {
-                                                        on_reply.call(ReplyContext {
-                                                            message_id: msg_id_for_reply.clone(),
-                                                            author_name: reply_author_name.clone(),
-                                                            content_preview: reply_text_preview.clone(),
-                                                        });
-                                                    },
-                                                    "reply"
-                                                }
-                                                // Edit/Delete buttons - only for own messages
-                                                if is_self {
-                                                    button {
-                                                        class: "text-xs text-text-muted hover:text-text transition-colors",
-                                                        title: "Edit message",
-                                                        onclick: move |_| {
-                                                            edit_text.set(current_text.clone());
-                                                            editing_message.set(Some(msg_id_str_for_edit.clone()));
-                                                        },
-                                                        "edit"
-                                                    }
-                                                    button {
-                                                        class: "text-xs text-text-muted hover:text-red-500 transition-colors",
-                                                        title: "Delete message",
-                                                        onclick: move |_| {
-                                                            on_request_delete.call(msg_id_for_delete.clone());
-                                                        },
-                                                        "delete"
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Touch-only kebab action menu (#402). The hover
-                                    // action bar above is wrapped by Tailwind in
-                                    // `@media (hover:hover)`, so it can never appear on a
-                                    // touch device. `.touch-actions` (main.css) reveals
-                                    // this kebab only where there is no hover pointer;
-                                    // tapping it opens a menu with the same Reply / React /
-                                    // Edit / Delete actions.
-                                    {
-                                        let msg_id_kebab = msg.id.clone();
-                                        let msg_id_kebab_toggle = msg.id.clone();
-                                        let msg_id_menu_reply = msg.message_id.clone();
-                                        let msg_id_menu_delete = msg.message_id.clone();
-                                        let msg_id_menu_edit = msg.id.clone();
-                                        let msg_id_menu_react = msg.id.clone();
-                                        let edit_text_kebab = msg.content_text.clone();
-                                        let reply_author_kebab = group.author_name.clone();
-                                        let reply_preview_kebab = clean_reply_preview(&msg.content_text, &member_names)
-                                            .chars()
-                                            .take(100)
-                                            .collect::<String>();
-                                        let menu_open = open_action_menu.read().as_deref()
-                                            == Some(msg_id_kebab.as_str());
-                                        rsx! {
-                                            div {
-                                                // Positioned in the gutter beside the bubble with
-                                                // `right-full`/`left-full` (NOT `translate`): a transform
-                                                // would become the containing block for the `fixed`
-                                                // dismiss backdrop below, shrinking it to this element
-                                                // instead of the viewport (#402 review).
-                                                // Raise the OPEN wrapper above sibling kebabs: every
-                                                // `.touch-actions` is z-50, and later ones paint above an
-                                                // open popover, so without this a nearby message's kebab
-                                                // could sit over the menu rows and steal the tap. `z-[60]`
-                                                // lifts the whole open popover+backdrop above them (and its
-                                                // backdrop then covers those kebabs, so a tap on one just
-                                                // dismisses). (#402 review)
-                                                class: format!(
-                                                    "touch-actions absolute top-1 {} {}",
-                                                    if menu_open { "z-[60]" } else { "z-50" },
-                                                    if is_self { "right-full mr-1" } else { "left-full ml-1" }
-                                                ),
-                                                // Kebab toggle button
-                                                button {
-                                                    class: "flex items-center justify-center w-8 h-8 rounded-full bg-panel shadow-md border border-border text-text-muted",
-                                                    "aria-label": "Message actions",
-                                                    "aria-haspopup": "menu",
-                                                    "aria-expanded": "{menu_open}",
-                                                    "data-testid": "message-kebab",
-                                                    onclick: move |e: MouseEvent| {
-                                                        e.stop_propagation();
-                                                        let is_open = open_action_menu.peek().as_deref()
-                                                            == Some(msg_id_kebab_toggle.as_str());
-                                                        if is_open {
-                                                            crate::util::defer(move || open_action_menu.set(None));
-                                                        } else {
-                                                            // Position the menu from the tap coordinates: flip it
-                                                            // above the kebab when the tap is in the bottom ~40% of
-                                                            // the viewport (so the composer doesn't clip it), and
-                                                            // open it toward the viewport centre (left-anchored when
-                                                            // the kebab is on the left half, right-anchored on the
-                                                            // right half) so its content never runs off a screen edge.
-                                                            let coords = e.client_coordinates();
-                                                            let win_w = web_sys::window()
-                                                                .and_then(|w| w.inner_width().ok())
-                                                                .and_then(|v| v.as_f64())
-                                                                .unwrap_or(400.0);
-                                                            // Choose the flip direction from the space available in
-                                                            // BOTH directions within the chat scrollport (which lives
-                                                            // inside an overflow-y-auto container whose bounds sit
-                                                            // above the composer and below the header). Open downward
-                                                            // when the menu fits below; only flip up when it doesn't
-                                                            // fit below AND there's more room above. A received menu
-                                                            // (2 rows) is shorter than an own menu (4 rows), so it
-                                                            // stays down in cases where an own menu would flip.
-                                                            // (#402 review)
-                                                            let (sp_top, sp_bottom) = web_sys::window()
-                                                                .and_then(|w| w.document())
-                                                                .and_then(|d| {
-                                                                    d.get_element_by_id("chat-scroll-container")
-                                                                })
-                                                                .map(|el| {
-                                                                    let r = el.get_bounding_client_rect();
-                                                                    (r.top(), r.bottom())
-                                                                })
-                                                                .unwrap_or((60.0, 600.0));
-                                                            let menu_height = if is_self { 200.0 } else { 110.0 };
-                                                            let space_below = sp_bottom - coords.y;
-                                                            let space_above = coords.y - sp_top;
-                                                            let above =
-                                                                space_below < menu_height && space_above > space_below;
-                                                            let align_left = coords.x < win_w * 0.5;
-                                                            // Cap the menu to the actual space on the chosen side
-                                                            // (minus a small gap) so it scrolls internally rather
-                                                            // than being clipped by the scroll container when it
-                                                            // fits neither side. Floor so it never collapses.
-                                                            // Exactly the space on the chosen side (minus the
-                                                            // mt-1/mb-1 gap): never larger, so the overflow-y-auto
-                                                            // menu can't exceed the scrollport and clip its own
-                                                            // rows. `above` already selects the roomier side, so
-                                                            // this is realistically ample; the 1px floor only
-                                                            // guards a degenerate near-zero measurement.
-                                                            let max_h = ((if above { space_above } else { space_below })
-                                                                - 16.0)
-                                                                .max(1.0);
-                                                            let id = msg_id_kebab_toggle.clone();
-                                                            // Defer signal writes out of the event handler per
-                                                            // .claude/rules/dioxus-signal-safety.md (Firefox-mobile
-                                                            // re-entrant borrow crashes).
-                                                            crate::util::defer(move || {
-                                                                menu_show_above.set(above);
-                                                                menu_align_left.set(align_left);
-                                                                menu_max_h.set(max_h);
-                                                                // Dismiss any open reaction picker so the two
-                                                                // popovers can't stack (#402 review).
-                                                                open_emoji_picker.set(None);
-                                                                open_action_menu.set(Some(id));
-                                                            });
-                                                        }
-                                                    },
-                                                    Icon { icon: FaEllipsisVertical, width: 16, height: 16 }
-                                                }
-                                                // Action menu popover + dismiss backdrop. The backdrop is
-                                                // `fixed inset-0` (covers the viewport now that no transformed
-                                                // ancestor clips it) so a tap anywhere else dismisses.
-                                                if menu_open {
-                                                    div {
-                                                        class: "fixed inset-0 z-40",
-                                                        onclick: move |_| crate::util::defer(move || open_action_menu.set(None)),
-                                                    }
-                                                    div {
-                                                        // Opens toward the bubble/centre (self: right of the
-                                                        // left-gutter kebab; other: left of the right-gutter
-                                                        // kebab); `max-w` clamps it to the viewport as a
-                                                        // backstop against a narrow-screen overflow.
-                                                        class: format!(
-                                                            "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
-                                                            if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                            if *menu_align_left.read() { "left-0" } else { "right-0" }
-                                                        ),
-                                                        style: format!("max-height: {}px", *menu_max_h.read()),
-                                                        "data-testid": "message-action-menu",
-                                                        button {
-                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
-                                                            onclick: move |_| {
-                                                                let id = msg_id_menu_reply.clone();
-                                                                let author = reply_author_kebab.clone();
-                                                                let preview = reply_preview_kebab.clone();
-                                                                crate::util::defer(move || {
-                                                                    on_reply.call(ReplyContext {
-                                                                        message_id: id,
-                                                                        author_name: author,
-                                                                        content_preview: preview,
-                                                                    });
-                                                                    open_action_menu.set(None);
-                                                                });
-                                                            },
-                                                            Icon { icon: FaReply, width: 14, height: 14 }
-                                                            "Reply"
-                                                        }
-                                                        button {
-                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
-                                                            onclick: move |_| {
-                                                                let picker_id = format!("inline-{}", msg_id_menu_react);
-                                                                // Inherit the kebab's flip direction so the picker
-                                                                // for a bottom message also opens upward, not
-                                                                // clipped by the composer (#402 review).
-                                                                let above = *menu_show_above.peek();
-                                                                crate::util::defer(move || {
-                                                                    picker_show_above.set(above);
-                                                                    open_emoji_picker.set(Some(picker_id));
-                                                                    open_action_menu.set(None);
-                                                                });
-                                                            },
-                                                            Icon { icon: FaFaceSmile, width: 14, height: 14 }
-                                                            "React"
-                                                        }
-                                                        if is_self {
-                                                            button {
-                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
-                                                                onclick: move |_| {
-                                                                    let t = edit_text_kebab.clone();
-                                                                    let id = msg_id_menu_edit.clone();
-                                                                    crate::util::defer(move || {
-                                                                        edit_text.set(t);
-                                                                        editing_message.set(Some(id));
-                                                                        open_action_menu.set(None);
-                                                                    });
-                                                                },
-                                                                Icon { icon: FaPenToSquare, width: 14, height: 14 }
-                                                                "Edit"
-                                                            }
-                                                            button {
-                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-error-bg text-left",
-                                                                onclick: move |_| {
-                                                                    let id = msg_id_menu_delete.clone();
-                                                                    crate::util::defer(move || {
-                                                                        on_request_delete.call(id);
-                                                                        open_action_menu.set(None);
-                                                                    });
-                                                                },
-                                                                Icon { icon: FaTrashCan, width: 14, height: 14 }
-                                                                "Delete"
-                                                            }
-                                                        }
+                                        // Deputy shield. Same glyph, same visibility rule and
+                                        // the same tooltip as the member-list row and the
+                                        // member-info modal chip, so the three read as one
+                                        // badge. The nickname above cannot forge it: nicknames
+                                        // are stripped of emoji by `crate::util::display_name`.
+                                        if let Some(badge) = group.author_badge.as_ref() {
+                                            {
+                                                let tooltip = badge.tooltip();
+                                                rsx! {
+                                                    span {
+                                                        "data-testid": "message-author-deputy-badge",
+                                                        class: "text-sm cursor-default",
+                                                        title: "{tooltip}",
+                                                        "aria-label": "{tooltip}",
+                                                        "🛡"
                                                     }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                // Reactions display with inline add button
-                                {
-                                    let msg_id_for_inline = msg.id.clone();
-                                    let msg_id_react = msg.message_id.clone();
-                                    let is_inline_picker_open = open_emoji_picker.read().as_ref() == Some(&format!("inline-{}", msg_id_for_inline));
-
-                                    // Find user's current reaction on this message (if any)
-                                    // No known identity ⇒ no reaction is ours,
-                                    // so nothing is highlighted and the picker
-                                    // offers a fresh reaction rather than a
-                                    // toggle of someone else's.
-                                    let user_reaction: Option<String> = msg.reactions.iter().find_map(|(emoji, reactors)| {
-                                        if self_member_id.is_some_and(|me| reactors.contains(&me)) {
-                                            Some(emoji.clone())
-                                        } else {
-                                            None
-                                        }
-                                    });
-                                    let user_reaction_for_picker = user_reaction.clone();
-
-                                    rsx! {
-                                        div {
-                                            class: format!(
-                                                "flex flex-wrap items-center gap-1 mt-0.5 {}",
-                                                if is_self { "justify-end" } else { "justify-start" }
-                                            ),
-                                            // Existing reactions (clickable to toggle if user has reacted)
-                                            {
-                                                let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
-                                                sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
-                                                sorted_reactions.into_iter().map(|(emoji, reactors)| {
-                                                    let count = reactors.len();
-                                                    let is_user_reaction = self_member_id.is_some_and(|me| reactors.contains(&me));
-                                                    let emoji_for_click = emoji.clone();
-                                                    let msg_id_for_click = msg_id_react.clone();
-
-                                                    // Build list of reactor names for tooltip
-                                                    let reactor_names: Vec<String> = reactors.iter().map(|reactor_id| {
-                                                        // Unknown identity ⇒ nobody is
-                                                        // labelled "You"; every reactor
-                                                        // falls through to their nickname.
-                                                        if Some(*reactor_id) == self_member_id {
-                                                            "You".to_string()
-                                                        } else {
-                                                            member_names.get(reactor_id)
-                                                                .cloned()
-                                                                .unwrap_or_else(|| "Unknown".to_string())
-                                                        }
-                                                    }).collect();
-                                                    let names_str = reactor_names.join(", ");
-
-                                                    let tooltip = if is_user_reaction {
-                                                        format!("{} (click to remove)", names_str)
-                                                    } else {
-                                                        names_str
-                                                    };
-
-                                                    rsx! {
-                                                        span {
-                                                            key: "{emoji}",
-                                                            class: format!(
-                                                                "inline-flex items-center gap-0.5 text-base transition-transform {}",
-                                                                if is_user_reaction {
-                                                                    // Subtle indicator: underline for user's reaction
-                                                                    "cursor-pointer hover:scale-110 underline decoration-accent decoration-2 underline-offset-4"
-                                                                } else {
-                                                                    "cursor-default hover:scale-110"
-                                                                }
-                                                            ),
-                                                            title: "{tooltip}",
-                                                            onclick: move |_| {
-                                                                if is_user_reaction {
-                                                                    on_react.call((msg_id_for_click.clone(), emoji_for_click.clone()));
-                                                                }
-                                                            },
-                                                            "{emoji}"
-                                                            if count > 1 {
-                                                                span { class: "text-xs text-text-muted", "{count}" }
-                                                            }
-                                                        }
+                                // Content-sized, so the bubble (`min-w-full`) grows to the
+                                // reaction row below it. `min-w-0 max-w-full` keeps a nowrap reply
+                                // preview from pushing it past the column on a narrow screen.
+                                div {
+                                    class: "flex flex-col min-w-0 max-w-full",
+                                    // Container for message bubble + hover actions
+                                    div {
+                                        class: "relative",
+                                        // Message bubble (or edit form if editing)
+                                        {
+                                            let is_editing = editing_message.read().as_ref() == Some(&msg.id);
+                                            let msg_id_for_save = msg.message_id.clone();
+                                            let original_text = msg.content_text.clone();
+                                            if is_editing {
+                                                let save_msg_id = msg_id_for_save.clone();
+                                                let save_original = original_text.clone();
+                                                // Unique DOM id so the @mention caret math targets THIS
+                                                // edit textarea (multiple groups can theoretically edit).
+                                                let edit_id = format!("edit-msg-{}", msg.id);
+                                                let pick_id = edit_id.clone();
+                                                let kd_id = edit_id.clone();
+                                                let input_id = edit_id.clone();
+                                                let input_members = edit_mention_members.clone();
+                                                // Enter and Save both commit through this. The size
+                                                // check runs at the call, so an over-limit draft stays
+                                                // open instead of being discarded.
+                                                fn commit_edit(
+                                                    edit_text: Signal<String>,
+                                                    mut editing_message: Signal<Option<String>>,
+                                                    on_edit: EventHandler<(MessageId, String)>,
+                                                    msg_id: MessageId,
+                                                    original: &str,
+                                                    is_private: bool,
+                                                    max_message_size: usize,
+                                                ) {
+                                                    let new_text = edit_text.read().clone();
+                                                    if RoomMessageBody::measure_edit(
+                                                        msg_id.clone(),
+                                                        &new_text,
+                                                        is_private,
+                                                    ) > max_message_size
+                                                    {
+                                                        return;
                                                     }
-                                                })
-                                            }
-                                            // Inline add reaction button (same line height as reactions)
-                                            div {
-                                                // Raise the whole picker (grid + z-40 backdrop) above the
-                                                // z-50 message kebabs while it's open, so a nearby closed
-                                                // kebab can't paint over the emoji grid and steal a tap
-                                                // (mirrors the action menu's z-[60] behaviour). (#402 review)
-                                                class: format!(
-                                                    "relative group/react inline-flex items-center {}",
-                                                    if is_inline_picker_open { "z-[60]" } else { "" }
-                                                ),
-                                                // Invisible backdrop when picker is open
-                                                if is_inline_picker_open {
-                                                    div {
-                                                        class: "fixed inset-0 z-40",
-                                                        onclick: move |_| open_emoji_picker.set(None),
+                                                    if !new_text.is_empty() && new_text != original {
+                                                        on_edit.call((msg_id, new_text));
                                                     }
+                                                    editing_message.set(None);
                                                 }
-                                                button {
-                                                    class: format!(
-                                                        "add-reaction-btn inline-flex items-center justify-center text-xl leading-none hover:scale-110 {}",
-                                                        if has_reactions || is_inline_picker_open { "has-reactions" } else { "" }
-                                                    ),
-                                                    title: "Add reaction",
-                                                    onclick: {
-                                                        let picker_id = format!("inline-{}", msg_id_for_inline);
-                                                        move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            let current = open_emoji_picker.read().clone();
-                                                            if current.as_ref() == Some(&picker_id) {
-                                                                open_emoji_picker.set(None);
-                                                            } else {
-                                                                // Determine if picker should appear above or below based on click position
-                                                                // If click is in bottom 40% of viewport, show picker above
-                                                                let click_y = e.client_coordinates().y;
-                                                                let viewport_height = web_sys::window()
-                                                                    .and_then(|w| w.inner_height().ok())
-                                                                    .and_then(|h| h.as_f64())
-                                                                    .unwrap_or(800.0);
-                                                                picker_show_above.set(click_y > viewport_height * 0.6);
-                                                                open_emoji_picker.set(Some(picker_id.clone()));
-                                                            }
-                                                        }
-                                                    },
-                                                    "+"
-                                                }
-                                                // Emoji picker for inline button (flips based on viewport position)
-                                                if is_inline_picker_open {
+                                                rsx! {
                                                     div {
                                                         class: format!(
-                                                            "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
-                                                            if *picker_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                            if is_self { "right-0" } else { "left-0" }
+                                                            "msg-edit-form w-full overflow-visible p-3 rounded-2xl {}",
+                                                            if is_self { "bg-accent" } else { "bg-surface" }
                                                         ),
-                                                        style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
-                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                        {FREQUENT_EMOJIS.iter().map(|emoji| {
-                                                            let emoji_str = emoji.to_string();
-                                                            let msg_id = msg_id_react.clone();
-                                                            let is_current = user_reaction_for_picker.as_ref() == Some(&emoji_str);
-                                                            rsx! {
-                                                                button {
-                                                                    key: "{emoji}",
-                                                                    class: format!(
-                                                                        "p-1 rounded hover:bg-surface transition-colors text-xl leading-none {}",
-                                                                        if is_current { "bg-accent/20 ring-2 ring-accent" } else { "" }
-                                                                    ),
-                                                                    title: if is_current {
-                                                                        format!("Remove {} reaction", emoji)
-                                                                    } else {
-                                                                        format!("React with {}", emoji)
-                                                                    },
-                                                                    onclick: move |_| {
-                                                                        on_react.call((msg_id.clone(), emoji_str.clone()));
-                                                                        open_emoji_picker.set(None);
-                                                                    },
-                                                                    "{emoji}"
+                                                        tabindex: "0",
+                                                        // Scroll into view when edit dialog appears (#93)
+                                                        onmounted: move |cx| {
+                                                            let el = cx.data();
+                                                            wasm_bindgen_futures::spawn_local(async move {
+                                                                let _ = el.scroll_to(ScrollBehavior::Smooth).await;
+                                                            });
+                                                        },
+                                                        // Global key bindings on the container (#94): Esc cancels,
+                                                        // Enter saves. Kept here (not solely on the textarea) so the
+                                                        // "(Esc)"/"(Enter)" button shortcuts work when keyboard focus
+                                                        // is on a button. The textarea's @mention handler calls
+                                                        // stop_propagation when it consumes a key, so these never
+                                                        // double-fire with mention navigation.
+                                                        onkeydown: {
+                                                            let msg_id = msg_id_for_save.clone();
+                                                            let original = original_text.clone();
+                                                            move |e: KeyboardEvent| {
+                                                                if e.key() == Key::Escape {
+                                                                    editing_message.set(None);
+                                                                } else if e.key() == Key::Enter && !e.modifiers().shift() {
+                                                                    // Shift+Enter inserts a newline. Mention
+                                                                    // selection takes the key first, on the
+                                                                    // textarea, and stops it reaching here.
+                                                                    e.prevent_default();
+                                                                    commit_edit(
+                                                                        edit_text,
+                                                                        editing_message,
+                                                                        on_edit,
+                                                                        msg_id.clone(),
+                                                                        &original,
+                                                                        is_private,
+                                                                        max_message_size,
+                                                                    );
                                                                 }
                                                             }
-                                                        })}
+                                                        },
+                                                        // `relative` anchors the @mention autocomplete
+                                                        // dropdown to the textarea.
+                                                        div { class: "relative",
+                                                            // @mention autocomplete dropdown (floats above the textarea)
+                                                            mention::MentionDropdown {
+                                                                mention: edit_mention,
+                                                                on_pick: move |i| mention::apply_mention_selection(
+                                                                    pick_id.clone(),
+                                                                    edit_text,
+                                                                    edit_mention,
+                                                                    i,
+                                                                    || {},
+                                                                ),
+                                                            }
+                                                            textarea {
+                                                                id: "{edit_id}",
+                                                                class: format!(
+                                                                    "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none {}",
+                                                                    if is_self { "bg-white/10 text-white placeholder-white/50 border border-white/20" } else { "bg-bg text-text border border-border" }
+                                                                ),
+                                                                value: "{edit_text}",
+                                                                onmounted: move |cx| {
+                                                                    let element = cx.data();
+                                                                    wasm_bindgen_futures::spawn_local(async move {
+                                                                        let _ = element.set_focus(true).await;
+                                                                    });
+                                                                },
+                                                                oninput: move |e| {
+                                                                    let value = e.value().to_string();
+                                                                    edit_text.set(value.clone());
+                                                                    // Detect / update the @mention autocomplete.
+                                                                    mention::update_mention_from_input(
+                                                                        &input_id, &value, &input_members, edit_mention,
+                                                                    );
+                                                                },
+                                                                // @mention navigation (Arrow/Enter/Tab/Esc) takes
+                                                                // precedence while the dropdown is open. When it
+                                                                // consumes the key, stop_propagation keeps the
+                                                                // container's Esc-cancel / Enter-save (above) from
+                                                                // also firing for that same key. Non-mention keys
+                                                                // bubble up to the container handler unchanged.
+                                                                onkeydown: move |e: KeyboardEvent| {
+                                                                    if mention::handle_mention_keydown(
+                                                                        &kd_id, &e, edit_text, edit_mention, || {},
+                                                                    ) {
+                                                                        e.stop_propagation();
+                                                                    }
+                                                                },
+                                                                // Dismiss the dropdown when focus leaves the textarea
+                                                                // (click elsewhere). Dropdown rows use mousedown +
+                                                                // preventDefault, so picking one does not blur first.
+                                                                onfocusout: move |_| {
+                                                                    crate::util::defer(move || edit_mention.set(None));
+                                                                },
+                                                            }
+                                                        }
+                                                        // Encoded-size gate for the edit action: same
+                                                        // measure the contract enforces. Without it an
+                                                        // over-limit edit is signed, sent, and silently
+                                                        // pruned by the contract validation.
+                                                        {
+                                                            let encoded_bytes = RoomMessageBody::measure_edit(
+                                                                msg_id_for_save.clone(),
+                                                                &edit_text.read(),
+                                                                is_private,
+                                                            );
+                                                            let over_limit = encoded_bytes > max_message_size;
+                                                            // `/ 5 * 4` (not `* 4 / 5`): max_message_size is
+                                                            // room-config-controlled and falls back to
+                                                            // usize::MAX with no room, so multiply-first
+                                                            // overflows.
+                                                            let near_limit = encoded_bytes > max_message_size / 5 * 4;
+                                                            rsx! {
+                                                                if near_limit {
+                                                                    div {
+                                                                        class: if over_limit {
+                                                                            "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium"
+                                                                        } else if is_self {
+                                                                            "text-xs text-right mt-1 pr-1 text-white/70"
+                                                                        } else {
+                                                                            "text-xs text-right mt-1 pr-1 text-text-muted"
+                                                                        },
+                                                                        if over_limit {
+                                                                            "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
+                                                                        } else {
+                                                                            "{encoded_bytes}/{max_message_size}"
+                                                                        }
+                                                                    }
+                                                                }
+                                                                div { class: "flex justify-end gap-3 mt-3",
+                                                                    style: "overflow: visible;",
+                                                                    button {
+                                                                        class: if is_self {
+                                                                            "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"
+                                                                        } else {
+                                                                            "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border"
+                                                                        },
+                                                                        onclick: move |_| editing_message.set(None),
+                                                                        "Cancel (Esc)"
+                                                                    }
+                                                                    button {
+                                                                        class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-medium hover:opacity-90",
+                                                                        style: if over_limit {
+                                                                            "background-color: #9ca3af; color: white; cursor: not-allowed; opacity: 0.6;"
+                                                                        } else {
+                                                                            "background-color: #2563eb; color: white;"
+                                                                        },
+                                                                        disabled: over_limit,
+                                                                        title: if over_limit {
+                                                                            format!("Edited message exceeds the {} byte limit", max_message_size)
+                                                                        } else {
+                                                                            String::new()
+                                                                        },
+                                                                        // `disabled` can lag a render, so the click
+                                                                        // re-checks the encoded size and keeps the
+                                                                        // draft when it is still over the limit.
+                                                                        onclick: move |_| {
+                                                                            commit_edit(
+                                                                                edit_text,
+                                                                                editing_message,
+                                                                                on_edit,
+                                                                                save_msg_id.clone(),
+                                                                                &save_original,
+                                                                                is_private,
+                                                                                max_message_size,
+                                                                            );
+                                                                        },
+                                                                        "Save (Enter)"
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                rsx! {
+                                                    // Message bubble. The reply strip (if any) is rendered as
+                                                    // the first child INSIDE the bubble so it shares the
+                                                    // bubble's width and its intrinsic size cannot reflow
+                                                    // the parent (fixes #206 and #207).
+                                                    div {
+                                                        class: format!(
+                                                            "flex flex-col text-sm overflow-hidden {} {} {}",
+                                                            if is_self {
+                                                                "bg-accent text-white"
+                                                            } else {
+                                                                "bg-surface text-text"
+                                                            },
+                                                            // Rounded corners based on position in the group ONLY.
+                                                            // Reactions must never change them: a reaction arriving
+                                                            // used to square off a bottom corner.
+                                                            if is_self {
+                                                                if is_first && is_last {
+                                                                    "rounded-2xl"
+                                                                } else if is_first {
+                                                                    "rounded-t-2xl rounded-bl-2xl rounded-br-md"
+                                                                } else if is_last {
+                                                                    "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
+                                                                } else {
+                                                                    "rounded-l-2xl rounded-r-md"
+                                                                }
+                                                            } else if is_first && is_last {
+                                                                "rounded-2xl"
+                                                            } else if is_first {
+                                                                "rounded-t-2xl rounded-br-2xl rounded-bl-md"
+                                                            } else if is_last {
+                                                                "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
+                                                            } else {
+                                                                "rounded-r-2xl rounded-l-md"
+                                                            },
+                                                            // `.msg-bubble` caps text width (main.css); `min-w-full`
+                                                            // lets a wider reaction row widen the bubble.
+                                                            "msg-bubble min-w-full"
+                                                        ),
+                                                        // Reply-quote strip (inside bubble, first child).
+                                                        // Exactly one arm renders, enforced by the type: an
+                                                        // unverifiable quote is `Unavailable`, which carries no
+                                                        // author or preview to render.
+                                                        //
+                                                        // Self bubbles use a white-tinted overlay so the strip
+                                                        // stays legible against the accent background; other
+                                                        // bubbles use a dark-tinted overlay against the surface
+                                                        // background. The previous `bg-accent/40 text-accent`
+                                                        // was invisible on self bubbles because the strip
+                                                        // composited to the same colour as the bubble.
+                                                        {
+                                                            match reply_strip {
+                                                                ReplyStrip::NotAReply => rsx! {},
+                                                                // Deliberately inert — no `role`/`tabindex`/
+                                                                // `onclick` — because there is no original
+                                                                // message to scroll to. It therefore carries
+                                                                // its own class rather than `reply-strip`,
+                                                                // whose focus/ellipsis rules assume a
+                                                                // focusable element with ellipsized text.
+                                                                //
+                                                                // The wording stays neutral: absence cannot
+                                                                // distinguish a ban from an ordinary aged-out
+                                                                // message, so claiming "banned" here would
+                                                                // mislabel the common case.
+                                                                ReplyStrip::Unavailable => rsx! {
+                                                                    div {
+                                                                        "data-testid": "reply-strip-unavailable",
+                                                                        class: format!(
+                                                                            "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 italic {}",
+                                                                            if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
+                                                                        ),
+                                                                        // The arrow is decorative; the sentence
+                                                                        // after it is what a screen reader needs.
+                                                                        ReplyIcon { size: 11 }
+                                                                        " "
+                                                                        "Original message unavailable"
+                                                                    }
+                                                                },
+                                                                ReplyStrip::Quote { author, preview, target_id } => {
+                                                                    // The quoted message's row id, built the same way
+                                                                    // the row renders its own `id: "msg-{msg.id}"`.
+                                                                    let target_row_id = format!("msg-{:?}", target_id.0);
+                                                                    // One copy each for the click and key handlers.
+                                                                    let target_row_id_for_click = target_row_id.clone();
+                                                                    let target_row_id_for_key = target_row_id.clone();
+                                                                    rsx! {
+                                                                        div {
+                                                                            "data-testid": "reply-strip",
+                                                                            // The row this strip jumps to, for automation.
+                                                                            "data-reply-target": "{target_row_id}",
+                                                                            class: format!(
+                                                                                "reply-strip min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
+                                                                                if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
+                                                                            ),
+                                                                            title: "Scroll to original message (Enter or Space to activate)",
+                                                                            role: "button",
+                                                                            tabindex: "0",
+                                                                            "aria-label": "Scroll to the message this is a reply to",
+                                                                            // DOM-only (no signal writes), so no `defer()`.
+                                                                            onclick: move |_| {
+                                                                                reply_highlight::jump_to_reply_target(&target_row_id_for_click);
+                                                                            },
+                                                                            onkeydown: move |e: KeyboardEvent| {
+                                                                                // Activate the same scroll-to-original
+                                                                                // behaviour via Enter or Space so keyboard
+                                                                                // users can reach it without a mouse.
+                                                                                if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
+                                                                                    e.prevent_default();
+                                                                                    reply_highlight::jump_to_reply_target(&target_row_id_for_key);
+                                                                                }
+                                                                            },
+                                                                            span { class: "font-medium", ReplyIcon { size: 11 } " @{author}: " }
+                                                                            span { "{preview}" }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        // Message body, wrapped in a padding container so the
+                                                        // "(edited)" indicator can sit inline at the trailing
+                                                        // edge of the body text rather than as a separate
+                                                        // flex-column row. `[overflow-wrap:anywhere]` ensures
+                                                        // long URLs and unbreakable tokens wrap instead of
+                                                        // forcing the bubble past `.msg-bubble`. `anywhere` is
+                                                        // stricter than `break-word`: it also lowers the
+                                                        // element's min-content so flex/grid parents can shrink
+                                                        // the bubble to fit.
+                                                        div {
+                                                            class: "px-3 py-2 min-w-0",
+                                                            div {
+                                                                class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
+                                                                dangerous_inner_html: "{msg.content_html}"
+                                                            }
+                                                            if msg.edited {
+                                                                span {
+                                                                    class: format!(
+                                                                        "text-xs ml-2 {}",
+                                                                        if is_self { "text-white/70" } else { "text-text-muted" }
+                                                                    ),
+                                                                    "(edited)"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Reactions display with inline add button
+                                    {
+                                        let picker_message_id = msg.id.clone();
+                                        let msg_id_react = msg.message_id.clone();
+                                        let is_inline_picker_open = open_emoji_picker
+                                            .read()
+                                            .as_deref()
+                                            == Some(picker_message_id.as_str());
+                                        let msg_id_for_reply = msg.message_id.clone();
+                                        // Clean mentions/markdown BEFORE truncating so no raw token reaches the stored preview
+                                        let reply_text_preview = clean_reply_preview(&msg.content_text, &member_names)
+                                            .chars()
+                                            .take(100)
+                                            .collect::<String>();
+                                        let reply_author_name = group.author_name.clone();
+                                        let msg_id_str_for_edit = msg.id.clone();
+                                        let msg_id_for_delete = msg.message_id.clone();
+                                        let current_text = msg.content_text.clone();
+                                        let (msg_time, msg_full_time) = time_labels(msg.time, msg.time_clamped, msg.receive_delay_secs);
+                                        let action_btn = "msg-action-btn inline-flex items-center justify-center h-5 hover:scale-110";
+                                        // Chip height (h-6) only beside chips, so a reaction-less row
+                                        // stays as short as its h-5 buttons (#605).
+                                        let add_reaction_btn = format!(
+                                            "msg-react-btn group/add inline-flex items-center justify-center {} px-1.5 rounded-2xl border border-transparent text-text-muted cursor-pointer hover:bg-panel hover:border-text hover:text-text",
+                                            if has_reactions { "h-6" } else { "h-5" },
+                                        );
+
+                                        // Find user's current reaction on this message (if any)
+                                        // No known identity ⇒ no reaction is ours,
+                                        // so nothing is highlighted and the picker
+                                        // offers a fresh reaction rather than a
+                                        // toggle of someone else's.
+                                        let user_reaction: Option<String> = msg.reactions.iter().find_map(|(emoji, reactors)| {
+                                            if self_member_id.is_some_and(|me| reactors.contains(&me)) {
+                                                Some(emoji.clone())
+                                            } else {
+                                                None
+                                            }
+                                        });
+
+                                        rsx! {
+                                            div {
+                                                "data-testid": "message-reaction-row",
+                                                class: "flex flex-wrap items-center gap-1 mt-0.5",
+                                                // Existing reactions, already in chip order (first reaction
+                                                // first). Clicking any chip reacts with its emoji through the
+                                                // picker's `on_react` path: it removes the viewer's own
+                                                // reaction, and otherwise switches theirs to this emoji.
+                                                {
+                                                    msg.reactions.iter().map(|(emoji, reactors)| {
+                                                        let count = reactors.len();
+                                                        let is_user_reaction = self_member_id.is_some_and(|me| reactors.contains(&me));
+                                                        let emoji_for_click = emoji.clone();
+                                                        let msg_id_for_click = msg_id_react.clone();
+
+                                                        // Build list of reactor names for tooltip
+                                                        let reactor_names: Vec<String> = reactors.iter().map(|reactor_id| {
+                                                            // Unknown identity ⇒ nobody is
+                                                            // labelled "You"; every reactor
+                                                            // falls through to their nickname.
+                                                            if Some(*reactor_id) == self_member_id {
+                                                                "You".to_string()
+                                                            } else {
+                                                                member_names.get(reactor_id)
+                                                                    .cloned()
+                                                                    .unwrap_or_else(|| "Unknown".to_string())
+                                                            }
+                                                        }).collect();
+                                                        let names_str = reactor_names.join(", ");
+
+                                                        let tooltip = if is_user_reaction {
+                                                            format!("{} (click to remove)", names_str)
+                                                        } else {
+                                                            names_str
+                                                        };
+
+                                                        rsx! {
+                                                            // The 1px border is always there (transparent at
+                                                            // rest) so hovering never shifts the row.
+                                                            button {
+                                                                key: "{emoji}",
+                                                                r#type: "button",
+                                                                "data-testid": "reaction-chip",
+                                                                "data-emoji": "{emoji}",
+                                                                "aria-pressed": if is_user_reaction { "true" } else { "false" },
+                                                                class: format!(
+                                                                    "inline-flex items-center gap-1 h-6 px-1.5 rounded-2xl border border-transparent text-base leading-none cursor-pointer transition-colors hover:bg-panel hover:border-text {}",
+                                                                    if is_user_reaction { "bg-surface-strong" } else { "bg-surface" }
+                                                                ),
+                                                                title: "{tooltip}",
+                                                                onclick: move |_| {
+                                                                    on_react.call((msg_id_for_click.clone(), emoji_for_click.clone()));
+                                                                },
+                                                                span { "{emoji}" }
+                                                                span {
+                                                                    "data-testid": "reaction-chip-count",
+                                                                    class: if is_user_reaction { "text-xs text-text" } else { "text-xs text-text-muted" },
+                                                                    "{count}"
+                                                                }
+                                                            }
+                                                        }
+                                                    })
+                                                }
+                                                // Add-reaction smiley, right after the last chip so it wraps
+                                                // with them, or alone at the bubble's left edge when there are
+                                                // none.
+                                                div {
+                                                    class: "relative inline-flex items-center",
+                                                    // Invisible backdrop when picker is open
+                                                    if is_inline_picker_open {
+                                                        div {
+                                                            class: "fixed inset-0 z-40",
+                                                            onclick: move |_| open_emoji_picker.set(None),
+                                                        }
+                                                    }
+                                                    button {
+                                                        r#type: "button",
+                                                        class: "{add_reaction_btn}",
+                                                        title: "Add reaction",
+                                                        "aria-label": "Add reaction",
+                                                        "data-testid": "add-reaction-button",
+                                                        onclick: {
+                                                            let picker_message_id = picker_message_id.clone();
+                                                            move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let current = open_emoji_picker.read().clone();
+                                                                if current.as_deref() == Some(picker_message_id.as_str()) {
+                                                                    open_emoji_picker.set(None);
+                                                                } else {
+                                                                    // Open toward the viewport centre: above when the click
+                                                                    // is in the bottom 40%, left-aligned in the left half.
+                                                                    let click = e.client_coordinates();
+                                                                    let window = web_sys::window();
+                                                                    let viewport_height = window.as_ref()
+                                                                        .and_then(|w| w.inner_height().ok())
+                                                                        .and_then(|h| h.as_f64())
+                                                                        .unwrap_or(800.0);
+                                                                    let viewport_width = window.as_ref()
+                                                                        .and_then(|w| w.inner_width().ok())
+                                                                        .and_then(|v| v.as_f64())
+                                                                        .unwrap_or(400.0);
+                                                                    picker_show_above.set(click.y > viewport_height * 0.6);
+                                                                    picker_align_left.set(click.x < viewport_width * 0.5);
+                                                                    open_emoji_picker.set(Some(picker_message_id.clone()));
+                                                                }
+                                                            }
+                                                        },
+                                                        // Faded at rest; full strength while the box is hovered.
+                                                        span {
+                                                            class: "inline-flex opacity-60 group-hover/add:opacity-100",
+                                                            SmileyIcon {}
+                                                        }
+                                                    }
+                                                    // Emoji picker for inline button (flips based on viewport position)
+                                                    if is_inline_picker_open {
+                                                        div {
+                                                            "data-testid": "emoji-picker",
+                                                            class: format!(
+                                                                "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
+                                                                if *picker_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
+                                                                if *picker_align_left.read() { "left-0" } else { "right-0" }
+                                                            ),
+                                                            style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
+                                                            onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                            {FREQUENT_EMOJIS.iter().map(|emoji| {
+                                                                let emoji_str = emoji.to_string();
+                                                                let msg_id = msg_id_react.clone();
+                                                                let is_current = user_reaction.as_ref() == Some(&emoji_str);
+                                                                rsx! {
+                                                                    button {
+                                                                        key: "{emoji}",
+                                                                        class: format!(
+                                                                            "p-1 rounded hover:bg-surface transition-colors text-xl leading-none {}",
+                                                                            if is_current { "bg-accent/20 ring-2 ring-accent" } else { "" }
+                                                                        ),
+                                                                        title: if is_current {
+                                                                            format!("Remove {} reaction", emoji)
+                                                                        } else {
+                                                                            format!("React with {}", emoji)
+                                                                        },
+                                                                        onclick: move |_| {
+                                                                            on_react.call((msg_id.clone(), emoji_str.clone()));
+                                                                            open_emoji_picker.set(None);
+                                                                        },
+                                                                        "{emoji}"
+                                                                    }
+                                                                }
+                                                            })}
+                                                        }
+                                                    }
+                                                }
+                                                // Time, reply, then edit/delete on own messages: one flex item, so
+                                                // it wraps as a unit. `pl-3` keeps it 16px clear of a full row's smiley.
+                                                div {
+                                                    "data-testid": "message-action-cluster",
+                                                    class: "flex items-center gap-3 ml-auto pl-3",
+                                                    span {
+                                                        "data-testid": "message-time",
+                                                        class: if msg.time_clamped { "msg-time text-xs text-text-muted cursor-default italic" } else { "msg-time text-xs text-text-muted cursor-default" },
+                                                        title: "{msg_full_time}",
+                                                        "{msg_time}"
+                                                    }
+                                                    button {
+                                                        class: "{action_btn}",
+                                                        title: "Reply",
+                                                        "aria-label": "Reply",
+                                                        "data-testid": "message-reply-button",
+                                                        onclick: move |_| {
+                                                            let ctx = ReplyContext {
+                                                                message_id: msg_id_for_reply.clone(),
+                                                                author_name: reply_author_name.clone(),
+                                                                content_preview: reply_text_preview.clone(),
+                                                            };
+                                                            crate::util::defer(move || on_reply.call(ctx));
+                                                        },
+                                                        ReplyIcon {}
+                                                    }
+                                                    if is_self {
+                                                        button {
+                                                            class: "{action_btn}",
+                                                            title: "Edit message",
+                                                            "aria-label": "Edit message",
+                                                            "data-testid": "message-edit-button",
+                                                            onclick: move |_| {
+                                                                let t = current_text.clone();
+                                                                let id = msg_id_str_for_edit.clone();
+                                                                crate::util::defer(move || {
+                                                                    edit_text.set(t);
+                                                                    editing_message.set(Some(id));
+                                                                });
+                                                            },
+                                                            EditIcon {}
+                                                        }
+                                                        button {
+                                                            class: "{action_btn} hover:text-red-500",
+                                                            title: "Delete message",
+                                                            "aria-label": "Delete message",
+                                                            "data-testid": "message-delete-button",
+                                                            onclick: move |_| {
+                                                                let id = msg_id_for_delete.clone();
+                                                                crate::util::defer(move || on_request_delete.call(id));
+                                                            },
+                                                            DeleteIcon {}
+                                                        }
                                                     }
                                                 }
                                             }
@@ -5749,18 +5621,6 @@ fn MessageGroupComponent(
                     }
                 }
 
-                // Time for self messages (shown at the end)
-                if is_self {
-                    div {
-                        class: if time_clamped {
-                            "text-xs text-text-muted mt-1 px-1 cursor-default italic opacity-70"
-                        } else {
-                            "text-xs text-text-muted mt-1 px-1 cursor-default"
-                        },
-                        title: "{full_time_str}",
-                        if time_clamped { "~{time_str}" } else { "{time_str}" }
-                    }
-                }
             }
         }
     }
@@ -8748,7 +8608,10 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(g.time_clamped, "a future timestamp must be flagged clamped");
+        assert!(
+            g.messages[0].time_clamped,
+            "a future timestamp must be flagged clamped"
+        );
         assert_eq!(
             g.messages[0].time, first_seen,
             "the clamp target must be when we first saw the message, not the \
@@ -8821,7 +8684,7 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(g.time_clamped);
+        assert!(g.messages[0].time_clamped);
         assert_eq!(g.messages[0].time, now);
     }
 
@@ -8858,7 +8721,7 @@ mod group_messages_clock_tests {
         let g = only_group(&items);
 
         assert!(
-            g.time_clamped,
+            g.messages[0].time_clamped,
             "a send time an hour after arrival is skew, even though it is in \
              the past relative to this render"
         );
@@ -8897,7 +8760,7 @@ mod group_messages_clock_tests {
         let g = only_group(&items);
 
         assert!(
-            !g.time_clamped,
+            !g.messages[0].time_clamped,
             "a few seconds of clock skew is normal and must not put a \
              \"sender's clock may be wrong\" marker on the message"
         );
@@ -8938,7 +8801,7 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(!g.time_clamped);
+        assert!(!g.messages[0].time_clamped);
         assert_eq!(g.messages[0].time, sent);
     }
 }
@@ -9030,8 +8893,8 @@ mod autoscroll_wiring_pins {
                 .find(needle)
                 .unwrap_or_else(|| panic!("the settle handler must contain `{needle}`"))
         };
-        let decide = at("letours=(settled_at-last_top.get()).abs()<=SCROLL_TOP_SLACK_PX;");
-        let record = at("last_top.set(settled_at);");
+        let decide = at("letours=(settled_at-last_top.top()).abs()<=SCROLL_TOP_SLACK_PX;");
+        let record = at("last_top.record(settled_at,container.client_height());");
         let early_out = at("ifours{return;}");
         assert!(
             decide < record && record < early_out,
@@ -9271,9 +9134,7 @@ mod autoscroll_wiring_pins {
         // reader to the bottom (#505 delta review). Two call sites: the head
         // reposition and the backfill restore.
         assert_eq!(
-            dense
-                .matches("last_scroll_top.set(last_scroll_top.get()+shift);")
-                .count(),
+            dense.matches("last_scroll_top.shift(shift);").count(),
             2,
             "both the head reposition and the backfill restore must update \
              `last_scroll_top` RELATIVELY — an absolute write erases the \

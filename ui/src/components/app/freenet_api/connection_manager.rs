@@ -225,6 +225,11 @@ mod imp {
                     }
                 },
             );
+            // Drop the `onerror` `WebApi::start` just set: freenet-stdlib types it as an
+            // `ErrorEvent` and reads `filename()`, but a WebSocket error is a plain
+            // `Event`, so it threw an uncaught page error on every failed connection.
+            // The `close` that always follows still reports it (and reconnects).
+            websocket.set_onerror(None);
 
             info!(
                 "Waiting for connection with timeout of {}ms",
@@ -312,3 +317,24 @@ mod imp {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use imp::ConnectionManager;
+
+#[cfg(test)]
+mod tests {
+    /// `WebApi::start` installs an `onerror` that throws on every WebSocket error,
+    /// so River clears it, which only works AFTER `start`.
+    #[test]
+    fn webapi_onerror_is_cleared_after_start() {
+        let code = include_str!("connection_manager.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let start = code.find("WebApi::start(").expect("the WebApi::start call");
+        let cleared = code
+            .find("websocket.set_onerror(None)")
+            .expect("River clearing WebApi's onerror");
+        assert!(
+            cleared > start,
+            "onerror must be cleared after WebApi::start sets it"
+        );
+    }
+}

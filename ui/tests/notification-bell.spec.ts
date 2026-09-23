@@ -198,8 +198,7 @@ test.describe("Per-room notification bell", () => {
     await selectRoom(page, ROOM);
 
     // Open room details via the title button.
-    const header = page.locator(".border-b.border-border.bg-panel").first();
-    await header.locator('button[title="Room details"]').click();
+    await page.getByTestId("room-title-button").click();
     await expect(
       page.getByRole("heading", { name: /Room Details/i })
     ).toBeVisible({ timeout: 5_000 });

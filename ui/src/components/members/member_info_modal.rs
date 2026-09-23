@@ -40,6 +40,11 @@ impl PartialEq<MemberId> for SelfMemberId {
     }
 }
 
+/// Shape shared by every chip in the tag row. Each chip adds only its tint and
+/// text colour, so the chips cannot drift apart in size.
+const TAG_CHIP_CLASS: &str =
+    "inline-flex items-center px-3 py-[5px] rounded-full text-sm font-medium";
+
 #[component]
 pub fn MemberInfoModal() -> Element {
     // Memos
@@ -472,22 +477,27 @@ pub fn MemberInfoModal() -> Element {
                         h1 { class: "text-xl font-semibold text-text mb-4", "Member Info" }
 
                         // Show tags for owner, self, and relationships
-                        div { class: "flex flex-wrap gap-2 mb-4",
+                        div {
+                            "data-testid": "member-info-tags",
+                            class: "flex flex-wrap gap-2 mb-4",
                             if is_owner {
                                 span {
-                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-blue-500/20 text-blue-400",
+                                    "data-testid": "member-info-owner-tag",
+                                    class: "{TAG_CHIP_CLASS} bg-blue-500/20 text-text",
                                     "👑 Room Owner"
                                 }
                             }
                             if member_id == self_member_id {
                                 span {
-                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-cyan-500/20 text-cyan-400",
+                                    "data-testid": "member-info-self-tag",
+                                    class: "{TAG_CHIP_CLASS} bg-cyan-500/20 text-text",
                                     "⭐ You"
                                 }
                             }
                             if is_downstream {
                                 span {
-                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-green-500/20 text-green-400",
+                                    "data-testid": "member-info-invited-by-you-tag",
+                                    class: "{TAG_CHIP_CLASS} bg-green-500/20 text-text",
                                     "🔑 Invited by You"
                                 }
                             }
@@ -495,7 +505,8 @@ pub fn MemberInfoModal() -> Element {
                             if let Some(self_member) = members_list.iter().find(|m| m.member.id() == self_member_id) {
                                 if self_member.member.invited_by == member_id {
                                     span {
-                                        class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-yellow-500/20 text-yellow-400",
+                                        "data-testid": "member-info-invited-you-tag",
+                                        class: "{TAG_CHIP_CLASS} bg-yellow-500/20 text-text",
                                         "🎪 Invited You"
                                     }
                                 }
@@ -509,7 +520,7 @@ pub fn MemberInfoModal() -> Element {
                             if deputy_badge.is_some() {
                                 span {
                                     "data-testid": "member-info-deputy-tag",
-                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-purple-500/20 text-purple-400",
+                                    class: "{TAG_CHIP_CLASS} bg-purple-500/20 text-text",
                                     title: "{deputy_tooltip}",
                                     "aria-label": "{deputy_tooltip}",
                                     "🛡 Deputy"
@@ -526,7 +537,8 @@ pub fn MemberInfoModal() -> Element {
                             if impersonation.is_some() {
                                 span {
                                     "data-testid": "member-info-impersonation-tag",
-                                    class: "inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-amber-500/20 text-amber-400",
+                                    // Amber text kept: it carries the warning.
+                                    class: "{TAG_CHIP_CLASS} bg-amber-500/20 text-amber-400",
                                     title: "{impersonation_tooltip}",
                                     "aria-label": "{impersonation_tooltip}",
                                     "{crate::util::confusable::WARNING_GLYPH} {impersonation_label}"

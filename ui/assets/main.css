@@ -1,58 +1,107 @@
-/* Reaction button hover visibility */
-.add-reaction-btn {
+/* Per-message time and buttons (conversation.rs): hidden at rest on a fine
+ * pointer, shown while the message row (`.group`) is hovered; a group's first
+ * row also holds its author name and badges. The action buttons show at 0.4
+ * (0.7 when hovered or focused). The add-reaction smiley shows at full opacity
+ * because its chip-style hover box must render at full strength (its icon does
+ * the fading). An open picker keeps its row hovered: its backdrop sits
+ * inside the row. */
+.msg-action-btn {
     opacity: 0;
     color: currentColor;
     transition: opacity 0.15s, transform 0.15s;
 }
 
-.group:hover .add-reaction-btn {
+.msg-react-btn {
+    opacity: 0;
+    transition: opacity 0.15s, background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.msg-time {
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.group:hover .msg-action-btn {
     opacity: 0.4;
 }
 
-.add-reaction-btn:hover {
+.msg-action-btn:hover,
+.msg-action-btn:focus-visible {
     opacity: 0.7 !important;
 }
 
-.add-reaction-btn.has-reactions {
-    opacity: 0.2;
+.group:hover :is(.msg-react-btn, .msg-time),
+.msg-react-btn:focus-visible {
+    opacity: 1;
 }
 
-.group:hover .add-reaction-btn.has-reactions {
-    opacity: 0.4;
-}
-
-/* Touch reveal for the inline add-reaction "+" button (same failure mode as
- * #402/#462 above): `.add-reaction-btn` reveals via `.group:hover`, a real
- * CSS `:hover`, which touch devices can't reliably trigger — so on a phone
- * the button was invisible (opacity: 0) yet still tappable, unless the
- * message already had reactions (`.has-reactions` gives it opacity: 0.2 at
- * rest regardless of hover), which is why the bug only showed on
- * reaction-less messages.
- *
- * Gate on pointer CAPABILITY, not viewport width — see the #462 comment
- * above for why `(hover: none), (any-pointer: coarse)` is the correct query
- * (`any-pointer: coarse` also catches a touchscreen laptop, which reports
- * `hover: hover` while a finger is on the glass).
- *
- * Deliberately does NOT widen the tap target the way #462 did: a min-size
- * here (tried in #605, reverted after user feedback) grows the reaction
- * row's line height on every message, even ones without reactions yet,
- * which reads as "the composer now takes up more room" — a real visible
- * regression, not just a WCAG nice-to-have. This button is also a
- * lower-stakes target than the DM-archive ✕ (a mis-tap just opens the
- * emoji picker, not a destructive action) and touch users have a second
- * path to the same action via the message kebab menu's "React" entry
- * (`conversation.rs`, `.touch-actions`) — a full menu row, comfortably
- * above the WCAG 2.5.8 AA 24px floor though still short of the 44px AAA
- * target itself. So: fix visibility only, leave sizing alone. */
+/* Touch: `:hover` can't be relied on, and an opacity-0 button is still
+ * tappable, so show them. Gated on pointer capability; the DM-rail rule below
+ * explains the query. No larger tap target: one was tried in #605 and
+ * reverted, since it made every message's reaction row taller, and a mis-tap
+ * is cheap (delete asks to confirm). */
 @media (hover: none), (any-pointer: coarse) {
-    .add-reaction-btn {
+    .msg-action-btn {
         opacity: 0.4;
     }
 
-    .add-reaction-btn.has-reactions {
-        opacity: 0.4;
+    .msg-react-btn,
+    .msg-time {
+        opacity: 1;
     }
+}
+
+/* Message-row band. The full-width message row (`.msg-row`, which on a
+ * group's first message also holds the author name) is the one container for
+ * both: its background is the bubble grey at 40% while hovered, and at full
+ * strength during a reply-jump highlight (`conversation/reply_highlight.rs`
+ * adds the class; it comes off on `animationend`). A plain background, never a
+ * `::before` in a stacking context, which would trap the emoji picker under
+ * later rows. Hover only on hover-capable pointers, so a tap doesn't leave a
+ * row stuck grey.
+ *
+ * The spacing around a row is padding, so the band covers it: 8px on the
+ * sides, 8px above a group's first row and below its last (two groups stay
+ * 16px apart), 2px on the inner edges between rows of one group (their old
+ * 4px, with no unhovered strip between them). The sides bleed into
+ * `#chat-content`'s 16px gutter, so bubbles keep their place and the content
+ * box is still `--chat-col` wide. The history list bleeds its first and last
+ * row the same way vertically (`-my-2` in conversation.rs). */
+.msg-row {
+    margin-inline: -0.5rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.5rem;
+    transition: background-color 0.15s;
+}
+
+.msg-row:first-child {
+    padding-top: 0.5rem;
+}
+
+.msg-row:last-child {
+    padding-bottom: 0.5rem;
+}
+
+@media (hover: hover) {
+    .msg-row:hover {
+        background-color: var(--color-row-hover);
+    }
+}
+
+/* Reply-jump highlight: full strength for 2s, then off at once, with no fade.
+ * The last 0.1s (2.0 / 2.1 = 95.238%) is a tail with no background-color
+ * keyframe, so its end value is the implicit 100% keyframe: the row's own
+ * background, whatever it is then (transparent, or the hover band when the
+ * pointer is on the row). `step-start` jumps straight to it. So by the time
+ * `animationend` takes the class off, the animated value already equals the
+ * row's own background, and removing the class changes nothing for the hover
+ * transition above to fade. */
+.msg-row.reply-highlight {
+    animation: replyHighlight 2.1s step-start;
+}
+
+@keyframes replyHighlight {
+    0%, 95.238% { background-color: var(--color-surface); }
 }
 
 /* @mention chips. Rendered as raw <span class="river-mention"> inside message
@@ -108,82 +157,43 @@
     outline-color: #fff;
 }
 
-/* Reply highlight animation (when clicking "scroll to original") */
-.reply-highlight {
-    animation: replyHighlight 2s ease-out;
+/* Message widths. `--chat-col` is the message column's width, published on
+ * `#chat-content` from its `onresize` (conversation.rs); the fallback only
+ * covers the first frame. Bubble text is 65ch for readability and never more
+ * than 75% of the column. The cap is on the bubble rather than its group so a
+ * wide reaction row can still widen the bubble (it carries `min-w-full`)
+ * instead of wrapping below it. */
+.msg-bubble {
+    max-width: min(65ch, calc(var(--chat-col, 100vw) * 0.75));
 }
 
-@keyframes replyHighlight {
-    0% { background-color: rgba(59, 130, 246, 0.2); }
-    100% { background-color: transparent; }
+.msg-group-header {
+    max-width: calc(var(--chat-col, 100vw) * 0.75);
 }
 
-/* Reply strip text truncation. The strip lives inside the message bubble
- * and always shows a single ellipsized line; on devices with a real pointer
- * (mouse) it expands to full text on hover. Touch devices skip the hover
- * expansion because (a) they have no reliable hover state and (b) tapping
- * the strip already scrolls to the quoted original message. */
+.msg-edit-form {
+    max-width: min(550px, calc(var(--chat-col, 100vw) * 0.75));
+}
+
+/* Reply strip: always a single ellipsized line, never expanded on hover or focus. */
 .reply-strip {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-@media (hover: hover) and (pointer: fine) {
-    .reply-strip:hover {
-        white-space: normal;
-        text-overflow: clip;
-    }
-}
-
-/* Keyboard users get the same full-preview expansion via focus-visible,
- * on all devices (not just those with a pointer). The strip is reachable
- * with Tab because it has role="button" and tabindex="0". */
+/* Focus ring for keyboard users (the strip has role="button" and tabindex="0"). */
 .reply-strip:focus-visible {
-    white-space: normal;
-    text-overflow: clip;
     outline: 2px solid currentColor;
     outline-offset: 1px;
 }
 
-/* Touch-only message action affordance (freenet/river#402).
- *
- * The per-message hover action bar (reply / edit / delete) is built with
- * Tailwind `group-hover:` utilities, which Tailwind v4 automatically wraps in
- * `@media (hover: hover)`. On a touch device (phone, tablet) there is no hover
- * pointer, so that bar can NEVER become visible and touch users have no way to
- * reach reply / edit / delete / react.
- *
- * `.touch-actions` is the exact complement: hidden by default (so mouse users
- * keep the clean hover-reveal desktop UI) and shown only where `hover: none`
- * matches — i.e. precisely the devices where the hover bar cannot appear. It
- * decorates the always-visible kebab (⋮) button that opens the touch action
- * menu. */
-.touch-actions {
-    display: none;
-}
-
-@media (hover: none) {
-    .touch-actions {
-        display: flex;
-    }
-
-    /* The hover action bar (reply/edit/delete) is opacity-0 until hovered, but
-     * an opacity-0 element still captures taps. On a touch device (no hover) it
-     * can never become visible, so make it non-interactive there; otherwise a
-     * tap on the gutter where it sits would fire an invisible reply/edit/delete.
-     * Left interactive on desktop (@media hover:hover) so slow mouse travel
-     * across the gap to the bar still works. (#402) */
-    .hover-actions {
-        pointer-events: none;
-    }
-}
-
 /* DM-rail Archive ✕ — touch reveal (freenet/river#462).
  *
- * Same failure mode as #402 above: the archive button in the Direct Messages
- * rail (`dm_rail_section.rs`) is `opacity-0` and reveals via Tailwind
- * `group-hover:opacity-100`, which Tailwind v4 wraps in `@media (hover: hover)`.
+ * Same failure mode as the message buttons above: the archive button in the
+ * Direct Messages rail (`dm_rail_section.rs`) is `opacity-0` and reveals via
+ * Tailwind `group-hover:opacity-100`, which Tailwind v4 wraps in
+ * `@media (hover: hover)`.
  * On a touch device that reveal can never fire, so before this rule the button
  * was invisible on phones and — because it is `opacity-0` yet still
  * hit-testable and overlays the row's right edge — an invisible-but-tappable

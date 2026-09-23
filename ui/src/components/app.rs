@@ -31,7 +31,6 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
 use river_core::room_state::member::MemberId;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
 
 /// Which panel is visible on mobile (<md). On desktop all panels are always visible.
@@ -54,8 +53,15 @@ pub static NOTIFICATION_MODAL: GlobalSignal<NotificationModalSignal> =
 pub static CREATE_ROOM_MODAL: GlobalSignal<CreateRoomModalSignal> =
     Global::new(|| CreateRoomModalSignal { show: false });
 pub static PENDING_INVITES: GlobalSignal<PendingInvites> = Global::new(PendingInvites::new);
-pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> =
-    Global::new(|| SynchronizerStatus::Connecting);
+/// `no-sync` builds never start the synchronizer (see `App`), so they are
+/// `Disconnected` for good rather than `Connecting` forever.
+pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> = Global::new(|| {
+    if cfg!(feature = "no-sync") {
+        SynchronizerStatus::Disconnected
+    } else {
+        SynchronizerStatus::Connecting
+    }
+});
 pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> = Global::new(FreenetSynchronizer::new);
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
@@ -225,8 +231,11 @@ pub fn App() -> Element {
     // This is synchronous - no network request needed
     get_auth_token_from_window();
 
-    // Start synchronizer - auth token is already available
-    spawn_local(async {
+    // Start synchronizer - auth token is already available. Not in `no-sync`
+    // builds: there is no node to reach, and the page's own origin answers the
+    // WebSocket upgrade with an error, then again on every reconnect.
+    #[cfg(not(feature = "no-sync"))]
+    wasm_bindgen_futures::spawn_local(async {
         debug!("Starting FreenetSynchronizer from App component");
         // Note: The synchronizer will set up the chat delegate after connection is established
         let mut synchronizer = SYNCHRONIZER.write();

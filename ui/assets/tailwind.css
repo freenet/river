@@ -41,6 +41,12 @@
   --color-warning-bg: #fefce8;
   --color-error-bg: #fef2f2;
   --color-accent-soft: oklch(from #0265e7 l c h / 12%);
+  /* Derived, so it follows dark mode without its own override: the viewer's own
+     reaction chip. */
+  --color-surface-strong: color-mix(in oklab, var(--color-surface), var(--color-text) 12%);
+  /* Message-row hover background: the bubble grey at 40%. The reply-jump
+     highlight fills the same row with it at full strength. */
+  --color-row-hover: color-mix(in srgb, var(--color-surface) 40%, transparent);
 }
 
 /* Dark mode colors */
@@ -68,6 +74,7 @@
 @utility bg-panel { background-color: var(--color-panel); }
 @utility bg-surface { background-color: var(--color-surface); }
 @utility bg-surface-hover { background-color: var(--color-surface-hover); }
+@utility bg-surface-strong { background-color: var(--color-surface-strong); }
 @utility bg-accent-soft { background-color: var(--color-accent-soft); }
 @utility bg-success-bg { background-color: var(--color-success-bg); }
 @utility bg-warning-bg { background-color: var(--color-warning-bg); }
@@ -79,6 +86,7 @@
 
 @utility border-border { border-color: var(--color-border); }
 @utility border-border-hover { border-color: var(--color-border-hover); }
+@utility border-text { border-color: var(--color-text); }
 
 /* `--color-panel` lives on `:root`, not in `@theme`, so Tailwind generates no
    colour utilities for it automatically — every panel/surface/text utility above

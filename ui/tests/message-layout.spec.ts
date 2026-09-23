@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { selectListedRoom, waitForApp } from "./example-room";
 
 // Regression tests for freenet/river#205, #206, #207:
 //   #205 edit box wider than view
@@ -9,31 +10,25 @@ import { test, expect, Page } from "@playwright/test";
 // reply message added in ui/src/example_data.rs specifically so these tests
 // can exercise the reply bubble layout.
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
 async function selectRoom(page: Page, roomName: string) {
-  const roomBtn = page.getByRole("button", { name: roomName });
-  if (!(await roomBtn.isVisible({ timeout: 500 }).catch(() => false))) {
+  const listed = page.getByTestId("room-list").getByRole("button", { name: roomName });
+  if (!(await listed.isVisible({ timeout: 500 }).catch(() => false))) {
     // Narrow-window case: temporarily expand to click the room.
     const vp = page.viewportSize();
     if (vp && vp.width < 768) {
       await page.setViewportSize({ width: 1280, height: vp.height });
-      await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-      await roomBtn.click();
-      await expect(
-        page.getByRole("heading", { name: roomName })
-      ).toBeVisible({ timeout: 5_000 });
+      await selectListedRoom(page, roomName);
       await page.setViewportSize({ width: vp.width, height: vp.height });
+      // `--chat-col` (the bubble width cap) is published from a
+      // ResizeObserver, so it lags the resize by a frame.
+      await page.evaluate(
+        () =>
+          new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
+      );
       return;
     }
   }
-  await roomBtn.click();
-  await expect(
-    page.getByRole("heading", { name: roomName })
-  ).toBeVisible({ timeout: 5_000 });
+  await selectListedRoom(page, roomName);
 }
 
 // #205: on a narrow viewport, clicking edit on an own message must not produce
@@ -48,49 +43,9 @@ test.describe("Edit box width (#205)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    // On touch devices (no hover) the hover action bar is non-interactive; the
-    // real edit path is the kebab menu (freenet/river#402). Use whichever
-    // affordance the current device exposes.
-    const touch = await page.evaluate(
-      () => window.matchMedia("(hover: none)").matches
-    );
-
-    let clicked = false;
-    if (touch) {
-      // Target a self (accent) message directly and open Edit from its kebab —
-      // no iterating/dismissing, so the deferred menu-close can't race a
-      // following kebab tap.
-      const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
-      await expect(ownRow).toBeVisible();
-      await ownRow.scrollIntoViewIfNeeded();
-      await ownRow.locator('[data-testid="message-kebab"]').click();
-      await page
-        .locator('[data-testid="message-action-menu"]')
-        .getByRole("button", { name: /edit/i })
-        .click();
-      clicked = true;
-    } else {
-      // Hover each message bubble until one exposes an Edit button (own messages
-      // in the private room, where the owner IS self). Bubbles are divs with
-      // `max-w-prose` in the class list.
-      const bubbles = page.locator(".max-w-prose");
-      const count = await bubbles.count();
-      expect(count).toBeGreaterThan(0);
-      for (let i = 0; i < count; i++) {
-        const bubble = bubbles.nth(i);
-        await bubble.scrollIntoViewIfNeeded();
-        await bubble.hover();
-        const editBtn = bubble
-          .locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]")
-          .getByRole("button", { name: /edit/i });
-        if (await editBtn.isVisible({ timeout: 500 }).catch(() => false)) {
-          await editBtn.click();
-          clicked = true;
-          break;
-        }
-      }
-    }
-    expect(clicked, "found an own-message edit affordance").toBe(true);
+    const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
+    await ownRow.scrollIntoViewIfNeeded();
+    await ownRow.locator('[data-testid="message-edit-button"]').click();
 
     const textarea = page.locator("textarea").first();
     await expect(textarea).toBeVisible({ timeout: 5_000 });
@@ -127,9 +82,9 @@ test.describe("Reply bubble layout (#206, #207)", () => {
 
     // Find the bubble containing the reply strip and a sibling non-reply bubble.
     const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[contains(@class,'max-w-prose')][1]"
+      "xpath=ancestor::*[contains(@class,'msg-bubble')][1]"
     );
-    const allBubbles = page.locator(".max-w-prose");
+    const allBubbles = page.locator(".msg-bubble");
     const bubbleCount = await allBubbles.count();
     let maxNonReplyWidth = 0;
     for (let i = 0; i < bubbleCount; i++) {
@@ -161,65 +116,36 @@ test.describe("Reply bubble layout (#206, #207)", () => {
     expect(replyWidth).toBeLessThanOrEqual(maxNonReplyWidth + 40);
   });
 
-  test("hovering the reply strip does not change the bubble width", async ({
-    page,
-  }, testInfo) => {
+  test("hovering the reply strip keeps it collapsed", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
     const replyStrip = page.locator(".reply-strip").first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
-
-    // The hover-expand CSS is gated behind
-    // `@media (hover: hover) and (pointer: fine)`, which evaluates false
-    // on touch-emulated Playwright projects AND on some headless desktop
-    // Firefox configurations. On those browsers the :hover rule never
-    // applies, so hovering cannot cause a reflow at all — the test would
-    // pass for the wrong reason. Skip when the media query is false, so
-    // the test only runs (and only matters) when it actually exercises
-    // the hover reflow pathway.
-    const hoverCapable = await page.evaluate(() =>
-      window.matchMedia("(hover: hover) and (pointer: fine)").matches
-    );
-    test.skip(
-      !hoverCapable,
-      `(hover: hover) and (pointer: fine) is false in this browser (project: ${testInfo.project.name}); the hover-expand CSS is suppressed and there is nothing to exercise`
-    );
-
     const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[contains(@class,'max-w-prose')][1]"
+      "xpath=ancestor::*[contains(@class,'msg-bubble')][1]"
+    );
+    const heightBefore = await replyBubble.evaluate(
+      (el) => el.getBoundingClientRect().height
     );
 
-    const widthBefore = await replyBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-
-    // Move mouse to the origin first to ensure no prior hover state
-    // affects the measurement, then hover the reply strip.
     await page.mouse.move(0, 0);
     await replyStrip.hover();
-    // Poll until the computed `white-space` flips to `normal`, which
-    // proves the hover CSS actually engaged.
-    await expect
-      .poll(async () =>
-        replyStrip.evaluate((el) => getComputedStyle(el).whiteSpace)
-      )
-      .toMatch(/normal/);
 
-    const widthAfter = await replyBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
+    expect(
+      await replyStrip.evaluate((el) => getComputedStyle(el).whiteSpace)
+    ).toBe("nowrap");
+    const heightAfter = await replyBubble.evaluate(
+      (el) => el.getBoundingClientRect().height
     );
-
-    // Width must not change when the reply strip expands on hover.
-    expect(Math.abs(widthAfter - widthBefore)).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(heightAfter - heightBefore)).toBeLessThanOrEqual(0.5);
   });
 });
 
 // #210: the reply strip has onclick and cursor-pointer but was previously a
-// plain div with no tabindex / role / key handler, and the hover-expand CSS
-// had no :focus-visible equivalent, so keyboard users couldn't reach or
-// activate it.
+// plain div with no tabindex / role / key handler and no focus style, so
+// keyboard users couldn't reach or activate it.
 test.describe("Reply strip keyboard accessibility (#210)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -291,7 +217,7 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     });
     expect(
       hasFocusVisibleRule,
-      ".reply-strip:focus-visible CSS rule must exist so keyboard users see full preview (#210)"
+      ".reply-strip:focus-visible CSS rule must exist so keyboard users see focus (#210)"
     ).toBe(true);
   });
 
@@ -302,22 +228,34 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    const replyStrip = page.locator(".reply-strip").first();
+    const replyStrip = page.locator('[data-testid="reply-strip"]').first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
 
-    // The onclick handler adds the `reply-highlight` class to the target
-    // message after scrolling; pressing Enter/Space on the focused strip
-    // must do the same (Space needs preventDefault to stop the page from
-    // scrolling).
-    await replyStrip.focus();
-    await page.keyboard.press("Enter");
+    // The onclick handler scrolls to the quoted message and highlights it;
+    // Enter and Space on the focused strip must each do the same (Space needs
+    // preventDefault to stop the page from scrolling).
+    const targetId = await replyStrip.getAttribute("data-reply-target");
+    expect(targetId, "reply strip names the row it jumps to").toBeTruthy();
+    const highlight = page.locator(".reply-highlight");
+    for (const key of ["Enter", "Space"]) {
+      // Start from no highlight, so each key has to produce its own.
+      await expect(highlight).toHaveCount(0, { timeout: 4_000 });
+      await replyStrip.focus();
+      await page.keyboard.press(key);
 
-    // Wait for the highlight class to appear on any `[id^='msg-']` element.
-    await expect
-      .poll(async () =>
-        page.locator("[id^='msg-'].reply-highlight").count()
-      )
-      .toBeGreaterThan(0);
+      // The `reply-highlight` class lands on the quoted row itself. Timing and
+      // extent of the band are covered in reply-highlight.spec.ts.
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              (id) => !!document.getElementById(id)?.classList.contains("reply-highlight"),
+              targetId!
+            ),
+          { message: `${key} highlights the quoted message` }
+        )
+        .toBe(true);
+    }
   });
 });
 
@@ -339,7 +277,7 @@ test.describe("Long unbreakable content (#212)", () => {
     await selectRoom(page, "Your Private Room");
 
     const longTokenBubble = page
-      .locator(".max-w-prose")
+      .locator(".msg-bubble")
       .filter({ hasText: "longlongurlpath" })
       .first();
     await expect(longTokenBubble).toBeVisible({ timeout: 10_000 });
@@ -567,11 +505,21 @@ function composerAutosizeCostTest() {
     await textarea.fill("a");
     expect(await height()).toBe(oneLine);
 
-    // And a shrink straight from the clamped maximum, which exercises the
-    // ceiling rather than the intermediate sizes.
+    // A draft far past the old 168px ceiling. There is no ceiling any more, so
+    // nothing holds a tall composer's height fixed: typing on its last line is
+    // write-free only because the border slack still leaves the box
+    // overflowing. Under the clamp this passed for a different reason (the
+    // target was pinned at the maximum), so it has to be re-checked here.
     await textarea.fill(Array.from({ length: 30 }, (_, i) => i).join("\n"));
-    const clamped = await height();
-    expect(clamped).toBeGreaterThan(fourLines);
+    const tall = await height();
+    expect(tall).toBeGreaterThan(fourLines);
+    const tallTypingWrites = await writesDuring(async () => {
+      await page.keyboard.type("xyz");
+    });
+    expect(tallTypingWrites).toEqual([]);
+    expect(await height()).toBe(tall);
+
+    // And a shrink straight from that tall draft, the largest single step down.
     await textarea.fill("a");
     expect(await height()).toBe(oneLine);
   });
@@ -588,6 +536,102 @@ test.describe("Composer auto-resize cost (#468) @ desktop", () => {
 test.describe("Composer auto-resize cost (#468) @ phone", () => {
   test.use({ viewport: { width: 390, height: 844 } });
   composerAutosizeCostTest();
+});
+
+// The composer grows with the draft instead of scrolling inside itself. It used
+// to stop at 168px (~7 lines) and scroll past that.
+test.describe("Composer grows without scrolling", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("a long draft grows the composer, with no internal scroll", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const textarea = page.getByTestId("message-input");
+    await expect(textarea).toBeVisible({ timeout: 10_000 });
+
+    const LINES = 15;
+    await textarea.fill(
+      Array.from({ length: LINES }, (_, i) => `draft line ${i}`).join("\n")
+    );
+    const m = await textarea.evaluate((el) => {
+      const cs = getComputedStyle(el);
+      return {
+        height: el.getBoundingClientRect().height,
+        scroll: el.scrollHeight,
+        client: el.clientHeight,
+        overflowY: cs.overflowY,
+        lineHeight: parseFloat(cs.lineHeight),
+        borders: parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth),
+      };
+    });
+
+    expect(m.overflowY).toBe("hidden");
+    // Every line gets its own line box. The old ceiling fit about seven.
+    expect(m.height).toBeGreaterThanOrEqual(LINES * m.lineHeight);
+    // Nothing is left to scroll to. The one overflow allowed is the
+    // border-width shortfall `auto_resize_message_input` keeps on purpose so
+    // typing can measure in place (#468 above).
+    expect(
+      m.scroll - m.client,
+      `scrollHeight ${m.scroll}, clientHeight ${m.client}`
+    ).toBeLessThanOrEqual(m.borders);
+  });
+});
+
+// The composer's focus indicator is its border turning `--color-text` (resolved
+// at runtime, not hard-coded), with no ring or outline.
+test.describe("Composer focus style", () => {
+  test.use({ viewport: { width: 1280, height: 800 }, colorScheme: "light" });
+
+  test("focus turns the border to --color-text, with no ring or outline", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+
+    const textarea = page.getByTestId("message-input");
+    await expect(textarea).toBeVisible({ timeout: 10_000 });
+
+    const read = () =>
+      textarea.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        return {
+          border: cs.borderTopColor,
+          shadow: cs.boxShadow,
+          outline: cs.outlineStyle,
+        };
+      });
+    // Resolved through the same computed-style path, so both are `rgb(...)`.
+    const textColor = await page.evaluate(() => {
+      const probe = document.createElement("span");
+      probe.style.color = "var(--color-text)";
+      document.body.appendChild(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    });
+
+    await textarea.blur();
+    const rest = await read();
+    expect(
+      rest.border,
+      "premise: the resting border must differ from the focus colour"
+    ).not.toBe(textColor);
+
+    await textarea.focus();
+    // `transition-colors` animates the border, so wait for it to settle.
+    await expect
+      .poll(async () => (await read()).border, { timeout: 2_000 })
+      .toBe(textColor);
+    const focused = await read();
+    expect(focused.shadow).toBe("none");
+    expect(focused.outline).toBe("none");
+  });
 });
 
 // On page refresh, the chat scroll container must land at the bottom of the
@@ -689,7 +733,7 @@ test.describe("Self message bubble mobile overflow", () => {
     const overflow = await page.evaluate(() => {
       const vw = window.innerWidth;
       const bad: Array<{ left: number; right: number; width: number; text: string }> = [];
-      for (const b of Array.from(document.querySelectorAll(".max-w-prose"))) {
+      for (const b of Array.from(document.querySelectorAll(".msg-bubble"))) {
         const r = b.getBoundingClientRect();
         if (r.width === 0) continue;
         if (r.left < -1 || r.right > vw + 1) {
@@ -756,7 +800,7 @@ test.describe("Unavailable reply quote", () => {
     ).not.toHaveCount(0);
 
     // Mutually exclusive with the quote strip: no bubble carries both.
-    const bubbles = page.locator(".max-w-prose");
+    const bubbles = page.locator(".msg-bubble");
     expect(await bubbles.count()).toBeGreaterThan(0);
     const bothInOneBubble = await bubbles.evaluateAll(
       (els) =>

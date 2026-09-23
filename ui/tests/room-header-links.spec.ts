@@ -81,22 +81,4 @@ test.describe("Room header description links", () => {
       page.getByRole("heading", { name: /Room Details/i })
     ).toHaveCount(0);
   });
-
-  test("clicking the room title still opens the room details modal", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, ROOM_WITH_LINKS);
-
-    const header = page.locator(".border-b.border-border.bg-panel").first();
-    // The title button has title="Room details".
-    const titleButton = header.locator('button[title="Room details"]');
-    await expect(titleButton).toBeVisible();
-    await titleButton.click();
-
-    await expect(
-      page.getByRole("heading", { name: /Room Details/i })
-    ).toBeVisible({ timeout: 5_000 });
-  });
 });

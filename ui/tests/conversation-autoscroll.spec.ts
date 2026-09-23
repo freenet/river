@@ -199,11 +199,11 @@ test.describe("Conversation follows new messages (#486)", () => {
     await openRoomAtBottom(page, "Team Chat Room");
     const roomyViewport = await viewportHeight(page);
 
-    // Typing a long message grows the composer to its 168px maximum, which
-    // takes more than the observer's 100px margin off the history in one step
-    // — so the old gate latched with no network activity at all. This is why
-    // #468 (the composer auto-resize) is a CAUSE of #486 rather than only a
-    // performance cost.
+    // Typing a long message grows the composer (twelve lines is ~260px taller,
+    // and it has no ceiling), which takes more than the observer's 100px margin
+    // off the history in one step — so the old gate latched with no network
+    // activity at all. This is why #468 (the composer auto-resize) is a CAUSE
+    // of #486 rather than only a performance cost.
     await page
       .getByTestId("message-input")
       .fill(Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n"));
@@ -248,11 +248,12 @@ test.describe("Conversation follows new messages (#486)", () => {
     // browser clamps `scrollTop` down on its own. The follow has to survive
     // that too, in both directions.
     //
-    // It does NOT pin `reader_moved_up_since`'s `.min(max_scroll_top(...))`:
-    // deleting that clamp was tried and this still passed, because the browser
-    // fires a settle for its own clamping and the settle repairs the reference
-    // before the next arrival. The `.min` narrows a race window rather than
-    // deciding an outcome, and nothing here is strong enough to claim otherwise.
+    // The composer collapses inside `oninput`, so the clamp happens during
+    // `fill("")` and the arrival below can land before the next frame, before
+    // anything has re-recorded the scroll mark. Whether it does is up to the
+    // engine, so this step only catches that race sometimes; the deterministic
+    // guard is `follows history that grows in the same frame the composer
+    // collapses`, below.
     await page.getByTestId("message-input").fill("");
     await expect
       .poll(() => viewportHeight(page), { timeout: 5_000 })
@@ -280,7 +281,7 @@ test.describe("Conversation follows new messages (#486)", () => {
     // something is inserted before it. `insertMessageBeforeLast` also signs
     // with its own key, so it can never merge into that group.
     await page.evaluate(() => {
-      const rows = document.querySelectorAll("#chat-scroll-container .space-y-4 > *");
+      const rows = document.querySelectorAll('#chat-scroll-container [data-testid="conversation-history"] > *');
       (rows[rows.length - 1] as any).__riverProbe = "last-row";
     });
 
@@ -295,7 +296,7 @@ test.describe("Conversation follows new messages (#486)", () => {
     );
 
     const lastRowSurvived = await page.evaluate(() => {
-      const rows = document.querySelectorAll("#chat-scroll-container .space-y-4 > *");
+      const rows = document.querySelectorAll('#chat-scroll-container [data-testid="conversation-history"] > *');
       return (rows[rows.length - 1] as any).__riverProbe === "last-row";
     });
     expect(
@@ -415,6 +416,87 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     );
   });
 
+  test("follows history that grows in the same frame the composer collapses", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    const roomyViewport = await viewportHeight(page);
+    await page.evaluate(() => {
+      const seq = ((window as any).__riverScrollSeq = { n: 0, scroll: 0, settle: 0 });
+      const c = document.getElementById("chat-scroll-container")!;
+      c.addEventListener("scroll", () => (seq.scroll = ++seq.n));
+      c.addEventListener("scrollend", () => (seq.settle = ++seq.n));
+    });
+
+    await page
+      .getByTestId("message-input")
+      .fill(Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n"));
+    await expect
+      .poll(() => viewportHeight(page), { timeout: 5_000 })
+      .toBeLessThan(roomyViewport - BOTTOM_THRESHOLD_PX);
+    await expectSettledAtBottom(page, "the composer grew and the view did not follow it");
+    // Wait out that follow's settle. One still in flight re-records the scroll
+    // mark after the clamp below and hides the race: without this wait the
+    // unfixed code passed 11 runs in 50.
+    await page.waitForFunction(
+      () => {
+        const s = (window as any).__riverScrollSeq;
+        return s.scroll > 0 && s.settle > s.scroll;
+      },
+      undefined,
+      { timeout: 5_000 }
+    );
+
+    // Grow the newest row from a MutationObserver on the composer. That runs
+    // as a microtask right after the composer collapses (and the browser clamps
+    // `scrollTop`) but before any frame, so every observer sees the clamp and
+    // the growth together — the ordering the burst test above only hits by
+    // chance. The padding stands in for an image or font loading in the newest
+    // message. 80px is under BOTTOM_THRESHOLD_PX, so the pin stays armed and
+    // only `reader_moved_up_since` can stand the follow down.
+    const GROWTH_PX = 80;
+    await page.evaluate(
+      ({ grow, collapsedAbove }) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const rows = c.querySelectorAll("[data-item-key]");
+        const newest = rows[rows.length - 1] as HTMLElement;
+        const observer = new MutationObserver(() => {
+          if (c.clientHeight <= collapsedAbove) return;
+          observer.disconnect();
+          const gap = c.scrollHeight - c.scrollTop - c.clientHeight;
+          const before = c.scrollHeight;
+          newest.style.paddingBottom = `${grow}px`;
+          (window as any).__riverSameFrame = { gap, grew: c.scrollHeight - before };
+        });
+        observer.observe(document.getElementById("message-input")!, {
+          attributes: true,
+          attributeFilter: ["style"],
+        });
+      },
+      { grow: GROWTH_PX, collapsedAbove: roomyViewport - BOTTOM_THRESHOLD_PX }
+    );
+    await page.getByTestId("message-input").fill("");
+
+    const premise = await (
+      await page.waitForFunction(() => (window as any).__riverSameFrame, undefined, {
+        timeout: 5_000,
+      })
+    ).jsonValue();
+    expect(
+      premise.gap,
+      "premise: collapsing the composer should leave the view clamped to the bottom"
+    ).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
+    expect(premise.grew, "premise: the newest row should have grown").toBeGreaterThan(
+      GROWTH_PX / 2
+    );
+
+    await expectSettledAtBottom(
+      page,
+      "the history grew in the same frame the composer collapsed and the view " +
+        "did not follow it"
+    );
+  });
+
   test("does not drag a parked reader down when a resize reflows the history", async ({
     page,
   }) => {
@@ -469,7 +551,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   function renderedRowCount(page: Page): Promise<number> {
     return page.evaluate(
       () =>
-        document.querySelectorAll("#chat-scroll-container .space-y-4 > *")
+        document.querySelectorAll('#chat-scroll-container [data-testid="conversation-history"] > *')
           .length
     );
   }
@@ -507,7 +589,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     return page.evaluate((f) => {
       const container = document.getElementById("chat-scroll-container")!;
       const cRect = container.getBoundingClientRect();
-      const rows = container.querySelectorAll(".space-y-4 > *");
+      const rows = container.querySelectorAll('[data-testid="conversation-history"] > *');
       for (const row of rows) {
         const r = row.getBoundingClientRect();
         if (r.top >= cRect.top && r.bottom <= cRect.bottom) {
@@ -524,7 +606,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   async function taggedRowTop(page: Page, flag: string): Promise<number | null> {
     return page.evaluate((f) => {
       const rows = document.querySelectorAll(
-        "#chat-scroll-container .space-y-4 > *"
+        '#chat-scroll-container [data-testid="conversation-history"] > *'
       );
       for (const row of rows) {
         if ((row as any)[f]) {
@@ -757,7 +839,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     const probeTop = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       c.scrollTop = 0;
-      const row = c.querySelector(".space-y-4 > [data-item-key]") as HTMLElement;
+      const row = c.querySelector('[data-testid="conversation-history"] > [data-item-key]') as HTMLElement;
       (row as any).__riverPagingProbe = true;
       return row.getBoundingClientRect().top;
     });

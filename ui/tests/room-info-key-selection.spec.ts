@@ -52,8 +52,9 @@ async function openRoomDetails(page: Page) {
   await roomBtn.click();
   await expect(page.getByRole("heading", { name: ROOM_NAME })).toBeVisible({ timeout: 5_000 });
 
-  // The (i) affordance in the room header opens the room-details modal.
-  await page.getByTitle("Room details").click();
+  // The (i) affordance in the room header opens the room-details modal. By
+  // test id: the title button carries title="Room details" too.
+  await page.getByTestId("room-info-button").click();
   await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
 }
 
@@ -261,23 +262,7 @@ test.describe("room-details copy buttons", () => {
       other: "room-public-key-input",
     },
   ]) {
-    test(`${field.button} confirms the copy`, async ({ page }) => {
-      await page.goto("/");
-      await waitForApp(page);
-      await openRoomDetails(page);
-
-      const value = await page.getByTestId(field.input).inputValue();
-      expect(value.length).toBeGreaterThan(0);
-
-      const button = page.getByTestId(field.button);
-      await expect(button).toBeVisible();
-      await expect(button).toHaveText(/Copy/);
-
-      await button.click();
-      await expect(button).toHaveText(/Copied!/, { timeout: 2_000 });
-    });
-
-    test(`${field.button} copies THAT field's value, not another`, async ({ page }) => {
+    test(`${field.button} copies that field and confirms it`, async ({ page }) => {
       await page.goto("/");
       await waitForApp(page);
       await openRoomDetails(page);
@@ -287,11 +272,15 @@ test.describe("room-details copy buttons", () => {
       expect(mine.length).toBeGreaterThan(0);
       expect(mine).not.toBe(other);
 
-      await captureClipboardWrites(page);
-      await page.getByTestId(field.button).click();
+      const button = page.getByTestId(field.button);
+      await expect(button).toBeVisible();
+      await expect(button).toHaveText(/Copy/);
 
-      // Asserting the button says "Copied!" is NOT enough: it would say that
-      // just the same if the two buttons' values were swapped.
+      await captureClipboardWrites(page);
+      await button.click();
+      await expect(button).toHaveText(/Copied!/, { timeout: 2_000 });
+      // The label would say "Copied!" just the same if the two buttons'
+      // values were swapped, so the clipboard has to be this field's text.
       await expect.poll(() => clipboardWrites(page), { timeout: 2_000 }).toEqual([mine]);
     });
   }
@@ -320,7 +309,7 @@ test.describe("room-details copy buttons", () => {
     await page.getByTestId("edit-room-close-button").click();
     await expect(page.getByTestId("edit-room-modal")).toHaveCount(0, { timeout: 15_000 });
 
-    const reopen = page.getByTitle("Room details");
+    const reopen = page.getByTestId("room-info-button");
     await expect(reopen).toBeVisible({ timeout: 15_000 });
     await reopen.click();
     await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 15_000 });
