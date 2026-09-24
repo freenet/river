@@ -166,10 +166,16 @@ plaintext in the chat delegate.
   `save_rooms_to_delegate` both share the helper — grep `CoalesceState`
   to find every caller.
   **Hydration gate (freenet/river#530):** before that, `save_outbound_dms_to_delegate`
-  awaits the `OUTBOUND_DMS_HYDRATED` latch (bounded by `await_flag_with_bound`,
-  15s worst case), so a save can never read `OUTBOUND_DMS`/`HIDDEN_DM_THREADS`
+  awaits the `OUTBOUND_DMS_HYDRATED` latch, so a save can never read `OUTBOUND_DMS`/`HIDDEN_DM_THREADS`
   before they've merged whatever the CURRENT delegate already has on disk —
-  otherwise the save's full-blob overwrite would truncate it. The latch is set
+  otherwise the save's full-blob overwrite would truncate it. The wait is
+  bounded (`await_flag_with_bound`, 300 polls of 50 ms = 15 s), but the count
+  runs only from the moment the current delegate's DM `GetRequest` is sent,
+  and restarts for each new request (`OUTBOUND_DMS_HYDRATION_REQUEST`; each
+  setup pass resets it before its register, freenet/river#709). Before a
+  request is out there is no bound: the save waits until a setup pass sends
+  one. If a save does give up and the `GetResponse` arrives later,
+  `mark_outbound_dms_hydrated()` runs one catch-up save of the merged store. The latch is set
   by `mark_outbound_dms_hydrated()`, called only from the CURRENT (non-legacy)
   delegate's `OUTBOUND_DMS_STORAGE_KEY` `GetResponse` handler in
   `response_handler.rs`, on every return path (no blob / parsed / parse

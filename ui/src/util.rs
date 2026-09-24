@@ -553,29 +553,71 @@ pub fn owner_vk_to_legacy_contract_keys(owner_vk: &VerifyingKey) -> Vec<Contract
 }
 
 #[cfg(test)]
-/// Source text with `//` comments removed (outside string literals), so a
-/// commented-out call cannot satisfy a wiring pin.
-pub(crate) fn strip_line_comments(src: &str) -> String {
-    src.lines()
-        .map(|line| {
-            let mut in_str = false;
-            let bytes = line.as_bytes();
-            let mut i = 0;
-            while i + 1 < bytes.len() {
-                match bytes[i] {
-                    b'\\' if in_str => i += 1,
-                    b'\'' if !in_str && bytes.get(i + 1..i + 3) == Some(b"\"'") => i += 2,
-                    b'\'' if !in_str && bytes.get(i + 1..i + 4) == Some(b"\\\"'") => i += 3,
-                    b'"' => in_str = !in_str,
-                    b'/' if !in_str && bytes[i + 1] == b'/' => return &line[..i],
-                    _ => {}
+/// Source text with `//` and (nested) `/* */` comments removed, outside string
+/// and quote-char literals, so commented-out code cannot satisfy a wiring pin.
+/// Newlines inside block comments are kept so line structure survives.
+pub(crate) fn strip_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let mut in_str = false;
+    let mut depth = 0usize;
+    while i < b.len() {
+        let rest = &b[i..];
+        if depth > 0 {
+            if rest.starts_with(b"*/") {
+                depth -= 1;
+                i += 2;
+            } else if rest.starts_with(b"/*") {
+                depth += 1;
+                i += 2;
+            } else {
+                if b[i] == b'\n' {
+                    out.push(b'\n');
                 }
                 i += 1;
             }
-            line
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+            continue;
+        }
+        if in_str {
+            out.push(b[i]);
+            if b[i] == b'\\' && i + 1 < b.len() {
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b[i] == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if rest.starts_with(b"//") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if rest.starts_with(b"/*") {
+            depth = 1;
+            i += 2;
+            continue;
+        }
+        if let Some(lit) = [&b"'\"'"[..], &b"'\\\"'"[..]]
+            .into_iter()
+            .find(|lit| rest.starts_with(lit))
+        {
+            out.extend_from_slice(lit);
+            i += lit.len();
+            continue;
+        }
+        if b[i] == b'"' {
+            in_str = true;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).expect("only ASCII-delimited ranges are removed")
 }
 
 #[cfg(test)]
