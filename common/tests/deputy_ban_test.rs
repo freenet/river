@@ -354,11 +354,28 @@ fn owner_deputized_global_mod_can_ban_anyone_including_inviter() {
 
     state.post_apply_cleanup(&params(&owner)).unwrap();
 
-    let ids = member_ids(&state);
-    assert!(!ids.contains(&victim.id), "global mod can ban any member");
+    // Since freenet/river#702 the mod and their inviter stay in `members` as
+    // enforced-banned tombstones: the mod's ban on their inviter removes the
+    // mod too (cascade), and the mod's key must stay available so that ban
+    // remains verifiable. "Removed" is therefore "not an active member".
+    let active: HashSet<MemberId> = state
+        .members
+        .active_members(&state.bans, &state.member_info, &params(&owner))
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
     assert!(
-        !ids.contains(&inviter.id) && !ids.contains(&mod_peer.id),
+        !active.contains(&victim.id),
+        "global mod can ban any member"
+    );
+    assert!(
+        !active.contains(&inviter.id) && !active.contains(&mod_peer.id),
         "global mod can ban their own inviter (cascades to mod, who is downstream)"
+    );
+    let ids = member_ids(&state);
+    assert!(
+        !ids.contains(&victim.id),
+        "the victim is not a ban issuer, so they leave `members` entirely"
     );
 }
 

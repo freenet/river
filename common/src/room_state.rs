@@ -236,41 +236,13 @@ impl ChatRoomStateV1 {
              the apply-time DM sweep and the step-6 sweep are no longer the same predicate \
              (freenet/river#675)"
         );
-        // Members of a mutual-ban cycle are enforced-banned but KEPT in
-        // `members`, together with any enforced-banned invite ancestors they
-        // need for a valid chain (freenet/river#702). Their in-cycle bans take
-        // effect, and a ban can only be verified while its issuer's
-        // `AuthorizedMember` is here: `MemberId` is not a cryptographic hash
-        // of the key, and a ban carries no key. Removing them would make both
-        // bans unverifiable on the next pass, step 5 would sweep them, and
-        // either moderator could rejoin with no ban left against them, which
-        // is the counter-ban escape Ian's rule forbids. It would also let a
-        // peer that has already removed B pass on B's counter-ban without
-        // B's key, where it cannot be told apart from a forgery.
-        //
-        // These retained members are removed from the room in every other
-        // sense: they are in `enforced_banned_ids`, their messages are swept
-        // at step 4b, their DMs at step 6, their invite subtree is removed,
-        // and their bans outside the cycle take no effect. This is the same
-        // mechanism as the step-2 exemption that keeps an inactive banner
-        // present so their ban stays enforceable.
-        let retained_banned_ids: HashSet<MemberId> = {
-            let members_by_id = self.members.members_by_member_id();
-            let mut retained = HashSet::new();
-            for cycle_member in &ban_resolution.cyclic {
-                let mut current = *cycle_member;
-                while current != owner_id
-                    && enforced_banned_ids.contains(&current)
-                    && retained.insert(current)
-                {
-                    match members_by_id.get(&current) {
-                        Some(m) => current = m.member.invited_by,
-                        None => break,
-                    }
-                }
-            }
-            retained
-        };
+        // Tombstones (`BanResolution::retained`: removed members who issued
+        // a ban that takes effect, such as both parties of a mutual ban, plus
+        // their removed ancestors) stay in `members` so their bans remain
+        // verifiable. For them "removed" means "present but enforced-banned":
+        // they are in `enforced_banned_ids`, so every step below treats them
+        // as removed. See `BanResolution::retained` for why (#702).
+        let retained_banned_ids = &ban_resolution.retained;
         self.members.members.retain(|m| {
             let id = m.member.id();
             !enforced_banned_ids.contains(&id) || retained_banned_ids.contains(&id)

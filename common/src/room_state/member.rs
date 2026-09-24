@@ -151,7 +151,7 @@ impl ComposableState for MembersV1 {
         self.remove_members_banned_before_member_info(&parent_state.bans, parameters);
 
         // Always enforce max members limit
-        self.remove_excess_members(parameters, max_members);
+        self.remove_excess_members(parameters, max_members, &parent_state.bans);
 
         // Sort for deterministic ordering (CRDT convergence requirement)
         self.members.sort_by_key(|m| m.member.id());
@@ -220,6 +220,33 @@ impl MembersV1 {
         self.check_banned_members(bans_v1, parameters).is_some()
     }
 
+    /// Every member who issued a stored ban (whatever its validity), plus
+    /// their invite ancestors. `post_apply_cleanup` step 0 may need any of
+    /// them: an issuer's key to verify their ban, an ancestor for the chain.
+    /// The early ban removal keeps them, and the `max_members` trim ranks them
+    /// last, so neither can drop a ban's issuer before step 0 has decided
+    /// whether it stays as a tombstone (freenet/river#702). The set is
+    /// bounded by the stored ban count (`max_user_bans`) times invite depth.
+    fn ban_issuers_and_ancestors(
+        &self,
+        bans_v1: &BansV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> HashSet<MemberId> {
+        let owner_id = parameters.owner_id();
+        let members_by_id = self.members_by_member_id();
+        let mut keep: HashSet<MemberId> = HashSet::new();
+        for ban in &bans_v1.0 {
+            let mut current = ban.banned_by;
+            while current != owner_id && keep.insert(current) {
+                match members_by_id.get(&current) {
+                    Some(m) => current = m.member.invited_by,
+                    None => break,
+                }
+            }
+        }
+        keep
+    }
+
     /// The early, partial ban removal run from `MembersV1::apply_delta`,
     /// before `member_info` (deputy grants) has been applied.
     ///
@@ -247,18 +274,7 @@ impl MembersV1 {
         if removed.is_empty() {
             return;
         }
-        let owner_id = parameters.owner_id();
-        let members_by_id = self.members_by_member_id();
-        let mut keep: HashSet<MemberId> = HashSet::new();
-        for ban in &bans_v1.0 {
-            let mut current = ban.banned_by;
-            while current != owner_id && keep.insert(current) {
-                match members_by_id.get(&current) {
-                    Some(m) => current = m.member.invited_by,
-                    None => break,
-                }
-            }
-        }
+        let keep = self.ban_issuers_and_ancestors(bans_v1, parameters);
         self.members
             .retain(|m| !removed.contains(&m.member.id()) || keep.contains(&m.member.id()));
     }
@@ -400,20 +416,27 @@ impl MembersV1 {
         // Steps 4-5, sources first.
         let mut removed: HashSet<MemberId> = HashSet::new();
         let mut cyclic: HashSet<MemberId> = HashSet::new();
+        let mut effective_issuers: HashSet<MemberId> = HashSet::new();
         for component in strongly_connected_components(&adjacency).into_iter().rev() {
             let in_cycle = component.len() >= 2;
             for issuer in &component {
                 let Some(reaches) = valid.get(issuer) else {
                     continue;
                 };
+                // Read once, before this issuer's own bans run: a ban that
+                // removes its own issuer (self-ban, or banning one's own
+                // inviter) must not stop the issuer's OTHER bans, or the
+                // answer would depend on the order of `bans_v1`.
+                let issuer_removed = removed.contains(issuer);
                 for reach in reaches {
                     let takes_effect = if in_cycle {
                         reach.iter().any(|y| component.contains(y))
                     } else {
-                        !removed.contains(issuer)
+                        !issuer_removed
                     };
                     if takes_effect {
                         removed.extend(reach.iter().copied());
+                        effective_issuers.insert(*issuer);
                     }
                 }
             }
@@ -426,7 +449,47 @@ impl MembersV1 {
         // cannot fire; kept so a future authority change cannot silently turn a
         // ban of the owner into a ban of the whole room.
         removed.remove(&owner_id);
-        BanResolution { removed, cyclic }
+
+        // Removed members who issued a ban that takes effect, and their
+        // removed invite ancestors, stay in `members` as enforced-banned
+        // tombstones (see `BanResolution::retained`).
+        let mut retained: HashSet<MemberId> = HashSet::new();
+        for issuer in &effective_issuers {
+            let mut current = *issuer;
+            while current != owner_id && removed.contains(&current) && retained.insert(current) {
+                match members_by_id.get(&current) {
+                    Some(m) => current = m.member.invited_by,
+                    None => break,
+                }
+            }
+        }
+        BanResolution {
+            removed,
+            cyclic,
+            retained,
+        }
+    }
+
+    /// The members who are IN the room: present in `members` and not
+    /// enforced-banned. THE accessor for every "who is in this room" question
+    /// outside the contract (member lists, counts, pickers, "is X a
+    /// member" checks).
+    ///
+    /// Since freenet/river#702, "removed by a ban" no longer always means
+    /// "absent from `members`": a tombstone (see [`BanResolution::retained`])
+    /// is present but enforced-banned, so reading `members` directly
+    /// overcounts.
+    pub fn active_members(
+        &self,
+        bans_v1: &BansV1,
+        member_info: &MemberInfoV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> Vec<&AuthorizedMember> {
+        let removed = self.banned_member_ids(bans_v1, member_info, parameters);
+        self.members
+            .iter()
+            .filter(|m| !removed.contains(&m.member.id()))
+            .collect()
     }
 
     /// Whether `banner` is currently authorized to ban `target` (#410).
@@ -540,7 +603,19 @@ impl MembersV1 {
     /// If the number of members exceeds the specified limit, remove the members with the longest invite chains
     /// until the limit is satisfied. When chain lengths are equal, remove the member with the highest MemberId
     /// for deterministic ordering (CRDT convergence requirement).
-    fn remove_excess_members(&mut self, parameters: &ChatRoomParametersV1, max_members: usize) {
+    ///
+    /// Ban issuers and their ancestors ([`Self::ban_issuers_and_ancestors`])
+    /// are trimmed only after every other member (freenet/river#702). A
+    /// mutual-ban tombstone that the cap evicted would take its ban's
+    /// verifiability with it, and the ban would decay. This is the same
+    /// protection the step-2 inactivity-prune exemption already gives a
+    /// banner, with the same bound: at most `max_user_bans` issuers.
+    fn remove_excess_members(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+        max_members: usize,
+        bans_v1: &BansV1,
+    ) {
         if self.members.len() <= max_members {
             return;
         }
@@ -558,8 +633,16 @@ impl MembersV1 {
             })
             .collect();
 
-        // Sort by chain length descending, then by MemberId descending for deterministic tie-breaking
-        chain_lengths.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        // Non-issuers first, then chain length descending, then MemberId
+        // descending for deterministic tie-breaking.
+        let protected = self.ban_issuers_and_ancestors(bans_v1, parameters);
+        chain_lengths.sort_by(|a, b| {
+            protected
+                .contains(&a.0)
+                .cmp(&protected.contains(&b.0))
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.0.cmp(&a.0))
+        });
 
         // Collect IDs to remove
         let excess = self.members.len() - max_members;
@@ -744,6 +827,30 @@ pub struct BanResolution {
     pub removed: HashSet<MemberId>,
     /// The members of mutual-ban cycles (a subset of `removed`).
     pub cyclic: HashSet<MemberId>,
+    /// Removed members who must nevertheless STAY in `members`, as
+    /// enforced-banned tombstones: every removed member who issued a ban that
+    /// takes effect (every cycle member, and the issuer of a ban that removes
+    /// its own issuer, such as banning one's own inviter), plus their removed
+    /// invite ancestors, which their chain needs to verify. A subset of
+    /// `removed`.
+    ///
+    /// For these members "removed" means "present in `members` but
+    /// enforced-banned" (freenet/river#702). The reason is verification: a
+    /// ban can only be checked against its issuer's key while the issuer's
+    /// `AuthorizedMember` is in `members`, because `MemberId` is a
+    /// non-cryptographic hash of the key and a ban carries no key. If such an
+    /// issuer left `members`, their ban would become unverifiable,
+    /// `post_apply_cleanup` step 5 would sweep it, and whoever it removed
+    /// could rejoin with no ban left against them. For a mutual ban that is
+    /// the counter-ban escape the rule forbids.
+    ///
+    /// A tombstone gets nothing that membership confers: it is in `removed`,
+    /// so its messages (including edits, deletions and reactions) are swept
+    /// at step 4b, its DMs at step 6, its invite subtree is removed with it,
+    /// and its bans outside its own cycle take no effect. It is exempt from
+    /// inactivity-prune (it issues a verifiable ban) and ranked last by the
+    /// `max_members` trim, so it cannot be evicted while its ban stands.
+    pub retained: HashSet<MemberId>,
 }
 
 /// Strongly connected components of `graph`, in reverse topological order
@@ -1460,11 +1567,11 @@ mod tests {
         };
 
         // Test case 1: No excess members
-        members.remove_excess_members(&parameters, 3);
+        members.remove_excess_members(&parameters, 3, &BansV1::default());
         assert_eq!(members.members.len(), 3);
 
         // Test case 2: One excess member
-        members.remove_excess_members(&parameters, 2);
+        members.remove_excess_members(&parameters, 2, &BansV1::default());
         assert_eq!(members.members.len(), 2);
         assert!(members
             .members
@@ -1664,14 +1771,14 @@ mod tests {
         };
 
         // Test with max_members set to 0
-        members.remove_excess_members(&parameters, 0);
+        members.remove_excess_members(&parameters, 0, &BansV1::default());
         assert_eq!(members.members.len(), 0);
 
         // Reset members
         members.members = vec![authorized_member1.clone(), authorized_member2.clone()];
 
         // Test with max_members greater than current number of members
-        members.remove_excess_members(&parameters, 3);
+        members.remove_excess_members(&parameters, 3, &BansV1::default());
         assert_eq!(members.members.len(), 2);
     }
 
