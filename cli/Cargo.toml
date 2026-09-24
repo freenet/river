@@ -86,7 +86,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Configuration
 toml = "0.8"
-directories = "5.0"
+directories = "6.0"
 
 # Advisory file locking — serializes concurrent riverctl invocations'
 # load→mutate→save sequences against rooms.json / outbound_dms.json so a
