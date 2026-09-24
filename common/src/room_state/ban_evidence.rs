@@ -48,6 +48,11 @@ pub struct BanEvidenceV1 {
 }
 
 impl BanEvidenceV1 {
+    /// No records: the field is then left out of the serialized state.
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
     /// Every record ban resolution may read: `members`, then each evidence
     /// record whose inviter is the owner or is itself in the map. A record
     /// whose chain no longer reaches the owner (an ancestor was lost, for

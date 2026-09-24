@@ -1910,3 +1910,22 @@ fn ban_evidence_records_must_verify() {
         "forged record skipped"
     );
 }
+
+/// A state with no ban evidence serializes exactly as it did before the
+/// field existed, so an old stored state re-serialized by the new contract is
+/// byte-identical (fdev verify-merge `state_idempotence` on the real corpus).
+#[test]
+fn empty_ban_evidence_is_not_serialized() {
+    let room = Room::new();
+    let t = room.person();
+    let s = room.state(&[&t], vec![], vec![room.msg(&t, 1)]);
+    assert!(s.ban_evidence.members.is_empty());
+    let bytes = ser(&s);
+    let needle = b"ban_evidence";
+    assert!(
+        !bytes.windows(needle.len()).any(|w| w == needle),
+        "an empty evidence field must not appear in the bytes"
+    );
+    let back: ChatRoomStateV1 = ciborium::de::from_reader(&bytes[..]).unwrap();
+    assert_eq!(ser(&back), bytes);
+}

@@ -60,8 +60,12 @@ pub struct ChatRoomStateV1 {
     /// membership: see [`BanEvidenceV1`]. Must come after `members` (its
     /// apply reads the updated member set) and before `member_info` (whose
     /// records for evidenced members it keeps valid). `#[serde(default)]`
-    /// keeps states written before this field backwards-compatible.
-    #[serde(default)]
+    /// keeps states written before this field backwards-compatible, and an
+    /// empty field is not serialized at all, so a state without evidence
+    /// keeps the exact bytes it had before this field existed: an old state
+    /// re-serialized by the new contract is byte-identical, and merging it
+    /// with itself does not rewrite it (merge-law `state_idempotence`).
+    #[serde(default, skip_serializing_if = "BanEvidenceV1::is_empty")]
     pub ban_evidence: BanEvidenceV1,
 
     /// Metadata about members like their nickname, can be updated by members themselves.
