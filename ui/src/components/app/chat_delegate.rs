@@ -3283,10 +3283,10 @@ mod tests {
     /// them.
     ///
     /// Updated for V32 (the freenet/river#423 release, PR #702). This time the
-    /// fix itself moves the delegate: chat-delegate links river-core's
-    /// `ChatRoomStateV1` merge, and `post_apply_cleanup`'s ban resolution
-    /// changed. The `river-core` 0.1.21 -> 0.1.22 bump, mandatory for the same
-    /// reason as V30 and V31, would move it regardless.
+    /// fix itself moves the delegate: at the same `river-core` 0.1.22, before
+    /// the fix, it built as `91d5fa8e…` (chat-delegate links river-core
+    /// room-state code). The `river-core` 0.1.21 -> 0.1.22 bump, mandatory for
+    /// the same reason as V30 and V31, would move it regardless.
     #[test]
     fn legacy_set_fingerprint_is_stable_across_codegen_changes() {
         assert_eq!(legacy_set_fingerprint(), "10f72d68c4c4ad91");
