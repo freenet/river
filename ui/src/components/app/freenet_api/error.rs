@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use freenet_stdlib::client_api;
+use freenet_stdlib::client_api::{ClientError, DelegateError, ErrorKind, RequestError};
+use freenet_stdlib::prelude::DelegateKey;
 use thiserror::Error;
 
 /// Error types for the Freenet synchronizer
@@ -8,6 +10,13 @@ use thiserror::Error;
 pub enum SynchronizerError {
     #[error("WebSocket connection error: {0}")]
     WebSocketError(String),
+
+    /// The node's typed `DelegateError::Missing` for `key`. Kept structured so
+    /// the legacy-migration seal can tell WHICH delegate is missing
+    /// (freenet/river#707). Displays exactly like the `WebSocketError` it used
+    /// to be mapped to.
+    #[error("WebSocket connection error: {message}")]
+    DelegateMissing { key: DelegateKey, message: String },
 
     #[error("WebSocket operation not supported: {0}")]
     WebSocketNotSupported(String),
@@ -67,5 +76,28 @@ impl From<&str> for SynchronizerError {
 impl From<client_api::Error> for SynchronizerError {
     fn from(error: client_api::Error) -> Self {
         SynchronizerError::ClientApiError(error.to_string())
+    }
+}
+
+impl SynchronizerError {
+    /// Map an error the node sent in answer to a request.
+    pub fn from_api_error(error: &ClientError) -> Self {
+        match error.kind() {
+            ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(key))) => {
+                SynchronizerError::DelegateMissing {
+                    key: key.clone(),
+                    message: error.to_string(),
+                }
+            }
+            _ => SynchronizerError::WebSocketError(error.to_string()),
+        }
+    }
+
+    /// The delegate a typed `DelegateError::Missing` names, if this is one.
+    pub fn missing_delegate_key(&self) -> Option<&DelegateKey> {
+        match self {
+            SynchronizerError::DelegateMissing { key, .. } => Some(key),
+            _ => None,
+        }
     }
 }

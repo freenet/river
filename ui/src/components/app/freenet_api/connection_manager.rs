@@ -163,7 +163,7 @@ mod imp {
                     let mapped_result: Result<
                         freenet_stdlib::client_api::HostResponse,
                         SynchronizerError,
-                    > = result.map_err(|e| SynchronizerError::WebSocketError(e.to_string()));
+                    > = result.map_err(|e| SynchronizerError::from_api_error(&e));
                     let tx = message_tx_clone.clone();
                     spawn_local(async move {
                         if let Err(e) = tx.unbounded_send(

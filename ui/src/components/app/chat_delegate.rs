@@ -622,6 +622,11 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
 
     let delegate = create_chat_delegate_container();
 
+    // freenet/river#709: arm the ack slot BEFORE sending, so the node's reply
+    // cannot arrive ahead of the waiter. Re-arming here also cancels a waiter
+    // left by a previous pass (reconnect/wake/Retry).
+    let register_ack = arm_register_ack(CHAT_DELEGATE_KEY.clone());
+
     // Get a write lock on the API and use it directly
     let api_result = {
         let mut web_api = WEB_API.write();
@@ -642,13 +647,18 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
 
     match api_result {
         Ok(_) => {
-            info!("Chat delegate registered successfully");
-            // NOTE: We don't await load_rooms_from_delegate() here because it would
-            // deadlock - it waits for a response that comes through the same message
-            // loop that called us. Instead, we fire off the request and let the
-            // response be handled by the response_handler through the message loop.
+            info!("RegisterDelegate sent; waiting for the node's reply before loading rooms");
+            // freenet/river#709: `WebApi::send` resolves once the bytes are on
+            // the socket, not when the node has registered the delegate. On the
+            // first load after a delegate re-key the node has never seen this
+            // delegate, and it can run the ListRequest / outbound-DM GetRequest
+            // BEFORE the RegisterDelegate queued ahead of them: both get an
+            // empty reply (or, since freenet-core#5729, `missing delegate`),
+            // the load never starts, and the user sees no rooms until a reload.
+            // So the two requests wait for the node's reply to the register.
             //
-            // The response handler will process GetResponse and populate ROOMS.
+            // The wait runs in its own task: the reply arrives through the same
+            // message loop that called us, so awaiting it here would deadlock.
             //
             // Legacy migration is NOT fired here. It is gated on the current
             // delegate's response: if the current delegate has data, migration is
@@ -657,12 +667,37 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             // current delegate and clobbering newer state (freenet/river#253).
             // The fresh-attempt bookkeeping (SAW_FETCH_FAILURE reset, Loading
             // state, hard-max arming) already ran in `begin_load_attempt()` above.
-            fire_list_rooms_request().await;
-            fire_load_outbound_dms_request().await;
+            crate::util::safe_spawn_local(async move {
+                let timeout =
+                    crate::util::sleep(std::time::Duration::from_millis(REGISTER_ACK_TIMEOUT_MS));
+                match wait_for_register_ack(register_ack, timeout).await {
+                    RegisterAckWait::Acked => {
+                        info!("Chat delegate registered successfully");
+                    }
+                    RegisterAckWait::TimedOut => {
+                        // No reply in time. Load anyway: this is what every
+                        // load did before #709, and a stuck rail is worse.
+                        warn!(
+                            "No reply to RegisterDelegate after {}ms; loading rooms anyway",
+                            REGISTER_ACK_TIMEOUT_MS
+                        );
+                    }
+                    RegisterAckWait::Superseded => {
+                        // A later setup pass re-armed the slot and owns the load.
+                        return;
+                    }
+                }
+                if !load_attempt_is_current(attempt) {
+                    return;
+                }
+                fire_list_rooms_request().await;
+                fire_load_outbound_dms_request().await;
+            });
 
             Ok(())
         }
         Err(e) => {
+            disarm_register_ack();
             // freenet/river#397 Codex review 8/11: RegisterDelegate failed — a
             // definitive setup failure, and this Err path returns before any load
             // worker runs. Resolve directly to `LoadFailed` (if still current +
@@ -671,6 +706,106 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             resolve_load_failed_if_empty(attempt);
             Err(format!("Failed to register chat delegate: {}", e))
         }
+    }
+}
+
+/// How long the room load waits for the node's reply to `RegisterDelegate`
+/// before loading anyway (freenet/river#709). A register normally completes in
+/// 10-20 ms; the budget covers a cold WASM compile on a slow or busy node. It is
+/// well under [`LOAD_HARD_MAX_MS`], so a lost reply still leaves time for the
+/// load itself.
+const REGISTER_ACK_TIMEOUT_MS: u64 = 15_000;
+
+/// The one outstanding wait for the node's reply to our `RegisterDelegate`
+/// (freenet/river#709).
+///
+/// The client API has no request ids. The node answers a successful register
+/// with `DelegateResponse { key, values: [] }` for the registered key, and the
+/// room load sends nothing else to the current delegate until that reply
+/// arrives, so the first empty response for the armed key is the register's.
+#[derive(Default)]
+pub(crate) struct RegisterAckSlot {
+    pending: Option<(DelegateKey, oneshot::Sender<()>)>,
+}
+
+impl RegisterAckSlot {
+    /// Arm a wait for `key`'s register reply. Replaces (and so cancels) any
+    /// earlier wait.
+    pub(crate) fn arm(&mut self, key: DelegateKey) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.pending = Some((key, tx));
+        rx
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.pending = None;
+    }
+
+    /// Feed a `DelegateResponse`. Returns true when it completed the armed
+    /// wait: an empty response for the armed key.
+    pub(crate) fn on_delegate_response(&mut self, key: &DelegateKey, values_len: usize) -> bool {
+        if values_len != 0 {
+            return false;
+        }
+        match self.pending.take() {
+            Some((armed, tx)) if armed.bytes() == key.bytes() => {
+                let _ = tx.send(());
+                true
+            }
+            other => {
+                self.pending = other;
+                false
+            }
+        }
+    }
+}
+
+static REGISTER_ACK: LazyLock<Mutex<RegisterAckSlot>> =
+    LazyLock::new(|| Mutex::new(RegisterAckSlot::default()));
+
+fn arm_register_ack(key: DelegateKey) -> oneshot::Receiver<()> {
+    REGISTER_ACK.lock().unwrap().arm(key)
+}
+
+fn disarm_register_ack() {
+    REGISTER_ACK.lock().unwrap().disarm();
+}
+
+/// Called by the response handler for every `DelegateResponse`, so a pending
+/// register wait can complete (freenet/river#709).
+pub(crate) fn note_delegate_response_for_register_ack(key: &DelegateKey, values_len: usize) {
+    if REGISTER_ACK
+        .lock()
+        .unwrap()
+        .on_delegate_response(key, values_len)
+    {
+        debug!("RegisterDelegate reply received");
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RegisterAckWait {
+    /// The node replied to the register.
+    Acked,
+    /// No reply within the timeout.
+    TimedOut,
+    /// A later setup pass re-armed (or disarmed) the slot.
+    Superseded,
+}
+
+/// Wait for the armed register reply, or `timeout`, whichever comes first.
+pub(crate) async fn wait_for_register_ack<T>(
+    ack: oneshot::Receiver<()>,
+    timeout: T,
+) -> RegisterAckWait
+where
+    T: std::future::Future<Output = ()>,
+{
+    let timeout = Box::pin(timeout);
+    match select(ack, timeout).await {
+        Either::Left((Ok(()), _)) => RegisterAckWait::Acked,
+        Either::Left((Err(oneshot::Canceled), _)) => RegisterAckWait::Superseded,
+        Either::Right(_) => RegisterAckWait::TimedOut,
     }
 }
 
@@ -734,6 +869,144 @@ pub(crate) fn reset_ensure_subscription_dedup() {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    fn register_test_key(b: u8) -> DelegateKey {
+        DelegateKey::new([b; 32], CodeHash::new([b.wrapping_add(1); 32]))
+    }
+
+    /// freenet/river#709: only an EMPTY `DelegateResponse` for the ARMED key
+    /// completes the register wait. A reply carrying values is a real delegate
+    /// response, and another key's reply belongs to someone else.
+    #[test]
+    fn register_ack_completes_only_on_empty_reply_for_armed_key() {
+        let key = register_test_key(0x11);
+        let other = register_test_key(0x22);
+        let mut slot = RegisterAckSlot::default();
+        let mut ack = slot.arm(key.clone());
+
+        assert!(!slot.on_delegate_response(&other, 0), "another key's reply");
+        assert!(!slot.on_delegate_response(&key, 1), "a reply with values");
+        assert_eq!(ack.try_recv(), Ok(None), "still waiting");
+
+        assert!(slot.on_delegate_response(&key, 0));
+        assert_eq!(ack.try_recv(), Ok(Some(())));
+        assert!(
+            !slot.on_delegate_response(&key, 0),
+            "one ack per arm: a second empty reply completes nothing"
+        );
+    }
+
+    /// freenet/river#709: the room load must not start before the node has
+    /// answered the register. Drives `wait_for_register_ack` the way
+    /// `set_up_chat_delegate` does and checks the load stays parked until the
+    /// ack arrives.
+    #[test]
+    fn room_load_waits_for_register_reply() {
+        use futures::executor::LocalPool;
+        use futures::task::LocalSpawnExt;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let key = register_test_key(0x33);
+        let mut slot = RegisterAckSlot::default();
+        let ack = slot.arm(key.clone());
+        let loaded = Rc::new(Cell::new(false));
+
+        let mut pool = LocalPool::new();
+        let loaded_in_task = loaded.clone();
+        pool.spawner()
+            .spawn_local(async move {
+                let outcome = wait_for_register_ack(ack, futures::future::pending()).await;
+                assert_eq!(outcome, RegisterAckWait::Acked);
+                loaded_in_task.set(true);
+            })
+            .unwrap();
+
+        pool.run_until_stalled();
+        assert!(
+            !loaded.get(),
+            "the list request must not go out before the register reply"
+        );
+
+        assert!(slot.on_delegate_response(&key, 0));
+        pool.run_until_stalled();
+        assert!(loaded.get(), "the register reply must release the load");
+    }
+
+    /// A later setup pass re-arms the slot; the earlier waiter must stand down
+    /// rather than fire a second load. A missing reply falls back to loading.
+    #[test]
+    fn register_wait_is_superseded_by_rearm_and_bounded_by_timeout() {
+        let key = register_test_key(0x44);
+        let mut slot = RegisterAckSlot::default();
+        let first = slot.arm(key.clone());
+        let _second = slot.arm(key.clone());
+        assert_eq!(
+            futures::executor::block_on(wait_for_register_ack(first, futures::future::pending())),
+            RegisterAckWait::Superseded
+        );
+
+        let third = slot.arm(key);
+        assert_eq!(
+            futures::executor::block_on(wait_for_register_ack(third, futures::future::ready(()))),
+            RegisterAckWait::TimedOut
+        );
+    }
+
+    /// freenet/river#709 wiring: in `set_up_chat_delegate` the list and
+    /// outbound-DM requests are sent only after `wait_for_register_ack`, the
+    /// slot is armed before the register is sent, and the response handler
+    /// feeds every `DelegateResponse` to the slot.
+    #[test]
+    fn set_up_chat_delegate_lists_rooms_only_after_register_reply() {
+        let src = include_str!("chat_delegate.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("production code before `mod tests`");
+        let start = production
+            .find("pub async fn set_up_chat_delegate()")
+            .expect("set_up_chat_delegate must exist");
+        let end = production[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .expect("set_up_chat_delegate must end");
+        let body = &production[start..end];
+
+        let arm = body
+            .find("arm_register_ack(")
+            .expect("the ack slot must be armed");
+        let send = body
+            .find("DelegateRequest::RegisterDelegate")
+            .expect("the delegate must be registered");
+        assert!(arm < send, "arm the ack slot BEFORE sending the register");
+
+        let wait = body
+            .find("wait_for_register_ack(")
+            .expect("the load must wait for the register reply");
+        for call in [
+            "fire_list_rooms_request().await",
+            "fire_load_outbound_dms_request().await",
+        ] {
+            let positions: Vec<usize> = body.match_indices(call).map(|(i, _)| i).collect();
+            assert_eq!(positions.len(), 1, "exactly one `{call}`");
+            assert!(
+                positions[0] > wait,
+                "`{call}` must come after wait_for_register_ack (freenet/river#709)"
+            );
+        }
+
+        let rh = include_str!("freenet_api/response_handler.rs");
+        let rh_production = rh.split("mod tests {").next().unwrap();
+        let arm_start = rh_production
+            .find("HostResponse::DelegateResponse { key, values } => {")
+            .expect("DelegateResponse arm must exist");
+        assert!(
+            rh_production[arm_start..arm_start + 400]
+                .contains("note_delegate_response_for_register_ack(&key, values.len())"),
+            "the response handler must feed every DelegateResponse to the register ack slot"
+        );
+    }
 
     /// freenet/river#590: leaving a room must record an AUTHORITATIVE tombstone
     /// rank, and rejoining must clear it.
