@@ -619,6 +619,7 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     // reconnect can advance the attempt mid-flight — gate the failure resolve on
     // still-current.
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    reset_outbound_dms_hydration_request();
 
     let delegate = create_chat_delegate_container();
 
@@ -675,11 +676,11 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
                         info!("Chat delegate registered successfully");
                     }
                     RegisterAckWait::Failed => {
-                        // The list would only fail the same way. Show Retry,
-                        // which re-registers.
-                        mark_fetch_failure_if_current(attempt);
-                        resolve_load_failed_if_empty(attempt);
-                        return;
+                        // Load anyway, as on a timeout: an earlier registration
+                        // may still serve the requests. If it does not, the
+                        // list's `missing delegate` reply resolves LoadFailed
+                        // (`on_current_delegate_missing`).
+                        warn!("RegisterDelegate was refused; loading rooms anyway");
                     }
                     RegisterAckWait::TimedOut => {
                         // No reply in time. Load anyway: this is what every
@@ -789,7 +790,10 @@ impl RegisterAckSlot {
     }
 
     /// Complete the armed wait for `key` with `registered`. Returns true when
-    /// a wait for that key was armed.
+    /// a wait for that key was armed. Matched by key only: a late reply or
+    /// error to an earlier pass's register on the same socket completes the
+    /// current wait. A late ack is harmless (the delegate is registered); a late
+    /// error only makes the load start early, as on a timeout.
     fn complete(&mut self, key: &DelegateKey, registered: bool) -> bool {
         match self.pending.take() {
             Some((_, armed, tx)) if armed.bytes() == key.bytes() => {
@@ -1148,11 +1152,11 @@ mod tests {
     #[test]
     fn strip_line_comments_drops_commented_code_only() {
         let src =
-            "a();\n// b();\nc(); // d();\nlet u = \"http://x\"; e();\nlet q = '\"'; f(); // g();";
+            "a();\n// b();\nc(); // d();\nlet u = \"http://x\"; e();\nlet q = '\"'; f(); // g();\nlet r = '\\\"'; h(); // k();";
         let out = crate::util::strip_line_comments(src);
         assert!(out.contains("a();") && out.contains("c();") && out.contains("e();"));
         assert!(!out.contains("b();") && !out.contains("d();") && !out.contains("g();"));
-        assert!(out.contains("f();"));
+        assert!(out.contains("f();") && out.contains("h();") && !out.contains("k();"));
         assert!(out.contains("http://x"));
     }
 
@@ -1213,8 +1217,7 @@ mod tests {
         assert!(arm < send, "arm the ack slot BEFORE sending the register");
 
         // The fire calls must sit inside the spawned waiter, after the wait,
-        // after the Superseded and Failed arms return, and behind the attempt
-        // gate.
+        // after the Superseded arm returns, and behind the attempt gate.
         let spawn = body
             .find("crate::util::safe_spawn_local(async move {")
             .expect("the load must run in a spawned waiter");
@@ -1228,24 +1231,18 @@ mod tests {
         let wait = waiter
             .find("wait_for_register_ack(")
             .expect("the load must wait for the register reply");
-        let mut after_arms = wait;
-        for arm in [
-            "RegisterAckWait::Superseded => {",
-            "RegisterAckWait::Failed => {",
-        ] {
-            let at = waiter
-                .find(arm)
-                .unwrap_or_else(|| panic!("`{arm}` must be handled"));
-            let arm_body = waiter.get(at + arm.len()..).unwrap();
-            let arm_body = arm_body
-                .get(..arm_body.find('}').expect("the arm must close"))
-                .unwrap();
-            assert!(
-                arm_body.contains("return;"),
-                "`{arm}` must return without loading"
-            );
-            after_arms = after_arms.max(at);
-        }
+        let superseded_arm = "RegisterAckWait::Superseded => {";
+        let superseded = waiter
+            .find(superseded_arm)
+            .expect("a superseded waiter must be handled");
+        let arm_body = waiter.get(superseded + superseded_arm.len()..).unwrap();
+        let arm_body = arm_body
+            .get(..arm_body.find('}').expect("the Superseded arm must close"))
+            .unwrap();
+        assert!(
+            arm_body.contains("return;"),
+            "a superseded waiter must return without loading"
+        );
         let gate = waiter
             .find("if !load_attempt_is_current(attempt) {")
             .expect("the load must be gated on the attempt still being current");
@@ -1258,8 +1255,8 @@ mod tests {
                 .find(call)
                 .unwrap_or_else(|| panic!("`{call}` must be inside the spawned waiter"));
             assert!(
-                at > wait && at > after_arms && at > gate,
-                "`{call}` must come after the wait, the returning arms and the attempt gate"
+                at > wait && at > superseded && at > gate,
+                "`{call}` must come after the wait, the Superseded return and the attempt gate"
             );
         }
         let err_arm = body
@@ -4520,7 +4517,7 @@ mod tests {
     #[test]
     fn await_flag_with_bound_returns_immediately_when_already_set() {
         static FLAG: AtomicBool = AtomicBool::new(true);
-        static REQUESTED: AtomicBool = AtomicBool::new(true);
+        static REQUESTED: AtomicU32 = AtomicU32::new(1);
         let start = std::time::Instant::now();
         futures::executor::block_on(await_flag_with_bound(
             &FLAG,
@@ -4544,7 +4541,7 @@ mod tests {
         static FLAG: AtomicBool = AtomicBool::new(false);
         FLAG.store(false, Ordering::SeqCst);
         let start = std::time::Instant::now();
-        static REQUESTED: AtomicBool = AtomicBool::new(true);
+        static REQUESTED: AtomicU32 = AtomicU32::new(1);
         let waiter =
             await_flag_with_bound(&FLAG, &REQUESTED, std::time::Duration::from_millis(20), 100);
         let flipper = async {
@@ -4565,7 +4562,7 @@ mod tests {
     fn await_flag_with_bound_gives_up_after_max_polls_when_never_set() {
         static FLAG: AtomicBool = AtomicBool::new(false);
         FLAG.store(false, Ordering::SeqCst);
-        static REQUESTED: AtomicBool = AtomicBool::new(true);
+        static REQUESTED: AtomicU32 = AtomicU32::new(1);
         // Small bound so the test itself stays fast; the production bound
         // (300 * 50ms = 15s) is a separate, deliberate constant.
         futures::executor::block_on(await_flag_with_bound(
@@ -4590,10 +4587,10 @@ mod tests {
     fn await_flag_with_bound_does_not_expire_before_the_request_is_sent() {
         use std::cell::Cell;
         static FLAG: AtomicBool = AtomicBool::new(false);
-        static REQUESTED: AtomicBool = AtomicBool::new(false);
+        static REQUEST: AtomicU32 = AtomicU32::new(0);
         let done = Cell::new(false);
         let waiter = async {
-            await_flag_with_bound(&FLAG, &REQUESTED, std::time::Duration::from_millis(1), 3).await;
+            await_flag_with_bound(&FLAG, &REQUEST, std::time::Duration::from_millis(1), 3).await;
             done.set(true);
         };
         let driver = async {
@@ -4603,11 +4600,46 @@ mod tests {
                 !done.get(),
                 "the wait gave up before the hydration request was sent"
             );
-            REQUESTED.store(true, Ordering::SeqCst);
+            REQUEST.store(1, Ordering::SeqCst);
         };
         futures::executor::block_on(futures::future::join(waiter, driver));
         assert!(done.get(), "once requested, the bound applies again");
         assert!(!FLAG.load(Ordering::SeqCst));
+    }
+
+    /// A request sent on a connection that then dropped must not use up the
+    /// bound while the next setup pass waits for its register reply: the pass
+    /// resets the request to 0, and a new request restarts the count.
+    #[test]
+    fn await_flag_with_bound_restarts_for_a_new_request() {
+        use std::cell::Cell;
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static REQUEST: AtomicU32 = AtomicU32::new(1);
+        let done = Cell::new(false);
+        // Budget: 12 polls of at least 5 ms each, so at least 60 ms of timed
+        // waiting per request.
+        let waiter = async {
+            await_flag_with_bound(&FLAG, &REQUEST, std::time::Duration::from_millis(5), 12).await;
+            done.set(true);
+        };
+        let driver = async {
+            // Request 1 uses most of its budget, then a reconnect's setup pass
+            // resets it before sending request 2.
+            crate::util::sleep(std::time::Duration::from_millis(45)).await;
+            REQUEST.store(0, Ordering::SeqCst);
+            crate::util::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!done.get(), "no bound may run while no request is out");
+            REQUEST.store(2, Ordering::SeqCst);
+            // Under 60 ms into request 2: only a count carried over from
+            // request 1 could have finished the wait by now.
+            crate::util::sleep(std::time::Duration::from_millis(40)).await;
+            assert!(
+                !done.get(),
+                "request 2 must get the full budget, not what request 1 left"
+            );
+        };
+        futures::executor::block_on(futures::future::join(waiter, driver));
+        assert!(done.get());
     }
 
     /// The DM `GetRequest` sender is what starts the bound.
@@ -4618,16 +4650,27 @@ mod tests {
         let ok_arm = body
             .find("Ok(_) => {")
             .expect("the send's Ok arm must exist");
+        let err_arm = body
+            .find("Err(e) =>")
+            .expect("the send's Err arm must exist");
         assert!(
-            body.get(ok_arm..)
+            body.get(ok_arm..err_arm)
                 .unwrap()
-                .contains("OUTBOUND_DMS_HYDRATION_REQUESTED.store(true"),
+                .contains("note_outbound_dms_hydration_requested();"),
             "a sent DM GetRequest must start the hydration bound"
         );
         assert!(
             fn_body(&production, "async fn await_outbound_dms_hydration() {")
-                .contains("&OUTBOUND_DMS_HYDRATION_REQUESTED"),
+                .contains("&OUTBOUND_DMS_HYDRATION_REQUEST,"),
             "the save's hydration wait must count its bound from the request"
+        );
+        let setup = fn_body(&production, "pub async fn set_up_chat_delegate()");
+        assert!(
+            setup
+                .find("reset_outbound_dms_hydration_request();")
+                .unwrap()
+                < setup.find("DelegateRequest::RegisterDelegate").unwrap(),
+            "each setup pass must stop timing an earlier pass's DM request"
         );
     }
 
@@ -7288,7 +7331,7 @@ async fn fire_load_outbound_dms_request() {
 
     match api_result {
         Ok(_) => {
-            OUTBOUND_DMS_HYDRATION_REQUESTED.store(true, Ordering::Release);
+            note_outbound_dms_hydration_requested();
             info!("Outbound-DMs load request sent")
         }
         Err(e) => error!("Failed to send outbound-DMs load request: {}", e),
@@ -8040,13 +8083,39 @@ static OUTBOUND_DMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 /// every archive/plaintext entry the in-memory signals don't know about yet).
 static OUTBOUND_DMS_HYDRATED: AtomicBool = AtomicBool::new(false);
 
-/// Set once the CURRENT delegate's outbound-DM `GetRequest` has been sent.
-/// The hydration wait's bound only runs from this point (see
-/// [`await_flag_with_bound`]). Since freenet/river#709 that request waits for
-/// the register reply (up to [`REGISTER_ACK_TIMEOUT_MS`]), so a bound that
-/// started at save time could expire before the request was even sent, and the
-/// save would then overwrite the stored blob with a truncated one.
-static OUTBOUND_DMS_HYDRATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Which outbound-DM `GetRequest` to the CURRENT delegate the hydration wait
+/// is timing: 0 while none has been sent in the current setup pass, otherwise a
+/// number that changes with every send. The hydration wait's bound only runs
+/// while this is non-zero, and restarts whenever it changes (see
+/// [`await_flag_with_bound`]).
+///
+/// Since freenet/river#709 the request waits for the register reply (up to
+/// [`REGISTER_ACK_TIMEOUT_MS`]), so a bound that started at save time could
+/// expire before the request was even sent, and the save would then overwrite
+/// the stored blob with a truncated one. For the same reason a setup pass that
+/// starts before hydration resets this to 0: a request sent on an earlier,
+/// dropped connection may never be answered, and its bound must not run down
+/// while the new pass waits for its register reply.
+static OUTBOUND_DMS_HYDRATION_REQUEST: AtomicU32 = AtomicU32::new(0);
+static OUTBOUND_DMS_HYDRATION_REQUEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// A setup pass is starting: stop timing any earlier pass's DM request.
+fn reset_outbound_dms_hydration_request() {
+    if !OUTBOUND_DMS_HYDRATED.load(Ordering::Acquire) {
+        OUTBOUND_DMS_HYDRATION_REQUEST.store(0, Ordering::Release);
+    }
+}
+
+/// The DM `GetRequest` was sent: start (or restart) the hydration bound.
+fn note_outbound_dms_hydration_requested() {
+    let mut id = OUTBOUND_DMS_HYDRATION_REQUEST_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    if id == 0 {
+        id = 1;
+    }
+    OUTBOUND_DMS_HYDRATION_REQUEST.store(id, Ordering::Release);
+}
 
 /// Mark the outbound-DM store hydrated from the CURRENT delegate
 /// (freenet/river#530).
@@ -8078,7 +8147,7 @@ pub(crate) fn mark_outbound_dms_hydrated() {
 #[cfg(test)]
 pub(crate) fn reset_outbound_dms_hydration_state_for_test() {
     OUTBOUND_DMS_HYDRATED.store(false, Ordering::SeqCst);
-    OUTBOUND_DMS_HYDRATION_REQUESTED.store(false, Ordering::SeqCst);
+    OUTBOUND_DMS_HYDRATION_REQUEST.store(0, Ordering::SeqCst);
 }
 
 /// Interval between hydration-latch polls in [`await_flag_with_bound`].
@@ -8091,7 +8160,7 @@ const OUTBOUND_DMS_HYDRATION_POLL_INTERVAL: std::time::Duration =
 /// [`await_delegate_response_outcome`]), so this is a generous margin for the
 /// rare case where the initial `GetResponse` is lost or badly delayed. The
 /// polls are counted from when the `GetRequest` was sent
-/// ([`OUTBOUND_DMS_HYDRATION_REQUESTED`]), not from when the save started.
+/// ([`OUTBOUND_DMS_HYDRATION_REQUEST`]), not from when the save started.
 /// Bounding it is what stops a lost response from turning into permanent
 /// silent data loss for the rest of the session (skeptical review on PR
 /// #670): without a bound, every subsequent archive/DM-send would await
@@ -8111,36 +8180,44 @@ const OUTBOUND_DMS_HYDRATION_POLL_INTERVAL: std::time::Duration =
 const OUTBOUND_DMS_HYDRATION_MAX_POLLS: u32 = 300;
 
 /// Poll `flag` every `interval` (yielding via [`crate::util::sleep`] between
-/// checks) until it is `true`, or until `max_polls` checks have elapsed SINCE
-/// `requested` became true, whichever comes first.
+/// checks) until it is `true`, or until `max_polls` checks have elapsed since
+/// `request` last changed to a non-zero value, whichever comes first.
 ///
-/// Polls taken before `requested` is set do not count: the bound exists for a
-/// response that was asked for and lost, and must not expire while the request
-/// has not been sent yet (freenet/river#709 moved that send behind the register
-/// reply). The pre-request wait is bounded in practice by the setup path, which
-/// sends the request within [`REGISTER_ACK_TIMEOUT_MS`] of every setup pass on
-/// a live connection; waiting longer only delays the save, while giving up
-/// early would overwrite the stored blob with a truncated one.
+/// Polls taken while `request` is 0 do not count, and a new request restarts
+/// the count: the bound exists for a response that was asked for and lost, and
+/// must not expire while the current request has not been sent yet
+/// (freenet/river#709 moved that send behind the register reply). Waiting
+/// longer only delays the save; giving up early would overwrite the stored blob
+/// with a truncated one. The wait before a request has no bound of its own: a
+/// setup pass sends the request once its register wait ends, unless the send
+/// fails or the pass is superseded, in which case the next pass (reconnect,
+/// wake or Retry) sends it.
 ///
 /// Extracted as a pure/generic helper (rather than inlined into
 /// [`save_outbound_dms_to_delegate`]) so it's unit-testable with small,
 /// fast intervals instead of the real 15s production bound.
 async fn await_flag_with_bound(
     flag: &AtomicBool,
-    requested: &AtomicBool,
+    request: &AtomicU32,
     interval: std::time::Duration,
     max_polls: u32,
 ) {
     if flag.load(Ordering::Acquire) {
         return;
     }
+    let mut timed_request = 0;
     let mut polls_since_request = 0;
     while polls_since_request < max_polls {
         crate::util::sleep(interval).await;
         if flag.load(Ordering::Acquire) {
             return;
         }
-        if requested.load(Ordering::Acquire) {
+        let current = request.load(Ordering::Acquire);
+        if current != timed_request {
+            timed_request = current;
+            polls_since_request = 0;
+        }
+        if current != 0 {
             polls_since_request += 1;
         }
     }
@@ -8157,7 +8234,7 @@ async fn await_flag_with_bound(
 async fn await_outbound_dms_hydration() {
     await_flag_with_bound(
         &OUTBOUND_DMS_HYDRATED,
-        &OUTBOUND_DMS_HYDRATION_REQUESTED,
+        &OUTBOUND_DMS_HYDRATION_REQUEST,
         OUTBOUND_DMS_HYDRATION_POLL_INTERVAL,
         OUTBOUND_DMS_HYDRATION_MAX_POLLS,
     )

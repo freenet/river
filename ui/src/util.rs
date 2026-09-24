@@ -565,6 +565,7 @@ pub(crate) fn strip_line_comments(src: &str) -> String {
                 match bytes[i] {
                     b'\\' if in_str => i += 1,
                     b'\'' if !in_str && bytes.get(i + 1..i + 3) == Some(b"\"'") => i += 2,
+                    b'\'' if !in_str && bytes.get(i + 1..i + 4) == Some(b"\\\"'") => i += 3,
                     b'"' => in_str = !in_str,
                     b'/' if !in_str && bytes[i + 1] == b'/' => return &line[..i],
                     _ => {}
