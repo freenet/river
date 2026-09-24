@@ -1865,3 +1865,48 @@ fn ban_evidence_travels_to_a_peer_that_never_saw_the_member() {
     let (agreed, _) = gossip_until_equal(&fresh, &resolved, &room.params, 4);
     assert_eq!(ser(&agreed), ser(&resolved));
 }
+
+/// Ban evidence is self-authorizing: a record whose invite signature does
+/// not verify is rejected by `verify` (a full-state PUT) and skipped by
+/// `apply_delta` (a merge), and a record for a current member is refused.
+#[test]
+fn ban_evidence_records_must_verify() {
+    use river_core::room_state::ban_evidence::BanEvidenceV1;
+    use river_core::room_state::member::AuthorizedMember;
+    let room = Room::new();
+    let (t, x) = (room.person(), room.person());
+    let s = room.state(&[&t], vec![], vec![room.msg(&t, 1)]);
+
+    let forged =
+        AuthorizedMember::with_signature(x.auth.member.clone(), Signature::from_bytes(&[3u8; 64]));
+    let mut bad = s.clone();
+    bad.ban_evidence = BanEvidenceV1 {
+        members: vec![forged.clone()],
+    };
+    assert!(
+        bad.verify(&bad, &room.params).is_err(),
+        "forged evidence rejected"
+    );
+
+    let mut present = s.clone();
+    present.ban_evidence = BanEvidenceV1 {
+        members: vec![t.auth.clone()],
+    };
+    assert!(
+        present.verify(&present, &room.params).is_err(),
+        "a current member is not evidence"
+    );
+
+    let after = apply_checked(
+        &s,
+        ChatRoomStateV1Delta {
+            ban_evidence: Some(vec![forged]),
+            ..Default::default()
+        },
+        &room.params,
+    );
+    assert!(
+        after.ban_evidence.members.is_empty(),
+        "forged record skipped"
+    );
+}
