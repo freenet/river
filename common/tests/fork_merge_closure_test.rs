@@ -519,31 +519,23 @@ fn honest_forks_always_converge() {
 /// they still fail on the pre-fix code, or pick new ones: `FORK_SEEDS=1000`
 /// against `a3e63c8c`'s `ban.rs` lists them.
 ///
-/// Silent divergence (every merge succeeds, the states differ) is reported
-/// but not asserted. With the apply-time orphaned-ban drop (#702 review
-/// rounds 1-3) it was 6 of 3006 pairs at `FORK_SEEDS=1000`: a member kept on
+/// Silent divergence (every merge succeeds, the states differ) must not
+/// happen either. With the apply-time orphaned-ban drop (#702 review rounds
+/// 1-3) it did, in 6 of 3006 pairs at `FORK_SEEDS=1000`: a member kept on
 /// one peer only by the banner prune exemption, dropped as orphaned on the
 /// other. Since bans are resolved from converged state
-/// (`MembersV1::resolve_bans`) and nothing is dropped at apply time, the
-/// same run finds 0. Tracked in freenet/river#703.
+/// (`MembersV1::resolve_bans`) and nothing is dropped at apply time, the same
+/// run finds 0.
 #[test]
 fn adversarial_forks_never_permanently_reject_each_other() {
     let mut seeds = default_seeds(seeds_from_env(3));
     seeds.extend([(40, 1), (60, 2), (83, 2), (201, 2), (252, 2), (292, 2)]);
     let (rejecting, silent) = endings(Mode::Adversarial, &seeds);
-    if !silent.is_empty() {
-        eprintln!(
-            "silent divergence (#703): {} of {} adversarial pairs:\n{}",
-            silent.len(),
-            seeds.len(),
-            silent.join("\n")
-        );
-    }
     assert!(
-        rejecting.is_empty(),
-        "{} of {} adversarial fork pairs PERMANENTLY REJECT each other (#423):\n{}",
-        rejecting.len(),
+        rejecting.is_empty() && silent.is_empty(),
+        "adversarial fork pairs that never converge, of {}:\nPERMANENTLY REJECTING (#423):\n{}\nsilently diverged:\n{}",
         seeds.len(),
-        rejecting.join("\n")
+        rejecting.join("\n"),
+        silent.join("\n")
     );
 }

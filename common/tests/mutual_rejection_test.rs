@@ -1136,11 +1136,14 @@ fn a_tombstone_cannot_escape_by_deputizing_its_partner() {
         member_info: Some(vec![AuthorizedMemberInfo::new(info, &a.sk)]),
         ..Default::default()
     };
-    let mut after = s.clone();
-    if after.apply_delta(&s, &room.params, &Some(delta)).is_err() {
-        after = s.clone();
-    }
-    after.verify(&after, &room.params).expect("verify");
+    // The record is signed by A and A is present, so the update applies: a
+    // tombstone can still publish `member_info`. It just cannot use it to
+    // escape.
+    let after = apply_checked(&s, delta, &room.params);
+    assert!(
+        after.member_info.deputies_of(a.id).contains(&b.id),
+        "the deputies record was stored"
+    );
     let active = active_ids(&after, &room.params);
     assert!(!active.contains(&a.id) && !active.contains(&b.id));
 }

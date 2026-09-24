@@ -152,17 +152,16 @@ impl ChatRoomStateV1 {
         //         evicted, so pass 2 prunes it — `cleanup(S) != cleanup(cleanup(S))`,
         //         which permanently diverges peers that run cleanup a different
         //         number of times.
-        //     Eviction drops INERT (currently-unauthorized) bans before
-        //     enforcing ones (#410 review round 1). This bounds an INERT flood
-        //     (forged / revoked-deputy bans, which `verify` accepts) — those are
-        //     evicted first, so a flood of them cannot push real moderator bans
-        //     out of the cap. It does NOT fully defend the un-ban DoS: an
-        //     ENFORCING-absent-target flood still evicts real bans, because a ban
-        //     by a current member of an ABSENT target classifies "enforcing"
-        //     WITHOUT any authorization check (`ban_is_enforcing` returns true for
-        //     a member-banner + absent target), and `banned_at` is an
-        //     attacker-signed, future-datable field — so a member can mint many
-        //     newest-dated "enforcing" bans that outrank and evict genuine ones.
+        //     Eviction drops bans that take no effect before those that do,
+        //     judged by `MembersV1::resolve_bans` over the uncapped set, one per
+        //     (issuer, target) (#410 review round 1, freenet/river#702). This
+        //     bounds a flood of forged, revoked-deputy or banned-issuer bans,
+        //     which `verify` accepts: those are evicted first, so they cannot
+        //     push real moderator bans out of the cap. It does NOT fully defend
+        //     the un-ban DoS: a CURRENT member's ban on an ABSENT target takes
+        //     effect, and `banned_at` is an attacker-signed, future-datable
+        //     field, so a member can mint many newest-dated effective bans that
+        //     outrank and evict genuine ones.
         //     The substantive fix (an authorization-aware / non-attacker-ordered
         //     cap) is deferred pending Ian's decision; tracked in
         //     freenet/river#413 (Limitation 2).
@@ -204,11 +203,12 @@ impl ChatRoomStateV1 {
 
         // 0. Enforce bans from the CONVERGED (now capped) state, deputy-aware (#410).
         //
-        // `MembersV1::apply_delta` already removed some members banned by the
-        // owner or an ancestor, but it ran BEFORE the sibling `member_info`
-        // field (which carries deputy grants) was applied, and it keeps every
-        // ban issuer and their ancestors so that this step can still verify
-        // their bans. This pass runs after every field has been applied, so
+        // `MembersV1::apply_delta` already removed the members an owner ban
+        // removes, which never affects the answer here (an owner-removed
+        // member has no ban authority). It ran BEFORE the sibling
+        // `member_info` field (which carries deputy grants) was applied, so it
+        // left every other ban to this step. This pass runs after every field
+        // has been applied, so
         // `self.member_info` is converged. `MembersV1::resolve_bans` decides
         // which bans take effect (a ban whose issuer is removed does not,
         // except the bans of a mutual-ban cycle, whose members are all
@@ -246,8 +246,8 @@ impl ChatRoomStateV1 {
              (freenet/river#675)"
         );
         // Tombstones (`BanResolution::retained`: removed members who issued
-        // a ban that takes effect, such as both parties of a mutual ban, plus
-        // their removed ancestors) stay in `members` so their bans remain
+        // a valid ban, such as both parties of a mutual ban, plus their
+        // removed ancestors) stay in `members` so their bans remain
         // verifiable. For them "removed" means "present but enforced-banned":
         // they are in `enforced_banned_ids`, so every step below treats them
         // as removed. See `BanResolution::retained` for why (#702).
