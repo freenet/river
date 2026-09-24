@@ -335,6 +335,28 @@ impl MembersV1 {
     /// Edges only point from an issuer to the members its ban would remove, so
     /// whether `I` is removed is settled before `I`'s own component is
     /// processed, and the result does not depend on ban order.
+    ///
+    /// # What "removed" means
+    ///
+    /// For most members, removed means absent from `members`. For a removed
+    /// member who issued a ban that takes effect (every member of a mutual-ban
+    /// cycle, or the issuer of a ban that removes its own issuer) it means
+    /// PRESENT in `members` but enforced-banned: a tombstone, see
+    /// [`BanResolution::retained`]. `MemberId` is not a key and a ban carries
+    /// none, so a ban can only be verified while its issuer's
+    /// `AuthorizedMember` is present. Outside the contract, ask
+    /// [`Self::active_members`], never `members` directly.
+    ///
+    /// # A consequence of the rule
+    ///
+    /// A mutual ban counts whenever its two halves were issued, and nothing
+    /// in converged state can tell a counter-ban from a later ban (`banned_at`
+    /// is signed by the issuer). So a tombstoned moderator who still holds
+    /// moderator authority can pull into a cycle, and so remove, anyone who
+    /// LATER bans them, even redundantly. The owner ends this by revoking
+    /// that moderator's grant: its bans lose authority and every cycle through
+    /// it dissolves. Pinned by
+    /// `a_tombstone_pulls_in_a_later_banner_until_its_grant_is_revoked`.
     pub fn resolve_bans(
         &self,
         bans_v1: &BansV1,

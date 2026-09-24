@@ -865,9 +865,13 @@ impl RoomData {
     /// ban — in which case it removes nobody. Consulting the raw ban list would
     /// keep such a target blocked in the UI and omit their secret on rotation,
     /// so the deputy design's retroactive un-ban would never take effect
-    /// client-side (freenet/river#411 round 6). Every ban-status consumer
-    /// (`can_send_message`, `can_participate`, `rotate_secret`) MUST use THIS
-    /// set rather than iterating `bans.0` directly.
+    /// client-side (freenet/river#411 round 6). No consumer may iterate
+    /// `bans.0` directly: membership questions go through
+    /// `ChatRoomStateV1::active_members` (present and not in this set, which
+    /// also excludes mutual-ban tombstones, freenet/river#702), and self's own
+    /// ban status through `is_self_enforced_banned`. Kept for the tests that
+    /// pin the enforced set directly.
+    #[cfg(test)]
     fn enforced_banned_member_ids(&self) -> std::collections::HashSet<MemberId> {
         self.room_state.members.banned_member_ids(
             &self.room_state.bans,
@@ -1600,16 +1604,15 @@ impl RoomData {
         // receive the rotated secret; otherwise a UI-revoked member would
         // silently lose access to a private room the contract still keeps them
         // in (freenet/river#411 round 6). See `enforced_banned_member_ids`.
-        let banned_members = self.enforced_banned_member_ids();
-
+        // `active_members` is exactly "present and not enforced-banned",
+        // which also excludes mutual-ban tombstones (freenet/river#702).
         let owner_id = MemberId::from(&self.owner_vk);
         let current_members_with_vks: Vec<(MemberId, ed25519_dalek::VerifyingKey)> = self
             .room_state
-            .members
-            .members
+            .active_members(&self.parameters())
             .iter()
             .map(|m| (MemberId::from(&m.member.member_vk), m.member.member_vk))
-            .filter(|(id, _)| !banned_members.contains(id) && *id != owner_id)
+            .filter(|(id, _)| *id != owner_id)
             .collect();
 
         if current_members_with_vks.is_empty() {
@@ -1672,11 +1675,12 @@ impl RoomData {
 
         let (room_secret, current_version) = self.get_secret()?;
 
-        // Get all current members
+        // Get all ACTIVE members. A mutual-ban tombstone is present in
+        // `members` but removed, and must never be issued the room secret
+        // (freenet/river#702).
         let member_ids: Vec<MemberId> = self
             .room_state
-            .members
-            .members
+            .active_members(&self.parameters())
             .iter()
             .map(|m| MemberId::from(&m.member.member_vk))
             .collect();

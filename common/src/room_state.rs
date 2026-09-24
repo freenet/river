@@ -15,7 +15,7 @@ pub mod version;
 use crate::room_state::ban::BansV1;
 use crate::room_state::configuration::AuthorizedConfigurationV1;
 use crate::room_state::direct_messages::DirectMessagesV1;
-use crate::room_state::member::{MemberId, MembersV1};
+use crate::room_state::member::{AuthorizedMember, MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::message::MessagesV1;
 use crate::room_state::secret::RoomSecretsV1;
@@ -80,6 +80,17 @@ pub struct ChatRoomStateV1 {
 }
 
 impl ChatRoomStateV1 {
+    /// The members who are IN the room: present and not enforced-banned. The
+    /// owner is implicit and not included. Shorthand for
+    /// [`MembersV1::active_members`] over this state's bans and deputy grants;
+    /// use it for every listing, count, picker and "is X a member" question.
+    /// Reading `members.members` directly also returns mutual-ban tombstones
+    /// (freenet/river#702), which are present but removed.
+    pub fn active_members(&self, parameters: &ChatRoomParametersV1) -> Vec<&AuthorizedMember> {
+        self.members
+            .active_members(&self.bans, &self.member_info, parameters)
+    }
+
     /// Post-apply cleanup: prune members who have no recent messages, clean up
     /// member_info for pruned members, remove orphaned bans, and sweep
     /// direct messages whose participants are no longer in the room.

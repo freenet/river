@@ -408,10 +408,12 @@ pub async fn send_structured_dm(
             let peer_vk = if peer == owner_id {
                 room
             } else {
+                // Active members only: a mutual-ban tombstone is present in
+                // `members` but removed, and a DM to it is swept
+                // (freenet/river#702).
                 match room_data
                     .room_state
-                    .members
-                    .members
+                    .active_members(&river_core::room_state::ChatRoomParametersV1 { owner: room })
                     .iter()
                     .find(|m| m.member.id() == peer)
                     .map(|m| m.member.member_vk)

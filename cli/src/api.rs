@@ -1268,10 +1268,13 @@ pub(crate) fn room_has_member_key(
     room_owner_key: &VerifyingKey,
     candidate: &VerifyingKey,
 ) -> bool {
+    // Active members only: a mutual-ban tombstone is present in `members`
+    // but is not in the room (freenet/river#702).
     candidate == room_owner_key
         || room_state
-            .members
-            .members
+            .active_members(&ChatRoomParametersV1 {
+                owner: *room_owner_key,
+            })
             .iter()
             .any(|m| m.member.member_vk == *candidate)
 }

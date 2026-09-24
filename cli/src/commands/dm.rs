@@ -262,12 +262,9 @@ async fn deliver_dm(
     // territory; see issue #110 for the related "pruned member" gap).
     // Sender membership is handled by the rejoin bundle below — Bug #1.
     let owner_id = MemberId::from(&room_owner_key);
-    let is_recipient_member = recipient_id == owner_id
-        || room_state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.id() == recipient_id);
+    // Active members only: a mutual-ban tombstone is present in `members` but
+    // is not in the room, and a DM to it is swept (freenet/river#702).
+    let is_recipient_member = room_has_member(&room_state, &room_owner_key, recipient_id);
     if !is_recipient_member {
         return Err(anyhow!("Recipient is not currently a member of the room."));
     }
@@ -423,13 +420,14 @@ async fn deliver_dm(
     Ok(())
 }
 
-/// Whether `member_id` is currently a member of `state` (the room owner always
-/// counts, even without an explicit `AuthorizedMember` entry).
-fn room_has_member(state: &ChatRoomStateV1, owner_id: MemberId, member_id: MemberId) -> bool {
-    member_id == owner_id
+/// Whether `member_id` is currently an ACTIVE member of `state` (the room
+/// owner always counts, even without an explicit `AuthorizedMember` entry). A
+/// mutual-ban tombstone is present in `members` but does not count
+/// (freenet/river#702).
+fn room_has_member(state: &ChatRoomStateV1, owner_vk: &VerifyingKey, member_id: MemberId) -> bool {
+    member_id == MemberId::from(owner_vk)
         || state
-            .members
-            .members
+            .active_members(&ChatRoomParametersV1 { owner: *owner_vk })
             .iter()
             .any(|m| m.member.id() == member_id)
 }
@@ -511,8 +509,7 @@ async fn execute_invite(
         )
     })?;
     let target_inviter_id = MemberId::from(&target_signing_key.verifying_key());
-    let target_owner_id = MemberId::from(&target_room_key);
-    if !room_has_member(&target_state, target_owner_id, target_inviter_id) {
+    if !room_has_member(&target_state, &target_room_key, target_inviter_id) {
         return Err(anyhow!(
             "Your identity is not a current member of the target room (--room), so an invitation \
              signed by it could not be accepted. Re-establish your membership there (send a \
@@ -1190,6 +1187,10 @@ fn resolve_recipient_vk(
     // error even though both matches resolve to the same destination
     // key (Skeptical-review #4 on pass 3).
     let owner_id = MemberId::from(room_owner_key);
+    // Recipients are ACTIVE members only (freenet/river#702).
+    let active = state.active_members(&ChatRoomParametersV1 {
+        owner: *room_owner_key,
+    });
 
     // Exact fast path: a full base58 verifying key (from `member list`) names one
     // recipient directly, so resolve it without the ambiguous prefix match.
@@ -1197,12 +1198,7 @@ fn resolve_recipient_vk(
         if target == owner_id {
             return Ok(*room_owner_key);
         }
-        if let Some(m) = state
-            .members
-            .members
-            .iter()
-            .find(|m| m.member.id() == target)
-        {
+        if let Some(m) = active.iter().find(|m| m.member.id() == target) {
             return Ok(m.member.member_vk);
         }
         return Err(anyhow!(
@@ -1211,9 +1207,7 @@ fn resolve_recipient_vk(
         ));
     }
 
-    let mut matches: Vec<(MemberId, VerifyingKey)> = state
-        .members
-        .members
+    let mut matches: Vec<(MemberId, VerifyingKey)> = active
         .iter()
         .filter(|m| m.member.id().to_string().starts_with(needle))
         .map(|m| (m.member.id(), m.member.member_vk))
@@ -2079,19 +2073,75 @@ mod tests {
         ));
 
         // Owner counts even without an explicit AuthorizedMember entry.
-        assert!(room_has_member(&state, owner_id, owner_id));
+        assert!(room_has_member(&state, &owner_vk, owner_id));
         // An enrolled member counts.
         assert!(room_has_member(
             &state,
-            owner_id,
+            &owner_vk,
             MemberId::from(&member.verifying_key())
         ));
         // A non-member does not.
         assert!(!room_has_member(
             &state,
-            owner_id,
+            &owner_vk,
             MemberId::from(&stranger.verifying_key())
         ));
+    }
+
+    /// A mutual-ban tombstone (freenet/river#702) stays in `members` but is
+    /// not an active member, so it is neither a DM recipient nor a valid
+    /// `dm invite` target signer.
+    #[test]
+    fn room_has_member_excludes_a_mutual_ban_tombstone() {
+        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+        let owner = key(1);
+        let (a, b) = (key(2), key(3));
+        let owner_vk = owner.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+        let mut state = ChatRoomStateV1::default();
+        for m in [&a, &b] {
+            state.members.members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    member_vk: m.verifying_key(),
+                    invited_by: owner_id,
+                },
+                &owner,
+            ));
+        }
+        let mut info = MemberInfo::new_public(owner_id, 1, "owner".into());
+        info.deputies = vec![
+            MemberId::from(&a.verifying_key()),
+            MemberId::from(&b.verifying_key()),
+        ];
+        state.member_info = MemberInfoV1 {
+            member_info: vec![AuthorizedMemberInfo::new(info, &owner)],
+        };
+        let ban = |by: &SigningKey, target: &SigningKey, secs: u64| {
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                    banned_user: MemberId::from(&target.verifying_key()),
+                },
+                MemberId::from(&by.verifying_key()),
+                by,
+            )
+        };
+        state.configuration.configuration.max_user_bans = 10;
+        state.bans = BansV1(vec![ban(&a, &b, 1), ban(&b, &a, 2)]);
+        state
+            .post_apply_cleanup(&ChatRoomParametersV1 { owner: owner_vk })
+            .unwrap();
+
+        let a_id = MemberId::from(&a.verifying_key());
+        assert!(
+            state.members.members.iter().any(|m| m.member.id() == a_id),
+            "A is a tombstone: still in `members`"
+        );
+        assert!(!room_has_member(&state, &owner_vk, a_id));
+        assert!(room_has_member(&state, &owner_vk, owner_id));
     }
 
     /// A blank / whitespace-only `--message` becomes `None` so the recipient's
