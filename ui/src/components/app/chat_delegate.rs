@@ -715,14 +715,30 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
 /// well under [`LOAD_HARD_MAX_MS`], so a lost reply still leaves time for the
 /// load itself.
 const REGISTER_ACK_TIMEOUT_MS: u64 = 15_000;
+const _: () = assert!(REGISTER_ACK_TIMEOUT_MS < LOAD_HARD_MAX_MS);
 
 /// The one outstanding wait for the node's reply to our `RegisterDelegate`
 /// (freenet/river#709).
 ///
-/// The client API has no request ids. The node answers a successful register
-/// with `DelegateResponse { key, values: [] }` for the registered key, and the
-/// room load sends nothing else to the current delegate until that reply
-/// arrives, so the first empty response for the armed key is the register's.
+/// The client API has no request ids, and the register's reply carries no
+/// payload to hold a correlation key, so the generic `PENDING_REQUESTS` waiter
+/// cannot be used. Instead: the node answers a successful register with
+/// `DelegateResponse { key, values: [] }` for the registered key, while every
+/// `ChatDelegateRequestMsg` handler in `delegates/chat-delegate` answers with
+/// exactly one `ApplicationMessage`. So an empty response for the armed key is
+/// the register's reply, with two known exceptions, both of which fall back to
+/// the pre-#709 race rather than to anything worse:
+///
+/// - a node that answers a request to a not-yet-registered delegate with an
+///   empty response (freenet 0.2.136 and earlier; freenet-core#5729 changed it
+///   to a typed `Missing`). Any other request to the current delegate that
+///   overtakes the register on the first load after a re-key (a user action in
+///   that window, or a request a timed-out earlier pass already sent) then
+///   reads as the ack.
+/// - a chat-delegate handler that one day answers with no messages.
+///
+/// Keys are compared by their 32 key bytes, the same identity the node and
+/// `is_legacy_delegate_key` use.
 #[derive(Default)]
 pub(crate) struct RegisterAckSlot {
     pending: Option<(DelegateKey, oneshot::Sender<()>)>,
@@ -781,6 +797,18 @@ pub(crate) fn note_delegate_response_for_register_ack(key: &DelegateKey, values_
     {
         debug!("RegisterDelegate reply received");
     }
+}
+
+/// The node reported the CURRENT chat delegate missing (freenet/river#707).
+/// This is not a legacy probe result, so it must not seal the migration. It
+/// does mean a request to the current delegate failed, most likely the room
+/// list after a failed or lost register, and no `ListResponse` will come to
+/// start the load. Record the failure and show Retry (which re-registers) if
+/// no rooms are showing, instead of waiting for the hard-max.
+pub(crate) fn on_current_delegate_missing() {
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    mark_fetch_failure_if_current(attempt);
+    resolve_load_failed_if_empty(attempt);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -981,18 +1009,41 @@ mod tests {
             .expect("the delegate must be registered");
         assert!(arm < send, "arm the ack slot BEFORE sending the register");
 
-        let wait = body
+        // The fire calls must sit inside the spawned waiter, after the wait,
+        // after the Superseded arm returns, and behind the attempt gate.
+        let spawn = body
+            .find("crate::util::safe_spawn_local(async move {")
+            .expect("the load must run in a spawned waiter");
+        let spawn_end = spawn
+            + body[spawn..]
+                .find("\n            });\n")
+                .expect("the spawned waiter must end");
+        let waiter = &body[spawn..spawn_end];
+        let wait = waiter
             .find("wait_for_register_ack(")
             .expect("the load must wait for the register reply");
+        let superseded = waiter
+            .find("RegisterAckWait::Superseded => {")
+            .expect("a superseded waiter must be handled");
+        assert!(
+            waiter[superseded..].trim_start_matches("RegisterAckWait::Superseded => {")[..200]
+                .contains("return;"),
+            "a superseded waiter must return without loading"
+        );
+        let gate = waiter
+            .find("if !load_attempt_is_current(attempt) {")
+            .expect("the load must be gated on the attempt still being current");
         for call in [
             "fire_list_rooms_request().await",
             "fire_load_outbound_dms_request().await",
         ] {
-            let positions: Vec<usize> = body.match_indices(call).map(|(i, _)| i).collect();
-            assert_eq!(positions.len(), 1, "exactly one `{call}`");
+            assert_eq!(body.matches(call).count(), 1, "exactly one `{call}`");
+            let at = waiter
+                .find(call)
+                .unwrap_or_else(|| panic!("`{call}` must be inside the spawned waiter"));
             assert!(
-                positions[0] > wait,
-                "`{call}` must come after wait_for_register_ack (freenet/river#709)"
+                at > wait && at > superseded && at > gate,
+                "`{call}` must come after the wait, the Superseded return and the attempt gate"
             );
         }
 

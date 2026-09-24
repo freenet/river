@@ -5,8 +5,8 @@ use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    current_delegate_key, request_legacy_seal_on_quiescence, reset_ensure_subscription_dedup,
-    set_up_chat_delegate,
+    current_delegate_key, on_current_delegate_missing, request_legacy_seal_on_quiescence,
+    reset_ensure_subscription_dedup, set_up_chat_delegate,
 };
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
@@ -825,6 +825,7 @@ impl FreenetSynchronizer {
                                     request_legacy_seal_on_quiescence();
                                 } else if e.missing_delegate_key().is_some() {
                                     warn!("The CURRENT chat delegate was reported missing; not a legacy probe, so not sealing (freenet/river#707)");
+                                    on_current_delegate_missing();
                                 }
 
                                 // Special handling for "not supported" errors
@@ -1051,6 +1052,14 @@ mod tests {
         };
         assert!(!should_request_legacy_seal(&untyped(&current), &current));
         assert!(should_request_legacy_seal(&untyped(&legacy), &current));
+
+        // The error arm must route a current-key Missing to the load's failure
+        // path, so the user gets Retry instead of a stuck rail.
+        let production = include_str!("freenet_synchronizer.rs")
+            .split("mod tests {")
+            .next()
+            .unwrap();
+        assert!(production.contains("on_current_delegate_missing();"));
 
         // Unrelated errors never seal.
         assert!(!should_request_legacy_seal(
