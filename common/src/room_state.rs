@@ -358,10 +358,32 @@ impl ChatRoomStateV1 {
                 }
             }
 
-            // There is no longer an inactivity-prune exemption for banners
-            // (#411 round 3 item B, removed in freenet/river#702). A pruned
-            // banner's record moves to `ban_evidence` below, so their ban stays
-            // verifiable and keeps taking effect without holding a member slot.
+            // A current member who is the ISSUER of a stored ban with a
+            // matching signature is exempt from inactivity-prune (#411 round 3
+            // item B). Since freenet/river#702 this is no longer what keeps
+            // such a ban verifiable (a pruned issuer's record would become ban
+            // evidence), but it is kept deliberately: every room stored today
+            // was produced with it, so dropping it would make those states
+            // stop being fixpoints of this function and rewrite them on their
+            // first merge (fdev verify-merge `transition_path_agreement` on the
+            // real Official-room corpus). `self.bans.0` was already capped at
+            // step 0-cap, and step 0 has already removed every banned member,
+            // so this exempts exactly the present issuers of surviving bans.
+            // It uses the step-5 predicate, so exemption <=> retention (#411
+            // round 4/5).
+            for ban in &self.bans.0 {
+                let banner = ban.banned_by;
+                if banner != owner_id
+                    && BansV1::ban_signature_matches_current_key(
+                        ban,
+                        &members_by_id,
+                        owner_id,
+                        &parameters.owner,
+                    )
+                {
+                    required_ids.insert(banner);
+                }
+            }
 
             // Walk invite chains upward, adding all ancestors (stop at owner)
             let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
@@ -1099,12 +1121,13 @@ mod tests {
         );
     }
 
-    /// #411 round 3 item B kept an inactive banner present so their ban did
-    /// not vanish. Since freenet/river#702 the banner is pruned like anyone
-    /// else and their record moves to `ban_evidence`, so the ban persists and
-    /// stays verifiable without holding a member slot.
+    /// #411 round 3 item B: a member who is the banner of a retained ban is
+    /// EXEMPT from inactivity-pruning, so their ban does not vanish. (Before
+    /// round 3 the banner was pruned and the ban persisted anyway; now the ban
+    /// persists BECAUSE the banner is kept present, which is what keeps it valid
+    /// under the round-3 "banner must be a current member" sweep.)
     #[test]
-    fn test_inactive_banner_is_pruned_to_evidence_and_ban_persists() {
+    fn test_banner_exempt_from_inactivity_prune_so_ban_persists() {
         let rng = &mut rand::thread_rng();
         let owner_sk = SigningKey::generate(rng);
         let owner_vk = owner_sk.verifying_key();
@@ -1147,7 +1170,8 @@ mod tests {
         };
         let auth_config = AuthorizedConfigurationV1::new(config, &owner_sk);
 
-        // A has no messages and is the banner of a retained ban.
+        // A has no messages, but A is the banner of a retained ban → exempt
+        // from inactivity-prune (round 3 item B).
         let mut state = ChatRoomStateV1 {
             configuration: auth_config,
             members: MembersV1 {
@@ -1159,12 +1183,15 @@ mod tests {
 
         state.post_apply_cleanup(&params).unwrap();
 
-        // A is pruned (no messages), and A's record is kept as ban evidence.
-        assert!(state.members.members.is_empty(), "A is pruned");
-        assert_eq!(state.ban_evidence.members.len(), 1);
-        assert_eq!(state.ban_evidence.members[0].member.id(), a_id);
+        // A is KEPT (exempt as a banner), not pruned.
+        assert_eq!(
+            state.members.members.len(),
+            1,
+            "A should be exempt from prune"
+        );
+        assert_eq!(state.members.members[0].member.id(), a_id);
 
-        // A's ban of C persists, verifiable through the evidence.
+        // A's ban of C persists (banner A is still a current member).
         assert_eq!(state.bans.0.len(), 1, "Ban should persist");
         assert_eq!(state.bans.0[0].ban.banned_user, c_id);
         assert_eq!(state.bans.0[0].banned_by, a_id);
