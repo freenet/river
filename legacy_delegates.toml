@@ -233,7 +233,7 @@ code_hash = "a44c64014d60fd245fe8fb5172f8fd7397039b248b3b6a8e95e89a0bb539fb5e"
 
 [[entry]]
 version = "V32"
-description = "Last chat-delegate generation before the freenet/river#423 release. NOT caused by that fix: rebuilding the fix without the river-core 0.1.21 -> 0.1.22 bump leaves the delegate byte-identical (c2e60638), so this generation is the version bump alone"
+description = "Last chat-delegate generation before the freenet/river#423 release (PR #702). Caused by that fix: chat-delegate links river-core's ChatRoomStateV1 merge, whose post_apply_cleanup ban resolution changed, and the river-core 0.1.21 -> 0.1.22 bump moves it as well"
 date = "2026-09-22"
 delegate_key = "c15cbbb7f850cc63e45faa4c05c82f174b0c8dc6a1670b938264b4b503f79b16"
 code_hash = "c2e6063899624b65715d683fbbba04637ba89b72dc17f5b1610343922356fc46"
