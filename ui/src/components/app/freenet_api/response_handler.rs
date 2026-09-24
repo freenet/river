@@ -18,13 +18,13 @@ use crate::components::app::chat_delegate::{
     fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
     is_legacy_delegate_key, is_legacy_migration_in_progress, legacy_scoped_correlation,
     load_state_after_probe_legacy, mark_legacy_migration_done, mark_legacy_migration_in_progress,
-    mark_outbound_dms_hydrated, note_delegate_response_for_register_ack, parse_room_storage_key,
-    per_room_terminal, prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence,
-    response_correlation_base, room_storage_key, save_outbound_dms_to_delegate,
-    save_rooms_to_delegate, send_delegate_request, send_delegate_request_to,
-    set_load_state_if_current, source_rank_for_delegate_key, LegacyMigrationAction,
-    LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState, OUTBOUND_DMS_STORAGE_KEY,
-    ROOMS_META_KEY, ROOMS_STORAGE_KEY,
+    mark_outbound_dms_hydrated, note_current_list_response,
+    note_delegate_response_for_register_ack, parse_room_storage_key, per_room_terminal,
+    prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, response_correlation_base,
+    room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
+    send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
+    LegacyMigrationAction, LoadWorkerGuard, PendingDelegateRequest, RoomsLoadState,
+    OUTBOUND_DMS_STORAGE_KEY, ROOMS_META_KEY, ROOMS_STORAGE_KEY,
 };
 use crate::components::app::document_title::{mark_current_room_as_read, update_document_title};
 use crate::components::app::notifications::mark_initial_sync_complete;
@@ -536,6 +536,7 @@ impl ResponseHandler {
                                                 });
                                             }
                                         } else {
+                                            note_current_list_response();
                                             crate::util::safe_spawn_local(async move {
                                                 load_rooms_per_room(keys).await;
                                             });

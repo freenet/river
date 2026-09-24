@@ -1059,7 +1059,13 @@ mod tests {
             .split("mod tests {")
             .next()
             .unwrap();
-        assert!(production.contains("on_current_delegate_missing();"));
+        let branch = production
+            .find("} else if e.missing_delegate_key().is_some() {")
+            .expect("the current-key Missing branch must exist");
+        assert!(
+            production[branch..branch + 400].contains("on_current_delegate_missing();"),
+            "the current-key Missing branch must call on_current_delegate_missing"
+        );
 
         // Unrelated errors never seal.
         assert!(!should_request_legacy_seal(

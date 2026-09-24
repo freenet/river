@@ -799,14 +799,45 @@ pub(crate) fn note_delegate_response_for_register_ack(key: &DelegateKey, values_
     }
 }
 
+/// `attempt + 1` of the load whose room `ListRequest` to the current delegate
+/// has been sent with no `ListResponse` yet; 0 when none is outstanding.
+static LIST_OUTSTANDING: AtomicU32 = AtomicU32::new(0);
+
+/// The current delegate answered a `ListRequest`.
+pub(crate) fn note_current_list_response() {
+    LIST_OUTSTANDING.store(0, Ordering::Relaxed);
+}
+
+/// Take the outstanding-list marker if it belongs to `attempt`.
+fn claim_outstanding_list(outstanding: &AtomicU32, attempt: u32) -> bool {
+    outstanding
+        .compare_exchange(
+            attempt.wrapping_add(1),
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
 /// The node reported the CURRENT chat delegate missing (freenet/river#707).
-/// This is not a legacy probe result, so it must not seal the migration. It
-/// does mean a request to the current delegate failed, most likely the room
-/// list after a failed or lost register, and no `ListResponse` will come to
-/// start the load. Record the failure and show Retry (which re-registers) if
-/// no rooms are showing, instead of waiting for the hard-max.
+/// This is not a legacy probe result, so it must not seal the migration.
+///
+/// The error carries no request id. If this attempt's room list is still
+/// unanswered, the list is what failed (a failed or lost register), no
+/// `ListResponse` will come to start the load, and the user would otherwise
+/// wait for the hard-max and then see "No rooms yet". So record the failure
+/// and show Retry, which re-registers. Once the list has been answered, a
+/// Missing belongs to some other request and is left alone: marking the
+/// attempt failed then would turn a correct Empty into LoadFailed.
+///
+/// Retry can still land inside the node's per-key rate-limit backoff (up to
+/// 5 s after repeated errors), in which case it fails the same way again.
 pub(crate) fn on_current_delegate_missing() {
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    if !claim_outstanding_list(&LIST_OUTSTANDING, attempt) {
+        return;
+    }
     mark_fetch_failure_if_current(attempt);
     resolve_load_failed_if_empty(attempt);
 }
@@ -981,6 +1012,48 @@ mod tests {
         );
     }
 
+    /// freenet/river#707 follow-up: a current-key Missing fails the load only
+    /// while THIS attempt's room list is unanswered, and only once.
+    #[test]
+    fn current_missing_claims_only_this_attempts_outstanding_list() {
+        let outstanding = AtomicU32::new(0);
+        assert!(
+            !claim_outstanding_list(&outstanding, 7),
+            "no list outstanding"
+        );
+
+        outstanding.store(7 + 1, Ordering::Relaxed);
+        assert!(
+            !claim_outstanding_list(&outstanding, 8),
+            "another attempt's list"
+        );
+        assert!(claim_outstanding_list(&outstanding, 7));
+        assert!(!claim_outstanding_list(&outstanding, 7), "claimed once");
+
+        let rh = include_str!("freenet_api/response_handler.rs");
+        let rh_production = rh.split("mod tests {").next().unwrap();
+        let current_list = rh_production
+            .find("load_rooms_per_room(keys).await;")
+            .expect("current-delegate ListResponse branch must exist");
+        assert!(
+            rh_production[current_list.saturating_sub(300)..current_list]
+                .contains("note_current_list_response();"),
+            "the current delegate's ListResponse must clear the outstanding marker"
+        );
+        let cd_production = include_str!("chat_delegate.rs")
+            .split("mod tests {")
+            .next()
+            .unwrap();
+        let handler = cd_production
+            .find("pub(crate) fn on_current_delegate_missing() {")
+            .expect("on_current_delegate_missing must exist");
+        let body = &cd_production[handler..handler + 400];
+        let claim = body
+            .find("claim_outstanding_list(&LIST_OUTSTANDING, attempt)")
+            .expect("the handler must be gated on the outstanding list");
+        assert!(claim < body.find("mark_fetch_failure_if_current(attempt)").unwrap());
+    }
+
     /// freenet/river#709 wiring: in `set_up_chat_delegate` the list and
     /// outbound-DM requests are sent only after `wait_for_register_ack`, the
     /// slot is armed before the register is sent, and the response handler
@@ -1025,9 +1098,10 @@ mod tests {
         let superseded = waiter
             .find("RegisterAckWait::Superseded => {")
             .expect("a superseded waiter must be handled");
+        let arm_body = &waiter[superseded + "RegisterAckWait::Superseded => {".len()..];
+        let arm_body = &arm_body[..arm_body.find('}').expect("the Superseded arm must close")];
         assert!(
-            waiter[superseded..].trim_start_matches("RegisterAckWait::Superseded => {")[..200]
-                .contains("return;"),
+            arm_body.contains("return;"),
             "a superseded waiter must return without loading"
         );
         let gate = waiter
@@ -6081,6 +6155,7 @@ async fn fire_list_rooms_request() {
     });
 
     // Send without waiting for response
+    LIST_OUTSTANDING.store(attempt.wrapping_add(1), Ordering::Relaxed);
     let api_result = {
         let mut web_api = WEB_API.write();
         if let Some(api) = web_api.as_mut() {
@@ -6091,6 +6166,7 @@ async fn fire_list_rooms_request() {
     };
 
     if let Err(e) = api_result {
+        let _ = claim_outstanding_list(&LIST_OUTSTANDING, attempt);
         error!("Failed to send list-rooms request: {}", e);
         // freenet/river#397 Codex review 5/7/11: the SEND itself failed (no
         // response will ever come, no worker), so mark the attempt failed AND
