@@ -863,7 +863,6 @@ pub(crate) fn enforced_ban_set_of(
     parent_state: &ChatRoomStateV1,
     parameters: &ChatRoomParametersV1,
 ) -> HashSet<MemberId> {
-    let owner_id = parameters.owner_id();
     let max_bans = parent_state.configuration.configuration.max_user_bans;
 
     if parent_state.bans.0.len() <= max_bans {
@@ -873,15 +872,13 @@ pub(crate) fn enforced_ban_set_of(
             parameters,
         );
     }
-    let members_by_id = parent_state.members.members_by_member_id();
     let mut capped: Vec<AuthorizedUserBan> = parent_state.bans.0.clone();
     BansV1::enforce_user_ban_cap(
         &mut capped,
         max_bans,
-        &members_by_id,
+        &parent_state.members,
         &parent_state.member_info,
-        owner_id,
-        &parameters.owner,
+        parameters,
     );
     parent_state
         .members

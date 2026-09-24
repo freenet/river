@@ -193,14 +193,12 @@ impl ChatRoomStateV1 {
             // data loss, so the two must agree by construction rather than by
             // two copies happening to match — which is exactly what drifted in
             // #671 and in #411 round 4.
-            let members_by_id = self.members.members_by_member_id();
             BansV1::enforce_user_ban_cap(
                 &mut self.bans.0,
                 max_bans,
-                &members_by_id,
+                &self.members,
                 &self.member_info,
-                owner_id,
-                &parameters.owner,
+                parameters,
             );
         }
 

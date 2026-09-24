@@ -26,12 +26,12 @@ use std::time::SystemTime;
 /// removed (freenet/river#423, #702).
 ///
 /// A ban is only honored while its banner is the OWNER or a CURRENT,
-/// signature-validated member: [`Self::ban_is_enforcing`] gates on that, and
+/// signature-validated member ([`MembersV1::resolve_bans`] gates on that), and
 /// [`crate::room_state::ChatRoomStateV1::post_apply_cleanup`] sweeps any ban
 /// whose banner is neither. A member who is a banner is exempt from
 /// inactivity-pruning while they hold a retained ban, so a moderator's bans do
 /// not vanish. The `max_user_bans` FIFO is enforced there too, evicting inert
-/// (currently-unauthorized) bans before enforcing ones, and
+/// bans that take no effect before those that do, and
 /// [`ComposableState::apply_delta`] bounds a single delta to `max_user_bans`
 /// new bans so a forged flood cannot make signature verification unbounded.
 ///
@@ -263,28 +263,53 @@ impl BansV1 {
     /// construction; two copies of an almost-identical predicate is precisely
     /// what drifted in freenet/river#671 and in #411 round 4.
     ///
-    /// Evicts inert-before-enforcing, then oldest-before-newest, then by ban
-    /// id, and restores the canonical `(banned_at, id)` stored order. A no-op
-    /// when already within the cap. `sort_by_cached_key` computes
-    /// `ban_is_enforcing` at most once per ban (#411 round 3 C).
+    /// Ranks each ban by whether it TAKES EFFECT in
+    /// [`MembersV1::resolve_bans`] over the uncapped set, keeping only one
+    /// ban per `(issuer, target)` pair as effective (the oldest by
+    /// `(banned_at, id)`; later duplicates add nothing). It then evicts
+    /// non-effective before effective, oldest before newest, then by ban id,
+    /// and restores the canonical `(banned_at, id)` stored order. A no-op when
+    /// already within the cap.
+    ///
+    /// Ranking by effect rather than by "verifiable and authorized" is what
+    /// stops a banned issuer from flooding the cap (freenet/river#702): a
+    /// member removed by a ban that takes effect, re-added with a burst of
+    /// future-dated bans, or a mutual-ban tombstone banning outsiders, issues
+    /// only bans that take no effect, so theirs are the ones evicted. The
+    /// residual #413 describes (a CURRENT member's effective bans on absent
+    /// targets) is unchanged.
     pub fn enforce_user_ban_cap(
         bans: &mut Vec<AuthorizedUserBan>,
         max_bans: usize,
-        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
+        members: &MembersV1,
         member_info: &MemberInfoV1,
-        owner_id: MemberId,
-        owner_vk: &VerifyingKey,
+        parameters: &ChatRoomParametersV1,
     ) {
         if bans.len() <= max_bans {
             return;
         }
-        bans.sort_by_cached_key(|ban| {
-            (
-                Self::ban_is_enforcing(ban, members_by_id, member_info, owner_id, owner_vk),
-                ban.ban.banned_at,
-                ban.id(),
-            )
-        });
+        let effective = members
+            .resolve_bans(&BansV1(bans.clone()), member_info, parameters)
+            .effective_bans;
+        let mut first_of_pair: HashMap<(MemberId, MemberId), (SystemTime, BanId)> = HashMap::new();
+        for ban in bans.iter().filter(|b| effective.contains(&b.id())) {
+            let key = (ban.banned_by, ban.ban.banned_user);
+            let rank = (ban.ban.banned_at, ban.id());
+            first_of_pair
+                .entry(key)
+                .and_modify(|best| {
+                    if rank < *best {
+                        *best = rank.clone();
+                    }
+                })
+                .or_insert(rank);
+        }
+        let keeps = |ban: &AuthorizedUserBan| {
+            first_of_pair
+                .get(&(ban.banned_by, ban.ban.banned_user))
+                .is_some_and(|(at, id)| *at == ban.ban.banned_at && *id == ban.id())
+        };
+        bans.sort_by_cached_key(|ban| (keeps(ban), ban.ban.banned_at, ban.id()));
         let to_remove = bans.len() - max_bans;
         bans.drain(0..to_remove);
         bans.sort_by(|a, b| {
@@ -293,52 +318,6 @@ impl BansV1 {
                 .cmp(&b.ban.banned_at)
                 .then_with(|| a.id().cmp(&b.id()))
         });
-    }
-
-    /// Whether `ban` is currently ENFORCING (worth keeping under `max_user_bans`
-    /// pressure) rather than INERT (evicted first). Pure function of the
-    /// converged `(members + member_info)` state (#410 review round 1).
-    ///
-    /// - The banner must be the owner or a current member AND the ban's signature
-    ///   must verify against that banner's CURRENT key
-    ///   ([`Self::ban_signature_matches_current_key`], #411 round 4 A). A
-    ///   non-member banner, or a forged/replayed ban whose signature does not
-    ///   match the converged key, is inert.
-    /// - If the target is a **current member**, the ban is enforcing iff its
-    ///   banner is currently authorized to ban it
-    ///   ([`MembersV1::is_ban_authorized`]). A forged ban on a present member,
-    ///   or a revoked-deputy ban whose target rejoined, is inert.
-    /// - If the target is **absent** (already removed/pruned), keep the ban (its
-    ///   banner is a signature-verified owner/member): a real enforcing ban.
-    pub fn ban_is_enforcing(
-        ban: &AuthorizedUserBan,
-        members_by_id: &HashMap<MemberId, &AuthorizedMember>,
-        member_info: &MemberInfoV1,
-        owner_id: MemberId,
-        owner_vk: &VerifyingKey,
-    ) -> bool {
-        let banner = ban.banned_by;
-        // A ban can only enforce while its banner is the owner or a current
-        // member (#411 round 3). A non-member banner ID — a stale/pruned deputy,
-        // or a forged one — must NOT make a ban enforcing, and such bans are
-        // swept from state entirely in `post_apply_cleanup`.
-        if banner != owner_id && !members_by_id.contains_key(&banner) {
-            return false;
-        }
-        // Re-verify the signature against the banner's CURRENT converged key
-        // (#411 round 4 A). Closes the same-delta pruned-deputy-replay bypass:
-        // `verify` skipped this at apply time because the banner was absent then.
-        if !Self::ban_signature_matches_current_key(ban, members_by_id, owner_id, owner_vk) {
-            return false;
-        }
-        let target = ban.ban.banned_user;
-        if members_by_id.contains_key(&target) {
-            MembersV1::is_ban_authorized(banner, target, members_by_id, member_info, owner_id)
-        } else {
-            // Target already removed and the banner is a signature-verified owner
-            // or current member (checked above): a real enforcing ban worth keeping.
-            true
-        }
     }
 }
 

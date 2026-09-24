@@ -796,11 +796,12 @@ fn a_cycle_members_ban_on_an_outsider_does_not_take_effect() {
     assert!(ids.contains(&z.id), "the outsider stays");
 }
 
-/// A mutual ban where one moderator invited the other. X's ban on Y is an
-/// ancestor ban, which the `members` step used to enforce before cleanup ever
-/// saw Y's counter-ban, so X survived. Both must be removed.
+/// A counter-ban on one's own inviter is void, like every ban whose cascade
+/// would remove its own issuer (`resolve_bans` step 3). X invited Y; X bans
+/// Y and Y bans X. Y's ban would remove Y too, so it takes no effect, and
+/// Y's counter-ban does not shield Y: X's ban removes Y, and X stays.
 #[test]
-fn a_mutual_ban_with_ones_own_inviter_removes_both() {
+fn a_counter_ban_on_ones_own_inviter_is_void() {
     let room = Room::new();
     let x = room.person();
     let y = room.person_invited_by(&x);
@@ -812,28 +813,27 @@ fn a_mutual_ban_with_ones_own_inviter_removes_both() {
         &room.params,
     );
     let ids = active_ids(&after, &room.params);
-    assert!(!ids.contains(&x.id), "X is removed");
-    assert!(!ids.contains(&y.id), "Y is removed");
+    assert!(ids.contains(&x.id), "Y's ban on its own inviter is void");
+    assert!(!ids.contains(&y.id), "X's ban on Y takes effect");
+    assert!(!member_ids(&after).contains(&y.id), "Y is no tombstone");
     assert!(ids.contains(&t.id));
 }
 
-/// A moderator banning their own inviter removes the inviter and, through the
-/// cascade, themselves. That is not a cycle: a ban's effect on its own issuer
-/// cannot void it.
+/// A ban on one's own inviter is void on its own too: the moderator stays,
+/// and so does the inviter.
 #[test]
-fn a_moderator_banning_their_own_inviter_removes_the_inviter() {
+fn a_ban_on_ones_own_inviter_is_void() {
     let room = Room::new();
     let x = room.person();
     let y = room.person_invited_by(&x);
     let s = room.modded_state(&[&x, &y], &[&y], vec![]);
     let after = apply_checked(&s, bans_delta(vec![room.ban(&y, &x, 10)]), &room.params);
     let ids = active_ids(&after, &room.params);
-    assert!(!ids.contains(&x.id), "the inviter is removed");
-    assert!(!ids.contains(&y.id), "and Y with their subtree");
+    assert!(ids.contains(&x.id) && ids.contains(&y.id));
 }
 
-/// A self-ban takes effect (it removes its issuer), and a ban on the owner
-/// never does.
+/// A self-ban is void (it would remove its issuer), and a ban on the owner
+/// never takes effect.
 #[test]
 fn self_bans_and_bans_on_the_owner() {
     let room = Room::new();
@@ -841,8 +841,8 @@ fn self_bans_and_bans_on_the_owner() {
     let s = room.modded_state(&[&a, &t], &[&a], vec![]);
     let after = apply_checked(&s, bans_delta(vec![room.ban(&a, &a, 10)]), &room.params);
     assert!(
-        !active_ids(&after, &room.params).contains(&a.id),
-        "a self-ban removes its issuer"
+        active_ids(&after, &room.params).contains(&a.id),
+        "a self-ban is void"
     );
 
     let owner = Person {
@@ -861,24 +861,26 @@ fn self_bans_and_bans_on_the_owner() {
     assert!(ids.contains(&t.id), "a ban on the owner removes nobody");
 }
 
-/// A mutual ban inside a subtree the owner also bans: both mutual bans still
-/// take effect, so the cycle partner outside the owner's ban is removed too.
+/// The owner's ban wins (Ian, 2026-09-24): a member the owner bans has no
+/// ban authority, even inside a mutual ban. An existing mutual ban between X
+/// and Y is resolved; then the owner bans X. X's ban on Y stops counting, so
+/// Y is released, and X leaves `members` entirely (an owner-removed member is
+/// never a tombstone).
 #[test]
-fn an_owner_banned_member_in_a_mutual_ban_still_removes_their_partner() {
+fn an_owner_ban_breaks_a_mutual_ban() {
     let room = Room::new();
     let (x, y, t) = (room.person(), room.person(), room.person());
     let s = room.modded_state(&[&x, &y, &t], &[&x, &y], vec![]);
-    let after = apply_checked(
+    let s = apply_checked(
         &s,
-        bans_delta(vec![
-            room.owner_ban(&x, 9),
-            room.ban(&x, &y, 10),
-            room.ban(&y, &x, 11),
-        ]),
+        bans_delta(vec![room.ban(&x, &y, 10), room.ban(&y, &x, 11)]),
         &room.params,
     );
+    assert!(!active_ids(&s, &room.params).contains(&y.id));
+    let after = apply_checked(&s, bans_delta(vec![room.owner_ban(&x, 20)]), &room.params);
     let ids = active_ids(&after, &room.params);
-    assert!(!ids.contains(&x.id) && !ids.contains(&y.id));
+    assert!(ids.contains(&y.id), "Y is released");
+    assert!(!member_ids(&after).contains(&x.id), "X is removed outright");
     assert!(ids.contains(&t.id));
 }
 
@@ -914,21 +916,23 @@ fn an_inert_ban_on_an_issuer_cannot_delete_their_stored_ban() {
     assert!(!ids.contains(&t.id), "and it takes effect");
 }
 
-/// A mutual-ban cycle member whose inviter is ALSO banned (here by the
-/// owner). The inviter must be retained as a tombstone too, or the cycle
-/// member's invite chain breaks and `verify` rejects the state. Everyone in
-/// the chain stays enforced-banned, and a second cleanup changes nothing.
+/// A mutual-ban cycle member whose inviter is ALSO banned, here by a
+/// moderator (an owner ban would make the cycle member owner-removed too,
+/// with no authority left). The inviter must be retained as a tombstone, or
+/// the cycle member's invite chain breaks and `verify` rejects the state.
+/// Everyone in the chain stays enforced-banned, and a second cleanup changes
+/// nothing.
 #[test]
 fn a_cycle_members_banned_inviter_is_retained_with_them() {
     let room = Room::new();
     let w = room.person();
     let x = room.person_invited_by(&w);
-    let (y, t) = (room.person(), room.person());
-    let s = room.modded_state(&[&w, &x, &y, &t], &[&x, &y], vec![]);
+    let (y, d, t) = (room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&w, &x, &y, &d, &t], &[&x, &y, &d], vec![]);
     let after = apply_checked(
         &s,
         bans_delta(vec![
-            room.owner_ban(&w, 9),
+            room.ban(&d, &w, 9),
             room.ban(&x, &y, 10),
             room.ban(&y, &x, 11),
         ]),
@@ -938,7 +942,7 @@ fn a_cycle_members_banned_inviter_is_retained_with_them() {
     for p in [&w, &x, &y] {
         assert!(!ids.contains(&p.id), "W, X and Y are all removed");
     }
-    assert!(ids.contains(&t.id));
+    assert!(ids.contains(&t.id) && ids.contains(&d.id));
     assert!(
         member_ids(&after).contains(&w.id),
         "W stays as a tombstone so X's chain verifies"
@@ -1301,11 +1305,10 @@ fn a_tombstone_pulls_in_a_later_banner_until_its_grant_is_revoked() {
     assert!(!active.contains(&a.id));
 }
 
-/// The `members` step used to remove an ancestor-banned member before
-/// cleanup saw their counter-ban. Arrival order must not matter: P sees X's
-/// ban on Y first, Q sees Y's ban on X first (which removes Y too, as X's
-/// invitee), and after gossip both agree that X and Y are removed, as when
-/// both bans arrive together.
+/// Arrival order must not matter for the `members` step's early removal
+/// (now owner bans only) either. P sees X's ban on Y first, Q sees Y's
+/// (void) ban on its inviter X first, and after gossip both agree with the
+/// state where both bans arrive together: Y removed, X stays.
 #[test]
 fn a_mutual_ban_with_ones_own_inviter_is_arrival_order_independent() {
     let room = Room::new();
@@ -1331,16 +1334,20 @@ fn a_mutual_ban_with_ones_own_inviter_is_arrival_order_independent() {
         );
     }
     let active = active_ids(&together, &room.params);
-    assert!(!active.contains(&x.id) && !active.contains(&y.id));
+    assert!(
+        active.contains(&x.id),
+        "Y's counter-ban on its inviter is void"
+    );
+    assert!(!active.contains(&y.id));
     assert!(active.contains(&t.id));
 }
 
-/// A ban that removes its own issuer (here: banning one's own inviter) does
-/// not void the issuer's OTHER bans. Otherwise the answer would depend on the
-/// order of the stored ban list: Y's ban on X sorts first, and must not stop
-/// Y's later ban on Z.
+/// A self-removing ban (here, Y banning its own inviter X) is void, and the
+/// issuer keeps no special power from it: Y is not removed, so Y's other
+/// ban, on Z, takes effect the ordinary way, whatever the order of the stored
+/// ban list.
 #[test]
-fn a_self_removing_ban_does_not_void_the_issuers_other_bans() {
+fn a_self_removing_ban_is_void_and_the_issuers_other_bans_stand() {
     let room = Room::new();
     let x = room.person();
     let y = room.person_invited_by(&x);
@@ -1352,7 +1359,7 @@ fn a_self_removing_ban_does_not_void_the_issuers_other_bans() {
         &room.params,
     );
     let active = active_ids(&after, &room.params);
-    assert!(!active.contains(&x.id) && !active.contains(&y.id));
-    assert!(!active.contains(&z.id), "Y's ban on Z also takes effect");
+    assert!(active.contains(&x.id) && active.contains(&y.id));
+    assert!(!active.contains(&z.id), "Y's ban on Z takes effect");
     assert!(active.contains(&t.id));
 }
