@@ -41,8 +41,8 @@ use std::time::SystemTime;
 /// effect because its issuer is not removed), and `banned_at` is signed by the
 /// issuer, so they can evict older effective bans (never owner bans). The
 /// flooder is identifiable on every junk ban, and an OWNER ban makes all of
-/// their bans inert. The former second residual (slot-squatting through the
-/// banner prune exemption) is gone: there is no such exemption since #702.
+/// their bans inert. The second #411 residual (slot-squatting through the
+/// banner prune exemption, which #702 keeps for fixpoint stability) remains.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
