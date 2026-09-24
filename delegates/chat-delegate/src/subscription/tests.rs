@@ -908,3 +908,71 @@ fn backfill_handles_sparse_high_version_state() {
         "must emit only the versions we actually have secrets for"
     );
 }
+
+/// freenet/river#702: members of a mutual-ban cycle stay in `members` as
+/// enforced-banned tombstones. The delegate's rotation must treat them as
+/// gone: they count as a departure in the member-set comparison (so a mutual
+/// ban rotates the secret) and never receive a rotated secret. Both sites go
+/// through `active_member_vks`.
+#[test]
+fn rotation_member_set_excludes_mutual_ban_tombstones() {
+    use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
+    use river_core::room_state::ChatRoomParametersV1;
+
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key();
+    let owner_id = MemberId::from(&owner_vk);
+    let (alice, bob, carol) = (
+        SigningKey::generate(&mut OsRng),
+        SigningKey::generate(&mut OsRng),
+        SigningKey::generate(&mut OsRng),
+    );
+    let mut state = private_room_state(&owner_sk, &[&alice, &bob, &carol]);
+    let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
+    let mut info = MemberInfo::new_public(owner_id, 1, "owner".into());
+    info.deputies = vec![id(&alice), id(&bob)];
+    state.member_info = MemberInfoV1 {
+        member_info: vec![AuthorizedMemberInfo::new(info, &owner_sk)],
+    };
+    let ban = |by: &SigningKey, target: &SigningKey, secs: u64| {
+        AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                banned_user: id(target),
+            },
+            id(by),
+            by,
+        )
+    };
+    state.configuration.configuration.max_user_bans = 10;
+    state.bans = BansV1(vec![ban(&alice, &bob, 1), ban(&bob, &alice, 2)]);
+    state
+        .post_apply_cleanup(&ChatRoomParametersV1 { owner: owner_vk })
+        .unwrap();
+
+    let present: Vec<MemberId> = state
+        .members
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
+    assert!(present.contains(&id(&alice)) && present.contains(&id(&bob)));
+    let active: Vec<MemberId> = active_member_vks(&state, &owner_vk)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    // (Carol has no messages, so cleanup prunes her for inactivity.)
+    assert!(!active.contains(&id(&alice)) && !active.contains(&id(&bob)));
+    assert!(!present.contains(&id(&carol)));
+
+    // Both rotation sites (change detection and recipients) and the cache
+    // use the helper; none reads the raw member list.
+    let src = include_str!("../subscription.rs");
+    assert_eq!(
+        src.matches("active_member_vks(").count(),
+        4,
+        "definition + 3 call sites"
+    );
+}
