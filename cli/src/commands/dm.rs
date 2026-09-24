@@ -264,7 +264,7 @@ async fn deliver_dm(
     let owner_id = MemberId::from(&room_owner_key);
     // Active members only: a mutual-ban tombstone is present in `members` but
     // is not in the room, and a DM to it is swept (freenet/river#702).
-    let is_recipient_member = room_has_member(&room_state, &room_owner_key, recipient_id);
+    let is_recipient_member = room_has_member(room_state, &room_owner_key, recipient_id);
     if !is_recipient_member {
         return Err(anyhow!("Recipient is not currently a member of the room."));
     }
