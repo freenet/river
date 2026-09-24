@@ -519,15 +519,13 @@ fn honest_forks_always_converge() {
 /// they still fail on the pre-fix code, or pick new ones: `FORK_SEEDS=1000`
 /// against `a3e63c8c`'s `ban.rs` lists them.
 ///
-/// Known residual, deliberately NOT asserted here: a pair can still SILENTLY
-/// diverge (every merge succeeds, the states differ) in 6 of 3006 cases
-/// at `FORK_SEEDS=1000`. Every case examined has the same shape. A member who
-/// has no messages is kept on one peer only by the pruning exemption for the
-/// banner of a surviving ban. On the other peer that member is absent and
-/// banned, so the ban is dropped as orphaned and the member is pruned again.
-/// It is the slot-squatting residual documented on `BansV1`, meeting the
-/// orphaned-ban rule. Content still flows both ways; only that member and
-/// their ban differ. Tracked in freenet/river#703.
+/// Silent divergence (every merge succeeds, the states differ) is reported
+/// but not asserted. With the apply-time orphaned-ban drop (#702 review
+/// rounds 1-3) it was 6 of 3006 pairs at `FORK_SEEDS=1000`: a member kept on
+/// one peer only by the banner prune exemption, dropped as orphaned on the
+/// other. Since bans are resolved from converged state
+/// (`MembersV1::resolve_bans`) and nothing is dropped at apply time, the
+/// same run finds 0. Tracked in freenet/river#703.
 #[test]
 fn adversarial_forks_never_permanently_reject_each_other() {
     let mut seeds = default_seeds(seeds_from_env(3));
@@ -535,7 +533,7 @@ fn adversarial_forks_never_permanently_reject_each_other() {
     let (rejecting, silent) = endings(Mode::Adversarial, &seeds);
     if !silent.is_empty() {
         eprintln!(
-            "known residual (#703): {} of {} adversarial pairs silently diverge:\n{}",
+            "silent divergence (#703): {} of {} adversarial pairs:\n{}",
             silent.len(),
             seeds.len(),
             silent.join("\n")

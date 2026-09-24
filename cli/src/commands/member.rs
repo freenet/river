@@ -126,8 +126,17 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
             // rows whose nickname came from a losing record while the deputy
             // annotation came from the canonical one. `members_with_info` is
             // deduplicated and `party` reads the canonical record.
+            // Members of a mutual-ban cycle stay in `members` as
+            // enforced-banned tombstones so their bans remain verifiable
+            // (freenet/river#702). They are not in the room: not listed.
+            let enforced_banned = room_state.members.banned_member_ids(
+                &room_state.bans,
+                &room_state.member_info,
+                &river_core::room_state::ChatRoomParametersV1 { owner: owner_vk },
+            );
             let members: Vec<_> = deputies
                 .members_with_info()
+                .filter(|id| !enforced_banned.contains(id))
                 .map(|id| {
                     let party = deputies.party(id);
                     let granted_by: Vec<MemberId> =

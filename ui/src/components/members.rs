@@ -1479,9 +1479,17 @@ pub fn MemberList() -> Element {
         // member's own view, and a deputy you appointed rises under you (#410).
         let ordered_ids = deputy_display_order(owner_id, members, &deputizers_of, &viewer_relevant);
 
+        // Members of a mutual-ban cycle stay in `members` as enforced-banned
+        // tombstones, so their bans remain verifiable (freenet/river#702).
+        // They are not in the room, so they are not listed.
+        let enforced_banned = members.banned_member_ids(&room_state.bans, member_info, &params);
+
         // Build display list in tree order
         let mut all_members = Vec::new();
         for &member_id in &ordered_ids {
+            if enforced_banned.contains(&member_id) {
+                continue;
+            }
             let is_owner = member_id == owner_id;
 
             let nickname = member_info

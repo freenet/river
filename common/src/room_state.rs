@@ -90,8 +90,10 @@ impl ChatRoomStateV1 {
     /// or are in the invite chain of someone who qualifies. The owner is
     /// never in the members list (they're implicit via parameters).
     ///
-    /// Bans are only removed if the banner was themselves BANNED (orphaned ban).
-    /// If the banner was merely pruned for inactivity, their bans persist.
+    /// A ban is swept once its banner is no longer a member, which happens only
+    /// when the banner is themselves banned: a banner with a verifiable ban is
+    /// exempt from inactivity-prune. Members of a mutual-ban cycle stay in
+    /// `members` as enforced-banned tombstones so their bans persist (#702).
     ///
     /// IDEMPOTENCE / CONVERGENCE INVARIANT: this function MUST be idempotent
     /// (`cleanup(S) == cleanup(cleanup(S))`) and a pure function of the converged
@@ -193,22 +195,23 @@ impl ChatRoomStateV1 {
 
         // 0. Enforce bans from the CONVERGED (now capped) state, deputy-aware (#410).
         //
-        // `MembersV1::apply_delta` already removed members banned by the owner
-        // or an ancestor, but it ran BEFORE the sibling `member_info` field
-        // (which carries deputy grants) was applied, so it could not evaluate
-        // deputy authority. This pass runs after every field has been applied,
-        // so `self.member_info` is converged: it removes members banned by a
-        // currently-authorized deputy, and — crucially — does NOT remove
-        // members whose deputy was revoked (the deputizer removed them from
-        // `MemberInfo.deputies` at a higher version). Because the removal set
-        // is a pure function of the converged (members + deputies + bans)
-        // state, and bans stay an add-only CRDT (never pruned here), every peer
-        // converges to the same member set regardless of delta order. Kept in
-        // post_apply_cleanup (NOT verify) so verify stays stable across
-        // ban/deputy changes — mirrors the DM ban-sweep precedent.
-        let enforced_banned_ids =
-            self.members
-                .banned_member_ids(&self.bans, &self.member_info, parameters);
+        // `MembersV1::apply_delta` already removed some members banned by the
+        // owner or an ancestor, but it ran BEFORE the sibling `member_info`
+        // field (which carries deputy grants) was applied, and it keeps every
+        // ban issuer and their ancestors so that this step can still verify
+        // their bans. This pass runs after every field has been applied, so
+        // `self.member_info` is converged. `MembersV1::resolve_bans` decides
+        // which bans take effect (a ban whose issuer is removed does not,
+        // except the bans of a mutual-ban cycle, whose members are all
+        // removed: freenet/river#423, #702). Because the result is a pure
+        // function of the converged (members + deputies + bans) state, every
+        // peer converges to the same member set regardless of delta order.
+        // Kept in post_apply_cleanup (NOT verify) so verify stays stable
+        // across ban/deputy changes, mirroring the DM ban-sweep precedent.
+        let ban_resolution = self
+            .members
+            .resolve_bans(&self.bans, &self.member_info, parameters);
+        let enforced_banned_ids = ban_resolution.removed.clone();
 
         // THE load-bearing invariant of the freenet/river#675 remedy: the ban
         // set `DirectMessagesV1::apply_delta` derived, before this function
@@ -233,9 +236,45 @@ impl ChatRoomStateV1 {
              the apply-time DM sweep and the step-6 sweep are no longer the same predicate \
              (freenet/river#675)"
         );
-        self.members
-            .members
-            .retain(|m| !enforced_banned_ids.contains(&m.member.id()));
+        // Members of a mutual-ban cycle are enforced-banned but KEPT in
+        // `members`, together with any enforced-banned invite ancestors they
+        // need for a valid chain (freenet/river#702). Their in-cycle bans take
+        // effect, and a ban can only be verified while its issuer's
+        // `AuthorizedMember` is here: `MemberId` is not a cryptographic hash
+        // of the key, and a ban carries no key. Removing them would make both
+        // bans unverifiable on the next pass, step 5 would sweep them, and
+        // either moderator could rejoin with no ban left against them, which
+        // is the counter-ban escape Ian's rule forbids. It would also let a
+        // peer that has already removed B pass on B's counter-ban without
+        // B's key, where it cannot be told apart from a forgery.
+        //
+        // These retained members are removed from the room in every other
+        // sense: they are in `enforced_banned_ids`, their messages are swept
+        // at step 4b, their DMs at step 6, their invite subtree is removed,
+        // and their bans outside the cycle take no effect. This is the same
+        // mechanism as the step-2 exemption that keeps an inactive banner
+        // present so their ban stays enforceable.
+        let retained_banned_ids: HashSet<MemberId> = {
+            let members_by_id = self.members.members_by_member_id();
+            let mut retained = HashSet::new();
+            for cycle_member in &ban_resolution.cyclic {
+                let mut current = *cycle_member;
+                while current != owner_id
+                    && enforced_banned_ids.contains(&current)
+                    && retained.insert(current)
+                {
+                    match members_by_id.get(&current) {
+                        Some(m) => current = m.member.invited_by,
+                        None => break,
+                    }
+                }
+            }
+            retained
+        };
+        self.members.members.retain(|m| {
+            let id = m.member.id();
+            !enforced_banned_ids.contains(&id) || retained_banned_ids.contains(&id)
+        });
 
         // 1. Collect message author IDs + DM participants + secret recipients.
         //
@@ -283,18 +322,12 @@ impl ChatRoomStateV1 {
         // see for every id this loop can add: a counted participant lands in
         // `required_ids` and therefore survives step 3 unchanged.
         //
-        // `enforced_banned_ids` is passed but is PROVABLY INERT here, and that
-        // is deliberate rather than an oversight: step 0 has already removed
-        // every enforced-banned id from `self.members`, so
-        // `members_after_ban_enforcement` and `enforced_banned_ids` are
-        // disjoint and `dm_endpoint_is_live` never reaches the ban check at
-        // this site. Verified by a disjointness `debug_assert!` run in debug
-        // profile across the whole suite and all 25 captured live states — it
-        // never fired. It is kept because passing it makes this predicate
-        // IDENTICAL to step 6's by construction, which is the entire property
-        // this fix is about; dropping it would restore the two-copies shape
-        // that drifted apart in the first place. It also means this call site
-        // adds NO new coupling to freenet/river#413's cap eviction.
+        // `enforced_banned_ids` is passed so this predicate is IDENTICAL to
+        // step 6's by construction, which is the entire property this fix is
+        // about. It is no longer inert here: members retained at step 0 as
+        // mutual-ban tombstones are present AND enforced-banned, and their
+        // DMs must not count toward the exemption, exactly as step 6 sweeps
+        // them. (They are kept present by the step-2 banner exemption anyway.)
         let members_after_ban_enforcement: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
         let dm_participants: HashSet<MemberId> =
@@ -428,10 +461,14 @@ impl ChatRoomStateV1 {
         //     leave orphaned messages that fail `MessagesV1::verify`
         //     ("Message author not found"). Owner-authored messages are always
         //     valid.
+        //     Members retained only as mutual-ban tombstones (step 0) are
+        //     current members but enforced-banned, so their messages go too.
         let current_member_ids: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
         self.recent_messages.messages.retain(|m| {
-            m.message.author == owner_id || current_member_ids.contains(&m.message.author)
+            m.message.author == owner_id
+                || (current_member_ids.contains(&m.message.author)
+                    && !enforced_banned_ids.contains(&m.message.author))
         });
 
         // Rebuild the PUBLIC `actions_state` cache now that removed authors'

@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -142,15 +142,13 @@ impl ComposableState for MembersV1 {
             }
         }
 
-        // Always check for and remove banned members. During apply_delta the
-        // sibling `member_info` field (which carries deputy grants) has not
-        // been applied yet — field ordering applies `members` before
-        // `member_info` — so deputy authority cannot be evaluated correctly
-        // here. We therefore pass an EMPTY `member_info`, enforcing only the
-        // stable owner/ancestor authority. The full deputy-aware enforcement
-        // (which needs the converged deputy state) runs afterwards in
-        // `ChatRoomStateV1::post_apply_cleanup`. See #410.
-        self.remove_banned_members(&parent_state.bans, &MemberInfoV1::default(), parameters);
+        // Remove members banned by the owner or an ancestor now, so the
+        // `max_members` trim below does not count them. The sibling
+        // `member_info` field (deputy grants) has not been applied yet, so
+        // this is only a SUBSET of what `post_apply_cleanup` step 0 removes;
+        // see `remove_members_banned_before_member_info` for why it cannot
+        // change step 0's answer. See #410 and freenet/river#423.
+        self.remove_members_banned_before_member_info(&parent_state.bans, parameters);
 
         // Always enforce max members limit
         self.remove_excess_members(parameters, max_members);
@@ -222,52 +220,147 @@ impl MembersV1 {
         self.check_banned_members(bans_v1, parameters).is_some()
     }
 
-    /// Removes banned members or members downstream of banned members in the
-    /// invite chain, for every currently-AUTHORIZED ban (see
-    /// [`Self::banned_member_ids`]). A ban whose banner has no current
-    /// authority (e.g. a revoked deputy, #410) is inert and removes nobody.
-    fn remove_banned_members(
+    /// The early, partial ban removal run from `MembersV1::apply_delta`,
+    /// before `member_info` (deputy grants) has been applied.
+    ///
+    /// It resolves the bans with NO deputy grants, so only owner and ancestor
+    /// bans are considered. That set is contained in what step 0 removes with
+    /// the converged grants: an owner ban always takes effect, and an ancestor
+    /// ban's targets lie inside its issuer's subtree, so if the issuer is
+    /// removed at step 0 the targets go with them.
+    ///
+    /// It then KEEPS every member who issued any ban, and their invite
+    /// ancestors, even if they are in that set. Step 0 needs an issuer's key
+    /// to verify their ban, and their chain to evaluate it, and a mutual ban
+    /// can make that ban take effect even though its issuer is removed. The
+    /// members removed here therefore issue no ban and are nobody's ancestor
+    /// among the issuers: they are sinks of the ban graph, so removing them
+    /// early cannot change which bans take effect at step 0 (freenet/river#423).
+    fn remove_members_banned_before_member_info(
         &mut self,
         bans_v1: &BansV1,
-        member_info: &MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) {
-        let banned_ids = self.banned_member_ids(bans_v1, member_info, parameters);
+        let removed = self
+            .resolve_bans(bans_v1, &MemberInfoV1::default(), parameters)
+            .removed;
+        if removed.is_empty() {
+            return;
+        }
+        let owner_id = parameters.owner_id();
+        let members_by_id = self.members_by_member_id();
+        let mut keep: HashSet<MemberId> = HashSet::new();
+        for ban in &bans_v1.0 {
+            let mut current = ban.banned_by;
+            while current != owner_id && keep.insert(current) {
+                match members_by_id.get(&current) {
+                    Some(m) => current = m.member.invited_by,
+                    None => break,
+                }
+            }
+        }
         self.members
-            .retain(|m| !banned_ids.contains(&m.member.id()));
+            .retain(|m| !removed.contains(&m.member.id()) || keep.contains(&m.member.id()));
     }
 
-    /// The set of member ids that must be removed because they are the target
-    /// of (or downstream of the target of) a currently-authorized ban.
-    ///
-    /// This is the deputy-aware member cascade (#410). It is a **pure function
-    /// of the converged `(members + member_info deputies + bans)` state**, so
-    /// every peer computes the same removal set regardless of the order deltas
-    /// arrived in — which is why enforcement lives here / in
-    /// `ChatRoomStateV1::post_apply_cleanup`, NOT in `verify` (flipping ban
-    /// validity inside `verify` would make it non-stable across deputy-state
-    /// changes and break convergence). Bans themselves are never pruned by this
-    /// (they remain an add-only CRDT tombstone set); revoking a deputy simply
-    /// makes their bans stop being authorized, so the previously-removed
-    /// members are no longer in this set and can rejoin.
+    /// The set of member ids that must be removed by the room's bans: see
+    /// [`Self::resolve_bans`] for the rule. Shared by `post_apply_cleanup`
+    /// step 0, the step 0-cap eviction (through `enforced_ban_set_of`) and the
+    /// DM sweep, so all three read one definition.
     pub fn banned_member_ids(
         &self,
         bans_v1: &BansV1,
         member_info: &MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) -> HashSet<MemberId> {
+        self.resolve_bans(bans_v1, member_info, parameters).removed
+    }
+
+    /// Decide which bans take effect, as a pure function of the converged
+    /// `(members + member_info deputies + bans)` state (freenet/river#423,
+    /// #702). Every peer computes the same result regardless of the order in
+    /// which deltas arrived, which is why this runs from
+    /// `ChatRoomStateV1::post_apply_cleanup` and NOT from `verify` (#410).
+    ///
+    /// # The rule (Ian, 2026-09-23)
+    ///
+    /// A ban does not take effect if its issuer is themselves removed by a ban
+    /// that does, EXCEPT in a mutual ban, where both bans take effect and both
+    /// issuers are removed. A moderator facing a ban cannot escape it by
+    /// counter-banning. Cycles longer than two are treated the same way: every
+    /// member of a mutual-ban cycle is removed.
+    ///
+    /// # Formalization
+    ///
+    /// 1. **Valid bans.** A ban is considered only if its signature verifies
+    ///    against its issuer's CURRENT key
+    ///    ([`BansV1::ban_signature_matches_current_key`], #411 round 4 A: the
+    ///    issuer must be the owner or a current member) and the issuer is
+    ///    authorized to ban the target ([`Self::is_ban_authorized`]). A ban
+    ///    that cannot be verified here, because its issuer is absent, takes no
+    ///    effect. `post_apply_cleanup` step 5 then sweeps it.
+    /// 2. **Reach.** A ban on `t` would remove `t` and `t`'s whole invite
+    ///    subtree (the cascade the room has always applied). "The issuer is
+    ///    removed" uses the same notion, so a member removed by the cascade of
+    ///    a ban on their inviter is removed like the target.
+    /// 3. **Graph.** Draw an edge `I -> Y` for every valid ban from `I` and
+    ///    every `Y` in its reach, except `Y == I`. A ban that would remove its
+    ///    own issuer (a self-ban, or a moderator banning their own inviter) is
+    ///    not a cycle: its effect cannot void itself.
+    /// 4. **Cycles.** Every member of a strongly connected component with two
+    ///    or more members is removed. A ban from a member of such a component
+    ///    takes effect iff its reach meets the component (it is one of the
+    ///    mutual bans). Their other bans do not, because their issuer is removed.
+    /// 5. **Everything else**, in topological order of the component graph: a
+    ///    ban from `I` takes effect iff `I` has not been removed by a ban that
+    ///    took effect earlier. The owner can never be a target, so owner bans
+    ///    always take effect.
+    ///
+    /// Edges only point from an issuer to the members its ban would remove, so
+    /// whether `I` is removed is settled before `I`'s own component is
+    /// processed, and the result does not depend on ban order.
+    pub fn resolve_bans(
+        &self,
+        bans_v1: &BansV1,
+        member_info: &MemberInfoV1,
+        parameters: &ChatRoomParametersV1,
+    ) -> BanResolution {
         let owner_id = parameters.owner_id();
         let members_by_id = self.members_by_member_id();
-        let mut banned_ids = HashSet::new();
+
+        let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
+        for m in &self.members {
+            children
+                .entry(m.member.invited_by)
+                .or_default()
+                .push(m.member.id());
+        }
+        let reach_of = |target: MemberId| -> BTreeSet<MemberId> {
+            let mut reach = BTreeSet::new();
+            reach.insert(target);
+            let mut stack = vec![target];
+            while let Some(current) = stack.pop() {
+                if let Some(kids) = children.get(&current) {
+                    for kid in kids {
+                        if reach.insert(*kid) {
+                            stack.push(*kid);
+                        }
+                    }
+                }
+            }
+            reach
+        };
+
+        // Step 1-2: the valid bans, grouped by issuer, each with its reach.
+        let mut valid: BTreeMap<MemberId, Vec<BTreeSet<MemberId>>> = BTreeMap::new();
         for ban in &bans_v1.0 {
-            // A ban only enforces if its signature verifies against the banner's
-            // CURRENT converged key (#411 round 4 A). `verify` skips the signature
-            // for a banner absent at bans-apply time (bans apply before members),
-            // so a delta that re-adds a pruned deputy via their public
-            // `AuthorizedMember` AND carries a garbage-signature ban attributed to
-            // them must be re-checked here — otherwise the retained deputy grant
-            // would remove members via a ban forged without the deputy's key. This
-            // never rejects a genuine ban (a member's id is the hash of their key).
+            // A ban only enforces if its signature verifies against the
+            // issuer's CURRENT converged key (#411 round 4 A). `apply_delta`
+            // skips the signature for an issuer absent at bans-apply time
+            // (bans apply before members), so a delta that re-adds an issuer
+            // via their public `AuthorizedMember` together with a
+            // garbage-signature ban must be re-checked here. This never
+            // rejects a genuine ban (a member's id is the hash of their key).
             if !BansV1::ban_signature_matches_current_key(
                 ban,
                 &members_by_id,
@@ -276,18 +369,64 @@ impl MembersV1 {
             ) {
                 continue;
             }
-            if Self::is_ban_authorized(
+            if !Self::is_ban_authorized(
                 ban.banned_by,
                 ban.ban.banned_user,
                 &members_by_id,
                 member_info,
                 owner_id,
             ) {
-                banned_ids.insert(ban.ban.banned_user);
-                banned_ids.extend(self.get_downstream_members(ban.ban.banned_user));
+                continue;
+            }
+            valid
+                .entry(ban.banned_by)
+                .or_default()
+                .push(reach_of(ban.ban.banned_user));
+        }
+
+        // Step 3: the graph. Nodes are issuers and the members they reach.
+        let mut adjacency: BTreeMap<MemberId, BTreeSet<MemberId>> = BTreeMap::new();
+        for (issuer, reaches) in &valid {
+            let out = adjacency.entry(*issuer).or_default();
+            for reach in reaches {
+                out.extend(reach.iter().copied().filter(|y| y != issuer));
             }
         }
-        banned_ids
+        let targets: Vec<MemberId> = adjacency.values().flatten().copied().collect();
+        for y in targets {
+            adjacency.entry(y).or_default();
+        }
+
+        // Steps 4-5, sources first.
+        let mut removed: HashSet<MemberId> = HashSet::new();
+        let mut cyclic: HashSet<MemberId> = HashSet::new();
+        for component in strongly_connected_components(&adjacency).into_iter().rev() {
+            let in_cycle = component.len() >= 2;
+            for issuer in &component {
+                let Some(reaches) = valid.get(issuer) else {
+                    continue;
+                };
+                for reach in reaches {
+                    let takes_effect = if in_cycle {
+                        reach.iter().any(|y| component.contains(y))
+                    } else {
+                        !removed.contains(issuer)
+                    };
+                    if takes_effect {
+                        removed.extend(reach.iter().copied());
+                    }
+                }
+            }
+            if in_cycle {
+                removed.extend(component.iter().copied());
+                cyclic.extend(component);
+            }
+        }
+        // The owner is never a target (`is_ban_authorized` denies it), so this
+        // cannot fire; kept so a future authority change cannot silently turn a
+        // ban of the owner into a ban of the whole room.
+        removed.remove(&owner_id);
+        BanResolution { removed, cyclic }
     }
 
     /// Whether `banner` is currently authorized to ban `target` (#410).
@@ -396,21 +535,6 @@ impl MembersV1 {
             }
         }
         false
-    }
-
-    /// Helper function to get all downstream members of a given member
-    fn get_downstream_members(&self, member_id: MemberId) -> HashSet<MemberId> {
-        let mut downstream = HashSet::new();
-        let mut to_check = vec![member_id];
-        while let Some(current) = to_check.pop() {
-            for member in &self.members {
-                if member.member.invited_by == current {
-                    downstream.insert(member.member.id());
-                    to_check.push(member.member.id());
-                }
-            }
-        }
-        downstream
     }
 
     /// If the number of members exceeds the specified limit, remove the members with the longest invite chains
@@ -610,6 +734,82 @@ impl MembersV1 {
         }
         chain_ids
     }
+}
+
+/// The outcome of [`MembersV1::resolve_bans`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BanResolution {
+    /// Every member id a ban removes: targets, their invite subtrees, and the
+    /// members of mutual-ban cycles. May name ids that are already absent.
+    pub removed: HashSet<MemberId>,
+    /// The members of mutual-ban cycles (a subset of `removed`).
+    pub cyclic: HashSet<MemberId>,
+}
+
+/// Strongly connected components of `graph`, in reverse topological order
+/// (a component comes before every component that has an edge into it).
+/// Iterative Tarjan, so a long ban chain cannot overflow the WASM stack.
+/// Deterministic: `BTreeMap`/`BTreeSet` iteration fixes the visit order.
+fn strongly_connected_components(
+    graph: &BTreeMap<MemberId, BTreeSet<MemberId>>,
+) -> Vec<BTreeSet<MemberId>> {
+    let mut index_of: HashMap<MemberId, usize> = HashMap::new();
+    let mut lowlink: HashMap<MemberId, usize> = HashMap::new();
+    let mut on_stack: HashSet<MemberId> = HashSet::new();
+    let mut stack: Vec<MemberId> = Vec::new();
+    let mut components = Vec::new();
+    let mut next_index = 0usize;
+    let empty = BTreeSet::new();
+
+    for &root in graph.keys() {
+        if index_of.contains_key(&root) {
+            continue;
+        }
+        // Each frame: the node and an iterator over its successors.
+        let mut frames: Vec<(MemberId, std::collections::btree_set::Iter<'_, MemberId>)> =
+            Vec::new();
+        index_of.insert(root, next_index);
+        lowlink.insert(root, next_index);
+        next_index += 1;
+        stack.push(root);
+        on_stack.insert(root);
+        frames.push((root, graph.get(&root).unwrap_or(&empty).iter()));
+
+        while let Some((node, successors)) = frames.last_mut() {
+            let node = *node;
+            if let Some(&next) = successors.next() {
+                if let std::collections::hash_map::Entry::Vacant(slot) = index_of.entry(next) {
+                    slot.insert(next_index);
+                    lowlink.insert(next, next_index);
+                    next_index += 1;
+                    stack.push(next);
+                    on_stack.insert(next);
+                    frames.push((next, graph.get(&next).unwrap_or(&empty).iter()));
+                } else if on_stack.contains(&next) {
+                    let low = lowlink[&node].min(index_of[&next]);
+                    lowlink.insert(node, low);
+                }
+                continue;
+            }
+            frames.pop();
+            if let Some((parent, _)) = frames.last() {
+                let low = lowlink[parent].min(lowlink[&node]);
+                lowlink.insert(*parent, low);
+            }
+            if lowlink[&node] == index_of[&node] {
+                let mut component = BTreeSet::new();
+                while let Some(member) = stack.pop() {
+                    on_stack.remove(&member);
+                    component.insert(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                components.push(component);
+            }
+        }
+    }
+    components
 }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
@@ -1171,7 +1371,7 @@ mod tests {
 
         // Test case 1: No banned members
         let empty_bans = BansV1(vec![]);
-        members.remove_banned_members(&empty_bans, &MemberInfoV1::default(), &parameters);
+        members.remove_members_banned_before_member_info(&empty_bans, &parameters);
         assert_eq!(members.members.len(), 4);
 
         // Test case 2: One banned member
@@ -1182,7 +1382,7 @@ mod tests {
         };
         let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
         let bans = BansV1(vec![authorized_ban]);
-        members.remove_banned_members(&bans, &MemberInfoV1::default(), &parameters);
+        members.remove_members_banned_before_member_info(&bans, &parameters);
         assert_eq!(members.members.len(), 2);
         assert!(members
             .members
@@ -1217,7 +1417,7 @@ mod tests {
         };
         let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
         let bans = BansV1(vec![authorized_ban]);
-        members.remove_banned_members(&bans, &MemberInfoV1::default(), &parameters);
+        members.remove_members_banned_before_member_info(&bans, &parameters);
         assert_eq!(members.members.len(), 3);
         assert!(members
             .members
