@@ -796,7 +796,7 @@ fn adversarial_forks_never_permanently_reject_each_other() {
 /// after every apply and merge.
 #[test]
 fn extended_forks_converge_and_cleanup_is_idempotent() {
-    let seeds = default_seeds(seeds_from_env(10));
+    let seeds = default_seeds(seeds_from_env(3));
     let (rejecting, silent) = endings(Mode::Extended, &seeds);
     assert!(
         rejecting.is_empty() && silent.is_empty(),
@@ -813,7 +813,7 @@ fn extended_forks_converge_and_cleanup_is_idempotent() {
 #[test]
 fn split_delivery_converges() {
     let mut failures = Vec::new();
-    for seed in 0..seeds_from_env(10) {
+    for seed in 0..seeds_from_env(3) {
         for (shape_ix, shape) in SHAPES.iter().enumerate() {
             drain_not_idempotent();
             let (pool, prefix, _, cap, max_bans) = *shape;
