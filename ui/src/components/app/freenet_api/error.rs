@@ -18,6 +18,12 @@ pub enum SynchronizerError {
     #[error("WebSocket connection error: {message}")]
     DelegateMissing { key: DelegateKey, message: String },
 
+    /// The node's typed `DelegateError::RegisterError` for `key`, kept
+    /// structured so the room load can stop waiting for the register reply
+    /// (freenet/river#709). Displays like `WebSocketError`.
+    #[error("WebSocket connection error: {message}")]
+    DelegateRegisterFailed { key: DelegateKey, message: String },
+
     #[error("WebSocket operation not supported: {0}")]
     WebSocketNotSupported(String),
 
@@ -89,6 +95,12 @@ impl SynchronizerError {
                     message: error.to_string(),
                 }
             }
+            ErrorKind::RequestError(RequestError::DelegateError(DelegateError::RegisterError(
+                key,
+            ))) => SynchronizerError::DelegateRegisterFailed {
+                key: key.clone(),
+                message: error.to_string(),
+            },
             _ => SynchronizerError::WebSocketError(error.to_string()),
         }
     }
@@ -97,6 +109,14 @@ impl SynchronizerError {
     pub fn missing_delegate_key(&self) -> Option<&DelegateKey> {
         match self {
             SynchronizerError::DelegateMissing { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The delegate a typed `DelegateError::RegisterError` names, if this is one.
+    pub fn register_failed_key(&self) -> Option<&DelegateKey> {
+        match self {
+            SynchronizerError::DelegateRegisterFailed { key, .. } => Some(key),
             _ => None,
         }
     }

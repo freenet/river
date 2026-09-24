@@ -553,6 +553,31 @@ pub fn owner_vk_to_legacy_contract_keys(owner_vk: &VerifyingKey) -> Vec<Contract
 }
 
 #[cfg(test)]
+/// Source text with `//` comments removed (outside string literals), so a
+/// commented-out call cannot satisfy a wiring pin.
+pub(crate) fn strip_line_comments(src: &str) -> String {
+    src.lines()
+        .map(|line| {
+            let mut in_str = false;
+            let bytes = line.as_bytes();
+            let mut i = 0;
+            while i + 1 < bytes.len() {
+                match bytes[i] {
+                    b'\\' if in_str => i += 1,
+                    b'\'' if !in_str && bytes.get(i + 1..i + 3) == Some(b"\"'") => i += 2,
+                    b'"' => in_str = !in_str,
+                    b'/' if !in_str && bytes[i + 1] == b'/' => return &line[..i],
+                    _ => {}
+                }
+                i += 1;
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::NaiveDate;

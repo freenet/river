@@ -209,9 +209,13 @@ Legacy migration is **gated on the current delegate's state** to avoid a race
 where stale legacy data overwrites newer state on the current delegate
 (freenet/river#253). The flow:
 
-1. On startup, `set_up_chat_delegate()` fires `fire_list_rooms_request()` (a
-   `ListRequest`) AND `fire_load_outbound_dms_request()` for the **current**
-   delegate only. It does NOT fire the legacy probes. (The startup load is now
+1. On startup, `set_up_chat_delegate()` sends `RegisterDelegate`, waits for the
+   node's reply to it (freenet/river#709; bounded by `REGISTER_ACK_TIMEOUT_MS`),
+   and then fires `fire_list_rooms_request()` (a `ListRequest`) AND
+   `fire_load_outbound_dms_request()` for the **current** delegate only. Sending
+   them without the wait let the node run them before the register on the first
+   load after a re-key, so the load never started. It does NOT fire the legacy
+   probes. (The startup load is now
    List-driven, not a `GetRequest{rooms_data}`, because the per-room keys are
    dynamic and must be discovered.)
 2. `LEGACY_DELEGATES` is generated at compile time from `legacy_delegates.toml`
