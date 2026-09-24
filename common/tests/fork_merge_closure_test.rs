@@ -23,8 +23,32 @@ use river_core::room_state::member::{AuthorizedMember, Member, MemberId, Members
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
+
+thread_local! {
+    /// Idempotence violations seen by `apply` / `merge` since the last drain.
+    static NOT_IDEMPOTENT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `post_apply_cleanup` must be a fixpoint on every state a peer can hold:
+/// Freenet runs it a variable number of times, and full-state PUTs bypass it,
+/// so `cleanup(S) != S` for a stored `S` diverges peers. Repeated gossip hides
+/// a pass-1/pass-2 difference (the next merge runs cleanup again), which is
+/// why this is checked after EVERY apply and merge rather than inferred from
+/// convergence (#702 review round 5).
+fn check_idempotent(s: &ChatRoomStateV1, p: &ChatRoomParametersV1, what: &str) {
+    let mut again = s.clone();
+    let _ = again.post_apply_cleanup(p);
+    if ser(&again) != ser(s) {
+        NOT_IDEMPOTENT.with(|v| v.borrow_mut().push(what.to_string()));
+    }
+}
+
+fn drain_not_idempotent() -> Vec<String> {
+    NOT_IDEMPOTENT.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
 
 struct PoolMember {
     sk: SigningKey,
@@ -320,6 +344,210 @@ fn random_op(
     }
 }
 
+fn op_for(
+    w: &World,
+    rng: &mut StdRng,
+    state: &ChatRoomStateV1,
+    clock: &mut ForkClock,
+    t: u64,
+    mode: Mode,
+) -> ChatRoomStateV1Delta {
+    if mode == Mode::Extended && rng.gen_bool(0.5) {
+        random_op_ext(w, rng, state, clock, t)
+    } else {
+        random_op(w, rng, state, clock, t, mode)
+    }
+}
+
+fn sign_ban(w: &World, by: Option<usize>, target: usize, at: u64) -> AuthorizedUserBan {
+    let ban = UserBan {
+        owner_member_id: w.owner_id,
+        banned_at: w.base_time + Duration::from_secs(at),
+        banned_user: w.pool[target].id,
+    };
+    match by {
+        None => AuthorizedUserBan::new(ban, w.owner_id, &w.owner_sk),
+        Some(b) => AuthorizedUserBan::new(ban, w.pool[b].id, &w.pool[b].sk),
+    }
+}
+
+/// The extra operation shapes of `Mode::Extended` (review round 5).
+fn random_op_ext(
+    w: &World,
+    rng: &mut StdRng,
+    state: &ChatRoomStateV1,
+    clock: &mut ForkClock,
+    t: u64,
+) -> ChatRoomStateV1Delta {
+    let n = w.pool.len();
+    let present: Vec<usize> = (0..n)
+        .filter(|&i| {
+            state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.id() == w.pool[i].id)
+        })
+        .collect();
+    let pick = |rng: &mut StdRng, from: &[usize]| -> Option<usize> {
+        if from.is_empty() {
+            None
+        } else {
+            Some(from[rng.gen_range(0..from.len())])
+        }
+    };
+    let bans = |v: Vec<AuthorizedUserBan>| ChatRoomStateV1Delta {
+        bans: Some(v),
+        ..Default::default()
+    };
+    match rng.gen_range(0..9) {
+        // A ban chain in one delta: A bans T and T bans Y, preferring an
+        // ancestor A of T (ancestor authority) and T an ancestor of Y.
+        0 => {
+            let Some(y) = pick(rng, &present) else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let chain = w.chain(y);
+            let tt = if chain.len() >= 2 {
+                chain[chain.len() - 2]
+            } else {
+                rng.gen_range(0..n)
+            };
+            let a = if chain.len() >= 3 {
+                Some(chain[chain.len() - 3])
+            } else {
+                pick(rng, &present)
+            };
+            bans(vec![sign_ban(w, a, tt, t), sign_ban(w, Some(tt), y, t)])
+        }
+        // A mutual pair or a 3-cycle among any pool members.
+        1 => {
+            let (a, b, c) = (
+                rng.gen_range(0..n),
+                rng.gen_range(0..n),
+                rng.gen_range(0..n),
+            );
+            if rng.gen_bool(0.5) {
+                bans(vec![sign_ban(w, Some(a), b, t), sign_ban(w, Some(b), a, t)])
+            } else {
+                bans(vec![
+                    sign_ban(w, Some(a), b, t),
+                    sign_ban(w, Some(b), c, t),
+                    sign_ban(w, Some(c), a, t),
+                ])
+            }
+        }
+        // An ancestor ban on a present member.
+        2 => {
+            let Some(y) = pick(rng, &present) else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let chain = w.chain(y);
+            if chain.len() < 2 {
+                return ChatRoomStateV1Delta::default();
+            }
+            let a = chain[rng.gen_range(0..chain.len() - 1)];
+            bans(vec![sign_ban(w, Some(a), y, t)])
+        }
+        // A rule-5 deputy grant and a ban under it, in one delta: A lists D,
+        // and D bans someone in A's subtree.
+        3 => {
+            let Some(y) = pick(rng, &present) else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let chain = w.chain(y);
+            if chain.len() < 2 {
+                return ChatRoomStateV1Delta::default();
+            }
+            let a = chain[rng.gen_range(0..chain.len() - 1)];
+            let d = rng.gen_range(0..n);
+            let v = clock.info_version.entry(a).or_insert(0);
+            *v += 1;
+            let mut info = MemberInfo::new_public(w.pool[a].id, *v, format!("g{a}"));
+            info.deputies = vec![w.pool[d].id];
+            ChatRoomStateV1Delta {
+                member_info: Some(vec![AuthorizedMemberInfo::new_with_member_key(
+                    info,
+                    &w.pool[a].sk,
+                )]),
+                bans: Some(vec![sign_ban(w, Some(d), y, t)]),
+                ..Default::default()
+            }
+        }
+        // Far-future sybil pairs under ban-cap pressure: two mutual pairs
+        // dated a century ahead.
+        4 => {
+            let far = t + 3_000_000_000;
+            let (a, b, c, d) = (
+                rng.gen_range(0..n),
+                rng.gen_range(0..n),
+                rng.gen_range(0..n),
+                rng.gen_range(0..n),
+            );
+            bans(vec![
+                sign_ban(w, Some(a), b, far),
+                sign_ban(w, Some(b), a, far),
+                sign_ban(w, Some(c), d, far + 1),
+                sign_ban(w, Some(d), c, far + 1),
+            ])
+        }
+        // The owner bans anyone (often a member already banned by others).
+        5 => bans(vec![sign_ban(w, None, rng.gen_range(0..n), t)]),
+        // A self-removing ban: a self-ban or a ban on one's own ancestor.
+        6 => {
+            let x = rng.gen_range(0..n);
+            let chain = w.chain(x);
+            let target = chain[rng.gen_range(0..chain.len())];
+            bans(vec![sign_ban(w, Some(x), target, t)])
+        }
+        // Joins that push the room over `max_members`, with a ban riding along.
+        7 => {
+            let mut members = Vec::new();
+            let mut msgs = Vec::new();
+            for _ in 0..3 {
+                let i = rng.gen_range(0..n);
+                for &c in &w.chain(i) {
+                    members.push(w.pool[c].auth.clone());
+                    msgs.push(w.msg(Some(c), t, &format!("flood {c}@{t}")));
+                }
+            }
+            let (a, b) = (rng.gen_range(0..n), rng.gen_range(0..n));
+            ChatRoomStateV1Delta {
+                members: Some(MembersDelta::new(members)),
+                recent_messages: Some(msgs),
+                bans: Some(vec![sign_ban(w, Some(a), b, t)]),
+                ..Default::default()
+            }
+        }
+        // A removed member replays their own record (with its chain) and a
+        // counter-ban on whoever banned them.
+        _ => {
+            let banned: Vec<(usize, MemberId)> = state
+                .bans
+                .0
+                .iter()
+                .filter_map(|b| {
+                    let x = (0..n).find(|&i| w.pool[i].id == b.ban.banned_user)?;
+                    (!present.contains(&x)).then_some((x, b.banned_by))
+                })
+                .collect();
+            if banned.is_empty() {
+                return ChatRoomStateV1Delta::default();
+            }
+            let (x, by) = banned[rng.gen_range(0..banned.len())];
+            let Some(d) = (0..n).find(|&i| w.pool[i].id == by) else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let members = w.chain(x).iter().map(|&c| w.pool[c].auth.clone()).collect();
+            ChatRoomStateV1Delta {
+                members: Some(MembersDelta::new(members)),
+                bans: Some(vec![sign_ban(w, Some(x), d, t)]),
+                ..Default::default()
+            }
+        }
+    }
+}
+
 fn apply(
     state: &mut ChatRoomStateV1,
     params: &ChatRoomParametersV1,
@@ -329,6 +557,7 @@ fn apply(
     let mut next = state.clone();
     match next.apply_delta(&parent, params, &Some(d)) {
         Ok(()) if next.verify(&next, params).is_ok() => {
+            check_idempotent(&next, params, "apply");
             *state = next;
             true
         }
@@ -346,6 +575,7 @@ fn merge(
     s.merge(&parent, p, b)?;
     s.verify(&s, p)
         .map_err(|e| format!("merged state fails verify: {e}"))?;
+    check_idempotent(&s, p, "merge");
     Ok(s)
 }
 
@@ -363,6 +593,14 @@ enum Mode {
     /// record is still validly signed by its claimed author: this is what a
     /// current or former member can produce at will, not a forgery.
     Adversarial,
+    /// Adversarial, plus the ban shapes review round 5 found the generator
+    /// never produced: several bans in one delta (chains, mutual pairs,
+    /// 3-cycles), ancestor bans, a deputy grant and a ban under it in one
+    /// delta, far-future sybil cycles under ban-cap pressure, owner bans on
+    /// banned members, self-removing bans, joins that push the room over
+    /// `max_members` together with a ban, and a removed member replaying their
+    /// own record with a counter-ban. See `random_op_ext`.
+    Extended,
 }
 
 /// Shapes: (pool size, common-prefix ops, ops per fork, max_recent_messages,
@@ -385,7 +623,7 @@ fn fork_pair(
     let mut t = 0u64;
     for _ in 0..prefix {
         t += 1;
-        let d = random_op(&w, &mut rng, &base, &mut clock, t, mode);
+        let d = op_for(&w, &mut rng, &base, &mut clock, t, mode);
         apply(&mut base, &w.params, d);
     }
     let (mut a, mut b) = (base.clone(), base);
@@ -400,10 +638,10 @@ fn fork_pair(
     cb.config_offset = 1000;
     for _ in 0..fork_ops {
         t += 1;
-        let d = random_op(&w, &mut rng, &a, &mut ca, t, mode);
+        let d = op_for(&w, &mut rng, &a, &mut ca, t, mode);
         apply(&mut a, &w.params, d);
         t += 1;
-        let d = random_op(&w, &mut rng, &b, &mut cb, t, mode);
+        let d = op_for(&w, &mut rng, &b, &mut cb, t, mode);
         apply(&mut b, &w.params, d);
     }
     (w, a, b)
@@ -476,12 +714,25 @@ fn default_seeds(n: u64) -> Vec<(u64, usize)> {
         .collect()
 }
 
-/// Returns (permanent rejections, silent divergences), each as a readable line.
+/// Returns (permanent rejections, silent divergences), each as a readable
+/// line. A pair whose cleanup was not idempotent at some apply or merge counts
+/// as silently diverged, with the reason.
 fn endings(mode: Mode, seeds: &[(u64, usize)]) -> (Vec<String>, Vec<String>) {
     let (mut rejecting, mut silent) = (Vec::new(), Vec::new());
     for &(seed, shape) in seeds {
+        drain_not_idempotent();
         let (w, a, b) = fork_pair(seed, SHAPES[shape], mode);
-        match ending(&w, &a, &b) {
+        let end = ending(&w, &a, &b);
+        let broken = drain_not_idempotent();
+        if !broken.is_empty() {
+            silent.push(format!(
+                "seed {seed} shape {shape}: cleanup not idempotent after {} ({} times)",
+                broken[0],
+                broken.len()
+            ));
+            continue;
+        }
+        match end {
             Ending::Converged => {}
             Ending::Rejecting(e) => rejecting.push(format!(
                 "seed {seed} shape {shape}: {}",
@@ -538,4 +789,93 @@ fn adversarial_forks_never_permanently_reject_each_other() {
         rejecting.join("\n"),
         silent.join("\n")
     );
+}
+
+/// `Mode::Extended` (review round 5): the ban shapes the adversarial mode
+/// never produced. Every pair must converge, and cleanup must be a fixpoint
+/// after every apply and merge.
+#[test]
+fn extended_forks_converge_and_cleanup_is_idempotent() {
+    let seeds = default_seeds(seeds_from_env(10));
+    let (rejecting, silent) = endings(Mode::Extended, &seeds);
+    assert!(
+        rejecting.is_empty() && silent.is_empty(),
+        "extended fork pairs that fail, of {}:\nPERMANENTLY REJECTING:\n{}\nsilent or non-idempotent:\n{}",
+        seeds.len(),
+        rejecting.join("\n"),
+        silent.join("\n")
+    );
+}
+
+/// Delivery-split equivalence: the same few bans (extended shapes) delivered
+/// as one delta to one peer, and one ban per peer to three others, must end in
+/// one state after gossip, with cleanup idempotent throughout.
+#[test]
+fn split_delivery_converges() {
+    let mut failures = Vec::new();
+    for seed in 0..seeds_from_env(10) {
+        for (shape_ix, shape) in SHAPES.iter().enumerate() {
+            drain_not_idempotent();
+            let (pool, prefix, _, cap, max_bans) = *shape;
+            let mut rng = StdRng::seed_from_u64(seed ^ 0x5eed);
+            let w = World::new(&mut rng, pool);
+            let mut base = w.initial_state(cap, max_bans);
+            let mut clock = ForkClock::default();
+            let mut t = 0;
+            for _ in 0..prefix {
+                t += 1;
+                let d = op_for(&w, &mut rng, &base, &mut clock, t, Mode::Extended);
+                apply(&mut base, &w.params, d);
+            }
+            let mut pieces: Vec<AuthorizedUserBan> = Vec::new();
+            while pieces.len() < 3 {
+                t += 1;
+                if let Some(b) = random_op_ext(&w, &mut rng, &base, &mut clock, t).bans {
+                    pieces.extend(b);
+                }
+            }
+            pieces.truncate(4);
+            let mut peers = vec![base.clone()];
+            apply(
+                &mut peers[0],
+                &w.params,
+                ChatRoomStateV1Delta {
+                    bans: Some(pieces.clone()),
+                    ..Default::default()
+                },
+            );
+            for b in &pieces {
+                let mut p = base.clone();
+                apply(
+                    &mut p,
+                    &w.params,
+                    ChatRoomStateV1Delta {
+                        bans: Some(vec![b.clone()]),
+                        ..Default::default()
+                    },
+                );
+                peers.push(p);
+            }
+            for _round in 0..6 {
+                for i in 0..peers.len() {
+                    for j in 0..peers.len() {
+                        if i != j {
+                            if let Ok(m) = merge(&peers[i], &peers[j], &w.params) {
+                                peers[i] = m;
+                            }
+                        }
+                    }
+                }
+            }
+            let broken = drain_not_idempotent();
+            if !broken.is_empty() {
+                failures.push(format!(
+                    "seed {seed} shape {shape_ix}: cleanup not idempotent"
+                ));
+            } else if peers.iter().any(|p| ser(p) != ser(&peers[0])) {
+                failures.push(format!("seed {seed} shape {shape_ix}: peers differ"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
