@@ -14,6 +14,9 @@ pub struct OptionalUpgradeV1(pub Option<AuthorizedUpgradeV1>);
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthorizedUpgradeV1 {
     pub upgrade: UpgradeV1,
+    /// Encoded as a CBOR byte string, accepting the legacy array form on
+    /// read; see [`crate::util::sig_serde`] (freenet/river#575).
+    #[serde(with = "crate::util::sig_serde")]
     pub signature: Signature,
 }
 

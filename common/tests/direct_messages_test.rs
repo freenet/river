@@ -1354,6 +1354,61 @@ fn direct_messages_wire_format_locked() {
     );
 }
 
+/// The pre-freenet/river#575 snapshot of the exact same fixture, kept as a
+/// permanent legacy-decode fixture. It was written by the code as it stood
+/// before signatures moved to a CBOR byte string, so its `sender_signature` and
+/// `recipient_signature` are genuinely in the legacy array-of-integers form —
+/// not something this test could have produced accidentally.
+///
+/// Two assertions, and both matter:
+///
+/// * it still decodes — this is the arm that keeps pre-#575 rooms alive across
+///   the contract migration, which re-PUTs existing state;
+/// * re-encoding what it decodes to yields the CURRENT snapshot, byte for byte
+///   — so old bytes are canonicalized on the way through and cannot alias to a
+///   second on-wire representation of the same state between peers.
+///
+/// Do NOT regenerate this file. It is a frozen historical artifact; if it ever
+/// stops decoding, the legacy arm of `util::sig_serde` has been broken and
+/// every existing room would be stranded.
+#[test]
+fn legacy_signature_array_wire_format_still_decodes_and_canonicalizes() {
+    let tests_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let legacy_hex =
+        std::fs::read_to_string(tests_dir.join("direct_messages_wire_format_legacy_sig_array.hex"))
+            .expect("frozen pre-#575 wire-format fixture must be present");
+    let legacy_bytes = data_encoding::HEXLOWER
+        .decode(legacy_hex.trim().as_bytes())
+        .expect("fixture must be valid hex");
+
+    let decoded: DirectMessagesV1 = ciborium::de::from_reader(legacy_bytes.as_slice())
+        .expect("pre-#575 direct-message state must still decode");
+    assert_eq!(decoded.messages.len(), 1);
+    assert_eq!(decoded.purges.len(), 1);
+
+    let mut re_encoded = Vec::new();
+    ciborium::ser::into_writer(&decoded, &mut re_encoded).unwrap();
+    assert_ne!(
+        re_encoded, legacy_bytes,
+        "the legacy fixture must NOT already be in the byte-string form, or \
+         this test proves nothing"
+    );
+    assert!(
+        re_encoded.len() < legacy_bytes.len(),
+        "the byte-string form must be smaller: {} vs {}",
+        re_encoded.len(),
+        legacy_bytes.len()
+    );
+
+    let current_hex =
+        std::fs::read_to_string(tests_dir.join("direct_messages_wire_format.hex")).unwrap();
+    assert_eq!(
+        data_encoding::HEXLOWER.encode(&re_encoded),
+        current_hex.trim(),
+        "re-encoding the legacy fixture must reproduce the current snapshot"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Domain separation: DM signed bytes start with 'M', purge with 'P'
 // ---------------------------------------------------------------------------

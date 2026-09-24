@@ -12,6 +12,9 @@ use std::fmt;
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AuthorizedConfigurationV1 {
     pub configuration: Configuration,
+    /// Encoded as a CBOR byte string, accepting the legacy array form on
+    /// read; see [`crate::util::sig_serde`] (freenet/river#575).
+    #[serde(with = "crate::util::sig_serde")]
     pub signature: Signature,
 }
 

@@ -655,4 +655,128 @@ mod tests {
             "invitation_secrets must survive the armored round-trip byte-for-byte"
         );
     }
+
+    /// Armored identity tokens are long-lived artifacts users save to disk and
+    /// paste into other devices, and they embed an `AuthorizedMember` (plus
+    /// optionally an `AuthorizedMemberInfo`). A token exported before
+    /// freenet/river#575 holds those signatures as CBOR arrays of 64 integers,
+    /// so `util::sig_serde`'s legacy arm has to keep them importable.
+    ///
+    /// The legacy token here is built through shadow structs that use the plain
+    /// `Signature` derive, so it is genuinely in the old encoding — the
+    /// `assert_ne!` against the current encoding is what stops this test going
+    /// vacuous if those shadows ever drift.
+    #[test]
+    fn legacy_signature_array_identity_token_still_imports() {
+        use ed25519_dalek::Signature;
+        use serde::Serialize;
+
+        let owner_sk = SigningKey::generate(&mut OsRng);
+        let owner_vk = owner_sk.verifying_key();
+        let owner_id = MemberId::from(&owner_vk);
+
+        let member_sk = SigningKey::generate(&mut OsRng);
+        let member = Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member_sk.verifying_key(),
+        };
+        let authorized_member = AuthorizedMember::new(member, &owner_sk);
+        let member_info = AuthorizedMemberInfo::new(
+            MemberInfo {
+                member_id: MemberId::from(&member_sk.verifying_key()),
+                version: 1,
+                preferred_nickname: SealedBytes::public(b"legacy-nick".to_vec()),
+                deputies: vec![],
+            },
+            &owner_sk,
+        );
+
+        #[derive(Serialize)]
+        struct LegacySigMember<'a> {
+            member: &'a Member,
+            signature: &'a Signature,
+        }
+        #[derive(Serialize)]
+        struct LegacySigMemberInfo<'a> {
+            member_info: &'a MemberInfo,
+            signature: &'a Signature,
+        }
+        #[derive(Serialize)]
+        struct LegacySigExport<'a> {
+            room_owner: VerifyingKey,
+            signing_key: &'a SigningKey,
+            authorized_member: LegacySigMember<'a>,
+            invite_chain: Vec<LegacySigMember<'a>>,
+            member_info: Option<LegacySigMemberInfo<'a>>,
+            room_name: Option<String>,
+            self_nickname: Option<String>,
+            invitation_secrets: HashMap<u32, [u8; 32]>,
+        }
+
+        let legacy = LegacySigExport {
+            room_owner: owner_vk,
+            signing_key: &member_sk,
+            authorized_member: LegacySigMember {
+                member: &authorized_member.member,
+                signature: &authorized_member.signature,
+            },
+            invite_chain: vec![],
+            member_info: Some(LegacySigMemberInfo {
+                member_info: &member_info.member_info,
+                signature: &member_info.signature,
+            }),
+            room_name: Some("Legacy Room".to_string()),
+            self_nickname: Some("legacy-nick".to_string()),
+            invitation_secrets: HashMap::new(),
+        };
+
+        let mut legacy_bytes = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut legacy_bytes).unwrap();
+
+        let current = IdentityExport {
+            room_owner: owner_vk,
+            signing_key: member_sk.clone(),
+            authorized_member: authorized_member.clone(),
+            invite_chain: vec![],
+            member_info: Some(member_info.clone()),
+            room_name: Some("Legacy Room".to_string()),
+            self_nickname: Some("legacy-nick".to_string()),
+            invitation_secrets: HashMap::new(),
+        };
+        let mut current_bytes = Vec::new();
+        ciborium::ser::into_writer(&current, &mut current_bytes).unwrap();
+
+        assert_ne!(
+            legacy_bytes, current_bytes,
+            "the legacy fixture must not already be in the byte-string form, \
+             or this test proves nothing"
+        );
+        assert!(
+            legacy_bytes.len() > current_bytes.len(),
+            "the array encoding must be the larger of the two: {} vs {}",
+            legacy_bytes.len(),
+            current_bytes.len()
+        );
+
+        let encoded = bs58::encode(&legacy_bytes).into_string();
+        let armored = format!("{}\n{}\n{}", ARMOR_BEGIN, encoded, ARMOR_END);
+
+        let decoded = IdentityExport::from_armored_string(&armored)
+            .expect("a pre-#575 armored identity token must still import");
+        assert_eq!(decoded.authorized_member, authorized_member);
+        assert_eq!(decoded.member_info.as_ref(), Some(&member_info));
+        decoded
+            .authorized_member
+            .verify_signature(&owner_vk)
+            .expect("the legacy-decoded membership proof must still verify");
+
+        // Re-exporting canonicalizes to the byte-string form.
+        let mut re_encoded = Vec::new();
+        ciborium::ser::into_writer(&decoded, &mut re_encoded).unwrap();
+        assert_eq!(
+            re_encoded, current_bytes,
+            "re-encoding a legacy token must produce the current canonical form"
+        );
+    }
 }
