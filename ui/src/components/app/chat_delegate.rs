@@ -702,7 +702,7 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
                 if !load_attempt_is_current(attempt) {
                     return;
                 }
-                fire_load_outbound_dms_request().await;
+                fire_load_outbound_dms_request(attempt).await;
             });
 
             Ok(())
@@ -1299,7 +1299,7 @@ mod tests {
             .expect("the load must be gated on the attempt still being current");
         for call in [
             "fire_list_rooms_request().await",
-            "fire_load_outbound_dms_request().await",
+            "fire_load_outbound_dms_request(attempt).await",
         ] {
             assert_eq!(body.matches(call).count(), 1, "exactly one `{call}`");
             let at = waiter
@@ -1314,7 +1314,7 @@ mod tests {
         // request on the new pass's connection.
         let list = waiter.find("fire_list_rooms_request().await").unwrap();
         let dms = waiter
-            .find("fire_load_outbound_dms_request().await")
+            .find("fire_load_outbound_dms_request(attempt).await")
             .unwrap();
         assert!(
             waiter
@@ -4782,7 +4782,10 @@ mod tests {
     #[test]
     fn outbound_dms_request_send_starts_the_hydration_bound() {
         let production = chat_delegate_production();
-        let body = fn_body(&production, "async fn fire_load_outbound_dms_request() {");
+        let body = fn_body(
+            &production,
+            "async fn fire_load_outbound_dms_request(attempt: u32) {",
+        );
         let ok_arm = body
             .find("Ok(_) => {")
             .expect("the send's Ok arm must exist");
@@ -4794,6 +4797,10 @@ mod tests {
                 .unwrap()
                 .contains("note_outbound_dms_hydration_requested();"),
             "a sent DM GetRequest must start the hydration bound"
+        );
+        assert!(
+            !body.contains("LOAD_ATTEMPT_GEN"),
+            "the attempt must come from the waiter's gated pass, not be re-read here"
         );
         let ok_text = body.get(ok_arm..err_arm).unwrap();
         assert!(
@@ -7439,9 +7446,11 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
 /// response. Mirrors [`fire_list_rooms_request`] — the response is
 /// processed in `freenet_api::response_handler` and hydrates the
 /// in-memory [`OUTBOUND_DMS`] signal.
-async fn fire_load_outbound_dms_request() {
+/// `attempt` is the load attempt of the setup pass sending it; the request
+/// starts the hydration bound only if that pass is still current once the
+/// send returns.
+async fn fire_load_outbound_dms_request(attempt: u32) {
     info!("Firing request to load outbound DMs from delegate storage");
-    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
 
     let request = ChatDelegateRequestMsg::GetRequest {
         key: ChatDelegateKey::new(OUTBOUND_DMS_STORAGE_KEY.to_vec()),
