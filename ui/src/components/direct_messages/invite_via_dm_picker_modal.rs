@@ -213,16 +213,9 @@ pub fn InviteViaDmPickerModal() -> Element {
                     CandidateRoom {
                         room_vk: *owner_vk,
                         label,
-                        // Owner is implicit, not in the member list — add 1
-                        // for a useful display count. Active members only
-                        // (freenet/river#702).
-                        member_count: room_data
-                            .room_state
-                            .active_members(&river_core::room_state::ChatRoomParametersV1 {
-                                owner: *owner_vk,
-                            })
-                            .len()
-                            + 1,
+                        // Owner is implicit, not in members.members — add 1
+                        // for a useful display count.
+                        member_count: room_data.room_state.members.members.len() + 1,
                         is_private: matches!(
                             room_data
                                 .room_state

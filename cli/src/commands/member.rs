@@ -126,8 +126,8 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
             // rows whose nickname came from a losing record while the deputy
             // annotation came from the canonical one. `members_with_info` is
             // deduplicated and `party` reads the canonical record.
-            let members: Vec<_> = listed_member_ids(&room_state, &owner_vk, &deputies)
-                .into_iter()
+            let members: Vec<_> = deputies
+                .members_with_info()
                 .map(|id| {
                     let party = deputies.party(id);
                     let granted_by: Vec<MemberId> =
@@ -504,27 +504,6 @@ fn ids_to_strings(ids: &[MemberId]) -> Vec<String> {
     ids.iter().map(|id| id.to_string()).collect()
 }
 
-/// The rows `member list` prints: every member with a `member_info` record
-/// who is the owner or an ACTIVE member (`ChatRoomStateV1::active_members`).
-/// A mutual-ban tombstone stays in `members` so its ban remains verifiable,
-/// but it is not in the room, so it is not listed (freenet/river#702).
-fn listed_member_ids(
-    room_state: &river_core::ChatRoomStateV1,
-    owner_vk: &ed25519_dalek::VerifyingKey,
-    deputies: &RoomDeputies<'_>,
-) -> Vec<MemberId> {
-    let active: std::collections::HashSet<MemberId> = room_state
-        .active_members(&river_core::room_state::ChatRoomParametersV1 { owner: *owner_vk })
-        .iter()
-        .map(|m| m.member.id())
-        .collect();
-    let owner_id = MemberId::from(owner_vk);
-    deputies
-        .members_with_info()
-        .filter(|id| *id == owner_id || active.contains(id))
-        .collect()
-}
-
 /// One row of `member list --format json`.
 ///
 /// A published output contract, so it lives in a testable helper rather than
@@ -630,82 +609,6 @@ mod tests {
     struct TestCli {
         #[command(subcommand)]
         command: MemberCommands,
-    }
-
-    /// freenet/river#702: `member list` omits both members of a mutual ban
-    /// (they stay in `members` as tombstones) and keeps everyone else.
-    #[test]
-    fn member_list_omits_mutual_ban_tombstones() {
-        use ed25519_dalek::SigningKey;
-        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
-        use river_core::room_state::member::{AuthorizedMember, Member};
-        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
-        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
-        use river_core::room_state::ChatRoomParametersV1;
-        let key = |seed: u8| SigningKey::from_bytes(&[seed; 32]);
-        let (owner_sk, a, b, t) = (key(1), key(2), key(3), key(4));
-        let owner_vk = owner_sk.verifying_key();
-        let owner_id = MemberId::from(&owner_vk);
-        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
-        let mut state = river_core::ChatRoomStateV1::default();
-        state.configuration.configuration.max_user_bans = 10;
-        let mut infos = Vec::new();
-        let mut owner_info = MemberInfo::new_public(owner_id, 1, "owner".into());
-        owner_info.deputies = vec![id(&a), id(&b)];
-        infos.push(AuthorizedMemberInfo::new(owner_info, &owner_sk));
-        for sk in [&a, &b, &t] {
-            state.members.members.push(AuthorizedMember::new(
-                Member {
-                    owner_member_id: owner_id,
-                    invited_by: owner_id,
-                    member_vk: sk.verifying_key(),
-                },
-                &owner_sk,
-            ));
-            infos.push(AuthorizedMemberInfo::new_with_member_key(
-                MemberInfo::new_public(id(sk), 1, "m".into()),
-                sk,
-            ));
-            state
-                .recent_messages
-                .messages
-                .push(AuthorizedMessageV1::new(
-                    MessageV1 {
-                        room_owner: owner_id,
-                        author: id(sk),
-                        time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
-                        content: RoomMessageBody::public("hi".into()),
-                    },
-                    sk,
-                ));
-        }
-        state.member_info = MemberInfoV1 { member_info: infos };
-        let ban = |by: &SigningKey, target: &SigningKey, secs: u64| {
-            AuthorizedUserBan::new(
-                UserBan {
-                    owner_member_id: owner_id,
-                    banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
-                    banned_user: id(target),
-                },
-                id(by),
-                by,
-            )
-        };
-        state.bans = BansV1(vec![ban(&a, &b, 2), ban(&b, &a, 3)]);
-        state
-            .post_apply_cleanup(&ChatRoomParametersV1 { owner: owner_vk })
-            .unwrap();
-        assert!(state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.id() == id(&a)));
-
-        let secrets = std::collections::HashMap::new();
-        let deputies = RoomDeputies::new(&state, &owner_vk, &secrets);
-        let listed = listed_member_ids(&state, &owner_vk, &deputies);
-        assert!(listed.contains(&id(&t)));
-        assert!(!listed.contains(&id(&a)) && !listed.contains(&id(&b)));
     }
 
     fn parse(args: &[&str]) -> Result<MemberCommands, clap::Error> {

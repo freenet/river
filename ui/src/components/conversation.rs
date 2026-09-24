@@ -4482,26 +4482,12 @@ pub fn Conversation() -> Element {
                                 // Option so an absent key would merely leave
                                 // self in the mention list instead of panicking.
                                 let self_id = room_data.self_member_id();
-                                // Only the owner and ACTIVE members: a mutual-ban
-                                // tombstone keeps its member_info record but is not
-                                // in the room (freenet/river#702).
-                                let owner_member_id = MemberId::from(&room_data.owner_vk);
-                                let active_ids: std::collections::HashSet<MemberId> = room_data
-                                    .room_state
-                                    .active_members(&room_data.parameters())
-                                    .iter()
-                                    .map(|m| m.member.id())
-                                    .collect();
                                 let mut mention_members: Vec<(MemberId, String)> = room_data
                                     .room_state
                                     .member_info
                                     .member_info
                                     .iter()
                                     .filter(|ami| Some(ami.member_info.member_id) != self_id)
-                                    .filter(|ami| {
-                                        let id = ami.member_info.member_id;
-                                        id == owner_member_id || active_ids.contains(&id)
-                                    })
                                     .map(|ami| {
                                         (
                                             ami.member_info.member_id,

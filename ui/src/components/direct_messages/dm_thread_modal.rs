@@ -237,12 +237,11 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
 
             // Peer must still be a member for sends to be accepted; surface
             // that constraint to the user up front.
-            // Active members only: a mutual-ban tombstone is present in
-            // `members` but removed (freenet/river#702).
             let peer_still_member = peer == owner_id
                 || room_data
                     .room_state
-                    .active_members(&ChatRoomParametersV1 { owner: room })
+                    .members
+                    .members
                     .iter()
                     .any(|m| m.member.id() == peer);
 

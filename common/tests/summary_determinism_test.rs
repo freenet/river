@@ -273,6 +273,8 @@ fn top_level_summary_serialization_is_order_independent() {
         let order = |i: i64| if reversed { N - 1 - i } else { i };
         let bans = (0..N).map(|i| ban_id(order(i))).collect();
         let members = (0..N).map(|i| member_id(order(i))).collect();
+        // freenet/river#702: the ban-evidence summary is a BTreeSet too.
+        let ban_evidence = (0..N).map(|i| member_id(order(i) + 1000)).collect();
         let member_info = (0..N)
             .map(|i| {
                 let j = order(i);
@@ -325,6 +327,7 @@ fn top_level_summary_serialization_is_order_independent() {
             configuration: 7,
             bans,
             members,
+            ban_evidence,
             member_info,
             secrets,
             recent_messages,

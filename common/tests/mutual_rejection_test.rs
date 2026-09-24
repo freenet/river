@@ -580,7 +580,9 @@ fn has_ban(s: &ChatRoomStateV1, ban: &AuthorizedUserBan) -> bool {
 /// mutual-ban cycle stay in `members` as tombstones (so their bans remain
 /// verifiable) but are enforced-banned, so they are not in this set.
 fn active_ids(s: &ChatRoomStateV1, p: &ChatRoomParametersV1) -> Vec<MemberId> {
-    let banned = s.members.banned_member_ids(&s.bans, &s.member_info, p);
+    let banned = s
+        .members
+        .banned_member_ids(&s.ban_evidence, &s.bans, &s.member_info, p);
     member_ids(s)
         .into_iter()
         .filter(|id| !banned.contains(id))
@@ -602,6 +604,28 @@ fn apply_checked(
     again.post_apply_cleanup(p).unwrap();
     assert_eq!(ser(&again), ser(&after), "cleanup must be idempotent");
     after
+}
+
+/// `who` re-adds their own public record with a message, as a client does
+/// on its next post. Returns the resulting state.
+fn rejoin(room: &Room, s: &ChatRoomStateV1, who: &Person, secs: u64) -> ChatRoomStateV1 {
+    apply_checked(
+        s,
+        ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(vec![who.auth.clone()])),
+            recent_messages: Some(vec![room.msg(who, secs)]),
+            ..Default::default()
+        },
+        &room.params,
+    )
+}
+
+fn evidence_ids(s: &ChatRoomStateV1) -> Vec<MemberId> {
+    s.ban_evidence
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .collect()
 }
 
 fn bans_delta(bans: Vec<AuthorizedUserBan>) -> ChatRoomStateV1Delta {
@@ -874,9 +898,13 @@ fn an_owner_ban_breaks_a_mutual_ban() {
     assert!(!active_ids(&s, &room.params).contains(&y.id));
     let after = apply_checked(&s, bans_delta(vec![room.owner_ban(&x, 20)]), &room.params);
     let ids = active_ids(&after, &room.params);
-    assert!(ids.contains(&y.id), "Y is released");
-    assert!(!member_ids(&after).contains(&x.id), "X is removed outright");
+    assert!(!ids.contains(&x.id), "X is removed");
     assert!(ids.contains(&t.id));
+    let back = rejoin(&room, &after, &y, 30);
+    assert!(
+        active_ids(&back, &room.params).contains(&y.id),
+        "Y is released: re-adding succeeds"
+    );
 }
 
 /// #702 review round 3: a signature-valid but INERT ban (an ordinary member
@@ -939,8 +967,8 @@ fn a_cycle_members_banned_inviter_is_retained_with_them() {
     }
     assert!(ids.contains(&t.id) && ids.contains(&d.id));
     assert!(
-        member_ids(&after).contains(&w.id),
-        "W stays as a tombstone so X's chain verifies"
+        evidence_ids(&after).contains(&w.id),
+        "W's record is kept as evidence so X's record verifies"
     );
 }
 
@@ -982,27 +1010,33 @@ fn resolved_mutual_ban(room: &Room) -> (Person, Person, Person, ChatRoomStateV1)
     (a, b, t, resolved)
 }
 
+/// freenet/river#702 (K'): a removed member leaves `members`; if a stored ban
+/// still needs their record, it moves to `ban_evidence`, which confers no
+/// membership. Both moderators of a mutual ban end up there.
 #[test]
-fn a_tombstone_stays_in_members_but_is_not_active() {
+fn removed_moderators_leave_members_and_their_records_become_evidence() {
     let room = Room::new();
     let (a, b, t, s) = resolved_mutual_ban(&room);
     let present = member_ids(&s);
-    assert!(present.contains(&a.id) && present.contains(&b.id));
-    let active = active_ids(&s, &room.params);
-    assert!(!active.contains(&a.id) && !active.contains(&b.id));
-    assert!(active.contains(&t.id));
-    // A listing that goes through the shared accessor does not show them.
-    let listed: Vec<MemberId> = s
+    assert!(!present.contains(&a.id) && !present.contains(&b.id));
+    assert!(present.contains(&t.id));
+    let evidence: Vec<MemberId> = s
+        .ban_evidence
         .members
-        .active_members(&s.bans, &s.member_info, &room.params)
         .iter()
         .map(|m| m.member.id())
         .collect();
-    assert!(!listed.contains(&a.id) && !listed.contains(&b.id));
+    assert!(evidence.contains(&a.id) && evidence.contains(&b.id));
+    assert!(
+        !evidence.contains(&t.id),
+        "an unreferenced member is not evidence"
+    );
 }
 
+/// A removed moderator re-adds themselves together with a reaction, an edit
+/// and a delete: none of them lands, and nothing of T's is changed.
 #[test]
-fn a_tombstone_cannot_react_edit_or_delete() {
+fn a_removed_member_cannot_react_edit_or_delete() {
     let room = Room::new();
     let (a, _b, t, s) = resolved_mutual_ban(&room);
     let target = s
@@ -1024,6 +1058,7 @@ fn a_tombstone_cannot_react_edit_or_delete() {
         )
     };
     let delta = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![a.auth.clone()])),
         recent_messages: Some(vec![
             action(RoomMessageBody::reaction(target.clone(), "x".into()), 30),
             action(RoomMessageBody::edit(target.clone(), "hijack".into()), 31),
@@ -1059,8 +1094,10 @@ fn a_tombstone_cannot_react_edit_or_delete() {
     );
 }
 
+/// A removed moderator re-adds themselves together with DMs in both
+/// directions: none is held.
 #[test]
-fn a_tombstone_can_neither_send_nor_receive_dms() {
+fn a_removed_member_can_neither_send_nor_receive_dms() {
     let room = Room::new();
     let (a, _b, t, s) = resolved_mutual_ban(&room);
     let dm = |from: &Person, to: &Person, ts: u64| {
@@ -1075,6 +1112,7 @@ fn a_tombstone_can_neither_send_nor_receive_dms() {
         .expect("sign dm")
     };
     let delta = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![a.auth.clone()])),
         direct_messages: Some(DirectMessagesDelta {
             new_messages: vec![dm(&a, &t, 40), dm(&t, &a, 41)],
             advanced_purges: vec![],
@@ -1092,40 +1130,37 @@ fn a_tombstone_can_neither_send_nor_receive_dms() {
     }
     assert!(
         after.direct_messages.messages.is_empty(),
-        "no DM to or from a tombstone is held"
+        "no DM to or from a removed member is held"
     );
 }
 
+/// A removed moderator re-adds themselves together with a new invitee: the
+/// invitee is in the removed member's subtree, so both are removed again, on
+/// every attempt.
 #[test]
-fn a_tombstones_invitee_is_removed_and_stays_removed() {
+fn a_removed_members_invitee_is_removed_and_stays_removed() {
     let room = Room::new();
     let (a, _b, _t, s) = resolved_mutual_ban(&room);
     let n = room.person_invited_by(&a);
-    let delta = ChatRoomStateV1Delta {
-        members: Some(MembersDelta::new(vec![n.auth.clone()])),
-        recent_messages: Some(vec![room.msg(&n, 50)]),
-        ..Default::default()
-    };
-    let after = apply_checked(&s, delta, &room.params);
-    assert!(
-        !member_ids(&after).contains(&n.id),
-        "the invitee is in the tombstone's subtree, so the cascade removes them"
-    );
-    // And again, from the resulting state (a rejoin attempt).
-    let delta = ChatRoomStateV1Delta {
-        members: Some(MembersDelta::new(vec![n.auth.clone()])),
-        recent_messages: Some(vec![room.msg(&n, 51)]),
-        ..Default::default()
-    };
-    let again = apply_checked(&after, delta, &room.params);
-    assert!(!member_ids(&again).contains(&n.id));
+    let mut state = s;
+    for secs in [50, 51] {
+        let delta = ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(vec![a.auth.clone(), n.auth.clone()])),
+            recent_messages: Some(vec![room.msg(&a, secs), room.msg(&n, secs + 10)]),
+            ..Default::default()
+        };
+        state = apply_checked(&state, delta, &room.params);
+        let ids = member_ids(&state);
+        assert!(!ids.contains(&a.id) && !ids.contains(&n.id));
+    }
 }
 
-/// A tombstone editing its own `deputies` cannot escape a cycle whose other
-/// edge rests on ABSOLUTE authority (owner-appointed moderator): the
-/// "cannot ban your deputizer" guardrail is checked after absolute grants.
-/// See the PR for the deputy-derived case, which is pre-existing and applies
-/// to every ban, not only to tombstones.
+/// A removed moderator editing their own `deputies` cannot escape a cycle
+/// whose other edge rests on ABSOLUTE authority (owner-appointed moderator):
+/// the "cannot ban your deputizer" guardrail is checked after absolute
+/// grants. Their record is ban evidence, so the update merges (see
+/// `BanEvidenceV1` for why it is not frozen). The deputy-derived case is
+/// pre-existing and applies to every ban.
 #[test]
 fn a_tombstone_cannot_escape_by_deputizing_its_partner() {
     let room = Room::new();
@@ -1136,9 +1171,8 @@ fn a_tombstone_cannot_escape_by_deputizing_its_partner() {
         member_info: Some(vec![AuthorizedMemberInfo::new(info, &a.sk)]),
         ..Default::default()
     };
-    // The record is signed by A and A is present, so the update applies: a
-    // tombstone can still publish `member_info`. It just cannot use it to
-    // escape.
+    // The record is signed by A, whose record is ban evidence, so the
+    // update applies. It just cannot be used to escape.
     let after = apply_checked(&s, delta, &room.params);
     assert!(
         after.member_info.deputies_of(a.id).contains(&b.id),
@@ -1148,48 +1182,30 @@ fn a_tombstone_cannot_escape_by_deputizing_its_partner() {
     assert!(!active.contains(&a.id) && !active.contains(&b.id));
 }
 
-/// The inactivity prune never evicts a tombstone: A and B have no messages
-/// left, yet stay (as tombstones) across repeated cleanups.
+/// The ban evidence and both mutual bans are stable under repeated cleanup:
+/// nothing about A and B (no messages, no membership) lets a later pass drop
+/// their records or their bans.
 #[test]
-fn inactivity_prune_does_not_evict_a_tombstone() {
+fn a_resolved_mutual_ban_is_a_cleanup_fixpoint() {
     let room = Room::new();
     let (a, b, _t, s) = resolved_mutual_ban(&room);
-    assert!(!s
-        .recent_messages
-        .messages
-        .iter()
-        .any(|m| m.message.author == a.id || m.message.author == b.id));
     let mut again = s.clone();
     for _ in 0..3 {
         again.post_apply_cleanup(&room.params).unwrap();
     }
     assert_eq!(ser(&again), ser(&s));
-    assert!(member_ids(&again).contains(&a.id) && member_ids(&again).contains(&b.id));
+    assert!(evidence_ids(&again).contains(&a.id) && evidence_ids(&again).contains(&b.id));
+    assert_eq!(again.bans.0.len(), 2);
 }
 
-/// The `max_members` trim ranks ban issuers last, so a room filling up does
-/// not evict a tombstone (which would let its ban decay). Non-issuers are
-/// trimmed instead.
+/// The `max_members` trim cannot touch removed members' records: they are
+/// ban evidence, not members, so a room filling up leaves the mutual ban in
+/// force.
 #[test]
-fn the_member_cap_does_not_evict_a_tombstone() {
-    let mut room = Room::new();
-    room.config = AuthorizedConfigurationV1::new(
-        Configuration {
-            owner_member_id: room.owner_id,
-            max_members: 4,
-            max_user_bans: 10,
-            max_recent_messages: 50,
-            max_message_size: 1000,
-            ..Default::default()
-        },
-        &room.owner_sk,
-    );
-    let (a, b, t, s) = resolved_mutual_ban(&room);
-    // A, B (tombstones) and T fill 3 of 4 slots. Three newcomers arrive, each
-    // invited by T so their chains are LONGER than the tombstones', which the
-    // old trim would have kept in preference to... nothing: it evicts longest
-    // chains first, and the tombstones must survive regardless.
-    let n: Vec<Person> = (0..3).map(|_| room.person()).collect();
+fn the_member_cap_cannot_dissolve_a_mutual_ban() {
+    let room = capped_room(4, 10);
+    let (a, b, _t, s) = resolved_mutual_ban(&room);
+    let n: Vec<Person> = (0..5).map(|_| room.person()).collect();
     let delta = ChatRoomStateV1Delta {
         members: Some(MembersDelta::new(
             n.iter().map(|p| p.auth.clone()).collect(),
@@ -1203,24 +1219,18 @@ fn the_member_cap_does_not_evict_a_tombstone() {
         ..Default::default()
     };
     let after = apply_checked(&s, delta, &room.params);
-    let ids = member_ids(&after);
-    assert!(
-        ids.contains(&a.id) && ids.contains(&b.id),
-        "tombstones survive the cap"
-    );
-    assert!(ids.len() <= 4);
-    let active = active_ids(&after, &room.params);
-    assert!(
-        !active.contains(&a.id) && !active.contains(&b.id),
-        "and stay banned"
-    );
-    let _ = t;
+    assert!(member_ids(&after).len() <= 4);
+    assert_eq!(after.bans.0.len(), 2, "both mutual bans stand");
+    for who in [&a, &b] {
+        let back = rejoin(&room, &after, who, 90);
+        assert!(!member_ids(&back).contains(&who.id), "still removed");
+    }
 }
 
 /// Release path: the owner revokes A's moderator grant. A's ban on B no
-/// longer has authority, so there is no cycle. B's ban on A takes effect;
-/// A leaves `members` (A issues no effective ban, so is no tombstone) and B
-/// is an active member again who can post. Cleanup stays idempotent.
+/// longer has authority, so there is no cycle. B's ban on A takes effect,
+/// and B is no longer banned: re-adding succeeds and B can post. Cleanup
+/// stays idempotent throughout (`apply_checked`).
 #[test]
 fn revoking_a_cycle_members_grant_releases_the_other() {
     let room = Room::new();
@@ -1232,40 +1242,25 @@ fn revoking_a_cycle_members_grant_releases_the_other() {
         ..Default::default()
     };
     let released = apply_checked(&s, revoke, &room.params);
-    let active = active_ids(&released, &room.params);
-    assert!(active.contains(&b.id), "B is released");
-    assert!(active.contains(&t.id));
+    assert!(active_ids(&released, &room.params).contains(&t.id));
+    let back = rejoin(&room, &released, &b, 70);
     assert!(
-        !member_ids(&released).contains(&a.id),
-        "A is removed outright"
+        member_ids(&back).contains(&b.id),
+        "B is released and can rejoin"
     );
-
-    let post = room.msg(&b, 70);
-    let after = apply_checked(
-        &released,
-        ChatRoomStateV1Delta {
-            recent_messages: Some(vec![post.clone()]),
-            ..Default::default()
-        },
-        &room.params,
-    );
-    assert!(
-        after
-            .recent_messages
-            .messages
-            .iter()
-            .any(|m| m.id() == post.id()),
-        "the released moderator can post again"
-    );
+    let back = rejoin(&room, &back, &a, 71);
+    assert!(!member_ids(&back).contains(&a.id), "A stays removed");
 }
 
-/// A tombstoned moderator can pull anyone who LATER bans them into a cycle:
-/// under Ian's rule a counter-ban counts whenever it was issued, and a pure
-/// function of converged state cannot tell "counter" from "later" (the ban
-/// timestamp is signed by its issuer). The owner ends it by revoking the
-/// tombstone's moderator grant. Pinned so the consequence is deliberate.
+/// A removed moderator can counter-ban, at any later time, anyone who banned
+/// them: under Ian's rule a mutual ban counts whenever its halves were
+/// issued, converged state cannot tell "counter" from "later" (`banned_at` is
+/// signed by its issuer), and the removed moderator's record is ban
+/// evidence, so the counter-ban verifies. The owner ends it by revoking the
+/// removed moderator's grant (or banning them). Pinned so the consequence is
+/// deliberate.
 #[test]
-fn a_tombstone_pulls_in_a_later_banner_until_its_grant_is_revoked() {
+fn a_removed_moderator_can_later_counter_ban_until_the_owner_acts() {
     let room = Room::new();
     let (a, b, c) = (room.person(), room.person(), room.person());
     let s = room.modded_state(&[&a, &b, &c], &[&a, &b, &c], vec![]);
@@ -1274,7 +1269,7 @@ fn a_tombstone_pulls_in_a_later_banner_until_its_grant_is_revoked() {
         bans_delta(vec![room.ban(&a, &b, 10), room.ban(&b, &a, 11)]),
         &room.params,
     );
-    // C redundantly bans A; A (a tombstone, still holding its key) bans C.
+    // C redundantly bans A; later, A bans C.
     let s = apply_checked(
         &s,
         bans_delta(vec![room.ban(&c, &a, 20), room.ban(&a, &c, 21)]),
@@ -1295,12 +1290,15 @@ fn a_tombstone_pulls_in_a_later_banner_until_its_grant_is_revoked() {
         },
         &room.params,
     );
-    let active = active_ids(&s, &room.params);
+    let s = rejoin(&room, &s, &b, 30);
+    let s = rejoin(&room, &s, &c, 31);
+    let ids = member_ids(&s);
     assert!(
-        active.contains(&b.id) && active.contains(&c.id),
+        ids.contains(&b.id) && ids.contains(&c.id),
         "revoking A releases both"
     );
-    assert!(!active.contains(&a.id));
+    let s = rejoin(&room, &s, &a, 32);
+    assert!(!member_ids(&s).contains(&a.id));
 }
 
 /// Arrival order must not matter for the `members` step's early removal
@@ -1439,7 +1437,7 @@ fn an_owner_ban_dissolves_a_deputy_cycle() {
         !active.contains(&a1.id) && !active.contains(&a2.id),
         "a mutual ban"
     );
-    assert!(member_ids(&s).contains(&a1.id), "A1 is a tombstone");
+    assert!(evidence_ids(&s).contains(&a1.id), "A1's record is evidence");
 
     let after = apply_checked(&s, bans_delta(vec![room.owner_ban(&a, 20)]), &room.params);
     let ids = member_ids(&after);
@@ -1541,7 +1539,7 @@ fn a_banned_issuer_cannot_flood_the_ban_cap() {
 /// The same for a mutual-ban tombstone: its bans outside the cycle take no
 /// effect, so they are evicted first, and the two mutual bans survive.
 #[test]
-fn a_tombstone_cannot_flood_the_ban_cap() {
+fn a_removed_cycle_member_cannot_flood_the_ban_cap() {
     let room = capped_room(20, 4);
     let (a, b, t, u) = (room.person(), room.person(), room.person(), room.person());
     let s = room.modded_state(&[&a, &b, &t, &u], &[&a, &b], vec![]);
@@ -1562,19 +1560,21 @@ fn a_tombstone_cannot_flood_the_ban_cap() {
 }
 
 /// A new mutual ban arriving in the same delta as enough joins to push the
-/// room over `max_members`: the trim evicts ordinary members first, keeps
-/// both cycle members as tombstones, and the result verifies.
+/// room over `max_members`. The trim runs in the `members` step, before
+/// cleanup, so it can evict a cycle member's record before the cycle is ever
+/// seen (a documented residual: the record is not evidence yet). The room
+/// still converges to both moderators removed, with both bans standing, as
+/// soon as it merges with a peer that saw the bans before the joins.
 #[test]
-fn an_over_cap_join_with_a_new_mutual_ban_keeps_the_tombstones() {
+fn an_over_cap_join_with_a_new_mutual_ban_converges() {
     let room = capped_room(4, 10);
     let (a, b, l) = (room.person(), room.person(), room.person());
     let s = room.modded_state(&[&a, &b, &l], &[&a, &b], vec![]);
     let newcomers: Vec<Person> = (0..3).map(|_| room.person()).collect();
-    let delta = ChatRoomStateV1Delta {
+    let joins = ChatRoomStateV1Delta {
         members: Some(MembersDelta::new(
             newcomers.iter().map(|p| p.auth.clone()).collect(),
         )),
-        bans: Some(vec![room.ban(&a, &b, 10), room.ban(&b, &a, 11)]),
         recent_messages: Some(
             newcomers
                 .iter()
@@ -1584,15 +1584,17 @@ fn an_over_cap_join_with_a_new_mutual_ban_keeps_the_tombstones() {
         ),
         ..Default::default()
     };
-    let after = apply_checked(&s, delta, &room.params);
-    let ids = member_ids(&after);
-    assert!(
-        ids.contains(&a.id) && ids.contains(&b.id),
-        "the tombstones stay"
-    );
+    let bans = vec![room.ban(&a, &b, 10), room.ban(&b, &a, 11)];
+    let mut together = joins.clone();
+    together.bans = Some(bans.clone());
+    let p = apply_checked(&s, together, &room.params);
+    let q = apply_checked(&s, bans_delta(bans), &room.params);
+    let q = apply_checked(&q, joins, &room.params);
+    let (agreed, _) = gossip_until_equal(&p, &q, &room.params, 4);
+    let ids = member_ids(&agreed);
     assert!(ids.len() <= 4);
-    let active = active_ids(&after, &room.params);
-    assert!(!active.contains(&a.id) && !active.contains(&b.id));
+    assert!(!ids.contains(&a.id) && !ids.contains(&b.id));
+    assert_eq!(agreed.bans.0.len(), 2, "both mutual bans stand");
 }
 
 /// A 3-cycle whose bans reach three different peers first: every gossip
@@ -1662,9 +1664,9 @@ fn owner_ban_wins_inside_resolve_bans() {
         vec![room.msg(&x, 1), room.msg(&y, 2), room.msg(&t, 3)],
     );
     s.member_info = room.owner_mods(&[&x, &y]);
-    let removed = s
-        .members
-        .banned_member_ids(&s.bans, &s.member_info, &room.params);
+    let removed =
+        s.members
+            .banned_member_ids(&s.ban_evidence, &s.bans, &s.member_info, &room.params);
     assert!(removed.contains(&x.id));
     assert!(
         !removed.contains(&y.id),
@@ -1674,4 +1676,192 @@ fn owner_ban_wins_inside_resolve_bans() {
     let active = active_ids(&s, &room.params);
     assert!(active.contains(&y.id) && active.contains(&t.id));
     assert!(!member_ids(&s).contains(&x.id));
+}
+
+// ---------------------------------------------------------------------------
+// Ban evidence (K', Ian 2026-09-24): round-5 findings.
+// ---------------------------------------------------------------------------
+
+/// Round 5 Must Fix 1: A invites T, T invites Y, and one delta carries A's
+/// ban on T and T's ban on Y. T's authority over Y is ancestry, so it must
+/// not change when the same pass removes Y. `apply_checked` asserts
+/// `cleanup(cleanup(S)) == cleanup(S)`.
+#[test]
+fn an_ancestor_ban_chain_in_one_delta_is_idempotent() {
+    let room = Room::new();
+    let a = room.person();
+    let t = room.person_invited_by(&a);
+    let y = room.person_invited_by(&t);
+    let s = room.modded_state(&[&a, &t, &y], &[], vec![]);
+    let (a_bans_t, t_bans_y) = (room.ban(&a, &t, 10), room.ban(&t, &y, 11));
+    let after = apply_checked(
+        &s,
+        bans_delta(vec![a_bans_t.clone(), t_bans_y.clone()]),
+        &room.params,
+    );
+    let ids = member_ids(&after);
+    assert!(ids.contains(&a.id));
+    assert!(!ids.contains(&t.id) && !ids.contains(&y.id));
+    assert!(has_ban(&after, &a_bans_t) && has_ban(&after, &t_bans_y));
+    assert!(evidence_ids(&after).contains(&t.id));
+}
+
+/// Round 5 Must Fix 1, second trigger: T's authority over Y is a subtree
+/// deputy grant (A lists T), T is banned by a moderator, and Y is pruned for
+/// inactivity in the same pass. Y's record and A's grant stay available, so
+/// the pass is idempotent.
+#[test]
+fn a_deputy_ban_on_a_pruned_target_is_idempotent() {
+    let room = Room::new();
+    let a = room.person();
+    let y = room.person_invited_by(&a);
+    let (t, d) = (room.person(), room.person());
+    let mut s = room.state(
+        &[&a, &y, &t, &d],
+        vec![],
+        vec![room.msg(&a, 1), room.msg(&t, 2), room.msg(&d, 3)],
+    );
+    let mut infos = room.owner_mods(&[&d]).member_info;
+    infos.push(deputies_record(&a, 1, &[&t]));
+    s.member_info = MemberInfoV1 { member_info: infos };
+    s.verify(&s, &room.params).expect("fixture");
+    let after = apply_checked(
+        &s,
+        bans_delta(vec![room.ban(&d, &t, 10), room.ban(&t, &y, 11)]),
+        &room.params,
+    );
+    let ids = member_ids(&after);
+    assert!(!ids.contains(&t.id), "D's ban on T takes effect");
+    assert!(!ids.contains(&y.id), "Y is pruned (no messages)");
+    assert!(ids.contains(&a.id) && ids.contains(&d.id));
+}
+
+/// Ian (2026-09-24): a mutual-ban cycle removes only its members. A bans P;
+/// P's invitee B bans A back. A's ban reaches B through P's subtree, so A and
+/// B form a cycle and both are removed, but P, the target of A's ban, stays:
+/// B's counter-ban shields P at the cost of B. The owner (or another
+/// moderator) can still ban P.
+#[test]
+fn a_mutual_ban_removes_only_the_cycle_members() {
+    let room = Room::new();
+    let (a, p) = (room.person(), room.person());
+    let b = room.person_invited_by(&p);
+    let s = room.modded_state(&[&a, &p, &b], &[&a, &b], vec![]);
+    let after = apply_checked(
+        &s,
+        bans_delta(vec![room.ban(&a, &p, 10), room.ban(&b, &a, 11)]),
+        &room.params,
+    );
+    let ids = member_ids(&after);
+    assert!(
+        !ids.contains(&a.id) && !ids.contains(&b.id),
+        "the cycle is removed"
+    );
+    assert!(ids.contains(&p.id), "the target outside the cycle stays");
+    let after = apply_checked(
+        &after,
+        bans_delta(vec![room.owner_ban(&p, 20)]),
+        &room.params,
+    );
+    assert!(
+        !member_ids(&after).contains(&p.id),
+        "the owner can still ban P"
+    );
+}
+
+/// Round 5 Must Fix 2: an ordinary member X deputizes sybils it invited and
+/// has them ban each other in pairs with far-future dates. Every pair is a
+/// cycle, but mutual bans rank below the owner's ban and below a moderator's
+/// ban that takes effect, so the cap evicts sybil bans instead.
+#[test]
+fn a_sybil_deputy_cycle_flood_cannot_evict_real_bans() {
+    let room = capped_room(20, 4);
+    let (v, w, d, x) = (room.person(), room.person(), room.person(), room.person());
+    let sybils: Vec<Person> = (0..4).map(|_| room.person_invited_by(&x)).collect();
+    let mut members: Vec<&Person> = vec![&v, &w, &d, &x];
+    members.extend(sybils.iter());
+    let mut s = room.modded_state(&members, &[&d], vec![]);
+    s.member_info
+        .member_info
+        .push(deputies_record(&x, 1, &sybils.iter().collect::<Vec<_>>()));
+    s.verify(&s, &room.params).expect("fixture");
+    let (owner_bans_v, d_bans_w) = (room.owner_ban(&v, 10), room.ban(&d, &w, 11));
+    let s = apply_checked(
+        &s,
+        bans_delta(vec![owner_bans_v.clone(), d_bans_w.clone()]),
+        &room.params,
+    );
+    let far = 3_000_000_000;
+    let flood = vec![
+        room.ban(&sybils[0], &sybils[1], far),
+        room.ban(&sybils[1], &sybils[0], far),
+        room.ban(&sybils[2], &sybils[3], far + 1),
+        room.ban(&sybils[3], &sybils[2], far + 1),
+    ];
+    let after = apply_checked(&s, bans_delta(flood), &room.params);
+    assert!(has_ban(&after, &owner_bans_v), "the owner's ban survives");
+    assert!(has_ban(&after, &d_bans_w), "the moderator's ban survives");
+    let ids = member_ids(&after);
+    assert!(!ids.contains(&v.id) && !ids.contains(&w.id));
+}
+
+/// Round 5 Must Fix 2: a member removed by a moderator's ban re-adds
+/// themselves with deputized sybils banning each other and a counter-ban on
+/// the moderator. The sybils are in the removed member's subtree, removed
+/// before their cycles form, so their bans rank lowest; the moderator's ban
+/// survives and the member stays removed.
+#[test]
+fn a_banned_member_cannot_flood_the_cap_to_escape() {
+    let room = capped_room(20, 5);
+    let (d, x, t) = (room.person(), room.person(), room.person());
+    let s = room.modded_state(&[&d, &x, &t], &[&d], vec![]);
+    let d_bans_x = room.ban(&d, &x, 10);
+    let s = apply_checked(&s, bans_delta(vec![d_bans_x.clone()]), &room.params);
+    assert!(!member_ids(&s).contains(&x.id));
+
+    let sybils: Vec<Person> = (0..4).map(|_| room.person_invited_by(&x)).collect();
+    let far = 3_000_000_000;
+    let mut members = vec![x.auth.clone()];
+    members.extend(sybils.iter().map(|p| p.auth.clone()));
+    let delta = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(members)),
+        member_info: Some(vec![deputies_record(
+            &x,
+            1,
+            &sybils.iter().collect::<Vec<_>>(),
+        )]),
+        bans: Some(vec![
+            room.ban(&sybils[0], &sybils[1], far),
+            room.ban(&sybils[1], &sybils[0], far),
+            room.ban(&sybils[2], &sybils[3], far + 1),
+            room.ban(&sybils[3], &sybils[2], far + 1),
+            room.ban(&x, &d, far + 2),
+        ]),
+        recent_messages: Some(vec![room.msg(&x, 50)]),
+        ..Default::default()
+    };
+    let after = apply_checked(&s, delta, &room.params);
+    assert!(has_ban(&after, &d_bans_x), "the moderator's ban survives");
+    let ids = member_ids(&after);
+    assert!(!ids.contains(&x.id), "X stays removed");
+    assert!(ids.contains(&d.id) && ids.contains(&t.id));
+}
+
+/// A peer that has the evidence and a peer that never saw the removed
+/// member converge: the evidence travels in its own delta.
+#[test]
+fn ban_evidence_travels_to_a_peer_that_never_saw_the_member() {
+    let room = Room::new();
+    let (a, b, t) = (room.person(), room.person(), room.person());
+    let full = room.modded_state(&[&a, &b, &t], &[&a, &b], vec![]);
+    let resolved = apply_checked(
+        &full,
+        bans_delta(vec![room.ban(&a, &b, 10), room.ban(&b, &a, 11)]),
+        &room.params,
+    );
+    // A peer that only ever knew T.
+    let mut fresh = room.state(&[&t], vec![], vec![room.msg(&t, 2)]);
+    fresh.member_info = room.owner_mods(&[&a, &b]);
+    let (agreed, _) = gossip_until_equal(&fresh, &resolved, &room.params, 4);
+    assert_eq!(ser(&agreed), ser(&resolved));
 }

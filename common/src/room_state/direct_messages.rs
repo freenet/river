@@ -867,6 +867,7 @@ pub(crate) fn enforced_ban_set_of(
 
     if parent_state.bans.0.len() <= max_bans {
         return parent_state.members.banned_member_ids(
+            &parent_state.ban_evidence,
             &parent_state.bans,
             &parent_state.member_info,
             parameters,
@@ -877,12 +878,16 @@ pub(crate) fn enforced_ban_set_of(
         &mut capped,
         max_bans,
         &parent_state.members,
+        &parent_state.ban_evidence,
         &parent_state.member_info,
         parameters,
     );
-    parent_state
-        .members
-        .banned_member_ids(&BansV1(capped), &parent_state.member_info, parameters)
+    parent_state.members.banned_member_ids(
+        &parent_state.ban_evidence,
+        &BansV1(capped),
+        &parent_state.member_info,
+        parameters,
+    )
 }
 
 /// Whether a DM endpoint is still a live participant: the room owner (implicit,

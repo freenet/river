@@ -361,27 +361,6 @@ fn pin_self_to_top<T>(rows: &mut [(T, MemberId)], self_id: MemberId) {
 }
 
 /// Order member IDs by DFS pre-order traversal of the invite tree.
-/// The member list's rows, in `ordered` order: the owner plus every ACTIVE
-/// member (`ChatRoomStateV1::active_members`). A mutual-ban tombstone stays in
-/// `members` so its ban remains verifiable, but it is not in the room, so it
-/// is not listed (freenet/river#702).
-pub(crate) fn listed_member_ids(
-    room_state: &river_core::ChatRoomStateV1,
-    params: &ChatRoomParametersV1,
-    ordered: Vec<MemberId>,
-) -> Vec<MemberId> {
-    let owner_id = params.owner_id();
-    let active: HashSet<MemberId> = room_state
-        .active_members(params)
-        .iter()
-        .map(|m| m.member.id())
-        .collect();
-    ordered
-        .into_iter()
-        .filter(|id| *id == owner_id || active.contains(id))
-        .collect()
-}
-
 /// Owner is the root; within siblings, order matches `members.members`
 /// (sorted by MemberId after CRDT convergence).
 /// Members with broken invite chains are appended at the end.
@@ -1498,11 +1477,7 @@ pub fn MemberList() -> Element {
         // rises to the top for everyone (including the owner's own view), a
         // non-owner's deputy rises within that member's subtree and in that
         // member's own view, and a deputy you appointed rises under you (#410).
-        let ordered_ids = listed_member_ids(
-            &room_state,
-            &params,
-            deputy_display_order(owner_id, members, &deputizers_of, &viewer_relevant),
-        );
+        let ordered_ids = deputy_display_order(owner_id, members, &deputizers_of, &viewer_relevant);
 
         // Build display list in tree order
         let mut all_members = Vec::new();
@@ -2732,76 +2707,6 @@ mod tests {
             member_vk: *invitee_vk,
         };
         AuthorizedMember::new(member, owner_sk)
-    }
-
-    /// freenet/river#702: a mutual-ban tombstone stays in `members` but is
-    /// not listed. Both moderators of a mutual ban disappear from the member
-    /// list; the owner and an uninvolved member stay, in the given order.
-    #[test]
-    fn member_list_omits_mutual_ban_tombstones() {
-        use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
-        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo, MemberInfoV1};
-        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
-        let mut rng = rand::thread_rng();
-        let owner_sk = SigningKey::generate(&mut rng);
-        let owner_vk = owner_sk.verifying_key();
-        let owner_id = MemberId::from(&owner_vk);
-        let (a, b, t) = (
-            SigningKey::generate(&mut rng),
-            SigningKey::generate(&mut rng),
-            SigningKey::generate(&mut rng),
-        );
-        let id = |sk: &SigningKey| MemberId::from(&sk.verifying_key());
-        let mut state = river_core::ChatRoomStateV1::default();
-        state.configuration.configuration.max_user_bans = 10;
-        for sk in [&a, &b, &t] {
-            state
-                .members
-                .members
-                .push(authorized_member(&owner_sk, &sk.verifying_key()));
-            state
-                .recent_messages
-                .messages
-                .push(AuthorizedMessageV1::new(
-                    MessageV1 {
-                        room_owner: owner_id,
-                        author: id(sk),
-                        time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
-                        content: RoomMessageBody::public("hi".into()),
-                    },
-                    sk,
-                ));
-        }
-        let mut info = MemberInfo::new_public(owner_id, 1, "owner".into());
-        info.deputies = vec![id(&a), id(&b)];
-        state.member_info = MemberInfoV1 {
-            member_info: vec![AuthorizedMemberInfo::new(info, &owner_sk)],
-        };
-        let ban = |by: &SigningKey, target: &SigningKey, secs: u64| {
-            AuthorizedUserBan::new(
-                UserBan {
-                    owner_member_id: owner_id,
-                    banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
-                    banned_user: id(target),
-                },
-                id(by),
-                by,
-            )
-        };
-        state.bans = BansV1(vec![ban(&a, &b, 2), ban(&b, &a, 3)]);
-        let params = ChatRoomParametersV1 { owner: owner_vk };
-        state.post_apply_cleanup(&params).unwrap();
-        assert!(state
-            .members
-            .members
-            .iter()
-            .any(|m| m.member.id() == id(&a)));
-
-        let ordered = vec![owner_id, id(&a), id(&t), id(&b)];
-        assert_eq!(
-            listed_member_ids(&state, &params, ordered),
-            vec![owner_id, id(&t)]
-        );
     }
 
     /// Like [`authorized_member`] but for a NON-owner inviter, so tests can

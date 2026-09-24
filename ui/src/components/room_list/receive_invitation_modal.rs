@@ -875,17 +875,9 @@ fn membership_status(
 /// Checks the membership status of the user in the room
 fn check_membership_status(inv: &Invitation, current_rooms: &Rooms) -> (bool, bool) {
     if let Some(room_data) = current_rooms.map.get(&inv.room) {
-        // Active members only: a mutual-ban tombstone is present in `members`
-        // but is not in the room (freenet/river#702).
-        let active: Vec<AuthorizedMember> = room_data
-            .room_state
-            .active_members(&room_data.parameters())
-            .into_iter()
-            .cloned()
-            .collect();
         membership_status(
             &room_data.owner_vk,
-            &active,
+            &room_data.room_state.members.members,
             room_data.self_verifying_key().as_ref(),
             &inv.invitee_signing_key.verifying_key(),
             &inv.invitee.member.member_vk,
@@ -1097,13 +1089,11 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
             // best-effort contract documented above already allows for an
             // unreadable/cold `ROOMS`.
             let already_member = room_data.self_verifying_key().is_some_and(|self_vk| {
-                let active: Vec<AuthorizedMember> = room_data
-                    .room_state
-                    .active_members(&room_data.parameters())
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                vk_is_room_member(&room_data.owner_vk, &active, &self_vk)
+                vk_is_room_member(
+                    &room_data.owner_vk,
+                    &room_data.room_state.members.members,
+                    &self_vk,
+                )
             });
             if already_member {
                 drop(rooms);

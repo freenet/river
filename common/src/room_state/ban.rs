@@ -1,4 +1,5 @@
-use crate::room_state::member::{AuthorizedMember, MemberId, MembersV1};
+use crate::room_state::ban_evidence::BanEvidenceV1;
+use crate::room_state::member::{AuthorizedMember, BanResolution, MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::{sign_struct, verify_struct};
@@ -7,8 +8,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fmt;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
@@ -22,168 +22,48 @@ use std::time::SystemTime;
 ///
 /// Which bans take effect is decided from converged state by
 /// [`MembersV1::resolve_bans`]: a ban whose issuer is themselves removed does
-/// not take effect, except in a mutual ban, where both do and both issuers are
-/// removed (freenet/river#423, #702).
+/// not take effect, except in a mutual ban, where only the cycle's members
+/// are removed; and the owner's ban wins over everything (freenet/river#423,
+/// #702).
 ///
-/// A ban is only honored while its banner is the OWNER or a CURRENT,
-/// signature-validated member ([`MembersV1::resolve_bans`] gates on that), and
-/// [`crate::room_state::ChatRoomStateV1::post_apply_cleanup`] sweeps any ban
-/// whose banner is neither. A member who is a banner is exempt from
-/// inactivity-pruning while they hold a retained ban, so a moderator's bans do
-/// not vanish. The `max_user_bans` FIFO is enforced there too, evicting inert
-/// bans that take no effect before those that do, and
+/// A ban is only honored while its issuer's record is known: the owner, a
+/// current member, or a member held in `ban_evidence` (a removed or pruned
+/// member whom a stored ban still references), and its signature must verify
+/// against that record's key. [`crate::room_state::ChatRoomStateV1::post_apply_cleanup`]
+/// sweeps any ban whose issuer is known nowhere. The `max_user_bans` cap is
+/// enforced there too, by tier (owner bans, then bans that take effect, then
+/// mutual bans, then the rest; see [`Self::enforce_user_ban_cap`]), and
 /// [`ComposableState::apply_delta`] bounds a single delta to `max_user_bans`
 /// new bans so a forged flood cannot make signature verification unbounded.
 ///
-/// KNOWN, ACCEPTED, self-limiting residuals (Ian confirmed, #411 round 3 D):
-/// 1. A current member can flood bans against ABSENT targets (each such ban is
-///    "enforcing" only because its banner is a member).
-/// 2. Slot-squatting: because of the item-B pruning exemption, a current member
-///    can make themselves PERMANENTLY exempt from inactivity-pruning with a
-///    single junk ban against an absent target — that ban is "enforcing", so it
-///    survives both the non-member-banner sweep and the `max_user_bans`
-///    eviction, and inactivity-prune can no longer reclaim their member slot.
-///
-/// Both are pre-existing/emergent and self-limiting the same way: the flooder /
-/// squatter is a current member, identifiable on every junk ban, and only an
-/// explicit OWNER ban reclaims the slot — banning them makes their bans inert
-/// and sweeps them (freeing the cap and making them prunable again).
-/// Inactivity-prune alone cannot. No code fix; documented deliberately.
+/// KNOWN, ACCEPTED, self-limiting residual (Ian confirmed, #411 round 3 D): a
+/// current member can flood bans against ABSENT targets (each such ban takes
+/// effect because its issuer is not removed), and `banned_at` is signed by the
+/// issuer, so they can evict older effective bans (never owner bans). The
+/// flooder is identifiable on every junk ban, and an OWNER ban makes all of
+/// their bans inert. The former second residual (slot-squatting through the
+/// banner prune exemption) is gone: there is no such exemption since #702.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct BansV1(pub Vec<AuthorizedUserBan>);
 
-/// Validation errors that can occur with bans.
-///
-/// Since #410, ban ENFORCEMENT authority (owner / ancestor / deputy) is no
-/// longer decided in `verify` — it is recomputed from converged state in
-/// `ChatRoomStateV1::post_apply_cleanup`. The former invite-chain /
-/// excess-count validation variants were removed with that change; the only
-/// remaining `verify`-time rejection is an orphaned ban whose banner was
-/// themselves banned.
-#[derive(Debug, Clone, PartialEq)]
-pub enum BanValidationError {
-    /// The banning member is not in the current member list AND was themselves
-    /// banned — an orphaned ban.
-    BannerNotFound(MemberId),
-}
-
-impl fmt::Display for BanValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BanValidationError::BannerNotFound(id) => {
-                write!(f, "Banning member not found in member list: {:?}", id)
-            }
-        }
-    }
-}
-
 impl BansV1 {
-    /// Validates the per-ban orphan constraints and returns a map of invalid
-    /// bans with errors. Does NOT enforce the `max_user_bans` ceiling — that is
-    /// a whole-collection concern applied as a hard count check in `verify` and
-    /// enforced (inert-first) in `ChatRoomStateV1::post_apply_cleanup` (#410).
-    fn get_invalid_bans(
-        &self,
-        parent_state: &ChatRoomStateV1,
-        parameters: &ChatRoomParametersV1,
-    ) -> HashMap<BanId, BanValidationError> {
-        let member_map = parent_state.members.members_by_member_id();
-        let mut invalid_bans = HashMap::new();
-        let banned_user_ids: HashSet<MemberId> = self.0.iter().map(|b| b.ban.banned_user).collect();
-
-        // Validate each ban
-        for ban in &self.0 {
-            self.validate_single_ban(
-                ban,
-                &member_map,
-                parameters,
-                &mut invalid_bans,
-                &banned_user_ids,
-            );
-        }
-
-        invalid_bans
-    }
-
-    /// Validates a single ban and adds any validation errors to the invalid_bans map.
+    /// Signature checks only: every ban whose banner is the owner, a member
+    /// of `parent_state` or held in its ban evidence must verify against that
+    /// banner's key. A ban whose banner is known nowhere is skipped, because
+    /// the key is not available here (see the loop body). Used by both
+    /// `verify` and `apply_delta`.
     ///
-    /// Note (#410): this does NOT reject a ban merely because the banner is not
-    /// a current ancestor of the target. Authority to ENFORCE a ban (owner /
-    /// ancestor / deputy, including retroactive deputy revocation) is evaluated
-    /// at enforcement time in [`crate::room_state::member::MembersV1::banned_member_ids`]
-    /// (run from `post_apply_cleanup`), NOT here. A ban whose banner has no
-    /// current authority (for example a revoked deputy) is INERT — it removes
-    /// nobody — but must still pass `verify`: a legitimately converged state (a
-    /// previously-banned user who rejoined after their deputy was revoked)
-    /// would otherwise fail validation and break convergence. Keeping ban
-    /// authority out of `verify` is exactly what makes `verify` stable across
-    /// deputy-state changes. Ban SIGNATURES are still verified in `verify`, and
-    /// the orphaned-ban check (banner was themselves banned) is retained.
-    fn validate_single_ban(
-        &self,
-        ban: &AuthorizedUserBan,
-        member_map: &HashMap<MemberId, &AuthorizedMember>,
-        parameters: &ChatRoomParametersV1,
-        invalid_bans: &mut HashMap<BanId, BanValidationError>,
-        banned_user_ids: &HashSet<MemberId>,
-    ) {
-        // If the banned member is no longer present they were already removed
-        // (e.g. by this ban, a cascade, or an inactivity prune); nothing left
-        // to enforce, so the ban is valid.
-        if !member_map.contains_key(&ban.ban.banned_user) {
-            return;
-        }
-
-        // Owner bans are always valid.
-        if ban.banned_by == parameters.owner_id() {
-            return;
-        }
-
-        // If the banner is not a current member, distinguish an orphaned ban
-        // (the banner was themselves banned) from a still-valid ban by a member
-        // who was merely pruned for inactivity. If the banner IS a current
-        // member the ban is accepted regardless of the banner's current
-        // ancestor/deputy authority (see the doc comment above) — enforcement
-        // decides who is actually removed.
-        if !member_map.contains_key(&ban.banned_by) && banned_user_ids.contains(&ban.banned_by) {
-            // Banner was banned — this ban is orphaned.
-            invalid_bans.insert(ban.id(), BanValidationError::BannerNotFound(ban.banned_by));
-        }
-    }
-
-    /// Per-ban validity + signature checks, EXCLUDING the `max_user_bans`
-    /// ceiling. `apply_delta` uses this because it defers cap enforcement to
-    /// `ChatRoomStateV1::post_apply_cleanup` (where the converged member_info is
-    /// available to evict inert bans before enforcing ones); `verify` layers the
-    /// hard count ceiling on top. See #410 review round 1.
-    fn verify_excluding_cap(
-        &self,
-        parent_state: &ChatRoomStateV1,
-        parameters: &ChatRoomParametersV1,
-    ) -> Result<(), String> {
-        let invalid_bans = self.get_invalid_bans(parent_state, parameters);
-        if !invalid_bans.is_empty() {
-            let error_messages: Vec<String> = invalid_bans
-                .iter()
-                .map(|(id, error)| format!("{:?}: {}", id, error))
-                .collect();
-            return Err(format!("Invalid bans: {}", error_messages.join(", ")));
-        }
-
-        self.verify_ban_signatures(parent_state, parameters)
-    }
-
-    /// Signature checks only: every ban whose banner is the owner or a member
-    /// of `parent_state` must verify against that banner's key. A ban whose
-    /// banner is not a member is skipped, because the key is not available
-    /// here (see the loop body). `verify` runs this after the orphaned-ban
-    /// rule; `apply_delta` runs it alone (freenet/river#423).
+    /// There is deliberately NO orphaned-ban rule any more (freenet/river#423,
+    /// #702): whether a ban takes effect, including "its issuer is banned", is
+    /// decided from converged state by `MembersV1::resolve_bans`.
     fn verify_ban_signatures(
         &self,
         parent_state: &ChatRoomStateV1,
         parameters: &ChatRoomParametersV1,
     ) -> Result<(), String> {
-        let members_by_id = parent_state.members.members_by_member_id();
+        let members_by_id = parent_state
+            .ban_evidence
+            .lookup(&parent_state.members, parameters.owner_id());
         let owner_vk = parameters.owner;
         let owner_id = parameters.owner_id();
 
@@ -263,36 +143,45 @@ impl BansV1 {
     /// construction; two copies of an almost-identical predicate is precisely
     /// what drifted in freenet/river#671 and in #411 round 4.
     ///
-    /// Ranks each ban by whether it TAKES EFFECT in
-    /// [`MembersV1::resolve_bans`] over the uncapped set, keeping only one
-    /// ban per `(issuer, target)` pair as effective (the oldest by
-    /// `(banned_at, id)`; later duplicates add nothing). It then evicts
-    /// non-effective before effective, oldest before newest, then by ban id,
-    /// and restores the canonical `(banned_at, id)` stored order. A no-op when
-    /// already within the cap.
+    /// Ranks each ban by its tier in [`MembersV1::resolve_bans`] over the
+    /// uncapped set (freenet/river#702, Ian 2026-09-24), highest kept first:
     ///
-    /// Ranking by effect rather than by "verifiable and authorized" is what
-    /// stops a banned issuer from flooding the cap (freenet/river#702): a
-    /// member removed by a ban that takes effect, re-added with a burst of
-    /// future-dated bans, or a mutual-ban tombstone banning outsiders, issues
-    /// only bans that take no effect, so theirs are the ones evicted. The
-    /// residual #413 describes (a CURRENT member's effective bans on absent
-    /// targets) is unchanged.
+    /// 1. owner bans ([`BanResolution::OWNER`]): a non-owner ban can never
+    ///    evict one;
+    /// 2. bans that take effect because their issuer is not removed
+    ///    ([`BanResolution::EFFECTIVE`]);
+    /// 3. the halves of a mutual-ban cycle ([`BanResolution::MUTUAL`]);
+    /// 4. everything else: bans that take no effect, by removed issuers, or
+    ///    unverifiable ([`BanResolution::INERT`]).
+    ///
+    /// Only one ban per `(issuer, target)` pair keeps its tier (the oldest by
+    /// `(banned_at, id)`); later duplicates add nothing and rank inert. Within
+    /// a tier it evicts oldest before newest, then by ban id, and restores the
+    /// canonical `(banned_at, id)` stored order. A no-op when already within
+    /// the cap.
+    ///
+    /// What this bounds: a member removed by a ban that takes effect, re-added
+    /// with a burst of bans, or a ring of sybils banning each other in pairs
+    /// under deputy grants with far-future dates, can only produce mutual or
+    /// inert bans, so it cannot evict an owner ban or a ban that takes effect.
+    /// A mutual-ban flood can still evict other mutual bans. The residual
+    /// #413 describes (a CURRENT member's effective bans on absent targets)
+    /// is unchanged.
     pub fn enforce_user_ban_cap(
         bans: &mut Vec<AuthorizedUserBan>,
         max_bans: usize,
         members: &MembersV1,
+        evidence: &BanEvidenceV1,
         member_info: &MemberInfoV1,
         parameters: &ChatRoomParametersV1,
     ) {
         if bans.len() <= max_bans {
             return;
         }
-        let effective = members
-            .resolve_bans(&BansV1(bans.clone()), member_info, parameters)
-            .effective_bans;
+        let resolution =
+            members.resolve_bans(evidence, &BansV1(bans.clone()), member_info, parameters);
         let mut first_of_pair: HashMap<(MemberId, MemberId), (SystemTime, BanId)> = HashMap::new();
-        for ban in bans.iter().filter(|b| effective.contains(&b.id())) {
+        for ban in bans.iter() {
             let key = (ban.banned_by, ban.ban.banned_user);
             let rank = (ban.ban.banned_at, ban.id());
             first_of_pair
@@ -304,12 +193,17 @@ impl BansV1 {
                 })
                 .or_insert(rank);
         }
-        let keeps = |ban: &AuthorizedUserBan| {
-            first_of_pair
+        let tier = |ban: &AuthorizedUserBan| {
+            let first = first_of_pair
                 .get(&(ban.banned_by, ban.ban.banned_user))
-                .is_some_and(|(at, id)| *at == ban.ban.banned_at && *id == ban.id())
+                .is_some_and(|(at, id)| *at == ban.ban.banned_at && *id == ban.id());
+            if first {
+                resolution.tier(&ban.id())
+            } else {
+                BanResolution::INERT
+            }
         };
-        bans.sort_by_cached_key(|ban| (keeps(ban), ban.ban.banned_at, ban.id()));
+        bans.sort_by_cached_key(|ban| (tier(ban), ban.ban.banned_at, ban.id()));
         let to_remove = bans.len() - max_bans;
         bans.drain(0..to_remove);
         bans.sort_by(|a, b| {
@@ -334,8 +228,8 @@ impl ComposableState for BansV1 {
     type Parameters = ChatRoomParametersV1;
 
     /// Verifies that all bans in the collection are valid:
-    /// - per-ban orphan constraints hold and all signatures are valid
-    ///   (`verify_excluding_cap`), AND
+    /// - every signature whose issuer is known verifies
+    ///   (`verify_ban_signatures`), AND
     /// - the number of bans does not exceed `max_user_bans` (the hard ceiling
     ///   on stored state; a legitimately-produced state is already ≤ the cap
     ///   because `post_apply_cleanup` evicts inert-first down to it).
@@ -344,7 +238,7 @@ impl ComposableState for BansV1 {
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
-        self.verify_excluding_cap(parent_state, parameters)?;
+        self.verify_ban_signatures(parent_state, parameters)?;
 
         if self.0.len() > parent_state.configuration.configuration.max_user_bans {
             return Err(format!(
@@ -707,7 +601,10 @@ mod tests {
             pruned_bans.verify(&state, &params).err()
         );
 
-        // Test 3b: Orphaned ban (banner was banned) — invalid
+        // Test 3b: an "orphaned" ban (banner absent and banned) is ACCEPTED by
+        // `verify` since freenet/river#423 / #702: whether it takes effect is
+        // decided from converged state by `MembersV1::resolve_bans`, and
+        // rejecting it here forked rooms permanently.
         let orphaned_key = SigningKey::generate(&mut rand::thread_rng());
         let orphaned_id: MemberId = orphaned_key.verifying_key().into();
         let orphaned_ban = AuthorizedUserBan::new(
@@ -731,8 +628,8 @@ mod tests {
         );
         let orphaned_bans = BansV1(vec![orphaned_ban, ban_of_orphaned]);
         assert!(
-            orphaned_bans.verify(&state, &params).is_err(),
-            "Orphaned ban (banner was banned) should fail verification"
+            orphaned_bans.verify(&state, &params).is_ok(),
+            "an orphaned ban passes verify; resolution decides its effect"
         );
 
         // Test 4: Valid ban by non-owner member

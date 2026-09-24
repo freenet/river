@@ -308,26 +308,19 @@ pub(crate) fn handle_contract_notification(
     // For public rooms it's safe to update the member-set cache even though
     // we never read it back: the cache is local-only and updating it
     // costs nothing.
-    let Ok(room_owner_vk) = VerifyingKey::from_bytes(&room_owner_vk_bytes) else {
-        logging::info("Notification for a room whose owner key is not a valid key — ignoring");
-        return Ok(vec![]);
-    };
-
     if new_state.configuration.configuration.privacy_mode != PrivacyMode::Private {
         logging::info("Notification for non-private room — no rotation needed");
-        update_member_set_cache(ctx, &room_b58, &new_state, &room_owner_vk);
+        update_member_set_cache(ctx, &room_b58, &new_state);
         return Ok(vec![]);
     }
 
-    // Compare the ACTIVE member set against the cached last-seen set. A
-    // mutual-ban tombstone is present in `members` but removed
-    // (freenet/river#702): it must count as a departure (so a mutual ban
-    // rotates the secret) and never receive a rotated secret.
-    let current_members: std::collections::BTreeSet<MemberId> =
-        active_member_vks(&new_state, &room_owner_vk)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+    // Compare member set against the cached last-seen set.
+    let current_members: std::collections::BTreeSet<MemberId> = new_state
+        .members
+        .members
+        .iter()
+        .map(|m| MemberId::from(&m.member.member_vk))
+        .collect();
 
     let previous_members: Option<std::collections::BTreeSet<MemberId>> = ctx
         .get_secret(&secret_keys::member_set(&room_b58))
@@ -439,8 +432,12 @@ pub(crate) fn handle_contract_notification(
     // any prior version and recover the actual secret bytes the room is
     // really using.
     let owner_id = MemberId::from(&owner_vk);
-    let current_with_vks: Vec<(MemberId, VerifyingKey)> =
-        active_member_vks(&new_state, &room_owner_vk);
+    let current_with_vks: Vec<(MemberId, VerifyingKey)> = new_state
+        .members
+        .members
+        .iter()
+        .map(|m| (MemberId::from(&m.member.member_vk), m.member.member_vk))
+        .collect();
 
     let new_encrypted_secrets = match build_rotation_encrypted_secrets(
         &signing_key,
@@ -475,6 +472,7 @@ pub(crate) fn handle_contract_notification(
         configuration: None,
         bans: None,
         members: None,
+        ban_evidence: None,
         member_info: None,
         secrets: Some(SecretsDelta {
             current_version: Some(new_version),
@@ -520,39 +518,18 @@ pub(crate) fn handle_contract_notification(
     // contract's CRDT dedup absorbs it. If the rotation succeeds, the cache
     // reflects the new member set so we don't spuriously re-rotate on the
     // next notification.
-    update_member_set_cache(ctx, &room_b58, &new_state, &room_owner_vk);
+    update_member_set_cache(ctx, &room_b58, &new_state);
 
     Ok(vec![OutboundDelegateMsg::UpdateContractRequest(update_req)])
 }
 
-/// The room's ACTIVE members (present and not enforced-banned) with their
-/// keys, through `ChatRoomStateV1::active_members`: the same set the UI's
-/// `rotate_secret` and `generate_missing_member_secrets` encrypt to, which
-/// keeps the UI and delegate blob sets identical (`.claude/rules/private-rooms.md`).
-fn active_member_vks(
-    state: &ChatRoomStateV1,
-    room_owner_vk: &VerifyingKey,
-) -> Vec<(MemberId, VerifyingKey)> {
-    state
-        .active_members(&river_core::room_state::ChatRoomParametersV1 {
-            owner: *room_owner_vk,
-        })
+fn update_member_set_cache(ctx: &mut DelegateCtx, room_b58: &str, new_state: &ChatRoomStateV1) {
+    let current_members: std::collections::BTreeSet<MemberId> = new_state
+        .members
+        .members
         .iter()
-        .map(|m| (MemberId::from(&m.member.member_vk), m.member.member_vk))
-        .collect()
-}
-
-fn update_member_set_cache(
-    ctx: &mut DelegateCtx,
-    room_b58: &str,
-    new_state: &ChatRoomStateV1,
-    room_owner_vk: &VerifyingKey,
-) {
-    let current_members: std::collections::BTreeSet<MemberId> =
-        active_member_vks(new_state, room_owner_vk)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        .map(|m| MemberId::from(&m.member.member_vk))
+        .collect();
     // CBOR-encoding a `BTreeSet<MemberId>` produces deterministic bytes for
     // the same set value: BTreeSet iterates in key order, ciborium preserves
     // that order, and `MemberId` is a fixed 32-byte struct. Even if it

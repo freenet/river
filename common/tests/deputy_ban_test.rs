@@ -1177,10 +1177,12 @@ fn inert_member_bans_evicted_before_enforcing_bans() {
     state.verify(&state, &p).expect("state verifies");
 }
 
-/// A member is exempt from inactivity-prune while they hold a retained ban;
-/// once their bans are gone they become prunable again.
+/// An inactive banner is pruned like anyone else; their record moves to ban
+/// evidence while their ban is stored, so the ban stays verifiable, and the
+/// evidence goes once the ban does (freenet/river#702; the #411 round 3
+/// prune exemption for banners is gone).
 #[test]
-fn banner_prunable_once_their_bans_are_gone() {
+fn inactive_banner_is_pruned_and_kept_as_evidence_only_while_their_ban_is() {
     let owner = Peer::new();
     let m = Peer::new();
     let c = Peer::new();
@@ -1195,28 +1197,30 @@ fn banner_prunable_once_their_bans_are_gone() {
         member_info: MemberInfoV1 {
             member_info: vec![info(&m, 0, vec![])],
         },
-        // M has NO messages; only being a banner keeps them present.
+        // M has NO messages.
         bans: BansV1(vec![ban(c.id, &m, owner_id)]),
         ..Default::default()
     };
 
     state.post_apply_cleanup(&p).unwrap();
+    assert!(!member_ids(&state).contains(&m.id), "M is pruned");
+    assert_eq!(state.bans.0.len(), 1, "M's ban is retained");
     assert!(
-        member_ids(&state).contains(&m.id),
-        "M is exempt from prune while a banner"
+        state
+            .ban_evidence
+            .members
+            .iter()
+            .any(|e| e.member.id() == m.id),
+        "M's record is kept as evidence for the ban"
     );
-    assert_eq!(
-        state.bans.0.len(),
-        1,
-        "M's ban is retained (banner is a current member)"
-    );
+    state.verify(&state, &p).expect("state verifies");
 
-    // Remove M's ban; M is now a plain inactive member.
+    // Remove M's ban; nothing needs M's record any more.
     state.bans.0.clear();
     state.post_apply_cleanup(&p).unwrap();
     assert!(
-        !member_ids(&state).contains(&m.id),
-        "once M's bans are gone, M is prunable again"
+        state.ban_evidence.members.is_empty(),
+        "evidence goes with the ban"
     );
 }
 
