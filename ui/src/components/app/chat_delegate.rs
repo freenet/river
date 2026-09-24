@@ -699,6 +699,9 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
                     return;
                 }
                 fire_list_rooms_request().await;
+                if !load_attempt_is_current(attempt) {
+                    return;
+                }
                 fire_load_outbound_dms_request().await;
             });
 
@@ -1259,6 +1262,19 @@ mod tests {
                 "`{call}` must come after the wait, the Superseded return and the attempt gate"
             );
         }
+        // A pass superseded while its list was being sent must not send the DM
+        // request on the new pass's connection.
+        let list = waiter.find("fire_list_rooms_request().await").unwrap();
+        let dms = waiter
+            .find("fire_load_outbound_dms_request().await")
+            .unwrap();
+        assert!(
+            waiter
+                .get(list..dms)
+                .unwrap()
+                .contains("if !load_attempt_is_current(attempt) {"),
+            "the attempt must be re-checked between the list and the DM request"
+        );
         let err_arm = body
             .find("Err(e) => {")
             .expect("the send's Err arm must exist");
@@ -4585,26 +4601,61 @@ mod tests {
     /// save overwrite the stored blob with a truncated one.
     #[test]
     fn await_flag_with_bound_does_not_expire_before_the_request_is_sent() {
-        use std::cell::Cell;
         static FLAG: AtomicBool = AtomicBool::new(false);
         static REQUEST: AtomicU32 = AtomicU32::new(0);
-        let done = Cell::new(false);
-        let waiter = async {
-            await_flag_with_bound(&FLAG, &REQUEST, std::time::Duration::from_millis(1), 3).await;
-            done.set(true);
-        };
-        let driver = async {
-            // Far more than 3 polls of 1 ms, with nothing requested yet.
-            crate::util::sleep(std::time::Duration::from_millis(60)).await;
-            assert!(
-                !done.get(),
-                "the wait gave up before the hydration request was sent"
-            );
-            REQUEST.store(1, Ordering::SeqCst);
-        };
-        futures::executor::block_on(futures::future::join(waiter, driver));
-        assert!(done.get(), "once requested, the bound applies again");
+        let (mut pool, done, tick) = drive_hydration_wait(&FLAG, &REQUEST, 3);
+
+        tick(50);
+        pool.run_until_stalled();
+        assert!(
+            !done.get(),
+            "the wait gave up before the hydration request was sent"
+        );
+
+        REQUEST.store(1, Ordering::SeqCst);
+        tick(3);
+        pool.run_until_stalled();
+        assert!(done.get(), "once requested, the bound applies");
         assert!(!FLAG.load(Ordering::SeqCst));
+    }
+
+    /// Runs `await_flag_with_polls` on a `LocalPool`, with each poll waiting
+    /// for one tick from the returned sender, so the tests count polls rather
+    /// than milliseconds.
+    fn drive_hydration_wait(
+        flag: &'static AtomicBool,
+        request: &'static AtomicU32,
+        max_polls: u32,
+    ) -> (
+        futures::executor::LocalPool,
+        std::rc::Rc<std::cell::Cell<bool>>,
+        impl Fn(usize),
+    ) {
+        use futures::task::LocalSpawnExt;
+        use futures::StreamExt;
+        let (tx, rx) = futures::channel::mpsc::unbounded::<()>();
+        let rx = std::rc::Rc::new(std::cell::RefCell::new(rx));
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let pool = futures::executor::LocalPool::new();
+        let done_in_task = done.clone();
+        pool.spawner()
+            .spawn_local(async move {
+                await_flag_with_polls(flag, request, max_polls, || {
+                    let rx = rx.clone();
+                    async move {
+                        futures::future::poll_fn(|cx| rx.borrow_mut().poll_next_unpin(cx)).await;
+                    }
+                })
+                .await;
+                done_in_task.set(true);
+            })
+            .unwrap();
+        let tick = move |n: usize| {
+            for _ in 0..n {
+                tx.unbounded_send(()).unwrap();
+            }
+        };
+        (pool, done, tick)
     }
 
     /// A request sent on a connection that then dropped must not use up the
@@ -4612,34 +4663,32 @@ mod tests {
     /// resets the request to 0, and a new request restarts the count.
     #[test]
     fn await_flag_with_bound_restarts_for_a_new_request() {
-        use std::cell::Cell;
         static FLAG: AtomicBool = AtomicBool::new(false);
         static REQUEST: AtomicU32 = AtomicU32::new(1);
-        let done = Cell::new(false);
-        // Budget: 12 polls of at least 5 ms each, so at least 60 ms of timed
-        // waiting per request.
-        let waiter = async {
-            await_flag_with_bound(&FLAG, &REQUEST, std::time::Duration::from_millis(5), 12).await;
-            done.set(true);
-        };
-        let driver = async {
-            // Request 1 uses most of its budget, then a reconnect's setup pass
-            // resets it before sending request 2.
-            crate::util::sleep(std::time::Duration::from_millis(45)).await;
-            REQUEST.store(0, Ordering::SeqCst);
-            crate::util::sleep(std::time::Duration::from_millis(100)).await;
-            assert!(!done.get(), "no bound may run while no request is out");
-            REQUEST.store(2, Ordering::SeqCst);
-            // Under 60 ms into request 2: only a count carried over from
-            // request 1 could have finished the wait by now.
-            crate::util::sleep(std::time::Duration::from_millis(40)).await;
-            assert!(
-                !done.get(),
-                "request 2 must get the full budget, not what request 1 left"
-            );
-        };
-        futures::executor::block_on(futures::future::join(waiter, driver));
-        assert!(done.get());
+        let (mut pool, done, tick) = drive_hydration_wait(&FLAG, &REQUEST, 12);
+
+        // Request 1 uses most of its budget.
+        tick(8);
+        pool.run_until_stalled();
+        assert!(!done.get());
+
+        // A reconnect's setup pass resets it: no bound runs.
+        REQUEST.store(0, Ordering::SeqCst);
+        tick(50);
+        pool.run_until_stalled();
+        assert!(!done.get(), "no bound may run while no request is out");
+
+        // Request 2 gets the full 12 polls, not the 4 request 1 left.
+        REQUEST.store(2, Ordering::SeqCst);
+        tick(11);
+        pool.run_until_stalled();
+        assert!(
+            !done.get(),
+            "request 2 must get the full budget, not what request 1 left"
+        );
+        tick(1);
+        pool.run_until_stalled();
+        assert!(done.get(), "request 2's budget still bounds the wait");
     }
 
     /// The DM `GetRequest` sender is what starts the bound.
@@ -8202,13 +8251,27 @@ async fn await_flag_with_bound(
     interval: std::time::Duration,
     max_polls: u32,
 ) {
+    await_flag_with_polls(flag, request, max_polls, || crate::util::sleep(interval)).await
+}
+
+/// [`await_flag_with_bound`] with the wait between polls supplied by the
+/// caller, so tests can drive the polls one at a time.
+async fn await_flag_with_polls<S, F>(
+    flag: &AtomicBool,
+    request: &AtomicU32,
+    max_polls: u32,
+    mut between_polls: S,
+) where
+    S: FnMut() -> F,
+    F: std::future::Future<Output = ()>,
+{
     if flag.load(Ordering::Acquire) {
         return;
     }
     let mut timed_request = 0;
     let mut polls_since_request = 0;
     while polls_since_request < max_polls {
-        crate::util::sleep(interval).await;
+        between_polls().await;
         if flag.load(Ordering::Acquire) {
             return;
         }
