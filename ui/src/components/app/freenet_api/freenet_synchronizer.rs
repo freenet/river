@@ -5,7 +5,9 @@ use super::error::SynchronizerError;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
-    request_legacy_seal_on_quiescence, reset_ensure_subscription_dedup, set_up_chat_delegate,
+    current_delegate_key, is_legacy_delegate_key, note_register_error_for_register_ack,
+    on_current_delegate_missing, request_legacy_seal_on_quiescence,
+    reset_ensure_subscription_dedup, set_up_chat_delegate,
 };
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
@@ -15,7 +17,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::HostResponse;
-use freenet_stdlib::prelude::OutboundDelegateMsg;
+use freenet_stdlib::prelude::{DelegateKey, OutboundDelegateMsg};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use river_core::room_state::member::AuthorizedMember;
@@ -41,6 +43,34 @@ use wasm_bindgen_futures::spawn_local;
 fn is_missing_delegate_error(message: &str) -> bool {
     (message.contains("delegate") && message.contains("not found"))
         || message.contains("missing delegate")
+}
+
+/// Whether an API error means a probed LEGACY delegate is absent, so the
+/// legacy migration may be sealed once the load is quiet.
+///
+/// freenet/river#707: the error channel carries no request id, so an error
+/// alone does not say which request failed. The current delegate can also be
+/// reported missing (the first load after a re-key, when the node runs a request
+/// before the `RegisterDelegate` ahead of it, freenet/river#709), and treating
+/// that as a legacy probe result would seal the migration for good. So a typed
+/// `Missing` seals only when it names a known LEGACY generation, and an untyped
+/// message that names `current` never seals.
+fn should_request_legacy_seal(error: &SynchronizerError, current: &DelegateKey) -> bool {
+    match error.missing_delegate_key() {
+        Some(key) => is_legacy_delegate_key(key.bytes()),
+        None => {
+            let message = error.to_string();
+            is_missing_delegate_error(&message) && !message.contains(&current.to_string())
+        }
+    }
+}
+
+/// Whether an untyped error is freenet-core's flattened
+/// `DelegateError::RegisterError` for `current` (freenet/river#709). Core wraps
+/// a refused register in `ExecutorError::other`, so the client gets only its
+/// text, `error while registering delegate <key>`.
+fn names_current_register_error(message: &str, current: &DelegateKey) -> bool {
+    message.contains(&format!("error while registering delegate {current}"))
 }
 
 /// Compute reconnection delay with exponential backoff and ±20% jitter.
@@ -781,12 +811,19 @@ impl FreenetSynchronizer {
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
 
+                                let current = current_delegate_key();
+                                if let Some(key) = e.register_failed_key() {
+                                    note_register_error_for_register_ack(key);
+                                } else if names_current_register_error(&e.to_string(), &current) {
+                                    note_register_error_for_register_ack(&current);
+                                }
+
                                 // Errors indicating a probed legacy delegate does not exist
                                 // on this node (see `is_missing_delegate_error`) should
                                 // permanently mark migration as done. The old delegate WASM
                                 // was never installed on this node, so retrying across
                                 // sessions will never succeed.
-                                if is_missing_delegate_error(&e.to_string()) {
+                                if should_request_legacy_seal(&e, &current) {
                                     info!("Delegate not found error (likely legacy migration) - requesting migration seal on quiescence");
                                     // Quiescence-gated, NOT immediate
                                     // (freenet/river#527). The fan-out probes ~26
@@ -802,6 +839,12 @@ impl FreenetSynchronizer {
                                     // legacy delegate must not speak for the other
                                     // twenty-five.
                                     request_legacy_seal_on_quiescence();
+                                } else if e
+                                    .missing_delegate_key()
+                                    .is_some_and(|key| key.bytes() == current.bytes())
+                                {
+                                    warn!("The CURRENT chat delegate was reported missing; not a legacy probe, so not sealing (freenet/river#707)");
+                                    on_current_delegate_missing();
                                 }
 
                                 // Special handling for "not supported" errors
@@ -992,6 +1035,105 @@ mod tests {
 
         // A same-shaped but unrelated error must not be misclassified.
         assert!(!is_missing_delegate_error("contract abc123 not found"));
+    }
+
+    /// freenet/river#707: a `missing delegate` error naming the CURRENT
+    /// delegate (the first-load race of freenet/river#709) must never request
+    /// the legacy-migration seal. A legacy key still does.
+    #[test]
+    fn missing_current_delegate_never_requests_seal() {
+        use freenet_stdlib::client_api::{ClientError, DelegateError, ErrorKind, RequestError};
+        use freenet_stdlib::prelude::CodeHash;
+
+        let current = DelegateKey::new([0x01; 32], CodeHash::new([0x02; 32]));
+        let (legacy_key, legacy_hash) =
+            crate::components::app::chat_delegate::legacy_delegate_pairs()[0];
+        let legacy = DelegateKey::new(legacy_key, CodeHash::new(legacy_hash));
+        let stranger = DelegateKey::new([0x03; 32], CodeHash::new([0x04; 32]));
+        let missing = |key: &DelegateKey| {
+            let client: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+                DelegateError::Missing(key.clone()),
+            ))
+            .into();
+            SynchronizerError::from_api_error(&client)
+        };
+
+        // Typed, as freenet-core#5729 and `freenet local` send it.
+        let current_missing = missing(&current);
+        assert_eq!(current_missing.missing_delegate_key(), Some(&current));
+        assert!(
+            is_missing_delegate_error(&current_missing.to_string()),
+            "the message still reads as a missing delegate; only the key tells them apart"
+        );
+        assert!(!should_request_legacy_seal(&current_missing, &current));
+        assert!(should_request_legacy_seal(&missing(&legacy), &current));
+        assert!(
+            !should_request_legacy_seal(&missing(&stranger), &current),
+            "a typed Missing seals only for a known legacy generation"
+        );
+
+        // Untyped wording from older nodes: the key is only in the text.
+        let untyped = |key: &DelegateKey| {
+            SynchronizerError::WebSocketError(format!("delegate {key} not found in store"))
+        };
+        assert!(!should_request_legacy_seal(&untyped(&current), &current));
+        assert!(should_request_legacy_seal(&untyped(&legacy), &current));
+
+        // The error arm must route a current-key Missing to the load's failure
+        // path, so the user gets Retry instead of a stuck rail.
+        let production = crate::util::strip_comments(
+            include_str!("freenet_synchronizer.rs")
+                .split("mod tests {")
+                .next()
+                .unwrap(),
+        );
+        let branch = production
+            .find(".is_some_and(|key| key.bytes() == current.bytes())")
+            .expect("the current-key Missing branch must exist");
+        assert!(
+            production
+                .get(branch..branch + 400)
+                .unwrap()
+                .contains("on_current_delegate_missing();"),
+            "the current-key Missing branch must call on_current_delegate_missing"
+        );
+        // And a typed RegisterError must end the register wait.
+        let arm = production
+            .find("Received error in API response")
+            .expect("the error arm must exist");
+        let arm_text = production.get(arm..arm + 700).unwrap();
+        assert!(arm_text.contains("note_register_error_for_register_ack(key)"));
+        assert!(
+            arm_text.contains("names_current_register_error(&e.to_string(), &current)"),
+            "the flattened (untyped) register error must also end the wait"
+        );
+        let register_failed = SynchronizerError::from_api_error(
+            &ErrorKind::RequestError(RequestError::DelegateError(DelegateError::RegisterError(
+                current.clone(),
+            )))
+            .into(),
+        );
+        assert_eq!(register_failed.register_failed_key(), Some(&current));
+
+        // Core main flattens a refused register to text; it must still be
+        // recognised for the current key, and only for it.
+        let flattened = format!(
+            "WebSocket connection error: client error: error while executing operation in the network: {}",
+            DelegateError::RegisterError(current.clone())
+        );
+        assert!(names_current_register_error(&flattened, &current));
+        assert!(!names_current_register_error(&flattened, &stranger));
+        assert!(!names_current_register_error(
+            &DelegateError::Missing(current.clone()).to_string(),
+            &current
+        ));
+        assert!(!should_request_legacy_seal(&register_failed, &current));
+
+        // Unrelated errors never seal.
+        assert!(!should_request_legacy_seal(
+            &SynchronizerError::WebSocketError("contract abc123 not found".into()),
+            &current
+        ));
     }
 
     #[test]

@@ -18,7 +18,8 @@ use crate::components::app::chat_delegate::{
     fire_legacy_migration_request, hydrate_hidden_dm_threads, hydrate_outbound_dms_cache,
     is_legacy_delegate_key, is_legacy_migration_in_progress, legacy_scoped_correlation,
     load_state_after_probe_legacy, mark_legacy_migration_done, mark_legacy_migration_in_progress,
-    mark_outbound_dms_hydrated, parse_room_storage_key, per_room_terminal,
+    mark_outbound_dms_hydrated, note_current_list_response,
+    note_delegate_response_for_register_ack, parse_room_storage_key, per_room_terminal,
     prune_outbound_dms_for_purges, request_legacy_seal_on_quiescence, response_correlation_base,
     room_storage_key, save_outbound_dms_to_delegate, save_rooms_to_delegate, send_delegate_request,
     send_delegate_request_to, set_load_state_if_current, source_rank_for_delegate_key,
@@ -133,6 +134,9 @@ impl ResponseHandler {
                 }
             },
             HostResponse::DelegateResponse { key, values } => {
+                // The room load waits for the node's reply to RegisterDelegate
+                // before listing rooms (freenet/river#709).
+                note_delegate_response_for_register_ack(&key, values.len());
                 // Check if this is a response from any known legacy delegate
                 let is_legacy_delegate = is_legacy_delegate_key(key.bytes());
                 // Which delegate GENERATION answered (freenet/river#527).
@@ -532,6 +536,7 @@ impl ResponseHandler {
                                                 });
                                             }
                                         } else {
+                                            note_current_list_response();
                                             crate::util::safe_spawn_local(async move {
                                                 load_rooms_per_room(keys).await;
                                             });

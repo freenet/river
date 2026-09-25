@@ -619,8 +619,14 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
     // reconnect can advance the attempt mid-flight — gate the failure resolve on
     // still-current.
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    reset_outbound_dms_hydration_request();
 
     let delegate = create_chat_delegate_container();
+
+    // freenet/river#709: arm the ack slot BEFORE sending, so the node's reply
+    // cannot arrive ahead of the waiter. Re-arming here also cancels a waiter
+    // left by a previous pass (reconnect/wake/Retry).
+    let register_ack = arm_register_ack(CHAT_DELEGATE_KEY.clone());
 
     // Get a write lock on the API and use it directly
     let api_result = {
@@ -642,13 +648,18 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
 
     match api_result {
         Ok(_) => {
-            info!("Chat delegate registered successfully");
-            // NOTE: We don't await load_rooms_from_delegate() here because it would
-            // deadlock - it waits for a response that comes through the same message
-            // loop that called us. Instead, we fire off the request and let the
-            // response be handled by the response_handler through the message loop.
+            info!("RegisterDelegate sent; waiting for the node's reply before loading rooms");
+            // freenet/river#709: `WebApi::send` resolves once the bytes are on
+            // the socket, not when the node has registered the delegate. On the
+            // first load after a delegate re-key the node has never seen this
+            // delegate, and it can run the ListRequest / outbound-DM GetRequest
+            // BEFORE the RegisterDelegate queued ahead of them: both get an
+            // empty reply (or, since freenet-core#5729, `missing delegate`),
+            // the load never starts, and the user sees no rooms until a reload.
+            // So the two requests wait for the node's reply to the register.
             //
-            // The response handler will process GetResponse and populate ROOMS.
+            // The wait runs in its own task: the reply arrives through the same
+            // message loop that called us, so awaiting it here would deadlock.
             //
             // Legacy migration is NOT fired here. It is gated on the current
             // delegate's response: if the current delegate has data, migration is
@@ -657,12 +668,47 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             // current delegate and clobbering newer state (freenet/river#253).
             // The fresh-attempt bookkeeping (SAW_FETCH_FAILURE reset, Loading
             // state, hard-max arming) already ran in `begin_load_attempt()` above.
-            fire_list_rooms_request().await;
-            fire_load_outbound_dms_request().await;
+            crate::util::safe_spawn_local(async move {
+                let timeout =
+                    crate::util::sleep(std::time::Duration::from_millis(REGISTER_ACK_TIMEOUT_MS));
+                match wait_for_register_ack(register_ack.receiver, timeout).await {
+                    RegisterAckWait::Acked => {
+                        info!("Chat delegate registered successfully");
+                    }
+                    RegisterAckWait::Failed => {
+                        // Load anyway, as on a timeout: an earlier registration
+                        // may still serve the requests. If it does not, the
+                        // list's `missing delegate` reply resolves LoadFailed
+                        // (`on_current_delegate_missing`).
+                        warn!("RegisterDelegate was refused; loading rooms anyway");
+                    }
+                    RegisterAckWait::TimedOut => {
+                        // No reply in time. Load anyway: this is what every
+                        // load did before #709, and a stuck rail is worse.
+                        warn!(
+                            "No reply to RegisterDelegate after {}ms; loading rooms anyway",
+                            REGISTER_ACK_TIMEOUT_MS
+                        );
+                    }
+                    RegisterAckWait::Superseded => {
+                        // A later setup pass re-armed the slot and owns the load.
+                        return;
+                    }
+                }
+                if !load_attempt_is_current(attempt) {
+                    return;
+                }
+                fire_list_rooms_request().await;
+                if !load_attempt_is_current(attempt) {
+                    return;
+                }
+                fire_load_outbound_dms_request(attempt).await;
+            });
 
             Ok(())
         }
         Err(e) => {
+            disarm_register_ack(register_ack.generation);
             // freenet/river#397 Codex review 8/11: RegisterDelegate failed — a
             // definitive setup failure, and this Err path returns before any load
             // worker runs. Resolve directly to `LoadFailed` (if still current +
@@ -671,6 +717,221 @@ pub async fn set_up_chat_delegate() -> Result<(), String> {
             resolve_load_failed_if_empty(attempt);
             Err(format!("Failed to register chat delegate: {}", e))
         }
+    }
+}
+
+/// How long the room load waits for the node's reply to `RegisterDelegate`
+/// before loading anyway (freenet/river#709). A register normally completes in
+/// 10-20 ms; the budget covers a cold WASM compile on a slow or busy node. It is
+/// well under [`LOAD_HARD_MAX_MS`], so a lost reply still leaves time for the
+/// load itself.
+///
+/// A refused register ends the wait early ([`note_register_error_for_register_ack`])
+/// when the error names the current delegate: typed as
+/// `DelegateError::RegisterError(<key>)`, or, as freenet-core main sends it
+/// today, flattened to an untyped error whose text contains `error while
+/// registering delegate <key>` (core wraps `RegisterError` in
+/// `ExecutorError::other`, `runtime/delegates.rs`, and the client sees
+/// `OperationError { cause }`). That text match comes from reading core, not
+/// from a captured reply. Failures that do not name the delegate, such as
+/// core's per-key rate limiter (`ExecutionError`), still spend the full
+/// budget.
+const REGISTER_ACK_TIMEOUT_MS: u64 = 15_000;
+const _: () = assert!(REGISTER_ACK_TIMEOUT_MS < LOAD_HARD_MAX_MS);
+
+/// The one outstanding wait for the node's reply to our `RegisterDelegate`
+/// (freenet/river#709).
+///
+/// The client API has no request ids, and the register's reply carries no
+/// payload to hold a correlation key, so the generic `PENDING_REQUESTS` waiter
+/// cannot be used. Instead: the node answers a successful register with
+/// `DelegateResponse { key, values: [] }` for the registered key, while every
+/// `ChatDelegateRequestMsg` handler in `delegates/chat-delegate` answers with
+/// exactly one `ApplicationMessage`. So an empty response for the armed key is
+/// the register's reply, with two known exceptions, both of which fall back to
+/// the pre-#709 race rather than to anything worse:
+///
+/// - a node that answers a request to a not-yet-registered delegate with an
+///   empty response (freenet 0.2.136 and earlier; freenet-core#5729 changed it
+///   to a typed `Missing`). Any other request to the current delegate that
+///   overtakes the register on the first load after a re-key (a user action in
+///   that window, or a request a timed-out earlier pass already sent) then
+///   reads as the ack.
+/// - a chat-delegate handler that one day answers with no messages.
+///
+/// Keys are compared by their 32 key bytes, the same identity the node and
+/// `is_legacy_delegate_key` use.
+#[derive(Default)]
+pub(crate) struct RegisterAckSlot {
+    /// The armed wait: its generation, the key, and where to report the
+    /// outcome (`true` registered, `false` the node refused the register).
+    pending: Option<(u64, DelegateKey, oneshot::Sender<bool>)>,
+    next_generation: u64,
+}
+
+/// One armed wait: its generation (to disarm only this wait) and receiver.
+pub(crate) struct ArmedRegisterAck {
+    generation: u64,
+    receiver: oneshot::Receiver<bool>,
+}
+
+impl RegisterAckSlot {
+    /// Arm a wait for `key`'s register reply. Replaces (and so cancels) any
+    /// earlier wait.
+    pub(crate) fn arm(&mut self, key: DelegateKey) -> ArmedRegisterAck {
+        let (tx, receiver) = oneshot::channel();
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        self.pending = Some((generation, key, tx));
+        ArmedRegisterAck {
+            generation,
+            receiver,
+        }
+    }
+
+    /// Drop the wait armed as `generation`. A later pass's wait is left alone.
+    pub(crate) fn disarm(&mut self, generation: u64) {
+        if matches!(&self.pending, Some((armed, _, _)) if *armed == generation) {
+            self.pending = None;
+        }
+    }
+
+    /// Complete the armed wait for `key` with `registered`. Returns true when
+    /// a wait for that key was armed. Matched by key only: a late reply or
+    /// error to an earlier pass's register on the same socket completes the
+    /// current wait. A late ack is harmless (the delegate is registered); a late
+    /// error only makes the load start early, as on a timeout.
+    fn complete(&mut self, key: &DelegateKey, registered: bool) -> bool {
+        match self.pending.take() {
+            Some((_, armed, tx)) if armed.bytes() == key.bytes() => {
+                let _ = tx.send(registered);
+                true
+            }
+            other => {
+                self.pending = other;
+                false
+            }
+        }
+    }
+
+    /// Feed a `DelegateResponse`. Returns true when it completed the armed
+    /// wait: an empty response for the armed key.
+    pub(crate) fn on_delegate_response(&mut self, key: &DelegateKey, values_len: usize) -> bool {
+        values_len == 0 && self.complete(key, true)
+    }
+
+    /// Feed a typed `DelegateError::RegisterError(key)`. Returns true when it
+    /// failed the armed wait for that key.
+    pub(crate) fn on_register_error(&mut self, key: &DelegateKey) -> bool {
+        self.complete(key, false)
+    }
+}
+
+static REGISTER_ACK: LazyLock<Mutex<RegisterAckSlot>> =
+    LazyLock::new(|| Mutex::new(RegisterAckSlot::default()));
+
+fn arm_register_ack(key: DelegateKey) -> ArmedRegisterAck {
+    REGISTER_ACK.lock().unwrap().arm(key)
+}
+
+fn disarm_register_ack(generation: u64) {
+    REGISTER_ACK.lock().unwrap().disarm(generation);
+}
+
+/// Called from the synchronizer's error arm for a typed
+/// `DelegateError::RegisterError`, so the room load stops waiting at once
+/// instead of sitting out [`REGISTER_ACK_TIMEOUT_MS`].
+pub(crate) fn note_register_error_for_register_ack(key: &DelegateKey) {
+    if REGISTER_ACK.lock().unwrap().on_register_error(key) {
+        warn!("The node refused RegisterDelegate for the chat delegate");
+    }
+}
+
+/// Called by the response handler for every `DelegateResponse`, so a pending
+/// register wait can complete (freenet/river#709).
+pub(crate) fn note_delegate_response_for_register_ack(key: &DelegateKey, values_len: usize) {
+    if REGISTER_ACK
+        .lock()
+        .unwrap()
+        .on_delegate_response(key, values_len)
+    {
+        debug!("RegisterDelegate reply received");
+    }
+}
+
+/// `attempt + 1` of the load whose room `ListRequest` to the current delegate
+/// has been sent with no `ListResponse` yet; 0 when none is outstanding.
+static LIST_OUTSTANDING: AtomicU32 = AtomicU32::new(0);
+
+/// The current delegate answered a `ListRequest`. Clears the marker only if
+/// it belongs to the current attempt. A reply to an earlier attempt's list
+/// cannot be told apart from the current one (no request ids), so a stale
+/// reply can still clear it; the cost is only the hard-max wait this marker
+/// exists to shorten.
+pub(crate) fn note_current_list_response() {
+    let _ = claim_outstanding_list(&LIST_OUTSTANDING, LOAD_ATTEMPT_GEN.load(Ordering::Relaxed));
+}
+
+/// Take the outstanding-list marker if it belongs to `attempt`.
+fn claim_outstanding_list(outstanding: &AtomicU32, attempt: u32) -> bool {
+    outstanding
+        .compare_exchange(
+            attempt.wrapping_add(1),
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+/// The node reported the CURRENT chat delegate missing (freenet/river#707).
+/// This is not a legacy probe result, so it must not seal the migration.
+///
+/// The error carries no request id. If this attempt's room list is still
+/// unanswered, the list is what failed (a failed or lost register), no
+/// `ListResponse` will come to start the load, and the user would otherwise
+/// wait for the hard-max and then see "No rooms yet". So record the failure
+/// and show Retry, which re-registers. Once the list has been answered, a
+/// Missing belongs to some other request and is left alone: marking the
+/// attempt failed then would turn a correct Empty into LoadFailed.
+///
+/// Retry re-registers, so it fails the same way again while the node keeps
+/// refusing the delegate's requests.
+pub(crate) fn on_current_delegate_missing() {
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    if !claim_outstanding_list(&LIST_OUTSTANDING, attempt) {
+        return;
+    }
+    mark_fetch_failure_if_current(attempt);
+    resolve_load_failed_if_empty(attempt);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RegisterAckWait {
+    /// The node replied to the register.
+    Acked,
+    /// The node answered the register with a typed `RegisterError`.
+    Failed,
+    /// No reply within the timeout.
+    TimedOut,
+    /// A later setup pass re-armed (or disarmed) the slot.
+    Superseded,
+}
+
+/// Wait for the armed register reply, or `timeout`, whichever comes first.
+pub(crate) async fn wait_for_register_ack<T>(
+    ack: oneshot::Receiver<bool>,
+    timeout: T,
+) -> RegisterAckWait
+where
+    T: std::future::Future<Output = ()>,
+{
+    let timeout = Box::pin(timeout);
+    match select(ack, timeout).await {
+        Either::Left((Ok(true), _)) => RegisterAckWait::Acked,
+        Either::Left((Ok(false), _)) => RegisterAckWait::Failed,
+        Either::Left((Err(oneshot::Canceled), _)) => RegisterAckWait::Superseded,
+        Either::Right(_) => RegisterAckWait::TimedOut,
     }
 }
 
@@ -734,6 +995,355 @@ pub(crate) fn reset_ensure_subscription_dedup() {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    fn register_test_key(b: u8) -> DelegateKey {
+        DelegateKey::new([b; 32], CodeHash::new([b.wrapping_add(1); 32]))
+    }
+
+    /// freenet/river#709: only an EMPTY `DelegateResponse` for the ARMED key
+    /// completes the register wait. A reply carrying values is a real delegate
+    /// response, and another key's reply belongs to someone else.
+    #[test]
+    fn register_ack_completes_only_on_empty_reply_for_armed_key() {
+        let key = register_test_key(0x11);
+        let other = register_test_key(0x22);
+        let mut slot = RegisterAckSlot::default();
+        let mut ack = slot.arm(key.clone()).receiver;
+
+        assert!(!slot.on_delegate_response(&other, 0), "another key's reply");
+        assert!(!slot.on_delegate_response(&key, 1), "a reply with values");
+        assert!(
+            !slot.on_register_error(&other),
+            "another key's register error"
+        );
+        assert_eq!(ack.try_recv(), Ok(None), "still waiting");
+
+        assert!(slot.on_delegate_response(&key, 0));
+        assert_eq!(ack.try_recv(), Ok(Some(true)));
+        assert!(
+            !slot.on_delegate_response(&key, 0),
+            "one ack per arm: a second empty reply completes nothing"
+        );
+    }
+
+    /// freenet/river#709: the room load must not start before the node has
+    /// answered the register. Drives `wait_for_register_ack` the way
+    /// `set_up_chat_delegate` does and checks the load stays parked until the
+    /// ack arrives.
+    #[test]
+    fn room_load_waits_for_register_reply() {
+        use futures::executor::LocalPool;
+        use futures::task::LocalSpawnExt;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let key = register_test_key(0x33);
+        let mut slot = RegisterAckSlot::default();
+        let ack = slot.arm(key.clone()).receiver;
+        let loaded = Rc::new(Cell::new(false));
+
+        let mut pool = LocalPool::new();
+        let loaded_in_task = loaded.clone();
+        pool.spawner()
+            .spawn_local(async move {
+                let outcome = wait_for_register_ack(ack, futures::future::pending()).await;
+                assert_eq!(outcome, RegisterAckWait::Acked);
+                loaded_in_task.set(true);
+            })
+            .unwrap();
+
+        pool.run_until_stalled();
+        assert!(
+            !loaded.get(),
+            "the list request must not go out before the register reply"
+        );
+
+        assert!(slot.on_delegate_response(&key, 0));
+        pool.run_until_stalled();
+        assert!(loaded.get(), "the register reply must release the load");
+    }
+
+    /// A later setup pass re-arms the slot; the earlier waiter must stand down
+    /// rather than fire a second load. A missing reply falls back to loading.
+    #[test]
+    fn register_wait_is_superseded_by_rearm_and_bounded_by_timeout() {
+        let key = register_test_key(0x44);
+        let mut slot = RegisterAckSlot::default();
+        let first = slot.arm(key.clone());
+        let second = slot.arm(key.clone());
+        assert_eq!(
+            futures::executor::block_on(wait_for_register_ack(
+                first.receiver,
+                futures::future::pending()
+            )),
+            RegisterAckWait::Superseded
+        );
+
+        // Disarming the superseded pass's generation must not touch the live
+        // wait (a failing Retry pass racing a later one).
+        slot.disarm(first.generation);
+        assert!(
+            slot.on_delegate_response(&key, 0),
+            "the later wait survives"
+        );
+        assert_eq!(
+            futures::executor::block_on(wait_for_register_ack(
+                second.receiver,
+                futures::future::pending()
+            )),
+            RegisterAckWait::Acked
+        );
+
+        let third = slot.arm(key.clone());
+        assert_eq!(
+            futures::executor::block_on(wait_for_register_ack(
+                third.receiver,
+                futures::future::ready(())
+            )),
+            RegisterAckWait::TimedOut
+        );
+
+        // A typed RegisterError for the armed key ends the wait at once.
+        let fourth = slot.arm(key.clone());
+        assert!(slot.on_register_error(&key));
+        assert_eq!(
+            futures::executor::block_on(wait_for_register_ack(
+                fourth.receiver,
+                futures::future::pending()
+            )),
+            RegisterAckWait::Failed
+        );
+    }
+
+    /// This file's production code (the mid-file test module excised), with
+    /// comments stripped.
+    fn chat_delegate_production() -> String {
+        let src = include_str!("chat_delegate.rs");
+        let tests_start = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("test module must exist");
+        let tests_end = tests_start
+            + src
+                .get(tests_start..)
+                .unwrap()
+                .find("\n}\n")
+                .expect("test module must terminate")
+            + 3;
+        crate::util::strip_comments(&format!(
+            "{}{}",
+            src.get(..tests_start).unwrap(),
+            src.get(tests_end..).unwrap()
+        ))
+    }
+
+    /// `response_handler.rs` production code with comments stripped.
+    fn response_handler_production() -> String {
+        crate::util::strip_comments(
+            include_str!("freenet_api/response_handler.rs")
+                .split("mod tests {")
+                .next()
+                .unwrap(),
+        )
+    }
+
+    /// The body of the function whose signature starts with `signature`.
+    fn fn_body<'a>(production: &'a str, signature: &str) -> &'a str {
+        let start = production
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` must exist"));
+        let rest = production.get(start..).unwrap();
+        rest.get(..rest.find("\n}\n").expect("function must end"))
+            .unwrap()
+    }
+
+    #[test]
+    fn strip_comments_drops_commented_code_only() {
+        let src = concat!(
+            "a();\n",
+            "// b();\n",
+            "c(); // d();\n",
+            "let u = \"http://x /* not a comment */\"; e();\n",
+            "let q = '\"'; f(); // g();\n",
+            "let r = '\\\"'; h(); // k();\n",
+            "/* m();\n n(); /* nested */ o(); */ p();\n",
+            "let s = \"multi\n// still string\"; t();",
+        );
+        let out = crate::util::strip_comments(src);
+        for kept in [
+            "a();",
+            "c();",
+            "e();",
+            "f();",
+            "h();",
+            "p();",
+            "t();",
+            "http://x /* not a comment */",
+            "// still string",
+        ] {
+            assert!(out.contains(kept), "`{kept}` must survive: {out}");
+        }
+        for dropped in ["b();", "d();", "g();", "k();", "m();", "n();", "o();"] {
+            assert!(
+                !out.contains(dropped),
+                "`{dropped}` must be stripped: {out}"
+            );
+        }
+        assert_eq!(
+            out.lines().count(),
+            src.lines().count(),
+            "line structure survives"
+        );
+    }
+
+    /// freenet/river#707 follow-up: a current-key Missing fails the load only
+    /// while THIS attempt's room list is unanswered, and only once.
+    #[test]
+    fn current_missing_claims_only_this_attempts_outstanding_list() {
+        let outstanding = AtomicU32::new(0);
+        assert!(
+            !claim_outstanding_list(&outstanding, 7),
+            "no list outstanding"
+        );
+
+        outstanding.store(7 + 1, Ordering::Relaxed);
+        assert!(
+            !claim_outstanding_list(&outstanding, 8),
+            "another attempt's list"
+        );
+        assert!(claim_outstanding_list(&outstanding, 7));
+        assert!(!claim_outstanding_list(&outstanding, 7), "claimed once");
+
+        let rh = response_handler_production();
+        let current_list = rh
+            .find("load_rooms_per_room(keys).await;")
+            .expect("current-delegate ListResponse branch must exist");
+        assert!(
+            rh.get(current_list.saturating_sub(300)..current_list)
+                .unwrap()
+                .contains("note_current_list_response();"),
+            "the current delegate's ListResponse must clear the outstanding marker"
+        );
+        let production = chat_delegate_production();
+        let body = fn_body(&production, "pub(crate) fn on_current_delegate_missing() {");
+        let claim = body
+            .find("claim_outstanding_list(&LIST_OUTSTANDING, attempt)")
+            .expect("the handler must be gated on the outstanding list");
+        let mark = body
+            .find("mark_fetch_failure_if_current(attempt)")
+            .expect("the handler must mark the failure");
+        assert!(claim < mark);
+    }
+
+    /// freenet/river#709 wiring: in `set_up_chat_delegate` the list and
+    /// outbound-DM requests are sent only after `wait_for_register_ack`, the
+    /// slot is armed before the register is sent, and the response handler
+    /// feeds every `DelegateResponse` to the slot.
+    #[test]
+    fn set_up_chat_delegate_lists_rooms_only_after_register_reply() {
+        let production = chat_delegate_production();
+        let body = fn_body(&production, "pub async fn set_up_chat_delegate()");
+
+        let arm = body
+            .find("arm_register_ack(")
+            .expect("the ack slot must be armed");
+        let send = body
+            .find("DelegateRequest::RegisterDelegate")
+            .expect("the delegate must be registered");
+        assert!(arm < send, "arm the ack slot BEFORE sending the register");
+
+        // The fire calls must sit inside the spawned waiter, after the wait,
+        // after the Superseded arm returns, and behind the attempt gate.
+        let spawn = body
+            .find("crate::util::safe_spawn_local(async move {")
+            .expect("the load must run in a spawned waiter");
+        let spawn_end = spawn
+            + body
+                .get(spawn..)
+                .unwrap()
+                .find("\n            });\n")
+                .expect("the spawned waiter must end");
+        let waiter = body.get(spawn..spawn_end).unwrap();
+        let wait = waiter
+            .find("wait_for_register_ack(")
+            .expect("the load must wait for the register reply");
+        let superseded_arm = "RegisterAckWait::Superseded => {";
+        let superseded = waiter
+            .find(superseded_arm)
+            .expect("a superseded waiter must be handled");
+        let arm_body = waiter.get(superseded + superseded_arm.len()..).unwrap();
+        let arm_body = arm_body
+            .get(..arm_body.find('}').expect("the Superseded arm must close"))
+            .unwrap();
+        assert!(
+            arm_body.contains("return;"),
+            "a superseded waiter must return without loading"
+        );
+        for arm in [
+            "RegisterAckWait::Failed => {",
+            "RegisterAckWait::TimedOut => {",
+        ] {
+            let at = waiter
+                .find(arm)
+                .unwrap_or_else(|| panic!("`{arm}` must be handled"));
+            let arm_body = waiter.get(at + arm.len()..).unwrap();
+            let arm_body = arm_body
+                .get(..arm_body.find("RegisterAckWait::").unwrap_or(arm_body.len()))
+                .unwrap();
+            assert!(
+                !arm_body.contains("return"),
+                "`{arm}` must load anyway, not return"
+            );
+        }
+        let gate = waiter
+            .find("if !load_attempt_is_current(attempt) {")
+            .expect("the load must be gated on the attempt still being current");
+        for call in [
+            "fire_list_rooms_request().await",
+            "fire_load_outbound_dms_request(attempt).await",
+        ] {
+            assert_eq!(body.matches(call).count(), 1, "exactly one `{call}`");
+            let at = waiter
+                .find(call)
+                .unwrap_or_else(|| panic!("`{call}` must be inside the spawned waiter"));
+            assert!(
+                at > wait && at > superseded && at > gate,
+                "`{call}` must come after the wait, the Superseded return and the attempt gate"
+            );
+        }
+        // A pass superseded while its list was being sent must not send the DM
+        // request on the new pass's connection.
+        let list = waiter.find("fire_list_rooms_request().await").unwrap();
+        let dms = waiter
+            .find("fire_load_outbound_dms_request(attempt).await")
+            .unwrap();
+        assert!(
+            waiter
+                .get(list..dms)
+                .unwrap()
+                .contains("if !load_attempt_is_current(attempt) {"),
+            "the attempt must be re-checked between the list and the DM request"
+        );
+        let err_arm = body
+            .find("Err(e) => {")
+            .expect("the send's Err arm must exist");
+        assert!(
+            body.get(err_arm..)
+                .unwrap()
+                .contains("disarm_register_ack(register_ack.generation)"),
+            "the send failure must disarm only the wait it armed"
+        );
+
+        let rh = response_handler_production();
+        let arm_start = rh
+            .find("HostResponse::DelegateResponse { key, values } => {")
+            .expect("DelegateResponse arm must exist");
+        assert!(
+            rh.get(arm_start..arm_start + 300)
+                .unwrap()
+                .contains("note_delegate_response_for_register_ack(&key, values.len())"),
+            "the response handler must feed every DelegateResponse to the register ack slot"
+        );
+    }
 
     /// freenet/river#590: leaving a room must record an AUTHORITATIVE tombstone
     /// rank, and rejoining must clear it.
@@ -3967,64 +4577,254 @@ mod tests {
     /// rationale.
     static OUTBOUND_DMS_HYDRATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Already-set fast path: no polling, returns essentially immediately.
+    /// Already-set fast path: returns hydrated without waiting for a poll.
     #[test]
     fn await_flag_with_bound_returns_immediately_when_already_set() {
         static FLAG: AtomicBool = AtomicBool::new(true);
-        let start = std::time::Instant::now();
-        futures::executor::block_on(await_flag_with_bound(
-            &FLAG,
-            std::time::Duration::from_secs(5),
-            1,
-        ));
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "an already-set flag must not wait a single poll interval"
+        static REQUEST: AtomicU32 = AtomicU32::new(1);
+        let (mut pool, done, _tick) = drive_hydration_wait(&FLAG, &REQUEST, 1);
+        pool.run_until_stalled();
+        assert_eq!(
+            done.get(),
+            Some(true),
+            "an already-set flag must not wait a single poll"
         );
     }
 
-    /// If the flag flips while a wait is in progress, the wait must return as
-    /// soon as it's observed — not sit out the full `max_polls` budget. Proven
-    /// by racing a flipper (no delay) against the waiter (a real, larger poll
-    /// interval + generous max_polls) and asserting the combined wait
-    /// completes far under the full budget.
+    /// If the flag flips mid-wait, the wait returns on the next poll rather
+    /// than sitting out the rest of its budget.
     #[test]
     fn await_flag_with_bound_returns_once_flag_set_mid_wait() {
         static FLAG: AtomicBool = AtomicBool::new(false);
-        FLAG.store(false, Ordering::SeqCst);
-        let start = std::time::Instant::now();
-        let waiter = await_flag_with_bound(&FLAG, std::time::Duration::from_millis(20), 100);
-        let flipper = async {
-            FLAG.store(true, Ordering::SeqCst);
-        };
-        futures::executor::block_on(futures::future::join(waiter, flipper));
-        assert!(
-            start.elapsed() < std::time::Duration::from_millis(200),
-            "must return on the first poll after the flag flips, not exhaust \
-             the full 100*20ms=2s budget: took {:?}",
-            start.elapsed()
+        static REQUEST: AtomicU32 = AtomicU32::new(1);
+        let (mut pool, done, tick) = drive_hydration_wait(&FLAG, &REQUEST, 100);
+        tick(2);
+        pool.run_until_stalled();
+        assert_eq!(done.get(), None);
+        FLAG.store(true, Ordering::SeqCst);
+        tick(1);
+        pool.run_until_stalled();
+        assert_eq!(
+            done.get(),
+            Some(true),
+            "must return on the first poll after the flag flips"
         );
     }
 
-    /// A flag that never flips must still return (not hang) once `max_polls`
-    /// is exhausted — the whole point of bounding the wait.
+    /// A flag that never flips must still return, reporting not hydrated, once
+    /// `max_polls` is exhausted: the whole point of bounding the wait.
     #[test]
     fn await_flag_with_bound_gives_up_after_max_polls_when_never_set() {
         static FLAG: AtomicBool = AtomicBool::new(false);
-        FLAG.store(false, Ordering::SeqCst);
-        // Small bound so the test itself stays fast; the production bound
-        // (300 * 50ms = 15s) is a separate, deliberate constant.
-        futures::executor::block_on(await_flag_with_bound(
-            &FLAG,
-            std::time::Duration::from_millis(1),
-            3,
-        ));
+        static REQUEST: AtomicU32 = AtomicU32::new(1);
+        let (mut pool, done, tick) = drive_hydration_wait(&FLAG, &REQUEST, 3);
+        tick(2);
+        pool.run_until_stalled();
+        assert_eq!(done.get(), None);
+        tick(1);
+        pool.run_until_stalled();
+        assert_eq!(done.get(), Some(false));
+    }
+
+    /// Round-2 review of #710: a save that gave up on hydration wrote a store
+    /// lacking what is on disk; when the late `GetResponse` merges the full
+    /// data, exactly one catch-up save must follow.
+    #[test]
+    fn hydration_after_a_timed_out_save_schedules_one_catch_up_save() {
+        let saved_before = AtomicBool::new(false);
+
+        record_hydration_wait_outcome(true, &saved_before);
         assert!(
-            !FLAG.load(Ordering::SeqCst),
-            "sanity: this test doesn't set the flag"
+            !take_catch_up_save(&saved_before),
+            "a hydrated save needs no catch-up"
         );
-        // Reaching this point at all is the assertion — a bug that removed
-        // the `max_polls` bound would hang the test instead of failing it.
+
+        record_hydration_wait_outcome(false, &saved_before);
+        record_hydration_wait_outcome(false, &saved_before);
+        assert!(take_catch_up_save(&saved_before));
+        assert!(
+            !take_catch_up_save(&saved_before),
+            "one catch-up per episode"
+        );
+
+        // Wiring: the save's wait records the outcome, and hydration runs the
+        // catch-up save.
+        let production = chat_delegate_production();
+        let wait = fn_body(&production, "async fn await_outbound_dms_hydration() {");
+        assert!(wait.contains(
+            "record_hydration_wait_outcome(hydrated, &OUTBOUND_DMS_SAVED_BEFORE_HYDRATION);"
+        ));
+        let mark = fn_body(&production, "pub(crate) fn mark_outbound_dms_hydrated() {");
+        let take = mark
+            .find("if take_catch_up_save(&OUTBOUND_DMS_SAVED_BEFORE_HYDRATION) {")
+            .expect("hydration must check for a pending catch-up save");
+        assert!(
+            mark.get(take..)
+                .unwrap()
+                .contains("save_outbound_dms_to_delegate().await"),
+            "the catch-up must actually save"
+        );
+        let latch = mark
+            .find("OUTBOUND_DMS_HYDRATED.store(true")
+            .expect("the latch must be set");
+        assert!(
+            latch < take,
+            "set the latch first, so the catch-up save does not wait"
+        );
+    }
+
+    /// freenet/river#709 review: the bound must not run down before the DM
+    /// `GetRequest` is sent. Since #709 that request waits for the register
+    /// reply, so a bound counted from save time could expire first and let the
+    /// save overwrite the stored blob with a truncated one.
+    #[test]
+    fn await_flag_with_bound_does_not_expire_before_the_request_is_sent() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static REQUEST: AtomicU32 = AtomicU32::new(0);
+        let (mut pool, done, tick) = drive_hydration_wait(&FLAG, &REQUEST, 3);
+
+        tick(50);
+        pool.run_until_stalled();
+        assert!(
+            done.get().is_none(),
+            "the wait gave up before the hydration request was sent"
+        );
+
+        REQUEST.store(1, Ordering::SeqCst);
+        tick(3);
+        pool.run_until_stalled();
+        assert!(
+            done.get() == Some(false),
+            "once requested, the bound applies"
+        );
+        assert!(!FLAG.load(Ordering::SeqCst));
+    }
+
+    /// Runs `await_flag_with_polls` on a `LocalPool`, with each poll waiting
+    /// for one tick from the returned sender, so the tests count polls rather
+    /// than milliseconds.
+    fn drive_hydration_wait(
+        flag: &'static AtomicBool,
+        request: &'static AtomicU32,
+        max_polls: u32,
+    ) -> (
+        futures::executor::LocalPool,
+        std::rc::Rc<std::cell::Cell<Option<bool>>>,
+        impl Fn(usize),
+    ) {
+        use futures::task::LocalSpawnExt;
+        use futures::StreamExt;
+        let (tx, rx) = futures::channel::mpsc::unbounded::<()>();
+        let rx = std::rc::Rc::new(std::cell::RefCell::new(rx));
+        let done = std::rc::Rc::new(std::cell::Cell::new(None));
+        let pool = futures::executor::LocalPool::new();
+        let done_in_task = done.clone();
+        pool.spawner()
+            .spawn_local(async move {
+                let hydrated = await_flag_with_polls(flag, request, max_polls, || {
+                    let rx = rx.clone();
+                    async move {
+                        futures::future::poll_fn(|cx| rx.borrow_mut().poll_next_unpin(cx)).await;
+                    }
+                })
+                .await;
+                done_in_task.set(Some(hydrated));
+            })
+            .unwrap();
+        let tick = move |n: usize| {
+            for _ in 0..n {
+                tx.unbounded_send(()).unwrap();
+            }
+        };
+        (pool, done, tick)
+    }
+
+    /// A request sent on a connection that then dropped must not use up the
+    /// bound while the next setup pass waits for its register reply: the pass
+    /// resets the request to 0, and a new request restarts the count.
+    #[test]
+    fn await_flag_with_bound_restarts_for_a_new_request() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static REQUEST: AtomicU32 = AtomicU32::new(1);
+        let (mut pool, done, tick) = drive_hydration_wait(&FLAG, &REQUEST, 12);
+
+        // Request 1 uses most of its budget.
+        tick(8);
+        pool.run_until_stalled();
+        assert!(done.get().is_none());
+
+        // A reconnect's setup pass resets it: no bound runs.
+        REQUEST.store(0, Ordering::SeqCst);
+        tick(50);
+        pool.run_until_stalled();
+        assert!(
+            done.get().is_none(),
+            "no bound may run while no request is out"
+        );
+
+        // Request 2 gets the full 12 polls, not the 4 request 1 left.
+        REQUEST.store(2, Ordering::SeqCst);
+        tick(11);
+        pool.run_until_stalled();
+        assert!(
+            done.get().is_none(),
+            "request 2 must get the full budget, not what request 1 left"
+        );
+        tick(1);
+        pool.run_until_stalled();
+        assert!(
+            done.get() == Some(false),
+            "request 2's budget still bounds the wait"
+        );
+    }
+
+    /// The DM `GetRequest` sender is what starts the bound.
+    #[test]
+    fn outbound_dms_request_send_starts_the_hydration_bound() {
+        let production = chat_delegate_production();
+        let body = fn_body(
+            &production,
+            "async fn fire_load_outbound_dms_request(attempt: u32) {",
+        );
+        let ok_arm = body
+            .find("Ok(_) => {")
+            .expect("the send's Ok arm must exist");
+        let err_arm = body
+            .find("Err(e) =>")
+            .expect("the send's Err arm must exist");
+        assert!(
+            body.get(ok_arm..err_arm)
+                .unwrap()
+                .contains("note_outbound_dms_hydration_requested();"),
+            "a sent DM GetRequest must start the hydration bound"
+        );
+        assert!(
+            !body.contains("LOAD_ATTEMPT_GEN"),
+            "the attempt must come from the waiter's gated pass, not be re-read here"
+        );
+        let ok_text = body.get(ok_arm..err_arm).unwrap();
+        assert!(
+            ok_text
+                .find("if load_attempt_is_current(attempt) {")
+                .unwrap()
+                < ok_text
+                    .find("note_outbound_dms_hydration_requested();")
+                    .unwrap(),
+            "a pass superseded during the send must not start the new pass's bound"
+        );
+        assert!(
+            fn_body(&production, "async fn await_outbound_dms_hydration() {")
+                .contains("&OUTBOUND_DMS_HYDRATION_REQUEST,"),
+            "the save's hydration wait must count its bound from the request"
+        );
+        let setup = fn_body(&production, "pub async fn set_up_chat_delegate()");
+        assert!(
+            setup
+                .find("reset_outbound_dms_hydration_request();")
+                .unwrap()
+                < setup.find("DelegateRequest::RegisterDelegate").unwrap(),
+            "each setup pass must stop timing an earlier pass's DM request"
+        );
     }
 
     /// `mark_outbound_dms_hydrated` sets the latch.
@@ -5757,6 +6557,7 @@ async fn fire_list_rooms_request() {
     });
 
     // Send without waiting for response
+    LIST_OUTSTANDING.store(attempt.wrapping_add(1), Ordering::Relaxed);
     let api_result = {
         let mut web_api = WEB_API.write();
         if let Some(api) = web_api.as_mut() {
@@ -5767,6 +6568,7 @@ async fn fire_list_rooms_request() {
     };
 
     if let Err(e) = api_result {
+        let _ = claim_outstanding_list(&LIST_OUTSTANDING, attempt);
         error!("Failed to send list-rooms request: {}", e);
         // freenet/river#397 Codex review 5/7/11: the SEND itself failed (no
         // response will ever come, no worker), so mark the attempt failed AND
@@ -6644,7 +7446,10 @@ async fn do_save_rooms_to_delegate(force_flush: bool) -> Result<(), String> {
 /// response. Mirrors [`fire_list_rooms_request`] — the response is
 /// processed in `freenet_api::response_handler` and hydrates the
 /// in-memory [`OUTBOUND_DMS`] signal.
-async fn fire_load_outbound_dms_request() {
+/// `attempt` is the load attempt of the setup pass sending it; the request
+/// starts the hydration bound only if that pass is still current once the
+/// send returns.
+async fn fire_load_outbound_dms_request(attempt: u32) {
     info!("Firing request to load outbound DMs from delegate storage");
 
     let request = ChatDelegateRequestMsg::GetRequest {
@@ -6681,7 +7486,14 @@ async fn fire_load_outbound_dms_request() {
     };
 
     match api_result {
-        Ok(_) => info!("Outbound-DMs load request sent"),
+        Ok(_) => {
+            // A pass that began while this send was in flight has reset the
+            // request; it will time its own.
+            if load_attempt_is_current(attempt) {
+                note_outbound_dms_hydration_requested();
+            }
+            info!("Outbound-DMs load request sent")
+        }
         Err(e) => error!("Failed to send outbound-DMs load request: {}", e),
     }
 }
@@ -7431,6 +8243,40 @@ static OUTBOUND_DMS_SAVE_STATE: CoalesceState = CoalesceState::new();
 /// every archive/plaintext entry the in-memory signals don't know about yet).
 static OUTBOUND_DMS_HYDRATED: AtomicBool = AtomicBool::new(false);
 
+/// Which outbound-DM `GetRequest` to the CURRENT delegate the hydration wait
+/// is timing: 0 while none has been sent in the current setup pass, otherwise a
+/// number that changes with every send. The hydration wait's bound only runs
+/// while this is non-zero, and restarts whenever it changes (see
+/// [`await_flag_with_bound`]).
+///
+/// Since freenet/river#709 the request waits for the register reply (up to
+/// [`REGISTER_ACK_TIMEOUT_MS`]), so a bound that started at save time could
+/// expire before the request was even sent, and the save would then overwrite
+/// the stored blob with a truncated one. For the same reason a setup pass that
+/// starts before hydration resets this to 0: a request sent on an earlier,
+/// dropped connection may never be answered, and its bound must not run down
+/// while the new pass waits for its register reply.
+static OUTBOUND_DMS_HYDRATION_REQUEST: AtomicU32 = AtomicU32::new(0);
+static OUTBOUND_DMS_HYDRATION_REQUEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// A setup pass is starting: stop timing any earlier pass's DM request.
+fn reset_outbound_dms_hydration_request() {
+    if !OUTBOUND_DMS_HYDRATED.load(Ordering::Acquire) {
+        OUTBOUND_DMS_HYDRATION_REQUEST.store(0, Ordering::Release);
+    }
+}
+
+/// The DM `GetRequest` was sent: start (or restart) the hydration bound.
+fn note_outbound_dms_hydration_requested() {
+    let mut id = OUTBOUND_DMS_HYDRATION_REQUEST_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    if id == 0 {
+        id = 1;
+    }
+    OUTBOUND_DMS_HYDRATION_REQUEST.store(id, Ordering::Release);
+}
+
 /// Mark the outbound-DM store hydrated from the CURRENT delegate
 /// (freenet/river#530).
 ///
@@ -7454,6 +8300,14 @@ static OUTBOUND_DMS_HYDRATED: AtomicBool = AtomicBool::new(false);
 /// a rarer, timing-dependent form.
 pub(crate) fn mark_outbound_dms_hydrated() {
     OUTBOUND_DMS_HYDRATED.store(true, Ordering::Release);
+    if take_catch_up_save(&OUTBOUND_DMS_SAVED_BEFORE_HYDRATION) {
+        info!("Outbound-DMs hydrated after a save gave up waiting; saving the merged store");
+        crate::util::safe_spawn_local(async {
+            if let Err(e) = save_outbound_dms_to_delegate().await {
+                warn!("Outbound-DMs catch-up save failed: {}", e);
+            }
+        });
+    }
 }
 
 /// Reset the hydration latch. For tests only; production sets it exactly
@@ -7461,6 +8315,8 @@ pub(crate) fn mark_outbound_dms_hydrated() {
 #[cfg(test)]
 pub(crate) fn reset_outbound_dms_hydration_state_for_test() {
     OUTBOUND_DMS_HYDRATED.store(false, Ordering::SeqCst);
+    OUTBOUND_DMS_HYDRATION_REQUEST.store(0, Ordering::SeqCst);
+    OUTBOUND_DMS_SAVED_BEFORE_HYDRATION.store(false, Ordering::SeqCst);
 }
 
 /// Interval between hydration-latch polls in [`await_flag_with_bound`].
@@ -7471,7 +8327,9 @@ const OUTBOUND_DMS_HYDRATION_POLL_INTERVAL: std::time::Duration =
 /// giving up and proceeding anyway (freenet/river#530). `50ms * 300 == 15s`:
 /// the delegate is local (the room-load round-trip caps itself at 10s in
 /// [`await_delegate_response_outcome`]), so this is a generous margin for the
-/// rare case where the initial `GetResponse` is lost or badly delayed.
+/// rare case where the initial `GetResponse` is lost or badly delayed. The
+/// polls are counted from when the `GetRequest` was sent
+/// ([`OUTBOUND_DMS_HYDRATION_REQUEST`]), not from when the save started.
 /// Bounding it is what stops a lost response from turning into permanent
 /// silent data loss for the rest of the session (skeptical review on PR
 /// #670): without a bound, every subsequent archive/DM-send would await
@@ -7491,20 +8349,62 @@ const OUTBOUND_DMS_HYDRATION_POLL_INTERVAL: std::time::Duration =
 const OUTBOUND_DMS_HYDRATION_MAX_POLLS: u32 = 300;
 
 /// Poll `flag` every `interval` (yielding via [`crate::util::sleep`] between
-/// checks) until it is `true` or `max_polls` checks have elapsed, whichever
-/// comes first. Returns once either condition is met — never hangs.
+/// checks) until it is `true`, or until `max_polls` checks have elapsed since
+/// `request` last changed to a non-zero value, whichever comes first.
+///
+/// Polls taken while `request` is 0 do not count, and a new request restarts
+/// the count: the bound exists for a response that was asked for and lost, and
+/// must not expire while the current request has not been sent yet
+/// (freenet/river#709 moved that send behind the register reply). Waiting
+/// longer only delays the save; giving up early would overwrite the stored blob
+/// with a truncated one. The wait before a request has no bound of its own: a
+/// setup pass sends the request once its register wait ends, unless the send
+/// fails or the pass is superseded, in which case the next pass (reconnect,
+/// wake or Retry) sends it. Until then every waiting save is parked, including
+/// `LiveImportSeam::flush` in the crate-migration walk, which therefore stalls
+/// (without sealing anything) until a pass sends the request.
 ///
 /// Extracted as a pure/generic helper (rather than inlined into
 /// [`save_outbound_dms_to_delegate`]) so it's unit-testable with small,
 /// fast intervals instead of the real 15s production bound.
-async fn await_flag_with_bound(flag: &AtomicBool, interval: std::time::Duration, max_polls: u32) {
+async fn await_flag_with_bound(
+    flag: &AtomicBool,
+    request: &AtomicU32,
+    interval: std::time::Duration,
+    max_polls: u32,
+) -> bool {
+    await_flag_with_polls(flag, request, max_polls, || crate::util::sleep(interval)).await
+}
+
+/// [`await_flag_with_bound`] with the wait between polls supplied by the
+/// caller, so tests can drive the polls one at a time.
+async fn await_flag_with_polls<S, F>(
+    flag: &AtomicBool,
+    request: &AtomicU32,
+    max_polls: u32,
+    mut between_polls: S,
+) -> bool
+where
+    S: FnMut() -> F,
+    F: std::future::Future<Output = ()>,
+{
     if flag.load(Ordering::Acquire) {
-        return;
+        return true;
     }
-    for _ in 0..max_polls {
-        crate::util::sleep(interval).await;
+    let mut timed_request = 0;
+    let mut polls_since_request = 0;
+    while polls_since_request < max_polls {
+        between_polls().await;
         if flag.load(Ordering::Acquire) {
-            return;
+            return true;
+        }
+        let current = request.load(Ordering::Acquire);
+        if current != timed_request {
+            timed_request = current;
+            polls_since_request = 0;
+        }
+        if current != 0 {
+            polls_since_request += 1;
         }
     }
     warn!(
@@ -7512,18 +8412,42 @@ async fn await_flag_with_bound(flag: &AtomicBool, interval: std::time::Duration,
          anyway using whatever state is currently in memory (freenet/river#530)",
         max_polls
     );
+    false
 }
 
 /// Wait for [`OUTBOUND_DMS_HYDRATED`], bounded by
-/// [`OUTBOUND_DMS_HYDRATION_MAX_POLLS`] so a lost `GetResponse` can't hang
-/// forever. See [`await_flag_with_bound`].
+/// [`OUTBOUND_DMS_HYDRATION_MAX_POLLS`] once the DM request is out, so a lost
+/// `GetResponse` can't hang forever. See [`await_flag_with_bound`].
+///
+/// A save that gives up here writes a store that lacks whatever is on disk.
+/// If the `GetResponse` then arrives, it merges the full data into memory, and
+/// [`mark_outbound_dms_hydrated`] runs one catch-up save so the merged store
+/// replaces the partial one.
 async fn await_outbound_dms_hydration() {
-    await_flag_with_bound(
+    let hydrated = await_flag_with_bound(
         &OUTBOUND_DMS_HYDRATED,
+        &OUTBOUND_DMS_HYDRATION_REQUEST,
         OUTBOUND_DMS_HYDRATION_POLL_INTERVAL,
         OUTBOUND_DMS_HYDRATION_MAX_POLLS,
     )
-    .await
+    .await;
+    record_hydration_wait_outcome(hydrated, &OUTBOUND_DMS_SAVED_BEFORE_HYDRATION);
+}
+
+/// Set when a DM save gave up waiting for hydration; consumed by
+/// [`mark_outbound_dms_hydrated`], which then runs one catch-up save.
+static OUTBOUND_DMS_SAVED_BEFORE_HYDRATION: AtomicBool = AtomicBool::new(false);
+
+fn record_hydration_wait_outcome(hydrated: bool, saved_before_hydration: &AtomicBool) {
+    if !hydrated {
+        saved_before_hydration.store(true, Ordering::Release);
+    }
+}
+
+/// Whether hydration landing now needs a catch-up save. At most once per
+/// timed-out save episode.
+fn take_catch_up_save(saved_before_hydration: &AtomicBool) -> bool {
+    saved_before_hydration.swap(false, Ordering::AcqRel)
 }
 
 /// Serialize the current [`OUTBOUND_DMS`] cache and persist it via the

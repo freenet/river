@@ -553,6 +553,74 @@ pub fn owner_vk_to_legacy_contract_keys(owner_vk: &VerifyingKey) -> Vec<Contract
 }
 
 #[cfg(test)]
+/// Source text with `//` and (nested) `/* */` comments removed, outside string
+/// and quote-char literals, so commented-out code cannot satisfy a wiring pin.
+/// Newlines inside block comments are kept so line structure survives.
+pub(crate) fn strip_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let mut in_str = false;
+    let mut depth = 0usize;
+    while i < b.len() {
+        let rest = &b[i..];
+        if depth > 0 {
+            if rest.starts_with(b"*/") {
+                depth -= 1;
+                i += 2;
+            } else if rest.starts_with(b"/*") {
+                depth += 1;
+                i += 2;
+            } else {
+                if b[i] == b'\n' {
+                    out.push(b'\n');
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if in_str {
+            out.push(b[i]);
+            if b[i] == b'\\' && i + 1 < b.len() {
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b[i] == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if rest.starts_with(b"//") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if rest.starts_with(b"/*") {
+            depth = 1;
+            i += 2;
+            continue;
+        }
+        if let Some(lit) = [&b"'\"'"[..], &b"'\\\"'"[..]]
+            .into_iter()
+            .find(|lit| rest.starts_with(lit))
+        {
+            out.extend_from_slice(lit);
+            i += lit.len();
+            continue;
+        }
+        if b[i] == b'"' {
+            in_str = true;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).expect("only ASCII-delimited ranges are removed")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::NaiveDate;
