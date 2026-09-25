@@ -19,6 +19,14 @@ pub fn verify_struct<T: Serialize>(
     verifying_key.verify(&data_to_sign, signature)
 }
 
+/// BLAKE3 of a value's CBOR encoding, identifying a record by its full
+/// content: equal values give equal digests.
+pub(crate) fn record_digest<T: Serialize>(value: &T) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(value, &mut bytes).expect("Serialization should not fail");
+    *blake3::hash(&bytes).as_bytes()
+}
+
 pub fn truncated_base64<T: AsRef<[u8]>>(data: T) -> String {
     let encoded = general_purpose::STANDARD_NO_PAD.encode(data);
     encoded.chars().take(10).collect()

@@ -295,13 +295,18 @@ impl ComposableState for MessagesV1 {
                 }
             }
 
-            // Deduplicate by message ID to prevent duplicate messages from race conditions
+            // Deduplicate by message ID against held messages. A message
+            // repeated identically inside this delta is stored once; records
+            // that share an id but differ are all kept, so `verify` judges
+            // each of them.
             let existing_ids: std::collections::HashSet<_> =
                 self.messages.iter().map(|m| m.id()).collect();
+            let mut in_delta = std::collections::HashSet::new();
             self.messages.extend(
                 delta
                     .iter()
                     .filter(|msg| !existing_ids.contains(&msg.id()))
+                    .filter(|msg| in_delta.insert(crate::util::record_digest(*msg)))
                     .cloned(),
             );
         }

@@ -11,7 +11,10 @@ readme = "../README.md"
 keywords = ["freenet", "chat", "p2p", "decentralized", "core"]
 categories = ["network-programming", "cryptography"]
 # Repo-only tests; not part of the published crate.
-exclude = ["tests/room_message_retention_test.rs"]
+exclude = [
+    "tests/room_message_retention_test.rs",
+    "tests/in_delta_dedupe_test.rs",
+]
 
 [dependencies]
 # Serialization
