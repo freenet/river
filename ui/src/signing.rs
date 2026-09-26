@@ -790,8 +790,7 @@ mod tests {
             format!("self_sk{expect}"),
         ];
 
-        let mut files = Vec::new();
-        crate::util::source_scan::rust_files(&root, &mut files);
+        let files = crate::util::source_scan::rust_files(&root);
         assert!(
             files.len() > 20,
             "expected to walk the crate's sources, found {} files under {} — \

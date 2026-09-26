@@ -901,8 +901,7 @@ mod tests {
         use std::path::Path;
 
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rust_files(&src, &mut files);
+        let files = rust_files(&src);
         assert!(files.len() > 20, "source walk found suspiciously few files");
 
         let mut offenders: Vec<String> = Vec::new();

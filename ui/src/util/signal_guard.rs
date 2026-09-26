@@ -118,6 +118,7 @@ pub fn schedule_nudge() {
 #[cfg(test)]
 mod tests {
     use crate::util::source_scan::production_only;
+    use crate::util::strip_comments;
 
     /// Every call site that `try_read()`s a signal inside a `use_memo` must read
     /// the anchor before its first fallible read, and must nudge on every
@@ -241,7 +242,7 @@ mod tests {
     fn every_fallible_memo_anchors_before_its_first_try_read_and_nudges() {
         let mut checked = 0usize;
         for (name, src) in GUARDED_MEMO_SITES {
-            let prod = crate::util::strip_comments(production_only(src));
+            let prod = strip_comments(production_only(src));
             let bodies = memo_bodies(&prod);
             assert!(
                 !bodies.is_empty(),
@@ -316,7 +317,7 @@ mod tests {
     fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
         let mut checked = 0usize;
         for (name, src) in GUARDED_EFFECT_SITES {
-            let prod = crate::util::strip_comments(production_only(src));
+            let prod = strip_comments(production_only(src));
             let bodies = effect_bodies(&prod);
             assert!(
                 !bodies.is_empty(),

@@ -599,17 +599,6 @@ mod volatile_value_binding_audit {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
     }
 
-    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("ui/src must be readable") {
-            let path = entry.expect("readable dir entry").path();
-            if path.is_dir() {
-                rust_sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-
     struct Audit {
         editable: BTreeSet<String>,
         display_only: BTreeSet<String>,
@@ -618,8 +607,7 @@ mod volatile_value_binding_audit {
 
     fn run_audit() -> Audit {
         let src_dir = ui_src_dir();
-        let mut files = Vec::new();
-        rust_sources(&src_dir, &mut files);
+        let mut files = crate::util::source_scan::rust_files(&src_dir);
         assert!(
             files.len() > 40,
             "the audit must walk the whole ui/src tree; found only {} files",

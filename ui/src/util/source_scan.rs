@@ -1,15 +1,17 @@
 use std::path::{Path, PathBuf};
 
 /// Every `.rs` file under `dir`, recursively.
-pub(crate) fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn rust_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).expect("readable source dir") {
         let path = entry.expect("readable dir entry").path();
         if path.is_dir() {
-            rust_files(&path, out);
+            out.extend(rust_files(&path));
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
     }
+    out
 }
 
 /// Cut production source at the test module so a needle appearing only in a
