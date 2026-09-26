@@ -107,30 +107,9 @@ test.describe("Document title unread badge", () => {
     await expect(page).toHaveTitle(/^\(\d+\) River$/, { timeout: 2_000 });
   });
 
-  // The other side of the same coin: once every room with unread messages
-  // has actually been opened (and thereby marked read), hiding the tab must
-  // NOT invent a badge out of nothing.
-  test("hiding the tab after reading every room keeps the plain title", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-
-    await selectRoom(page, "Public Discussion Room");
-    await selectRoom(page, "Team Chat Room");
-    await expect(page).toHaveTitle("River - Team Chat Room", {
-      timeout: 5_000,
-    });
-
-    await setTabHidden(page);
-
-    await expect(page).not.toHaveTitle(/^\(\d+\) /, { timeout: 2_000 });
-    await expect(page).toHaveTitle("River - Team Chat Room");
-  });
-
-  // Defensive: once nothing is unread, a hide -> show -> hide cycle must
-  // not introduce a badge on the second hide either (e.g. by counting
-  // messages twice or toggling state in the wrong direction).
+  // Once every unread room has been opened (and so marked read), hiding the
+  // tab must not invent a badge, on the first hide or on a second one after
+  // showing again (e.g. by counting messages twice or toggling state wrongly).
   test("hide -> show -> hide cycle stays badge-free once everything is read", async ({
     page,
   }) => {

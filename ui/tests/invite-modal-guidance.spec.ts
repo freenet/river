@@ -33,7 +33,7 @@ async function openInviteModal(page: Page) {
 test.describe("Invite-member modal guidance copy", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("recommends sending the invitation via DM, naming Share invite", async ({
+  test("recommends a DM invite above the one-person-only link warning", async ({
     page,
   }) => {
     await page.goto("/");
@@ -44,37 +44,17 @@ test.describe("Invite-member modal guidance copy", () => {
     await expect(rec).toBeVisible();
     await expect(rec).toContainText(/in a DM/i);
     await expect(rec).toContainText(/Share invite/);
-  });
-
-  test("still warns that the link or code is for one person only", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await openInviteModal(page);
 
     const warning = page.getByTestId("invite-share-warning");
     await expect(warning).toBeVisible();
     await expect(warning).toContainText(/one person only/i);
     await expect(warning).toContainText(/New Invitation/);
-  });
 
-  test("shows the DM recommendation above the link-sharing warning", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await openInviteModal(page);
-
-    const recBox = await page
-      .getByTestId("invite-dm-recommendation")
-      .boundingBox();
-    const warnBox = await page
-      .getByTestId("invite-share-warning")
-      .boundingBox();
+    // Recommended path first — the fallback warning sits below it.
+    const recBox = await rec.boundingBox();
+    const warnBox = await warning.boundingBox();
     expect(recBox).not.toBeNull();
     expect(warnBox).not.toBeNull();
-    // Recommended path first — the fallback warning sits below it.
     expect(recBox!.y).toBeLessThan(warnBox!.y);
   });
 });

@@ -4,7 +4,7 @@ import { waitForApp, selectRoom } from "./example-room";
 test.describe("Desktop layout (1280px)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("shows 3-column layout with room selected", async ({ page }) => {
+  test("shows 3-column layout with room selected, no horizontal scrollbar", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
@@ -18,12 +18,6 @@ test.describe("Desktop layout (1280px)", () => {
     await expect(
       page.getByRole("heading", { name: "Team Chat Room" })
     ).toBeVisible();
-  });
-
-  test("no horizontal scrollbar", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Team Chat Room");
 
     const hasHScroll = await page.evaluate(
       () =>
@@ -37,7 +31,7 @@ test.describe("Desktop layout (1280px)", () => {
 test.describe("Tablet layout (768px)", () => {
   test.use({ viewport: { width: 768, height: 1024 } });
 
-  test("shows all panels with narrower sidebars", async ({ page }) => {
+  test("shows all panels with narrower sidebars, no horizontal scrollbar", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
@@ -48,12 +42,6 @@ test.describe("Tablet layout (768px)", () => {
     await expect(
       page.locator("aside").filter({ hasText: "Active Members" })
     ).toBeVisible();
-  });
-
-  test("no horizontal scrollbar", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Team Chat Room");
 
     const hasHScroll = await page.evaluate(
       () =>
@@ -100,7 +88,7 @@ test.describe("Breakpoint boundary (767px)", () => {
 test.describe("Mobile layout (480px)", () => {
   test.use({ viewport: { width: 480, height: 844 } });
 
-  test("shows only chat panel by default", async ({ page }) => {
+  test("shows only chat panel by default, no horizontal scrollbar", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
@@ -111,6 +99,13 @@ test.describe("Mobile layout (480px)", () => {
     await expect(
       page.getByPlaceholder("Type your message...")
     ).toBeVisible();
+
+    const hasHScroll = await page.evaluate(
+      () =>
+        document.documentElement.scrollWidth >
+        document.documentElement.clientWidth
+    );
+    expect(hasHScroll).toBe(false);
   });
 
   test("hamburger opens room list, room click returns to chat", async ({
@@ -166,18 +161,6 @@ test.describe("Mobile layout (480px)", () => {
     ).toBeVisible();
   });
 
-  test("no horizontal scrollbar", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Team Chat Room");
-
-    const hasHScroll = await page.evaluate(
-      () =>
-        document.documentElement.scrollWidth >
-        document.documentElement.clientWidth
-    );
-    expect(hasHScroll).toBe(false);
-  });
 });
 
 test.describe("Small mobile layout (320px)", () => {

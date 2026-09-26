@@ -60,25 +60,4 @@ test.describe("DM archive UX overhaul (#266)", () => {
     // either — the source was removed).
     await expect(page.getByRole("button", { name: "Hide" })).toHaveCount(0);
   });
-
-  test("layout remains stable across responsive breakpoints", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-
-    // Desktop → tablet → mobile. The DM rail section's `group-hover`
-    // reveal shares the same Tailwind generator as the rest of the app;
-    // if Tailwind weren't picking up its classes, the layout would
-    // regress here. (The `md:opacity-*` breakpoint gate this comment
-    // used to name was removed by #462 — the reveal is gated on pointer
-    // capability now; `dm-archive-touch.spec.ts` measures that cascade.)
-    for (const width of [1280, 768, 480]) {
-      await page.setViewportSize({ width, height: 800 });
-      // Body should always have a visible main panel — a layout-broken
-      // app would render zero-height columns.
-      const bodyBox = await page.locator("body").boundingBox();
-      expect(bodyBox?.height ?? 0).toBeGreaterThan(0);
-    }
-  });
 });

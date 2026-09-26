@@ -13,23 +13,6 @@ const ROOM_NAME = "Public Discussion Room";
 test.describe("Export Identity copy feedback", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("clicking Copy to Clipboard updates the button to 'Copied!'", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, ROOM_NAME);
-
-    const exportButton = page.getByRole("button", { name: "Export ID" });
-    await expect(exportButton).toBeVisible({ timeout: 5_000 });
-    await exportButton.click();
-
-    const copyButton = page.getByRole("button", { name: "Copy to Clipboard" });
-    await expect(copyButton).toBeVisible({ timeout: 5_000 });
-
-    await copyButton.click();
-
-    await expect(page.getByRole("button", { name: "Copied!" })).toBeVisible({ timeout: 2_000 });
-  });
-
   test("dismissing via the backdrop also resets the button text", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);

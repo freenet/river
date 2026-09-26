@@ -11,21 +11,6 @@ const ROOM = "Public Discussion Room";
 test.describe("Per-room notification bell", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("bell is in the header and defaults to 'All messages'", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, ROOM);
-
-    const bell = page.getByTestId("notification-bell-button");
-    await expect(bell).toBeVisible();
-    // This room has no stored preference, so the default is All. (Since
-    // freenet/river#500 the fixture seeds "Your Private Room" as Muted, so
-    // "no stored preference" is no longer true of every example room.)
-    await expect(bell).toHaveAttribute("title", "Notifications: All messages");
-  });
-
   test("clicking the bell opens the notification modal with three modes", async ({
     page,
   }) => {
@@ -92,6 +77,7 @@ test.describe("Per-room notification bell", () => {
 
     await page.getByTestId("notification-modal-close").click();
     await expect(modal).toHaveCount(0, { timeout: 5_000 });
+    // No stored preference here, so All is the default (#500 seeds only "Your Private Room" as Muted).
     await expect(
       page.getByTestId("notification-bell-button")
     ).toHaveAttribute("title", "Notifications: All messages");

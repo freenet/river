@@ -59,19 +59,9 @@ test.describe("Room header description links", () => {
     await expect(
       page.getByRole("heading", { name: /Room Details/i })
     ).toHaveCount(0);
-  });
 
-  test("clicking the room title still opens the room details modal", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, ROOM_WITH_LINKS);
-
-    const titleButton = page.getByTestId("room-title-button");
-    await expect(titleButton).toBeVisible();
-    await titleButton.click();
-
+    // The title still opens it, which also proves the heading locator above is live.
+    await page.getByTestId("room-title-button").click();
     await expect(
       page.getByRole("heading", { name: /Room Details/i })
     ).toBeVisible({ timeout: 5_000 });

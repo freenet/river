@@ -33,20 +33,6 @@ test.describe("Mobile hamburger unread badge", () => {
   // the desktop Playwright projects too.
   test.use({ viewport: { width: 390, height: 844 } });
 
-  test("welcome screen hamburger shows total unread across rooms", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-
-    // No room selected yet → the welcome screen's hamburger. Two of the three
-    // example rooms are unread AND unmuted, so the badge must show.
-    const badge = page.locator(`${HAMBURGER} ${BADGE}`);
-    await expect(badge).toBeVisible({ timeout: 5_000 });
-    await expect(badge).toHaveText(/^\d+$/);
-    expect(Number(await badge.textContent())).toBeGreaterThan(0);
-  });
-
   test("badge counts only OTHER rooms and clears once all are read", async ({
     page,
   }) => {
@@ -56,6 +42,7 @@ test.describe("Mobile hamburger unread badge", () => {
     const hamburger = page.locator(HAMBURGER);
     const badge = page.locator(`${HAMBURGER} ${BADGE}`);
     await expect(badge).toBeVisible({ timeout: 5_000 });
+    await expect(badge).toHaveText(/^\d+$/);
     const initialTotal = Number(await badge.textContent());
 
     // ALL_ROOMS[0] is the MUTED room, which contributes nothing to this badge,

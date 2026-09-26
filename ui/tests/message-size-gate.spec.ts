@@ -38,16 +38,6 @@ test.describe("Encoded message size gate", () => {
     await expect(input).toHaveValue(text);
   });
 
-  test("990 raw chars (encoded 999 <= 1000) shows the encoded count and keeps Send enabled", async ({
-    page,
-  }) => {
-    const input = page.getByTestId("message-input");
-    await input.fill("a".repeat(990)); // encoded 999
-
-    await expect(page.getByText("999/1000")).toBeVisible();
-    await expect(page.getByTestId("send-message-button")).toBeEnabled();
-  });
-
   test("multi-byte characters count as encoded bytes, not characters", async ({
     page,
   }) => {

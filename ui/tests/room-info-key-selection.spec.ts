@@ -246,22 +246,6 @@ test.describe("room-details copy buttons", () => {
       other: "room-public-key-input",
     },
   ]) {
-    test(`${field.button} confirms the copy`, async ({ page }) => {
-      await page.goto("/");
-      await waitForApp(page);
-      await openRoomDetails(page);
-
-      const value = await page.getByTestId(field.input).inputValue();
-      expect(value.length).toBeGreaterThan(0);
-
-      const button = page.getByTestId(field.button);
-      await expect(button).toBeVisible();
-      await expect(button).toHaveText(/Copy/);
-
-      await button.click();
-      await expect(button).toHaveText(/Copied!/, { timeout: 2_000 });
-    });
-
     test(`${field.button} copies THAT field's value, not another`, async ({ page }) => {
       await page.goto("/");
       await waitForApp(page);
@@ -272,11 +256,14 @@ test.describe("room-details copy buttons", () => {
       expect(mine.length).toBeGreaterThan(0);
       expect(mine).not.toBe(other);
 
+      const button = page.getByTestId(field.button);
+      await expect(button).toHaveText(/Copy/);
       await captureClipboardWrites(page);
-      await page.getByTestId(field.button).click();
+      await button.click();
+      await expect(button).toHaveText(/Copied!/, { timeout: 2_000 });
 
-      // Asserting the button says "Copied!" is NOT enough: it would say that
-      // just the same if the two buttons' values were swapped.
+      // The "Copied!" label is NOT enough on its own: it would say that just
+      // the same if the two buttons' values were swapped.
       await expect.poll(() => clipboardWrites(page), { timeout: 2_000 }).toEqual([mine]);
     });
   }
