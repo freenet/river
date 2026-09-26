@@ -4,6 +4,7 @@ aider_stdlib_map.md
 # will have compiled files and executables
 debug/
 target/
+docs/plans/
 
 # Cargo.lock IS committed (deliberately, since freenet/river#2776 A1).
 # River builds byte-reproducible contract/delegate WASM whose bytes define the
