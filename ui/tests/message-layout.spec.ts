@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { waitForApp, selectRoom } from "./example-room";
+import { waitForApp, selectRoom, openOwnMessageEdit } from "./example-room";
 
 // Regression tests for freenet/river#205, #206, #207:
 //   #205 edit box wider than view
@@ -22,52 +22,7 @@ test.describe("Edit box width (#205)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    // On touch devices (no hover) the hover action bar is non-interactive; the
-    // real edit path is the kebab menu (freenet/river#402). Use whichever
-    // affordance the current device exposes.
-    const touch = await page.evaluate(
-      () => window.matchMedia("(hover: none)").matches
-    );
-
-    let clicked = false;
-    if (touch) {
-      // Target a self (accent) message directly and open Edit from its kebab —
-      // no iterating/dismissing, so the deferred menu-close can't race a
-      // following kebab tap.
-      const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
-      await expect(ownRow).toBeVisible();
-      await ownRow.scrollIntoViewIfNeeded();
-      await ownRow.locator('[data-testid="message-kebab"]').click();
-      await page
-        .locator('[data-testid="message-action-menu"]')
-        .getByRole("button", { name: /edit/i })
-        .click();
-      clicked = true;
-    } else {
-      // Hover each message bubble until one exposes an Edit button (own messages
-      // in the private room, where the owner IS self). Bubbles are found by the
-      // `message-bubble` test id.
-      const bubbles = page.getByTestId("message-bubble");
-      const count = await bubbles.count();
-      expect(count).toBeGreaterThan(0);
-      for (let i = 0; i < count; i++) {
-        const bubble = bubbles.nth(i);
-        await bubble.scrollIntoViewIfNeeded();
-        await bubble.hover();
-        const editBtn = bubble
-          .locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]")
-          .getByRole("button", { name: /edit/i });
-        if (await editBtn.isVisible({ timeout: 500 }).catch(() => false)) {
-          await editBtn.click();
-          clicked = true;
-          break;
-        }
-      }
-    }
-    expect(clicked, "found an own-message edit affordance").toBe(true);
-
-    const textarea = page.locator("textarea").first();
-    await expect(textarea).toBeVisible({ timeout: 5_000 });
+    const textarea = await openOwnMessageEdit(page);
 
     // The edit container (parent of the textarea) must not exceed the
     // viewport width. Before the fix it had an inline `width: 550px` and

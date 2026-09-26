@@ -1,4 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
+import { selectRoom } from "./example-room";
 
 // Regression tests for Bug #5 (Ivvor, Matrix 2026-05-17): the WebSocket
 // connection indicator must remain visible when the user has no rooms —
@@ -190,10 +191,7 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    await page.getByRole("button", { name: "Team Chat Room" }).click();
-    await expect(
-      page.getByRole("heading", { name: "Team Chat Room" })
-    ).toBeVisible({ timeout: 5_000 });
+    await selectRoom(page, "Team Chat Room");
 
     // The Members rail is now mounted (it returns empty only when no room
     // is selected — that was the Bug #5 root cause).

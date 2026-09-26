@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Regression coverage for the inline add-reaction "+" button being invisible
 // (but still tappable) on touch devices.
@@ -56,7 +57,7 @@ test.describe("Add-reaction + button cascade", () => {
       page,
     }) => {
       await page.goto("/");
-      await page.waitForSelector(".app-root", { timeout: 30_000 });
+      await waitForApp(page);
 
       const m = await measureProbe(page, hasReactions);
 

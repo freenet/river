@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { waitForApp, openRoomWithComposer } from "./example-room";
+import { waitForApp, openRoomWithComposer, openOwnMessageEdit } from "./example-room";
 
 // Regression tests for the "message was lost" bug (HostFat, Matrix 2026-07):
 // the input gate compared raw text bytes against max_message_size, but the
@@ -13,13 +13,16 @@ import { waitForApp, openRoomWithComposer } from "./example-room";
 // 1000 bytes (encoded), public room. Public text encodes as CBOR
 // {text: "..."} = raw bytes + 9 for texts in the 256..65535-byte range.
 
+test.beforeEach(async ({ page }) => {
+  await page.goto("/");
+  await waitForApp(page);
+  await openRoomWithComposer(page);
+});
+
 test.describe("Encoded message size gate", () => {
   test("998 raw chars (encoded 1007 > 1000) disables Send and keeps the draft on Enter", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     const text = "a".repeat(998); // raw 998 <= 1000, encoded 1007 > 1000
     await input.fill(text);
@@ -38,9 +41,6 @@ test.describe("Encoded message size gate", () => {
   test("990 raw chars (encoded 999 <= 1000) shows the encoded count and keeps Send enabled", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     await input.fill("a".repeat(990)); // encoded 999
 
@@ -51,9 +51,6 @@ test.describe("Encoded message size gate", () => {
   test("multi-byte characters count as encoded bytes, not characters", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     // 499 chars but 998 UTF-8 bytes -> encoded 1007 > 1000. Users count
     // characters; the limit is bytes. The gate must block this visibly
@@ -67,9 +64,6 @@ test.describe("Encoded message size gate", () => {
   test("a message at exactly the encoded limit is sendable (no off-by-one)", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     await input.fill("a".repeat(991)); // encoded exactly 1000
 
@@ -86,49 +80,7 @@ test.describe("Encoded size gate on the edit form", () => {
   test("over-limit edit disables Save, shows the counter, and Enter keeps the form open", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await openRoomWithComposer(page);
-
-    // Open the edit form on an own message — kebab menu on touch devices,
-    // hover actions on desktop (same affordance split as
-    // message-layout.spec.ts / freenet/river#402).
-    const touch = await page.evaluate(
-      () => window.matchMedia("(hover: none)").matches
-    );
-    let clicked = false;
-    if (touch) {
-      const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
-      await expect(ownRow).toBeVisible();
-      await ownRow.scrollIntoViewIfNeeded();
-      await ownRow.locator('[data-testid="message-kebab"]').click();
-      await page
-        .locator('[data-testid="message-action-menu"]')
-        .getByRole("button", { name: /edit/i })
-        .click();
-      clicked = true;
-    } else {
-      const bubbles = page.getByTestId("message-bubble");
-      const count = await bubbles.count();
-      expect(count).toBeGreaterThan(0);
-      for (let i = 0; i < count; i++) {
-        const bubble = bubbles.nth(i);
-        await bubble.scrollIntoViewIfNeeded();
-        await bubble.hover();
-        const editBtn = bubble
-          .locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]")
-          .getByRole("button", { name: /edit/i });
-        if (await editBtn.isVisible({ timeout: 500 }).catch(() => false)) {
-          await editBtn.click();
-          clicked = true;
-          break;
-        }
-      }
-    }
-    expect(clicked, "found an own-message edit affordance").toBe(true);
-
-    const editArea = page.locator('textarea[id^="edit-msg-"]');
-    await expect(editArea).toBeVisible({ timeout: 5_000 });
+    const editArea = await openOwnMessageEdit(page);
 
     // 998 raw chars: within the limit as raw text, over it as an encoded
     // edit action (ActionContentV1 overhead > plain-text overhead).

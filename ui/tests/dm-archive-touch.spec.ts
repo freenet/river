@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Regression coverage for freenet/river#462: the DM rail's archive ✕ was
 // unreachable on touch.
@@ -56,7 +57,7 @@ test.describe("DM archive ✕ cascade (#462)", () => {
     page,
   }) => {
     await page.goto("/");
-    await page.waitForSelector(".app-root", { timeout: 30_000 });
+    await waitForApp(page);
 
     const m = await measureProbe(page);
 

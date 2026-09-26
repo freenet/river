@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp } from "./example-room";
+import { waitForApp, selectListedRoom } from "./example-room";
 
 // Regression test for freenet/river#564: typing in the Room Details dialog was
 // wiped every few seconds by unrelated room-state updates.
@@ -31,13 +31,7 @@ async function openRoomDetails(page: Page) {
   if (vp && vp.width < 1024) {
     await page.setViewportSize({ width: 1280, height: vp.height });
   }
-
-  // Scope to the room list: once a room is selected the header button carries
-  // the room name as its accessible name too, which would be a second match.
-  const roomBtn = page.getByTestId("room-list").getByRole("button", { name: OWNED_ROOM });
-  await expect(roomBtn).toBeVisible({ timeout: 10_000 });
-  await roomBtn.click();
-  await expect(page.getByRole("heading", { name: OWNED_ROOM })).toBeVisible({ timeout: 5_000 });
+  await selectListedRoom(page, OWNED_ROOM);
 
   await page.getByTestId("room-title-button").click();
   await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });

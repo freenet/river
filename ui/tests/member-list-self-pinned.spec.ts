@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // End-to-end coverage for freenet/river#584: the viewer's own row is pinned to
 // index 0 of the member list, above the room owner.
@@ -26,13 +27,8 @@ test.describe("Member list pins the viewer's own row (#584)", () => {
 
   test("your own row is first, above the room owner", async ({ page }) => {
     await page.goto("/");
-    await page.waitForSelector(".app-root", { timeout: 30_000 });
-    await page.getByText("Team Chat Room").first().click();
-    // Confirm the click actually landed, so a miss fails saying so rather than
-    // timing out on an empty member list further down.
-    await expect(
-      page.getByRole("heading", { name: "Team Chat Room" }),
-    ).toBeVisible({ timeout: 15_000 });
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
 
     const rows = page.locator('[data-testid="member-list"] li');
     await rows.first().waitFor({ state: "visible", timeout: 15_000 });

@@ -40,6 +40,9 @@ import { waitForApp, selectRoom } from "./example-room";
 // delivering INBOUND messages. Sending through the composer would prove
 // nothing: that path raises `force_scroll`, deliberately bypassing the pin.
 
+// Rendered history rows: display items plus date separators.
+const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
+
 /// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs.
 const BOTTOM_THRESHOLD_PX = 100;
 /// Slack for fractional layout after a scroll that did land at the bottom.
@@ -99,12 +102,6 @@ async function deliver(page: Page, text: string) {
   await expect(page.getByText(text, { exact: false }).last()).toBeVisible({
     timeout: 5_000,
   });
-}
-
-/// Deliver an inbound message one position from the end of the history: it
-/// grows the content WITHOUT remounting the last row.
-async function insertBeforeLast(page: Page, text: string) {
-  await callRiverTest(page, "insertMessageBeforeLast", text);
 }
 
 /// Open a room and wait until the history has settled at its newest message.
@@ -258,13 +255,13 @@ test.describe("Conversation follows new messages (#486)", () => {
     // single message whose key (its first message's id) cannot change when
     // something is inserted before it. `insertMessageBeforeLast` also signs
     // with its own key, so it can never merge into that group.
-    await page.evaluate(() => {
-      const rows = document.querySelectorAll('[data-testid="conversation-history"] > *');
-      (rows[rows.length - 1] as any).__riverProbe = "last-row";
+    await page.locator(HISTORY_ROWS).last().evaluate((row) => {
+      (row as any).__riverProbe = "last-row";
     });
 
-    await insertBeforeLast(
+    await callRiverTest(
       page,
+      "insertMessageBeforeLast",
       "inserted above the last row: " + "x".repeat(400)
     );
 
@@ -273,10 +270,10 @@ test.describe("Conversation follows new messages (#486)", () => {
       "content grew above the last row and the view did not follow it"
     );
 
-    const lastRowSurvived = await page.evaluate(() => {
-      const rows = document.querySelectorAll('[data-testid="conversation-history"] > *');
-      return (rows[rows.length - 1] as any).__riverProbe === "last-row";
-    });
+    const lastRowSurvived = await page
+      .locator(HISTORY_ROWS)
+      .last()
+      .evaluate((row) => (row as any).__riverProbe === "last-row");
     expect(
       lastRowSurvived,
       "the last row remounted, so this exercised the old trigger rather than " +
@@ -443,14 +440,10 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   const CAPPED_ROOM = "Capped History Room";
   const DEEP_ROOM_PATH = "/?deep-history-room=1";
 
-  /// Rendered history rows: display items plus date separators. A windowed
-  /// tail is ~60 items + a separator or two; the whole fixture is ~92 items.
+  /// A windowed tail is ~60 items + a separator or two; the whole fixture is
+  /// ~92 items.
   function renderedRowCount(page: Page): Promise<number> {
-    return page.evaluate(
-      () =>
-        document.querySelectorAll('[data-testid="conversation-history"] > *')
-          .length
-    );
+    return page.locator(HISTORY_ROWS).count();
   }
 
   /// The premise all three tests stand on: the windowed render path is
@@ -483,10 +476,10 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   /// watches their message jump away while every offset reads steady. The
   /// probed row's rect is what catches that.
   async function tagVisibleRow(page: Page, flag: string): Promise<number | null> {
-    return page.evaluate((f) => {
+    return page.evaluate(([f, rowsSelector]) => {
       const container = document.getElementById("chat-scroll-container")!;
       const cRect = container.getBoundingClientRect();
-      const rows = container.querySelectorAll('[data-testid="conversation-history"] > *');
+      const rows = container.querySelectorAll(rowsSelector);
       for (const row of rows) {
         const r = row.getBoundingClientRect();
         if (r.top >= cRect.top && r.bottom <= cRect.bottom) {
@@ -495,23 +488,21 @@ test.describe("Windowed history follows arrivals (#501)", () => {
         }
       }
       return null;
-    }, flag);
+    }, [flag, HISTORY_ROWS]);
   }
 
   /// The tagged row's current viewport-relative top, or null if it left the
   /// DOM (i.e. the window slid out from under it).
   async function taggedRowTop(page: Page, flag: string): Promise<number | null> {
-    return page.evaluate((f) => {
-      const rows = document.querySelectorAll(
-        '[data-testid="conversation-history"] > *'
-      );
+    return page.evaluate(([f, rowsSelector]) => {
+      const rows = document.querySelectorAll(rowsSelector);
       for (const row of rows) {
         if ((row as any)[f]) {
           return row.getBoundingClientRect().top;
         }
       }
       return null;
-    }, flag);
+    }, [flag, HISTORY_ROWS]);
   }
 
   test("keeps following a burst of arrivals in a windowed room", async ({

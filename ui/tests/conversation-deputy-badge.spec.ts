@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp } from "./example-room";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Render coverage for the two halves of the deputy-badge change:
 //
@@ -33,7 +33,7 @@ const BADGE_GLYPHS = ["🛡", "👑", "⭐", "🔑", "🎪"];
 async function openTeamChat(page: Page) {
   await page.goto("/");
   await waitForApp(page);
-  await page.getByText("Team Chat Room").first().click();
+  await selectRoom(page, "Team Chat Room");
   // Author lines only render for OTHER people's messages, and the deputy is
   // guaranteed to have posted one, so waiting for the badge also guarantees
   // the conversation has finished rendering.

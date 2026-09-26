@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp } from "./example-room";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Copy test for the invite-member modal's guidance blocks.
 //
@@ -18,17 +18,7 @@ import { waitForApp } from "./example-room";
 const ROOM_NAME = "Public Discussion Room";
 
 async function openInviteModal(page: Page) {
-  const vp = page.viewportSize();
-  if (vp && vp.width < 1024) {
-    await page.setViewportSize({ width: 1280, height: vp.height });
-  }
-  const roomBtn = page.getByRole("button", { name: ROOM_NAME });
-  await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-  await roomBtn.click();
-  await expect(page.getByRole("heading", { name: ROOM_NAME })).toBeVisible({
-    timeout: 5_000,
-  });
-
+  await selectRoom(page, ROOM_NAME);
   await page.getByTestId("invite-member-button").click();
   await expect(page.getByTestId("invite-member-modal")).toBeVisible({
     timeout: 5_000,

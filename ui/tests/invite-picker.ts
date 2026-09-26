@@ -1,9 +1,5 @@
 import { expect, Locator, Page } from "@playwright/test";
-import { selectRoom } from "./example-room";
-
-export function memberRows(page: Page): Locator {
-  return page.getByTestId("member-list").locator('[data-testid^="member-item-"] button');
-}
+import { memberRows, selectRoom } from "./example-room";
 
 // member_display_parts marks only the local user with ⭐.
 export function nonSelfMemberRows(page: Page): Locator {

@@ -1,4 +1,4 @@
-import { expect, Page } from "@playwright/test";
+import { expect, Locator, Page } from "@playwright/test";
 
 export async function waitForApp(page: Page) {
   await page.waitForSelector(".app-root", { timeout: 30_000 });
@@ -25,22 +25,25 @@ export async function selectListedRoom(page: Page, roomName: string) {
 // Any viewport: the list if it is on screen, else the hamburger, else widen for the click.
 export async function selectRoom(page: Page, roomName: string) {
   const listed = page.getByTestId("room-list").getByRole("button", { name: roomName });
-  if (!(await listed.isVisible())) {
-    const hamburger = page.getByTestId("hamburger-rooms-button").filter({ visible: true });
-    if ((await hamburger.count()) > 0) {
-      await hamburger.click();
-    } else {
-      const vp = page.viewportSize();
-      if (!vp) throw new Error("selectRoom needs a fixed viewport");
-      await page.setViewportSize({ width: 1280, height: vp.height });
-      await selectListedRoom(page, roomName);
-      await page.setViewportSize(vp);
-      // Let layout settle after the resize round trip (mobile-safari measured too early).
-      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-      return;
-    }
+  if (await listed.isVisible()) return selectListedRoom(page, roomName);
+
+  const hamburger = page.getByTestId("hamburger-rooms-button").filter({ visible: true });
+  if ((await hamburger.count()) > 0) {
+    await hamburger.click();
+    return selectListedRoom(page, roomName);
   }
+
+  const vp = page.viewportSize();
+  if (!vp) throw new Error("selectRoom needs a fixed viewport");
+  await page.setViewportSize({ width: 1280, height: vp.height });
   await selectListedRoom(page, roomName);
+  await page.setViewportSize(vp);
+  // Let layout settle after the resize round trip (mobile-safari measured too early).
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+}
+
+export function memberRows(page: Page): Locator {
+  return page.getByTestId("member-list").locator('[data-testid^="member-item-"] button');
 }
 
 // Self owns "Your Private Room"; in "Public Discussion Room" self is an observer with no composer.
@@ -49,21 +52,20 @@ export async function openRoomWithComposer(page: Page) {
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
 
-// Any CSS colour (tokens, color-mix, oklab) as sRGB [r, g, b, a], so engines compare equal.
-export function resolveColor(page: Page, css: string): Promise<number[]> {
-  return page.evaluate((value) => {
-    const probe = document.createElement("div");
-    probe.style.color = value;
-    document.body.appendChild(probe);
-    const computed = getComputedStyle(probe).color;
-    probe.remove();
-    const ctx = Object.assign(document.createElement("canvas"), { width: 1, height: 1 }).getContext(
-      "2d",
-      { willReadFrequently: true }
-    )!;
-    ctx.fillStyle = computed;
-    ctx.fillRect(0, 0, 1, 1);
-    const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
-    return [r, g, b, a / 255];
-  }, css);
+// The edit form on the first own (accent) message: its kebab on touch, its hover
+// actions otherwise (freenet/river#402). Returns the edit textarea.
+export async function openOwnMessageEdit(page: Page): Promise<Locator> {
+  const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
+  await expect(ownRow).toBeVisible();
+  await ownRow.scrollIntoViewIfNeeded();
+  if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
+    await ownRow.getByTestId("message-kebab").click();
+    await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
+  } else {
+    await ownRow.getByTestId("message-bubble").hover();
+    await ownRow.getByRole("button", { name: /edit/i }).click();
+  }
+  const editArea = page.locator('textarea[id^="edit-msg-"]');
+  await expect(editArea).toBeVisible({ timeout: 5_000 });
+  return editArea;
 }
