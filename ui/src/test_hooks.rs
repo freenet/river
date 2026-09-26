@@ -40,37 +40,45 @@ pub fn install_test_hooks() {
         return;
     }
 
+    // Leaks one closure per hook; the idempotency guard above bounds it.
+    fn expose<T: ?Sized + wasm_bindgen::closure::WasmClosure>(
+        hooks: &js_sys::Object,
+        name: &str,
+        hook: Closure<T>,
+    ) {
+        let _ = js_sys::Reflect::set(hooks, &JsValue::from_str(name), hook.as_ref());
+        hook.forget();
+    }
+
     let hooks = js_sys::Object::new();
 
-    let append = Closure::wrap(Box::new(move |text: String| {
-        crate::util::defer(move || deliver_message(text, Delivery::Append));
-    }) as Box<dyn FnMut(String)>);
-    let _ = js_sys::Reflect::set(&hooks, &JsValue::from_str("appendMessage"), append.as_ref());
-    append.forget();
-
-    let insert = Closure::wrap(Box::new(move |text: String| {
-        crate::util::defer(move || deliver_message(text, Delivery::BeforeLast));
-    }) as Box<dyn FnMut(String)>);
-    let _ = js_sys::Reflect::set(
+    expose(
         &hooks,
-        &JsValue::from_str("insertMessageBeforeLast"),
-        insert.as_ref(),
+        "appendMessage",
+        Closure::wrap(Box::new(move |text: String| {
+            crate::util::defer(move || deliver_message(text, Delivery::Append));
+        }) as Box<dyn FnMut(String)>),
     );
-    insert.forget();
+
+    expose(
+        &hooks,
+        "insertMessageBeforeLast",
+        Closure::wrap(Box::new(move |text: String| {
+            crate::util::defer(move || deliver_message(text, Delivery::BeforeLast));
+        }) as Box<dyn FnMut(String)>),
+    );
 
     // A burst in ONE state mutation — one delta application, one re-render —
     // as a network delta carrying many messages produces. The windowing specs
     // use it to grow an anchored window well past one backfill step without
     // paying per-delivery render round-trips (#505 blocker 2).
-    let append_many = Closure::wrap(Box::new(move |count: u32| {
-        crate::util::defer(move || deliver_batch(count as usize));
-    }) as Box<dyn FnMut(u32)>);
-    let _ = js_sys::Reflect::set(
+    expose(
         &hooks,
-        &JsValue::from_str("appendMessages"),
-        append_many.as_ref(),
+        "appendMessages",
+        Closure::wrap(Box::new(move |count: u32| {
+            crate::util::defer(move || deliver_batch(count as usize));
+        }) as Box<dyn FnMut(u32)>),
     );
-    append_many.forget();
 
     // Drive the no-room screen's load states (freenet/river#509). The example
     // build always seeds rooms and never leaves `ROOMS_LOAD_STATE` anywhere
@@ -82,35 +90,33 @@ pub fn install_test_hooks() {
     // Clears ROOMS as well as setting the state: `room_list_display_state`
     // renders the list whenever there is anything to show, so a state change
     // alone would change nothing.
-    let set_load_state = Closure::wrap(Box::new(move |state: String| {
-        use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
-        let parsed = match state.as_str() {
-            "loading" => RoomsLoadState::Loading,
-            "migrating" => RoomsLoadState::Migrating,
-            "failed" => RoomsLoadState::LoadFailed,
-            "loaded" => RoomsLoadState::Loaded,
-            other => {
-                crate::util::debug_log(&format!("[test] unknown rooms load state {other:?}"));
-                return;
-            }
-        };
-        crate::util::defer(move || {
-            crate::components::app::ROOMS.with_mut(|rooms| {
-                rooms.map.clear();
-                rooms.room_order.clear();
-                rooms.current_room_key = None;
-            });
-            *crate::components::app::CURRENT_ROOM.write() =
-                crate::room_data::CurrentRoom { owner_key: None };
-            *ROOMS_LOAD_STATE.write() = parsed;
-        });
-    }) as Box<dyn FnMut(String)>);
-    let _ = js_sys::Reflect::set(
+    expose(
         &hooks,
-        &JsValue::from_str("setRoomsLoadState"),
-        set_load_state.as_ref(),
+        "setRoomsLoadState",
+        Closure::wrap(Box::new(move |state: String| {
+            use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
+            let parsed = match state.as_str() {
+                "loading" => RoomsLoadState::Loading,
+                "migrating" => RoomsLoadState::Migrating,
+                "failed" => RoomsLoadState::LoadFailed,
+                "loaded" => RoomsLoadState::Loaded,
+                other => {
+                    crate::util::debug_log(&format!("[test] unknown rooms load state {other:?}"));
+                    return;
+                }
+            };
+            crate::util::defer(move || {
+                crate::components::app::ROOMS.with_mut(|rooms| {
+                    rooms.map.clear();
+                    rooms.room_order.clear();
+                    rooms.current_room_key = None;
+                });
+                *crate::components::app::CURRENT_ROOM.write() =
+                    crate::room_data::CurrentRoom { owner_key: None };
+                *ROOMS_LOAD_STATE.write() = parsed;
+            });
+        }) as Box<dyn FnMut(String)>),
     );
-    set_load_state.forget();
 
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
