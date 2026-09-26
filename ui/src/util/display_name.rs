@@ -897,18 +897,8 @@ mod tests {
     /// files on purpose (see the comment on `source` below).
     #[test]
     fn nickname_render_paths_go_through_display_nickname() {
-        use std::path::{Path, PathBuf};
-
-        fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("readable source dir") {
-                let path = entry.expect("readable dir entry").path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
+        use crate::util::source_scan::rust_files;
+        use std::path::Path;
 
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();

@@ -790,22 +790,8 @@ mod tests {
             format!("self_sk{expect}"),
         ];
 
-        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-
         let mut files = Vec::new();
-        rust_files(&root, &mut files);
+        crate::util::source_scan::rust_files(&root, &mut files);
         assert!(
             files.len() > 20,
             "expected to walk the crate's sources, found {} files under {} — \

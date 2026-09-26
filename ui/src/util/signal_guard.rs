@@ -117,6 +117,8 @@ pub fn schedule_nudge() {
 
 #[cfg(test)]
 mod tests {
+    use crate::util::source_scan::production_only;
+
     /// Every call site that `try_read()`s a signal inside a `use_memo` must read
     /// the anchor before its first fallible read, and must nudge on every
     /// degraded branch. Source-scraped rather than run, because exercising the
@@ -179,29 +181,6 @@ mod tests {
         ),
     ];
 
-    /// Cut production source at the test module so a needle appearing only in a
-    /// test cannot satisfy the pin. Splits on `mod tests`, not
-    /// `#[cfg(test)]`, because attributes also decorate non-test items.
-    fn production_only(src: &str) -> &str {
-        match src.find("\nmod tests") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
-
-    /// Drop `//` comments before scanning. Without this the pin matches its own
-    /// explanatory prose: a comment that mentions `try_read(` reads as a fallible
-    /// read occurring before the anchor, and the pin fails on correct code.
-    fn strip_line_comments(src: &str) -> String {
-        src.lines()
-            .map(|l| match l.find("//") {
-                Some(i) => &l[..i],
-                None => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// Body of each `<prefix>(...)` call (e.g. `use_memo(` or `use_effect(`),
     /// delimited by balancing the parenthesis the call opens. Whole-file
     /// scanning is not good enough: these files also `try_read()` from event
@@ -262,7 +241,7 @@ mod tests {
     fn every_fallible_memo_anchors_before_its_first_try_read_and_nudges() {
         let mut checked = 0usize;
         for (name, src) in GUARDED_MEMO_SITES {
-            let prod = strip_line_comments(production_only(src));
+            let prod = crate::util::strip_comments(production_only(src));
             let bodies = memo_bodies(&prod);
             assert!(
                 !bodies.is_empty(),
@@ -337,7 +316,7 @@ mod tests {
     fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
         let mut checked = 0usize;
         for (name, src) in GUARDED_EFFECT_SITES {
-            let prod = strip_line_comments(production_only(src));
+            let prod = crate::util::strip_comments(production_only(src));
             let bodies = effect_bodies(&prod);
             assert!(
                 !bodies.is_empty(),
