@@ -1,8 +1,8 @@
 import { Page } from "@playwright/test";
 
-// The window.__riverTest hooks the suite calls; ui/src/test_hooks.rs defines them. Later PRs add theirs here.
 export type RoomsLoadState = "loading" | "migrating" | "failed" | "loaded";
 
+// Mirrors the window.__riverTest hooks ui/src/test_hooks.rs installs.
 export type RiverTestHooks = {
   appendMessage(text: string): void;
   insertMessageBeforeLast(text: string): void;
@@ -10,7 +10,7 @@ export type RiverTestHooks = {
   setRoomsLoadState(state: RoomsLoadState): void;
 };
 
-// One hook per round trip; timing-sensitive sequences call window.__riverTest in their own evaluate.
+// One hook per round trip.
 export async function callRiverTest<K extends keyof RiverTestHooks>(
   page: Page,
   name: K,

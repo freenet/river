@@ -120,7 +120,6 @@ test.describe("Mobile layout (480px)", () => {
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
 
-    // Open hamburger
     await page.getByTestId("hamburger-rooms-button").click();
 
     // Room list should be visible
@@ -149,7 +148,6 @@ test.describe("Mobile layout (480px)", () => {
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
 
-    // Click members button (last button in header)
     await page.getByTestId("header-members-button").click();
 
     // Members panel visible

@@ -180,7 +180,6 @@ test.describe("Per-room notification bell", () => {
     await waitForApp(page);
     await selectRoom(page, ROOM);
 
-    // Open room details via the title button.
     await page.getByTestId("room-title-button").click();
     await expect(
       page.getByRole("heading", { name: /Room Details/i })

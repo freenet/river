@@ -32,7 +32,7 @@ for (const { label, viewport, isMobile } of [
   // fix is viewport-independent and so is this coverage.
   { label: "desktop", viewport: { width: 1280, height: 800 }, isMobile: false },
 ]) {
-  test.describe(`Rooms load state on the no-room screen (${label})`, () => {
+  test.describe(`Rooms load state on the no-room screen (${label})`, { tag: "@chromium-only" }, () => {
     test.use({ viewport });
 
     test("a loading account is told its rooms are loading, not that it has none", async ({
