@@ -23,36 +23,22 @@ import { waitForApp, selectRoom } from "./example-room";
 // observer there, so every message counts as unread until a room is
 // opened) — these tests rely on that, not on a zero-unread starting state.
 
-// Force the tab into the "hidden" visibility state. We override the
-// `document.hidden` and `document.visibilityState` getters and dispatch the
-// `visibilitychange` event the same way Chromium / WebKit / Firefox do when
-// the tab goes to the background.
-async function setTabHidden(page: Page) {
-  await page.evaluate(() => {
+// Force the tab's visibility state. We override the `document.hidden` and
+// `document.visibilityState` getters and dispatch the `visibilitychange`
+// event the same way Chromium / WebKit / Firefox do when the tab goes to the
+// background or comes back.
+async function setTabVisibility(page: Page, state: "hidden" | "visible") {
+  await page.evaluate((state) => {
     Object.defineProperty(document, "hidden", {
       configurable: true,
-      get: () => true,
+      get: () => state === "hidden",
     });
     Object.defineProperty(document, "visibilityState", {
       configurable: true,
-      get: () => "hidden",
+      get: () => state,
     });
     document.dispatchEvent(new Event("visibilitychange"));
-  });
-}
-
-async function setTabVisible(page: Page) {
-  await page.evaluate(() => {
-    Object.defineProperty(document, "hidden", {
-      configurable: true,
-      get: () => false,
-    });
-    Object.defineProperty(document, "visibilityState", {
-      configurable: true,
-      get: () => "visible",
-    });
-    document.dispatchEvent(new Event("visibilitychange"));
-  });
+  }, state);
 }
 
 test.describe("Document title unread badge", { tag: "@chromium-only" }, () => {
@@ -83,7 +69,7 @@ test.describe("Document title unread badge", { tag: "@chromium-only" }, () => {
       teamChatBtn.locator('[data-testid="room-unread-badge"]')
     ).toBeVisible({ timeout: 5_000 });
 
-    await setTabHidden(page);
+    await setTabVisibility(page, "hidden");
 
     await expect(page).toHaveTitle(/^\(\d+\) River - Public Discussion Room$/, {
       timeout: 2_000,
@@ -102,7 +88,7 @@ test.describe("Document title unread badge", { tag: "@chromium-only" }, () => {
     // No room is auto-selected, so the visible-tab title starts plain.
     await expect(page).toHaveTitle("River", { timeout: 5_000 });
 
-    await setTabHidden(page);
+    await setTabVisibility(page, "hidden");
 
     await expect(page).toHaveTitle(/^\(\d+\) River$/, { timeout: 2_000 });
   });
@@ -122,13 +108,13 @@ test.describe("Document title unread badge", { tag: "@chromium-only" }, () => {
       timeout: 5_000,
     });
 
-    await setTabHidden(page);
+    await setTabVisibility(page, "hidden");
     await expect(page).toHaveTitle("River - Team Chat Room");
 
-    await setTabVisible(page);
+    await setTabVisibility(page, "visible");
     await expect(page).toHaveTitle("River - Team Chat Room");
 
-    await setTabHidden(page);
+    await setTabVisibility(page, "hidden");
     await expect(page).not.toHaveTitle(/^\(\d+\) /, { timeout: 2_000 });
     await expect(page).toHaveTitle("River - Team Chat Room");
   });
