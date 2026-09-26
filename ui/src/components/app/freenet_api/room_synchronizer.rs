@@ -155,8 +155,8 @@ fn outbound_summary(
     // freenet/river#519 through: the top-level destructure catches a new field
     // on `ChatRoomStateV1Summary` ITSELF, and the two leaf destructures below
     // catch one added to `MessagesSummary` or `DirectMessagesSummary`. The other
-    // seven leaf summaries — `members`, `bans`, `member_info`, `secrets`,
-    // `configuration`, `upgrade`, `version` — are bound whole and are NOT
+    // eight leaf summaries — `members`, `bans`, `ban_evidence`, `member_info`,
+    // `secrets`, `configuration`, `upgrade`, `version` — are bound whole and are NOT
     // guarded. So when the `MembersV1` follow-up adds `MembersSummary.horizon`,
     // nothing here will fail to compile; whoever writes it must remember to
     // neutralise it and destructure that leaf too.
@@ -164,6 +164,7 @@ fn outbound_summary(
         configuration,
         bans,
         members,
+        ban_evidence,
         member_info,
         secrets,
         recent_messages,
@@ -212,6 +213,7 @@ fn outbound_summary(
         configuration,
         bans,
         members,
+        ban_evidence,
         member_info,
         secrets,
         recent_messages,
