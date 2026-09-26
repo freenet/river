@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { callRiverTest, RoomsLoadState } from "./river-test";
 
 // Regression coverage for freenet/river#509.
 //
@@ -22,10 +23,8 @@ async function waitForApp(page: Page) {
   await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
 }
 
-async function setLoadState(page: Page, state: string) {
-  await page.evaluate((s) => {
-    (window as any).__riverTest.setRoomsLoadState(s);
-  }, state);
+async function setLoadState(page: Page, state: RoomsLoadState) {
+  await callRiverTest(page, "setRoomsLoadState", state);
 }
 
 const WELCOME = "Welcome to River";

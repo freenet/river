@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { callRiverTest } from "./river-test";
 
 // Regression tests for freenet/river#486: new messages arrived and the view
 // did not follow them.
@@ -116,7 +117,7 @@ async function expectSettledAtBottom(page: Page, why: string) {
 /// passes whether or not the bug is present, and `retries: 2` would keep that
 /// invisible.
 async function deliver(page: Page, text: string) {
-  await page.evaluate((t) => (window as any).__riverTest.appendMessage(t), text);
+  await callRiverTest(page, "appendMessage", text);
   await expect(page.getByText(text, { exact: false }).last()).toBeVisible({
     timeout: 5_000,
   });
@@ -125,10 +126,7 @@ async function deliver(page: Page, text: string) {
 /// Deliver an inbound message one position from the end of the history: it
 /// grows the content WITHOUT remounting the last row.
 async function insertBeforeLast(page: Page, text: string) {
-  await page.evaluate(
-    (t) => (window as any).__riverTest.insertMessageBeforeLast(t),
-    text
-  );
+  await callRiverTest(page, "insertMessageBeforeLast", text);
 }
 
 /// Open a room and wait until the history has settled at its newest message.
@@ -714,7 +712,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     ).not.toBeNull();
 
     const beforeBatch = await renderedRowCount(page);
-    await page.evaluate(() => (window as any).__riverTest.appendMessages(61));
+    await callRiverTest(page, "appendMessages", 61);
     // The batch landed and the SURVIVING remainder of the old window is still
     // rendered (the arrivals alone add 61 rows; losing the survivors would
     // shrink the count back toward the window size).
@@ -826,7 +824,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     const beforeBatch = await renderedRowCount(page);
     // One batched delivery of more than a whole growth step, in a single
     // state mutation — as a network delta carrying many messages does.
-    await page.evaluate(() => (window as any).__riverTest.appendMessages(61));
+    await callRiverTest(page, "appendMessages", 61);
     await expect
       .poll(() => renderedRowCount(page), {
         timeout: 5_000,
