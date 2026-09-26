@@ -118,7 +118,6 @@ pub fn schedule_nudge() {
 #[cfg(test)]
 mod tests {
     use crate::util::source_scan::production_only;
-    use crate::util::strip_comments;
 
     /// Every call site that `try_read()`s a signal inside a `use_memo` must read
     /// the anchor before its first fallible read, and must nudge on every
@@ -240,7 +239,7 @@ mod tests {
         let kind = hook.trim_end_matches('(');
         let mut checked = 0usize;
         for (name, src) in sites {
-            let prod = strip_comments(production_only(src));
+            let prod = production_only(src);
             let bodies = hook_bodies(&prod, hook);
             assert!(
                 !bodies.is_empty(),

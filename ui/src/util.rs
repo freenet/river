@@ -699,6 +699,9 @@ let h = r#"quote " and // and /* inside"#; a();
 let bs = br"\"; b(); // c();
 let cs = cr#"\"#; d();
 let r#type = 1; let bar = "x"; e(); // f();
+let esc = "\"/*"; k(); // m();
+let id = ar"\"; // n();
+";
 /* g(); */ h();"##;
         let out = strip_comments(src);
         for kept in [
@@ -709,10 +712,13 @@ let r#type = 1; let bar = "x"; e(); // f();
             "d();",
             "e();",
             "h();",
+            "k();",
+            // `ar"` is not a raw string, so `n();` is still inside the string.
+            "n();",
         ] {
             assert!(out.contains(kept), "`{kept}` must survive: {out}");
         }
-        for dropped in ["c();", "f();", "g();"] {
+        for dropped in ["c();", "f();", "g();", "m();"] {
             assert!(
                 !out.contains(dropped),
                 "`{dropped}` must be stripped: {out}"
