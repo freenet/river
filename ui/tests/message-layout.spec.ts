@@ -71,9 +71,9 @@ test.describe("Edit box width (#205)", () => {
       clicked = true;
     } else {
       // Hover each message bubble until one exposes an Edit button (own messages
-      // in the private room, where the owner IS self). Bubbles are divs with
-      // `max-w-prose` in the class list.
-      const bubbles = page.locator(".max-w-prose");
+      // in the private room, where the owner IS self). Bubbles are found by the
+      // `message-bubble` test id.
+      const bubbles = page.getByTestId("message-bubble");
       const count = await bubbles.count();
       expect(count).toBeGreaterThan(0);
       for (let i = 0; i < count; i++) {
@@ -127,9 +127,9 @@ test.describe("Reply bubble layout (#206, #207)", () => {
 
     // Find the bubble containing the reply strip and a sibling non-reply bubble.
     const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[contains(@class,'max-w-prose')][1]"
+      "xpath=ancestor::*[@data-testid='message-bubble'][1]"
     );
-    const allBubbles = page.locator(".max-w-prose");
+    const allBubbles = page.getByTestId("message-bubble");
     const bubbleCount = await allBubbles.count();
     let maxNonReplyWidth = 0;
     for (let i = 0; i < bubbleCount; i++) {
@@ -188,7 +188,7 @@ test.describe("Reply bubble layout (#206, #207)", () => {
     );
 
     const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[contains(@class,'max-w-prose')][1]"
+      "xpath=ancestor::*[@data-testid='message-bubble'][1]"
     );
 
     const widthBefore = await replyBubble.evaluate(
@@ -339,7 +339,7 @@ test.describe("Long unbreakable content (#212)", () => {
     await selectRoom(page, "Your Private Room");
 
     const longTokenBubble = page
-      .locator(".max-w-prose")
+      .getByTestId("message-bubble")
       .filter({ hasText: "longlongurlpath" })
       .first();
     await expect(longTokenBubble).toBeVisible({ timeout: 10_000 });
@@ -689,7 +689,7 @@ test.describe("Self message bubble mobile overflow", () => {
     const overflow = await page.evaluate(() => {
       const vw = window.innerWidth;
       const bad: Array<{ left: number; right: number; width: number; text: string }> = [];
-      for (const b of Array.from(document.querySelectorAll(".max-w-prose"))) {
+      for (const b of Array.from(document.querySelectorAll('[data-testid="message-bubble"]'))) {
         const r = b.getBoundingClientRect();
         if (r.width === 0) continue;
         if (r.left < -1 || r.right > vw + 1) {
@@ -756,7 +756,7 @@ test.describe("Unavailable reply quote", () => {
     ).not.toHaveCount(0);
 
     // Mutually exclusive with the quote strip: no bubble carries both.
-    const bubbles = page.locator(".max-w-prose");
+    const bubbles = page.getByTestId("message-bubble");
     expect(await bubbles.count()).toBeGreaterThan(0);
     const bothInOneBubble = await bubbles.evaluateAll(
       (els) =>

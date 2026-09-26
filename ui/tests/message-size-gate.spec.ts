@@ -135,7 +135,7 @@ test.describe("Encoded size gate on the edit form", () => {
         .click();
       clicked = true;
     } else {
-      const bubbles = page.locator(".max-w-prose");
+      const bubbles = page.getByTestId("message-bubble");
       const count = await bubbles.count();
       expect(count).toBeGreaterThan(0);
       for (let i = 0; i < count; i++) {

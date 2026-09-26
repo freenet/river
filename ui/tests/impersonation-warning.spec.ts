@@ -189,8 +189,7 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
     await page.setViewportSize({ width: 320, height: vp?.height ?? 568 });
 
     // Now switch to the members panel, which is a separate view at this width.
-    const header = page.locator(".border-b.border-border.bg-panel");
-    await header.locator("button").last().click();
+    await page.getByTestId("header-members-button").click();
     await expect(page.locator("aside").filter({ hasText: "Active Members" })).toBeVisible({
       timeout: 15_000,
     });

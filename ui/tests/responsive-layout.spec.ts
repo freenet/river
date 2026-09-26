@@ -164,8 +164,7 @@ test.describe("Mobile layout (480px)", () => {
     await selectRoom(page, "Team Chat Room");
 
     // Open hamburger
-    const header = page.locator(".border-b.border-border.bg-panel");
-    await header.locator("button").first().click();
+    await page.getByTestId("hamburger-rooms-button").click();
 
     // Room list should be visible
     await expect(
@@ -194,8 +193,7 @@ test.describe("Mobile layout (480px)", () => {
     await selectRoom(page, "Team Chat Room");
 
     // Click members button (last button in header)
-    const header = page.locator(".border-b.border-border.bg-panel");
-    await header.locator("button").last().click();
+    await page.getByTestId("header-members-button").click();
 
     // Members panel visible
     await expect(
@@ -261,8 +259,7 @@ test.describe("Desktop recovery after mobile", () => {
     await selectRoom(page, "Team Chat Room");
 
     // Switch to members view on mobile
-    const header = page.locator(".border-b.border-border.bg-panel");
-    await header.locator("button").last().click();
+    await page.getByTestId("header-members-button").click();
     await expect(
       page.locator("aside").filter({ hasText: "Active Members" })
     ).toBeVisible();

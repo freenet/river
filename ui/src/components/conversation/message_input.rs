@@ -188,6 +188,7 @@ pub fn MessageInput(
             }
         }
         div { class: "flex-shrink-0 border-t border-border bg-panel relative z-50",
+            "data-testid": "message-composer",
             div { class: "max-w-4xl mx-auto px-4 py-3",
                 // Reply preview strip
                 {

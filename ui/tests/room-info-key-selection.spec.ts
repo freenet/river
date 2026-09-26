@@ -53,7 +53,7 @@ async function openRoomDetails(page: Page) {
   await expect(page.getByRole("heading", { name: ROOM_NAME })).toBeVisible({ timeout: 5_000 });
 
   // The (i) affordance in the room header opens the room-details modal.
-  await page.getByTitle("Room details").click();
+  await page.getByTestId("room-title-button").click();
   await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
 }
 
@@ -320,7 +320,7 @@ test.describe("room-details copy buttons", () => {
     await page.getByTestId("edit-room-close-button").click();
     await expect(page.getByTestId("edit-room-modal")).toHaveCount(0, { timeout: 15_000 });
 
-    const reopen = page.getByTitle("Room details");
+    const reopen = page.getByTestId("room-title-button");
     await expect(reopen).toBeVisible({ timeout: 15_000 });
     await reopen.click();
     await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 15_000 });

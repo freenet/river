@@ -37,8 +37,7 @@ test.describe("Room header description links", () => {
     await waitForApp(page);
     await selectRoom(page, ROOM_WITH_LINKS);
 
-    const header = page.locator(".border-b.border-border.bg-panel").first();
-    const link = header.locator('a[href="https://freenet.org/"]');
+    const link = page.getByTestId("room-header-description").locator('a[href="https://freenet.org/"]');
     await expect(link).toBeVisible();
 
     const hasButtonAncestor = await link.evaluate((el) =>
@@ -54,8 +53,7 @@ test.describe("Room header description links", () => {
     await waitForApp(page);
     await selectRoom(page, ROOM_WITH_LINKS);
 
-    const header = page.locator(".border-b.border-border.bg-panel").first();
-    const link = header.locator('a[href="https://freenet.org/"]');
+    const link = page.getByTestId("room-header-description").locator('a[href="https://freenet.org/"]');
     await expect(link).toBeVisible();
 
     // Neutralise navigation so the click stays on the page. We deliberately
@@ -89,9 +87,7 @@ test.describe("Room header description links", () => {
     await waitForApp(page);
     await selectRoom(page, ROOM_WITH_LINKS);
 
-    const header = page.locator(".border-b.border-border.bg-panel").first();
-    // The title button has title="Room details".
-    const titleButton = header.locator('button[title="Room details"]');
+    const titleButton = page.getByTestId("room-title-button");
     await expect(titleButton).toBeVisible();
     await titleButton.click();
 

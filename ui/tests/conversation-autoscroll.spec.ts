@@ -278,7 +278,7 @@ test.describe("Conversation follows new messages (#486)", () => {
     // something is inserted before it. `insertMessageBeforeLast` also signs
     // with its own key, so it can never merge into that group.
     await page.evaluate(() => {
-      const rows = document.querySelectorAll("#chat-scroll-container .space-y-4 > *");
+      const rows = document.querySelectorAll('[data-testid="conversation-history"] > *');
       (rows[rows.length - 1] as any).__riverProbe = "last-row";
     });
 
@@ -293,7 +293,7 @@ test.describe("Conversation follows new messages (#486)", () => {
     );
 
     const lastRowSurvived = await page.evaluate(() => {
-      const rows = document.querySelectorAll("#chat-scroll-container .space-y-4 > *");
+      const rows = document.querySelectorAll('[data-testid="conversation-history"] > *');
       return (rows[rows.length - 1] as any).__riverProbe === "last-row";
     });
     expect(
@@ -467,7 +467,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   function renderedRowCount(page: Page): Promise<number> {
     return page.evaluate(
       () =>
-        document.querySelectorAll("#chat-scroll-container .space-y-4 > *")
+        document.querySelectorAll('[data-testid="conversation-history"] > *')
           .length
     );
   }
@@ -505,7 +505,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     return page.evaluate((f) => {
       const container = document.getElementById("chat-scroll-container")!;
       const cRect = container.getBoundingClientRect();
-      const rows = container.querySelectorAll(".space-y-4 > *");
+      const rows = container.querySelectorAll('[data-testid="conversation-history"] > *');
       for (const row of rows) {
         const r = row.getBoundingClientRect();
         if (r.top >= cRect.top && r.bottom <= cRect.bottom) {
@@ -522,7 +522,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   async function taggedRowTop(page: Page, flag: string): Promise<number | null> {
     return page.evaluate((f) => {
       const rows = document.querySelectorAll(
-        "#chat-scroll-container .space-y-4 > *"
+        '[data-testid="conversation-history"] > *'
       );
       for (const row of rows) {
         if ((row as any)[f]) {
@@ -755,7 +755,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     const probeTop = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       c.scrollTop = 0;
-      const row = c.querySelector(".space-y-4 > [data-item-key]") as HTMLElement;
+      const row = c.querySelector('[data-testid="conversation-history"] > [data-item-key]') as HTMLElement;
       (row as any).__riverPagingProbe = true;
       return row.getBoundingClientRect().top;
     });
