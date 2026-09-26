@@ -1990,7 +1990,7 @@ mod tests {
     #[test]
     fn dm_thread_modal_send_has_no_client_side_pair_cap_guard() {
         let src = include_str!("dm_thread_modal.rs");
-        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let body = crate::util::source_scan::production_only(src);
         for symbol in ["pair_message_count(", "MAX_DM_MESSAGES_PER_PAIR"] {
             assert!(
                 !body.contains(symbol),
