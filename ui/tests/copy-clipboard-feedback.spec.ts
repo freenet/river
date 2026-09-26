@@ -10,7 +10,7 @@ import { waitForApp, selectRoom } from "./example-room";
 // "Export ID" affordance is available.
 const ROOM_NAME = "Public Discussion Room";
 
-test.describe("Export Identity copy feedback", () => {
+test.describe("Export Identity copy feedback", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("dismissing via the backdrop also resets the button text", async ({ page }) => {

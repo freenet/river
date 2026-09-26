@@ -19,7 +19,7 @@ test.beforeEach(async ({ page }) => {
   await openRoomWithComposer(page);
 });
 
-test.describe("Encoded message size gate", () => {
+test.describe("Encoded message size gate", { tag: "@chromium-only" }, () => {
   test("998 raw chars (encoded 1007 > 1000) disables Send and keeps the draft on Enter", async ({
     page,
   }) => {

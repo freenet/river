@@ -246,7 +246,7 @@ test.describe("room-details copy buttons", () => {
       other: "room-public-key-input",
     },
   ]) {
-    test(`${field.button} copies THAT field's value, not another`, async ({ page }) => {
+    test(`${field.button} copies THAT field's value, not another`, { tag: "@chromium-only" }, async ({ page }) => {
       await page.goto("/");
       await waitForApp(page);
       await openRoomDetails(page);
@@ -268,7 +268,7 @@ test.describe("room-details copy buttons", () => {
     });
   }
 
-  test("the copy feedback resets when the panel is closed and reopened", async ({ page }) => {
+  test("the copy feedback resets when the panel is closed and reopened", { tag: "@chromium-only" }, async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await openRoomDetails(page);

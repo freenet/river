@@ -9,7 +9,7 @@ import { waitForApp } from "./example-room";
 //
 // Requested by Ian Clarke, 2026-05-20.
 
-test.describe("Rooms list unread badge", () => {
+test.describe("Rooms list unread badge", { tag: "@chromium-only" }, () => {
   // Force a desktop viewport so the room rail is visible on the mobile
   // Playwright projects too.
   test.use({ viewport: { width: 1280, height: 800 } });
@@ -83,7 +83,7 @@ test.describe("Rooms list unread badge", () => {
   });
 });
 
-test.describe("Muted rooms and the cross-surface totals", () => {
+test.describe("Muted rooms and the cross-surface totals", { tag: "@chromium-only" }, () => {
   // The hamburger badge is `md:hidden`, so this needs a mobile viewport.
   test.use({ viewport: { width: 390, height: 844 } });
 

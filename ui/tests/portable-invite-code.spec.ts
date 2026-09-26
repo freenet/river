@@ -27,7 +27,7 @@ async function openInviteModalAndReadCode(page: Page): Promise<string> {
   return await codeInput.inputValue();
 }
 
-test.describe("Portable invite codes (issue #381)", () => {
+test.describe("Portable invite codes (issue #381)", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("invite modal exposes a portable code with copy feedback", async ({

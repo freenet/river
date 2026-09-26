@@ -8,7 +8,7 @@ import { waitForApp, selectRoom } from "./example-room";
 
 const ROOM_WITH_LINKS = "Public Discussion Room";
 
-test.describe("Room header description links", () => {
+test.describe("Room header description links", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("links in description are NOT nested inside <button>", async ({

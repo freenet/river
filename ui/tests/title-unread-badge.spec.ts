@@ -55,7 +55,7 @@ async function setTabVisible(page: Page) {
   });
 }
 
-test.describe("Document title unread badge", () => {
+test.describe("Document title unread badge", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   // freenet/river#446's headline behavioral change. Opening "Public

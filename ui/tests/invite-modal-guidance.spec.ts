@@ -30,7 +30,7 @@ async function openInviteModal(page: Page) {
   });
 }
 
-test.describe("Invite-member modal guidance copy", () => {
+test.describe("Invite-member modal guidance copy", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("recommends a DM invite above the one-person-only link warning", async ({

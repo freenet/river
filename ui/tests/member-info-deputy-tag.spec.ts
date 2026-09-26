@@ -22,7 +22,7 @@ async function openTeamChatMembers(page: Page) {
   await expect(memberRows(page).first()).toBeVisible({ timeout: 5_000 });
 }
 
-test.describe("Member-info modal deputy shield legend (#451)", () => {
+test.describe("Member-info modal deputy shield legend (#451)", { tag: "@chromium-only" }, () => {
   // Fixed desktop viewport so the member list is always in-panel (mirrors
   // dm-thread-modal.spec.ts).
   test.use({ viewport: { width: 1280, height: 800 } });

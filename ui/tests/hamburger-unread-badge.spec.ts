@@ -28,7 +28,7 @@ const ALL_ROOMS = [
   "Team Chat Room",
 ];
 
-test.describe("Mobile hamburger unread badge", () => {
+test.describe("Mobile hamburger unread badge", { tag: "@chromium-only" }, () => {
   // Force a mobile viewport so the hamburger (md:hidden) is rendered on
   // the desktop Playwright projects too.
   test.use({ viewport: { width: 390, height: 844 } });

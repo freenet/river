@@ -38,7 +38,7 @@ import { waitForApp } from "./example-room";
 // "did WASM panic?" coverage, do it via a deliberate panic-detection
 // harness, not by parsing console text.
 
-test.describe("DM archive UX overhaul (#266)", () => {
+test.describe("DM archive UX overhaul (#266)", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("page loads cleanly with archive code paths wired up", async ({

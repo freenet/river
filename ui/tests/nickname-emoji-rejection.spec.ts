@@ -11,7 +11,7 @@ import { waitForApp } from "./example-room";
 // conversation-deputy-badge.spec.ts. This spec only pins that honest users get
 // told.
 
-test.describe("Nickname inputs reject emoji", () => {
+test.describe("Nickname inputs reject emoji", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("the create-room nickname field explains and blocks", async ({

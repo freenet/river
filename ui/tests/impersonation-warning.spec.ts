@@ -55,7 +55,7 @@ async function openTeamChat(page: Page) {
   await page.locator(LIST_WARNING).first().waitFor({ state: "visible", timeout: 15_000 });
 }
 
-test.describe("Impersonation warning (#489)", () => {
+test.describe("Impersonation warning (#489)", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("the impostor's row carries ⚠ and the deputy's does not", async ({ page }) => {

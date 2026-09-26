@@ -40,7 +40,7 @@ async function openTeamChat(page: Page) {
   await page.locator(BADGE).first().waitFor({ state: "visible", timeout: 15_000 });
 }
 
-test.describe("Deputy badge on message authors", () => {
+test.describe("Deputy badge on message authors", { tag: "@chromium-only" }, () => {
   // Fixed desktop viewport so the conversation pane is always in view
   // (mirrors member-info-deputy-tag.spec.ts).
   test.use({ viewport: { width: 1280, height: 800 } });

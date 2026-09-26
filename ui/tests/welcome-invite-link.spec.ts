@@ -32,7 +32,7 @@ async function expectInviteLink(page: Page) {
   await expect(link).toHaveAttribute("rel", /noopener/);
 }
 
-test.describe("Welcome screen invite link (issue #159)", () => {
+test.describe("Welcome screen invite link (issue #159)", { tag: "@chromium-only" }, () => {
   test("desktop: invite link is shown on the Welcome screen", async ({
     page,
   }) => {

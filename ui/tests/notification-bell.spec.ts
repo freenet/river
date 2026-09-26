@@ -11,7 +11,7 @@ const ROOM = "Public Discussion Room";
 test.describe("Per-room notification bell", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("clicking the bell opens the notification modal with three modes", async ({
+  test("clicking the bell opens the notification modal with three modes", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await page.goto("/");
@@ -28,7 +28,7 @@ test.describe("Per-room notification bell", () => {
     await expect(modal.getByText("Muted")).toBeVisible();
   });
 
-  test("selecting a mode applies it, closes the modal, and updates the bell", async ({
+  test("selecting a mode applies it, closes the modal, and updates the bell", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await page.goto("/");
@@ -64,7 +64,7 @@ test.describe("Per-room notification bell", () => {
     await expect(mutedRow).toHaveClass(/border-accent/);
   });
 
-  test("closing via the ✕ leaves the preference unchanged", async ({
+  test("closing via the ✕ leaves the preference unchanged", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await page.goto("/");
@@ -159,7 +159,7 @@ test.describe("Per-room notification bell", () => {
     }
   });
 
-  test("room-details modal no longer carries the notification setting", async ({
+  test("room-details modal no longer carries the notification setting", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await page.goto("/");
