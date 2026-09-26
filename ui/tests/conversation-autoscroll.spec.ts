@@ -545,7 +545,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // each arrival slid the window, the shifted scrollTop read as reader
     // movement, and the view never followed again. The loop is what catches a
     // fix that survives one arrival and then latches. Delivered arrivals
-    // alternate authors (see `test_author` in example_data.rs), so each one
+    // alternate authors (see `test_author` in test_hooks.rs), so each one
     // is its own display item and the loop interleaves window GROWTH with the
     // settle-at-bottom TRIM — six arrivals folding into one group would
     // exercise the windowing arithmetic zero times.

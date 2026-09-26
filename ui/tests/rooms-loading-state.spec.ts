@@ -15,7 +15,7 @@ import { test, expect, Page } from "@playwright/test";
 //
 // The example build always seeds rooms, so these states are unreachable without
 // a hook: `__riverTest.setRoomsLoadState(state)` clears ROOMS and sets
-// ROOMS_LOAD_STATE (example_data.rs, gated on example-data + no-sync).
+// ROOMS_LOAD_STATE (test_hooks.rs, gated on example-data + no-sync).
 
 async function waitForApp(page: Page) {
   await page.waitForSelector(".app-root", { timeout: 30_000 });
