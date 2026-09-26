@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Regression test for issue #159: the Welcome screen (shown when no room
 // is selected) must offer a concrete next step for new users — a link to
@@ -6,11 +7,6 @@ import { test, expect, Page } from "@playwright/test";
 // Official" room. The issue specifically called out that, especially on
 // mobile, a brand-new user has no idea what to do after "Create a new
 // room, or get invited to an existing one."
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
 
 const INVITE_HREF = "https://freenet.org/quickstart#invite-form";
 

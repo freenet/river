@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Copy test for the invite-member modal's guidance blocks.
 //
@@ -11,11 +12,6 @@ import { test, expect, Page } from "@playwright/test";
 // These assertions pin BOTH blocks and their order, so a future refactor
 // of this modal can't silently drop the recommendation and leave
 // copy-the-link as the only documented path.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
 
 // A room where the test user is a member, so "Invite Member" can generate
 // an invitation (matches the portable-invite-code spec).

@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // The UX half of the nickname change: a nickname input tells the user why
 // emoji aren't allowed instead of silently dropping the characters at render
@@ -9,10 +10,6 @@ import { test, expect, Page } from "@playwright/test";
 // (`crate::util::display_name`) exists and is covered by Rust unit tests plus
 // conversation-deputy-badge.spec.ts. This spec only pins that honest users get
 // told.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-}
 
 test.describe("Nickname inputs reject emoji", () => {
   test.use({ viewport: { width: 1280, height: 800 } });

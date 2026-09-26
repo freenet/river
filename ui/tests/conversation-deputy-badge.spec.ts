@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Render coverage for the two halves of the deputy-badge change:
 //
@@ -28,10 +29,6 @@ const AUTHOR_NAME = '#chat-scroll-container span[title^="Member ID"]';
 // Every glyph River uses as a badge somewhere in the UI. None may appear in a
 // rendered author NAME.
 const BADGE_GLYPHS = ["🛡", "👑", "⭐", "🔑", "🎪"];
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-}
 
 async function openTeamChat(page: Page) {
   await page.goto("/");

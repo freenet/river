@@ -1,5 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Regression tests for freenet/river#486: new messages arrived and the view
 // did not follow them.
@@ -43,29 +44,6 @@ import { callRiverTest } from "./river-test";
 const BOTTOM_THRESHOLD_PX = 100;
 /// Slack for fractional layout after a scroll that did land at the bottom.
 const AT_BOTTOM_EPSILON_PX = 4;
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-  await page.waitForFunction(() => (window as any).__riverTest !== undefined, {
-    timeout: 30_000,
-  });
-}
-
-async function selectRoom(page: Page, roomName: string) {
-  await page.getByRole("button", { name: roomName }).click();
-  await expect(page.getByRole("heading", { name: roomName })).toBeVisible({
-    timeout: 5_000,
-  });
-  // The mobile projects keep their touch/UA emulation but run at the desktop
-  // viewport these describes set, so the chat panel is always the visible one.
-  // Asserted rather than assumed: if it were hidden, every geometry read below
-  // would return 0 and the failures would point at scrolling rather than at
-  // layout.
-  await expect(page.locator("#chat-scroll-container")).toBeVisible({
-    timeout: 5_000,
-  });
-}
 
 /// scrollHeight - scrollTop - clientHeight: how far the end of the history is
 /// below the visible area. 0 means the newest message is fully in view.
@@ -138,6 +116,9 @@ async function openRoomAtBottom(page: Page, roomName: string, path = "/") {
   await page.goto(path);
   await waitForApp(page);
   await selectRoom(page, roomName);
+  // Mobile projects run at the desktop viewport, so the chat panel is visible;
+  // asserted since a hidden panel would make every geometry read below return 0.
+  await expect(page.locator("#chat-scroll-container")).toBeVisible({ timeout: 5_000 });
   await expectSettledAtBottom(page, "opening a room should land on its newest message");
 }
 

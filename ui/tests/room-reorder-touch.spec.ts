@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Regression test for freenet/river#348.
 //
@@ -12,11 +13,6 @@ import { test, expect, Page } from "@playwright/test";
 // The controls call the same input-agnostic persistence helpers
 // (`move_room_up` / `move_room_down` in ui/src/room_data.rs) that the drag path
 // uses, so this test exercises the full gesture → reorder wiring.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
 
 // Stable per-room testids (`room-item-{base58(owner_vk)}`, added in #363) in
 // rail (DOM) order. Identity-based, so it's robust to duplicate display names.

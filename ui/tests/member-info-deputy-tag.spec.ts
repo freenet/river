@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Render coverage for freenet/river#451: the member-info modal legend must
 // show the 🛡 deputy chip for a member who carries the shield in the member
@@ -15,10 +16,6 @@ import { test, expect, Page } from "@playwright/test";
 // from the info page) — which a source-grep pin cannot catch.
 
 const DEPUTY_TAG = '[data-testid="member-info-deputy-tag"]';
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-}
 
 async function openTeamChatMembers(page: Page) {
   await page.getByText("Team Chat Room").first().click();

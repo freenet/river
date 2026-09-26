@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Regression tests for freenet/river#205, #206, #207:
 //   #205 edit box wider than view
@@ -8,33 +9,6 @@ import { test, expect, Page } from "@playwright/test";
 // Assumes the example-data build is served on `baseURL`, which includes a
 // reply message added in ui/src/example_data.rs specifically so these tests
 // can exercise the reply bubble layout.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
-async function selectRoom(page: Page, roomName: string) {
-  const roomBtn = page.getByRole("button", { name: roomName });
-  if (!(await roomBtn.isVisible({ timeout: 500 }).catch(() => false))) {
-    // Narrow-window case: temporarily expand to click the room.
-    const vp = page.viewportSize();
-    if (vp && vp.width < 768) {
-      await page.setViewportSize({ width: 1280, height: vp.height });
-      await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-      await roomBtn.click();
-      await expect(
-        page.getByRole("heading", { name: roomName })
-      ).toBeVisible({ timeout: 5_000 });
-      await page.setViewportSize({ width: vp.width, height: vp.height });
-      return;
-    }
-  }
-  await roomBtn.click();
-  await expect(
-    page.getByRole("heading", { name: roomName })
-  ).toBeVisible({ timeout: 5_000 });
-}
 
 // #205: on a narrow viewport, clicking edit on an own message must not produce
 // an edit container wider than the available chat area.

@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Coverage for: on mobile, a room fills the whole screen, so new messages
 // arriving in OTHER rooms were invisible until the user happened to open
@@ -7,11 +8,6 @@ import { test, expect, Page } from "@playwright/test";
 // the DM rail lives behind the same button).
 //
 // Requested by The Torist, 2026-07-22.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
 
 const HAMBURGER = '[data-testid="hamburger-rooms-button"]';
 const BADGE = '[data-testid="hamburger-unread-badge"]';

@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Regression test for freenet/river#564: typing in the Room Details dialog was
 // wiped every few seconds by unrelated room-state updates.
@@ -24,11 +25,6 @@ import { test, expect, Page } from "@playwright/test";
 
 const OWNED_ROOM = "Your Private Room";
 const DRAFT = "A description I am still in the middle of typing";
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
 
 async function openRoomDetails(page: Page) {
   const vp = page.viewportSize();

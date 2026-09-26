@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
 //   1. Touch-accessible message action menu (kebab), since the hover action
@@ -8,44 +9,6 @@ import { test, expect, Page } from "@playwright/test";
 //      open the room-details modal.
 //   3. A scroll-to-latest button shown whenever the history is not pinned to
 //      the bottom, plus a snap-to-bottom on room switch.
-
-// Helper: wait for WASM app to fully render
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
-// Helper: select a room at any viewport width (mirrors responsive-layout.spec).
-async function selectRoom(page: Page, roomName: string) {
-  const roomBtn = page.getByRole("button", { name: roomName });
-
-  if (!(await roomBtn.isVisible({ timeout: 500 }).catch(() => false))) {
-    const hamburger = page.locator(
-      ".border-b.border-border.bg-panel button >> nth=0"
-    );
-    if (await hamburger.isVisible({ timeout: 500 }).catch(() => false)) {
-      await hamburger.click();
-      await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-    } else {
-      const vp = page.viewportSize();
-      if (vp && vp.width < 768) {
-        await page.setViewportSize({ width: 1280, height: vp.height });
-        await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-        await roomBtn.click();
-        await expect(
-          page.getByRole("heading", { name: roomName })
-        ).toBeVisible({ timeout: 5_000 });
-        await page.setViewportSize({ width: vp.width, height: vp.height });
-        return;
-      }
-    }
-  }
-
-  await roomBtn.click();
-  await expect(
-    page.getByRole("heading", { name: roomName })
-  ).toBeVisible({ timeout: 5_000 });
-}
 
 // Whether this browser context has no hover pointer (i.e. a touch device).
 // The kebab is shown only in that case; the hover action bar only otherwise.

@@ -1,4 +1,5 @@
 import { test, expect, Page, Locator } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Regression test for freenet/river#537: the Room Public Key and Contract ID
 // in the room-details panel could not be selected or copied in Firefox.
@@ -33,11 +34,6 @@ const ROOM_NAME = "Public Discussion Room";
 // report, so the Ctrl+C acceptance criterion is still genuinely gated.
 const WEBKIT_KEYBOARD_COPY_SKIP =
   "Playwright's WebKit does not deliver a keyboard copy to a readonly input (harness limitation, verified against a bare input outside River); mouse selection is still asserted on webkit.";
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
 
 async function openRoomDetails(page: Page) {
   const vp = page.viewportSize();

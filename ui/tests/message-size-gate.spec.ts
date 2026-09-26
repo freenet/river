@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp, openRoomWithComposer } from "./example-room";
 
 // Regression tests for the "message was lost" bug (HostFat, Matrix 2026-07):
 // the input gate compared raw text bytes against max_message_size, but the
@@ -12,49 +13,13 @@ import { test, expect, Page } from "@playwright/test";
 // 1000 bytes (encoded), public room. Public text encodes as CBOR
 // {text: "..."} = raw bytes + 9 for texts in the 256..65535-byte range.
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
-async function selectRoom(page: Page, roomName: string) {
-  const roomBtn = page.getByRole("button", { name: roomName });
-  if (!(await roomBtn.isVisible({ timeout: 500 }).catch(() => false))) {
-    // Narrow-window case: temporarily expand to click the room.
-    const vp = page.viewportSize();
-    if (vp && vp.width < 768) {
-      await page.setViewportSize({ width: 1280, height: vp.height });
-      await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-      await roomBtn.click();
-      await expect(page.getByRole("heading", { name: roomName })).toBeVisible({
-        timeout: 5_000,
-      });
-      await page.setViewportSize({ width: vp.width, height: vp.height });
-      return;
-    }
-  }
-  await roomBtn.click();
-  await expect(page.getByRole("heading", { name: roomName })).toBeVisible({
-    timeout: 5_000,
-  });
-}
-
-async function openRoomWithInput(page: Page) {
-  await page.goto("/");
-  await waitForApp(page);
-  // Self is the owner of "Your Private Room" in example data, so the
-  // message input is available there.
-  await selectRoom(page, "Your Private Room");
-  await expect(page.getByTestId("message-input")).toBeVisible({
-    timeout: 10_000,
-  });
-}
-
 test.describe("Encoded message size gate", () => {
   test("998 raw chars (encoded 1007 > 1000) disables Send and keeps the draft on Enter", async ({
     page,
   }) => {
-    await openRoomWithInput(page);
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     const text = "a".repeat(998); // raw 998 <= 1000, encoded 1007 > 1000
     await input.fill(text);
@@ -73,7 +38,9 @@ test.describe("Encoded message size gate", () => {
   test("990 raw chars (encoded 999 <= 1000) shows the encoded count and keeps Send enabled", async ({
     page,
   }) => {
-    await openRoomWithInput(page);
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     await input.fill("a".repeat(990)); // encoded 999
 
@@ -84,7 +51,9 @@ test.describe("Encoded message size gate", () => {
   test("multi-byte characters count as encoded bytes, not characters", async ({
     page,
   }) => {
-    await openRoomWithInput(page);
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     // 499 chars but 998 UTF-8 bytes -> encoded 1007 > 1000. Users count
     // characters; the limit is bytes. The gate must block this visibly
@@ -98,7 +67,9 @@ test.describe("Encoded message size gate", () => {
   test("a message at exactly the encoded limit is sendable (no off-by-one)", async ({
     page,
   }) => {
-    await openRoomWithInput(page);
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomWithComposer(page);
     const input = page.getByTestId("message-input");
     await input.fill("a".repeat(991)); // encoded exactly 1000
 
@@ -115,7 +86,9 @@ test.describe("Encoded size gate on the edit form", () => {
   test("over-limit edit disables Save, shows the counter, and Enter keeps the form open", async ({
     page,
   }) => {
-    await openRoomWithInput(page);
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomWithComposer(page);
 
     // Open the edit form on an own message — kebab menu on touch devices,
     // hover actions on desktop (same affordance split as

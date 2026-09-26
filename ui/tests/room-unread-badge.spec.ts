@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Regression test for: unread message counts were surfaced in the document
 // <title> and the DM rail, but rooms in the Rooms list had no unread
@@ -7,11 +8,6 @@ import { test, expect, Page } from "@playwright/test";
 // messages.
 //
 // Requested by Ian Clarke, 2026-05-20.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
 
 test.describe("Rooms list unread badge", () => {
   // Force a desktop viewport so the room rail is visible on the mobile

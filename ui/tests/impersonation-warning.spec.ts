@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Render coverage for freenet/river#489: the ⚠ impersonation warning.
 //
@@ -39,10 +40,6 @@ const rowsWithWarning = (page: Page) =>
   page.locator(MEMBER_ROW).filter({ has: page.locator(LIST_WARNING) });
 const rowsWithShield = (page: Page) =>
   page.locator(MEMBER_ROW).filter({ has: page.locator(LIST_DEPUTY) });
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-}
 
 async function openTeamChat(page: Page) {
   await page.goto("/");

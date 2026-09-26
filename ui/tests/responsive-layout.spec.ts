@@ -1,48 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
-
-// Helper: wait for WASM app to fully render
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  // Wait for at least one interactive element to confirm WASM hydration
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
-// Helper: select a room at any viewport width.
-// On desktop the room list is always visible. On mobile we may need to
-// navigate to the Rooms view first (via hamburger button).
-async function selectRoom(page: Page, roomName: string) {
-  const roomBtn = page.getByRole("button", { name: roomName });
-
-  if (!(await roomBtn.isVisible({ timeout: 500 }).catch(() => false))) {
-    // Try the hamburger in the chat header (visible when a room IS selected on mobile)
-    const hamburger = page.locator(
-      ".border-b.border-border.bg-panel button >> nth=0"
-    );
-    if (await hamburger.isVisible({ timeout: 500 }).catch(() => false)) {
-      await hamburger.click();
-      await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-    } else {
-      // No room selected yet on mobile — the room list panel is hidden.
-      // Temporarily resize to desktop to select the room, then resize back.
-      const vp = page.viewportSize();
-      if (vp && vp.width < 768) {
-        await page.setViewportSize({ width: 1280, height: vp.height });
-        await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-        await roomBtn.click();
-        await expect(
-          page.getByRole("heading", { name: roomName })
-        ).toBeVisible({ timeout: 5_000 });
-        await page.setViewportSize({ width: vp.width, height: vp.height });
-        return;
-      }
-    }
-  }
-
-  await roomBtn.click();
-  await expect(
-    page.getByRole("heading", { name: roomName })
-  ).toBeVisible({ timeout: 5_000 });
-}
+import { test, expect } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 test.describe("Desktop layout (1280px)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });

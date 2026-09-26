@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Archive-UX overhaul (issue #266, follow-up to #261).
 //
@@ -36,11 +37,6 @@ import { test, expect, Page } from "@playwright/test";
 // adding only-here filtering is a brittle wart. If we ever want
 // "did WASM panic?" coverage, do it via a deliberate panic-detection
 // harness, not by parsing console text.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
 
 test.describe("DM archive UX overhaul (#266)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
