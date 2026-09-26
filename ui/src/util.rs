@@ -555,77 +555,177 @@ pub fn owner_vk_to_legacy_contract_keys(owner_vk: &VerifyingKey) -> Vec<Contract
 }
 
 #[cfg(test)]
-/// Source text with `//` and (nested) `/* */` comments removed, outside string
-/// and quote-char literals, so commented-out code cannot satisfy a wiring pin.
-/// Newlines inside block comments are kept so line structure survives.
+/// Source text with `//` and (nested) `/* */` comments removed, outside string,
+/// raw-string and quote-char literals, so commented-out code cannot satisfy a
+/// wiring pin. Newlines inside block comments are kept so line structure
+/// survives.
 pub(crate) fn strip_comments(src: &str) -> String {
+    let out = src
+        .bytes()
+        .zip(lex(src))
+        .filter(|&(c, kind)| kind != Lexeme::Comment || c == b'\n')
+        .map(|(c, _)| c)
+        .collect();
+    String::from_utf8(out).expect("only ASCII-delimited ranges are removed")
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Lexeme {
+    Code,
+    Literal,
+    Comment,
+}
+
+/// What each byte of `src` is part of, for the source-scan pins: code, a
+/// string / raw-string / quote-char literal, or a comment. A comment's
+/// trailing newline counts as code.
+#[cfg(test)]
+pub(crate) fn lex(src: &str) -> Vec<Lexeme> {
     let b = src.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
+    let mut kinds = vec![Lexeme::Code; b.len()];
     let mut i = 0;
-    let mut in_str = false;
-    let mut depth = 0usize;
     while i < b.len() {
         let rest = &b[i..];
-        if depth > 0 {
-            if rest.starts_with(b"*/") {
-                depth -= 1;
-                i += 2;
-            } else if rest.starts_with(b"/*") {
-                depth += 1;
-                i += 2;
-            } else {
-                if b[i] == b'\n' {
-                    out.push(b'\n');
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if in_str {
-            out.push(b[i]);
-            if b[i] == b'\\' && i + 1 < b.len() {
-                out.push(b[i + 1]);
-                i += 2;
-                continue;
-            }
-            if b[i] == b'"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        if rest.starts_with(b"//") {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if rest.starts_with(b"/*") {
-            depth = 1;
-            i += 2;
-            continue;
-        }
-        if let Some(lit) = [&b"'\"'"[..], &b"'\\\"'"[..]]
+        let (kind, len) = if rest.starts_with(b"//") {
+            let len = rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len());
+            (Lexeme::Comment, len)
+        } else if rest.starts_with(b"/*") {
+            (Lexeme::Comment, block_comment_len(rest))
+        } else if let Some(lit) = [&b"'\"'"[..], &b"'\\\"'"[..]]
             .into_iter()
             .find(|lit| rest.starts_with(lit))
         {
-            out.extend_from_slice(lit);
-            i += lit.len();
-            continue;
-        }
-        if b[i] == b'"' {
-            in_str = true;
-        }
-        out.push(b[i]);
-        i += 1;
+            (Lexeme::Literal, lit.len())
+        } else if let Some(len) = raw_string_len(b, i) {
+            (Lexeme::Literal, len)
+        } else if b[i] == b'"' {
+            (Lexeme::Literal, string_len(rest))
+        } else {
+            (Lexeme::Code, 1)
+        };
+        kinds[i..i + len].fill(kind);
+        i += len;
     }
-    String::from_utf8(out).expect("only ASCII-delimited ranges are removed")
+    kinds
+}
+
+/// Length of the (nested) block comment `rest` starts with, or all of `rest`
+/// if it never closes.
+#[cfg(test)]
+fn block_comment_len(rest: &[u8]) -> usize {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i..].starts_with(b"/*") {
+            depth += 1;
+            i += 2;
+        } else if rest[i..].starts_with(b"*/") {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return i;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    rest.len()
+}
+
+/// Length of the `"`-delimited string `rest` starts with, escapes included.
+#[cfg(test)]
+fn string_len(rest: &[u8]) -> usize {
+    let mut i = 1;
+    while i < rest.len() {
+        match rest[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    rest.len()
+}
+
+/// Length of the raw string (`r"…"`, `r#"…"#`, with an optional `b` or `c`
+/// prefix) starting at `b[i]`, if one does. Escapes mean nothing inside a raw
+/// string, so treating `r"\"` as a normal string would leave the scanner
+/// believing a string is still open (freenet/river#716).
+#[cfg(test)]
+fn raw_string_len(b: &[u8], i: usize) -> Option<usize> {
+    if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') {
+        return None;
+    }
+    let rest = &b[i..];
+    let prefix = if rest.starts_with(b"r") {
+        1
+    } else if rest.starts_with(b"br") || rest.starts_with(b"cr") {
+        2
+    } else {
+        return None;
+    };
+    let hashes = rest[prefix..].iter().take_while(|&&c| c == b'#').count();
+    if rest.get(prefix + hashes) != Some(&b'"') {
+        return None;
+    }
+    let body = prefix + hashes + 1;
+    let close: Vec<u8> = std::iter::once(b'"')
+        .chain(std::iter::repeat_n(b'#', hashes))
+        .collect();
+    Some(
+        rest[body..]
+            .windows(close.len())
+            .position(|w| w == close.as_slice())
+            .map_or(rest.len(), |p| body + p + close.len()),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    /// freenet/river#716: a raw string ending in a backslash used to leave the
+    /// scanner inside a string, so a later `"/*"` literal opened a phantom
+    /// block comment that hid real code from the pins.
+    #[test]
+    fn strip_comments_keeps_code_after_raw_strings() {
+        let src = r##"let _ = seal_for_room(is_private, room_secret_ref, Vec::new());
+let _a = r"\";
+let _b = "/*";
+let s = Some(SealedBytes::public(new_name.clone().into_bytes()));
+let _c = "*/";
+let h = r#"quote " and // and /* inside"#; a();
+let bs = br"\"; b(); // c();
+let cs = cr#"\"#; d();
+let r#type = 1; let bar = "x"; e(); // f();
+let esc = "\"/*"; k(); // m();
+let id = ar"\"; // n();
+";
+/* g(); */ h();"##;
+        let out = strip_comments(src);
+        for kept in [
+            "SealedBytes::public(new_name",
+            r##"r#"quote " and // and /* inside"#"##,
+            "a();",
+            "b();",
+            "d();",
+            "e();",
+            "h();",
+            "k();",
+            // `ar"` is not a raw string, so `n();` is still inside the string.
+            "n();",
+        ] {
+            assert!(out.contains(kept), "`{kept}` must survive: {out}");
+        }
+        for dropped in ["c();", "f();", "g();", "m();"] {
+            assert!(
+                !out.contains(dropped),
+                "`{dropped}` must be stripped: {out}"
+            );
+        }
+        assert_eq!(out.lines().count(), src.lines().count());
+    }
 
     fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
