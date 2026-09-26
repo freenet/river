@@ -4,6 +4,8 @@ pub mod confusable;
 pub mod display_name;
 pub mod ecies;
 pub mod signal_guard;
+#[cfg(test)]
+pub(crate) mod source_scan;
 
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
@@ -645,18 +647,8 @@ mod tests {
     /// them individually would not have stopped the eighth.
     #[test]
     fn event_handlers_never_write_a_global_signal_without_defer() {
-        use std::path::{Path, PathBuf};
-
-        fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("readable source dir") {
-                let path = entry.expect("readable dir entry").path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
+        use crate::util::source_scan::rust_files;
+        use std::path::Path;
 
         /// `IDENT.write(` / `IDENT.with_mut(` where IDENT is SCREAMING_CASE,
         /// i.e. a `GlobalSignal`. Local `use_signal` handles are lowercase and
@@ -688,8 +680,7 @@ mod tests {
         }
 
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rust_files(&src, &mut files);
+        let files = rust_files(&src);
         assert!(files.len() > 20, "source walk found suspiciously few files");
 
         let mut offenders: Vec<String> = Vec::new();

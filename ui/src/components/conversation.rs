@@ -3859,6 +3859,7 @@ pub fn Conversation() -> Element {
                                             // target stays clear of the hamburger (#402).
                                             class: "flex items-center gap-2 px-3 py-1.5 md:-ml-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0",
                                             title: "Room details",
+                                            "data-testid": "room-title-button",
                                             onclick: move |_| {
                                                 crate::util::defer(move || {
                                                     if let Some(current_room) = CURRENT_ROOM.read().owner_key {
@@ -3952,6 +3953,7 @@ pub fn Conversation() -> Element {
                                 }
                                 // Mobile: button to open members panel
                                 button {
+                                    "data-testid": "header-members-button",
                                     class: "md:hidden p-2 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors flex-shrink-0",
                                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Members),
                                     Icon { icon: FaUsers, width: 18, height: 18 }
@@ -5152,6 +5154,7 @@ fn MessageGroupComponent(
                                                 // bubble's width and its intrinsic size cannot reflow
                                                 // the parent (fixes #206 and #207).
                                                 div {
+                                                    "data-testid": "message-bubble",
                                                     class: format!(
                                                         "flex flex-col text-sm overflow-hidden {} {} {}",
                                                         if is_self {
@@ -5635,6 +5638,7 @@ fn MessageGroupComponent(
                                                     rsx! {
                                                         span {
                                                             key: "{emoji}",
+                                                            "data-testid": "reaction-chip",
                                                             class: format!(
                                                                 "inline-flex items-center gap-0.5 text-base transition-transform {}",
                                                                 if is_user_reaction {
@@ -5676,6 +5680,7 @@ fn MessageGroupComponent(
                                                     }
                                                 }
                                                 button {
+                                                    "data-testid": "add-reaction-button",
                                                     class: format!(
                                                         "add-reaction-btn inline-flex items-center justify-center text-xl leading-none hover:scale-110 {}",
                                                         if has_reactions || is_inline_picker_open { "has-reactions" } else { "" }
@@ -5706,6 +5711,7 @@ fn MessageGroupComponent(
                                                 // Emoji picker for inline button (flips based on viewport position)
                                                 if is_inline_picker_open {
                                                     div {
+                                                        "data-testid": "emoji-picker",
                                                         class: format!(
                                                             "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
                                                             if *picker_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },

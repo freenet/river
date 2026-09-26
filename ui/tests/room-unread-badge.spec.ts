@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Regression test for: unread message counts were surfaced in the document
 // <title> and the DM rail, but rooms in the Rooms list had no unread
@@ -8,12 +9,7 @@ import { test, expect, Page } from "@playwright/test";
 //
 // Requested by Ian Clarke, 2026-05-20.
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
-test.describe("Rooms list unread badge", () => {
+test.describe("Rooms list unread badge", { tag: "@chromium-only" }, () => {
   // Force a desktop viewport so the room rail is visible on the mobile
   // Playwright projects too.
   test.use({ viewport: { width: 1280, height: 800 } });
@@ -87,7 +83,7 @@ test.describe("Rooms list unread badge", () => {
   });
 });
 
-test.describe("Muted rooms and the cross-surface totals", () => {
+test.describe("Muted rooms and the cross-surface totals", { tag: "@chromium-only" }, () => {
   // The hamburger badge is `md:hidden`, so this needs a mobile viewport.
   test.use({ viewport: { width: 390, height: 844 } });
 

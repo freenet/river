@@ -1,4 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
+import { callRiverTest } from "./river-test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Regression tests for freenet/river#486: new messages arrived and the view
 // did not follow them.
@@ -38,33 +40,13 @@ import { test, expect, Page } from "@playwright/test";
 // delivering INBOUND messages. Sending through the composer would prove
 // nothing: that path raises `force_scroll`, deliberately bypassing the pin.
 
+// Rendered history rows: display items plus date separators.
+const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
+
 /// Matches BOTTOM_THRESHOLD_PX in ui/src/components/conversation.rs.
 const BOTTOM_THRESHOLD_PX = 100;
 /// Slack for fractional layout after a scroll that did land at the bottom.
 const AT_BOTTOM_EPSILON_PX = 4;
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-  await page.waitForFunction(() => (window as any).__riverTest !== undefined, {
-    timeout: 30_000,
-  });
-}
-
-async function selectRoom(page: Page, roomName: string) {
-  await page.getByRole("button", { name: roomName }).click();
-  await expect(page.getByRole("heading", { name: roomName })).toBeVisible({
-    timeout: 5_000,
-  });
-  // The mobile projects keep their touch/UA emulation but run at the desktop
-  // viewport these describes set, so the chat panel is always the visible one.
-  // Asserted rather than assumed: if it were hidden, every geometry read below
-  // would return 0 and the failures would point at scrolling rather than at
-  // layout.
-  await expect(page.locator("#chat-scroll-container")).toBeVisible({
-    timeout: 5_000,
-  });
-}
 
 /// scrollHeight - scrollTop - clientHeight: how far the end of the history is
 /// below the visible area. 0 means the newest message is fully in view.
@@ -116,19 +98,10 @@ async function expectSettledAtBottom(page: Page, why: string) {
 /// passes whether or not the bug is present, and `retries: 2` would keep that
 /// invisible.
 async function deliver(page: Page, text: string) {
-  await page.evaluate((t) => (window as any).__riverTest.appendMessage(t), text);
+  await callRiverTest(page, "appendMessage", text);
   await expect(page.getByText(text, { exact: false }).last()).toBeVisible({
     timeout: 5_000,
   });
-}
-
-/// Deliver an inbound message one position from the end of the history: it
-/// grows the content WITHOUT remounting the last row.
-async function insertBeforeLast(page: Page, text: string) {
-  await page.evaluate(
-    (t) => (window as any).__riverTest.insertMessageBeforeLast(t),
-    text
-  );
 }
 
 /// Open a room and wait until the history has settled at its newest message.
@@ -140,6 +113,9 @@ async function openRoomAtBottom(page: Page, roomName: string, path = "/") {
   await page.goto(path);
   await waitForApp(page);
   await selectRoom(page, roomName);
+  // Mobile projects run at the desktop viewport, so the chat panel is visible;
+  // asserted since a hidden panel would make every geometry read below return 0.
+  await expect(page.locator("#chat-scroll-container")).toBeVisible({ timeout: 5_000 });
   await expectSettledAtBottom(page, "opening a room should land on its newest message");
 }
 
@@ -279,13 +255,13 @@ test.describe("Conversation follows new messages (#486)", () => {
     // single message whose key (its first message's id) cannot change when
     // something is inserted before it. `insertMessageBeforeLast` also signs
     // with its own key, so it can never merge into that group.
-    await page.evaluate(() => {
-      const rows = document.querySelectorAll("#chat-scroll-container .space-y-4 > *");
-      (rows[rows.length - 1] as any).__riverProbe = "last-row";
+    await page.locator(HISTORY_ROWS).last().evaluate((row) => {
+      (row as any).__riverProbe = "last-row";
     });
 
-    await insertBeforeLast(
+    await callRiverTest(
       page,
+      "insertMessageBeforeLast",
       "inserted above the last row: " + "x".repeat(400)
     );
 
@@ -294,10 +270,10 @@ test.describe("Conversation follows new messages (#486)", () => {
       "content grew above the last row and the view did not follow it"
     );
 
-    const lastRowSurvived = await page.evaluate(() => {
-      const rows = document.querySelectorAll("#chat-scroll-container .space-y-4 > *");
-      return (rows[rows.length - 1] as any).__riverProbe === "last-row";
-    });
+    const lastRowSurvived = await page
+      .locator(HISTORY_ROWS)
+      .last()
+      .evaluate((row) => (row as any).__riverProbe === "last-row");
     expect(
       lastRowSurvived,
       "the last row remounted, so this exercised the old trigger rather than " +
@@ -464,14 +440,10 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   const CAPPED_ROOM = "Capped History Room";
   const DEEP_ROOM_PATH = "/?deep-history-room=1";
 
-  /// Rendered history rows: display items plus date separators. A windowed
-  /// tail is ~60 items + a separator or two; the whole fixture is ~92 items.
+  /// A windowed tail is ~60 items + a separator or two; the whole fixture is
+  /// ~92 items.
   function renderedRowCount(page: Page): Promise<number> {
-    return page.evaluate(
-      () =>
-        document.querySelectorAll("#chat-scroll-container .space-y-4 > *")
-          .length
-    );
+    return page.locator(HISTORY_ROWS).count();
   }
 
   /// The premise all three tests stand on: the windowed render path is
@@ -504,10 +476,10 @@ test.describe("Windowed history follows arrivals (#501)", () => {
   /// watches their message jump away while every offset reads steady. The
   /// probed row's rect is what catches that.
   async function tagVisibleRow(page: Page, flag: string): Promise<number | null> {
-    return page.evaluate((f) => {
+    return page.evaluate(([f, rowsSelector]) => {
       const container = document.getElementById("chat-scroll-container")!;
       const cRect = container.getBoundingClientRect();
-      const rows = container.querySelectorAll(".space-y-4 > *");
+      const rows = container.querySelectorAll(rowsSelector);
       for (const row of rows) {
         const r = row.getBoundingClientRect();
         if (r.top >= cRect.top && r.bottom <= cRect.bottom) {
@@ -516,23 +488,21 @@ test.describe("Windowed history follows arrivals (#501)", () => {
         }
       }
       return null;
-    }, flag);
+    }, [flag, HISTORY_ROWS]);
   }
 
   /// The tagged row's current viewport-relative top, or null if it left the
   /// DOM (i.e. the window slid out from under it).
   async function taggedRowTop(page: Page, flag: string): Promise<number | null> {
-    return page.evaluate((f) => {
-      const rows = document.querySelectorAll(
-        "#chat-scroll-container .space-y-4 > *"
-      );
+    return page.evaluate(([f, rowsSelector]) => {
+      const rows = document.querySelectorAll(rowsSelector);
       for (const row of rows) {
         if ((row as any)[f]) {
           return row.getBoundingClientRect().top;
         }
       }
       return null;
-    }, flag);
+    }, [flag, HISTORY_ROWS]);
   }
 
   test("keeps following a burst of arrivals in a windowed room", async ({
@@ -545,7 +515,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // each arrival slid the window, the shifted scrollTop read as reader
     // movement, and the view never followed again. The loop is what catches a
     // fix that survives one arrival and then latches. Delivered arrivals
-    // alternate authors (see `test_author` in example_data.rs), so each one
+    // alternate authors (see `test_author` in test_hooks.rs), so each one
     // is its own display item and the loop interleaves window GROWTH with the
     // settle-at-bottom TRIM — six arrivals folding into one group would
     // exercise the windowing arithmetic zero times.
@@ -714,7 +684,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     ).not.toBeNull();
 
     const beforeBatch = await renderedRowCount(page);
-    await page.evaluate(() => (window as any).__riverTest.appendMessages(61));
+    await callRiverTest(page, "appendMessages", 61);
     // The batch landed and the SURVIVING remainder of the old window is still
     // rendered (the arrivals alone add 61 rows; losing the survivors would
     // shrink the count back toward the window size).
@@ -757,7 +727,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     const probeTop = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       c.scrollTop = 0;
-      const row = c.querySelector(".space-y-4 > [data-item-key]") as HTMLElement;
+      const row = c.querySelector('[data-testid="conversation-history"] > [data-item-key]') as HTMLElement;
       (row as any).__riverPagingProbe = true;
       return row.getBoundingClientRect().top;
     });
@@ -826,7 +796,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     const beforeBatch = await renderedRowCount(page);
     // One batched delivery of more than a whole growth step, in a single
     // state mutation — as a network delta carrying many messages does.
-    await page.evaluate(() => (window as any).__riverTest.appendMessages(61));
+    await callRiverTest(page, "appendMessages", 61);
     await expect
       .poll(() => renderedRowCount(page), {
         timeout: 5_000,

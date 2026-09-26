@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp, memberRows, selectRoom } from "./example-room";
 
 // Render coverage for freenet/river#489: the ⚠ impersonation warning.
 //
@@ -32,23 +33,18 @@ const CONVERSATION_WARNING = '[data-testid="message-author-impersonation-warning
 // so these address the badge directly rather than filtering rows by glyph. A
 // glyph filter would also match a nickname that merely CONTAINS the character,
 // which is the kind of thing this feature exists to be careful about.
-const MEMBER_ROW = 'button[title^="Member ID"]';
 const LIST_WARNING = '[data-testid="member-list-impersonation-warning"]';
 const LIST_DEPUTY = '[data-testid="member-list-deputy"]';
 const rowsWithWarning = (page: Page) =>
-  page.locator(MEMBER_ROW).filter({ has: page.locator(LIST_WARNING) });
+  memberRows(page).filter({ has: page.locator(LIST_WARNING) });
 const rowsWithShield = (page: Page) =>
-  page.locator(MEMBER_ROW).filter({ has: page.locator(LIST_DEPUTY) });
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-}
+  memberRows(page).filter({ has: page.locator(LIST_DEPUTY) });
 
 async function openTeamChat(page: Page) {
   await page.goto("/");
   await waitForApp(page);
-  await page.getByText("Team Chat Room").first().click();
-  await page.locator(MEMBER_ROW).first().waitFor({ state: "visible", timeout: 15_000 });
+  await selectRoom(page, "Team Chat Room");
+  await memberRows(page).first().waitFor({ state: "visible", timeout: 15_000 });
   // Wait for the badge itself, not merely for the list to have rows.
   //
   // The member list paints before the impersonation sweep has produced a
@@ -59,7 +55,7 @@ async function openTeamChat(page: Page) {
   await page.locator(LIST_WARNING).first().waitFor({ state: "visible", timeout: 15_000 });
 }
 
-test.describe("Impersonation warning (#489)", () => {
+test.describe("Impersonation warning (#489)", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("the impostor's row carries ⚠ and the deputy's does not", async ({ page }) => {
@@ -89,12 +85,7 @@ test.describe("Impersonation warning (#489)", () => {
     // worse than shipping nothing. Do not generalise this assertion to "a
     // deputy is never warned".
     await expect(rowsWithShield(page)).toHaveCount(1);
-    await expect(
-      page
-        .locator(MEMBER_ROW)
-        .filter({ has: page.locator(LIST_DEPUTY) })
-        .filter({ has: page.locator(LIST_WARNING) }),
-    ).toHaveCount(0);
+    await expect(rowsWithShield(page).filter({ has: page.locator(LIST_WARNING) })).toHaveCount(0);
   });
 
   test("the impostor's message author line carries ⚠", async ({ page }) => {
@@ -169,28 +160,13 @@ test.describe("Impersonation warning survives a narrow viewport (#489)", () => {
   test.use({ viewport: { width: 320, height: 568 } });
 
   /// Open Team Chat's member list at 320px.
-  ///
-  /// At 320px no room is selected yet and the room-list panel is hidden, so
-  /// the room cannot be clicked at all. `responsive-layout.spec.ts` hit the
-  /// same wall and solved it by selecting at desktop width and resizing back;
-  /// the LAYOUT under test is still the 320px one, which is what matters here.
   async function openTeamChatAtNarrowWidth(page: Page) {
     await page.goto("/");
     await waitForApp(page);
-
-    const roomBtn = page.getByRole("button", { name: "Team Chat Room" });
-    const vp = page.viewportSize();
-    await page.setViewportSize({ width: 1280, height: vp?.height ?? 568 });
-    await expect(roomBtn).toBeVisible({ timeout: 15_000 });
-    await roomBtn.click();
-    await expect(page.getByRole("heading", { name: "Team Chat Room" })).toBeVisible({
-      timeout: 15_000,
-    });
-    await page.setViewportSize({ width: 320, height: vp?.height ?? 568 });
+    await selectRoom(page, "Team Chat Room");
 
     // Now switch to the members panel, which is a separate view at this width.
-    const header = page.locator(".border-b.border-border.bg-panel");
-    await header.locator("button").last().click();
+    await page.getByTestId("header-members-button").click();
     await expect(page.locator("aside").filter({ hasText: "Active Members" })).toBeVisible({
       timeout: 15_000,
     });

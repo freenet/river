@@ -1,4 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
+import { openMemberInfoForFirstNonSelf } from "./invite-picker";
 
 // Regression test: quoted text (`> …` Markdown) inside a message bubble must
 // stay legible, and must not invert against the bubble it sits in.
@@ -195,13 +197,11 @@ async function sampleQuote(page: Page, surface: Surface): Promise<Sample> {
 
 async function openRoomWithMessages(page: Page) {
   await page.goto("/");
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
+  await waitForApp(page);
 
   // "Your Private Room" is the example-data room the local user owns, so it
   // carries both self-authored (bg-accent) and received (bg-surface) bubbles.
-  const roomBtn = page.getByRole("button", { name: "Your Private Room" });
-  await expect(roomBtn).toBeVisible({ timeout: 15_000 });
-  await roomBtn.click();
+  await selectRoom(page, "Your Private Room");
   await expect(
     page.locator('[data-testid="conversation-history"] .prose')
   ).not.toHaveCount(0, { timeout: 15_000 });
@@ -215,27 +215,9 @@ async function openRoomWithMessages(page: Page) {
  */
 async function openDmThread(page: Page) {
   await page.goto("/");
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await page.getByText("Team Chat Room").first().click();
-
-  const members = page.locator('button[title^="Member ID"]');
-  await members.first().waitFor({ state: "visible", timeout: 15_000 });
-
-  // Member names are randomised per load and the local user's "(You)" row can
-  // appear anywhere, so pick the first row that is not us.
-  const count = await members.count();
-  let opened = false;
-  for (let i = 0; i < count; i++) {
-    const text = (await members.nth(i).textContent()) ?? "";
-    if (!/\(You\)/i.test(text)) {
-      await members.nth(i).click();
-      opened = true;
-      break;
-    }
-  }
-  expect(opened, "example data should list at least one other member").toBe(true);
-
-  await page.locator('button[aria-label="Send direct message"]').first().click();
+  await waitForApp(page);
+  await openMemberInfoForFirstNonSelf(page);
+  await page.getByTestId("member-info-dm-button").click();
   await page.waitForSelector("#dm-scroll-container", { timeout: 15_000 });
 
   const composer = page.getByPlaceholder("Type a direct message...");

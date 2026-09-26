@@ -2050,7 +2050,7 @@ mod tests {
     #[test]
     fn rail_builders_read_infallible_guard_before_first_fallible_read() {
         let src = include_str!("dm_rail_section.rs");
-        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let body = crate::util::source_scan::production_only(src);
         let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
 
         // (builder head, next-function head bounding the segment,
@@ -2118,7 +2118,7 @@ mod tests {
     #[test]
     fn rail_last_good_caches_have_clean_pass_write_discipline() {
         let src = include_str!("dm_rail_section.rs");
-        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let body = crate::util::source_scan::production_only(src);
         let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
 
         let view_start = stripped

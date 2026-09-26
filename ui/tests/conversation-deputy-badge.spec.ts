@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Render coverage for the two halves of the deputy-badge change:
 //
@@ -29,21 +30,17 @@ const AUTHOR_NAME = '#chat-scroll-container span[title^="Member ID"]';
 // rendered author NAME.
 const BADGE_GLYPHS = ["🛡", "👑", "⭐", "🔑", "🎪"];
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-}
-
 async function openTeamChat(page: Page) {
   await page.goto("/");
   await waitForApp(page);
-  await page.getByText("Team Chat Room").first().click();
+  await selectRoom(page, "Team Chat Room");
   // Author lines only render for OTHER people's messages, and the deputy is
   // guaranteed to have posted one, so waiting for the badge also guarantees
   // the conversation has finished rendering.
   await page.locator(BADGE).first().waitFor({ state: "visible", timeout: 15_000 });
 }
 
-test.describe("Deputy badge on message authors", () => {
+test.describe("Deputy badge on message authors", { tag: "@chromium-only" }, () => {
   // Fixed desktop viewport so the conversation pane is always in view
   // (mirrors member-info-deputy-tag.spec.ts).
   test.use({ viewport: { width: 1280, height: 800 } });

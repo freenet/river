@@ -1,4 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp } from "./example-room";
+import { callRiverTest, RoomsLoadState } from "./river-test";
 
 // Regression coverage for freenet/river#509.
 //
@@ -15,17 +17,10 @@ import { test, expect, Page } from "@playwright/test";
 //
 // The example build always seeds rooms, so these states are unreachable without
 // a hook: `__riverTest.setRoomsLoadState(state)` clears ROOMS and sets
-// ROOMS_LOAD_STATE (example_data.rs, gated on example-data + no-sync).
+// ROOMS_LOAD_STATE (test_hooks.rs, gated on example-data + no-sync).
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
-async function setLoadState(page: Page, state: string) {
-  await page.evaluate((s) => {
-    (window as any).__riverTest.setRoomsLoadState(s);
-  }, state);
+async function setLoadState(page: Page, state: RoomsLoadState) {
+  await callRiverTest(page, "setRoomsLoadState", state);
 }
 
 const WELCOME = "Welcome to River";
@@ -37,7 +32,7 @@ for (const { label, viewport, isMobile } of [
   // fix is viewport-independent and so is this coverage.
   { label: "desktop", viewport: { width: 1280, height: 800 }, isMobile: false },
 ]) {
-  test.describe(`Rooms load state on the no-room screen (${label})`, () => {
+  test.describe(`Rooms load state on the no-room screen (${label})`, { tag: "@chromium-only" }, () => {
     test.use({ viewport });
 
     test("a loading account is told its rooms are loading, not that it has none", async ({

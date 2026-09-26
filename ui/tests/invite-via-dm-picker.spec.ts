@@ -1,4 +1,11 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, Locator, Page } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
+import {
+  nonSelfMemberRows,
+  openMemberInfoForFirstNonSelf,
+  openShareInvitePicker,
+  pickerHeading,
+} from "./invite-picker";
 
 // Smoke test for the redesigned invite-via-DM picker (PR for #252 v2,
 // structured-Invite variant).
@@ -20,91 +27,25 @@ import { test, expect, Page } from "@playwright/test";
 // personal-message textarea, and the Send button being enabled only
 // after a room is selected.
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-}
+// Open the picker for `row`'s member and return the nickname in its title
+// ("Invite <name> to another room").
+async function openPickerAndReadTitle(page: Page, row: Locator): Promise<string> {
+  await row.click();
+  await openShareInvitePicker(page);
 
-async function openMemberInfo(page: Page) {
-  // Select a room that lists the local user as a Member, so the
-  // member-info modal's "Share an invite via DM" option appears.
-  // Example-data's "Team Chat Room" matches.
-  await page.getByText("Team Chat Room").first().click();
-
-  // The member list is rendered after the room hydrates; wait for at
-  // least one member row to appear before iterating (otherwise the
-  // iterator races the first paint and we get count=0 → skip).
-  await page
-    .locator('button[title^="Member ID"]')
-    .first()
-    .waitFor({ state: "visible", timeout: 5_000 })
-    .catch(() => undefined);
-
-  // Member rows are buttons with `title="Member ID: …"`
-  // (members.rs:341). Example-data populates them with random names each
-  // app load, so we can't rely on a fixed index for anyone but the local
-  // user — who is pinned to index 0 since freenet/river#584, though this
-  // helper deliberately does not depend on that. Pick the first row that
-  // isn't the local user (see `isSelfRowText`).
-  const memberButtons = page.locator('button[title^="Member ID"]');
-  const count = await memberButtons.count();
-  for (let i = 0; i < count; i++) {
-    const text = (await memberButtons.nth(i).textContent()) || "";
-    if (!isSelfRowText(text)) {
-      await memberButtons.nth(i).click();
-      return true;
-    }
-  }
-  return false;
-}
-
-// Open the member-info modal for the member row at `memberIndex`, click
-// "Share an invite via DM", and return the nickname rendered in the
-// picker title ("Invite <name> to another room"). Returns null if the
-// Share-invite entry point isn't available (observer-only example data).
-async function openPickerAndReadTitle(
-  page: Page,
-  memberIndex: number,
-): Promise<string | null> {
-  await page.locator('button[title^="Member ID"]').nth(memberIndex).click();
-
-  const shareInvite = page
-    .getByRole("button", { name: /share an invite/i })
-    .first();
-  await shareInvite
-    .waitFor({ state: "visible", timeout: 5_000 })
-    .catch(() => undefined);
-  if (!(await shareInvite.isVisible().catch(() => false))) {
-    return null;
-  }
-  await shareInvite.click();
-
-  const header = page.getByRole("heading", {
-    name: /invite .+ to another room/i,
-  });
-  await expect(header).toBeVisible({ timeout: 5_000 });
-
-  const headingText = ((await header.textContent()) || "").trim();
+  const headingText = ((await pickerHeading(page).textContent()) || "").trim();
   const match = headingText.match(/^Invite (.+) to another room$/);
-  return match ? match[1] : null;
+  expect(match, `picker header didn't match the expected format: "${headingText}"`).not.toBeNull();
+  return match![1];
 }
 
 // Dismiss the picker, then the member-info modal behind it, leaving the
 // member list interactable again.
 async function closePickerAndMemberInfo(page: Page) {
   await page.getByRole("button", { name: /close picker/i }).click();
-  await expect(
-    page.getByRole("heading", { name: /invite .+ to another room/i }),
-  ).toHaveCount(0);
+  await expect(pickerHeading(page)).toHaveCount(0);
 
-  // Dismiss the member-info modal by clicking its backdrop. Target the
-  // backdrop element explicitly (not a screen coordinate) and click a
-  // corner, clear of the centered modal card. The picker's own backdrop
-  // is already gone (asserted above), so the only `bg-black/50` overlay
-  // left is the member-info modal's.
-  await page
-    .locator('div[class*="bg-black/50"]')
-    .last()
-    .click({ position: { x: 5, y: 5 } });
+  await page.getByTestId("member-info-close-button").click();
   await expect(
     page.getByRole("heading", { name: /^Member Info$/ }),
   ).toHaveCount(0);
@@ -125,35 +66,6 @@ async function readCandidateRoomNames(page: Page): Promise<string[]> {
   return names;
 }
 
-// Whether a member row's display text marks it as the local user.
-// `member_display_parts` (members.rs) gives every self row — and only
-// the self row — a ⭐ badge, regardless of whether the user is the
-// room's owner or a plain member, so the ⭐ is the reliable universal
-// marker. (The self nickname suffix varies: "(You)" in member-rooms,
-// "(Owner)" in owner-rooms — so it is not usable on its own.)
-function isSelfRowText(text: string): boolean {
-  return text.includes("⭐");
-}
-
-// All member rows that are not the local user, with their list index.
-async function nonSelfMemberRows(
-  page: Page,
-): Promise<{ index: number; text: string }[]> {
-  await page
-    .locator('button[title^="Member ID"]')
-    .first()
-    .waitFor({ state: "visible", timeout: 5_000 })
-    .catch(() => undefined);
-  const memberButtons = page.locator('button[title^="Member ID"]');
-  const count = await memberButtons.count();
-  const rows: { index: number; text: string }[] = [];
-  for (let i = 0; i < count; i++) {
-    const text = ((await memberButtons.nth(i).textContent()) || "").trim();
-    if (text && !isSelfRowText(text)) rows.push({ index: i, text });
-  }
-  return rows;
-}
-
 test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -163,41 +75,8 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    const opened = await openMemberInfo(page);
-    if (!opened) {
-      test.skip(true, "example-data has no non-self/owner member to open");
-      return;
-    }
-
-    // The member-info modal contains a "Share an invite via DM…" entry
-    // (the exact label was added in #260; keep the substring match
-    // resilient to minor wording tweaks).
-    const shareInvite = page
-      .getByRole("button", { name: /share an invite/i })
-      .first();
-    // The member-info modal renders asynchronously after the member-
-    // row click; wait briefly for the Share button to materialise
-    // before deciding whether to skip.
-    await shareInvite
-      .waitFor({ state: "visible", timeout: 5_000 })
-      .catch(() => undefined);
-
-    // Skip the test cleanly if example data places the local user in
-    // fewer than 2 rooms — the picker requires at least one other room
-    // to be a viable invite target.
-    if (!(await shareInvite.isVisible().catch(() => false))) {
-      test.skip(true, "no 'Share an invite via DM' entry point — example data may be observer-only");
-      return;
-    }
-
-    await shareInvite.click();
-
-    // Picker header should appear. Title format: "Invite <nickname> to
-    // another room".
-    const header = page.getByRole("heading", {
-      name: /invite .+ to another room/i,
-    });
-    await expect(header).toBeVisible({ timeout: 5_000 });
+    await openMemberInfoForFirstNonSelf(page);
+    await openShareInvitePicker(page);
 
     // Personal-message textarea is present.
     const textarea = page.locator("textarea").first();
@@ -228,35 +107,15 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    const opened = await openMemberInfo(page);
-    if (!opened) {
-      test.skip(true, "example-data has no non-self/owner member to open");
-      return;
-    }
+    await openMemberInfoForFirstNonSelf(page);
+    await openShareInvitePicker(page);
 
-    const shareInvite = page
-      .getByRole("button", { name: /share an invite/i })
-      .first();
-    // The member-info modal renders asynchronously after the member-
-    // row click; wait briefly for the Share button to materialise
-    // before deciding whether to skip.
-    await shareInvite
-      .waitFor({ state: "visible", timeout: 5_000 })
-      .catch(() => undefined);
-    if (!(await shareInvite.isVisible().catch(() => false))) {
-      test.skip(true, "no 'Share an invite via DM' entry point");
-      return;
-    }
-
-    await shareInvite.click();
     const closeButton = page.getByRole("button", { name: /close picker/i });
     await expect(closeButton).toBeVisible();
     await closeButton.click();
 
     // After close the picker header is gone.
-    await expect(
-      page.getByRole("heading", { name: /invite .+ to another room/i }),
-    ).toHaveCount(0);
+    await expect(pickerHeading(page)).toHaveCount(0);
   });
 
   // Regression test for Ivvor's 2026-05-20 report: inviting several
@@ -272,45 +131,38 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    await page.getByText("Team Chat Room").first().click();
+    await selectRoom(page, "Team Chat Room");
 
     // Two different non-self member rows — each row is a distinct member.
-    const nonSelf = await nonSelfMemberRows(page);
-    if (nonSelf.length < 2) {
-      test.skip(true, "example data has fewer than two non-self members");
-      return;
-    }
-    const [memberA, memberB] = nonSelf;
+    const nonSelf = nonSelfMemberRows(page);
+    await expect(
+      nonSelf.nth(1),
+      "Team Chat Room lists at least two members other than the local user",
+    ).toBeVisible({ timeout: 5_000 });
+    const textA = ((await nonSelf.nth(0).textContent()) || "").trim();
+    const textB = ((await nonSelf.nth(1).textContent()) || "").trim();
 
     // First invite: open the picker for member A.
-    const titleA = await openPickerAndReadTitle(page, memberA.index);
-    if (titleA === null) {
-      test.skip(
-        true,
-        "no 'Share an invite via DM' entry point — observer-only example data",
-      );
-      return;
-    }
+    const titleA = await openPickerAndReadTitle(page, nonSelf.nth(0));
     await closePickerAndMemberInfo(page);
 
     // Second invite: reopen the picker for member B. Before the fix the
     // title still read member A's name here.
-    const titleB = await openPickerAndReadTitle(page, memberB.index);
-    expect(titleB).not.toBeNull();
+    const titleB = await openPickerAndReadTitle(page, nonSelf.nth(1));
 
     // The picker title is the unsealed nickname; a member row renders
     // "<nickname> <badges>", so a row text always starts with that
     // member's own title. These assertions pin each title to the member
     // it was opened for — with the bug, titleB held member A's name and
-    // `memberB.text.startsWith(titleB)` was false. (A row text can't
+    // `textB.startsWith(titleB)` was false. (A row text can't
     // start with a *different* member's nickname unless one nickname is a
     // PREFIX of another. Since #494 the fixture deliberately contains two
     // confusable names, but `confusable_variant` substitutes a character
     // rather than appending, so they are the same length and neither is a
     // prefix of the other — this still implicitly proves titleA ≠ titleB.)
     expect(titleA.length).toBeGreaterThan(0);
-    expect(memberA.text.startsWith(titleA)).toBeTruthy();
-    expect(memberB.text.startsWith(titleB!)).toBeTruthy();
+    expect(textA.startsWith(titleA)).toBeTruthy();
+    expect(textB.startsWith(titleB)).toBeTruthy();
   });
 
   // Regression test for the second half of the same fix: `candidates`
@@ -325,40 +177,36 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await waitForApp(page);
 
     // First open: picker launched from "Team Chat Room".
-    await page.getByText("Team Chat Room").first().click();
-    const rowsA = await nonSelfMemberRows(page);
-    if (rowsA.length === 0) {
-      test.skip(true, "Team Chat Room has no non-self member");
-      return;
-    }
-    const openedA = await openPickerAndReadTitle(page, rowsA[0].index);
-    if (openedA === null) {
-      test.skip(true, "no 'Share an invite via DM' entry point");
-      return;
-    }
+    await selectRoom(page, "Team Chat Room");
+    await expect(
+      nonSelfMemberRows(page).first(),
+      "Team Chat Room lists a member other than the local user",
+    ).toBeVisible({ timeout: 5_000 });
+    await openPickerAndReadTitle(page, nonSelfMemberRows(page).first());
     const candidatesFromTeamChat = await readCandidateRoomNames(page);
     await closePickerAndMemberInfo(page);
 
     // Switch the current room. Member keys are per-room, so the first
-    // member row's ID changes when the room switches — wait for that
-    // before reading the new room's member list (avoids racing the
+    // member row's data-testid changes when the room switches — wait for
+    // that before reading the new room's member list (avoids racing the
     // re-render and reading the old room's rows).
-    const firstMemberRow = page.locator('button[title^="Member ID"]').first();
-    await firstMemberRow.waitFor({ state: "visible", timeout: 5_000 });
-    const firstMemberId = await firstMemberRow.getAttribute("title");
-    expect(firstMemberId).toBeTruthy();
-    await page.getByText("Your Private Room").first().click();
-    await expect(
-      page.locator('button[title^="Member ID"]').first(),
-    ).not.toHaveAttribute("title", firstMemberId ?? "");
+    const memberItems = page
+      .getByTestId("member-list")
+      .locator('[data-testid^="member-item-"]');
+    await expect(memberItems.first()).toBeVisible({ timeout: 5_000 });
+    const firstMemberTestId = await memberItems.first().getAttribute("data-testid");
+    expect(firstMemberTestId).toBeTruthy();
+    await selectRoom(page, "Your Private Room");
+    await expect(memberItems.first()).not.toHaveAttribute(
+      "data-testid",
+      firstMemberTestId ?? "",
+    );
 
-    const rowsB = await nonSelfMemberRows(page);
-    if (rowsB.length === 0) {
-      test.skip(true, "Your Private Room has no non-self member");
-      return;
-    }
-    const openedB = await openPickerAndReadTitle(page, rowsB[0].index);
-    expect(openedB).not.toBeNull();
+    await expect(
+      nonSelfMemberRows(page).first(),
+      "Your Private Room lists a member other than the local user",
+    ).toBeVisible({ timeout: 5_000 });
+    await openPickerAndReadTitle(page, nonSelfMemberRows(page).first());
     const candidatesFromPrivateRoom = await readCandidateRoomNames(page);
 
     // The candidate list excludes the *current* room and includes every
@@ -385,19 +233,15 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    await page.getByText("Team Chat Room").first().click();
-    const nonSelf = await nonSelfMemberRows(page);
-    if (nonSelf.length < 2) {
-      test.skip(true, "example data has fewer than two non-self members");
-      return;
-    }
+    await selectRoom(page, "Team Chat Room");
+    const nonSelf = nonSelfMemberRows(page);
+    await expect(
+      nonSelf.nth(1),
+      "Team Chat Room lists at least two members other than the local user",
+    ).toBeVisible({ timeout: 5_000 });
 
     // First session: open the picker, pick a candidate room.
-    const titleA = await openPickerAndReadTitle(page, nonSelf[0].index);
-    if (titleA === null) {
-      test.skip(true, "no 'Share an invite via DM' entry point");
-      return;
-    }
+    await openPickerAndReadTitle(page, nonSelf.nth(0));
     const firstCandidate = page
       .locator('button[aria-label^="Select room"]')
       .first();
@@ -410,8 +254,7 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
 
     // Second session: reopen for a different member. No candidate row
     // should be pre-selected and Send must start disabled.
-    const titleB = await openPickerAndReadTitle(page, nonSelf[1].index);
-    expect(titleB).not.toBeNull();
+    await openPickerAndReadTitle(page, nonSelf.nth(1));
     await expect(
       page.locator('button[aria-label^="Select room"][aria-pressed="true"]'),
     ).toHaveCount(0);

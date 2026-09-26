@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Coverage for: on mobile, a room fills the whole screen, so new messages
 // arriving in OTHER rooms were invisible until the user happened to open
@@ -7,11 +8,6 @@ import { test, expect, Page } from "@playwright/test";
 // the DM rail lives behind the same button).
 //
 // Requested by The Torist, 2026-07-22.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
 
 const HAMBURGER = '[data-testid="hamburger-rooms-button"]';
 const BADGE = '[data-testid="hamburger-unread-badge"]';
@@ -32,24 +28,10 @@ const ALL_ROOMS = [
   "Team Chat Room",
 ];
 
-test.describe("Mobile hamburger unread badge", () => {
+test.describe("Mobile hamburger unread badge", { tag: "@chromium-only" }, () => {
   // Force a mobile viewport so the hamburger (md:hidden) is rendered on
   // the desktop Playwright projects too.
   test.use({ viewport: { width: 390, height: 844 } });
-
-  test("welcome screen hamburger shows total unread across rooms", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-
-    // No room selected yet → the welcome screen's hamburger. Two of the three
-    // example rooms are unread AND unmuted, so the badge must show.
-    const badge = page.locator(`${HAMBURGER} ${BADGE}`);
-    await expect(badge).toBeVisible({ timeout: 5_000 });
-    await expect(badge).toHaveText(/^\d+$/);
-    expect(Number(await badge.textContent())).toBeGreaterThan(0);
-  });
 
   test("badge counts only OTHER rooms and clears once all are read", async ({
     page,
@@ -60,6 +42,7 @@ test.describe("Mobile hamburger unread badge", () => {
     const hamburger = page.locator(HAMBURGER);
     const badge = page.locator(`${HAMBURGER} ${BADGE}`);
     await expect(badge).toBeVisible({ timeout: 5_000 });
+    await expect(badge).toHaveText(/^\d+$/);
     const initialTotal = Number(await badge.textContent());
 
     // ALL_ROOMS[0] is the MUTED room, which contributes nothing to this badge,

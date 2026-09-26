@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp, memberRows, selectRoom } from "./example-room";
 
 // Render coverage for freenet/river#451: the member-info modal legend must
 // show the 🛡 deputy chip for a member who carries the shield in the member
@@ -16,20 +17,12 @@ import { test, expect, Page } from "@playwright/test";
 
 const DEPUTY_TAG = '[data-testid="member-info-deputy-tag"]';
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-}
-
 async function openTeamChatMembers(page: Page) {
-  await page.getByText("Team Chat Room").first().click();
-  await page
-    .locator('button[title^="Member ID"]')
-    .first()
-    .waitFor({ state: "visible", timeout: 5_000 })
-    .catch(() => undefined);
+  await selectRoom(page, "Team Chat Room");
+  await expect(memberRows(page).first()).toBeVisible({ timeout: 5_000 });
 }
 
-test.describe("Member-info modal deputy shield legend (#451)", () => {
+test.describe("Member-info modal deputy shield legend (#451)", { tag: "@chromium-only" }, () => {
   // Fixed desktop viewport so the member list is always in-panel (mirrors
   // dm-thread-modal.spec.ts).
   test.use({ viewport: { width: 1280, height: 800 } });
@@ -48,9 +41,7 @@ test.describe("Member-info modal deputy shield legend (#451)", () => {
     // stripping: example_data.rs deliberately gives the OWNER the stored
     // nickname "… (Owner) 🛡👑", so if `crate::util::display_name` ever stops
     // stripping it, the owner's row matches too and this becomes 2.
-    const deputyRow = page
-      .locator('button[title^="Member ID"]')
-      .filter({ hasText: "🛡" });
+    const deputyRow = memberRows(page).filter({ hasText: "🛡" });
     await expect(deputyRow).toHaveCount(1);
 
     await deputyRow.first().click();
@@ -73,18 +64,7 @@ test.describe("Member-info modal deputy shield legend (#451)", () => {
     await openTeamChatMembers(page);
 
     // Pick a member row WITHOUT the shield (the owner or the local user).
-    const rows = page.locator('button[title^="Member ID"]');
-    const count = await rows.count();
-    let openedNonDeputy = false;
-    for (let i = 0; i < count; i++) {
-      const text = (await rows.nth(i).textContent()) || "";
-      if (!text.includes("🛡")) {
-        await rows.nth(i).click();
-        openedNonDeputy = true;
-        break;
-      }
-    }
-    expect(openedNonDeputy).toBe(true);
+    await memberRows(page).filter({ hasNotText: "🛡" }).first().click();
 
     await expect(page.getByTestId("member-info-modal")).toBeVisible({
       timeout: 5_000,

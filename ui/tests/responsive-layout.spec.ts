@@ -1,53 +1,10 @@
-import { test, expect, Page } from "@playwright/test";
-
-// Helper: wait for WASM app to fully render
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  // Wait for at least one interactive element to confirm WASM hydration
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
-// Helper: select a room at any viewport width.
-// On desktop the room list is always visible. On mobile we may need to
-// navigate to the Rooms view first (via hamburger button).
-async function selectRoom(page: Page, roomName: string) {
-  const roomBtn = page.getByRole("button", { name: roomName });
-
-  if (!(await roomBtn.isVisible({ timeout: 500 }).catch(() => false))) {
-    // Try the hamburger in the chat header (visible when a room IS selected on mobile)
-    const hamburger = page.locator(
-      ".border-b.border-border.bg-panel button >> nth=0"
-    );
-    if (await hamburger.isVisible({ timeout: 500 }).catch(() => false)) {
-      await hamburger.click();
-      await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-    } else {
-      // No room selected yet on mobile — the room list panel is hidden.
-      // Temporarily resize to desktop to select the room, then resize back.
-      const vp = page.viewportSize();
-      if (vp && vp.width < 768) {
-        await page.setViewportSize({ width: 1280, height: vp.height });
-        await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-        await roomBtn.click();
-        await expect(
-          page.getByRole("heading", { name: roomName })
-        ).toBeVisible({ timeout: 5_000 });
-        await page.setViewportSize({ width: vp.width, height: vp.height });
-        return;
-      }
-    }
-  }
-
-  await roomBtn.click();
-  await expect(
-    page.getByRole("heading", { name: roomName })
-  ).toBeVisible({ timeout: 5_000 });
-}
+import { test, expect } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 test.describe("Desktop layout (1280px)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("shows 3-column layout with room selected", async ({ page }) => {
+  test("shows 3-column layout with room selected, no horizontal scrollbar", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
@@ -61,12 +18,6 @@ test.describe("Desktop layout (1280px)", () => {
     await expect(
       page.getByRole("heading", { name: "Team Chat Room" })
     ).toBeVisible();
-  });
-
-  test("no horizontal scrollbar", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Team Chat Room");
 
     const hasHScroll = await page.evaluate(
       () =>
@@ -80,7 +31,7 @@ test.describe("Desktop layout (1280px)", () => {
 test.describe("Tablet layout (768px)", () => {
   test.use({ viewport: { width: 768, height: 1024 } });
 
-  test("shows all panels with narrower sidebars", async ({ page }) => {
+  test("shows all panels with narrower sidebars, no horizontal scrollbar", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
@@ -91,12 +42,6 @@ test.describe("Tablet layout (768px)", () => {
     await expect(
       page.locator("aside").filter({ hasText: "Active Members" })
     ).toBeVisible();
-  });
-
-  test("no horizontal scrollbar", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Team Chat Room");
 
     const hasHScroll = await page.evaluate(
       () =>
@@ -143,7 +88,7 @@ test.describe("Breakpoint boundary (767px)", () => {
 test.describe("Mobile layout (480px)", () => {
   test.use({ viewport: { width: 480, height: 844 } });
 
-  test("shows only chat panel by default", async ({ page }) => {
+  test("shows only chat panel by default, no horizontal scrollbar", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
@@ -154,6 +99,13 @@ test.describe("Mobile layout (480px)", () => {
     await expect(
       page.getByPlaceholder("Type your message...")
     ).toBeVisible();
+
+    const hasHScroll = await page.evaluate(
+      () =>
+        document.documentElement.scrollWidth >
+        document.documentElement.clientWidth
+    );
+    expect(hasHScroll).toBe(false);
   });
 
   test("hamburger opens room list, room click returns to chat", async ({
@@ -163,9 +115,7 @@ test.describe("Mobile layout (480px)", () => {
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
 
-    // Open hamburger
-    const header = page.locator(".border-b.border-border.bg-panel");
-    await header.locator("button").first().click();
+    await page.getByTestId("hamburger-rooms-button").click();
 
     // Room list should be visible
     await expect(
@@ -193,9 +143,7 @@ test.describe("Mobile layout (480px)", () => {
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
 
-    // Click members button (last button in header)
-    const header = page.locator(".border-b.border-border.bg-panel");
-    await header.locator("button").last().click();
+    await page.getByTestId("header-members-button").click();
 
     // Members panel visible
     await expect(
@@ -213,18 +161,6 @@ test.describe("Mobile layout (480px)", () => {
     ).toBeVisible();
   });
 
-  test("no horizontal scrollbar", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Team Chat Room");
-
-    const hasHScroll = await page.evaluate(
-      () =>
-        document.documentElement.scrollWidth >
-        document.documentElement.clientWidth
-    );
-    expect(hasHScroll).toBe(false);
-  });
 });
 
 test.describe("Small mobile layout (320px)", () => {
@@ -261,8 +197,7 @@ test.describe("Desktop recovery after mobile", () => {
     await selectRoom(page, "Team Chat Room");
 
     // Switch to members view on mobile
-    const header = page.locator(".border-b.border-border.bg-panel");
-    await header.locator("button").last().click();
+    await page.getByTestId("header-members-button").click();
     await expect(
       page.locator("aside").filter({ hasText: "Active Members" })
     ).toBeVisible();

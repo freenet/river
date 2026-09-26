@@ -49,6 +49,7 @@ pub fn seal_for_room(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::strip_comments;
 
     #[test]
     fn public_room_with_no_secret_returns_public_sealed() {
@@ -126,22 +127,13 @@ mod tests {
     /// why the call site avoids it) don't trip the negative assertion.
     #[test]
     fn seal_for_room_call_sites_pinned() {
-        // Strip everything after the first `//` on each line so the
-        // assertions only see actual code, not commentary about it.
-        fn strip_line_comments(src: &str) -> String {
-            src.lines()
-                .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-
-        let nickname_src = strip_line_comments(include_str!(
+        let nickname_src = strip_comments(include_str!(
             "../components/members/member_info_modal/nickname_field.rs"
         ));
         let room_name_src =
-            strip_line_comments(include_str!("../components/room_list/room_name_field.rs"));
+            strip_comments(include_str!("../components/room_list/room_name_field.rs"));
         let edit_room_src =
-            strip_line_comments(include_str!("../components/room_list/edit_room_modal.rs"));
+            strip_comments(include_str!("../components/room_list/edit_room_modal.rs"));
 
         for (name, src) in [
             ("nickname_field.rs", &nickname_src),

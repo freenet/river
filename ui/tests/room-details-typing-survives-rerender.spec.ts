@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp, selectListedRoom } from "./example-room";
 
 // Regression test for freenet/river#564: typing in the Room Details dialog was
 // wiped every few seconds by unrelated room-state updates.
@@ -25,25 +26,14 @@ import { test, expect, Page } from "@playwright/test";
 const OWNED_ROOM = "Your Private Room";
 const DRAFT = "A description I am still in the middle of typing";
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
 async function openRoomDetails(page: Page) {
   const vp = page.viewportSize();
   if (vp && vp.width < 1024) {
     await page.setViewportSize({ width: 1280, height: vp.height });
   }
+  await selectListedRoom(page, OWNED_ROOM);
 
-  // Scope to the room list: once a room is selected the header button carries
-  // the room name as its accessible name too, which would be a second match.
-  const roomBtn = page.getByTestId("room-list").getByRole("button", { name: OWNED_ROOM });
-  await expect(roomBtn).toBeVisible({ timeout: 10_000 });
-  await roomBtn.click();
-  await expect(page.getByRole("heading", { name: OWNED_ROOM })).toBeVisible({ timeout: 5_000 });
-
-  await page.getByTitle("Room details").click();
+  await page.getByTestId("room-title-button").click();
   await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
 }
 
@@ -192,7 +182,7 @@ test.describe("Room Details: in-progress typing survives room-state updates", ()
     await page.getByTestId("edit-room-close-button").click();
     await expect(page.getByTestId("edit-room-modal")).toBeHidden({ timeout: 5_000 });
 
-    await page.getByTitle("Room details").click();
+    await page.getByTestId("room-title-button").click();
     await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
     await expect(page.getByTestId("room-description-input")).toHaveValue(DRAFT, {
       timeout: 10_000,

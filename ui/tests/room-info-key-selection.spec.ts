@@ -1,4 +1,5 @@
 import { test, expect, Page, Locator } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Regression test for freenet/river#537: the Room Public Key and Contract ID
 // in the room-details panel could not be selected or copied in Firefox.
@@ -34,26 +35,10 @@ const ROOM_NAME = "Public Discussion Room";
 const WEBKIT_KEYBOARD_COPY_SKIP =
   "Playwright's WebKit does not deliver a keyboard copy to a readonly input (harness limitation, verified against a bare input outside River); mouse selection is still asserted on webkit.";
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
 async function openRoomDetails(page: Page) {
-  const vp = page.viewportSize();
-  if (vp && vp.width < 1024) {
-    await page.setViewportSize({ width: 1280, height: vp.height });
-  }
-
-  // Scope to the room list — once a room is selected the header button carries
-  // the room name as its accessible name too, which would be a second match.
-  const roomBtn = page.getByTestId("room-list").getByRole("button", { name: ROOM_NAME });
-  await expect(roomBtn).toBeVisible({ timeout: 10_000 });
-  await roomBtn.click();
-  await expect(page.getByRole("heading", { name: ROOM_NAME })).toBeVisible({ timeout: 5_000 });
-
+  await selectRoom(page, ROOM_NAME);
   // The (i) affordance in the room header opens the room-details modal.
-  await page.getByTitle("Room details").click();
+  await page.getByTestId("room-title-button").click();
   await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
 }
 
@@ -261,23 +246,7 @@ test.describe("room-details copy buttons", () => {
       other: "room-public-key-input",
     },
   ]) {
-    test(`${field.button} confirms the copy`, async ({ page }) => {
-      await page.goto("/");
-      await waitForApp(page);
-      await openRoomDetails(page);
-
-      const value = await page.getByTestId(field.input).inputValue();
-      expect(value.length).toBeGreaterThan(0);
-
-      const button = page.getByTestId(field.button);
-      await expect(button).toBeVisible();
-      await expect(button).toHaveText(/Copy/);
-
-      await button.click();
-      await expect(button).toHaveText(/Copied!/, { timeout: 2_000 });
-    });
-
-    test(`${field.button} copies THAT field's value, not another`, async ({ page }) => {
+    test(`${field.button} copies THAT field's value, not another`, { tag: "@chromium-only" }, async ({ page }) => {
       await page.goto("/");
       await waitForApp(page);
       await openRoomDetails(page);
@@ -287,16 +256,19 @@ test.describe("room-details copy buttons", () => {
       expect(mine.length).toBeGreaterThan(0);
       expect(mine).not.toBe(other);
 
+      const button = page.getByTestId(field.button);
+      await expect(button).toHaveText(/Copy/);
       await captureClipboardWrites(page);
-      await page.getByTestId(field.button).click();
+      await button.click();
+      await expect(button).toHaveText(/Copied!/, { timeout: 2_000 });
 
-      // Asserting the button says "Copied!" is NOT enough: it would say that
-      // just the same if the two buttons' values were swapped.
+      // The "Copied!" label is NOT enough on its own: it would say that just
+      // the same if the two buttons' values were swapped.
       await expect.poll(() => clipboardWrites(page), { timeout: 2_000 }).toEqual([mine]);
     });
   }
 
-  test("the copy feedback resets when the panel is closed and reopened", async ({ page }) => {
+  test("the copy feedback resets when the panel is closed and reopened", { tag: "@chromium-only" }, async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await openRoomDetails(page);
@@ -320,7 +292,7 @@ test.describe("room-details copy buttons", () => {
     await page.getByTestId("edit-room-close-button").click();
     await expect(page.getByTestId("edit-room-modal")).toHaveCount(0, { timeout: 15_000 });
 
-    const reopen = page.getByTitle("Room details");
+    const reopen = page.getByTestId("room-title-button");
     await expect(reopen).toBeVisible({ timeout: 15_000 });
     await reopen.click();
     await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 15_000 });
@@ -350,7 +322,7 @@ test.describe("room-details copy buttons", () => {
 
     // The narrow viewport is the whole point of this check: adding a button
     // beside each value is exactly what could overflow a small screen, and
-    // `openRoomDetails` widens to desktop, so the other tests never see it.
+    // this describe runs at desktop width, so the other tests never see it.
     // 320px is the smallest width responsive-layout.spec.ts covers.
     await page.setViewportSize({ width: 320, height: 800 });
     const modal = page.getByTestId("edit-room-modal");

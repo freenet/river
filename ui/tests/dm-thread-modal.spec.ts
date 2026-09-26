@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp } from "./example-room";
 
 // Smoke tests for the DM thread modal Phase 3 changes
 // (#243 structured invite-DM variant + auto-scroll):
@@ -19,10 +20,6 @@ import { test, expect, Page } from "@playwright/test";
 // `ui/src/components/direct_messages/dm_thread_modal.rs::tests` pin the
 // pure logic (decode + room-mismatch rejection); the wiring tested
 // here is the structural part Playwright can reach.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-}
 
 async function openDmThreadModal(page: Page) {
   // Click into a room that lists the local user as a Member so the

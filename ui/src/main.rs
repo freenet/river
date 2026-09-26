@@ -12,6 +12,8 @@ mod nickname;
 mod pending_invites;
 mod room_data;
 pub mod signing;
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+mod test_hooks;
 mod util;
 
 use components::app::App;

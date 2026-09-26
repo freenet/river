@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp, selectRoom, openOwnMessageEdit } from "./example-room";
 
 // Regression tests for freenet/river#205, #206, #207:
 //   #205 edit box wider than view
@@ -8,33 +9,6 @@ import { test, expect, Page } from "@playwright/test";
 // Assumes the example-data build is served on `baseURL`, which includes a
 // reply message added in ui/src/example_data.rs specifically so these tests
 // can exercise the reply bubble layout.
-
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
-async function selectRoom(page: Page, roomName: string) {
-  const roomBtn = page.getByRole("button", { name: roomName });
-  if (!(await roomBtn.isVisible({ timeout: 500 }).catch(() => false))) {
-    // Narrow-window case: temporarily expand to click the room.
-    const vp = page.viewportSize();
-    if (vp && vp.width < 768) {
-      await page.setViewportSize({ width: 1280, height: vp.height });
-      await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-      await roomBtn.click();
-      await expect(
-        page.getByRole("heading", { name: roomName })
-      ).toBeVisible({ timeout: 5_000 });
-      await page.setViewportSize({ width: vp.width, height: vp.height });
-      return;
-    }
-  }
-  await roomBtn.click();
-  await expect(
-    page.getByRole("heading", { name: roomName })
-  ).toBeVisible({ timeout: 5_000 });
-}
 
 // #205: on a narrow viewport, clicking edit on an own message must not produce
 // an edit container wider than the available chat area.
@@ -48,52 +22,7 @@ test.describe("Edit box width (#205)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    // On touch devices (no hover) the hover action bar is non-interactive; the
-    // real edit path is the kebab menu (freenet/river#402). Use whichever
-    // affordance the current device exposes.
-    const touch = await page.evaluate(
-      () => window.matchMedia("(hover: none)").matches
-    );
-
-    let clicked = false;
-    if (touch) {
-      // Target a self (accent) message directly and open Edit from its kebab —
-      // no iterating/dismissing, so the deferred menu-close can't race a
-      // following kebab tap.
-      const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
-      await expect(ownRow).toBeVisible();
-      await ownRow.scrollIntoViewIfNeeded();
-      await ownRow.locator('[data-testid="message-kebab"]').click();
-      await page
-        .locator('[data-testid="message-action-menu"]')
-        .getByRole("button", { name: /edit/i })
-        .click();
-      clicked = true;
-    } else {
-      // Hover each message bubble until one exposes an Edit button (own messages
-      // in the private room, where the owner IS self). Bubbles are divs with
-      // `max-w-prose` in the class list.
-      const bubbles = page.locator(".max-w-prose");
-      const count = await bubbles.count();
-      expect(count).toBeGreaterThan(0);
-      for (let i = 0; i < count; i++) {
-        const bubble = bubbles.nth(i);
-        await bubble.scrollIntoViewIfNeeded();
-        await bubble.hover();
-        const editBtn = bubble
-          .locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]")
-          .getByRole("button", { name: /edit/i });
-        if (await editBtn.isVisible({ timeout: 500 }).catch(() => false)) {
-          await editBtn.click();
-          clicked = true;
-          break;
-        }
-      }
-    }
-    expect(clicked, "found an own-message edit affordance").toBe(true);
-
-    const textarea = page.locator("textarea").first();
-    await expect(textarea).toBeVisible({ timeout: 5_000 });
+    const textarea = await openOwnMessageEdit(page);
 
     // The edit container (parent of the textarea) must not exceed the
     // viewport width. Before the fix it had an inline `width: 550px` and
@@ -127,9 +56,9 @@ test.describe("Reply bubble layout (#206, #207)", () => {
 
     // Find the bubble containing the reply strip and a sibling non-reply bubble.
     const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[contains(@class,'max-w-prose')][1]"
+      "xpath=ancestor::*[@data-testid='message-bubble'][1]"
     );
-    const allBubbles = page.locator(".max-w-prose");
+    const allBubbles = page.getByTestId("message-bubble");
     const bubbleCount = await allBubbles.count();
     let maxNonReplyWidth = 0;
     for (let i = 0; i < bubbleCount; i++) {
@@ -188,7 +117,7 @@ test.describe("Reply bubble layout (#206, #207)", () => {
     );
 
     const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[contains(@class,'max-w-prose')][1]"
+      "xpath=ancestor::*[@data-testid='message-bubble'][1]"
     );
 
     const widthBefore = await replyBubble.evaluate(
@@ -339,7 +268,7 @@ test.describe("Long unbreakable content (#212)", () => {
     await selectRoom(page, "Your Private Room");
 
     const longTokenBubble = page
-      .locator(".max-w-prose")
+      .getByTestId("message-bubble")
       .filter({ hasText: "longlongurlpath" })
       .first();
     await expect(longTokenBubble).toBeVisible({ timeout: 10_000 });
@@ -689,7 +618,7 @@ test.describe("Self message bubble mobile overflow", () => {
     const overflow = await page.evaluate(() => {
       const vw = window.innerWidth;
       const bad: Array<{ left: number; right: number; width: number; text: string }> = [];
-      for (const b of Array.from(document.querySelectorAll(".max-w-prose"))) {
+      for (const b of Array.from(document.querySelectorAll('[data-testid="message-bubble"]'))) {
         const r = b.getBoundingClientRect();
         if (r.width === 0) continue;
         if (r.left < -1 || r.right > vw + 1) {
@@ -756,7 +685,7 @@ test.describe("Unavailable reply quote", () => {
     ).not.toHaveCount(0);
 
     // Mutually exclusive with the quote strip: no bubble carries both.
-    const bubbles = page.locator(".max-w-prose");
+    const bubbles = page.getByTestId("message-bubble");
     expect(await bubbles.count()).toBeGreaterThan(0);
     const bothInOneBubble = await bubbles.evaluateAll(
       (els) =>

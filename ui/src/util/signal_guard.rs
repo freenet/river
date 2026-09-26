@@ -117,6 +117,9 @@ pub fn schedule_nudge() {
 
 #[cfg(test)]
 mod tests {
+    use crate::util::source_scan::production_only;
+    use crate::util::strip_comments;
+
     /// Every call site that `try_read()`s a signal inside a `use_memo` must read
     /// the anchor before its first fallible read, and must nudge on every
     /// degraded branch. Source-scraped rather than run, because exercising the
@@ -179,29 +182,6 @@ mod tests {
         ),
     ];
 
-    /// Cut production source at the test module so a needle appearing only in a
-    /// test cannot satisfy the pin. Splits on `mod tests`, not
-    /// `#[cfg(test)]`, because attributes also decorate non-test items.
-    fn production_only(src: &str) -> &str {
-        match src.find("\nmod tests") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
-
-    /// Drop `//` comments before scanning. Without this the pin matches its own
-    /// explanatory prose: a comment that mentions `try_read(` reads as a fallible
-    /// read occurring before the anchor, and the pin fails on correct code.
-    fn strip_line_comments(src: &str) -> String {
-        src.lines()
-            .map(|l| match l.find("//") {
-                Some(i) => &l[..i],
-                None => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// Body of each `<prefix>(...)` call (e.g. `use_memo(` or `use_effect(`),
     /// delimited by balancing the parenthesis the call opens. Whole-file
     /// scanning is not good enough: these files also `try_read()` from event
@@ -242,31 +222,29 @@ mod tests {
         out
     }
 
-    fn memo_bodies(src: &str) -> Vec<(usize, &str)> {
-        hook_bodies(src, "use_memo(")
-    }
-
-    /// Same shape as [`memo_bodies`], for `use_effect(...)` (freenet/river#559:
-    /// `use_effect` rebuilds its dependency set on every pass via the same
-    /// `reset_and_run_in` primitive as `Memo`, so it has the identical
-    /// contended-`try_read` latch risk).
-    fn effect_bodies(src: &str) -> Vec<(usize, &str)> {
-        hook_bodies(src, "use_effect(")
-    }
-
-    /// Every memo that reads a signal fallibly must read the anchor FIRST and
-    /// must nudge on contention. Checked per memo body, not per file: each memo
-    /// rebuilds its own dependency set, so an anchor in a sibling memo protects
-    /// nothing.
-    #[test]
-    fn every_fallible_memo_anchors_before_its_first_try_read_and_nudges() {
+    /// Every `hook` body in `sites` that reads a signal fallibly must read the
+    /// anchor FIRST and nudge once per fallible read. Checked per body, not per
+    /// file: each memo or effect rebuilds its own dependency set, so an anchor in
+    /// a sibling protects nothing.
+    ///
+    /// `expected` is an EXACT count, not a floor. A floor left exactly the slack
+    /// this assertion exists to remove: the matcher could stop finding some of
+    /// conversation.rs's memo bodies -- the file that caused #555 -- and still
+    /// pass.
+    fn assert_fallible_hooks_are_guarded(
+        sites: &[(&str, &str)],
+        hook: &str,
+        issue: &str,
+        expected: usize,
+    ) {
+        let kind = hook.trim_end_matches('(');
         let mut checked = 0usize;
-        for (name, src) in GUARDED_MEMO_SITES {
-            let prod = strip_line_comments(production_only(src));
-            let bodies = memo_bodies(&prod);
+        for (name, src) in sites {
+            let prod = strip_comments(production_only(src));
+            let bodies = hook_bodies(&prod, hook);
             assert!(
                 !bodies.is_empty(),
-                "{name}: no use_memo found; the brace matcher or the file changed \
+                "{name}: no {kind} found; the brace matcher or the file changed \
                  shape. Fix the pin rather than deleting it."
             );
             let mut fallible_in_file = 0usize;
@@ -278,21 +256,21 @@ mod tests {
                 checked += 1;
                 let anchor = body.find("signal_guard::anchor").unwrap_or_else(|| {
                     panic!(
-                        "{name}: use_memo at line {line} reads a signal with \
+                        "{name}: {kind} at line {line} reads a signal with \
                          try_read() but never calls signal_guard::anchor(). A \
                          contended pass can leave it with zero subscriptions and \
-                         it will never re-evaluate (freenet/river#555)."
+                         it will never re-run ({issue})."
                     )
                 });
                 assert!(
                     anchor < first_try,
-                    "{name}: use_memo at line {line} calls \
+                    "{name}: {kind} at line {line} calls \
                      signal_guard::anchor() AFTER its first try_read( — on the \
                      Err path the anchor is never reached, so it registers \
-                     nothing (freenet/river#555)."
+                     nothing ({issue})."
                 );
-                // One nudge per fallible read, not one per memo. The anchor keeps
-                // the memo alive, but a contended read still drops THAT signal's
+                // One nudge per fallible read, not one per body. The anchor keeps
+                // the hook alive, but a contended read still drops THAT signal's
                 // subscription, so each fallible read needs its own retry. A
                 // per-body `contains` check passed happily while two secondary
                 // reads (OUTBOUND_DMS, SYNC_INFO) had no nudge at all -- human
@@ -301,101 +279,42 @@ mod tests {
                 let nudges = body.matches("signal_guard::schedule_nudge").count();
                 assert!(
                     nudges >= reads,
-                    "{name}: use_memo at line {line} has {reads} fallible \
+                    "{name}: {kind} at line {line} has {reads} fallible \
                      read(s) but only {nudges} schedule_nudge() call(s). Every \
                      read that can fail needs a nudge on its own failure \
                      branch, or that signal's subscription is dropped with \
-                     nothing to restore it (freenet/river#555)."
+                     nothing to restore it ({issue})."
                 );
             }
             assert!(
                 fallible_in_file > 0,
-                "{name}: listed in GUARDED_MEMO_SITES but no use_memo reads \
-                 fallibly. Remove the entry rather than leaving a vacuous pin."
+                "{name}: listed as a guarded site but no {kind} reads fallibly. \
+                 Remove the entry rather than leaving a vacuous pin."
             );
         }
-        // EXACT count, not a floor. There are 12 fallible memos across the 8
-        // files (conversation.rs alone has 4, member_info_modal.rs 2). A floor of
-        // 8 left exactly the slack this assertion exists to remove: the matcher
-        // could stop finding all four conversation.rs bodies -- the file that
-        // caused #555 -- and still pass.
         assert_eq!(
-            checked, 12,
-            "expected to check exactly the 12 known fallible memos, checked \
-             {checked}. If you added or removed a fallible memo, update this \
+            checked, expected,
+            "expected to check exactly the {expected} known fallible {kind} \
+             bodies, checked {checked}. If you added or removed one, update this \
              number deliberately; if you did not, the matcher has stopped \
-             finding memo bodies and this pin has gone vacuous."
+             finding {kind} bodies and this pin has gone vacuous."
         );
     }
 
-    /// Same requirement as [`every_fallible_memo_anchors_before_its_first_try_read_and_nudges`],
-    /// for `use_effect(...)` bodies (freenet/river#559). Checked per effect
-    /// body, not per file: each effect rebuilds its own dependency set, so an
-    /// anchor in a sibling effect (or in a memo elsewhere in the same file)
-    /// protects nothing.
+    #[test]
+    fn every_fallible_memo_anchors_before_its_first_try_read_and_nudges() {
+        // 12 across the 8 files; conversation.rs alone has 4, member_info_modal.rs 2.
+        assert_fallible_hooks_are_guarded(GUARDED_MEMO_SITES, "use_memo(", "freenet/river#555", 12);
+    }
+
     #[test]
     fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
-        let mut checked = 0usize;
-        for (name, src) in GUARDED_EFFECT_SITES {
-            let prod = strip_line_comments(production_only(src));
-            let bodies = effect_bodies(&prod);
-            assert!(
-                !bodies.is_empty(),
-                "{name}: no use_effect found; the brace matcher or the file \
-                 changed shape. Fix the pin rather than deleting it."
-            );
-            let mut fallible_in_file = 0usize;
-            for (line, body) in bodies {
-                let Some(first_try) = body.find("try_read(") else {
-                    continue;
-                };
-                fallible_in_file += 1;
-                checked += 1;
-                let anchor = body.find("signal_guard::anchor").unwrap_or_else(|| {
-                    panic!(
-                        "{name}: use_effect at line {line} reads a signal with \
-                         try_read() but never calls signal_guard::anchor(). A \
-                         contended pass can leave it with zero subscriptions and \
-                         it will never re-run for the rest of the session \
-                         (freenet/river#559)."
-                    )
-                });
-                assert!(
-                    anchor < first_try,
-                    "{name}: use_effect at line {line} calls \
-                     signal_guard::anchor() AFTER its first try_read( — on the \
-                     Err path the anchor is never reached, so it registers \
-                     nothing (freenet/river#559)."
-                );
-                let reads = body.matches("try_read(").count();
-                let nudges = body.matches("signal_guard::schedule_nudge").count();
-                assert!(
-                    nudges >= reads,
-                    "{name}: use_effect at line {line} has {reads} fallible \
-                     read(s) but only {nudges} schedule_nudge() call(s). Every \
-                     read that can fail needs a nudge on its own failure \
-                     branch, or that signal's subscription is dropped with \
-                     nothing to restore it (freenet/river#559)."
-                );
-            }
-            assert!(
-                fallible_in_file > 0,
-                "{name}: listed in GUARDED_EFFECT_SITES but no use_effect reads \
-                 fallibly. Remove the entry rather than leaving a vacuous pin."
-            );
-        }
-        // EXACT count, not a floor — see the sibling memo test's comment for
-        // why: a floor would stay green even if the matcher stopped finding
-        // some of app.rs's five fallible effects. Seven fallible use_effect
-        // reads across the three files (app.rs has five, members.rs and
-        // dm_thread_modal.rs one each) is the full set freenet/river#559
-        // identified.
-        assert_eq!(
-            checked, 7,
-            "expected to check exactly the 7 known fallible effects, checked \
-             {checked}. If you added or removed a fallible effect, update this \
-             number deliberately; if you did not, the matcher has stopped \
-             finding effect bodies and this pin has gone vacuous."
+        // 7 across the 3 files; app.rs has 5, members.rs and dm_thread_modal.rs 1 each.
+        assert_fallible_hooks_are_guarded(
+            GUARDED_EFFECT_SITES,
+            "use_effect(",
+            "freenet/river#559",
+            7,
         );
     }
 

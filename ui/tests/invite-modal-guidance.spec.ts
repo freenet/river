@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Copy test for the invite-member modal's guidance blocks.
 //
@@ -12,27 +13,12 @@ import { test, expect, Page } from "@playwright/test";
 // of this modal can't silently drop the recommendation and leave
 // copy-the-link as the only documented path.
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
 // A room where the test user is a member, so "Invite Member" can generate
 // an invitation (matches the portable-invite-code spec).
 const ROOM_NAME = "Public Discussion Room";
 
 async function openInviteModal(page: Page) {
-  const vp = page.viewportSize();
-  if (vp && vp.width < 1024) {
-    await page.setViewportSize({ width: 1280, height: vp.height });
-  }
-  const roomBtn = page.getByRole("button", { name: ROOM_NAME });
-  await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-  await roomBtn.click();
-  await expect(page.getByRole("heading", { name: ROOM_NAME })).toBeVisible({
-    timeout: 5_000,
-  });
-
+  await selectRoom(page, ROOM_NAME);
   await page.getByTestId("invite-member-button").click();
   await expect(page.getByTestId("invite-member-modal")).toBeVisible({
     timeout: 5_000,
@@ -44,10 +30,10 @@ async function openInviteModal(page: Page) {
   });
 }
 
-test.describe("Invite-member modal guidance copy", () => {
+test.describe("Invite-member modal guidance copy", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("recommends sending the invitation via DM, naming Share invite", async ({
+  test("recommends a DM invite above the one-person-only link warning", async ({
     page,
   }) => {
     await page.goto("/");
@@ -58,37 +44,17 @@ test.describe("Invite-member modal guidance copy", () => {
     await expect(rec).toBeVisible();
     await expect(rec).toContainText(/in a DM/i);
     await expect(rec).toContainText(/Share invite/);
-  });
-
-  test("still warns that the link or code is for one person only", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await openInviteModal(page);
 
     const warning = page.getByTestId("invite-share-warning");
     await expect(warning).toBeVisible();
     await expect(warning).toContainText(/one person only/i);
     await expect(warning).toContainText(/New Invitation/);
-  });
 
-  test("shows the DM recommendation above the link-sharing warning", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await openInviteModal(page);
-
-    const recBox = await page
-      .getByTestId("invite-dm-recommendation")
-      .boundingBox();
-    const warnBox = await page
-      .getByTestId("invite-share-warning")
-      .boundingBox();
+    // Recommended path first — the fallback warning sits below it.
+    const recBox = await rec.boundingBox();
+    const warnBox = await warning.boundingBox();
     expect(recBox).not.toBeNull();
     expect(warnBox).not.toBeNull();
-    // Recommended path first — the fallback warning sits below it.
     expect(recBox!.y).toBeLessThan(warnBox!.y);
   });
 });

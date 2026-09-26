@@ -4413,8 +4413,8 @@ mod tests {
     }
 
     /// Production slice of a source file for the pins above: everything before
-    /// the test module (the whole file when it has none), with line comments
-    /// stripped.
+    /// the test module (the whole file when it has none), with comments
+    /// stripped by the string-aware `crate::util::strip_comments`.
     ///
     /// Stripping comments matters — a guard that was DELETED but is still
     /// QUOTED in a comment would otherwise satisfy a `contains`/`rfind`, the
@@ -4428,11 +4428,7 @@ mod tests {
     /// against that with [`assert_prod_only`].
     fn prod_source(source: &str) -> String {
         let end = source.find("#[cfg(test)]").unwrap_or(source.len());
-        source[..end]
-            .lines()
-            .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
-            .collect::<Vec<_>>()
-            .join("\n")
+        crate::util::strip_comments(&source[..end])
     }
 
     /// Fails if a [`prod_source`] slice still contains test code, which would

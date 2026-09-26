@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn dm_send_path_has_no_client_side_pair_cap_guard() {
         let src = include_str!("direct_messages.rs");
-        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let body = crate::util::source_scan::production_only(src);
         for symbol in ["pair_message_count(", "MAX_DM_MESSAGES_PER_PAIR"] {
             assert!(
                 !body.contains(symbol),
@@ -974,7 +974,7 @@ mod tests {
     #[test]
     fn mark_thread_read_write_is_gated_pinned() {
         let src = include_str!("direct_messages.rs");
-        let body = &src[..src.find("mod tests").unwrap_or(src.len())];
+        let body = crate::util::source_scan::production_only(src);
         let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
 
         let start = stripped

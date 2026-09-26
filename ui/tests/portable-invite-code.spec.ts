@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // Feature test for issue #381: portable invite codes.
 //
@@ -8,27 +9,9 @@ import { test, expect, Page } from "@playwright/test";
 // normal invitation flow. This lets a user on a non-standard host (e.g.
 // try.freenet.org) join without hand-editing the host out of an invite link.
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
 // A room where the test user is a member, so the "Invite Member" affordance
 // can generate an invitation (matches the copy-clipboard-feedback spec).
 const ROOM_NAME = "Public Discussion Room";
-
-async function selectRoom(page: Page) {
-  const vp = page.viewportSize();
-  if (vp && vp.width < 1024) {
-    await page.setViewportSize({ width: 1280, height: vp.height });
-  }
-  const roomBtn = page.getByRole("button", { name: ROOM_NAME });
-  await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-  await roomBtn.click();
-  await expect(
-    page.getByRole("heading", { name: ROOM_NAME })
-  ).toBeVisible({ timeout: 5_000 });
-}
 
 async function openInviteModalAndReadCode(page: Page): Promise<string> {
   await page.getByTestId("invite-member-button").click();
@@ -44,7 +27,7 @@ async function openInviteModalAndReadCode(page: Page): Promise<string> {
   return await codeInput.inputValue();
 }
 
-test.describe("Portable invite codes (issue #381)", () => {
+test.describe("Portable invite codes (issue #381)", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("invite modal exposes a portable code with copy feedback", async ({
@@ -52,7 +35,7 @@ test.describe("Portable invite codes (issue #381)", () => {
   }) => {
     await page.goto("/");
     await waitForApp(page);
-    await selectRoom(page);
+    await selectRoom(page, ROOM_NAME);
 
     const code = await openInviteModalAndReadCode(page);
     // A base58 invite code is a non-trivial string; sanity-check it looks real.
@@ -70,7 +53,7 @@ test.describe("Portable invite codes (issue #381)", () => {
   }) => {
     await page.goto("/");
     await waitForApp(page);
-    await selectRoom(page);
+    await selectRoom(page, ROOM_NAME);
 
     // Create side: grab a real portable code.
     const code = await openInviteModalAndReadCode(page);

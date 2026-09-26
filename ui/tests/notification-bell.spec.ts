@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
+import { waitForApp, selectRoom } from "./example-room";
 
 // The per-room notification preference (All / Mentions & replies / Muted) is
 // reached from a bell icon in the conversation header, which opens a compact
@@ -7,43 +8,10 @@ import { test, expect, Page } from "@playwright/test";
 
 const ROOM = "Public Discussion Room";
 
-async function waitForApp(page: Page) {
-  await page.waitForSelector(".app-root", { timeout: 30_000 });
-  await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);
-}
-
-async function selectRoom(page: Page, roomName: string) {
-  const vp = page.viewportSize();
-  if (vp && vp.width < 1024) {
-    await page.setViewportSize({ width: 1280, height: vp.height });
-  }
-  const roomBtn = page.getByRole("button", { name: roomName });
-  await expect(roomBtn).toBeVisible({ timeout: 5_000 });
-  await roomBtn.click();
-  await expect(
-    page.getByRole("heading", { name: roomName })
-  ).toBeVisible({ timeout: 5_000 });
-}
-
 test.describe("Per-room notification bell", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test("bell is in the header and defaults to 'All messages'", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, ROOM);
-
-    const bell = page.getByTestId("notification-bell-button");
-    await expect(bell).toBeVisible();
-    // This room has no stored preference, so the default is All. (Since
-    // freenet/river#500 the fixture seeds "Your Private Room" as Muted, so
-    // "no stored preference" is no longer true of every example room.)
-    await expect(bell).toHaveAttribute("title", "Notifications: All messages");
-  });
-
-  test("clicking the bell opens the notification modal with three modes", async ({
+  test("clicking the bell opens the notification modal with three modes", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await page.goto("/");
@@ -60,7 +28,7 @@ test.describe("Per-room notification bell", () => {
     await expect(modal.getByText("Muted")).toBeVisible();
   });
 
-  test("selecting a mode applies it, closes the modal, and updates the bell", async ({
+  test("selecting a mode applies it, closes the modal, and updates the bell", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await page.goto("/");
@@ -96,7 +64,7 @@ test.describe("Per-room notification bell", () => {
     await expect(mutedRow).toHaveClass(/border-accent/);
   });
 
-  test("closing via the ✕ leaves the preference unchanged", async ({
+  test("closing via the ✕ leaves the preference unchanged", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await page.goto("/");
@@ -109,6 +77,7 @@ test.describe("Per-room notification bell", () => {
 
     await page.getByTestId("notification-modal-close").click();
     await expect(modal).toHaveCount(0, { timeout: 5_000 });
+    // No stored preference here, so All is the default (#500 seeds only "Your Private Room" as Muted).
     await expect(
       page.getByTestId("notification-bell-button")
     ).toHaveAttribute("title", "Notifications: All messages");
@@ -190,16 +159,14 @@ test.describe("Per-room notification bell", () => {
     }
   });
 
-  test("room-details modal no longer carries the notification setting", async ({
+  test("room-details modal no longer carries the notification setting", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, ROOM);
 
-    // Open room details via the title button.
-    const header = page.locator(".border-b.border-border.bg-panel").first();
-    await header.locator('button[title="Room details"]').click();
+    await page.getByTestId("room-title-button").click();
     await expect(
       page.getByRole("heading", { name: /Room Details/i })
     ).toBeVisible({ timeout: 5_000 });

@@ -1,5 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
+// Engine-agnostic tests (usually hook-driven) tag themselves @chromium-only and run once.
+const CHROMIUM_ONLY = /@chromium-only/;
+
 export default defineConfig({
   testDir: ".",
   testMatch: "*.spec.ts",
@@ -32,19 +35,23 @@ export default defineConfig({
     },
     {
       name: "firefox",
+      grepInvert: CHROMIUM_ONLY,
       use: { ...devices["Desktop Firefox"] },
     },
     {
       name: "webkit",
+      grepInvert: CHROMIUM_ONLY,
       use: { ...devices["Desktop Safari"] },
     },
     // Mobile viewports (Chromium engine)
     {
       name: "mobile-chrome",
+      grepInvert: CHROMIUM_ONLY,
       use: { ...devices["Pixel 5"] },
     },
     {
       name: "mobile-safari",
+      grepInvert: CHROMIUM_ONLY,
       use: { ...devices["iPhone 13"] },
     },
   ],
