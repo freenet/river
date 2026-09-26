@@ -58,3 +58,6 @@ ui/tests/test-results/
 # Syncthing in-flight transfer files (`.syncthing.<name>.tmp` are
 # created by the syncthing daemon while a file is being received).
 **/.syncthing.*.tmp
+
+.DS_Store
+contracts/room-contract/.rustc_info.json
