@@ -1,23 +1,23 @@
 import { test, expect } from "@playwright/test";
 import { openRoomWithComposer, waitForApp } from "./example-room";
 
-// Only a group's LAST bubble ever changed shape, so the target must be one.
+// The bug only reshaped a group's last bubble, so target one.
 const LAST_IN_GROUP = '[data-testid="conversation-history"] [id^="msg-"]:last-child';
 const NO_REACTIONS = ':not(:has([data-testid="reaction-chip"]))';
 
-test.describe("Bubble corners", () => {
+test.describe("Bubble corners", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   for (const kind of ["own", "received"] as const) {
-    test(`a reaction leaves the bubble's corners unchanged (${kind})`, { tag: "@chromium-only" }, async ({ page }) => {
+    test(`a reaction leaves the bubble's corners unchanged (${kind})`, async ({ page }) => {
       await page.goto("/");
       await waitForApp(page);
       await openRoomWithComposer(page);
 
       const side = kind === "own" ? ":has(.bg-accent)" : ":not(:has(.bg-accent))";
-      const candidate = page.locator(`${LAST_IN_GROUP}${side}${NO_REACTIONS}`).last();
-      // Pin by id: the :not(:has(chip)) locator stops matching once the row has a reaction.
-      const row = page.locator(`[id="${await candidate.getAttribute("id")}"]`);
+      // Pin by id: NO_REACTIONS stops matching once the reaction lands.
+      const id = await page.locator(`${LAST_IN_GROUP}${side}${NO_REACTIONS}`).last().getAttribute("id");
+      const row = page.locator(`[id="${id}"]`);
       const corners = () => row.getByTestId("message-bubble").evaluate((el) => {
         const s = getComputedStyle(el);
         return [s.borderTopLeftRadius, s.borderTopRightRadius, s.borderBottomRightRadius, s.borderBottomLeftRadius];
