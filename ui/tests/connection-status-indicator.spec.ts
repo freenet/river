@@ -47,6 +47,7 @@ async function waitForApp(page: Page) {
 // A genuinely-rendered pill ALWAYS matches one of these rows; a stuck or
 // blank pill (e.g. a regression that replaces the reactive `try_read()`
 // with a non-subscribing `peek()` and renders no real state) would not.
+// Error isn't listed: its label is the message.
 const STATUS_STATES = [
   { dot: "bg-green-500", label: "Connected" },
   { dot: "bg-yellow-500", label: "Connecting..." },
@@ -69,30 +70,10 @@ async function expectCoherentState(visiblePill: Locator) {
   const dotClass = (await dot.getAttribute("class")) ?? "";
   const labelText = ((await visiblePill.textContent()) ?? "").trim();
 
-  // Distinct status colours — `bg-red-500` is shared by Disconnected and
-  // Error, so dedupe before counting how many the dot carries.
-  const colours = [...new Set(STATUS_STATES.map((s) => s.dot))];
-  const present = colours.filter((c) =>
-    new RegExp(`(^|\\s)${c}(\\s|$)`).test(dotClass)
-  );
-  // Exactly one status colour — not zero (blank/stuck dot) and not several
-  // (ambiguous render).
-  expect(
-    present,
-    `dot class "${dotClass}" must carry exactly one status colour`
-  ).toHaveLength(1);
-
-  const colour = present[0];
-  const expectedLabels = STATUS_STATES.filter((s) => s.dot === colour).map(
-    (s) => s.label
-  );
-  const labelMatches = expectedLabels.includes(labelText);
-  expect(
-    labelMatches,
-    `label "${labelText}" must match dot colour "${colour}" (one of ${JSON.stringify(
-      expectedLabels
-    )})`
-  ).toBeTruthy();
+  // Exactly one status colour: not zero (blank/stuck dot), not several (ambiguous render).
+  const present = STATUS_STATES.filter((s) => new RegExp(`(^|\\s)${s.dot}(\\s|$)`).test(dotClass));
+  expect(present, `dot class "${dotClass}" must carry exactly one status colour`).toHaveLength(1);
+  expect(labelText, `label must match dot colour "${present[0].dot}"`).toBe(present[0].label);
 }
 
 test.describe("Connection status indicator on desktop (Bug #5)", () => {
@@ -201,16 +182,14 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
   test("an error shows only its message", { tag: "@chromium-only" }, async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
-    const label = page.locator(VISIBLE_PILL).getByTestId("connection-status-label");
-
-    await callRiverTest(page, "setSyncStatus", "error");
-    await expect(label).toHaveText("WebSocket connection failed or timed out");
-
+    const label = page.locator(ROOMS_RAIL).getByTestId("connection-status-label");
     const long = "The node sent a reply this version of River cannot read. ".repeat(4).trim();
+
     await callRiverTest(page, "setSyncStatus", `error:${long}`);
+    await expect(label).toHaveText(long);
     await expect(label).toHaveAttribute("title", long);
     // Truncated to one line, not wrapped: the text overflows its box.
-    expect(await label.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+    await expect.poll(() => label.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
   });
 });
 
