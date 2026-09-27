@@ -245,7 +245,7 @@ pub enum SynchronizerStatus {
 
 impl From<SynchronizerError> for SynchronizerStatus {
     fn from(error: SynchronizerError) -> Self {
-        SynchronizerStatus::Error(error.to_string())
+        SynchronizerStatus::Error(error.user_message())
     }
 }
 

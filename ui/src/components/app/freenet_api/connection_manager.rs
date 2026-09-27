@@ -1,7 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use crate::components::app::freenet_api::constants::*;
-    use crate::components::app::freenet_api::error::SynchronizerError;
+    use crate::components::app::freenet_api::error::{node_error_message, SynchronizerError};
     use crate::components::app::freenet_api::freenet_synchronizer;
     use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
     use crate::components::app::{AUTH_TOKEN, SYNC_STATUS, WEB_API};
@@ -178,13 +178,14 @@ mod imp {
                         let error_msg = format!("WebSocket error: {}", error);
                         error!("{}", error_msg);
 
-                        // Check if this is a connection closed error
+                        // Raw text: the stored one is capitalised.
                         let is_connection_closed = error_msg.contains("connection closed");
+                        let user_msg = node_error_message(&error);
 
                         let tx = error_tx.clone();
                         spawn_local(async move {
                             *SYNC_STATUS.write() =
-                                freenet_synchronizer::SynchronizerStatus::Error(error_msg);
+                                freenet_synchronizer::SynchronizerStatus::Error(user_msg);
 
                             // Trigger reconnection for connection closed errors
                             if is_connection_closed {
@@ -252,7 +253,7 @@ mod imp {
                     );
                     error!("{}", error);
                     *SYNC_STATUS.write() =
-                        freenet_synchronizer::SynchronizerStatus::Error(error.to_string());
+                        freenet_synchronizer::SynchronizerStatus::Error(error.user_message());
 
                     let ready_state = websocket.ready_state();
                     if ready_state == web_sys::WebSocket::CONNECTING

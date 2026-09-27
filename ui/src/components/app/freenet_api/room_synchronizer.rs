@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use super::error::SynchronizerError;
+use super::error::{node_error_message, SynchronizerError};
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::{
     mark_current_room_as_read, update_document_title, DOCUMENT_VISIBLE,
@@ -750,7 +750,7 @@ impl RoomSynchronizer {
                             // Update pending invite status to error
                             PENDING_INVITES.with_mut(|pending| {
                                 if let Some(join) = pending.map.get_mut(&owner_vk) {
-                                    join.status = PendingRoomStatus::Error(e.to_string());
+                                    join.status = PendingRoomStatus::Error(node_error_message(&e));
                                 }
                             });
                         }
@@ -830,7 +830,7 @@ impl RoomSynchronizer {
                                 SYNC_INFO.with_mut(|sync_info| {
                                     sync_info.update_sync_status(
                                         owner_vk,
-                                        RoomSyncStatus::Error(e.to_string()),
+                                        RoomSyncStatus::Error(node_error_message(&e)),
                                     );
                                 });
                             }
@@ -898,7 +898,7 @@ impl RoomSynchronizer {
                             SYNC_INFO.with_mut(|sync_info| {
                                 sync_info.update_sync_status(
                                     owner_vk,
-                                    RoomSyncStatus::Error(e.to_string()),
+                                    RoomSyncStatus::Error(node_error_message(&e)),
                                 );
                             });
                         }
@@ -1687,7 +1687,7 @@ impl RoomSynchronizer {
                 }
                 Err(e) => {
                     error!("Failed to send GET request for contract: {}", e);
-                    Err(SynchronizerError::ClientApiError(e.to_string()))
+                    Err(SynchronizerError::ClientApiError(node_error_message(&e)))
                 }
             }
         } else {
@@ -1721,7 +1721,7 @@ impl RoomSynchronizer {
                 }
                 Err(e) => {
                     error!("Failed to send subscription request: {}", e);
-                    Err(SynchronizerError::SubscribeError(e.to_string()))
+                    Err(SynchronizerError::SubscribeError(node_error_message(&e)))
                 }
             }
         } else {

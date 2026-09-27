@@ -70,7 +70,7 @@ pub async fn handle_put_response(
             if let Err(e) = subscribe_result {
                 error!("Failed to subscribe to contract after PUT: {}", e);
                 // Update the sync status to error
-                let error_msg = e.to_string();
+                let error_msg = e.user_message();
                 crate::util::defer(move || {
                     SYNC_INFO
                         .write()
