@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use super::error::{node_error_message, SynchronizerError};
+use super::error::{node_error_message, request_error_message, SynchronizerError};
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::{
     mark_current_room_as_read, update_document_title, DOCUMENT_VISIBLE,
@@ -830,7 +830,7 @@ impl RoomSynchronizer {
                                 SYNC_INFO.with_mut(|sync_info| {
                                     sync_info.update_sync_status(
                                         owner_vk,
-                                        RoomSyncStatus::Error(node_error_message(&e)),
+                                        RoomSyncStatus::Error(request_error_message(&e)),
                                     );
                                 });
                             }
@@ -898,7 +898,7 @@ impl RoomSynchronizer {
                             SYNC_INFO.with_mut(|sync_info| {
                                 sync_info.update_sync_status(
                                     owner_vk,
-                                    RoomSyncStatus::Error(node_error_message(&e)),
+                                    RoomSyncStatus::Error(request_error_message(&e)),
                                 );
                             });
                         }

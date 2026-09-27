@@ -90,15 +90,25 @@ impl From<client_api::Error> for SynchronizerError {
 pub fn node_error_message(error: &client_api::Error) -> String {
     #[cfg(target_family = "wasm")]
     if let client_api::Error::ConnectionError(value) = error {
-        if let Some(text) = connection_error_text(value) {
-            return capitalise_first(text);
-        }
+        // No text: the JSON itself, without stdlib's `request error:` label.
+        let text = connection_error_text(value).unwrap_or_else(|| value.to_string());
+        return capitalise_first(&text);
     }
     capitalise_first(&error.to_string())
 }
 
-fn connection_error_text(value: &serde_json::Value) -> Option<&str> {
-    value.get("error")?.as_str().filter(|s| !s.is_empty())
+/// A room's GET or PUT that couldn't be sent.
+pub fn request_error_message(error: &client_api::Error) -> String {
+    format!("Request error: {}", node_error_message(error))
+}
+
+fn connection_error_text(value: &serde_json::Value) -> Option<String> {
+    let text = value.get("error")?.as_str().filter(|s| !s.is_empty())?;
+    // stdlib's send precondition says `WebSocket is not open (state: CLOSED)`.
+    let state = text
+        .strip_prefix("WebSocket is not open (state: ")
+        .and_then(|s| s.strip_suffix(')'));
+    Some(state.map_or_else(|| text.to_string(), |s| format!("WebSocket state: {s}")))
 }
 
 fn capitalise_first(s: &str) -> String {
@@ -181,21 +191,26 @@ mod tests {
             msg
         );
         assert_eq!(
-            SynchronizerError::SubscribeError("WebSocket is not open (state: CLOSED)".into())
-                .user_message(),
-            "Failed to subscribe to contract: WebSocket is not open (state: CLOSED)"
+            SynchronizerError::SubscribeError("WebSocket state: CLOSED".into()).user_message(),
+            "Failed to subscribe to contract: WebSocket state: CLOSED"
         );
     }
 
     #[test]
     fn connection_error_text_takes_only_the_error_field() {
         assert_eq!(
+            connection_error_text(
+                &serde_json::json!({"error": "connection closed", "source": "close"})
+            ),
+            Some("connection closed".to_string())
+        );
+        assert_eq!(
             connection_error_text(&serde_json::json!({
                 "error": "WebSocket is not open (state: CLOSED)",
                 "origin": "send precondition check",
                 "request": "ContractOp(..)"
             })),
-            Some("WebSocket is not open (state: CLOSED)")
+            Some("WebSocket state: CLOSED".to_string())
         );
         for no_text in [
             serde_json::json!({"source": "close"}),
@@ -211,6 +226,10 @@ mod tests {
         assert_eq!(
             node_error_message(&client_api::Error::ConnectionClosed),
             "Connection closed"
+        );
+        assert_eq!(
+            request_error_message(&client_api::Error::ConnectionClosed),
+            "Request error: Connection closed"
         );
     }
 }

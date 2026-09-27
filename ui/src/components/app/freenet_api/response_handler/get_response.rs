@@ -1,7 +1,7 @@
 use crate::components::app::freenet_api::backward_probe::{
     deliver_probe_response, start_backward_probe,
 };
-use crate::components::app::freenet_api::error::{node_error_message, SynchronizerError};
+use crate::components::app::freenet_api::error::{request_error_message, SynchronizerError};
 use crate::components::app::freenet_api::response_handler::update_notification::{
     clear_upgrade_target, follow_upgrade_pointer_if_needed, upgrade_target_owner,
 };
@@ -741,7 +741,7 @@ pub async fn handle_get_response(
                             MemberId::from(owner_vk),
                             e
                         );
-                        Err(node_error_message(&e))
+                        Err(request_error_message(&e))
                     }
                 }
             } else {
