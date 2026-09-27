@@ -7,7 +7,6 @@ pub mod sync_info;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::document_title::DocumentTitleUpdater;
-use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
 use crate::components::direct_messages::{DmThreadModal, InviteViaDmPickerModal};
@@ -227,7 +226,7 @@ pub fn App() -> Element {
     // This is synchronous - no network request needed
     get_auth_token_from_window();
 
-    // Start synchronizer - auth token is already available. Not in no-sync builds: there is no node.
+    // Start synchronizer - auth token is already available
     #[cfg(not(feature = "no-sync"))]
     wasm_bindgen_futures::spawn_local(async {
         debug!("Starting FreenetSynchronizer from App component");
@@ -478,6 +477,7 @@ pub fn App() -> Element {
 
     #[cfg(not(feature = "no-sync"))]
     {
+        use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
         // The synchronizer is now started in the auth token effect
 
         // Watch NEEDS_SYNC signal for USER-initiated changes only
