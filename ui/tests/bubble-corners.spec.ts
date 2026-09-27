@@ -1,5 +1,15 @@
-import { test, expect } from "@playwright/test";
-import { openRoomWithComposer, waitForApp } from "./example-room";
+import { test, expect, Page } from "@playwright/test";
+import { openRoomWithComposer, selectRoom, waitForApp } from "./example-room";
+
+async function unevenBubbles(page: Page) {
+  return page.evaluate(() =>
+    Array.from(document.querySelectorAll('[data-testid="message-bubble"]')).flatMap((el) => {
+      const s = getComputedStyle(el);
+      const radii = [s.borderTopLeftRadius, s.borderTopRightRadius, s.borderBottomRightRadius, s.borderBottomLeftRadius];
+      return new Set(radii).size === 1 ? [] : [{ radii, text: (el.textContent ?? "").replace(/\s+/g, " ").slice(0, 40) }];
+    }),
+  );
+}
 
 // The bug only reshaped a group's last bubble, so target one.
 const LAST_IN_GROUP = '[data-testid="conversation-history"] [id^="msg-"]:last-child';
@@ -7,6 +17,15 @@ const NO_REACTIONS = ':not(:has([data-testid="reaction-chip"]))';
 
 test.describe("Bubble corners", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("every corner of a bubble is the same radius", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    for (const room of ["Your Private Room", "Public Discussion Room", "Team Chat Room"]) {
+      await selectRoom(page, room);
+      expect(await unevenBubbles(page), room).toEqual([]);
+    }
+  });
 
   for (const kind of ["own", "received"] as const) {
     test(`a reaction leaves the bubble's corners unchanged (${kind})`, async ({ page }) => {
@@ -25,6 +44,7 @@ test.describe("Bubble corners", { tag: "@chromium-only" }, () => {
 
       await row.scrollIntoViewIfNeeded();
       const before = await corners();
+      expect(new Set(before).size, "every corner is the same radius").toBe(1);
       await row.hover();
       await row.getByTestId("add-reaction-button").click();
       await page.getByTestId("emoji-picker").getByRole("button").first().click();

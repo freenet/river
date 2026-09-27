@@ -4919,10 +4919,7 @@ fn MessageGroupComponent(
                         if is_self { "flex flex-col items-end" } else { "" }
                     ),
                     {
-                        let messages_len = group.messages.len();
-                        group.messages.into_iter().enumerate().map(move |(idx, msg)| {
-                        let is_last = idx == messages_len - 1;
-                        let is_first = idx == 0;
+                        group.messages.into_iter().map(move |msg| {
                         let has_reactions = !msg.reactions.is_empty();
                         let reply_strip_val = msg.reply_strip.clone();
 
@@ -5156,36 +5153,16 @@ fn MessageGroupComponent(
                                                 div {
                                                     "data-testid": "message-bubble",
                                                     class: format!(
-                                                        "flex flex-col text-sm overflow-hidden {} {} {}",
+                                                        "flex flex-col text-sm overflow-hidden {} {}",
                                                         if is_self {
                                                             "bg-accent text-white"
                                                         } else {
                                                             "bg-surface text-text"
                                                         },
-                                                        // Rounded corners based on position
-                                                        if is_self {
-                                                            if is_first && is_last {
-                                                                "rounded-2xl"
-                                                            } else if is_first {
-                                                                "rounded-t-2xl rounded-bl-2xl rounded-br-md"
-                                                            } else if is_last {
-                                                                "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
-                                                            } else {
-                                                                "rounded-l-2xl rounded-r-md"
-                                                            }
-                                                        } else if is_first && is_last {
-                                                            "rounded-2xl"
-                                                        } else if is_first {
-                                                            "rounded-t-2xl rounded-br-2xl rounded-bl-md"
-                                                        } else if is_last {
-                                                            "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
-                                                        } else {
-                                                            "rounded-r-2xl rounded-l-md"
-                                                        },
                                                         // Max width for readability; overflow-hidden on
                                                         // parent + min-w-0 on the reply strip prevents
                                                         // the nowrap strip from widening the bubble.
-                                                        "max-w-prose"
+                                                        "rounded-2xl max-w-prose"
                                                     ),
                                                     // Reply-quote strip (inside bubble, first child).
                                                     // Exactly one arm renders, enforced by the type: an
