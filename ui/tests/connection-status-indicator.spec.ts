@@ -1,4 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
+import { callRiverTest } from "./river-test";
 import { selectRoom } from "./example-room";
 
 // Regression tests for Bug #5 (Ivvor, Matrix 2026-05-17): the WebSocket
@@ -50,9 +51,6 @@ const STATUS_STATES = [
   { dot: "bg-green-500", label: "Connected" },
   { dot: "bg-yellow-500", label: "Connecting..." },
   { dot: "bg-red-500", label: "Disconnected" },
-  // SynchronizerStatus::Error renders "Error: <msg>" with the red dot; the
-  // label is matched with a prefix below rather than an exact string.
-  { dot: "bg-red-500", label: "Error:" },
 ];
 
 // Assert the visible pill renders a coherent connection state: its dot
@@ -88,9 +86,7 @@ async function expectCoherentState(visiblePill: Locator) {
   const expectedLabels = STATUS_STATES.filter((s) => s.dot === colour).map(
     (s) => s.label
   );
-  const labelMatches = expectedLabels.some((l) =>
-    l.endsWith(":") ? labelText.startsWith(l) : labelText === l
-  );
+  const labelMatches = expectedLabels.includes(labelText);
   expect(
     labelMatches,
     `label "${labelText}" must match dot colour "${colour}" (one of ${JSON.stringify(
@@ -200,6 +196,21 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
     await expect(page.locator(VISIBLE_PILL)).toHaveCount(1);
     await expect(page.locator(ROOMS_RAIL).locator(VISIBLE_PILL)).toHaveCount(1);
     await expect(page.locator(MEMBERS_RAIL).locator(PILL)).toHaveCount(0);
+  });
+
+  test("an error shows only its message", { tag: "@chromium-only" }, async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    const label = page.locator(VISIBLE_PILL).getByTestId("connection-status-label");
+
+    await callRiverTest(page, "setSyncStatus", "error");
+    await expect(label).toHaveText("WebSocket connection failed or timed out");
+
+    const long = "The node sent a reply this version of River cannot read. ".repeat(4).trim();
+    await callRiverTest(page, "setSyncStatus", `error:${long}`);
+    await expect(label).toHaveAttribute("title", long);
+    // Truncated to one line, not wrapped: the text overflows its box.
+    expect(await label.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
   });
 });
 

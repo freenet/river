@@ -93,6 +93,25 @@ pub fn install_test_hooks() {
         });
     });
 
+    // No-sync builds never connect, so this is the only way a spec reaches the pill's other states.
+    expose(&hooks, "setSyncStatus", move |state: String| {
+        use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
+        let parsed = match state.as_str() {
+            "connecting" => SynchronizerStatus::Connecting,
+            "connected" => SynchronizerStatus::Connected,
+            "disconnected" => SynchronizerStatus::Disconnected,
+            "error" => SynchronizerStatus::Error("WebSocket connection failed or timed out".into()),
+            other => match other.strip_prefix("error:") {
+                Some(message) => SynchronizerStatus::Error(message.to_string()),
+                None => {
+                    crate::util::debug_log(&format!("[test] unknown sync status {other:?}"));
+                    return;
+                }
+            },
+        };
+        crate::util::defer(move || *crate::components::app::SYNC_STATUS.write() = parsed);
+    });
+
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 

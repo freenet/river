@@ -2,12 +2,15 @@ import { Page } from "@playwright/test";
 
 export type RoomsLoadState = "loading" | "migrating" | "failed" | "loaded";
 
+export type SyncStatus = "connecting" | "connected" | "disconnected" | "error" | `error:${string}`;
+
 // Mirrors the window.__riverTest hooks ui/src/test_hooks.rs installs.
 export type RiverTestHooks = {
   appendMessage(text: string): void;
   insertMessageBeforeLast(text: string): void;
   appendMessages(count: number): void;
   setRoomsLoadState(state: RoomsLoadState): void;
+  setSyncStatus(status: SyncStatus): void;
 };
 
 // One hook per round trip.
