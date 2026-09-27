@@ -5164,20 +5164,20 @@ fn MessageGroupComponent(
                                                         },
                                                         // Rounded corners based on position
                                                         if is_self {
-                                                            if is_first && is_last && !has_reactions {
+                                                            if is_first && is_last {
                                                                 "rounded-2xl"
                                                             } else if is_first {
                                                                 "rounded-t-2xl rounded-bl-2xl rounded-br-md"
-                                                            } else if is_last && !has_reactions {
+                                                            } else if is_last {
                                                                 "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
                                                             } else {
                                                                 "rounded-l-2xl rounded-r-md"
                                                             }
-                                                        } else if is_first && is_last && !has_reactions {
+                                                        } else if is_first && is_last {
                                                             "rounded-2xl"
                                                         } else if is_first {
                                                             "rounded-t-2xl rounded-br-2xl rounded-bl-md"
-                                                        } else if is_last && !has_reactions {
+                                                        } else if is_last {
                                                             "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
                                                         } else {
                                                             "rounded-r-2xl rounded-l-md"
