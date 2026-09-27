@@ -225,6 +225,8 @@ mod imp {
                     }
                 },
             );
+            // stdlib's onerror reads ErrorEvent::filename() off a plain Event and throws; the close that follows reports it.
+            websocket.set_onerror(None);
 
             info!(
                 "Waiting for connection with timeout of {}ms",
@@ -312,3 +314,21 @@ mod imp {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use imp::ConnectionManager;
+
+#[cfg(test)]
+mod tests {
+    // WebApi::start installs an onerror that throws on every WebSocket error; clearing it only works after start.
+    #[test]
+    fn webapi_onerror_is_cleared_after_start() {
+        let src = crate::util::strip_comments(include_str!("connection_manager.rs"));
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        let start = code.find("WebApi::start(").expect("the WebApi::start call");
+        let cleared = code
+            .find("websocket.set_onerror(None)")
+            .expect("River clears WebApi's onerror");
+        assert!(
+            cleared > start,
+            "onerror must be cleared after WebApi::start sets it"
+        );
+    }
+}
