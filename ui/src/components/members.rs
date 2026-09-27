@@ -52,28 +52,21 @@ pub fn ConnectionStatusIndicator() -> Element {
         .map(|r| r.clone())
         .unwrap_or(SynchronizerStatus::Connecting);
 
-    let (pill_classes, dot_classes, label) = match &status {
+    let (pill_classes, dot_classes) = match &status {
         SynchronizerStatus::Connected => (
             "bg-success-bg text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800",
             "bg-green-500",
-            "Connected".to_string(),
         ),
         SynchronizerStatus::Connecting => (
             "bg-warning-bg text-yellow-700 dark:text-yellow-400 border border-yellow-200 dark:border-yellow-800",
             "bg-yellow-500",
-            "Connecting...".to_string(),
         ),
-        SynchronizerStatus::Disconnected => (
+        SynchronizerStatus::Disconnected | SynchronizerStatus::Error(_) => (
             "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
             "bg-red-500",
-            "Disconnected".to_string(),
-        ),
-        SynchronizerStatus::Error(msg) => (
-            "bg-error-bg text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800",
-            "bg-red-500",
-            format!("Error: {}", msg),
         ),
     };
+    let label = connection_status_label(&status);
 
     rsx! {
         div { class: "px-3 pb-3 flex-shrink-0",
@@ -81,10 +74,20 @@ pub fn ConnectionStatusIndicator() -> Element {
                 "aria-label": "WebSocket connection status",
                 "data-testid": "connection-status-indicator",
                 class: "w-full px-3 py-1.5 rounded-full flex items-center justify-center text-xs font-medium {pill_classes}",
-                div { class: "w-2 h-2 rounded-full mr-2 {dot_classes}" }
-                span { "{label}" }
+                div { class: "w-2 h-2 rounded-full mr-2 flex-shrink-0 {dot_classes}" }
+                span { "data-testid": "connection-status-label", class: "truncate min-w-0", title: "{label}", "{label}" }
             }
         }
+    }
+}
+
+// The red dot already says it is an error, so an error shows only its message.
+fn connection_status_label(status: &SynchronizerStatus) -> String {
+    match status {
+        SynchronizerStatus::Connected => "Connected".to_string(),
+        SynchronizerStatus::Connecting => "Connecting...".to_string(),
+        SynchronizerStatus::Disconnected => "Disconnected".to_string(),
+        SynchronizerStatus::Error(msg) => msg.clone(),
     }
 }
 
@@ -2698,6 +2701,15 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
 mod tests {
     use super::*;
     use river_core::room_state::member::Member;
+
+    #[test]
+    fn an_error_pill_shows_only_its_message() {
+        let msg = "WebSocket connection failed or timed out";
+        assert_eq!(
+            connection_status_label(&SynchronizerStatus::Error(msg.into())),
+            msg
+        );
+    }
 
     fn authorized_member(owner_sk: &SigningKey, invitee_vk: &VerifyingKey) -> AuthorizedMember {
         let owner_id = MemberId::from(&owner_sk.verifying_key());
