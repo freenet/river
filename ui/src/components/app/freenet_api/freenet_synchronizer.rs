@@ -243,12 +243,6 @@ pub enum SynchronizerStatus {
     Error(String),
 }
 
-impl From<SynchronizerError> for SynchronizerStatus {
-    fn from(error: SynchronizerError) -> Self {
-        SynchronizerStatus::Error(error.user_message())
-    }
-}
-
 impl FreenetSynchronizer {
     pub fn new() -> Self {
         let (message_tx, message_rx) = unbounded();

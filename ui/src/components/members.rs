@@ -82,12 +82,12 @@ pub fn ConnectionStatusIndicator() -> Element {
 }
 
 // The red dot already says it is an error, so an error shows only its message.
-fn connection_status_label(status: &SynchronizerStatus) -> String {
+fn connection_status_label(status: &SynchronizerStatus) -> &str {
     match status {
-        SynchronizerStatus::Connected => "Connected".to_string(),
-        SynchronizerStatus::Connecting => "Connecting...".to_string(),
-        SynchronizerStatus::Disconnected => "Disconnected".to_string(),
-        SynchronizerStatus::Error(msg) => msg.clone(),
+        SynchronizerStatus::Connected => "Connected",
+        SynchronizerStatus::Connecting => "Connecting...",
+        SynchronizerStatus::Disconnected => "Disconnected",
+        SynchronizerStatus::Error(msg) => msg,
     }
 }
 

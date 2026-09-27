@@ -103,10 +103,7 @@ pub fn install_test_hooks() {
             "error" => SynchronizerStatus::Error("WebSocket connection failed or timed out".into()),
             other => match other.strip_prefix("error:") {
                 Some(message) => SynchronizerStatus::Error(message.to_string()),
-                None => {
-                    crate::util::debug_log(&format!("[test] unknown sync status {other:?}"));
-                    return;
-                }
+                None => wasm_bindgen::throw_str(&format!("unknown sync status {other:?}")),
             },
         };
         crate::util::defer(move || *crate::components::app::SYNC_STATUS.write() = parsed);

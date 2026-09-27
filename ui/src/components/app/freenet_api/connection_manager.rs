@@ -175,11 +175,9 @@ mod imp {
                 },
                 {
                     move |error| {
-                        let error_msg = format!("WebSocket error: {}", error);
-                        error!("{}", error_msg);
-
-                        // Raw text: the stored one is capitalised.
-                        let is_connection_closed = error_msg.contains("connection closed");
+                        error!("WebSocket error: {error}");
+                        // Raw text, not user_msg: that one is capitalised.
+                        let is_connection_closed = error.to_string().contains("connection closed");
                         let user_msg = node_error_message(&error);
 
                         let tx = error_tx.clone();

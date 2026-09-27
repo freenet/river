@@ -89,11 +89,9 @@ impl From<client_api::Error> for SynchronizerError {
 /// A freenet-stdlib client error as one sentence: the browser client's JSON `error` field, not the whole payload.
 pub fn node_error_message(error: &client_api::Error) -> String {
     #[cfg(target_family = "wasm")]
-    {
-        if let client_api::Error::ConnectionError(value) = error {
-            if let Some(text) = connection_error_text(value) {
-                return capitalise_first(text);
-            }
+    if let client_api::Error::ConnectionError(value) = error {
+        if let Some(text) = connection_error_text(value) {
+            return capitalise_first(text);
         }
     }
     capitalise_first(&error.to_string())
@@ -153,9 +151,9 @@ impl SynchronizerError {
             SynchronizerError::WebSocketError(msg)
             | SynchronizerError::WebSocketNotSupported(msg)
             | SynchronizerError::ClientApiError(msg)
-            | SynchronizerError::Unknown(msg) => msg.clone(),
-            SynchronizerError::DelegateMissing { message, .. }
-            | SynchronizerError::DelegateRegisterFailed { message, .. } => message.clone(),
+            | SynchronizerError::Unknown(msg)
+            | SynchronizerError::DelegateMissing { message: msg, .. }
+            | SynchronizerError::DelegateRegisterFailed { message: msg, .. } => msg.clone(),
             SynchronizerError::ConnectionTimeout(_)
             | SynchronizerError::ApiNotInitialized
             | SynchronizerError::RoomNotFound(_)
