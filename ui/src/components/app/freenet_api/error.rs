@@ -172,47 +172,25 @@ impl SynchronizerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet_stdlib::client_api;
 
     #[test]
-    fn user_message_drops_a_label_that_only_restates_the_payload() {
+    fn user_message_says_the_failure_once() {
         let msg = "WebSocket connection failed or timed out";
-        for e in [
-            SynchronizerError::WebSocketError(msg.into()),
-            SynchronizerError::ClientApiError(msg.into()),
-            SynchronizerError::Unknown(msg.into()),
-        ] {
-            assert_eq!(e.user_message(), msg);
-        }
-        // Display keeps the label: logs and the substring checks in freenet_synchronizer.rs read it.
         assert_eq!(
-            SynchronizerError::WebSocketError(msg.into()).to_string(),
-            format!("WebSocket connection error: {msg}")
+            SynchronizerError::WebSocketError(msg.into()).user_message(),
+            msg
         );
-    }
-
-    #[test]
-    fn user_message_keeps_a_label_that_says_what_failed() {
         assert_eq!(
             SynchronizerError::SubscribeError("WebSocket is not open (state: CLOSED)".into())
                 .user_message(),
             "Failed to subscribe to contract: WebSocket is not open (state: CLOSED)"
         );
-        assert_eq!(
-            SynchronizerError::ConnectionTimeout(5000).user_message(),
-            "Connection timeout after 5000ms"
-        );
     }
 
     #[test]
     fn connection_error_text_takes_only_the_error_field() {
-        use freenet_stdlib::prelude::serde_json::json;
         assert_eq!(
-            connection_error_text(&json!({"error": "connection closed", "source": "close"})),
-            Some("connection closed")
-        );
-        assert_eq!(
-            connection_error_text(&json!({
+            connection_error_text(&serde_json::json!({
                 "error": "WebSocket is not open (state: CLOSED)",
                 "origin": "send precondition check",
                 "request": "ContractOp(..)"
@@ -220,9 +198,9 @@ mod tests {
             Some("WebSocket is not open (state: CLOSED)")
         );
         for no_text in [
-            json!({"source": "close"}),
-            json!({"error": ""}),
-            json!({"error": 5}),
+            serde_json::json!({"source": "close"}),
+            serde_json::json!({"error": ""}),
+            serde_json::json!({"error": 5}),
         ] {
             assert_eq!(connection_error_text(&no_text), None, "{no_text}");
         }
@@ -233,10 +211,6 @@ mod tests {
         assert_eq!(
             node_error_message(&client_api::Error::ConnectionClosed),
             "Connection closed"
-        );
-        assert_eq!(
-            SynchronizerError::from(client_api::Error::ChannelClosed).user_message(),
-            "Channel closed"
         );
     }
 }

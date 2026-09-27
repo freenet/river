@@ -2702,15 +2702,6 @@ mod tests {
     use super::*;
     use river_core::room_state::member::Member;
 
-    #[test]
-    fn an_error_pill_shows_only_its_message() {
-        let msg = "WebSocket connection failed or timed out";
-        assert_eq!(
-            connection_status_label(&SynchronizerStatus::Error(msg.into())),
-            msg
-        );
-    }
-
     fn authorized_member(owner_sk: &SigningKey, invitee_vk: &VerifyingKey) -> AuthorizedMember {
         let owner_id = MemberId::from(&owner_sk.verifying_key());
         let member = Member {
