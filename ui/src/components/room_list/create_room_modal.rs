@@ -133,7 +133,7 @@ pub fn CreateRoomModal() -> Element {
     let nickname_has_emoji = contains_hidden_chars(&nickname());
 
     rsx! {
-        // Backdrop: z-50 like the composer; rendered later in the DOM, so it paints over it.
+        // Backdrop: z-50 like every other modal; mounted outside the fixed .app-root shell, so it covers the composer at any positive z-index.
         div {
             "data-testid": "create-room-backdrop",
             class: "fixed inset-0 bg-black/50 z-50",

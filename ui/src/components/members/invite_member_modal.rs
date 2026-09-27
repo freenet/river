@@ -149,7 +149,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     }
 
     rsx! {
-        // Backdrop: z-50 like the composer; rendered later in the DOM, so it paints over it.
+        // Backdrop: inside the fixed .app-root shell with the z-50 composer; z-50 and later in the DOM, so it paints over it.
         div {
             "data-testid": "invite-member-backdrop",
             class: "fixed inset-0 bg-black/50 z-50",
