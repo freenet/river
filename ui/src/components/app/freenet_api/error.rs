@@ -2,6 +2,7 @@
 
 use freenet_stdlib::client_api;
 use freenet_stdlib::client_api::{ClientError, DelegateError, ErrorKind, RequestError};
+use freenet_stdlib::prelude::serde_json;
 use freenet_stdlib::prelude::DelegateKey;
 use thiserror::Error;
 
@@ -81,8 +82,33 @@ impl From<&str> for SynchronizerError {
 
 impl From<client_api::Error> for SynchronizerError {
     fn from(error: client_api::Error) -> Self {
-        SynchronizerError::ClientApiError(error.to_string())
+        SynchronizerError::ClientApiError(node_error_message(&error))
     }
+}
+
+/// A freenet-stdlib client error as one sentence: the browser client's JSON `error` field, not the whole payload.
+pub fn node_error_message(error: &client_api::Error) -> String {
+    #[cfg(target_family = "wasm")]
+    {
+        if let client_api::Error::ConnectionError(value) = error {
+            if let Some(text) = connection_error_text(value) {
+                return capitalise_first(text);
+            }
+        }
+    }
+    capitalise_first(&error.to_string())
+}
+
+fn connection_error_text(value: &serde_json::Value) -> Option<&str> {
+    value.get("error")?.as_str().filter(|s| !s.is_empty())
+}
+
+fn capitalise_first(s: &str) -> String {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 impl SynchronizerError {
@@ -148,6 +174,7 @@ impl SynchronizerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freenet_stdlib::client_api;
 
     #[test]
     fn user_message_drops_a_label_that_only_restates_the_payload() {
@@ -176,6 +203,42 @@ mod tests {
         assert_eq!(
             SynchronizerError::ConnectionTimeout(5000).user_message(),
             "Connection timeout after 5000ms"
+        );
+    }
+
+    #[test]
+    fn connection_error_text_takes_only_the_error_field() {
+        use freenet_stdlib::prelude::serde_json::json;
+        assert_eq!(
+            connection_error_text(&json!({"error": "connection closed", "source": "close"})),
+            Some("connection closed")
+        );
+        assert_eq!(
+            connection_error_text(&json!({
+                "error": "WebSocket is not open (state: CLOSED)",
+                "origin": "send precondition check",
+                "request": "ContractOp(..)"
+            })),
+            Some("WebSocket is not open (state: CLOSED)")
+        );
+        for no_text in [
+            json!({"source": "close"}),
+            json!({"error": ""}),
+            json!({"error": 5}),
+        ] {
+            assert_eq!(connection_error_text(&no_text), None, "{no_text}");
+        }
+    }
+
+    #[test]
+    fn a_client_error_becomes_one_capitalised_sentence() {
+        assert_eq!(
+            node_error_message(&client_api::Error::ConnectionClosed),
+            "Connection closed"
+        );
+        assert_eq!(
+            SynchronizerError::from(client_api::Error::ChannelClosed).user_message(),
+            "Channel closed"
         );
     }
 }
