@@ -120,4 +120,62 @@ impl SynchronizerError {
             _ => None,
         }
     }
+
+    /// The failure said once, for users; `Display` keeps its labels for logs and control flow.
+    pub fn user_message(&self) -> String {
+        match self {
+            SynchronizerError::WebSocketError(msg)
+            | SynchronizerError::WebSocketNotSupported(msg)
+            | SynchronizerError::ClientApiError(msg)
+            | SynchronizerError::Unknown(msg) => msg.clone(),
+            SynchronizerError::DelegateMissing { message, .. }
+            | SynchronizerError::DelegateRegisterFailed { message, .. } => message.clone(),
+            SynchronizerError::ConnectionTimeout(_)
+            | SynchronizerError::ApiNotInitialized
+            | SynchronizerError::RoomNotFound(_)
+            | SynchronizerError::ContractInfoNotFound(_)
+            | SynchronizerError::MessageSendError(_)
+            | SynchronizerError::StateMergeError(_)
+            | SynchronizerError::DeltaApplyError(_)
+            | SynchronizerError::PutContractError(_)
+            | SynchronizerError::SubscribeError(_)
+            | SynchronizerError::SerializationError(_)
+            | SynchronizerError::DeserializationError(_) => self.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_message_drops_a_label_that_only_restates_the_payload() {
+        let msg = "WebSocket connection failed or timed out";
+        for e in [
+            SynchronizerError::WebSocketError(msg.into()),
+            SynchronizerError::ClientApiError(msg.into()),
+            SynchronizerError::Unknown(msg.into()),
+        ] {
+            assert_eq!(e.user_message(), msg);
+        }
+        // Display keeps the label: logs and the substring checks in freenet_synchronizer.rs read it.
+        assert_eq!(
+            SynchronizerError::WebSocketError(msg.into()).to_string(),
+            format!("WebSocket connection error: {msg}")
+        );
+    }
+
+    #[test]
+    fn user_message_keeps_a_label_that_says_what_failed() {
+        assert_eq!(
+            SynchronizerError::SubscribeError("WebSocket is not open (state: CLOSED)".into())
+                .user_message(),
+            "Failed to subscribe to contract: WebSocket is not open (state: CLOSED)"
+        );
+        assert_eq!(
+            SynchronizerError::ConnectionTimeout(5000).user_message(),
+            "Connection timeout after 5000ms"
+        );
+    }
 }
