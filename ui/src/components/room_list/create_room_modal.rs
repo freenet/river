@@ -133,9 +133,9 @@ pub fn CreateRoomModal() -> Element {
     let nickname_has_emoji = contains_hidden_chars(&nickname());
 
     rsx! {
-        // Backdrop
+        // Dimmer and centring wrapper are one element, so a click outside the card hits this handler.
         div {
-            class: "fixed inset-0 bg-black/50 z-40",
+            class: "fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4",
             // Signal mutation from an event handler must be deferred
             // (dioxus-signal-safety: direct writes here are the Firefox
             // mobile RefCell re-entrancy crash path).
@@ -145,11 +145,7 @@ pub fn CreateRoomModal() -> Element {
                         modal.show = false;
                     });
                 });
-            }
-        }
-
-        // Modal
-        div { class: "fixed inset-0 z-50 flex items-center justify-center p-4",
+            },
             div {
                 "data-testid": "create-room-modal",
                 class: "bg-panel rounded-xl shadow-xl max-w-md w-full",
