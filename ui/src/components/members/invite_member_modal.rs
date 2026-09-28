@@ -49,6 +49,14 @@ pub(crate) fn get_invitation_base_url() -> String {
     }
 }
 
+fn room_display_name(room: &RoomData) -> String {
+    let sealed_name = &room.room_state.configuration.configuration.display.name;
+    match unseal_bytes_with_secrets(sealed_name, &room.secrets) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(_) => sealed_name.to_string_lossy(),
+    }
+}
+
 async fn create_invitation(room_data: Option<RoomData>) -> Result<Invitation, String> {
     let Some(room_data) = room_data else {
         return Err("No room selected".to_string());
@@ -167,24 +175,26 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
 #[component]
 fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> Element {
-    // Subscribe to the room only while it is unknown: a transient `None` retries,
-    // and later room updates never re-mint the link.
+    // What the link depends on: WHICH room, and whether we hold its signing key.
+    // A memo only notifies when its value changes, so an arriving message never
+    // re-mints the link, while a room switch (a notification click changes
+    // CURRENT_ROOM with this modal still open) or the key arriving does.
+    let room_identity = use_memo(move || room().map(|r| (r.owner_vk, r.signing_key().is_some())));
     let mut invitation_future = use_resource(move || async move {
-        let known = room.peek().clone();
-        let room_data = if known.is_some() { known } else { room() };
-        create_invitation(room_data).await
+        let _ = room_identity();
+        let room_data = room.peek().clone();
+        // Named from the same snapshot the link is minted from, so the message
+        // can never name one room while the link grants another.
+        let room_name = room_data.as_ref().map(room_display_name);
+        create_invitation(room_data)
+            .await
+            .map(|invitation| (invitation, room_name))
     });
 
     match &*invitation_future.read_unchecked() {
-        Some(Ok(invitation)) => {
-            let room_name = room()
-                .map(|r| {
-                    let sealed_name = &r.room_state.configuration.configuration.display.name;
-                    match unseal_bytes_with_secrets(sealed_name, &r.secrets) {
-                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                        Err(_) => sealed_name.to_string_lossy(),
-                    }
-                })
+        Some(Ok((invitation, room_name))) => {
+            let room_name = room_name
+                .clone()
                 .unwrap_or_else(|| "this chat room".to_string());
 
             let invite_code = invitation.to_encoded_string();
@@ -377,6 +387,7 @@ fn InvitationContent(
         div { class: "mb-4",
             label { class: "block text-sm font-medium text-text mb-1", "Full invitation message:" }
             div {
+                "data-testid": "invite-message-text",
                 class: "p-3 bg-surface rounded-lg text-xs text-text font-mono whitespace-pre-wrap max-h-40 overflow-y-auto",
                 "{invitation_text}"
             }

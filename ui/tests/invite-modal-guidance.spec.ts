@@ -106,4 +106,43 @@ test.describe("Invite-member modal lifecycle", { tag: "@chromium-only" }, () => 
     await page.waitForTimeout(600);
     await expect(link).toHaveValue(first);
   });
+
+  // A notification click switches CURRENT_ROOM with this modal still open. The
+  // message must never name the new room while the link still grants the old one.
+  test("a room switch re-mints the link for the room the message names", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openInviteModal(page);
+    const link = page.getByTestId("invite-link-input");
+    const message = page.getByTestId("invite-message-text");
+    const first = await link.inputValue();
+    await expect(message).toContainText(ROOM_NAME);
+
+    // Every (message, link) pair ever rendered, however briefly.
+    await page.evaluate(() => {
+      const seen: { message: string; link: string }[] = ((window as any).__invitePairs = []);
+      const record = () => {
+        const m = document.querySelector('[data-testid="invite-message-text"]');
+        const l = document.querySelector('[data-testid="invite-link-input"]') as HTMLInputElement | null;
+        if (m && l) seen.push({ message: m.textContent ?? "", link: l.value });
+      };
+      new MutationObserver(record).observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+      });
+    });
+
+    await callRiverTest(page, "switchRoom", "Team Chat Room");
+    await expect(message).toContainText("Team Chat Room", { timeout: 10_000 });
+    await expect(link).not.toHaveValue(first);
+
+    const pairs = (await page.evaluate(() => (window as any).__invitePairs)) as {
+      message: string;
+      link: string;
+    }[];
+    const mismatched = pairs.filter((p) => p.message.includes("Team Chat Room") && p.link === first);
+    expect(mismatched, "the message named the new room over the old room's link").toEqual([]);
+  });
 });

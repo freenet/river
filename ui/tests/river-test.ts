@@ -8,6 +8,7 @@ export type RiverTestHooks = {
   insertMessageBeforeLast(text: string): void;
   appendMessages(count: number): void;
   setRoomsLoadState(state: RoomsLoadState): void;
+  switchRoom(name: string): void;
 };
 
 // One hook per round trip.

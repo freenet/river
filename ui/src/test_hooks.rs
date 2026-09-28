@@ -93,6 +93,26 @@ pub fn install_test_hooks() {
         });
     });
 
+    // Switch rooms the way a notification click does: CURRENT_ROOM changes
+    // while whatever modal is open stays open. The room list is behind the
+    // modal's backdrop, so the UI itself cannot do this from a test.
+    expose(&hooks, "switchRoom", move |name: String| {
+        crate::util::defer(move || {
+            let key = ROOMS.read().map.iter().find_map(|(key, room)| {
+                let sealed = &room.room_state.configuration.configuration.display.name;
+                let shown = crate::util::ecies::unseal_bytes_with_secrets(sealed, &room.secrets)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                    .unwrap_or_else(|_| sealed.to_string_lossy());
+                (shown == name).then_some(*key)
+            });
+            if let Some(key) = key {
+                *CURRENT_ROOM.write() = CurrentRoom {
+                    owner_key: Some(key),
+                };
+            }
+        });
+    });
+
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 
