@@ -4746,6 +4746,21 @@ pub fn Conversation() -> Element {
     }
 }
 
+/// Corner radii for a bubble at this position in its group: every corner is
+/// round except the ones on the sender's side that face a neighbouring bubble.
+/// Takes position only, so nothing else (reactions, edits) can reshape it.
+fn bubble_corner_classes(is_self: bool, is_first: bool, is_last: bool) -> &'static str {
+    match (is_self, is_first, is_last) {
+        (_, true, true) => "rounded-2xl",
+        (true, true, false) => "rounded-t-2xl rounded-bl-2xl rounded-br-md",
+        (true, false, true) => "rounded-b-2xl rounded-tl-2xl rounded-tr-md",
+        (true, false, false) => "rounded-l-2xl rounded-r-md",
+        (false, true, false) => "rounded-t-2xl rounded-br-2xl rounded-bl-md",
+        (false, false, true) => "rounded-b-2xl rounded-tr-2xl rounded-tl-md",
+        (false, false, false) => "rounded-r-2xl rounded-l-md",
+    }
+}
+
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -5196,26 +5211,10 @@ fn MessageGroupComponent(
                                                         } else {
                                                             "bg-surface text-text"
                                                         },
-                                                        // Rounded corners based on position
-                                                        if is_self {
-                                                            if is_first && is_last && !has_reactions {
-                                                                "rounded-2xl"
-                                                            } else if is_first {
-                                                                "rounded-t-2xl rounded-bl-2xl rounded-br-md"
-                                                            } else if is_last && !has_reactions {
-                                                                "rounded-b-2xl rounded-tl-2xl rounded-tr-md"
-                                                            } else {
-                                                                "rounded-l-2xl rounded-r-md"
-                                                            }
-                                                        } else if is_first && is_last && !has_reactions {
-                                                            "rounded-2xl"
-                                                        } else if is_first {
-                                                            "rounded-t-2xl rounded-br-2xl rounded-bl-md"
-                                                        } else if is_last && !has_reactions {
-                                                            "rounded-b-2xl rounded-tr-2xl rounded-tl-md"
-                                                        } else {
-                                                            "rounded-r-2xl rounded-l-md"
-                                                        },
+                                                        // Grouped bubbles pinch the corner facing a
+                                                        // neighbour. Position only: a reaction must
+                                                        // not reshape the bubble.
+                                                        bubble_corner_classes(is_self, is_first, is_last),
                                                         // Max width for readability; overflow-hidden on
                                                         // parent + min-w-0 on the reply strip prevents
                                                         // the nowrap strip from widening the bubble.
@@ -5809,6 +5808,31 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lone bubble is fully round, and a grouped one pinches only the
+    /// sender-side corners that face a neighbour.
+    #[test]
+    fn bubble_corners_pinch_only_toward_a_neighbour() {
+        for is_self in [true, false] {
+            assert_eq!(bubble_corner_classes(is_self, true, true), "rounded-2xl");
+            for (is_first, is_last) in [(true, false), (false, true), (false, false)] {
+                let classes = bubble_corner_classes(is_self, is_first, is_last);
+                let pinched: Vec<&str> =
+                    classes.split(' ').filter(|c| c.ends_with("-md")).collect();
+                let side = if is_self { 'r' } else { 'l' };
+                let expected = match (is_first, is_last) {
+                    (true, false) => format!("rounded-b{side}-md"),
+                    (false, true) => format!("rounded-t{side}-md"),
+                    _ => format!("rounded-{side}-md"),
+                };
+                assert_eq!(
+                    pinched,
+                    vec![expected.as_str()],
+                    "is_self={is_self} is_first={is_first} is_last={is_last}"
+                );
+            }
+        }
+    }
 
     /// Source-grep pin: the message-action handlers must LOOK UP the open
     /// room's data when they run, never CAPTURE it.

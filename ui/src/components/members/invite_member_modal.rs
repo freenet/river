@@ -149,14 +149,12 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     }
 
     rsx! {
-        // Backdrop
+        // Dimmer and centring wrapper are one element, so a click outside the card hits this handler.
+        // Same stacking context (.app-root) and z-index as the composer, so DOM order puts it on top.
         div {
-            class: "fixed inset-0 bg-black/50 z-40",
-            onclick: move |_| is_active.set(false)
-        }
-
-        // Modal
-        div { class: "fixed inset-0 z-50 flex items-center justify-center p-4",
+            "data-testid": "invite-member-backdrop",
+            class: "fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4",
+            onclick: move |_| is_active.set(false),
             div {
                 "data-testid": "invite-member-modal",
                 class: "bg-panel rounded-xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto",
