@@ -147,6 +147,19 @@ async function readerScrollsWithoutGesture(page: Page, top: number) {
   }, top);
 }
 
+/// Same, but resolves once the scroll has SETTLED: the pin re-arms on `scrollend`, so an arrival before that races the handler.
+async function readerScrollsWithoutGestureAndSettles(page: Page, top: number) {
+  await page.evaluate(async (t) => {
+    const el = document.getElementById("chat-scroll-container")!;
+    const settled = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
+      el.addEventListener("scrollend", () => { clearTimeout(timer); resolve(); }, { once: true });
+    });
+    el.scrollTop = t;
+    await settled;
+  }, top);
+}
+
 /// Hold for a moment and assert the view did not move.
 ///
 /// Compares `scrollTop` rather than distance-from-bottom: distance also moves
@@ -304,7 +317,7 @@ test.describe("Conversation follows new messages (#486)", () => {
     // suite that only used the button would still pass if the re-arm branch
     // were narrowed to, say, `distance <= 0`, and a reader who stopped a few
     // fractional pixels short would never be followed again.
-    await readerScrollsWithoutGesture(page, await historyHeight(page));
+    await readerScrollsWithoutGestureAndSettles(page, await historyHeight(page));
     await expectSettledAtBottom(page, "the reader's own scroll should reach the bottom");
     await deliver(page, "arrived after the reader scrolled back down");
     await expectSettledAtBottom(
