@@ -9116,6 +9116,21 @@ mod autoscroll_wiring_pins {
              it between the gate and the scroll) as well as consult the guard, \
              and a forced scroll must override both"
         );
+        // A resize moves one edge, a reader scroll moves both. Dropping the
+        // bottom-edge conjunct reads a composer collapse's scrollTop clamp as
+        // the reader scrolling up, and the follow stops short (#722).
+        assert!(
+            dense
+                .contains("top+SCROLL_TOP_SLACK_PX<top_was&&bottom+SCROLL_TOP_SLACK_PX<bottom_was"),
+            "the guard must require BOTH edges of the view to have moved up"
+        );
+        // A zero height puts the recorded bottom edge at the top, so the
+        // bottom-edge check never fires and the guard goes silent.
+        assert!(
+            dense
+                .contains("last_top.record(max_scroll_top(&container),container.client_height());"),
+            "our own scroll must record the view's real height alongside its top"
+        );
     }
 
     /// The trigger, not just the gate. An `onmounted` on the last bubble is
