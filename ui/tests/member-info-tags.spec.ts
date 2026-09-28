@@ -1,11 +1,7 @@
 import { test, expect, Page, Locator } from "@playwright/test";
-import { waitForApp, selectListedRoom, memberRows } from "./example-room";
+import { waitForApp, selectListedRoom, memberRows, resolveColor } from "./example-room";
 
-// The member-info modal's status chips (👑 Room Owner, 🎪 Invited You, ...)
-// render their label in the body text colour, `--color-text`. The ⚠
-// impersonation chip keeps its amber text, because there the colour is the
-// warning. In "Team Chat Room" the owner's modal shows 👑 + 🎪 and the seeded
-// impostor's shows ⚠ (ui/src/example_data.rs).
+// In "Team Chat Room" the owner's modal shows 👑 + 🎪 and the seeded impostor's shows ⚠ (ui/src/example_data.rs).
 
 async function openModalFor(page: Page, badgeTestId: string) {
   await memberRows(page)
@@ -15,24 +11,12 @@ async function openModalFor(page: Page, badgeTestId: string) {
   await expect(page.getByTestId("member-info-modal")).toBeVisible({ timeout: 5_000 });
 }
 
-// The chip's text colour, and what `var(--color-text)` resolves to under the
-// same cascade. Both are serialized by the same engine, so string equality is
-// meaningful.
-async function chipColours(chip: Locator) {
+async function colourOf(chip: Locator) {
   await expect(chip).toBeVisible();
-  return chip.evaluate((el) => {
-    const probe = document.createElement("span");
-    probe.style.color = "var(--color-text)";
-    el.parentElement!.appendChild(probe);
-    try {
-      return { chip: getComputedStyle(el).color, text: getComputedStyle(probe).color };
-    } finally {
-      probe.remove();
-    }
-  });
+  return resolveColor(chip.page(), await chip.evaluate((el) => getComputedStyle(el).color));
 }
 
-test.describe("Member-info modal tag chips", () => {
+test.describe("Member-info modal tag chips", { tag: "@chromium-only" }, () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("status chips use --color-text; the warning chip keeps its own colour", async ({ page }) => {
@@ -40,11 +24,11 @@ test.describe("Member-info modal tag chips", () => {
     await waitForApp(page);
     await selectListedRoom(page, "Team Chat Room");
     await expect(memberRows(page).first()).toBeVisible({ timeout: 5_000 });
+    const text = await resolveColor(page, "var(--color-text)");
 
     await openModalFor(page, "member-list-owner");
     for (const tag of ["member-info-owner-tag", "member-info-invited-you-tag"]) {
-      const c = await chipColours(page.getByTestId(tag));
-      expect(c.chip, tag).toBe(c.text);
+      expect(await colourOf(page.getByTestId(tag)), tag).toEqual(text);
     }
     await page.getByTestId("member-info-close-button").click();
     await expect(page.getByTestId("member-info-modal")).toHaveCount(0, { timeout: 5_000 });
@@ -55,7 +39,6 @@ test.describe("Member-info modal tag chips", () => {
       timeout: 15_000,
     });
     await openModalFor(page, "member-list-impersonation-warning");
-    const warning = await chipColours(page.getByTestId("member-info-impersonation-tag"));
-    expect(warning.chip).not.toBe(warning.text);
+    expect(await colourOf(page.getByTestId("member-info-impersonation-tag"))).not.toEqual(text);
   });
 });
