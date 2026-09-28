@@ -508,12 +508,15 @@ function composerAutosizeCostTest() {
     await textarea.fill("a");
     expect(await height()).toBe(oneLine);
 
-    // A draft past the cap (half the viewport). CSS `max-height` holds the
-    // box at the cap, and typing on the draft's last line changes no content
-    // height, so it must still write nothing.
+    // A draft past the cap (half the viewport, 30% below the md breakpoint,
+    // where the on-screen keyboard also takes space). CSS `max-height` holds
+    // the box at the cap, and typing on the draft's last line changes no
+    // content height, so it must still write nothing.
     await textarea.fill(draftOf(60));
     const tall = await height();
-    const cap = await page.evaluate(() => window.innerHeight / 2);
+    const cap = await page.evaluate(
+      () => window.innerHeight * (window.innerWidth < 768 ? 0.3 : 0.5),
+    );
     expect(Math.abs(tall - cap)).toBeLessThanOrEqual(1);
     const tallTypingWrites = await writesDuring(async () => {
       await page.keyboard.type("xyz");

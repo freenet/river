@@ -309,7 +309,10 @@ pub fn MessageInput(
                             "data-testid": "message-input",
                             // `field-sizing-content` grows the box natively;
                             // `max-h-[50dvh]` caps it, or a long draft scrolls the
-                            // whole app shell, header and Send with it.
+                            // whole app shell, header and Send with it. Phones cap
+                            // at `30dvh`: `dvh` ignores the on-screen keyboard, so
+                            // half of it would leave almost no history visible
+                            // above the keyboard while a long draft is typed.
                             // `leading-6` is load-bearing on the JS fallback, not
                             // cosmetic: see `auto_resize_message_input`. It pins the
                             // line box to 24px so one line of text plus `py-2.5`
@@ -319,7 +322,7 @@ pub fn MessageInput(
                             // minimum, min-height takes over the box, and the
                             // in-place measurement stops working — costing an EXTRA
                             // forced layout per keystroke instead of saving one.
-                            class: "w-full px-4 py-2.5 leading-6 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-hidden focus:border-text transition-colors resize-none min-h-[44px] field-sizing-content max-h-[50dvh] overflow-y-auto",
+                            class: "w-full px-4 py-2.5 leading-6 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-hidden focus:border-text transition-colors resize-none min-h-[44px] field-sizing-content max-h-[30dvh] md:max-h-[50dvh] overflow-y-auto",
                             placeholder: "Type your message...",
                             value: "{message_text}",
                             rows: "1",
