@@ -1916,6 +1916,32 @@ fn first_history_row_identity() -> Option<(String, i32)> {
 #[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
+/// Where the view was last accounted for: both edges, because a resize moves only one of them.
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct ScrollMark {
+    top: std::cell::Cell<i32>,
+    height: std::cell::Cell<i32>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ScrollMark {
+    fn top(&self) -> i32 {
+        self.top.get()
+    }
+    fn bottom(&self) -> i32 {
+        self.top.get() + self.height.get()
+    }
+    fn record(&self, top: i32, height: i32) {
+        self.top.set(top);
+        self.height.set(height);
+    }
+    /// Content above the view moved by `delta`, which moves both edges.
+    fn shift(&self, delta: i32) {
+        self.top.set(self.top.get() + delta);
+    }
+}
+
 /// Has the view moved ABOVE the offset `last_top` records?
 ///
 /// `pinned_to_bottom` is only re-measured when a scroll SETTLES, so between the
@@ -1938,16 +1964,22 @@ const SCROLL_TOP_SLACK_PX: i32 = 2;
 /// therefore lands short until the next content change, which corrects it. Only
 /// the button animates; every automatic scroll is instant and lands within the
 /// same task.
+///
+/// Moved means BOTH edges went up: a reader scroll moves both, while a resize
+/// (the composer collapsing clamps `scrollTop`) moves only one.
 #[cfg(target_arch = "wasm32")]
-fn reader_moved_up_since(last_top: &Rc<std::cell::Cell<i32>>) -> bool {
+fn reader_moved_up_since(last_top: &Rc<ScrollMark>) -> bool {
     let Some(container) = chat_scroll_container() else {
         return false;
     };
-    // Never judge against an offset the container can no longer reach: if the
+    // Never judge against an edge the container can no longer reach: if the
     // history shrank, the browser clamped the position down on its own and that
     // is not the reader moving.
-    let reference = last_top.get().min(max_scroll_top(&container));
-    container.scroll_top() + SCROLL_TOP_SLACK_PX < reference
+    let top = container.scroll_top();
+    let bottom = top + container.client_height();
+    let top_was = last_top.top().min(max_scroll_top(&container));
+    let bottom_was = last_top.bottom().min(container.scroll_height());
+    top + SCROLL_TOP_SLACK_PX < top_was && bottom + SCROLL_TOP_SLACK_PX < bottom_was
 }
 
 /// Snap the history to its newest message.
@@ -1962,7 +1994,7 @@ fn reader_moved_up_since(last_top: &Rc<std::cell::Cell<i32>>) -> bool {
 #[cfg(target_arch = "wasm32")]
 fn scroll_history_to_bottom(
     pinned: &Rc<std::cell::Cell<bool>>,
-    last_top: &Rc<std::cell::Cell<i32>>,
+    last_top: &Rc<ScrollMark>,
     behavior: web_sys::ScrollBehavior,
 ) {
     let Some(container) = chat_scroll_container() else {
@@ -1970,7 +2002,7 @@ fn scroll_history_to_bottom(
         return;
     };
     pinned.set(true);
-    last_top.set(max_scroll_top(&container));
+    last_top.record(max_scroll_top(&container), container.client_height());
     let opts = web_sys::ScrollToOptions::new();
     opts.set_top(container.scroll_height() as f64);
     opts.set_behavior(behavior);
@@ -2014,7 +2046,7 @@ fn scroll_history_to_bottom(
 #[must_use]
 fn install_scroll_pin_listeners(
     pinned: Rc<std::cell::Cell<bool>>,
-    last_top: Rc<std::cell::Cell<i32>>,
+    last_top: Rc<ScrollMark>,
     window_items: Signal<usize>,
     window_anchor: Rc<std::cell::RefCell<Option<WindowAnchor>>>,
     window_overgrown: Rc<std::cell::Cell<bool>>,
@@ -2044,13 +2076,13 @@ fn install_scroll_pin_listeners(
                 return;
             };
             let settled_at = container.scroll_top();
-            let ours = (settled_at - last_top.get()).abs() <= SCROLL_TOP_SLACK_PX;
+            let ours = (settled_at - last_top.top()).abs() <= SCROLL_TOP_SLACK_PX;
             // Where the view ended up is a fact whoever caused it, and it is
             // what everything else compares against. Recorded before the
             // `ours` early-out on purpose: the version that only recorded it
             // for reader settles is what let a stale offset suppress the
             // follow indefinitely.
-            last_top.set(settled_at);
+            last_top.record(settled_at, container.client_height());
             let distance = container.scroll_height() as f64
                 - settled_at as f64
                 - container.client_height() as f64;
@@ -2332,7 +2364,7 @@ pub fn Conversation() -> Element {
     // until the settle lands. Only the browser has scroll positions, hence the
     // gate. See `install_scroll_pin_listeners`.
     #[cfg(target_arch = "wasm32")]
-    let last_scroll_top = use_hook(|| Rc::new(std::cell::Cell::new(0i32)));
+    let last_scroll_top = use_hook(|| Rc::new(ScrollMark::default()));
 
     // Re-window when the reader opens a DIFFERENT room. The window means "how
     // far back have I looked in THIS room", so carrying it across rooms would
@@ -2475,7 +2507,7 @@ pub fn Conversation() -> Element {
                 // follow paths drag them to the bottom (#505 delta review).
                 // Relative keeps the gap, and keeps this settle readable as
                 // the reader's so the pin resolves honestly.
-                last_scroll_top.set(last_scroll_top.get() + shift);
+                last_scroll_top.shift(shift);
                 container.set_scroll_top(target);
             }
         });
@@ -2853,7 +2885,7 @@ pub fn Conversation() -> Element {
             // `pinned == false` no animation can be in flight, so an unpinned
             // reader whose patch pulled `max_scroll_top` under their recorded
             // offset still gets compensated.
-            if pinned_to_bottom.get() && last_scroll_top.get() >= max_scroll_top(&container) {
+            if pinned_to_bottom.get() && last_scroll_top.top() >= max_scroll_top(&container) {
                 return;
             }
             let Some(post_top) = history_row_offset_top(&key) else {
@@ -2883,7 +2915,7 @@ pub fn Conversation() -> Element {
                 // whose settle already landed the two move together, so it
                 // reads as ours and leaves their (already correct) pin
                 // alone.
-                last_scroll_top.set(last_scroll_top.get() + shift);
+                last_scroll_top.shift(shift);
                 container.set_scroll_top(target);
             }
         });
@@ -3100,7 +3132,7 @@ pub fn Conversation() -> Element {
                 // read it as "the reader has scrolled up" and stand the follow
                 // down. Zero is the "no constraint yet" value it starts at.
                 #[cfg(target_arch = "wasm32")]
-                last_scroll_top.set(0);
+                last_scroll_top.record(0, 0);
             }
         });
     }
@@ -9036,8 +9068,8 @@ mod autoscroll_wiring_pins {
                 .find(needle)
                 .unwrap_or_else(|| panic!("the settle handler must contain `{needle}`"))
         };
-        let decide = at("letours=(settled_at-last_top.get()).abs()<=SCROLL_TOP_SLACK_PX;");
-        let record = at("last_top.set(settled_at);");
+        let decide = at("letours=(settled_at-last_top.top()).abs()<=SCROLL_TOP_SLACK_PX;");
+        let record = at("last_top.record(settled_at,container.client_height());");
         let early_out = at("ifours{return;}");
         assert!(
             decide < record && record < early_out,
@@ -9277,9 +9309,7 @@ mod autoscroll_wiring_pins {
         // reader to the bottom (#505 delta review). Two call sites: the head
         // reposition and the backfill restore.
         assert_eq!(
-            dense
-                .matches("last_scroll_top.set(last_scroll_top.get()+shift);")
-                .count(),
+            dense.matches("last_scroll_top.shift(shift);").count(),
             2,
             "both the head reposition and the backfill restore must update \
              `last_scroll_top` RELATIVELY — an absolute write erases the \

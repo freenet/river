@@ -404,6 +404,53 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     );
   });
 
+  test("follows history that grows in the same frame the composer collapses", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    const roomyViewport = await viewportHeight(page);
+    await page.evaluate(() => {
+      const seq = ((window as any).__riverScrollSeq = { n: 0, scroll: 0, settle: 0 });
+      const c = document.getElementById("chat-scroll-container")!;
+      c.addEventListener("scroll", () => (seq.scroll = ++seq.n));
+      c.addEventListener("scrollend", () => (seq.settle = ++seq.n));
+    });
+    await page.getByTestId("message-input")
+      .fill(Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n"));
+    await expect.poll(() => viewportHeight(page), { timeout: 5_000 })
+      .toBeLessThan(roomyViewport - BOTTOM_THRESHOLD_PX);
+    await expectSettledAtBottom(page, "the composer grew and the view did not follow it");
+    // A follow still settling would re-record the mark after the clamp below and hide the race.
+    await page.waitForFunction(() => {
+      const s = (window as any).__riverScrollSeq;
+      return s.scroll > 0 && s.settle > s.scroll;
+    }, undefined, { timeout: 5_000 });
+
+    // On `document`, so it runs after the app's own input handler has collapsed the composer, before any frame.
+    const GROWTH_PX = 80; // under BOTTOM_THRESHOLD_PX: the pin stays armed, so only reader_moved_up_since can refuse
+    await page.evaluate(({ grow, collapsedAbove }) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const rows = c.querySelectorAll("[data-item-key]");
+      const newest = rows[rows.length - 1] as HTMLElement;
+      const onInput = () => {
+        if (c.clientHeight <= collapsedAbove) return; // this read forces the collapse and the scrollTop clamp
+        document.removeEventListener("input", onInput);
+        const gap = c.scrollHeight - c.scrollTop - c.clientHeight;
+        const before = c.scrollHeight;
+        newest.style.paddingBottom = `${grow}px`;
+        (window as any).__riverSameFrame = { gap, grew: c.scrollHeight - before };
+      };
+      document.addEventListener("input", onInput);
+    }, { grow: GROWTH_PX, collapsedAbove: roomyViewport - BOTTOM_THRESHOLD_PX });
+    await page.getByTestId("message-input").fill("");
+
+    const premise = await (await page.waitForFunction(
+      () => (window as any).__riverSameFrame, undefined, { timeout: 5_000 })).jsonValue();
+    expect(premise.gap, "premise: the collapse should leave the view clamped to the bottom")
+      .toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
+    expect(premise.grew, "premise: the newest row should have grown").toBeGreaterThan(GROWTH_PX / 2);
+    await expectSettledAtBottom(page,
+      "the history grew in the same frame the composer collapsed and the view did not follow it");
+  });
+
   test("does not drag a parked reader down when a resize reflows the history", async ({
     page,
   }) => {
