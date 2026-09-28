@@ -1,5 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 import { waitForApp, selectRoom } from "./example-room";
+import { callRiverTest } from "./river-test";
 
 // Copy test for the invite-member modal's guidance blocks.
 //
@@ -56,5 +57,53 @@ test.describe("Invite-member modal guidance copy", { tag: "@chromium-only" }, ()
     expect(recBox).not.toBeNull();
     expect(warnBox).not.toBeNull();
     expect(recBox!.y).toBeLessThan(warnBox!.y);
+  });
+});
+
+test.describe("Invite-member modal lifecycle", { tag: "@chromium-only" }, () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  // Records every needle that ever appears in the page text, however briefly.
+  async function watchForText(page: Page, needles: string[]) {
+    await page.evaluate((needles) => {
+      const seen: string[] = ((window as any).__seenText = []);
+      new MutationObserver(() => {
+        const text = document.body.innerText;
+        for (const n of needles) if (text.includes(n) && !seen.includes(n)) seen.push(n);
+      }).observe(document.body, { childList: true, subtree: true, characterData: true });
+    }, needles);
+    return () => page.evaluate(() => (window as any).__seenText as string[]);
+  }
+
+  // The invitation resource used to run while the modal was closed, so opening it first showed that run's error.
+  test("opening it never shows a stale error", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    const seen = await watchForText(page, ["Modal closed", "Try Again"]);
+    await openInviteModal(page); // waits for the link
+    expect(await seen()).toEqual([]);
+  });
+
+  test("New Invitation replaces the link", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openInviteModal(page);
+    const link = page.getByTestId("invite-link-input");
+    const first = await link.inputValue();
+    await page.getByTestId("invite-new-invitation-button").click();
+    await expect(link).not.toHaveValue(first, { timeout: 10_000 });
+  });
+
+  test("an arriving message does not replace the link", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openInviteModal(page);
+    const link = page.getByTestId("invite-link-input");
+    const first = await link.inputValue();
+    await callRiverTest(page, "appendMessage", "arrived while inviting");
+    await expect(page.getByText("arrived while inviting")).toBeAttached({ timeout: 5_000 });
+    // Fixed hold: proving the link does NOT change needs a wait; a local re-mint lands well inside it.
+    await page.waitForTimeout(600);
+    await expect(link).toHaveValue(first);
   });
 });

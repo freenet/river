@@ -7,7 +7,6 @@ use dioxus_free_icons::icons::fa_solid_icons::{FaArrowsRotate, FaCopy, FaXmark};
 use dioxus_free_icons::Icon;
 use ed25519_dalek::SigningKey;
 use river_core::room_state::member::{AuthorizedMember, Member};
-use std::rc::Rc;
 
 /// Fallback URL for non-browser environments or when `window.location` is
 /// unavailable. This is ONLY reached off the browser (native/test builds) or
@@ -50,11 +49,69 @@ pub(crate) fn get_invitation_base_url() -> String {
     }
 }
 
+async fn create_invitation(room_data: Option<RoomData>) -> Result<Invitation, String> {
+    let Some(room_data) = room_data else {
+        return Err("No room selected".to_string());
+    };
+    // Issuing an invitation signs the invitee's `Member` record
+    // with the inviter's key, so this whole path needs the
+    // private half. Surface it as a normal resource error (the
+    // modal already renders `Err(String)`) rather than panicking.
+    let Some(self_sk) = room_data.signing_key().cloned() else {
+        return Err(
+            "The local signing key for this room is unavailable, so an invitation cannot be created."
+                .to_string(),
+        );
+    };
+    // Generate new signing key for invitee
+    let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let invitee_verifying_key = invitee_signing_key.verifying_key();
+
+    // Create member struct
+    let member = Member {
+        owner_member_id: room_data.owner_vk.into(),
+        invited_by: self_sk.verifying_key().into(),
+        member_vk: invitee_verifying_key,
+    };
+
+    // Serialize member to CBOR for signing
+    let mut member_bytes = Vec::new();
+    ciborium::ser::into_writer(&member, &mut member_bytes)
+        .map_err(|e| format!("Failed to serialize member: {}", e))?;
+
+    // Sign using delegate with fallback to local signing
+    let signature =
+        crate::signing::sign_member_with_fallback(room_data.room_key(), member_bytes, &self_sk)
+            .await;
+
+    // Create authorized member with pre-computed signature
+    let authorized_member = AuthorizedMember::with_signature(member, signature);
+
+    // For a private room, embed the room secrets the inviter
+    // holds so the invitee can decrypt the room immediately on
+    // join, without waiting for the owner delegate's
+    // `encrypted_secrets` back-fill. Empty for a public room,
+    // or if the inviter holds no secret yet (then the invitee
+    // falls back to that wait).
+    let room_secrets = if room_data.is_private() {
+        collect_invitation_secrets(&room_data.secrets)
+    } else {
+        Vec::new()
+    };
+
+    // Create invitation
+    let invitation = Invitation {
+        room: room_data.owner_vk,
+        invitee_signing_key,
+        invitee: authorized_member,
+        room_secrets,
+    };
+
+    Ok(invitation)
+}
+
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
-    // Add a signal to track when a new invitation is generated
-    let regenerate_trigger = use_signal(|| 0);
-
     let current_room_data_signal: Memo<Option<RoomData>> = use_memo(move || {
         // freenet/river#555: anchor before the fallible ROOMS read.
         crate::util::signal_guard::anchor();
@@ -69,79 +126,6 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                     None
                 }
             })
-    });
-
-    let invitation_future = use_resource(move || {
-        let _trigger = *regenerate_trigger.read(); // Use underscore to indicate intentional unused variable
-                                                   // Using trigger value to force re-execution when regenerate_trigger changes
-        async move {
-            if !*is_active.read() {
-                return Err("Modal closed".to_string());
-            }
-            let room_data = current_room_data_signal();
-            if let Some(room_data) = room_data {
-                // Issuing an invitation signs the invitee's `Member` record
-                // with the inviter's key, so this whole path needs the
-                // private half. Surface it as a normal resource error (the
-                // modal already renders `Err(String)`) rather than panicking.
-                let Some(self_sk) = room_data.signing_key().cloned() else {
-                    return Err(
-                        "The local signing key for this room is unavailable, so an invitation cannot be created."
-                            .to_string(),
-                    );
-                };
-                // Generate new signing key for invitee
-                let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
-                let invitee_verifying_key = invitee_signing_key.verifying_key();
-
-                // Create member struct
-                let member = Member {
-                    owner_member_id: room_data.owner_vk.into(),
-                    invited_by: self_sk.verifying_key().into(),
-                    member_vk: invitee_verifying_key,
-                };
-
-                // Serialize member to CBOR for signing
-                let mut member_bytes = Vec::new();
-                ciborium::ser::into_writer(&member, &mut member_bytes)
-                    .map_err(|e| format!("Failed to serialize member: {}", e))?;
-
-                // Sign using delegate with fallback to local signing
-                let signature = crate::signing::sign_member_with_fallback(
-                    room_data.room_key(),
-                    member_bytes,
-                    &self_sk,
-                )
-                .await;
-
-                // Create authorized member with pre-computed signature
-                let authorized_member = AuthorizedMember::with_signature(member, signature);
-
-                // For a private room, embed the room secrets the inviter
-                // holds so the invitee can decrypt the room immediately on
-                // join, without waiting for the owner delegate's
-                // `encrypted_secrets` back-fill. Empty for a public room,
-                // or if the inviter holds no secret yet (then the invitee
-                // falls back to that wait).
-                let room_secrets = if room_data.is_private() {
-                    collect_invitation_secrets(&room_data.secrets)
-                } else {
-                    Vec::new()
-                };
-
-                // Create invitation
-                let invitation = Invitation {
-                    room: room_data.owner_vk,
-                    invitee_signing_key,
-                    invitee: authorized_member,
-                    room_secrets,
-                };
-
-                Ok::<Invitation, String>(invitation)
-            } else {
-                Err("No room selected".to_string())
-            }
-        }
     });
 
     if !*is_active.read() {
@@ -171,117 +155,134 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
                     }
                 }
 
-                // Body
+                // Body. Mounted only while the modal is open, so every open
+                // starts a fresh invitation from nothing.
                 div { class: "px-6 py-4",
-                    match &*invitation_future.read_unchecked() {
-                        Some(Ok(invitation)) => {
-                            let room_name = current_room_data_signal()
-                                .map(|r| {
-                                    let sealed_name = &r.room_state.configuration.configuration.display.name;
-                                    match unseal_bytes_with_secrets(sealed_name, &r.secrets) {
-                                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                                        Err(_) => sealed_name.to_string_lossy(),
-                                    }
-                                })
-                                .unwrap_or_else(|| "this chat room".to_string());
-
-                            let invite_code = invitation.to_encoded_string();
-                            let base_url = get_invitation_base_url();
-                            let invite_url = format!("{}?invitation={}", base_url, invite_code);
-
-                            let default_msg = format!(
-                                "You've been invited to join the chat room \"{}\"!\n\n\
-                                To join:\n\
-                                1. Install Freenet from https://freenet.org\n\
-                                2. Open this link:\n\
-                                {}\n\n\
-                                IMPORTANT: This invitation is for you only — do not share it with anyone else. \
-                                It contains a unique identity key. If someone else uses this link, you will both \
-                                share the same identity and neither will work correctly.",
-                                room_name, invite_url
-                            );
-
-                            rsx! {
-                                // Recommended path first: ask, then send the
-                                // invitation as a DM via the built-in
-                                // "Share invite" flow (#252, #457). It hands
-                                // the recipient a one-click Accept card and
-                                // never puts a bearer credential through an
-                                // outside channel, so it belongs ABOVE the
-                                // link/code it is meant to displace.
-                                div {
-                                    "data-testid": "invite-dm-recommendation",
-                                    class: "mb-4 p-3 bg-accent-soft border-l-4 border-accent rounded-r-lg",
-                                    p { class: "text-sm text-text",
-                                        span { class: "font-medium", "Best way to invite someone: send the invitation in a DM. " }
-                                        "Ask whether they'd like to join first. Then, in any room you already share with them, click their name in the member list, choose "
-                                        span { class: "font-medium", "Share invite" }
-                                        ", and pick this room. River drops an invitation card into your DM thread that they accept in one click — nothing to copy, paste, or leak."
-                                    }
-                                }
-
-                                // Fallback path (no shared room yet): the
-                                // link/code below are bearer credentials — a
-                                // single reusable identity — hence the
-                                // one-person-only warning.
-                                div {
-                                    "data-testid": "invite-share-warning",
-                                    class: "mb-4 p-3 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
-                                    p { class: "text-sm text-text",
-                                        span { class: "font-medium", "No DM yet? Share the link or code below privately, with one person only. " }
-                                        "Each invitation creates a unique identity and is good for exactly one person. If two people use the same link or code, they share one identity and neither works correctly. Click "
-                                        span { class: "font-medium", "New Invitation" }
-                                        " for every additional person."
-                                    }
-                                }
-
-                                InvitationContent {
-                                    invitation_text: default_msg,
-                                    invitation_url: invite_url.clone(),
-                                    invitation_code: invite_code.clone(),
-                                    invitation: Rc::new(invitation.clone()),
-                                    is_active: is_active,
-                                    regenerate_trigger: regenerate_trigger
-                                }
-                            }
-                        }
-                        Some(Err(err)) => {
-                            rsx! {
-                                div { class: "text-center py-8",
-                                    p { class: "text-red-500 mb-4", "{err}" }
-                                    button {
-                                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
-                                        onclick: move |_| {
-                                            is_active.set(false);
-                                            is_active.set(true);
-                                        },
-                                        "Try Again"
-                                    }
-                                }
-                            }
-                        },
-                        None => {
-                            rsx! {
-                                div { class: "text-center py-8",
-                                    div { class: "w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto mb-4" }
-                                    p { class: "text-text-muted", "Generating invitation..." }
-                                }
-                            }
-                        }
-                    }
+                    InviteMemberBody { is_active, room: current_room_data_signal }
                 }
             }
         }
     }
 }
+
+#[component]
+fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> Element {
+    // Subscribe to the room only while it is unknown: a transient `None` retries,
+    // and later room updates never re-mint the link.
+    let mut invitation_future = use_resource(move || async move {
+        let known = room.peek().clone();
+        let room_data = if known.is_some() { known } else { room() };
+        create_invitation(room_data).await
+    });
+
+    match &*invitation_future.read_unchecked() {
+        Some(Ok(invitation)) => {
+            let room_name = room()
+                .map(|r| {
+                    let sealed_name = &r.room_state.configuration.configuration.display.name;
+                    match unseal_bytes_with_secrets(sealed_name, &r.secrets) {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                        Err(_) => sealed_name.to_string_lossy(),
+                    }
+                })
+                .unwrap_or_else(|| "this chat room".to_string());
+
+            let invite_code = invitation.to_encoded_string();
+            let base_url = get_invitation_base_url();
+            let invite_url = format!("{}?invitation={}", base_url, invite_code);
+
+            let default_msg = format!(
+                "You've been invited to join the chat room \"{}\"!\n\n\
+                To join:\n\
+                1. Install Freenet from https://freenet.org\n\
+                2. Open this link:\n\
+                {}\n\n\
+                IMPORTANT: This invitation is for you only — do not share it with anyone else. \
+                It contains a unique identity key. If someone else uses this link, you will both \
+                share the same identity and neither will work correctly.",
+                room_name, invite_url
+            );
+
+            rsx! {
+                // Recommended path first: ask, then send the
+                // invitation as a DM via the built-in
+                // "Share invite" flow (#252, #457). It hands
+                // the recipient a one-click Accept card and
+                // never puts a bearer credential through an
+                // outside channel, so it belongs ABOVE the
+                // link/code it is meant to displace.
+                div {
+                    "data-testid": "invite-dm-recommendation",
+                    class: "mb-4 p-3 bg-accent-soft border-l-4 border-accent rounded-r-lg",
+                    p { class: "text-sm text-text",
+                        span { class: "font-medium", "Best way to invite someone: send the invitation in a DM. " }
+                        "Ask whether they'd like to join first. Then, in any room you already share with them, click their name in the member list, choose "
+                        span { class: "font-medium", "Share invite" }
+                        ", and pick this room. River drops an invitation card into your DM thread that they accept in one click — nothing to copy, paste, or leak."
+                    }
+                }
+
+                // Fallback path (no shared room yet): the
+                // link/code below are bearer credentials — a
+                // single reusable identity — hence the
+                // one-person-only warning.
+                div {
+                    "data-testid": "invite-share-warning",
+                    class: "mb-4 p-3 bg-warning-bg border-l-4 border-yellow-500 rounded-r-lg",
+                    p { class: "text-sm text-text",
+                        span { class: "font-medium", "No DM yet? Share the link or code below privately, with one person only. " }
+                        "Each invitation creates a unique identity and is good for exactly one person. If two people use the same link or code, they share one identity and neither works correctly. Click "
+                        span { class: "font-medium", "New Invitation" }
+                        " for every additional person."
+                    }
+                }
+
+                InvitationContent {
+                    invitation_text: default_msg,
+                    invitation_url: invite_url,
+                    invitation_code: invite_code,
+                    is_active,
+                    // Clear first, so the old link can't be copied while the new one is signed.
+                    on_new_invitation: move |_| {
+                        invitation_future.clear();
+                        invitation_future.restart();
+                    }
+                }
+            }
+        }
+        Some(Err(err)) => {
+            rsx! {
+                div { class: "text-center py-8",
+                    p { class: "text-red-500 mb-4", "{err}" }
+                    button {
+                        class: "px-4 py-2 bg-surface hover:bg-surface-hover text-text rounded-lg transition-colors",
+                        onclick: move |_| {
+                            invitation_future.clear();
+                            invitation_future.restart();
+                        },
+                        "Try Again"
+                    }
+                }
+            }
+        }
+        None => {
+            rsx! {
+                div { class: "text-center py-8",
+                    div { class: "w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto mb-4" }
+                    p { class: "text-text-muted", "Generating invitation..." }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn InvitationContent(
     invitation_text: String,
     invitation_url: String,
     invitation_code: String,
-    invitation: Rc<Invitation>,
     is_active: Signal<bool>,
-    regenerate_trigger: Signal<i32>,
+    on_new_invitation: EventHandler<()>,
 ) -> Element {
     let mut copy_msg_text = use_signal(|| "Copy Message".to_string());
     let mut copy_link_text = use_signal(|| "Copy Link".to_string());
@@ -397,8 +398,7 @@ fn InvitationContent(
                     copy_msg_text.set("Copy Message".to_string());
                     copy_link_text.set("Copy Link".to_string());
                     copy_code_text.set("Copy Code".to_string());
-                    let current_value = *regenerate_trigger.read();
-                    regenerate_trigger.set(current_value + 1);
+                    on_new_invitation.call(());
                 },
                 Icon { icon: FaArrowsRotate, width: 14, height: 14 }
                 span { "New Invitation" }
@@ -410,5 +410,26 @@ fn InvitationContent(
                 "Close"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_invitation;
+    use futures::executor::block_on;
+
+    // Refused before signing (which reads the `WEB_API` global), so no Dioxus runtime is needed.
+    #[test]
+    fn a_room_without_a_local_key_is_refused_before_signing() {
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key();
+        let mut room = crate::room_data::test_minimal_room_data(owner);
+        room.self_sk = None;
+        let refused = block_on(create_invitation(Some(room))).err();
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|e| e.contains("local signing key for this room is unavailable")),
+            "got {refused:?}"
+        );
     }
 }
