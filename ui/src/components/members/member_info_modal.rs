@@ -40,7 +40,7 @@ impl PartialEq<MemberId> for SelfMemberId {
     }
 }
 
-/// `px-3 py-[5px]` on every member-info chip; the colour is set per chip.
+/// Shape shared by every member-info chip; each chip adds its own colours.
 const TAG_CHIP_CLASS: &str =
     "inline-flex items-center px-3 py-[5px] rounded-full text-sm font-medium";
 
@@ -536,7 +536,7 @@ pub fn MemberInfoModal() -> Element {
                             if impersonation.is_some() {
                                 span {
                                     "data-testid": "member-info-impersonation-tag",
-                                    // Amber text kept: it carries the warning.
+                                    // Amber, not `text-text`: the colour is the warning.
                                     class: "{TAG_CHIP_CLASS} bg-amber-500/20 text-amber-400",
                                     title: "{impersonation_tooltip}",
                                     "aria-label": "{impersonation_tooltip}",

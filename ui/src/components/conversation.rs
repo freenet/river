@@ -3888,7 +3888,8 @@ pub fn Conversation() -> Element {
                                 // `<button>` per the HTML spec. Nesting also bubbles link
                                 // clicks to the modal-opening onclick handler.
                                 div { class: "min-w-0 flex-1",
-                                    // Title on the left; `ml-auto` on the (i) pushes (i) and the bell to the right edge.
+                                    // Title on the left; `ml-auto` on the (i) pushes (i)
+                                    // and the bell to the right edge.
                                     div { class: "flex items-center gap-1 min-w-0",
                                         button {
                                             // `md:-ml-3` pulls only the LEFT hover edge outward on

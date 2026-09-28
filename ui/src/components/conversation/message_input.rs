@@ -29,7 +29,8 @@ fn measure_draft(text: &str, reply: Option<&ReplyContext>, is_private: bool) -> 
     }
 }
 
-/// Size the composer to its content on engines without `field-sizing: content` (Firefox ESR 140 / Tor Browser, Safari < 26.2); CSS `max-height` is the cap.
+/// Size the composer to its content on engines without `field-sizing: content`
+/// (Firefox ESR 140 / Tor Browser, Safari < 26.2). CSS `max-height` is the cap.
 ///
 /// This runs on every keystroke, so the DOM access pattern is the whole cost.
 /// Collapsing to `height: auto` before every measurement — the obvious
@@ -78,12 +79,12 @@ fn measure_draft(text: &str, reply: Option<&ReplyContext>, is_private: bool) -> 
 /// explicit `leading-6` on the textarea is what keeps one line above the
 /// minimum at every body font size. Do not remove it as "cosmetic".
 ///
-/// Pinned by the Playwright test `Composer auto-resize cost (#468)`, which runs
-/// at BOTH a desktop and a phone viewport and asserts `scrollHeight >
-/// clientHeight` before relying on it — pinning one viewport is what let the
-/// mobile regression through, since `test.use({viewport})` overrides the
-/// project's device viewport and so varies the engine without varying the
-/// layout regime.
+/// Pinned by the Playwright test `Composer auto-resize cost (#468, JS
+/// fallback)`, which runs at BOTH a desktop and a phone viewport and asserts
+/// `scrollHeight > clientHeight` before relying on it — pinning one viewport
+/// is what let the mobile regression through, since `test.use({viewport})`
+/// overrides the project's device viewport and so varies the engine without
+/// varying the layout regime.
 fn auto_resize_message_input() {
     let Some(el) = get_message_textarea() else {
         return;
@@ -93,8 +94,9 @@ fn auto_resize_message_input() {
     }
     let style = el.style();
 
-    // Both reads come off one layout; no write separates them.
+    // The reads come off one layout; no write separates them.
     let scroll_height = el.scroll_height();
+    let cap = max_height_px(&el);
     let content_height = if scroll_height > el.client_height() {
         scroll_height
     } else {
@@ -110,8 +112,8 @@ fn auto_resize_message_input() {
         style.set_property("height", &target).ok();
     }
 
-    // Scroll inside only once `max-height` holds the box below its content.
-    let overflow = if max_height_px(&el).is_some_and(|cap| f64::from(content_height) >= cap) {
+    // Below the cap, `hidden` removes the border slack's ~2px scroll range.
+    let overflow = if cap.is_some_and(|max| f64::from(content_height) >= max) {
         "auto"
     } else {
         "hidden"
@@ -121,31 +123,31 @@ fn auto_resize_message_input() {
     }
 }
 
-/// Computed `field-sizing == "content"`, cached on the first call. A stylesheet
-/// can force `fixed` before that call; `CSS.supports` could not.
+/// Computed `field-sizing == "content"`, cached on the first call. Computed style,
+/// not `CSS.supports`, so a stylesheet (the #468 test's) can force the fallback.
 fn sizes_itself(el: &web_sys::HtmlTextAreaElement) -> bool {
     thread_local! {
         static NATIVE: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
     }
     NATIVE.with(|native| {
-        *native.get_or_init(|| {
-            web_sys::window()
-                .and_then(|w| w.get_computed_style(el).ok().flatten())
-                .and_then(|s| s.get_property_value("field-sizing").ok())
-                .is_some_and(|v| v == "content")
-        })
+        *native.get_or_init(|| computed_style(el, "field-sizing").is_some_and(|v| v == "content"))
     })
 }
 
 /// The composer's resolved `max-height` in px, or `None` for `none`.
 fn max_height_px(el: &web_sys::HtmlTextAreaElement) -> Option<f64> {
+    computed_style(el, "max-height")?
+        .strip_suffix("px")?
+        .parse()
+        .ok()
+}
+
+/// One computed-style property of `el`, or `None` if it can't be read.
+fn computed_style(el: &web_sys::Element, prop: &str) -> Option<String> {
     web_sys::window()?
         .get_computed_style(el)
         .ok()??
-        .get_property_value("max-height")
-        .ok()?
-        .strip_suffix("px")?
-        .parse()
+        .get_property_value(prop)
         .ok()
 }
 
@@ -204,7 +206,7 @@ pub fn MessageInput(
         message_text.set(format!("{}{}", current, emoji));
     };
 
-    // One measurement per render, for the counter and Send; sending re-measures at the click.
+    // Once per render, for the counter and Send; `send_message` re-measures on click.
     let encoded_bytes = measure_draft(
         &message_text.read(),
         replying_to.read().as_ref(),
@@ -305,16 +307,18 @@ pub fn MessageInput(
                         textarea {
                             id: "message-input",
                             "data-testid": "message-input",
-                            // `field-sizing-content` sizes the box natively; `leading-6` matters on the JS fallback.
-                            // `leading-6` is load-bearing, not cosmetic: see
-                            // `auto_resize_message_input`. It pins the line box to
-                            // 24px so one line of text plus `py-2.5` always exceeds
-                            // `min-h-[44px]`, at every body font size. Without it the
-                            // mobile font clamp (`tailwind.css`: 13px below 768px)
-                            // leaves the natural height under the minimum, min-height
-                            // takes over the box, and the in-place measurement stops
-                            // working — costing an EXTRA forced layout per keystroke
-                            // instead of saving one.
+                            // `field-sizing-content` grows the box natively;
+                            // `max-h-[50dvh]` caps it, or a long draft scrolls the
+                            // whole app shell, header and Send with it.
+                            // `leading-6` is load-bearing on the JS fallback, not
+                            // cosmetic: see `auto_resize_message_input`. It pins the
+                            // line box to 24px so one line of text plus `py-2.5`
+                            // always exceeds `min-h-[44px]`, at every body font size.
+                            // Without it the mobile font clamp (`tailwind.css`: 13px
+                            // below 768px) leaves the natural height under the
+                            // minimum, min-height takes over the box, and the
+                            // in-place measurement stops working — costing an EXTRA
+                            // forced layout per keystroke instead of saving one.
                             class: "w-full px-4 py-2.5 leading-6 bg-surface border border-border rounded-xl text-text placeholder-text-muted focus:outline-hidden focus:border-text transition-colors resize-none min-h-[44px] field-sizing-content max-h-[50dvh] overflow-y-auto",
                             placeholder: "Type your message...",
                             value: "{message_text}",
