@@ -1,5 +1,6 @@
 import { test, expect, Page } from "@playwright/test";
 import { waitForApp, selectRoom } from "./example-room";
+import { callRiverTest } from "./river-test";
 
 // Copy test for the invite-member modal's guidance blocks.
 //
@@ -98,5 +99,18 @@ test.describe("Invite-member modal while the invitation is created", () => {
     await expect(link).not.toHaveValue(first, { timeout: 10_000 });
     await expect(link).not.toHaveValue("");
     expect(await page.evaluate(() => (window as any).__seenInviteText)).toEqual([]);
+  });
+
+  test("an arriving message does not replace the link", { tag: "@chromium-only" }, async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openInviteModal(page);
+    const link = page.getByTestId("invite-link-input");
+    const first = await link.inputValue();
+    await callRiverTest(page, "appendMessage", "arrived while inviting");
+    await expect(page.getByText("arrived while inviting")).toBeAttached({ timeout: 5_000 });
+    // Fixed hold: proving the link does NOT change needs a wait; a local re-mint lands well inside it.
+    await page.waitForTimeout(600);
+    await expect(link).toHaveValue(first);
   });
 });

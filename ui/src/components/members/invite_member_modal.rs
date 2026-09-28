@@ -167,8 +167,12 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
 #[component]
 fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> Element {
-    let mut invitation_future =
-        use_resource(move || async move { create_invitation(room()).await });
+    // Subscribe only while the room is unknown: a transient `None` retries, and later room updates never re-mint.
+    let mut invitation_future = use_resource(move || async move {
+        let known = room.peek().clone();
+        let room_data = if known.is_some() { known } else { room() };
+        create_invitation(room_data).await
+    });
 
     match &*invitation_future.read_unchecked() {
         Some(Ok(invitation)) => {
