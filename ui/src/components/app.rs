@@ -7,7 +7,6 @@ pub mod sync_info;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::document_title::DocumentTitleUpdater;
-use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
 use crate::components::direct_messages::{DmThreadModal, InviteViaDmPickerModal};
@@ -31,7 +30,6 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
 use river_core::room_state::member::MemberId;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
 
 /// Which panel is visible on mobile (<md). On desktop all panels are always visible.
@@ -54,8 +52,14 @@ pub static NOTIFICATION_MODAL: GlobalSignal<NotificationModalSignal> =
 pub static CREATE_ROOM_MODAL: GlobalSignal<CreateRoomModalSignal> =
     Global::new(|| CreateRoomModalSignal { show: false });
 pub static PENDING_INVITES: GlobalSignal<PendingInvites> = Global::new(PendingInvites::new);
-pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> =
-    Global::new(|| SynchronizerStatus::Connecting);
+// no-sync builds never start the synchronizer, so they are Disconnected for good.
+pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> = Global::new(|| {
+    if cfg!(feature = "no-sync") {
+        SynchronizerStatus::Disconnected
+    } else {
+        SynchronizerStatus::Connecting
+    }
+});
 pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> = Global::new(FreenetSynchronizer::new);
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
@@ -223,7 +227,8 @@ pub fn App() -> Element {
     get_auth_token_from_window();
 
     // Start synchronizer - auth token is already available
-    spawn_local(async {
+    #[cfg(not(feature = "no-sync"))]
+    wasm_bindgen_futures::spawn_local(async {
         debug!("Starting FreenetSynchronizer from App component");
         // Note: The synchronizer will set up the chat delegate after connection is established
         let mut synchronizer = SYNCHRONIZER.write();
@@ -472,6 +477,7 @@ pub fn App() -> Element {
 
     #[cfg(not(feature = "no-sync"))]
     {
+        use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
         // The synchronizer is now started in the auth token effect
 
         // Watch NEEDS_SYNC signal for USER-initiated changes only
