@@ -48,6 +48,9 @@ const BOTTOM_THRESHOLD_PX = 100;
 /// Slack for fractional layout after a scroll that did land at the bottom.
 const AT_BOTTOM_EPSILON_PX = 4;
 
+/// A draft long enough to grow the composer past its 168px cap.
+const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
+
 /// scrollHeight - scrollTop - clientHeight: how far the end of the history is
 /// below the visible area. 0 means the newest message is fully in view.
 function distanceFromBottom(page: Page): Promise<number> {
@@ -139,21 +142,24 @@ async function readerScrollsTo(page: Page, top: number) {
 /// the content on Firefox, and find-in-page, focus-driven scrolling and browser
 /// scroll restoration produce none either. Nothing in the implementation
 /// listens for gestures — whose settle it is, is decided by where the view came
-/// to rest — so this is the ordinary path rather than a fallback, and these two
-/// helpers should behave identically.
+/// to rest — so this is the ordinary path rather than a fallback. Unlike
+/// `readerScrollsTo`, this helper waits for `scrollend` because the pin
+/// re-arms there, so an arrival before that races the handler. The pre-settle
+/// window is still covered on purpose by the batched at-cap test, which
+/// deliberately does not wait.
 async function readerScrollsWithoutGesture(page: Page, top: number) {
-  await page.evaluate((t) => {
-    document.getElementById("chat-scroll-container")!.scrollTop = t;
-  }, top);
-}
-
-/// Same, but resolves once the scroll has SETTLED: the pin re-arms on `scrollend`, so an arrival before that races the handler.
-async function readerScrollsWithoutGestureAndSettles(page: Page, top: number) {
   await page.evaluate(async (t) => {
     const el = document.getElementById("chat-scroll-container")!;
     const settled = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
-      el.addEventListener("scrollend", () => { clearTimeout(timer); resolve(); }, { once: true });
+      el.addEventListener(
+        "scrollend",
+        () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        { once: true },
+      );
     });
     el.scrollTop = t;
     await settled;
@@ -193,9 +199,7 @@ test.describe("Conversation follows new messages (#486)", () => {
     // — so the old gate latched with no network activity at all. This is why
     // #468 (the composer auto-resize) is a CAUSE of #486 rather than only a
     // performance cost.
-    await page
-      .getByTestId("message-input")
-      .fill(Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n"));
+    await page.getByTestId("message-input").fill(LONG_DRAFT);
 
     // The premise, asserted rather than assumed: the window over the history
     // has to shrink by more than the margin, or the latch would never have
@@ -317,7 +321,7 @@ test.describe("Conversation follows new messages (#486)", () => {
     // suite that only used the button would still pass if the re-arm branch
     // were narrowed to, say, `distance <= 0`, and a reader who stopped a few
     // fractional pixels short would never be followed again.
-    await readerScrollsWithoutGestureAndSettles(page, await historyHeight(page));
+    await readerScrollsWithoutGesture(page, await historyHeight(page));
     await expectSettledAtBottom(page, "the reader's own scroll should reach the bottom");
     await deliver(page, "arrived after the reader scrolled back down");
     await expectSettledAtBottom(
@@ -404,51 +408,75 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     );
   });
 
-  test("follows history that grows in the same frame the composer collapses", async ({ page }) => {
+  test("follows history that grows in the same frame the composer collapses", async ({
+    page,
+  }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     const roomyViewport = await viewportHeight(page);
     await page.evaluate(() => {
-      const seq = ((window as any).__riverScrollSeq = { n: 0, scroll: 0, settle: 0 });
       const c = document.getElementById("chat-scroll-container")!;
-      c.addEventListener("scroll", () => (seq.scroll = ++seq.n));
-      c.addEventListener("scrollend", () => (seq.settle = ++seq.n));
+      for (const type of ["scroll", "scrollend"]) {
+        c.addEventListener(type, () => {
+          (window as any).__riverLastScrollEvent = type;
+        });
+      }
     });
-    await page.getByTestId("message-input")
-      .fill(Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n"));
-    await expect.poll(() => viewportHeight(page), { timeout: 5_000 })
+    await page.getByTestId("message-input").fill(LONG_DRAFT);
+    await expect
+      .poll(() => viewportHeight(page), {
+        timeout: 5_000,
+        message:
+          "the composer did not grow enough that clearing it would clamp the " +
+          "view, so this test is not exercising the same-frame race",
+      })
       .toBeLessThan(roomyViewport - BOTTOM_THRESHOLD_PX);
     await expectSettledAtBottom(page, "the composer grew and the view did not follow it");
-    // A follow still settling would re-record the mark after the clamp below and hide the race.
-    await page.waitForFunction(() => {
-      const s = (window as any).__riverScrollSeq;
-      return s.scroll > 0 && s.settle > s.scroll;
-    }, undefined, { timeout: 5_000 });
+    // A follow still settling would re-record the mark after the clamp and
+    // hide the race.
+    await page.waitForFunction(
+      () => (window as any).__riverLastScrollEvent === "scrollend",
+      undefined,
+      { timeout: 5_000 },
+    );
 
-    // On `document`, so it runs after the app's own input handler has collapsed the composer, before any frame.
-    const GROWTH_PX = 80; // under BOTTOM_THRESHOLD_PX: the pin stays armed, so only reader_moved_up_since can refuse
-    await page.evaluate(({ grow, collapsedAbove }) => {
-      const c = document.getElementById("chat-scroll-container")!;
-      const rows = c.querySelectorAll("[data-item-key]");
-      const newest = rows[rows.length - 1] as HTMLElement;
-      const onInput = () => {
-        if (c.clientHeight <= collapsedAbove) return; // this read forces the collapse and the scrollTop clamp
-        document.removeEventListener("input", onInput);
-        const gap = c.scrollHeight - c.scrollTop - c.clientHeight;
-        const before = c.scrollHeight;
-        newest.style.paddingBottom = `${grow}px`;
-        (window as any).__riverSameFrame = { gap, grew: c.scrollHeight - before };
-      };
-      document.addEventListener("input", onInput);
-    }, { grow: GROWTH_PX, collapsedAbove: roomyViewport - BOTTOM_THRESHOLD_PX });
+    // On `document`, so it runs after the app's own input handler has
+    // collapsed the composer, before any frame.
+    const GROWTH_PX = 80;
+    // Under BOTTOM_THRESHOLD_PX: the pin stays armed, so only
+    // reader_moved_up_since can refuse.
+    await page.evaluate(
+      ({ grow, collapsedAbove }) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        const rows = c.querySelectorAll("[data-item-key]");
+        const newest = rows[rows.length - 1] as HTMLElement;
+        const onInput = () => {
+          // Reading clientHeight forces the collapse (and the scrollTop clamp) now.
+          const collapsed = c.clientHeight > collapsedAbove;
+          const before = c.scrollHeight;
+          newest.style.paddingBottom = `${grow}px`;
+          (window as any).__riverSameFrame = {
+            collapsed,
+            grew: c.scrollHeight - before,
+          };
+        };
+        document.addEventListener("input", onInput, { once: true });
+      },
+      { grow: GROWTH_PX, collapsedAbove: roomyViewport - BOTTOM_THRESHOLD_PX },
+    );
     await page.getByTestId("message-input").fill("");
 
-    const premise = await (await page.waitForFunction(
-      () => (window as any).__riverSameFrame, undefined, { timeout: 5_000 })).jsonValue();
-    expect(premise.gap, "premise: the collapse should leave the view clamped to the bottom")
-      .toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
-    expect(premise.grew, "premise: the newest row should have grown").toBeGreaterThan(GROWTH_PX / 2);
-    await expectSettledAtBottom(page,
-      "the history grew in the same frame the composer collapsed and the view did not follow it");
+    const premise = await page.evaluate(() => (window as any).__riverSameFrame);
+    expect(
+      premise.collapsed,
+      "premise: the composer should collapse inside the input handler",
+    ).toBe(true);
+    expect(premise.grew, "premise: the newest row should have grown").toBeGreaterThan(
+      AT_BOTTOM_EPSILON_PX,
+    );
+    await expectSettledAtBottom(
+      page,
+      "the history grew in the same frame the composer collapsed and the view did not follow it",
+    );
   });
 
   test("does not drag a parked reader down when a resize reflows the history", async ({
