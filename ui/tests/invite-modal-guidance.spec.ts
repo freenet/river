@@ -108,8 +108,9 @@ test.describe("Invite-member modal lifecycle", { tag: "@chromium-only" }, () => 
   });
 
   // A notification click switches CURRENT_ROOM with this modal still open. The
-  // message must never name the new room while the link still grants the old one.
-  test("a room switch re-mints the link for the room the message names", async ({ page }) => {
+  // modal closes, and until it does the message never names the new room over
+  // the old room's link.
+  test("a room switch closes the modal without naming the new room", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await openInviteModal(page);
@@ -135,14 +136,16 @@ test.describe("Invite-member modal lifecycle", { tag: "@chromium-only" }, () => 
     });
 
     await callRiverTest(page, "switchRoom", "Team Chat Room");
-    await expect(message).toContainText("Team Chat Room", { timeout: 10_000 });
-    await expect(link).not.toHaveValue(first);
+    await expect(page.getByTestId("invite-member-modal")).toHaveCount(0, { timeout: 5_000 });
+    // The switch really happened: the header now shows the new room.
+    await expect(page.getByTestId("room-title-button")).toContainText("Team Chat Room");
 
     const pairs = (await page.evaluate(() => (window as any).__invitePairs)) as {
       message: string;
       link: string;
     }[];
-    const mismatched = pairs.filter((p) => p.message.includes("Team Chat Room") && p.link === first);
-    expect(mismatched, "the message named the new room over the old room's link").toEqual([]);
+    const mismatched = pairs.filter((p) => p.message.includes("Team Chat Room"));
+    expect(mismatched, "the invite message named the room switched to").toEqual([]);
+    expect(pairs.every((p) => p.link === first), "the link was re-minted").toBe(true);
   });
 });

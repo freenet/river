@@ -175,14 +175,27 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
 #[component]
 fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> Element {
-    // What the link depends on: WHICH room, and whether we hold its signing key.
-    // A memo only notifies when its value changes, so an arriving message never
-    // re-mints the link, while a room switch (a notification click changes
-    // CURRENT_ROOM with this modal still open) or the key arriving does.
-    let room_identity = use_memo(move || room().map(|r| (r.owner_vk, r.signing_key().is_some())));
+    // A room switch closes the modal. A notification click changes CURRENT_ROOM
+    // with this modal still open; re-minting for the new room would let Copy
+    // Link hand out a room the user never chose, and keeping the old link would
+    // leave a modal about a room that is no longer on screen.
+    let opened_for = use_hook(|| CURRENT_ROOM.peek().owner_key);
+    use_effect(move || {
+        crate::util::signal_guard::anchor();
+        let Ok(current) = CURRENT_ROOM.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return;
+        };
+        if current.owner_key != opened_for {
+            crate::util::defer(move || is_active.set(false));
+        }
+    });
+
+    // Subscribe to the room only while it is unknown: a transient `None` retries,
+    // and later room updates never re-mint the link.
     let mut invitation_future = use_resource(move || async move {
-        let _ = room_identity();
-        let room_data = room.peek().clone();
+        let known = room.peek().clone();
+        let room_data = if known.is_some() { known } else { room() };
         // Named from the same snapshot the link is minted from, so the message
         // can never name one room while the link grants another.
         let room_name = room_data.as_ref().map(room_display_name);
