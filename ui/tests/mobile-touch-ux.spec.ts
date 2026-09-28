@@ -4,9 +4,7 @@ import { waitForApp, selectRoom } from "./example-room";
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
 //   1. Touch-accessible message action menu (kebab), since the hover action
 //      bar can never appear on a device without a hover pointer.
-//   2. Extra spacing between the header hamburger (open room list) and the
-//      room-name/details tap target, so switching rooms does not accidentally
-//      open the room-details modal.
+//   2. Header hamburger spacing: see room-header-layout.spec.ts.
 //   3. A scroll-to-latest button shown whenever the history is not pinned to
 //      the bottom, plus a snap-to-bottom on room switch.
 
@@ -304,34 +302,6 @@ test.describe("Message action kebab menu (#402.1)", () => {
       await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
     }
     await expect(menus).toHaveCount(0);
-  });
-});
-
-test.describe("Mobile header hamburger spacing (#402.2)", () => {
-  test.use({ viewport: { width: 390, height: 844 } });
-
-  test("hamburger does not overlap the room-name tap target", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Team Chat Room");
-
-    const header = page.locator(".border-b.border-border.bg-panel").first();
-    const hamburger = header.locator("button").first();
-    // The room-details button is the one wrapping the room-name heading.
-    const roomDetails = header.locator("button:has(h2)").first();
-
-    const hb = await hamburger.boundingBox();
-    const rb = await roomDetails.boundingBox();
-    expect(hb).not.toBeNull();
-    expect(rb).not.toBeNull();
-    if (hb && rb) {
-      // The room-details target must start strictly to the right of the
-      // hamburger, with a real gap rather than an overlapping hit area.
-      const gap = rb.x - (hb.x + hb.width);
-      expect(gap).toBeGreaterThanOrEqual(4);
-    }
   });
 });
 

@@ -79,6 +79,7 @@
 
 @utility border-border { border-color: var(--color-border); }
 @utility border-border-hover { border-color: var(--color-border-hover); }
+@utility border-text { border-color: var(--color-text); }
 
 /* `--color-panel` lives on `:root`, not in `@theme`, so Tailwind generates no
    colour utilities for it automatically — every panel/surface/text utility above

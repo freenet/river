@@ -3839,9 +3839,20 @@ pub fn Conversation() -> Element {
             // Room header
             {
                 current_room_data.as_ref().map(|_room_data| {
+                    let open_room_details = move || {
+                        crate::util::defer(move || {
+                            if let Some(current_room) = CURRENT_ROOM.read().owner_key {
+                                EDIT_ROOM_MODAL.with_mut(|modal| {
+                                    modal.room = Some(current_room);
+                                });
+                            }
+                        });
+                    };
                     rsx! {
                         div { class: "flex-shrink-0 px-3 md:px-6 py-3 border-b border-border bg-panel",
-                            div { class: "flex items-center justify-between gap-2 md:gap-3 max-w-4xl mx-auto",
+                            div {
+                                "data-testid": "room-header-row",
+                                class: "flex items-center justify-between gap-2 md:gap-3 max-w-4xl mx-auto",
                                 // Mobile: hamburger to open rooms panel. `mr-1` plus the row
                                 // `gap-2` keep this switch-rooms button clear of the room-name
                                 // tap target so a touch user does not open the room-details
@@ -3877,39 +3888,29 @@ pub fn Conversation() -> Element {
                                 // `<button>` per the HTML spec. Nesting also bubbles link
                                 // clicks to the modal-opening onclick handler.
                                 div { class: "min-w-0 flex-1",
-                                    // Room title + notification bell on one line, so the bell
-                                    // sits right after the (i) and vertically centred with it —
-                                    // NOT at the header's far edge. The bell is a SIBLING of the
-                                    // room-details button (a <button> can't nest another
-                                    // <button>). The title button is content-sized (no `w-full`)
-                                    // so the bell hugs the (i); a long name still truncates via
-                                    // `min-w-0` + `truncate`.
+                                    // Title on the left; `ml-auto` on the (i) pushes (i)
+                                    // and the bell to the right edge.
                                     div { class: "flex items-center gap-1 min-w-0",
                                         button {
                                             // `md:-ml-3` pulls only the LEFT hover edge outward on
-                                            // desktop (no adjacent hamburger there); the right edge
-                                            // stays put so the bell sits close to the (i). On mobile
+                                            // desktop (no adjacent hamburger there). On mobile
                                             // the negative margin is dropped so this room-details
                                             // target stays clear of the hamburger (#402).
-                                            class: "flex items-center gap-2 px-3 py-1.5 md:-ml-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0",
+                                            class: "flex items-center px-3 py-1.5 md:-ml-3 rounded-lg bg-transparent hover:bg-surface transition-colors cursor-pointer min-w-0",
                                             title: "Room details",
                                             "data-testid": "room-title-button",
-                                            onclick: move |_| {
-                                                crate::util::defer(move || {
-                                                    if let Some(current_room) = CURRENT_ROOM.read().owner_key {
-                                                        EDIT_ROOM_MODAL.with_mut(|modal| {
-                                                            modal.room = Some(current_room);
-                                                        });
-                                                    }
-                                                });
-                                            },
+                                            onclick: move |_| open_room_details(),
                                             h2 { class: "text-lg font-semibold text-text truncate",
                                                 "{current_room_label}"
                                             }
-                                            span {
-                                                class: "text-text-muted flex-shrink-0",
-                                                Icon { icon: FaCircleInfo, width: 16, height: 16 }
-                                            }
+                                        }
+                                        button {
+                                            "data-testid": "room-info-button",
+                                            class: "ml-auto flex-shrink-0 p-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                                            title: "Room details",
+                                            "aria-label": "Room details",
+                                            onclick: move |_| open_room_details(),
+                                            Icon { icon: FaCircleInfo, width: 16, height: 16 }
                                         }
                                         // Per-room notification preference. Icon reflects state:
                                         // bell = notifying, bell-slash = muted; the tooltip names

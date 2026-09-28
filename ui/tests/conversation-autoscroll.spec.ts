@@ -194,11 +194,10 @@ test.describe("Conversation follows new messages (#486)", () => {
     await openRoomAtBottom(page, "Team Chat Room");
     const roomyViewport = await viewportHeight(page);
 
-    // Typing a long message grows the composer to its 168px maximum, which
-    // takes more than the observer's 100px margin off the history in one step
-    // — so the old gate latched with no network activity at all. This is why
-    // #468 (the composer auto-resize) is a CAUSE of #486 rather than only a
-    // performance cost.
+    // Typing a long message grows the composer, which takes more than the
+    // observer's 100px margin off the history in one step — so the old gate
+    // latched with no network activity at all. This is why #468 (the composer
+    // auto-resize) is a CAUSE of #486 rather than only a performance cost.
     await page.getByTestId("message-input").fill(LONG_DRAFT);
 
     // The premise, asserted rather than assumed: the window over the history

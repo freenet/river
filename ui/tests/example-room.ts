@@ -69,3 +69,20 @@ export async function openOwnMessageEdit(page: Page): Promise<Locator> {
   await expect(editArea).toBeVisible({ timeout: 5_000 });
   return editArea;
 }
+
+// Any CSS colour (tokens, color-mix, oklab) as sRGB [r, g, b, a], so engines compare equal.
+export function resolveColor(page: Page, css: string): Promise<number[]> {
+  return page.evaluate((value) => {
+    const probe = document.createElement("div");
+    probe.style.color = value;
+    document.body.appendChild(probe);
+    const computed = getComputedStyle(probe).color;
+    probe.remove();
+    const ctx = Object.assign(document.createElement("canvas"), { width: 1, height: 1 })
+      .getContext("2d", { willReadFrequently: true })!;
+    ctx.fillStyle = computed;
+    ctx.fillRect(0, 0, 1, 1);
+    const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
+    return [r, g, b, a / 255];
+  }, css);
+}
