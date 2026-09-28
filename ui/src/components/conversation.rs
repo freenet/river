@@ -1916,7 +1916,7 @@ fn first_history_row_identity() -> Option<(String, i32)> {
 #[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
-/// Where the view was last accounted for: both edges, because a resize moves only one of them.
+/// Both edges of the view as last accounted for; see `reader_moved_up_since`.
 #[cfg(target_arch = "wasm32")]
 #[derive(Default)]
 struct ScrollMark {
@@ -1942,7 +1942,10 @@ impl ScrollMark {
     }
 }
 
-/// Has the view moved ABOVE the offset `last_top` records?
+/// Has the view moved up since `last_top` recorded it, at BOTH edges?
+///
+/// A reader scroll moves both edges; a resize moves only one (the composer
+/// collapsing clamps `scrollTop`, a growing one lifts the bottom).
 ///
 /// `pinned_to_bottom` is only re-measured when a scroll SETTLES, so between the
 /// reader moving the view and their `scrollend` arriving it is stale by design.
@@ -1964,19 +1967,16 @@ impl ScrollMark {
 /// therefore lands short until the next content change, which corrects it. Only
 /// the button animates; every automatic scroll is instant and lands within the
 /// same task.
-///
-/// Moved means BOTH edges went up: a reader scroll moves both, while a resize
-/// (the composer collapsing clamps `scrollTop`) moves only one.
 #[cfg(target_arch = "wasm32")]
 fn reader_moved_up_since(last_top: &Rc<ScrollMark>) -> bool {
     let Some(container) = chat_scroll_container() else {
         return false;
     };
+    let top = container.scroll_top();
+    let bottom = top + container.client_height();
     // Never judge against an edge the container can no longer reach: if the
     // history shrank, the browser clamped the position down on its own and that
     // is not the reader moving.
-    let top = container.scroll_top();
-    let bottom = top + container.client_height();
     let top_was = last_top.top().min(max_scroll_top(&container));
     let bottom_was = last_top.bottom().min(container.scroll_height());
     top + SCROLL_TOP_SLACK_PX < top_was && bottom + SCROLL_TOP_SLACK_PX < bottom_was
@@ -1986,10 +1986,11 @@ fn reader_moved_up_since(last_top: &Rc<ScrollMark>) -> bool {
 ///
 /// Every programmatic scroll goes through here so two things always happen
 /// together: the pin is re-armed (we are taking the reader to the bottom, so
-/// that is where they now are), and the offset we asked for is recorded. That
-/// offset is what the settle handler compares against to tell OUR scroll's
-/// settle from the reader's, and what a later resize compares against to tell
-/// "content grew underneath us" from "the reader has moved since".
+/// that is where they now are), and the position (both edges) we asked for is
+/// recorded. That position (both edges) is what the settle handler compares
+/// against to tell OUR scroll's settle from the reader's, and what a later
+/// resize compares against to tell "content grew underneath us" from "the
+/// reader has moved since".
 /// See [`install_scroll_pin_listeners`].
 #[cfg(target_arch = "wasm32")]
 fn scroll_history_to_bottom(
@@ -2356,13 +2357,14 @@ pub fn Conversation() -> Element {
     // forced the IntersectionObserver's write through `defer` (#402).
     let pinned_to_bottom = use_hook(|| Rc::new(std::cell::Cell::new(true)));
     // Where the scroll position was last accounted for: our own scrolls write
-    // the offset they asked for, and every settle overwrites it with where the
-    // view actually came to rest. Two readers depend on it — the settle handler
-    // uses it to tell our own scroll's settle from the reader's, and the
-    // ResizeObserver uses it to tell "content grew underneath us" from "the
-    // reader has moved since", which `pinned_to_bottom` alone cannot answer
-    // until the settle lands. Only the browser has scroll positions, hence the
-    // gate. See `install_scroll_pin_listeners`.
+    // the position (both edges) they asked for, and every settle overwrites it
+    // with where the view actually came to rest. Two readers depend on it —
+    // the settle handler uses it to tell our own scroll's settle from the
+    // reader's, and the ResizeObserver uses it to tell "content grew
+    // underneath us" from "the reader has moved since", which
+    // `pinned_to_bottom` alone cannot answer until the settle lands. Only the
+    // browser has scroll positions, hence the gate. See
+    // `install_scroll_pin_listeners`.
     #[cfg(target_arch = "wasm32")]
     let last_scroll_top = use_hook(|| Rc::new(ScrollMark::default()));
 
