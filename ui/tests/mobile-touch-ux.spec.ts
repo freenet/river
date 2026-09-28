@@ -4,7 +4,8 @@ import { waitForApp, selectRoom } from "./example-room";
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
 //   1. Touch-accessible message action menu (kebab), since the hover action
 //      bar can never appear on a device without a hover pointer.
-//   2. A scroll-to-latest button shown whenever the history is not pinned to
+//   2. Header hamburger spacing: see room-header-layout.spec.ts.
+//   3. A scroll-to-latest button shown whenever the history is not pinned to
 //      the bottom, plus a snap-to-bottom on room switch.
 
 // Whether this browser context has no hover pointer (i.e. a touch device).
