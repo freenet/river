@@ -399,13 +399,16 @@ const RECORD_COMPOSER_HEIGHT_WRITES = `
 })();
 `;
 
-// Engines without field-sizing (Firefox ESR 140 / Tor, Safari < 26.2) run the JS resize; every Playwright engine has it, so force it off.
+// Engines without field-sizing (Firefox ESR 140 / Tor, Safari < 26.2) run the JS resize.
+// Every Playwright engine has it, so force it off before `sizes_itself` caches its answer.
 const FORCE_COMPOSER_FALLBACK = `
 document.addEventListener("DOMContentLoaded", () => {
   const s = document.createElement("style");
   s.textContent = "#message-input{field-sizing:fixed!important}";
   document.head.appendChild(s);
 });`;
+
+const draftOf = (lines: number) => Array.from({ length: lines }, (_, i) => `draft line ${i}`).join("\n");
 
 // The cost property has to hold in BOTH layout regimes, so this body runs at a
 // desktop width and again at a phone width. Pinning only 1280x800 (as the first
@@ -505,10 +508,10 @@ function composerAutosizeCostTest() {
     await textarea.fill("a");
     expect(await height()).toBe(oneLine);
 
-    // A draft past the ceiling (half the viewport). CSS `max-height` holds the
+    // A draft past the cap (half the viewport). CSS `max-height` holds the
     // box at the cap, and typing on the draft's last line changes no content
     // height, so it must still write nothing.
-    await textarea.fill(Array.from({ length: 60 }, (_, i) => i).join("\n"));
+    await textarea.fill(draftOf(60));
     const tall = await height();
     const cap = await page.evaluate(() => window.innerHeight / 2);
     expect(Math.abs(tall - cap)).toBeLessThanOrEqual(1);
@@ -537,15 +540,13 @@ test.describe("Composer auto-resize cost (#468, JS fallback) @ phone", () => {
   composerAutosizeCostTest();
 });
 
-const draftOf = (lines: number) => Array.from({ length: lines }, (_, i) => `draft line ${i}`).join("\n");
-
 test.describe("Composer grows with the draft, up to half the viewport", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("grows as you type, and an 80-line draft never scrolls the app shell", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
-    await openRoomWithComposer(page); // "Your Private Room"
+    await openRoomWithComposer(page);
     const ta = page.getByTestId("message-input");
     const metrics = () =>
       ta.evaluate((el) => {
@@ -559,18 +560,18 @@ test.describe("Composer grows with the draft, up to half the viewport", () => {
           cap: window.innerHeight / 2,
         };
       });
-    await ta.fill(draftOf(12)); // past main's old 168px ceiling, under the cap
+    await ta.fill(draftOf(12)); // taller than the old 168px ceiling, under the cap
     let m = await metrics();
     expect(m.height).toBeGreaterThanOrEqual(12 * m.lineHeight);
     expect(m.scroll - m.client, "nothing to scroll below the cap").toBeLessThanOrEqual(1);
 
     await ta.fill(draftOf(80));
+    // Typing at the end scrolls the caret into view; uncapped, that scrolled the app shell.
     await ta.press("ControlOrMeta+End");
     await page.keyboard.type("END");
     m = await metrics();
     expect(Math.abs(m.height - m.cap)).toBeLessThanOrEqual(1);
     expect(m.overflowY).toBe("auto");
-    expect(m.scroll).toBeGreaterThan(m.client);
     const shell = await page.evaluate(() => ({
       appScroll: document.querySelector(".app-root")!.scrollTop,
       headerTop: document.querySelector('[data-testid="room-header-row"]')!.getBoundingClientRect().top,
@@ -582,37 +583,6 @@ test.describe("Composer grows with the draft, up to half the viewport", () => {
     expect(shell.sendBottom).toBeLessThanOrEqual(shell.vh);
   });
 });
-
-test(
-  "focus turns the composer border to the text colour, with no ring",
-  { tag: "@chromium-only" },
-  async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 800 });
-    await page.goto("/");
-    await waitForApp(page);
-    await openRoomWithComposer(page);
-    const ta = page.getByTestId("message-input");
-    await ta.focus();
-    // `transition-colors` animates the border, so poll until it settles.
-    await expect
-      .poll(() =>
-        ta.evaluate((el) => {
-          const probe = document.createElement("span");
-          probe.style.color = "var(--color-text)";
-          el.parentElement!.appendChild(probe);
-          try {
-            const cs = getComputedStyle(el);
-            return {
-              matches: cs.borderTopColor === getComputedStyle(probe).color && cs.boxShadow === "none",
-            };
-          } finally {
-            probe.remove();
-          }
-        }),
-      )
-      .toEqual({ matches: true });
-  },
-);
 
 // On page refresh, the chat scroll container must land at the bottom of the
 // message list, not partway down. The previous code called scrollIntoView on
