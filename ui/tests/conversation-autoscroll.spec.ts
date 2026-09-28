@@ -48,7 +48,7 @@ const BOTTOM_THRESHOLD_PX = 100;
 /// Slack for fractional layout after a scroll that did land at the bottom.
 const AT_BOTTOM_EPSILON_PX = 4;
 
-/// A draft long enough to grow the composer past its 168px cap.
+/// A draft long enough to take more than BOTTOM_THRESHOLD_PX off the history.
 const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
 
 /// scrollHeight - scrollTop - clientHeight: how far the end of the history is

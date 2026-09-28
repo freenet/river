@@ -3030,9 +3030,9 @@ pub fn Conversation() -> Element {
     //   image, a web font swapping in, a markdown block rewrapping on a
     //   narrower screen;
     // * the WINDOW shrinks over fixed content — which is what growing the
-    //   composer does. That is freenet/river#486's third cause: the composer
-    //   reaching its 168px maximum takes more than the observer's 100px margin
-    //   off the history in one step, with no network activity at all.
+    //   composer does. That is freenet/river#486's third cause: a growing
+    //   composer can take more than the observer's 100px margin off the
+    //   history in one step, with no network activity at all.
     //   De-latching the gate stops that freezing auto-scroll for good, but on
     //   its own it still leaves the newest message below the fold until
     //   something else happens, so the container has to be watched too.

@@ -508,12 +508,17 @@ function composerAutosizeCostTest() {
     await textarea.fill("a");
     expect(await height()).toBe(oneLine);
 
-    // A draft past the cap (half the viewport). CSS `max-height` holds the
-    // box at the cap, and typing on the draft's last line changes no content
-    // height, so it must still write nothing.
+    // A draft past the cap: half the viewport on a large screen, 30% on a
+    // phone in either orientation (the on-screen keyboard also takes space).
+    // CSS `max-height` holds the box at the cap, and typing on the draft's
+    // last line changes no content height, so it must still write nothing.
     await textarea.fill(draftOf(60));
     const tall = await height();
-    const cap = await page.evaluate(() => window.innerHeight / 2);
+    const cap = await page.evaluate(
+      () =>
+        window.innerHeight *
+        (window.innerWidth >= 768 && window.innerHeight >= 640 ? 0.5 : 0.3),
+    );
     expect(Math.abs(tall - cap)).toBeLessThanOrEqual(1);
     const tallTypingWrites = await writesDuring(async () => {
       await page.keyboard.type("xyz");
@@ -537,6 +542,14 @@ test.describe("Composer auto-resize cost (#468, JS fallback) @ desktop", () => {
 // could not see.
 test.describe("Composer auto-resize cost (#468, JS fallback) @ phone", () => {
   test.use({ viewport: { width: 390, height: 844 } });
+  composerAutosizeCostTest();
+});
+
+// A landscape phone is wider than the md breakpoint but short, so the cap
+// must stay at 30%: a width-only gate gave it half the height, covering
+// everything above the on-screen keyboard.
+test.describe("Composer auto-resize cost (#468, JS fallback) @ landscape phone", () => {
+  test.use({ viewport: { width: 844, height: 390 } });
   composerAutosizeCostTest();
 });
 

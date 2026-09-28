@@ -18,7 +18,9 @@ const box = async (l: Locator) => {
 };
 const right = (b: { x: number; width: number }) => b.x + b.width;
 
-test.describe("Room header layout", { tag: "@chromium-only" }, () => {
+// Not @chromium-only: flex geometry differs across engines, and this replaced
+// the #402.2 hamburger-spacing test, which ran on every project.
+test.describe("Room header layout", () => {
   test("at 1280px (i) and the bell sit at the right edge", async ({ page }) => {
     await openRoomAt(page, { width: 1280, height: 800 });
     const row = await box(page.getByTestId("room-header-row"));
