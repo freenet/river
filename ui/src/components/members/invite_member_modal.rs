@@ -196,6 +196,15 @@ fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> El
     let mut invitation_future = use_resource(move || async move {
         let known = room.peek().clone();
         let room_data = if known.is_some() { known } else { room() };
+        // Never mint for a room the modal was not opened for. If the room was
+        // still loading and CURRENT_ROOM moved meanwhile, the effect above is
+        // closing the modal; wait for that rather than race it.
+        if room_data
+            .as_ref()
+            .is_some_and(|r| Some(r.owner_vk) != opened_for)
+        {
+            std::future::pending::<()>().await;
+        }
         // Named from the same snapshot the link is minted from, so the message
         // can never name one room while the link grants another.
         let room_name = room_data.as_ref().map(room_display_name);

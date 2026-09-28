@@ -545,6 +545,14 @@ test.describe("Composer auto-resize cost (#468, JS fallback) @ phone", () => {
   composerAutosizeCostTest();
 });
 
+// A landscape phone is wider than the md breakpoint but short, so the cap
+// must stay at 30%: a width-only gate gave it half the height, covering
+// everything above the on-screen keyboard.
+test.describe("Composer auto-resize cost (#468, JS fallback) @ landscape phone", () => {
+  test.use({ viewport: { width: 844, height: 390 } });
+  composerAutosizeCostTest();
+});
+
 test.describe("Composer grows with the draft, up to half the viewport", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
