@@ -38,7 +38,7 @@ const WEBKIT_KEYBOARD_COPY_SKIP =
 async function openRoomDetails(page: Page) {
   await selectRoom(page, ROOM_NAME);
   // The (i) affordance in the room header opens the room-details modal.
-  await page.getByTestId("room-title-button").click();
+  await page.getByTestId("room-info-button").click();
   await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 5_000 });
 }
 
@@ -292,7 +292,7 @@ test.describe("room-details copy buttons", () => {
     await page.getByTestId("edit-room-close-button").click();
     await expect(page.getByTestId("edit-room-modal")).toHaveCount(0, { timeout: 15_000 });
 
-    const reopen = page.getByTestId("room-title-button");
+    const reopen = page.getByTestId("room-info-button");
     await expect(reopen).toBeVisible({ timeout: 15_000 });
     await reopen.click();
     await expect(page.getByTestId("edit-room-modal")).toBeVisible({ timeout: 15_000 });
