@@ -3060,7 +3060,17 @@ pub fn Conversation() -> Element {
             let pinned_to_bottom = pinned_to_bottom.clone();
             let last_scroll_top = last_scroll_top.clone();
             let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
-                if !pinned_to_bottom.get() {
+                // A field-sizing composer collapse clamps WebKit to the bottom
+                // without a settle the pin trusts, so the next arrival sits a
+                // row short. Being at the bottom re-arms the pin. A reader who
+                // has actually moved up is neither pinned nor within the margin.
+                let at_bottom = chat_scroll_container().is_some_and(|container| {
+                    let distance = container.scroll_height() as f64
+                        - container.scroll_top() as f64
+                        - container.client_height() as f64;
+                    distance <= BOTTOM_THRESHOLD_PX
+                });
+                if !pinned_to_bottom.get() && !at_bottom {
                     return;
                 }
                 // Stand down if the reader has moved since we last knew where
@@ -3068,7 +3078,7 @@ pub fn Conversation() -> Element {
                 // this, a resize landing in that window undoes their scroll —
                 // measured on Firefox: reader reaches scrollTop 0, a resize
                 // fires 2ms later, the view snaps back.
-                if reader_moved_up_since(&last_scroll_top) {
+                if !at_bottom && reader_moved_up_since(&last_scroll_top) {
                     return;
                 }
                 // Instant: this fires DURING layout settling, so animating

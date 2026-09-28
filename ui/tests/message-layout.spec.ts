@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { waitForApp, selectRoom, openOwnMessageEdit } from "./example-room";
+import { waitForApp, selectRoom, openOwnMessageEdit, openRoomWithComposer } from "./example-room";
 
 // Regression tests for freenet/river#205, #206, #207:
 //   #205 edit box wider than view
@@ -399,6 +399,14 @@ const RECORD_COMPOSER_HEIGHT_WRITES = `
 })();
 `;
 
+// Engines without field-sizing (Firefox ESR 140 / Tor, Safari < 26.2) run the JS resize; every Playwright engine has it, so force it off.
+const FORCE_COMPOSER_FALLBACK = `
+document.addEventListener("DOMContentLoaded", () => {
+  const s = document.createElement("style");
+  s.textContent = "#message-input{field-sizing:fixed!important}";
+  document.head.appendChild(s);
+});`;
+
 // The cost property has to hold in BOTH layout regimes, so this body runs at a
 // desktop width and again at a phone width. Pinning only 1280x800 (as the first
 // version of this test did) leaves the mobile regime uncovered even when the
@@ -414,6 +422,7 @@ function composerAutosizeCostTest() {
   test("typing within a line writes no height; growth and shrink still resize", async ({
     page,
   }) => {
+    await page.addInitScript(FORCE_COMPOSER_FALLBACK);
     await page.addInitScript(RECORD_COMPOSER_HEIGHT_WRITES);
     await page.goto("/");
     await waitForApp(page);
@@ -496,17 +505,26 @@ function composerAutosizeCostTest() {
     await textarea.fill("a");
     expect(await height()).toBe(oneLine);
 
-    // And a shrink straight from the clamped maximum, which exercises the
-    // ceiling rather than the intermediate sizes.
-    await textarea.fill(Array.from({ length: 30 }, (_, i) => i).join("\n"));
-    const clamped = await height();
-    expect(clamped).toBeGreaterThan(fourLines);
+    // A draft past the ceiling (half the viewport). CSS `max-height` holds the
+    // box at the cap, and typing on the draft's last line changes no content
+    // height, so it must still write nothing.
+    await textarea.fill(Array.from({ length: 60 }, (_, i) => i).join("\n"));
+    const tall = await height();
+    const cap = await page.evaluate(() => window.innerHeight / 2);
+    expect(Math.abs(tall - cap)).toBeLessThanOrEqual(1);
+    const tallTypingWrites = await writesDuring(async () => {
+      await page.keyboard.type("xyz");
+    });
+    expect(tallTypingWrites).toEqual([]);
+    expect(await height()).toBe(tall);
+    expect(await textarea.evaluate((el) => getComputedStyle(el).overflowY)).toBe("auto");
+
     await textarea.fill("a");
     expect(await height()).toBe(oneLine);
   });
 }
 
-test.describe("Composer auto-resize cost (#468) @ desktop", () => {
+test.describe("Composer auto-resize cost (#468, JS fallback) @ desktop", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
   composerAutosizeCostTest();
 });
@@ -514,10 +532,87 @@ test.describe("Composer auto-resize cost (#468) @ desktop", () => {
 // 390x844 is an iPhone-class viewport, comfortably inside the <768px branch
 // where the body font clamps to 13px. This is the regime the desktop-only pin
 // could not see.
-test.describe("Composer auto-resize cost (#468) @ phone", () => {
+test.describe("Composer auto-resize cost (#468, JS fallback) @ phone", () => {
   test.use({ viewport: { width: 390, height: 844 } });
   composerAutosizeCostTest();
 });
+
+const draftOf = (lines: number) => Array.from({ length: lines }, (_, i) => `draft line ${i}`).join("\n");
+
+test.describe("Composer grows with the draft, up to half the viewport", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("grows as you type, and an 80-line draft never scrolls the app shell", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomWithComposer(page); // "Your Private Room"
+    const ta = page.getByTestId("message-input");
+    const metrics = () =>
+      ta.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        return {
+          height: el.getBoundingClientRect().height,
+          scroll: el.scrollHeight,
+          client: el.clientHeight,
+          overflowY: cs.overflowY,
+          lineHeight: parseFloat(cs.lineHeight),
+          cap: window.innerHeight / 2,
+        };
+      });
+    await ta.fill(draftOf(12)); // past main's old 168px ceiling, under the cap
+    let m = await metrics();
+    expect(m.height).toBeGreaterThanOrEqual(12 * m.lineHeight);
+    expect(m.scroll - m.client, "nothing to scroll below the cap").toBeLessThanOrEqual(1);
+
+    await ta.fill(draftOf(80));
+    await ta.press("ControlOrMeta+End");
+    await page.keyboard.type("END");
+    m = await metrics();
+    expect(Math.abs(m.height - m.cap)).toBeLessThanOrEqual(1);
+    expect(m.overflowY).toBe("auto");
+    expect(m.scroll).toBeGreaterThan(m.client);
+    const shell = await page.evaluate(() => ({
+      appScroll: document.querySelector(".app-root")!.scrollTop,
+      headerTop: document.querySelector('[data-testid="room-header-row"]')!.getBoundingClientRect().top,
+      sendBottom: document.querySelector('[data-testid="send-message-button"]')!.getBoundingClientRect().bottom,
+      vh: window.innerHeight,
+    }));
+    expect(shell.appScroll, "the app shell must not scroll").toBe(0);
+    expect(shell.headerTop).toBeGreaterThanOrEqual(0);
+    expect(shell.sendBottom).toBeLessThanOrEqual(shell.vh);
+  });
+});
+
+test(
+  "focus turns the composer border to the text colour, with no ring",
+  { tag: "@chromium-only" },
+  async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/");
+    await waitForApp(page);
+    await openRoomWithComposer(page);
+    const ta = page.getByTestId("message-input");
+    await ta.focus();
+    // `transition-colors` animates the border, so poll until it settles.
+    await expect
+      .poll(() =>
+        ta.evaluate((el) => {
+          const probe = document.createElement("span");
+          probe.style.color = "var(--color-text)";
+          el.parentElement!.appendChild(probe);
+          try {
+            const cs = getComputedStyle(el);
+            return {
+              matches: cs.borderTopColor === getComputedStyle(probe).color && cs.boxShadow === "none",
+            };
+          } finally {
+            probe.remove();
+          }
+        }),
+      )
+      .toEqual({ matches: true });
+  },
+);
 
 // On page refresh, the chat scroll container must land at the bottom of the
 // message list, not partway down. The previous code called scrollIntoView on
