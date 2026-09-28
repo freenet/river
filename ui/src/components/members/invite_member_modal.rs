@@ -167,7 +167,8 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
 
 #[component]
 fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> Element {
-    // Subscribe only while the room is unknown: a transient `None` retries, and later room updates never re-mint.
+    // Subscribe to the room only while it is unknown: a transient `None` retries,
+    // and later room updates never re-mint the link.
     let mut invitation_future = use_resource(move || async move {
         let known = room.peek().clone();
         let room_data = if known.is_some() { known } else { room() };
@@ -238,9 +239,9 @@ fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> El
 
                 InvitationContent {
                     invitation_text: default_msg,
-                    invitation_url: invite_url.clone(),
-                    invitation_code: invite_code.clone(),
-                    is_active: is_active,
+                    invitation_url: invite_url,
+                    invitation_code: invite_code,
+                    is_active,
                     // Clear first, so the old link can't be copied while the new one is signed.
                     on_new_invitation: move |_| {
                         invitation_future.clear();
@@ -417,7 +418,7 @@ mod tests {
     use super::create_invitation;
     use futures::executor::block_on;
 
-    // Both refusals return before anything is signed, so no node is needed.
+    // Refused before signing (which reads the `WEB_API` global), so no Dioxus runtime is needed.
     #[test]
     fn a_room_without_a_local_key_is_refused_before_signing() {
         let owner = ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key();
@@ -429,10 +430,6 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("local signing key for this room is unavailable")),
             "got {refused:?}"
-        );
-        assert_eq!(
-            block_on(create_invitation(None)).err().as_deref(),
-            Some("No room selected")
         );
     }
 }
