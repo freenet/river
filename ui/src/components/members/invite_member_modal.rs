@@ -50,6 +50,67 @@ pub(crate) fn get_invitation_base_url() -> String {
     }
 }
 
+async fn create_invitation(room_data: Option<RoomData>) -> Result<Invitation, String> {
+    let Some(room_data) = room_data else {
+        return Err("No room selected".to_string());
+    };
+    // Issuing an invitation signs the invitee's `Member` record
+    // with the inviter's key, so this whole path needs the
+    // private half. Surface it as a normal resource error (the
+    // modal already renders `Err(String)`) rather than panicking.
+    let Some(self_sk) = room_data.signing_key().cloned() else {
+        return Err(
+            "The local signing key for this room is unavailable, so an invitation cannot be created."
+                .to_string(),
+        );
+    };
+    // Generate new signing key for invitee
+    let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let invitee_verifying_key = invitee_signing_key.verifying_key();
+
+    // Create member struct
+    let member = Member {
+        owner_member_id: room_data.owner_vk.into(),
+        invited_by: self_sk.verifying_key().into(),
+        member_vk: invitee_verifying_key,
+    };
+
+    // Serialize member to CBOR for signing
+    let mut member_bytes = Vec::new();
+    ciborium::ser::into_writer(&member, &mut member_bytes)
+        .map_err(|e| format!("Failed to serialize member: {}", e))?;
+
+    // Sign using delegate with fallback to local signing
+    let signature =
+        crate::signing::sign_member_with_fallback(room_data.room_key(), member_bytes, &self_sk)
+            .await;
+
+    // Create authorized member with pre-computed signature
+    let authorized_member = AuthorizedMember::with_signature(member, signature);
+
+    // For a private room, embed the room secrets the inviter
+    // holds so the invitee can decrypt the room immediately on
+    // join, without waiting for the owner delegate's
+    // `encrypted_secrets` back-fill. Empty for a public room,
+    // or if the inviter holds no secret yet (then the invitee
+    // falls back to that wait).
+    let room_secrets = if room_data.is_private() {
+        collect_invitation_secrets(&room_data.secrets)
+    } else {
+        Vec::new()
+    };
+
+    // Create invitation
+    let invitation = Invitation {
+        room: room_data.owner_vk,
+        invitee_signing_key,
+        invitee: authorized_member,
+        room_secrets,
+    };
+
+    Ok(invitation)
+}
+
 #[component]
 pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
     // Add a signal to track when a new invitation is generated
@@ -78,69 +139,7 @@ pub fn InviteMemberModal(is_active: Signal<bool>) -> Element {
             if !*is_active.read() {
                 return Err("Modal closed".to_string());
             }
-            let room_data = current_room_data_signal();
-            if let Some(room_data) = room_data {
-                // Issuing an invitation signs the invitee's `Member` record
-                // with the inviter's key, so this whole path needs the
-                // private half. Surface it as a normal resource error (the
-                // modal already renders `Err(String)`) rather than panicking.
-                let Some(self_sk) = room_data.signing_key().cloned() else {
-                    return Err(
-                        "The local signing key for this room is unavailable, so an invitation cannot be created."
-                            .to_string(),
-                    );
-                };
-                // Generate new signing key for invitee
-                let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
-                let invitee_verifying_key = invitee_signing_key.verifying_key();
-
-                // Create member struct
-                let member = Member {
-                    owner_member_id: room_data.owner_vk.into(),
-                    invited_by: self_sk.verifying_key().into(),
-                    member_vk: invitee_verifying_key,
-                };
-
-                // Serialize member to CBOR for signing
-                let mut member_bytes = Vec::new();
-                ciborium::ser::into_writer(&member, &mut member_bytes)
-                    .map_err(|e| format!("Failed to serialize member: {}", e))?;
-
-                // Sign using delegate with fallback to local signing
-                let signature = crate::signing::sign_member_with_fallback(
-                    room_data.room_key(),
-                    member_bytes,
-                    &self_sk,
-                )
-                .await;
-
-                // Create authorized member with pre-computed signature
-                let authorized_member = AuthorizedMember::with_signature(member, signature);
-
-                // For a private room, embed the room secrets the inviter
-                // holds so the invitee can decrypt the room immediately on
-                // join, without waiting for the owner delegate's
-                // `encrypted_secrets` back-fill. Empty for a public room,
-                // or if the inviter holds no secret yet (then the invitee
-                // falls back to that wait).
-                let room_secrets = if room_data.is_private() {
-                    collect_invitation_secrets(&room_data.secrets)
-                } else {
-                    Vec::new()
-                };
-
-                // Create invitation
-                let invitation = Invitation {
-                    room: room_data.owner_vk,
-                    invitee_signing_key,
-                    invitee: authorized_member,
-                    room_secrets,
-                };
-
-                Ok::<Invitation, String>(invitation)
-            } else {
-                Err("No room selected".to_string())
-            }
+            create_invitation(current_room_data_signal()).await
         }
     });
 
@@ -410,5 +409,30 @@ fn InvitationContent(
                 "Close"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_invitation;
+    use futures::executor::block_on;
+
+    // Both refusals return before anything is signed, so no node is needed.
+    #[test]
+    fn a_room_without_a_local_key_is_refused_before_signing() {
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key();
+        let mut room = crate::room_data::test_minimal_room_data(owner);
+        room.self_sk = None;
+        let refused = block_on(create_invitation(Some(room))).err();
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|e| e.contains("local signing key for this room is unavailable")),
+            "got {refused:?}"
+        );
+        assert_eq!(
+            block_on(create_invitation(None)).err().as_deref(),
+            Some("No room selected")
+        );
     }
 }
