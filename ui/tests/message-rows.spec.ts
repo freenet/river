@@ -6,7 +6,7 @@ test("hovering a group's author header lights its whole first row", async ({ pag
     await page.evaluate(() => matchMedia("(hover: none), (any-pointer: coarse)").matches),
     "no band on touch"
   );
-  // Same-author pairs, so received groups have headers.
+  // Deterministic groups; the other rooms' example data is random.
   await page.goto("/?deep-history-room=1");
   await waitForApp(page);
   await selectRoom(page, "Capped History Room");
