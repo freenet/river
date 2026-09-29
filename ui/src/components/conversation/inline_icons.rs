@@ -1,8 +1,8 @@
 //! Stroke icons for the message buttons, drawn in `currentColor`.
 use dioxus::prelude::*;
 
-/// The 16x16 `currentColor` stroke `<svg>` every icon here shares.
-fn stroke_svg(size: u32, stroke_width: &'static str, children: Element) -> Element {
+/// A 16x16-viewBox stroke icon drawn in `currentColor`.
+fn stroke_icon(d: &'static str, size: u32) -> Element {
     rsx! {
         svg {
             class: "inline-block align-[-0.125em]",
@@ -11,17 +11,13 @@ fn stroke_svg(size: u32, stroke_width: &'static str, children: Element) -> Eleme
             view_box: "0 0 16 16",
             fill: "none",
             stroke: "currentColor",
-            stroke_width: stroke_width,
+            stroke_width: "2",
             stroke_linecap: "round",
             stroke_linejoin: "round",
             "aria-hidden": "true",
-            {children}
+            path { d }
         }
     }
-}
-
-fn stroke_icon(d: &'static str, size: u32) -> Element {
-    stroke_svg(size, "2", rsx! { path { d: d } })
 }
 
 #[component]

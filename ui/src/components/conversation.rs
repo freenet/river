@@ -4413,10 +4413,7 @@ pub fn Conversation() -> Element {
             if current_room_data.is_some() {
                 ReactionPicker {
                     target: picker_target,
-                    on_react: {
-                        let h = handle_toggle_reaction.clone();
-                        move |(id, emoji): (MessageId, String)| h(id, emoji)
-                    },
+                    on_react: move |(id, emoji)| handle_toggle_reaction(id, emoji),
                 }
             }
 
@@ -4731,23 +4728,19 @@ fn time_labels(time: DateTime<Utc>, clamped: bool, delay_secs: Option<i64>) -> (
     let timestamp_ms = time.timestamp_millis();
     let clamp_mark = if clamped { "~" } else { "" };
     let short = format!("{clamp_mark}{}", format_utc_as_local_time(timestamp_ms));
-    let full = if clamped {
+    let full = format_utc_as_full_datetime(timestamp_ms);
+    let tooltip = if clamped {
         format!(
-            "{} (sender's clock may be ahead of yours — their timestamp was later \
+            "{full} (sender's clock may be ahead of yours — their timestamp was later \
              than when this message reached you, so the time shown is when it \
-             arrived)",
-            format_utc_as_full_datetime(timestamp_ms)
+             arrived)"
         )
     } else if let Some(secs) = delay_secs {
-        format!(
-            "{} (received after {} delay)",
-            format_utc_as_full_datetime(timestamp_ms),
-            format_delay(secs)
-        )
+        format!("{full} (received after {} delay)", format_delay(secs))
     } else {
-        format_utc_as_full_datetime(timestamp_ms)
+        full
     };
-    (short, full)
+    (short, tooltip)
 }
 
 #[component]
@@ -4833,12 +4826,7 @@ fn MessageGroupComponent(
             {
                 group.messages.into_iter().enumerate().map(move |(idx, msg)| {
                 let is_first = idx == 0;
-                let has_reactions = !msg.reactions.is_empty();
                 let reply_strip_val = msg.reply_strip.clone();
-                let (time_str, full_time_str) =
-                    time_labels(msg.time, msg.time_clamped, msg.receive_delay_secs);
-                let time_clamped = msg.time_clamped;
-                let time_iso = msg.time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
                 rsx! {
                     div {
@@ -4916,276 +4904,272 @@ fn MessageGroupComponent(
                         // Content-sized: the bubble spans its reaction row, past its own cap if need be (min-w-full).
                         div {
                             class: "flex flex-col min-w-0 max-w-full",
-                            // Container for the message bubble
-                            div {
-                                class: "relative",
-                                // Message bubble (or edit form if editing)
-                                {
-                                    let is_editing = editing_message.read().as_ref() == Some(&msg.id);
-                                    let msg_id_for_save = msg.message_id.clone();
-                                    let original_text = msg.content_text.clone();
-                                    if is_editing {
-                                        let save_msg_id = msg_id_for_save.clone();
-                                        let save_original = original_text.clone();
-                                        // Unique DOM id so the @mention caret math targets THIS
-                                        // edit textarea (multiple groups can theoretically edit).
-                                        let edit_id = format!("edit-msg-{}", msg.id);
-                                        let pick_id = edit_id.clone();
-                                        let kd_id = edit_id.clone();
-                                        let input_id = edit_id.clone();
-                                        let input_members = edit_mention_members.clone();
-                                        rsx! {
-                                            div {
-                                                class: format!(
-                                                    "msg-edit-form p-3 rounded-2xl {}",
-                                                    if is_self { "bg-accent" } else { "bg-surface" }
-                                                ),
-                                                tabindex: "0",
-                                                // Scroll into view when edit dialog appears (#93)
-                                                onmounted: move |cx| {
-                                                    let el = cx.data();
-                                                    wasm_bindgen_futures::spawn_local(async move {
-                                                        let _ = el.scroll_to(ScrollBehavior::Smooth).await;
-                                                    });
-                                                },
-                                                // Global key bindings on the container (#94): Esc cancels,
-                                                // Enter saves. Kept here (not solely on the textarea) so the
-                                                // "(Esc)"/"(Enter)" button shortcuts work when keyboard focus
-                                                // is on a button. The textarea's @mention handler calls
-                                                // stop_propagation when it consumes a key, so these never
-                                                // double-fire with mention navigation.
-                                                onkeydown: {
-                                                    let msg_id = msg_id_for_save.clone();
-                                                    let original = original_text.clone();
-                                                    move |e: KeyboardEvent| {
-                                                        if e.key() == Key::Escape {
-                                                            editing_message.set(None);
-                                                        } else if e.key() == Key::Enter && !e.modifiers().shift() {
-                                                            e.prevent_default();
-                                                            commit_edit(msg_id.clone(), &original);
-                                                        }
-                                                    }
-                                                },
-                                                // `relative` anchors the @mention autocomplete
-                                                // dropdown to the textarea.
-                                                div { class: "relative",
-                                                    // @mention autocomplete dropdown (floats above the textarea)
-                                                    mention::MentionDropdown {
-                                                        mention: edit_mention,
-                                                        on_pick: move |i| mention::apply_mention_selection(
-                                                            pick_id.clone(),
-                                                            edit_text,
-                                                            edit_mention,
-                                                            i,
-                                                            || {},
-                                                        ),
-                                                    }
-                                                    textarea {
-                                                        id: "{edit_id}",
-                                                        class: format!(
-                                                            "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none {}",
-                                                            if is_self { "bg-white/10 text-white placeholder-white/50 border border-white/20" } else { "bg-bg text-text border border-border" }
-                                                        ),
-                                                        value: "{edit_text}",
-                                                        onmounted: move |cx| {
-                                                            let element = cx.data();
-                                                            wasm_bindgen_futures::spawn_local(async move {
-                                                                let _ = element.set_focus(true).await;
-                                                            });
-                                                        },
-                                                        oninput: move |e| {
-                                                            let value = e.value().to_string();
-                                                            edit_text.set(value.clone());
-                                                            // Detect / update the @mention autocomplete.
-                                                            mention::update_mention_from_input(
-                                                                &input_id, &value, &input_members, edit_mention,
-                                                            );
-                                                        },
-                                                        // @mention navigation (Arrow/Enter/Tab/Esc) takes
-                                                        // precedence while the dropdown is open. When it
-                                                        // consumes the key, stop_propagation keeps the
-                                                        // container's Esc-cancel / Enter-save (above) from
-                                                        // also firing for that same key. Non-mention keys
-                                                        // bubble up to the container handler unchanged.
-                                                        onkeydown: move |e: KeyboardEvent| {
-                                                            if mention::handle_mention_keydown(
-                                                                &kd_id, &e, edit_text, edit_mention, || {},
-                                                            ) {
-                                                                e.stop_propagation();
-                                                            }
-                                                        },
-                                                        // Dismiss the dropdown when focus leaves the textarea
-                                                        // (click elsewhere). Dropdown rows use mousedown +
-                                                        // preventDefault, so picking one does not blur first.
-                                                        onfocusout: move |_| {
-                                                            crate::util::defer(move || edit_mention.set(None));
-                                                        },
+                            // Message bubble (or edit form if editing)
+                            {
+                                let is_editing = editing_message.read().as_ref() == Some(&msg.id);
+                                let msg_id_for_save = msg.message_id.clone();
+                                let original_text = msg.content_text.clone();
+                                if is_editing {
+                                    let save_msg_id = msg_id_for_save.clone();
+                                    let save_original = original_text.clone();
+                                    // Unique DOM id so the @mention caret math targets THIS
+                                    // edit textarea (multiple groups can theoretically edit).
+                                    let edit_id = format!("edit-msg-{}", msg.id);
+                                    let pick_id = edit_id.clone();
+                                    let kd_id = edit_id.clone();
+                                    let input_id = edit_id.clone();
+                                    let input_members = edit_mention_members.clone();
+                                    rsx! {
+                                        div {
+                                            class: format!(
+                                                "msg-edit-form p-3 rounded-2xl {}",
+                                                if is_self { "bg-accent" } else { "bg-surface" }
+                                            ),
+                                            tabindex: "0",
+                                            // Scroll into view when edit dialog appears (#93)
+                                            onmounted: move |cx| {
+                                                let el = cx.data();
+                                                wasm_bindgen_futures::spawn_local(async move {
+                                                    let _ = el.scroll_to(ScrollBehavior::Smooth).await;
+                                                });
+                                            },
+                                            // Global key bindings on the container (#94): Esc cancels,
+                                            // Enter saves. Kept here (not solely on the textarea) so the
+                                            // "(Esc)"/"(Enter)" button shortcuts work when keyboard focus
+                                            // is on a button. The textarea's @mention handler calls
+                                            // stop_propagation when it consumes a key, so these never
+                                            // double-fire with mention navigation.
+                                            onkeydown: {
+                                                let msg_id = msg_id_for_save.clone();
+                                                let original = original_text.clone();
+                                                move |e: KeyboardEvent| {
+                                                    if e.key() == Key::Escape {
+                                                        editing_message.set(None);
+                                                    } else if e.key() == Key::Enter && !e.modifiers().shift() {
+                                                        e.prevent_default();
+                                                        commit_edit(msg_id.clone(), &original);
                                                     }
                                                 }
-                                                // Encoded-size gate for the edit action: same
-                                                // measure the contract enforces. Without it an
-                                                // over-limit edit is signed, sent, and silently
-                                                // pruned by the contract validation.
-                                                {
-                                                    let encoded_bytes = RoomMessageBody::measure_edit(
-                                                        msg_id_for_save.clone(),
-                                                        &edit_text.read(),
-                                                        is_private,
-                                                    );
-                                                    let over_limit = encoded_bytes > max_message_size;
-                                                    // `/ 5 * 4` (not `* 4 / 5`): max_message_size is
-                                                    // room-config-controlled and falls back to
-                                                    // usize::MAX with no room, so multiply-first
-                                                    // overflows.
-                                                    let near_limit = encoded_bytes > max_message_size / 5 * 4;
-                                                    rsx! {
-                                                        if near_limit {
-                                                            div {
-                                                                class: if over_limit {
-                                                                    "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium"
-                                                                } else if is_self {
-                                                                    "text-xs text-right mt-1 pr-1 text-white/70"
-                                                                } else {
-                                                                    "text-xs text-right mt-1 pr-1 text-text-muted"
-                                                                },
-                                                                if over_limit {
-                                                                    "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
-                                                                } else {
-                                                                    "{encoded_bytes}/{max_message_size}"
-                                                                }
+                                            },
+                                            // `relative` anchors the @mention autocomplete
+                                            // dropdown to the textarea.
+                                            div { class: "relative",
+                                                // @mention autocomplete dropdown (floats above the textarea)
+                                                mention::MentionDropdown {
+                                                    mention: edit_mention,
+                                                    on_pick: move |i| mention::apply_mention_selection(
+                                                        pick_id.clone(),
+                                                        edit_text,
+                                                        edit_mention,
+                                                        i,
+                                                        || {},
+                                                    ),
+                                                }
+                                                textarea {
+                                                    id: "{edit_id}",
+                                                    class: format!(
+                                                        "w-full min-h-[240px] p-2 rounded-lg text-sm resize-y focus:outline-none {}",
+                                                        if is_self { "bg-white/10 text-white placeholder-white/50 border border-white/20" } else { "bg-bg text-text border border-border" }
+                                                    ),
+                                                    value: "{edit_text}",
+                                                    onmounted: move |cx| {
+                                                        let element = cx.data();
+                                                        wasm_bindgen_futures::spawn_local(async move {
+                                                            let _ = element.set_focus(true).await;
+                                                        });
+                                                    },
+                                                    oninput: move |e| {
+                                                        let value = e.value().to_string();
+                                                        edit_text.set(value.clone());
+                                                        // Detect / update the @mention autocomplete.
+                                                        mention::update_mention_from_input(
+                                                            &input_id, &value, &input_members, edit_mention,
+                                                        );
+                                                    },
+                                                    // @mention navigation (Arrow/Enter/Tab/Esc) takes
+                                                    // precedence while the dropdown is open. When it
+                                                    // consumes the key, stop_propagation keeps the
+                                                    // container's Esc-cancel / Enter-save (above) from
+                                                    // also firing for that same key. Non-mention keys
+                                                    // bubble up to the container handler unchanged.
+                                                    onkeydown: move |e: KeyboardEvent| {
+                                                        if mention::handle_mention_keydown(
+                                                            &kd_id, &e, edit_text, edit_mention, || {},
+                                                        ) {
+                                                            e.stop_propagation();
+                                                        }
+                                                    },
+                                                    // Dismiss the dropdown when focus leaves the textarea
+                                                    // (click elsewhere). Dropdown rows use mousedown +
+                                                    // preventDefault, so picking one does not blur first.
+                                                    onfocusout: move |_| {
+                                                        crate::util::defer(move || edit_mention.set(None));
+                                                    },
+                                                }
+                                            }
+                                            // Encoded-size gate for the edit action: same
+                                            // measure the contract enforces. Without it an
+                                            // over-limit edit is signed, sent, and silently
+                                            // pruned by the contract validation.
+                                            {
+                                                let encoded_bytes = RoomMessageBody::measure_edit(
+                                                    msg_id_for_save.clone(),
+                                                    &edit_text.read(),
+                                                    is_private,
+                                                );
+                                                let over_limit = encoded_bytes > max_message_size;
+                                                // `/ 5 * 4` (not `* 4 / 5`): max_message_size is
+                                                // room-config-controlled and falls back to
+                                                // usize::MAX with no room, so multiply-first
+                                                // overflows.
+                                                let near_limit = encoded_bytes > max_message_size / 5 * 4;
+                                                rsx! {
+                                                    if near_limit {
+                                                        div {
+                                                            class: if over_limit {
+                                                                "text-xs text-right mt-1 pr-1 text-red-600 dark:text-red-400 font-medium"
+                                                            } else if is_self {
+                                                                "text-xs text-right mt-1 pr-1 text-white/70"
+                                                            } else {
+                                                                "text-xs text-right mt-1 pr-1 text-text-muted"
+                                                            },
+                                                            if over_limit {
+                                                                "Message too long \u{2014} {encoded_bytes}/{max_message_size} bytes"
+                                                            } else {
+                                                                "{encoded_bytes}/{max_message_size}"
                                                             }
                                                         }
-                                                        div { class: "flex justify-end gap-3 mt-3",
-                                                            style: "overflow: visible;",
-                                                            button {
-                                                                class: if is_self {
-                                                                    "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"
-                                                                } else {
-                                                                    "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border"
-                                                                },
-                                                                onclick: move |_| editing_message.set(None),
-                                                                "Cancel (Esc)"
-                                                            }
-                                                            button {
-                                                                class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-medium hover:opacity-90",
-                                                                style: if over_limit {
-                                                                    "background-color: #9ca3af; color: white; cursor: not-allowed; opacity: 0.6;"
-                                                                } else {
-                                                                    "background-color: #2563eb; color: white;"
-                                                                },
-                                                                disabled: over_limit,
-                                                                title: if over_limit {
-                                                                    format!("Edited message exceeds the {} byte limit", max_message_size)
-                                                                } else {
-                                                                    String::new()
-                                                                },
-                                                                onclick: move |_| commit_edit(save_msg_id.clone(), &save_original),
-                                                                "Save (Enter)"
-                                                            }
+                                                    }
+                                                    div { class: "flex justify-end gap-3 mt-3",
+                                                        style: "overflow: visible;",
+                                                        button {
+                                                            class: if is_self {
+                                                                "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"
+                                                            } else {
+                                                                "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-surface text-text hover:bg-border"
+                                                            },
+                                                            onclick: move |_| editing_message.set(None),
+                                                            "Cancel (Esc)"
+                                                        }
+                                                        button {
+                                                            class: "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg font-medium hover:opacity-90",
+                                                            style: if over_limit {
+                                                                "background-color: #9ca3af; color: white; cursor: not-allowed; opacity: 0.6;"
+                                                            } else {
+                                                                "background-color: #2563eb; color: white;"
+                                                            },
+                                                            disabled: over_limit,
+                                                            title: if over_limit {
+                                                                format!("Edited message exceeds the {} byte limit", max_message_size)
+                                                            } else {
+                                                                String::new()
+                                                            },
+                                                            onclick: move |_| commit_edit(save_msg_id.clone(), &save_original),
+                                                            "Save (Enter)"
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                    } else {
-                                        let reply_strip_inner = reply_strip_val.clone();
-                                        rsx! {
-                                            // Message bubble. The reply strip (if any) is rendered as
-                                            // the first child INSIDE the bubble so it shares the
-                                            // bubble's width and its intrinsic size cannot reflow
-                                            // the parent (fixes #206 and #207).
-                                            div {
-                                                "data-testid": "message-bubble",
-                                                // overflow-hidden + min-w-0 on the reply strip keep the nowrap strip from widening the bubble.
-                                                class: format!(
-                                                    "msg-bubble min-w-full flex flex-col text-sm overflow-hidden {}",
-                                                    if is_self {
-                                                        "bg-accent text-white"
-                                                    } else {
-                                                        "bg-surface text-text"
-                                                    }
-                                                ),
-                                                // Reply-quote strip (inside bubble, first child).
-                                                // Exactly one arm renders, enforced by the type: an
-                                                // unverifiable quote is `Unavailable`, which carries no
-                                                // author or preview to render.
-                                                //
-                                                // Self bubbles use a white-tinted overlay so the strip
-                                                // stays legible against the accent background; other
-                                                // bubbles use a dark-tinted overlay against the surface
-                                                // background. The previous `bg-accent/40 text-accent`
-                                                // was invisible on self bubbles because the strip
-                                                // composited to the same colour as the bubble.
-                                                {
-                                                    match reply_strip_inner {
-                                                        ReplyStrip::NotAReply => rsx! {},
-                                                        // Deliberately inert — a plain div with no
-                                                        // `onclick` — because there is no original
-                                                        // message to scroll to. It therefore carries
-                                                        // its own class rather than `reply-strip`,
-                                                        // whose focus outline assumes a button.
-                                                        //
-                                                        // The wording stays neutral: absence cannot
-                                                        // distinguish a ban from an ordinary aged-out
-                                                        // message, so claiming "banned" here would
-                                                        // mislabel the common case.
-                                                        ReplyStrip::Unavailable => rsx! {
-                                                            div {
-                                                                "data-testid": "reply-strip-unavailable",
+                                    }
+                                } else {
+                                    let reply_strip_inner = reply_strip_val.clone();
+                                    rsx! {
+                                        // Message bubble. The reply strip (if any) is rendered as
+                                        // the first child INSIDE the bubble so it shares the
+                                        // bubble's width and its intrinsic size cannot reflow
+                                        // the parent (fixes #206 and #207).
+                                        div {
+                                            "data-testid": "message-bubble",
+                                            // overflow-hidden + min-w-0 on the reply strip keep the nowrap strip from widening the bubble.
+                                            class: format!(
+                                                "msg-bubble min-w-full flex flex-col text-sm overflow-hidden {}",
+                                                if is_self {
+                                                    "bg-accent text-white"
+                                                } else {
+                                                    "bg-surface text-text"
+                                                }
+                                            ),
+                                            // Reply-quote strip (inside bubble, first child).
+                                            // Exactly one arm renders, enforced by the type: an
+                                            // unverifiable quote is `Unavailable`, which carries no
+                                            // author or preview to render.
+                                            //
+                                            // Self bubbles use a white-tinted overlay so the strip
+                                            // stays legible against the accent background; other
+                                            // bubbles use a dark-tinted overlay against the surface
+                                            // background. The previous `bg-accent/40 text-accent`
+                                            // was invisible on self bubbles because the strip
+                                            // composited to the same colour as the bubble.
+                                            {
+                                                match reply_strip_inner {
+                                                    ReplyStrip::NotAReply => rsx! {},
+                                                    // Deliberately inert — a plain div with no
+                                                    // `onclick` — because there is no original
+                                                    // message to scroll to. It therefore carries
+                                                    // its own class rather than `reply-strip`,
+                                                    // whose focus outline assumes a button.
+                                                    //
+                                                    // The wording stays neutral: absence cannot
+                                                    // distinguish a ban from an ordinary aged-out
+                                                    // message, so claiming "banned" here would
+                                                    // mislabel the common case.
+                                                    ReplyStrip::Unavailable => rsx! {
+                                                        div {
+                                                            "data-testid": "reply-strip-unavailable",
+                                                            class: format!(
+                                                                "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 italic {}",
+                                                                if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
+                                                            ),
+                                                            // The arrow is decorative; the sentence
+                                                            // after it is what a screen reader needs.
+                                                            span { "aria-hidden": "true", "\u{21a9} " }
+                                                            "Original message unavailable"
+                                                        }
+                                                    },
+                                                    ReplyStrip::Quote { author, preview, target_id } => {
+                                                        let target_row_id = format!("msg-{:?}", target_id.0);
+                                                        rsx! {
+                                                            // A native button: its accessible name is the quote, `title` its description.
+                                                            button {
+                                                                r#type: "button",
+                                                                "data-testid": "reply-strip",
+                                                                "data-reply-target": "{target_row_id}",
                                                                 class: format!(
-                                                                    "reply-strip-unavailable min-w-0 w-full text-[11px] leading-normal px-3 pt-1.5 pb-1.5 italic {}",
+                                                                    "reply-strip min-w-0 w-full text-left text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
                                                                     if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
                                                                 ),
-                                                                // The arrow is decorative; the sentence
-                                                                // after it is what a screen reader needs.
-                                                                span { "aria-hidden": "true", "\u{21a9} " }
-                                                                "Original message unavailable"
-                                                            }
-                                                        },
-                                                        ReplyStrip::Quote { author, preview, target_id } => {
-                                                            let target_row_id = format!("msg-{:?}", target_id.0);
-                                                            rsx! {
-                                                                // A native button: its accessible name is the quote, `title` its description.
-                                                                button {
-                                                                    r#type: "button",
-                                                                    "data-testid": "reply-strip",
-                                                                    "data-reply-target": "{target_row_id}",
-                                                                    class: format!(
-                                                                        "reply-strip block min-w-0 w-full text-left text-[11px] leading-normal px-3 pt-1.5 pb-1.5 cursor-pointer {}",
-                                                                        if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
-                                                                    ),
-                                                                    title: "Scroll to original message",
-                                                                    onclick: move |_| reply_highlight::jump_to_reply_target(&target_row_id),
-                                                                    span { class: "font-medium", ReplyIcon { size: 11 } " @{author}: " }
-                                                                    span { "{preview}" }
-                                                                }
+                                                                title: "Scroll to original message",
+                                                                onclick: move |_| reply_highlight::jump_to_reply_target(&target_row_id),
+                                                                span { class: "font-medium", ReplyIcon { size: 11 } " @{author}: " }
+                                                                span { "{preview}" }
                                                             }
                                                         }
                                                     }
                                                 }
-                                                // Message body, wrapped in a padding container so the
-                                                // "(edited)" indicator can sit inline at the trailing
-                                                // edge of the body text rather than as a separate
-                                                // flex-column row. `[overflow-wrap:anywhere]` ensures
-                                                // long URLs and unbreakable tokens wrap instead of
-                                                // forcing the bubble past its width cap. `anywhere` is
-                                                // stricter than `break-word`: it also lowers the
-                                                // element's min-content so flex/grid parents can shrink
-                                                // the bubble to fit.
+                                            }
+                                            // Message body, wrapped in a padding container so the
+                                            // "(edited)" indicator can sit inline at the trailing
+                                            // edge of the body text rather than as a separate
+                                            // flex-column row. `[overflow-wrap:anywhere]` ensures
+                                            // long URLs and unbreakable tokens wrap instead of
+                                            // forcing the bubble past its width cap. `anywhere` is
+                                            // stricter than `break-word`: it also lowers the
+                                            // element's min-content so flex/grid parents can shrink
+                                            // the bubble to fit.
+                                            div {
+                                                class: "px-3 py-2 min-w-0",
                                                 div {
-                                                    class: "px-3 py-2 min-w-0",
-                                                    div {
-                                                        class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
-                                                        dangerous_inner_html: "{msg.content_html}"
-                                                    }
-                                                    if msg.edited {
-                                                        span {
-                                                            class: format!(
-                                                                "text-xs ml-2 {}",
-                                                                if is_self { "text-white/70" } else { "text-text-muted" }
-                                                            ),
-                                                            "(edited)"
-                                                        }
+                                                    class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
+                                                    dangerous_inner_html: "{msg.content_html}"
+                                                }
+                                                if msg.edited {
+                                                    span {
+                                                        class: format!(
+                                                            "text-xs ml-2 {}",
+                                                            if is_self { "text-white/70" } else { "text-text-muted" }
+                                                        ),
+                                                        "(edited)"
                                                     }
                                                 }
                                             }
@@ -5196,21 +5180,25 @@ fn MessageGroupComponent(
                             // Reactions display with inline add button
                             {
                                 let msg_id_react = msg.message_id.clone();
-                                // Bindings for the reply / edit / delete buttons.
                                 let msg_id_str_for_edit = msg.id.clone();
                                 let msg_id_for_delete = msg.message_id.clone();
-                                let msg_id_for_reply = msg.message_id.clone();
                                 let current_text = msg.content_text.clone();
                                 // Clean the snapshot (mentions -> @name, markdown stripped)
                                 // BEFORE truncating, so the stored preview is plain text and
                                 // no consumer (UI, CLI, old client) ever sees a raw token —
                                 // even one that would have crossed the truncation boundary.
-                                let reply_text_preview = clean_reply_preview(&msg.content_text, &member_names)
-                                    .chars()
-                                    .take(100)
-                                    .collect::<String>();
-                                let reply_author_name = group.author_name.clone();
+                                let reply_ctx = ReplyContext {
+                                    message_id: msg.message_id.clone(),
+                                    author_name: group.author_name.clone(),
+                                    content_preview: clean_reply_preview(&msg.content_text, &member_names)
+                                        .chars()
+                                        .take(100)
+                                        .collect(),
+                                };
                                 let action_btn = "msg-action-btn inline-flex items-center justify-center h-5";
+                                let (time_str, full_time_str) =
+                                    time_labels(msg.time, msg.time_clamped, msg.receive_delay_secs);
+                                let time_iso = msg.time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
                                 // Find user's current reaction on this message (if any)
                                 // No known identity ⇒ no reaction is ours,
@@ -5228,7 +5216,7 @@ fn MessageGroupComponent(
                                 rsx! {
                                     div {
                                         "data-testid": "message-reaction-row",
-                                        class: "reaction-row flex flex-wrap items-center gap-1 mt-0.5",
+                                        class: "flex flex-wrap items-center gap-1 mt-0.5",
                                         // Existing reactions (clickable to toggle if user has reacted)
                                         {
                                             let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
@@ -5290,7 +5278,7 @@ fn MessageGroupComponent(
                                         AddReactionButton {
                                             message_id: msg_id_react.clone(),
                                             user_reaction: user_reaction.clone(),
-                                            has_reactions,
+                                            has_reactions: !msg.reactions.is_empty(),
                                             picker_target,
                                         }
                                         div {
@@ -5304,11 +5292,7 @@ fn MessageGroupComponent(
                                                 "aria-label": "Reply",
                                                 "data-testid": "message-reply-button",
                                                 onclick: move |_| {
-                                                    let ctx = ReplyContext {
-                                                        message_id: msg_id_for_reply.clone(),
-                                                        author_name: reply_author_name.clone(),
-                                                        content_preview: reply_text_preview.clone(),
-                                                    };
+                                                    let ctx = reply_ctx.clone();
                                                     crate::util::defer(move || on_reply.call(ctx));
                                                 },
                                                 ReplyIcon {}
@@ -5352,7 +5336,7 @@ fn MessageGroupComponent(
                                             datetime: "{time_iso}",
                                             class: format!(
                                                 "text-xs text-text-muted cursor-default whitespace-nowrap pl-2 {}",
-                                                if time_clamped { "italic opacity-70" } else { "" }
+                                                if msg.time_clamped { "italic opacity-70" } else { "" }
                                             ),
                                             title: "{full_time_str}",
                                             "{time_str}"

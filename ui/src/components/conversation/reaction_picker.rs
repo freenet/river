@@ -13,14 +13,14 @@ use wasm_bindgen::JsCast;
 use super::emoji_picker::FREQUENT_EMOJIS;
 
 /// DOM id of the picker, and the value every "+" names in `popovertarget`.
-pub(super) const REACTION_PICKER_ID: &str = "reaction-picker";
+const REACTION_PICKER_ID: &str = "reaction-picker";
 
 /// Which message the open picker reacts to. Set by the "+" click, cleared when the picker closes.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub(super) struct PickerTarget {
-    pub message_id: MessageId,
+    message_id: MessageId,
     /// The viewer's current reaction on that message; picking it again removes it.
-    pub current: Option<String>,
+    current: Option<String>,
 }
 
 fn picker_element() -> Option<web_sys::HtmlElement> {
@@ -36,9 +36,9 @@ fn picker_is_open() -> bool {
     picker_element().is_some_and(|el| el.matches(":popover-open").unwrap_or(false))
 }
 
-/// Close the picker if it is open; its `toggle` handler then clears the target. A DOM call, not a signal write.
+/// Close the picker (a no-op when closed); its `toggle` handler clears the target. A DOM call, not a signal write.
 pub(super) fn close_reaction_picker() {
-    if let Some(el) = picker_element().filter(|el| el.matches(":popover-open").unwrap_or(false)) {
+    if let Some(el) = picker_element() {
         let _ = el.hide_popover();
     }
 }
@@ -64,7 +64,7 @@ pub(super) fn ReactionPicker(
                 }
             },
             div { class: "grid grid-cols-4 gap-0.5",
-                for emoji in FREQUENT_EMOJIS.iter().copied() {
+                for (emoji, is_current) in FREQUENT_EMOJIS.iter().map(|&e| (e, current.as_deref() == Some(e))) {
                     button {
                         key: "{emoji}",
                         r#type: "button",
@@ -73,9 +73,9 @@ pub(super) fn ReactionPicker(
                         popovertargetaction: "hide",
                         class: format!(
                             "p-1 rounded hover:bg-surface transition-colors text-xl leading-none {}",
-                            if current.as_deref() == Some(emoji) { "bg-accent/20 ring-2 ring-accent" } else { "" }
+                            if is_current { "bg-accent/20 ring-2 ring-accent" } else { "" }
                         ),
-                        title: if current.as_deref() == Some(emoji) {
+                        title: if is_current {
                             format!("Remove {emoji} reaction")
                         } else {
                             format!("React with {emoji}")
@@ -120,7 +120,7 @@ pub(super) fn AddReactionButton(
             "data-testid": "add-reaction-button",
             popovertarget: REACTION_PICKER_ID,
             // Keeps this "+" shown while its picker is open (main.css) and names its owner.
-            "aria-expanded": if open_for_me { "true" } else { "false" },
+            "aria-expanded": "{open_for_me}",
             onclick: move |_| {
                 // The browser toggles after this handler, so only an opening click names the target.
                 if !picker_is_open() {

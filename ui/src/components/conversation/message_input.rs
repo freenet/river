@@ -246,7 +246,7 @@ pub fn MessageInput(
                         rsx! {
                             div { class: "flex items-center gap-2 mb-2 px-3 py-1.5 bg-surface border-l-2 border-accent rounded text-sm text-text-muted",
                                 span { class: "flex-1 truncate",
-                                    span { class: "font-medium", ReplyIcon { size: 14 } " @{author}: " }
+                                    span { class: "font-medium", ReplyIcon {} " @{author}: " }
                                     "{preview}"
                                 }
                                 button {
