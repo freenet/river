@@ -7,12 +7,11 @@ use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaCopy;
 use dioxus_free_icons::Icon;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
-use river_core::chat_delegate::RoomKey;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata};
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::ops::Deref;
 use wasm_bindgen_futures::spawn_local;
 
@@ -580,30 +579,16 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
 
         let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
-        // A configuration edit is signed, so it needs the private half. Fold
-        // the key into the same `Option` the "room not found" case already
-        // uses: a room whose blob carries no local signing key simply cannot
-        // publish a config change.
-        let signing_data = ROOMS.with(|rooms| {
-            rooms.map.get(&owner_key).and_then(|room_data| {
-                room_data.signing_key().cloned().map(|self_sk| {
-                    (
-                        room_data.room_key(),
-                        self_sk,
-                        room_data.room_state.clone(),
-                        room_data.is_private(),
-                        room_data.get_secret().map(|(s, v)| (*s, v)),
-                    )
-                })
+        let seal_data = ROOMS.with(|rooms| {
+            rooms.map.get(&owner_key).map(|room_data| {
+                (
+                    room_data.is_private(),
+                    room_data.get_secret().map(|(s, v)| (*s, v)),
+                )
             })
         });
-
-        let Some((room_key, self_sk, room_state_clone, is_private, room_secret_opt)) = signing_data
-        else {
-            // Backstop only. `is_owner` is now the key-gated `user_can_edit`,
-            // so a key-less owner never gets an enabled textarea to reach this
-            // from; the modal explains the refusal up front instead (R4).
-            warn!("Cannot update the room description: room or local signing key unavailable");
+        let Some((is_private, room_secret_opt)) = seal_data else {
+            warn!("Cannot update the room description: room unavailable");
             return;
         };
 
@@ -637,16 +622,8 @@ fn RoomDescriptionField(config: Configuration, is_owner: bool) -> Element {
             name: new_config.display.name.clone(),
             description: sealed_desc,
         };
-        new_config.configuration_version += 1;
 
-        sign_and_apply_configuration(
-            owner_key,
-            room_key,
-            self_sk,
-            room_state_clone,
-            new_config,
-            "Room description",
-        );
+        sign_and_apply_configuration(owner_key, new_config, "Room description");
     };
 
     rsx! {
@@ -756,37 +733,10 @@ fn NumericConfigField(
 
         let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
-        // Signed configuration edit: fold the private key into the same
-        // `Option` the "room not found" case already uses, so a blob without
-        // a local signing key degrades to "cannot edit" rather than panicking.
-        let signing_data = ROOMS.with(|rooms| {
-            rooms.map.get(&owner_key).and_then(|room_data| {
-                room_data
-                    .signing_key()
-                    .cloned()
-                    .map(|self_sk| (room_data.room_key(), self_sk, room_data.room_state.clone()))
-            })
-        });
-
-        let Some((room_key, self_sk, room_state_clone)) = signing_data else {
-            // Backstop only: this whole field is rendered behind the key-gated
-            // `user_can_edit`, so a key-less owner never sees it (R4).
-            warn!("Cannot update the room configuration: room or local signing key unavailable");
-            return;
-        };
-
         let mut new_config = config.clone();
         field.set(&mut new_config, new_val);
-        new_config.configuration_version += 1;
 
-        sign_and_apply_configuration(
-            owner_key,
-            room_key,
-            self_sk,
-            room_state_clone,
-            new_config,
-            label,
-        );
+        sign_and_apply_configuration(owner_key, new_config, label);
     };
 
     rsx! {
@@ -837,37 +787,10 @@ fn MaxMembersField(
 
         let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
-        // Signed configuration edit: fold the private key into the same
-        // `Option` the "room not found" case already uses, so a blob without
-        // a local signing key degrades to "cannot edit" rather than panicking.
-        let signing_data = ROOMS.with(|rooms| {
-            rooms.map.get(&owner_key).and_then(|room_data| {
-                room_data
-                    .signing_key()
-                    .cloned()
-                    .map(|self_sk| (room_data.room_key(), self_sk, room_data.room_state.clone()))
-            })
-        });
-
-        let Some((room_key, self_sk, room_state_clone)) = signing_data else {
-            // Backstop only: the input is rendered behind the key-gated
-            // `user_can_edit`, so a key-less owner never sees it (R4).
-            warn!("Cannot update the room configuration: room or local signing key unavailable");
-            return;
-        };
-
         let mut new_config = config.clone();
         new_config.max_members = new_max;
-        new_config.configuration_version += 1;
 
-        sign_and_apply_configuration(
-            owner_key,
-            room_key,
-            self_sk,
-            room_state_clone,
-            new_config,
-            "Max members",
-        );
+        sign_and_apply_configuration(owner_key, new_config, "Max members");
     };
 
     rsx! {
@@ -899,15 +822,31 @@ fn MaxMembersField(
     }
 }
 
-/// Sign `new_config` with the room key, apply it locally and queue the sync.
+/// Bump `new_config`'s version, sign it with the room key, apply it locally and
+/// queue the sync. The room's state is snapshotted here, synchronously, as the
+/// parent for the delta.
 pub(super) fn sign_and_apply_configuration(
     owner_key: VerifyingKey,
-    room_key: RoomKey,
-    self_sk: SigningKey,
-    room_state: ChatRoomStateV1,
-    new_config: Configuration,
+    mut new_config: Configuration,
     what: &'static str,
 ) {
+    let signing_data = ROOMS.with(|rooms| {
+        rooms.map.get(&owner_key).and_then(|room_data| {
+            room_data
+                .signing_key()
+                .cloned()
+                .map(|self_sk| (room_data.room_key(), self_sk, room_data.room_state.clone()))
+        })
+    });
+    let Some((room_key, self_sk, room_state)) = signing_data else {
+        // Backstop only: every caller is reachable only through the key-gated
+        // `user_can_edit`, so a key-less owner never gets an enabled field;
+        // the modal explains the refusal up front instead (R4).
+        warn!("Cannot update {what}: room or local signing key unavailable");
+        return;
+    };
+    new_config.configuration_version += 1;
+
     spawn_local(async move {
         let mut config_bytes = Vec::new();
         if let Err(e) = ciborium::ser::into_writer(&new_config, &mut config_bytes) {

@@ -70,36 +70,16 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             // Get the owner key first
             let owner_key = CURRENT_ROOM.read().owner_key.expect("No owner key");
 
-            // Get signing data and encryption info from room
-            let signing_data = ROOMS.with(|rooms| {
-                if let Some(room_data) = rooms.map.get(&owner_key) {
-                    // The rename is signed, so the private half is required.
-                    // A blob that keeps its key elsewhere degrades exactly
-                    // like a missing room: the edit is dropped, with a log.
-                    // Backstop only. `is_owner` is the caller's key-gated
-                    // `user_can_edit`, so a key-less owner gets a disabled
-                    // input and the modal's own "this device doesn't hold your
-                    // key" notice instead of an edit that only logs (R4).
-                    let Some(self_sk) = room_data.signing_key().cloned() else {
-                        error!("No local signing key for the current room; room name edit dropped");
-                        return None;
-                    };
-                    Some((
-                        room_data.room_key(),
-                        self_sk,
-                        room_data.room_state.clone(),
+            let seal_data = ROOMS.with(|rooms| {
+                rooms.map.get(&owner_key).map(|room_data| {
+                    (
                         room_data.is_private(),
                         room_data.get_secret().map(|(s, v)| (*s, v)),
-                    ))
-                } else {
-                    error!("Room state not found for current room");
-                    None
-                }
+                    )
+                })
             });
-
-            let Some((room_key, self_sk, room_state_clone, is_private, room_secret_opt)) =
-                signing_data
-            else {
+            let Some((is_private, room_secret_opt)) = seal_data else {
+                warn!("Cannot update the room name: room unavailable");
                 return;
             };
 
@@ -127,16 +107,8 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
                 name: sealed_name,
                 description: new_config.display.description.clone(),
             };
-            new_config.configuration_version += 1;
 
-            sign_and_apply_configuration(
-                owner_key,
-                room_key,
-                self_sk,
-                room_state_clone,
-                new_config,
-                "Room name",
-            );
+            sign_and_apply_configuration(owner_key, new_config, "Room name");
         } else {
             error!("Room name is empty");
         }
