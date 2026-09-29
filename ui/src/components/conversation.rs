@@ -3981,11 +3981,9 @@ pub fn Conversation() -> Element {
             div {
                 class: "flex-1 min-h-0 relative",
                 div {
-                    // `overflow-x-hidden` is a backstop: a kebab action menu on
-                    // a very short self message can extend a few px past the
-                    // viewport edge; clip it (trailing whitespace only — the
-                    // menu content is left-aligned and stays visible) rather
-                    // than show a horizontal scrollbar in the history. #402.
+                    // `overflow-x-hidden` is a backstop: clip anything a row
+                    // pushes past the viewport edge rather than show a
+                    // horizontal scrollbar in the history. #402.
                     class: "h-full overflow-y-auto overflow-x-hidden",
                     // `overflow-anchor: none`: the pin machinery owns this
                     // container's `scrollTop`. Browser scroll anchoring rewrites
@@ -4917,7 +4915,7 @@ fn MessageGroupComponent(
                         // Content-sized: the bubble spans its reaction row, past its own cap if need be (min-w-full).
                         div {
                             class: "flex flex-col min-w-0 max-w-full",
-                            // Container for message bubble + hover actions
+                            // Container for the message bubble
                             div {
                                 class: "relative",
                                 // Message bubble (or edit form if editing)

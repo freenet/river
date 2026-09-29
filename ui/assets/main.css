@@ -42,8 +42,8 @@
     }
 }
 
-/* Touch reveal for the inline add-reaction "+" button (same failure mode as
- * #402/#462 above): `.add-reaction-btn` reveals via `.group:hover`, a real
+/* Touch reveal for the inline add-reaction "+" button (the failure mode of
+ * #402 and #462): `.add-reaction-btn` reveals via `.group:hover`, a real
  * CSS `:hover`, which touch devices can't reliably trigger — so on a phone
  * the button was invisible (opacity: 0) yet still tappable, unless the
  * message already had reactions (`.has-reactions` gives it opacity: 0.2 at
@@ -237,8 +237,9 @@
 
 /* DM-rail Archive ✕ — touch reveal (freenet/river#462).
  *
- * Same failure mode as #402 above: the archive button in the Direct Messages
- * rail (`dm_rail_section.rs`) is `opacity-0` and reveals via Tailwind
+ * Same failure mode as #402 (the old message action bar): the archive
+ * button in the Direct Messages rail (`dm_rail_section.rs`) is `opacity-0`
+ * and reveals via Tailwind
  * `group-hover:opacity-100`, which Tailwind v4 wraps in `@media (hover: hover)`.
  * On a touch device that reveal can never fire, so before this rule the button
  * was invisible on phones and — because it is `opacity-0` yet still
