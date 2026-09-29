@@ -27,6 +27,7 @@ mod mention;
 mod message_input;
 mod not_member_notification;
 mod reaction_picker;
+mod reply_highlight;
 use self::inline_icons::{DeleteIcon, EditIcon, ReplyIcon};
 use self::not_member_notification::NotMemberNotification;
 use self::reaction_picker::{AddReactionButton, PickerTarget, ReactionPicker};
@@ -5154,16 +5155,7 @@ fn MessageGroupComponent(
                                                                         if is_self { "bg-white/25 text-white/90" } else { "bg-black/[0.12] text-text-muted" }
                                                                     ),
                                                                     title: "Scroll to original message",
-                                                                    onclick: move |_| {
-                                                                        if let Some(window) = web_sys::window() {
-                                                                            if let Some(doc) = window.document() {
-                                                                                if let Some(el) = doc.get_element_by_id(&target_row_id) {
-                                                                                    el.scroll_into_view();
-                                                                                    let _ = el.class_list().add_1("reply-highlight");
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    },
+                                                                    onclick: move |_| reply_highlight::jump_to_reply_target(&target_row_id),
                                                                     span { class: "font-medium", ReplyIcon { size: 11 } " @{author}: " }
                                                                     span { "{preview}" }
                                                                 }

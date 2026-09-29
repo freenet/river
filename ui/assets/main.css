@@ -126,6 +126,7 @@
     padding: 0.125rem 0.5rem;
     border-radius: 0.5rem;
     transition: background-color 0.15s;
+    scroll-margin-block: 0.75rem; /* room above/below a reply jump */
 }
 
 .msg-row:first-child {
@@ -195,16 +196,6 @@
 
 .bg-accent .river-mention:focus-visible {
     outline-color: #fff;
-}
-
-/* Reply highlight animation (when clicking "scroll to original") */
-.reply-highlight {
-    animation: replyHighlight 2s ease-out;
-}
-
-@keyframes replyHighlight {
-    0% { background-color: rgba(59, 130, 246, 0.2); }
-    100% { background-color: transparent; }
 }
 
 /* Reply strip: always one ellipsized line. */

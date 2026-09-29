@@ -210,22 +210,40 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    const replyStrip = page.locator(".reply-strip").first();
+    const replyStrip = page.getByTestId("reply-strip").first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
+    const target = (await replyStrip.getAttribute("data-reply-target"))!;
 
-    // The onclick handler adds the `reply-highlight` class to the target
-    // message after scrolling; pressing Enter/Space on the focused strip
-    // must do the same (Space needs preventDefault to stop the page from
-    // scrolling).
+    // A jump lights the quoted row with a `reply-highlight` animation.
+    const highlighted = () =>
+      page.evaluate(
+        (id) =>
+          document
+            .getElementById(id)
+            ?.getAnimations()
+            .some((a) => a.id === "reply-highlight" && a.playState === "running") ?? false,
+        target
+      );
+
+    // A native button activates on both keys with no key handler. `.focus()`, not Tab:
+    // WebKit leaves native buttons out of the plain Tab order.
     await replyStrip.focus();
     await page.keyboard.press("Enter");
+    await expect.poll(highlighted).toBe(true);
 
-    // Wait for the highlight class to appear on any `[id^='msg-']` element.
-    await expect
-      .poll(async () =>
-        page.locator("[id^='msg-'].reply-highlight").count()
-      )
-      .toBeGreaterThan(0);
+    await page.evaluate(
+      (id) =>
+        document
+          .getElementById(id)
+          ?.getAnimations()
+          .filter((a) => a.id === "reply-highlight")
+          .forEach((a) => a.finish()),
+      target
+    );
+    await expect.poll(highlighted).toBe(false);
+
+    await page.keyboard.press("Space");
+    await expect.poll(highlighted).toBe(true);
   });
 });
 
