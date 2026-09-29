@@ -23,7 +23,6 @@ use crate::util::{
 };
 mod emoji_picker;
 mod mention;
-mod message_actions;
 mod message_input;
 mod not_member_notification;
 mod reaction_picker;
