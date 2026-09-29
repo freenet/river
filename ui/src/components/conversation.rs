@@ -22,10 +22,12 @@ use crate::util::{
     get_current_system_time, local_message_date, local_today,
 };
 mod emoji_picker;
+mod inline_icons;
 mod mention;
 mod message_input;
 mod not_member_notification;
 mod reaction_picker;
+use self::inline_icons::{DeleteIcon, EditIcon, ReplyIcon};
 use self::not_member_notification::NotMemberNotification;
 use self::reaction_picker::{AddReactionButton, PickerTarget, ReactionPicker};
 use crate::components::conversation::message_input::MessageInput;
@@ -5506,6 +5508,21 @@ fn MessageGroupComponent(
                             // Reactions display with inline add button
                             {
                                 let msg_id_react = msg.message_id.clone();
+                                // Bindings for the reply / edit / delete buttons.
+                                let msg_id_str_for_edit = msg.id.clone();
+                                let msg_id_for_delete = msg.message_id.clone();
+                                let msg_id_for_reply = msg.message_id.clone();
+                                let current_text = msg.content_text.clone();
+                                // Clean the snapshot (mentions -> @name, markdown stripped)
+                                // BEFORE truncating, so the stored preview is plain text and
+                                // no consumer (UI, CLI, old client) ever sees a raw token —
+                                // even one that would have crossed the truncation boundary.
+                                let reply_text_preview = clean_reply_preview(&msg.content_text, &member_names)
+                                    .chars()
+                                    .take(100)
+                                    .collect::<String>();
+                                let reply_author_name = group.author_name.clone();
+                                let action_btn = "msg-action-btn inline-flex items-center justify-center h-5";
 
                                 // Find user's current reaction on this message (if any)
                                 // No known identity ⇒ no reaction is ours,
@@ -5523,10 +5540,7 @@ fn MessageGroupComponent(
                                 rsx! {
                                     div {
                                         "data-testid": "message-reaction-row",
-                                        class: format!(
-                                            "flex flex-wrap items-center gap-1 mt-0.5 {}",
-                                            if is_self { "justify-end" } else { "justify-start" }
-                                        ),
+                                        class: "reaction-row flex flex-wrap items-center gap-1 mt-0.5",
                                         // Existing reactions (clickable to toggle if user has reacted)
                                         {
                                             let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
@@ -5591,16 +5605,65 @@ fn MessageGroupComponent(
                                             has_reactions,
                                             picker_target,
                                         }
+                                        div {
+                                            "data-testid": "message-action-cluster",
+                                            // `pl-3`: at least 16px between a full reaction row and the buttons.
+                                            class: "flex items-center gap-3 ml-auto pl-3 text-text-muted",
+                                            button {
+                                                r#type: "button",
+                                                class: "{action_btn}",
+                                                title: "Reply",
+                                                "aria-label": "Reply",
+                                                "data-testid": "message-reply-button",
+                                                onclick: move |_| {
+                                                    let ctx = ReplyContext {
+                                                        message_id: msg_id_for_reply.clone(),
+                                                        author_name: reply_author_name.clone(),
+                                                        content_preview: reply_text_preview.clone(),
+                                                    };
+                                                    crate::util::defer(move || on_reply.call(ctx));
+                                                },
+                                                ReplyIcon {}
+                                            }
+                                            if is_self {
+                                                button {
+                                                    r#type: "button",
+                                                    class: "{action_btn}",
+                                                    title: "Edit message",
+                                                    "aria-label": "Edit message",
+                                                    "data-testid": "message-edit-button",
+                                                    onclick: move |_| {
+                                                        let t = current_text.clone();
+                                                        let id = msg_id_str_for_edit.clone();
+                                                        crate::util::defer(move || {
+                                                            edit_text.set(t);
+                                                            editing_message.set(Some(id));
+                                                        });
+                                                    },
+                                                    EditIcon {}
+                                                }
+                                                button {
+                                                    r#type: "button",
+                                                    class: "{action_btn} hover:text-red-500",
+                                                    title: "Delete message",
+                                                    "aria-label": "Delete message",
+                                                    "data-testid": "message-delete-button",
+                                                    onclick: move |_| {
+                                                        let id = msg_id_for_delete.clone();
+                                                        crate::util::defer(move || on_request_delete.call(id));
+                                                    },
+                                                    DeleteIcon {}
+                                                }
+                                            }
+                                        }
                                         // This message's own time, always visible at the
-                                        // bubble's bottom right. `ml-auto` only on others'
-                                        // rows: an own row is already `justify-end`, and there
-                                        // it would push the chips to the left edge.
+                                        // bubble's bottom right, after the cluster (which
+                                        // takes the free space with its `ml-auto`).
                                         time {
                                             "data-testid": "message-time",
                                             datetime: "{time_iso}",
                                             class: format!(
-                                                "text-xs text-text-muted cursor-default whitespace-nowrap pl-2 {} {}",
-                                                if is_self { "" } else { "ml-auto" },
+                                                "text-xs text-text-muted cursor-default whitespace-nowrap pl-2 {}",
                                                 if time_clamped { "italic opacity-70" } else { "" }
                                             ),
                                             title: "{full_time_str}",
