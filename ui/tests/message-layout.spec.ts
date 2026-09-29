@@ -668,7 +668,7 @@ test.describe("Auto-scroll to bottom on refresh", () => {
 // 375px screen (clipped, message text cut off left and right), exactly the
 // "text going off the edge" report. Received (left-aligned) bubbles were fine
 // because their wrapper is a plain block that already fills the column. Fixed
-// by `min-w-0 max-w-full` on the per-message wrapper (conversation.rs). The
+// by `min-w-0 max-w-full` on the bubble's content wrapper (conversation.rs). The
 // example data carries a self reply to the long-URL message so this reproduces.
 test.describe("Self message bubble mobile overflow", () => {
   test.use({ viewport: { width: 375, height: 667 } });

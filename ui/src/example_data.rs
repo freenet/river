@@ -736,7 +736,7 @@ fn add_example_messages(
     // A SELF (owner-authored) reply whose quoted preview is the long URL above.
     // The reply strip renders its preview with `white-space: nowrap`, so an
     // unbreakable long URL in the preview drives the bubble to its full
-    // `max-w-prose` width. On a self (right-aligned) message that used to
+    // width cap. On a self (right-aligned) message that used to
     // overflow the viewport on narrow mobile screens, clipping the bubble off
     // both edges. Kept in example data so the mobile-overflow Playwright
     // regression test has a self bubble that WOULD overflow without the
