@@ -957,18 +957,22 @@ mod tests {
             }
             // An unseal whose argument is the nickname field. The window is
             // generous because rustfmt often breaks the call across lines.
-            let mut rest = production;
-            while let Some(idx) = rest.find("unseal_bytes_with_secrets(") {
-                let after = &rest[idx..];
-                // Take CHARS, not bytes: these files are full of multi-byte
-                // characters (em-dashes and emoji in comments), and a byte
-                // slice would panic on a char boundary and be blamed on
-                // whichever unrelated change happened to move the text.
-                let window: String = after.chars().take(160).collect();
-                if window.contains("preferred_nickname") {
-                    offenders.push(format!("{rel}: unseal of preferred_nickname"));
+            // `unseal_text_or_placeholder` wraps the same unseal, so it is a
+            // second way to render a nickname without the sanitiser.
+            for needle in ["unseal_bytes_with_secrets(", "unseal_text_or_placeholder("] {
+                let mut rest = production;
+                while let Some(idx) = rest.find(needle) {
+                    let after = &rest[idx..];
+                    // Take CHARS, not bytes: these files are full of multi-byte
+                    // characters (em-dashes and emoji in comments), and a byte
+                    // slice would panic on a char boundary and be blamed on
+                    // whichever unrelated change happened to move the text.
+                    let window: String = after.chars().take(160).collect();
+                    if window.contains("preferred_nickname") {
+                        offenders.push(format!("{rel}: unseal of preferred_nickname"));
+                    }
+                    rest = &after[1..];
                 }
-                rest = &after[1..];
             }
         }
 
