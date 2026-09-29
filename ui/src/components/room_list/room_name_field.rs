@@ -1,12 +1,10 @@
+use super::edit_room_modal::sign_and_apply_configuration;
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::util::ecies::{seal_for_room, unseal_text_or_placeholder};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use freenet_scaffold::ComposableState;
-use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+use river_core::room_state::configuration::Configuration;
 use river_core::room_state::privacy::RoomDisplayMetadata;
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
-use wasm_bindgen_futures::spawn_local;
 
 /// Whether a keydown in the room-name input should commit the value and close
 /// the edit-room dialog (freenet/river#21).
@@ -131,62 +129,14 @@ pub fn RoomNameField(config: Configuration, is_owner: bool) -> Element {
             };
             new_config.configuration_version += 1;
 
-            spawn_local(async move {
-                // Serialize config to CBOR for signing
-                let mut config_bytes = Vec::new();
-                if let Err(e) = ciborium::ser::into_writer(&new_config, &mut config_bytes) {
-                    error!("Failed to serialize config for signing: {:?}", e);
-                    return;
-                }
-
-                // Sign using delegate with fallback to local signing
-                let signature =
-                    crate::signing::sign_config_with_fallback(room_key, config_bytes, &self_sk)
-                        .await;
-
-                let new_authorized_config =
-                    AuthorizedConfigurationV1::with_signature(new_config, signature);
-
-                let delta = ChatRoomStateV1Delta {
-                    configuration: Some(new_authorized_config),
-                    ..Default::default()
-                };
-
-                // Defer ROOMS mutation to a clean execution context to
-                // prevent RefCell re-entrant borrow panics.
-                crate::util::defer(move || {
-                    let applied = ROOMS.with_mut(|rooms| {
-                        if let Some(room_data) = rooms.map.get_mut(&owner_key) {
-                            info!("Applying delta to room state");
-                            match ComposableState::apply_delta(
-                                &mut room_data.room_state,
-                                &room_state_clone,
-                                &ChatRoomParametersV1 { owner: owner_key },
-                                &Some(delta),
-                            ) {
-                                Ok(_) => {
-                                    info!("Delta applied successfully");
-                                    // #310: apply_delta re-runs the public-only
-                                    // actions-state rebuild; re-derive private
-                                    // edits/reactions with decryption. No-op on
-                                    // public rooms.
-                                    room_data.rebuild_private_actions_state();
-                                    true
-                                }
-                                Err(e) => {
-                                    error!("Failed to apply delta: {:?}", e);
-                                    false
-                                }
-                            }
-                        } else {
-                            false
-                        }
-                    });
-                    if applied {
-                        crate::components::app::mark_needs_sync(owner_key);
-                    }
-                });
-            });
+            sign_and_apply_configuration(
+                owner_key,
+                room_key,
+                self_sk,
+                room_state_clone,
+                new_config,
+                "Room name",
+            );
         } else {
             error!("Room name is empty");
         }
