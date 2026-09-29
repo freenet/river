@@ -1,3 +1,4 @@
+/* Unlayered: every rule in this file beats Tailwind's layered utilities, whatever their specificity. */
 /* Reaction button hover visibility */
 .add-reaction-btn {
     opacity: 0;
@@ -53,6 +54,15 @@
     .add-reaction-btn.has-reactions {
         opacity: 0.4;
     }
+}
+
+/* Width caps are a share of the group's column. Never on #chat-content: WebKit 307984 blanks the room list after a resize. */
+.msg-bubbles {
+    container-type: inline-size;
+}
+
+.msg-bubble {
+    max-width: min(65ch, 75cqi);
 }
 
 /* @mention chips. Rendered as raw <span class="river-mention"> inside message
