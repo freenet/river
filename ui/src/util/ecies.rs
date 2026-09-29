@@ -46,6 +46,17 @@ pub fn seal_for_room(
     }
 }
 
+/// A sealed display field as text, or the encrypted placeholder when `secrets` can't open it.
+pub fn unseal_text_or_placeholder(
+    sealed: &SealedBytes,
+    secrets: &std::collections::HashMap<u32, [u8; 32]>,
+) -> String {
+    match unseal_bytes_with_secrets(sealed, secrets) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => sealed.to_string_lossy(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -39,7 +39,6 @@ use crate::components::app::ROOMS;
 use crate::components::direct_messages::{
     is_thread_hidden_for, open_dm_thread, DM_LAST_SEEN, HIDDEN_DM_THREADS,
 };
-use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
     icons::fa_solid_icons::{FaEnvelope, FaXmark},
@@ -906,16 +905,7 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
         let Some(self_id) = room_data.self_member_id() else {
             continue;
         };
-        let sealed_name = &room_data
-            .room_state
-            .configuration
-            .configuration
-            .display
-            .name;
-        let room_name = match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
-            Ok(b) => String::from_utf8_lossy(&b).to_string(),
-            Err(_) => sealed_name.to_string_lossy(),
-        };
+        let room_name = room_data.display_name();
         let nicknames: HashMap<MemberId, String> = room_data
             .room_state
             .member_info
@@ -1065,16 +1055,7 @@ fn build_view() -> Vec<DmRailEntry> {
         };
 
         // Decrypted room name for display.
-        let sealed_name = &room_data
-            .room_state
-            .configuration
-            .configuration
-            .display
-            .name;
-        let room_name = match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
-            Ok(b) => String::from_utf8_lossy(&b).to_string(),
-            Err(_) => sealed_name.to_string_lossy(),
-        };
+        let room_name = room_data.display_name();
 
         // Nickname lookup per member id.
         let nicknames: HashMap<MemberId, String> = room_data

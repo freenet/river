@@ -2,7 +2,7 @@ use super::room_name_field::RoomNameField;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
 use crate::room_data::RoomData;
-use crate::util::ecies::{seal_for_room, unseal_bytes_with_secrets};
+use crate::util::ecies::{seal_for_room, unseal_text_or_placeholder};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::FaCopy;
@@ -560,10 +560,7 @@ fn stored_description(config: &Configuration) -> String {
         .display
         .description
         .as_ref()
-        .map(|sealed| match unseal_bytes_with_secrets(sealed, &secrets) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-            Err(_) => sealed.to_string_lossy(),
-        })
+        .map(|sealed| unseal_text_or_placeholder(sealed, &secrets))
         .unwrap_or_default()
 }
 

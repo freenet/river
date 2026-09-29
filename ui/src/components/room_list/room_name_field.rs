@@ -1,5 +1,5 @@
 use crate::components::app::{CURRENT_ROOM, EDIT_ROOM_MODAL, ROOMS};
-use crate::util::ecies::{seal_for_room, unseal_bytes_with_secrets};
+use crate::util::ecies::{seal_for_room, unseal_text_or_placeholder};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use freenet_scaffold::ComposableState;
@@ -43,10 +43,7 @@ fn stored_room_name(config: &Configuration) -> String {
                 .map(|room_data| room_data.secrets.clone())
         })
         .unwrap_or_default();
-    match unseal_bytes_with_secrets(&config.display.name, &secrets) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-        Err(_) => config.display.name.to_string_lossy(),
-    }
+    unseal_text_or_placeholder(&config.display.name, &secrets)
 }
 
 /// `is_owner` means "may edit this room's name", which the caller

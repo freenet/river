@@ -1,7 +1,6 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::components::members::{collect_invitation_secrets, Invitation};
 use crate::room_data::RoomData;
-use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaArrowsRotate, FaCopy, FaXmark};
 use dioxus_free_icons::Icon;
@@ -46,14 +45,6 @@ pub(crate) fn get_invitation_base_url() -> String {
     #[cfg(not(target_arch = "wasm32"))]
     {
         FALLBACK_BASE_URL.to_string()
-    }
-}
-
-fn room_display_name(room: &RoomData) -> String {
-    let sealed_name = &room.room_state.configuration.configuration.display.name;
-    match unseal_bytes_with_secrets(sealed_name, &room.secrets) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-        Err(_) => sealed_name.to_string_lossy(),
     }
 }
 
@@ -207,7 +198,7 @@ fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> El
         }
         // Named from the same snapshot the link is minted from, so the message
         // can never name one room while the link grants another.
-        let room_name = room_data.as_ref().map(room_display_name);
+        let room_name = room_data.as_ref().map(|r| r.display_name());
         create_invitation(room_data)
             .await
             .map(|invitation| (invitation, room_name))

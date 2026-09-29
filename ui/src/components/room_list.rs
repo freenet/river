@@ -18,7 +18,6 @@ use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal}
 use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::components::room_list::join_with_code_modal::JoinWithCodeModal;
 use crate::room_data::CurrentRoom;
-use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
 use dioxus_free_icons::{
@@ -253,17 +252,7 @@ pub fn RoomList() -> Element {
                 };
                 let awaiting_sync =
                     room_data.is_awaiting_initial_sync() && sync_error_msg.is_none();
-                // Decrypt room name if room is private and we have the secret
-                let sealed_name = &room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .display
-                    .name;
-                let room_name = match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                    Err(_) => sealed_name.to_string_lossy(),
-                };
+                let room_name = room_data.display_name();
                 let is_current = current_room_key == Some(room_key);
                 let is_private = room_data
                     .room_state
