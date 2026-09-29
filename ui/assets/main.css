@@ -205,10 +205,10 @@
     text-overflow: ellipsis;
 }
 
-/* Keyboard focus draws an outline only. */
+/* Keyboard focus draws an outline only, inset: the bubble's overflow-hidden clips one drawn outside. */
 .reply-strip:focus-visible {
     outline: 2px solid currentColor;
-    outline-offset: 1px;
+    outline-offset: -2px;
 }
 
 /* DM-rail Archive ✕ — touch reveal (freenet/river#462).
