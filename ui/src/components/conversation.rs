@@ -4842,6 +4842,18 @@ fn MessageGroupComponent(
         }
     });
 
+    // Enter and Save both commit here; an over-limit draft stays open.
+    let mut commit_edit = move |msg_id: MessageId, original: &str| {
+        let new_text = edit_text.read().clone();
+        if RoomMessageBody::measure_edit(msg_id.clone(), &new_text, is_private) > max_message_size {
+            return;
+        }
+        if !new_text.is_empty() && new_text != original {
+            on_edit.call((msg_id, new_text));
+        }
+        editing_message.set(None);
+    };
+
     rsx! {
         div {
             class: format!(
@@ -4968,10 +4980,9 @@ fn MessageGroupComponent(
                                                 rsx! {
                                                     div {
                                                         class: format!(
-                                                            "p-3 rounded-2xl {}",
+                                                            "msg-edit-form w-full overflow-visible p-3 rounded-2xl {}",
                                                             if is_self { "bg-accent" } else { "bg-surface" }
                                                         ),
-                                                        style: "width: 100%; max-width: 550px; overflow: visible;",
                                                         tabindex: "0",
                                                         // Scroll into view when edit dialog appears (#93)
                                                         onmounted: move |cx| {
@@ -4994,21 +5005,7 @@ fn MessageGroupComponent(
                                                                     editing_message.set(None);
                                                                 } else if e.key() == Key::Enter && !e.modifiers().shift() {
                                                                     e.prevent_default();
-                                                                    let new_text = edit_text.read().clone();
-                                                                    // Encoded-size gate: keep the form open so the
-                                                                    // over-limit edit isn't silently discarded.
-                                                                    if RoomMessageBody::measure_edit(
-                                                                        msg_id.clone(),
-                                                                        &new_text,
-                                                                        is_private,
-                                                                    ) > max_message_size
-                                                                    {
-                                                                        return;
-                                                                    }
-                                                                    if !new_text.is_empty() && new_text != original {
-                                                                        on_edit.call((msg_id.clone(), new_text));
-                                                                    }
-                                                                    editing_message.set(None);
+                                                                    commit_edit(msg_id.clone(), &original);
                                                                 }
                                                             }
                                                         },
@@ -5125,26 +5122,7 @@ fn MessageGroupComponent(
                                                                         } else {
                                                                             String::new()
                                                                         },
-                                                                        onclick: move |_| {
-                                                                            let new_text = edit_text.read().clone();
-                                                                            // Same guard as Enter-save: `disabled` should
-                                                                            // make this unreachable when over, but a
-                                                                            // render-lag click must keep the form open
-                                                                            // rather than fall through to the silent
-                                                                            // safety-net drop.
-                                                                            if RoomMessageBody::measure_edit(
-                                                                                save_msg_id.clone(),
-                                                                                &new_text,
-                                                                                is_private,
-                                                                            ) > max_message_size
-                                                                            {
-                                                                                return;
-                                                                            }
-                                                                            if !new_text.is_empty() && new_text != save_original {
-                                                                                on_edit.call((save_msg_id.clone(), new_text));
-                                                                            }
-                                                                            editing_message.set(None);
-                                                                        },
+                                                                        onclick: move |_| commit_edit(save_msg_id.clone(), &save_original),
                                                                         "Save (Enter)"
                                                                     }
                                                                 }
