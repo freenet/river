@@ -73,6 +73,34 @@
     }
 }
 
+/* Reply, edit and delete stay hidden until their row is hovered or holds keyboard focus. */
+.msg-action-btn {
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.msg-row:is(:hover, :has(:focus-visible)) .msg-action-btn {
+    opacity: 0.4;
+}
+
+.msg-row:is(:hover, :has(:focus-visible)) .msg-action-btn:is(:hover, :focus-visible) {
+    opacity: 0.7;
+}
+
+/* Touch can't hover: always shown, with a 26x28 hit area that takes no layout space (WCAG 2.5.8). */
+@media (hover: none), (any-pointer: coarse) {
+    .msg-action-btn {
+        opacity: 0.4;
+        position: relative;
+    }
+
+    .msg-action-btn::after {
+        content: "";
+        position: absolute;
+        inset: -4px -6px;
+    }
+}
+
 /* Width caps are a share of the group's column. Never on #chat-content: WebKit 307984 blanks the room list after a resize. */
 .msg-bubbles {
     container-type: inline-size;
