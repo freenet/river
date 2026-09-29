@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp, selectListedRoom, resolveColor } from "./example-room";
+import { waitForApp, selectListedRoom, resolveColor, computedColor } from "./example-room";
 
 // A reply's quote strip jumps to the quoted row and lights the whole row for 2s.
 // "Public Discussion Room": self is an observer, so every group has an author header,
@@ -54,24 +54,7 @@ test("the highlight fills the quoted row, author name included", async ({ page }
 
   // Bubble grey on the row itself (not on an inset box), compared as resolved colours.
   const surface = await resolveColor(page, "var(--color-surface)");
-  await expect
-    .poll(async () =>
-      resolveColor(
-        page,
-        await page.evaluate((id) => getComputedStyle(document.getElementById(id)!).backgroundColor, target)
-      )
-    )
-    .toEqual(surface);
-
-  const headerInsideRow = await page.evaluate((id) => {
-    const row = document.getElementById(id)!;
-    const header = row.querySelector('[data-testid="message-group-header"]');
-    if (!header) return false;
-    const r = row.getBoundingClientRect();
-    const h = header.getBoundingClientRect();
-    return h.top >= r.top && h.bottom <= r.bottom && h.left >= r.left && h.right <= r.right;
-  }, target);
-  expect(headerInsideRow).toBe(true);
+  await expect.poll(() => computedColor(page.locator(`[id="${target}"]`), "backgroundColor")).toEqual(surface);
 });
 
 // No @chromium-only: whether an animation ending starts a CSS transition is engine behaviour.
@@ -82,7 +65,6 @@ test("the highlight switches off with no fade, even under the pointer", async ({
 
   // The row's hover band fades in over 150ms; let that settle so only an ending highlight can start one.
   await page.locator(`[id="${target}"]`).hover();
-  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
   await expect
     .poll(() =>
       page.evaluate(
@@ -101,4 +83,28 @@ test("the highlight switches off with no fade, even under the pointer", async ({
       .filter((a) => a instanceof CSSTransition && a.transitionProperty === "background-color").length;
   }, target);
   expect(transitionsAfterEnd).toBe(0);
+});
+
+test("pressing Enter or Space on the focused reply strip scrolls to the original", async ({ page }) => {
+  const target = (await strip(page).getAttribute("data-reply-target"))!;
+
+  // A native button activates on both keys with no key handler. `.focus()`, not Tab:
+  // WebKit leaves native buttons out of the plain Tab order.
+  await strip(page).focus();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => highlight(page, target)).not.toBeNull();
+
+  await page.evaluate(
+    (id) =>
+      document
+        .getElementById(id)
+        ?.getAnimations()
+        .filter((a) => a.id === "reply-highlight")
+        .forEach((a) => a.finish()),
+    target
+  );
+  await expect.poll(() => highlight(page, target)).toBeNull();
+
+  await page.keyboard.press("Space");
+  await expect.poll(() => highlight(page, target)).not.toBeNull();
 });

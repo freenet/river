@@ -52,8 +52,7 @@ export async function openRoomWithComposer(page: Page) {
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
 
-// The edit form on the first own message, opened from its edit button
-// (`message-action-cluster`), the same path for every pointer. Returns the edit textarea.
+// Opens the first own message's edit form; returns its textarea.
 export async function openOwnMessageEdit(page: Page): Promise<Locator> {
   const ownRow = page.locator('[data-self="true"] [id^="msg-"]').first();
   await expect(ownRow).toBeVisible();
@@ -80,3 +79,11 @@ export function resolveColor(page: Page, css: string): Promise<number[]> {
     return [r, g, b, a / 255];
   }, css);
 }
+
+export async function computedColor(el: Locator, prop: "color" | "backgroundColor" = "color") {
+  return resolveColor(el.page(), await el.evaluate((e, p) => getComputedStyle(e)[p], prop));
+}
+
+// The same query as main.css's touch blocks.
+export const isCoarsePointer = (page: Page) =>
+  page.evaluate(() => matchMedia("(hover: none), (any-pointer: coarse)").matches);

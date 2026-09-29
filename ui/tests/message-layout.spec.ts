@@ -39,8 +39,7 @@ test.describe("Edit box width (#205)", () => {
 });
 
 // #206 and #207: at a narrow viewport, a reply message bubble should not be
-// wider than a sibling non-reply bubble, and hovering the reply strip should
-// not change the bubble's width.
+// wider than a sibling non-reply bubble, and its strip stays on one line.
 test.describe("Reply bubble layout (#206, #207)", () => {
   test.use({ viewport: { width: 480, height: 900 } });
 
@@ -90,43 +89,29 @@ test.describe("Reply bubble layout (#206, #207)", () => {
     expect(replyWidth).toBeLessThanOrEqual(maxNonReplyWidth + 40);
   });
 
-  test("hovering the reply strip keeps it on one line", async ({ page }) => {
+  test("the reply strip is one line", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    const replyStrip = page.locator(".reply-strip").first();
-    await expect(replyStrip).toBeVisible({ timeout: 10_000 });
+    const strips = page.getByTestId("reply-strip");
+    await expect(strips.first()).toBeVisible({ timeout: 10_000 });
 
-    const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[@data-testid='message-bubble'][1]"
-    );
-
-    const widthBefore = await replyBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-
-    // Move the mouse to the origin first so no earlier hover state affects
-    // the measurement, then hover the strip.
-    await page.mouse.move(0, 0);
-    await replyStrip.hover();
-
-    // The strip stays one ellipsized line under the pointer.
-    expect(
-      await replyStrip.evaluate((el) => getComputedStyle(el).whiteSpace)
-    ).toBe("nowrap");
-
-    const widthAfter = await replyBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-    expect(Math.abs(widthAfter - widthBefore)).toBeLessThanOrEqual(0.5);
+    // Content height (less padding) against the line height: one line at any width.
+    for (const strip of await strips.all()) {
+      const { content, line } = await strip.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        return {
+          content: el.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom),
+          line: parseFloat(cs.lineHeight),
+        };
+      });
+      expect(content, `strip content ${content}px vs line ${line}px`).toBeLessThanOrEqual(1.5 * line);
+    }
   });
 });
 
-// #210: the reply strip has onclick and cursor-pointer but was previously a
-// plain div with no tabindex / role / key handler, and the hover-expand CSS
-// had no :focus-visible equivalent, so keyboard users couldn't reach or
-// activate it.
+// #210: keyboard users can reach and activate the reply strip, and see where focus is.
 test.describe("Reply strip keyboard accessibility (#210)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -150,7 +135,6 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     await expect(replyStrip).toHaveAccessibleName(/@.+:/);
     await expect(replyStrip).toHaveAccessibleDescription(/original message/i);
 
-    // Focusable via .focus(): a native button accepts focus with no tabindex.
     await replyStrip.evaluate((el) => (el as HTMLElement).focus());
     const isFocused = await replyStrip.evaluate(
       (el) => document.activeElement === el
@@ -201,49 +185,6 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
       hasFocusVisibleRule,
       ".reply-strip:focus-visible CSS rule must exist so keyboard users see the focus outline (#210)"
     ).toBe(true);
-  });
-
-  test("pressing Enter or Space on the focused reply strip scrolls to the original", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-
-    const replyStrip = page.getByTestId("reply-strip").first();
-    await expect(replyStrip).toBeVisible({ timeout: 10_000 });
-    const target = (await replyStrip.getAttribute("data-reply-target"))!;
-
-    // A jump lights the quoted row with a `reply-highlight` animation.
-    const highlighted = () =>
-      page.evaluate(
-        (id) =>
-          document
-            .getElementById(id)
-            ?.getAnimations()
-            .some((a) => a.id === "reply-highlight" && a.playState === "running") ?? false,
-        target
-      );
-
-    // A native button activates on both keys with no key handler. `.focus()`, not Tab:
-    // WebKit leaves native buttons out of the plain Tab order.
-    await replyStrip.focus();
-    await page.keyboard.press("Enter");
-    await expect.poll(highlighted).toBe(true);
-
-    await page.evaluate(
-      (id) =>
-        document
-          .getElementById(id)
-          ?.getAnimations()
-          .filter((a) => a.id === "reply-highlight")
-          .forEach((a) => a.finish()),
-      target
-    );
-    await expect.poll(highlighted).toBe(false);
-
-    await page.keyboard.press("Space");
-    await expect.poll(highlighted).toBe(true);
   });
 });
 

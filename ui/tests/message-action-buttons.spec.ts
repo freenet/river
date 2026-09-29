@@ -1,5 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
-import { openRoomWithComposer, resolveColor, waitForApp } from "./example-room";
+import { test, expect, Locator, Page } from "@playwright/test";
+import { computedColor, isCoarsePointer, openRoomWithComposer, resolveColor, waitForApp } from "./example-room";
 
 // The reply, edit and delete buttons under each bubble
 // (ui/src/components/conversation.rs, `message-action-cluster`):
@@ -15,8 +15,7 @@ test.beforeEach(async ({ page }) => {
 
 const own = (page: Page) => page.locator('[data-self="true"] [id^="msg-"]').first();
 const received = (page: Page) => page.locator('[data-self="false"] [id^="msg-"]').first();
-const isCoarse = (page: Page) =>
-  page.evaluate(() => matchMedia("(hover: none), (any-pointer: coarse)").matches);
+const BUTTON_ID = /^message-(reply|edit|delete)-button$/;
 
 test(
   "own rows offer reply, edit and delete; received rows only reply",
@@ -75,30 +74,23 @@ test("the buttons stay hidden until their row is hovered or holds keyboard focus
   page,
   browserName,
 }) => {
-  test.skip(await isCoarse(page), "always shown on touch");
+  test.skip(await isCoarsePointer(page), "always shown on touch");
   const row = own(page);
   await row.scrollIntoViewIfNeeded();
-  const op = (id: string) =>
-    row.getByTestId(id).evaluate((el) => +getComputedStyle(el).opacity);
+  const op = (btn: Locator) => btn.evaluate((el) => +getComputedStyle(el).opacity);
+  const reply = row.getByTestId("message-reply-button");
 
   await page.mouse.move(0, 0);
-  await expect.poll(() => op("message-reply-button")).toBe(0);
+  await expect.poll(() => op(reply)).toBe(0);
 
   await row.getByTestId("message-bubble").hover();
-  await expect.poll(() => op("message-reply-button")).toBeGreaterThan(0);
+  await expect.poll(() => op(reply)).toBeGreaterThan(0);
 
-  // Delete turns red on hover. An unlayered `color` rule for `.msg-action-btn` would beat
-  // Tailwind's `hover:text-red-500` and keep it grey (the old branch's B2).
-  expect(
-    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-red-500").trim()),
-    "premise: the red token is emitted"
-  ).not.toBe("");
+  // Delete turns red on hover; an unlayered `color` rule for `.msg-action-btn` would beat `hover:text-red-500`.
   const del = row.getByTestId("message-delete-button");
   await del.hover();
   const red = await resolveColor(page, "var(--color-red-500)");
-  await expect
-    .poll(async () => resolveColor(page, await del.evaluate((el) => getComputedStyle(el).color)))
-    .toEqual(red);
+  await expect.poll(() => computedColor(del)).toEqual(red);
 
   // WebKit keeps buttons out of the plain Tab order (they need Option+Tab).
   if (browserName === "webkit") return;
@@ -107,26 +99,20 @@ test("the buttons stay hidden until their row is hovered or holds keyboard focus
   await page.mouse.move(0, 0);
   await page.getByTestId("message-input").focus();
   let focused = "";
-  for (let i = 0; i < 300 && !/^message-(reply|edit|delete)-button$/.test(focused); i++) {
+  for (let i = 0; i < 300 && !BUTTON_ID.test(focused); i++) {
     await page.keyboard.press("Shift+Tab");
     focused = await page.evaluate(
       () => (document.activeElement as HTMLElement | null)?.dataset.testid ?? ""
     );
   }
-  expect(focused, "Shift+Tab from the composer reaches a message button").toMatch(
-    /^message-(reply|edit|delete)-button$/
-  );
+  expect(focused, "Shift+Tab from the composer reaches a message button").toMatch(BUTTON_ID);
   // The first one reached is the last row's last button, so its reply is not the focused one.
   const focusedRow = page.locator('[id^="msg-"]:has(:focus)');
-  await expect
-    .poll(() =>
-      focusedRow.getByTestId("message-reply-button").evaluate((el) => +getComputedStyle(el).opacity)
-    )
-    .toBeGreaterThanOrEqual(0.4);
+  await expect.poll(() => op(focusedRow.getByTestId("message-reply-button"))).toBeGreaterThanOrEqual(0.4);
 });
 
 test("on touch, a tap just beside an icon lands on its button", async ({ page }) => {
-  test.skip(!(await isCoarse(page)), "touch only");
+  test.skip(!(await isCoarsePointer(page)), "touch only");
   const row = own(page);
   await row.scrollIntoViewIfNeeded();
   for (const id of ["message-reply-button", "message-edit-button", "message-delete-button"]) {
@@ -134,8 +120,7 @@ test("on touch, a tap just beside an icon lands on its button", async ({ page })
       const r = btn.getBoundingClientRect();
       const cx = r.left + r.width / 2;
       const cy = r.top + r.height / 2;
-      const lands = (x: number, y: number) =>
-        document.elementFromPoint(x, y)?.closest('[data-testid="' + (btn as HTMLElement).dataset.testid + '"]') === btn;
+      const lands = (x: number, y: number) => btn.contains(document.elementFromPoint(x, y));
       return {
         left: lands(r.left - 4, cy),
         right: lands(r.right + 4, cy),

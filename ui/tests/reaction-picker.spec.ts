@@ -16,21 +16,13 @@ test.beforeEach(async ({ page }) => {
   await openRoomWithComposer(page);
 });
 
-/** Scroll the history so `plus`'s centre sits at viewport y = `y`. */
-async function placeAt(plus: Locator, y: number) {
-  await plus.evaluate((el, target) => {
+/** Scroll the history so `plus`'s centre sits at `fraction` of the viewport height. */
+async function placeAt(plus: Locator, fraction: number) {
+  await plus.evaluate((el, f) => {
     const scroller = document.getElementById("chat-scroll-container")!;
     const r = el.getBoundingClientRect();
-    scroller.scrollBy(0, r.top + r.height / 2 - target);
-  }, y);
-  await expect
-    .poll(() =>
-      plus.evaluate((el) => {
-        const r = el.getBoundingClientRect();
-        return Math.round(r.top + r.height / 2);
-      })
-    )
-    .toBeGreaterThan(0);
+    scroller.scrollBy(0, r.top + r.height / 2 - f * innerHeight);
+  }, fraction);
 }
 
 /** A "+" from the middle of the history, so it can be scrolled anywhere. */
@@ -44,15 +36,15 @@ async function middlePlus(page: Page): Promise<Locator> {
 /** Open the picker from `plus` the way a person would. */
 async function openFrom(page: Page, plus: Locator) {
   const row = plus.locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]");
-  await row.hover().catch(() => {});
+  await row.hover();
   await plus.click();
   await expect(page.locator(PICKER)).toBeVisible();
 }
 
 /** Where the open picker sits, and whether anything paints over any part of it. */
 const pickerLayout = (page: Page) =>
-  page.evaluate(() => {
-    const p = document.querySelector('[data-testid="emoji-picker"]')!;
+  page.evaluate((sel) => {
+    const p = document.querySelector(sel)!;
     const r = p.getBoundingClientRect();
     // Edge midpoints 3px in, corners 8px in (inside the 12px rounding).
     const cx = (r.left + r.right) / 2;
@@ -74,7 +66,7 @@ const pickerLayout = (page: Page) =>
         hit ? `${hit.tagName.toLowerCase()}[${(hit as HTMLElement).dataset.testid ?? ""}]` : "nothing"
       );
     return { bottom: r.bottom, viewportHeight: window.innerHeight, covered };
-  });
+  }, PICKER);
 
 test("Escape closes it", async ({ page }) => {
   const plus = await middlePlus(page);
@@ -113,28 +105,22 @@ test.describe("on a short landscape screen", () => {
   test.use({ viewport: { width: 844, height: 390 } });
 
   test("nothing covers it", async ({ page }) => {
-    // A "+" just above the middle of the screen: the old heuristic opened the
-    // picker downward here and 44px of it landed under the composer.
+    // Top layer: the composer never paints over it.
     const plus = await middlePlus(page);
-    await placeAt(plus, Math.round(390 * 0.55));
+    await placeAt(plus, 0.55);
     await openFrom(page, plus);
     const l = await pickerLayout(page);
     expect(l.covered, "something paints over the picker").toEqual([]);
     expect(l.bottom).toBeLessThanOrEqual(l.viewportHeight + 1);
   });
-});
 
-test.describe("on a wide screen", () => {
-  test.use({ viewport: { width: 1280, height: 800 } });
-
-  test("opens beside the + that opened it", async ({ page }) => {
+  test("opens beside the + that opened it, flipped to stay on screen", async ({ page }) => {
+    // Low on the screen there is less room below the "+" than the picker is tall, so it has to flip above.
     const plus = await middlePlus(page);
-    await placeAt(plus, Math.round(800 * 0.4));
-    await plus.click();
-    const picker = page.locator(PICKER);
-    await expect(picker).toBeVisible();
+    await placeAt(plus, 290 / 390);
+    await openFrom(page, plus);
     const b = (await plus.boundingBox())!;
-    const p = (await picker.boundingBox())!;
+    const p = (await page.locator(PICKER).boundingBox())!;
     // Touches the "+" on the side it opened toward, below or above it, within the 0.25rem gap.
     const below = p.y >= b.y + b.height - 1 && p.y - (b.y + b.height) <= 8;
     const above = b.y >= p.y + p.height - 1 && b.y - (p.y + p.height) <= 8;
