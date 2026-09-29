@@ -93,6 +93,10 @@
     max-width: 75cqi;
 }
 
+.msg-edit-form {
+    max-width: min(550px, 75cqi);
+}
+
 /* @mention chips. Rendered as raw <span class="river-mention"> inside message
  * bodies (see conversation::message_to_html_with_mentions). Clickable via the
  * document-level mention click interceptor.
