@@ -4179,13 +4179,8 @@ pub fn Conversation() -> Element {
                                         // fully-read room behaves exactly as
                                         // before.
                                         //
-                                        // Deliberately OUTSIDE the `space-y-4`
-                                        // list: as a child it would take the
-                                        // first row's place, pushing that row
-                                        // down by the 1rem gap and shifting the
-                                        // history by that much every time the
-                                        // sentinel appeared or (on the last
-                                        // backfill) disappeared.
+                                        // Outside the history list, which holds
+                                        // only rows.
                                         // Gated on the opening snap having
                                         // landed as well: a >window room's
                                         // first render sits at `scrollTop = 0`
@@ -4274,7 +4269,7 @@ pub fn Conversation() -> Element {
                                             }
                                         }
                                         div {
-                                            class: "space-y-4",
+                                            class: "-my-2",
                                             // Stable automation hook for the
                                             // history rows (AGENTS.md test-id
                                             // rule); additive markup only.
@@ -4290,7 +4285,7 @@ pub fn Conversation() -> Element {
                                                     DisplayRow::DateSeparator { key, label } => rsx! {
                                                         div {
                                                             key: "{key}",
-                                                            class: "flex justify-center py-2",
+                                                            class: "flex justify-center py-4",
                                                             span {
                                                                 class: "text-xs font-medium text-text-muted bg-surface px-3 py-1 rounded-full",
                                                                 "{label}"
@@ -4307,7 +4302,7 @@ pub fn Conversation() -> Element {
                                                                 // head-reposition machinery
                                                                 // (`history_row_offset_top`).
                                                                 "data-item-key": "{key}",
-                                                                class: "flex justify-center py-1",
+                                                                class: "flex justify-center py-3",
                                                                 span {
                                                                     class: "text-xs text-text-muted italic",
                                                                     "{text}"
@@ -4325,7 +4320,7 @@ pub fn Conversation() -> Element {
                                                             // component cannot carry a DOM
                                                             // attribute directly. It is the
                                                             // keyed list child, so diffing
-                                                            // and `space-y-4` spacing are
+                                                            // and row spacing are
                                                             // unchanged.
                                                             div {
                                                                 key: "{key}",
@@ -4871,83 +4866,6 @@ fn MessageGroupComponent(
             div {
                 class: "msg-group w-full",
                 "data-self": if is_self { "true" } else { "false" },
-                // Header with name and time (only for others)
-                if !is_self {
-                    div { class: "flex items-baseline gap-2 mb-1 px-1",
-                        span {
-                            class: "text-sm font-medium text-text cursor-pointer hover:text-accent transition-colors",
-                            title: "Member ID: {group.author_id}",
-                            onclick: move |_| {
-                                crate::util::defer(move || {
-                                    MEMBER_INFO_MODAL.with_mut(|signal| {
-                                        signal.member = Some(group.author_id);
-                                    });
-                                });
-                            },
-                            "{group.author_name}"
-                        }
-                        // Impersonation warning. Sits immediately after the
-                        // name, before the shield slot. The two are NOT
-                        // mutually exclusive — two deputies whose names collide
-                        // each carry a shield AND a warning — so these really
-                        // are two badge positions and both can be filled at
-                        // once. Do not collapse them into one slot, and do not
-                        // suppress the warning when a shield is present: a
-                        // deputised sockpuppet carries a genuine shield, and
-                        // suppressing on it is the exact immunity
-                        // `a_deputised_sockpuppet_cannot_suppress_its_own_warning`
-                        // denies.
-                        //
-                        // The nickname above cannot forge this glyph: U+26A0 is
-                        // inside the range `display_name::is_display_hidden`
-                        // strips, so it can never survive into a rendered
-                        // nickname. `the_warning_glyph_cannot_appear_in_a_nickname`
-                        // pins that.
-                        if let Some(warning) = group.author_impersonation.as_ref() {
-                            {
-                                let tooltip = warning.tooltip();
-                                rsx! {
-                                    span {
-                                        "data-testid": "message-author-impersonation-warning",
-                                        class: "text-sm cursor-default",
-                                        title: "{tooltip}",
-                                        "aria-label": "{tooltip}",
-                                        {crate::util::confusable::WARNING_GLYPH}
-                                    }
-                                }
-                            }
-                        }
-                        // Deputy shield. Same glyph, same visibility rule and
-                        // the same tooltip as the member-list row and the
-                        // member-info modal chip, so the three read as one
-                        // badge. The nickname above cannot forge it: nicknames
-                        // are stripped of emoji by `crate::util::display_name`.
-                        if let Some(badge) = group.author_badge.as_ref() {
-                            {
-                                let tooltip = badge.tooltip();
-                                rsx! {
-                                    span {
-                                        "data-testid": "message-author-deputy-badge",
-                                        class: "text-sm cursor-default",
-                                        title: "{tooltip}",
-                                        "aria-label": "{tooltip}",
-                                        "🛡"
-                                    }
-                                }
-                            }
-                        }
-                        span {
-                            class: if time_clamped {
-                                "text-xs text-text-muted cursor-default italic opacity-70"
-                            } else {
-                                "text-xs text-text-muted cursor-default"
-                            },
-                            title: "{full_time_str}",
-                            if time_clamped { "~{time_str}" } else { "{time_str}" }
-                        }
-                    }
-                }
-
                 // Message bubbles
                 div {
                     class: "msg-bubbles",
@@ -4964,6 +4882,83 @@ fn MessageGroupComponent(
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
                                 class: if is_self { "msg-row group flex flex-col items-end" } else { "msg-row group flex flex-col items-start" },
+                                // Header with name and time (only for others)
+                                if is_first && !is_self {
+                                    div { class: "msg-group-header flex items-baseline gap-2 pb-1 px-1",
+                                        "data-testid": "message-group-header",
+                                        span {
+                                            class: "text-sm font-medium text-text cursor-pointer hover:text-accent transition-colors",
+                                            title: "Member ID: {group.author_id}",
+                                            onclick: move |_| {
+                                                crate::util::defer(move || {
+                                                    MEMBER_INFO_MODAL.with_mut(|signal| {
+                                                        signal.member = Some(group.author_id);
+                                                    });
+                                                });
+                                            },
+                                            "{group.author_name}"
+                                        }
+                                        // Impersonation warning. Sits immediately after the
+                                        // name, before the shield slot. The two are NOT
+                                        // mutually exclusive — two deputies whose names collide
+                                        // each carry a shield AND a warning — so these really
+                                        // are two badge positions and both can be filled at
+                                        // once. Do not collapse them into one slot, and do not
+                                        // suppress the warning when a shield is present: a
+                                        // deputised sockpuppet carries a genuine shield, and
+                                        // suppressing on it is the exact immunity
+                                        // `a_deputised_sockpuppet_cannot_suppress_its_own_warning`
+                                        // denies.
+                                        //
+                                        // The nickname above cannot forge this glyph: U+26A0 is
+                                        // inside the range `display_name::is_display_hidden`
+                                        // strips, so it can never survive into a rendered
+                                        // nickname. `the_warning_glyph_cannot_appear_in_a_nickname`
+                                        // pins that.
+                                        if let Some(warning) = group.author_impersonation.as_ref() {
+                                            {
+                                                let tooltip = warning.tooltip();
+                                                rsx! {
+                                                    span {
+                                                        "data-testid": "message-author-impersonation-warning",
+                                                        class: "text-sm cursor-default",
+                                                        title: "{tooltip}",
+                                                        "aria-label": "{tooltip}",
+                                                        {crate::util::confusable::WARNING_GLYPH}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Deputy shield. Same glyph, same visibility rule and
+                                        // the same tooltip as the member-list row and the
+                                        // member-info modal chip, so the three read as one
+                                        // badge. The nickname above cannot forge it: nicknames
+                                        // are stripped of emoji by `crate::util::display_name`.
+                                        if let Some(badge) = group.author_badge.as_ref() {
+                                            {
+                                                let tooltip = badge.tooltip();
+                                                rsx! {
+                                                    span {
+                                                        "data-testid": "message-author-deputy-badge",
+                                                        class: "text-sm cursor-default",
+                                                        title: "{tooltip}",
+                                                        "aria-label": "{tooltip}",
+                                                        "🛡"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        span {
+                                            class: if time_clamped {
+                                                "text-xs text-text-muted cursor-default italic opacity-70"
+                                            } else {
+                                                "text-xs text-text-muted cursor-default"
+                                            },
+                                            title: "{full_time_str}",
+                                            if time_clamped { "~{time_str}" } else { "{time_str}" }
+                                        }
+                                    }
+                                }
                                 // Content-sized, so the bubble (`min-w-full`) widens to its reaction row.
                                 div {
                                     class: "flex flex-col min-w-0 max-w-full",
@@ -5761,22 +5756,21 @@ fn MessageGroupComponent(
                                         }
                                     }
                                 }
+                                // Time for self messages (shown at the end)
+                                if is_last && is_self {
+                                    div {
+                                        class: if time_clamped {
+                                            "text-xs text-text-muted pt-1 px-1 cursor-default italic opacity-70"
+                                        } else {
+                                            "text-xs text-text-muted pt-1 px-1 cursor-default"
+                                        },
+                                        title: "{full_time_str}",
+                                        if time_clamped { "~{time_str}" } else { "{time_str}" }
+                                    }
+                                }
                             }
                         }
                     })
-                    }
-                }
-
-                // Time for self messages (shown at the end)
-                if is_self {
-                    div {
-                        class: if time_clamped {
-                            "text-xs text-text-muted mt-1 px-1 cursor-default italic opacity-70"
-                        } else {
-                            "text-xs text-text-muted mt-1 px-1 cursor-default"
-                        },
-                        title: "{full_time_str}",
-                        if time_clamped { "~{time_str}" } else { "{time_str}" }
                     }
                 }
             }
