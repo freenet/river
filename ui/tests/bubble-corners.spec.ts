@@ -3,8 +3,7 @@ import { openRoomWithComposer, waitForApp } from "./example-room";
 
 // The bug only reshaped a group's last bubble, so target one. A group's last
 // bubble (lone or not) used to lose its rounded bottom once it had a reaction.
-// Which corners are pinched by position is pinned by the Rust unit test
-// `bubble_corners_pinch_only_toward_a_neighbour`.
+// Every corner is the same radius (main.css `.msg-bubble`).
 const LAST_IN_GROUP = '[data-testid="conversation-history"] [id^="msg-"]:last-child';
 const NO_REACTIONS = ':not(:has([data-testid="reaction-chip"]))';
 
