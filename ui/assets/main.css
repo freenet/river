@@ -207,30 +207,15 @@
     100% { background-color: transparent; }
 }
 
-/* Reply strip text truncation. The strip lives inside the message bubble
- * and always shows a single ellipsized line; on devices with a real pointer
- * (mouse) it expands to full text on hover. Touch devices skip the hover
- * expansion because (a) they have no reliable hover state and (b) tapping
- * the strip already scrolls to the quoted original message. */
+/* Reply strip: always one ellipsized line. */
 .reply-strip {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-@media (hover: hover) and (pointer: fine) {
-    .reply-strip:hover {
-        white-space: normal;
-        text-overflow: clip;
-    }
-}
-
-/* Keyboard users get the same full-preview expansion via focus-visible,
- * on all devices (not just those with a pointer). The strip is reachable
- * with Tab because it has role="button" and tabindex="0". */
+/* Keyboard focus draws an outline only. */
 .reply-strip:focus-visible {
-    white-space: normal;
-    text-overflow: clip;
     outline: 2px solid currentColor;
     outline-offset: 1px;
 }

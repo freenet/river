@@ -90,31 +90,13 @@ test.describe("Reply bubble layout (#206, #207)", () => {
     expect(replyWidth).toBeLessThanOrEqual(maxNonReplyWidth + 40);
   });
 
-  test("hovering the reply strip does not change the bubble width", async ({
-    page,
-  }, testInfo) => {
+  test("hovering the reply strip keeps it on one line", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
     const replyStrip = page.locator(".reply-strip").first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
-
-    // The hover-expand CSS is gated behind
-    // `@media (hover: hover) and (pointer: fine)`, which evaluates false
-    // on touch-emulated Playwright projects AND on some headless desktop
-    // Firefox configurations. On those browsers the :hover rule never
-    // applies, so hovering cannot cause a reflow at all — the test would
-    // pass for the wrong reason. Skip when the media query is false, so
-    // the test only runs (and only matters) when it actually exercises
-    // the hover reflow pathway.
-    const hoverCapable = await page.evaluate(() =>
-      window.matchMedia("(hover: hover) and (pointer: fine)").matches
-    );
-    test.skip(
-      !hoverCapable,
-      `(hover: hover) and (pointer: fine) is false in this browser (project: ${testInfo.project.name}); the hover-expand CSS is suppressed and there is nothing to exercise`
-    );
 
     const replyBubble = replyStrip.locator(
       "xpath=ancestor::*[@data-testid='message-bubble'][1]"
@@ -124,23 +106,19 @@ test.describe("Reply bubble layout (#206, #207)", () => {
       (el) => el.getBoundingClientRect().width
     );
 
-    // Move mouse to the origin first to ensure no prior hover state
-    // affects the measurement, then hover the reply strip.
+    // Move the mouse to the origin first so no earlier hover state affects
+    // the measurement, then hover the strip.
     await page.mouse.move(0, 0);
     await replyStrip.hover();
-    // Poll until the computed `white-space` flips to `normal`, which
-    // proves the hover CSS actually engaged.
-    await expect
-      .poll(async () =>
-        replyStrip.evaluate((el) => getComputedStyle(el).whiteSpace)
-      )
-      .toMatch(/normal/);
+
+    // The strip stays one ellipsized line under the pointer.
+    expect(
+      await replyStrip.evaluate((el) => getComputedStyle(el).whiteSpace)
+    ).toBe("nowrap");
 
     const widthAfter = await replyBubble.evaluate(
       (el) => el.getBoundingClientRect().width
     );
-
-    // Width must not change when the reply strip expands on hover.
     expect(Math.abs(widthAfter - widthBefore)).toBeLessThanOrEqual(0.5);
   });
 });
@@ -165,13 +143,14 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     const replyStrip = page.locator('[data-testid="reply-strip"]').first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
 
-    // ARIA contract
-    await expect(replyStrip).toHaveAttribute("role", "button");
-    await expect(replyStrip).toHaveAttribute("tabindex", "0");
-    await expect(replyStrip).toHaveAttribute("aria-label", /reply/i);
+    // A native button: its accessible name is the quote and its title is the
+    // description, so a screen reader announces the author and text.
+    expect(await replyStrip.evaluate((el) => el.tagName)).toBe("BUTTON");
+    await expect(replyStrip).toHaveRole("button");
+    await expect(replyStrip).toHaveAccessibleName(/@.+:/);
+    await expect(replyStrip).toHaveAccessibleDescription(/original message/i);
 
-    // Focusable via .focus() — this also verifies the element accepts focus
-    // at the DOM level (tabindex >= 0).
+    // Focusable via .focus(): a native button accepts focus with no tabindex.
     await replyStrip.evaluate((el) => (el as HTMLElement).focus());
     const isFocused = await replyStrip.evaluate(
       (el) => document.activeElement === el
@@ -220,7 +199,7 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     });
     expect(
       hasFocusVisibleRule,
-      ".reply-strip:focus-visible CSS rule must exist so keyboard users see full preview (#210)"
+      ".reply-strip:focus-visible CSS rule must exist so keyboard users see the focus outline (#210)"
     ).toBe(true);
   });
 
