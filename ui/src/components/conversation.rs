@@ -26,15 +26,16 @@ mod mention;
 mod message_actions;
 mod message_input;
 mod not_member_notification;
-use self::emoji_picker::FREQUENT_EMOJIS;
+mod reaction_picker;
 use self::not_member_notification::NotMemberNotification;
+use self::reaction_picker::{AddReactionButton, PickerTarget, ReactionPicker};
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaFaceSmile,
-    FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaPenToSquare,
+    FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -2505,6 +2506,8 @@ pub fn Conversation() -> Element {
     // a time across the whole history — opening one closes any other (#402).
     let open_action_menu: Signal<Option<String>> = use_signal(|| None);
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
+    // Which message the shared reaction picker is open for.
+    let picker_target: Signal<Option<PickerTarget>> = use_signal(|| None);
 
     // State for delete confirmation modal
     let mut pending_delete: Signal<Option<MessageId>> = use_signal(|| None);
@@ -4338,6 +4341,7 @@ pub fn Conversation() -> Element {
                                                                     }
                                                                 },
                                                                 open_action_menu: open_action_menu,
+                                                                picker_target: picker_target,
                                                                 }
                                                             }
                                                         }
@@ -4406,6 +4410,17 @@ pub fn Conversation() -> Element {
                         },
                         Icon { icon: FaChevronDown, width: 18, height: 18 }
                     }
+                }
+            }
+
+            // The one reaction picker; every message's "+" opens it (top layer, so its DOM position is irrelevant).
+            if current_room_data.is_some() {
+                ReactionPicker {
+                    target: picker_target,
+                    on_react: {
+                        let h = handle_toggle_reaction.clone();
+                        move |(id, emoji): (MessageId, String)| h(id, emoji)
+                    },
                 }
             }
 
@@ -4760,20 +4775,16 @@ fn MessageGroupComponent(
     on_reply: EventHandler<ReplyContext>,
     // Shared across all groups so only one action menu is open at a time (#402).
     open_action_menu: Signal<Option<String>>,
+    /// Only passed to each `AddReactionButton`.
+    picker_target: Signal<Option<PickerTarget>>,
 ) -> Element {
     let mut open_action_menu = open_action_menu;
-    // Per-group: at most one picker per group, and while a picker is open its
-    // raised (z-[60]) backdrop covers every other group's kebabs and "+"
-    // buttons, so tapping one dismisses the picker rather than stacking a
-    // second popover — the single-popover guarantee comes from the z-order, not
-    // a shared signal (#402).
-    let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
     let is_self = group.is_self;
 
     // Whether the kebab action menu should open above (true) or below (false)
     // the kebab. Set from the tap position so the menu for a message near the
     // bottom of the viewport flips upward instead of being clipped by the
-    // composer — mirrors `picker_show_above` for the emoji picker (#402).
+    // composer (#402).
     let mut menu_show_above: Signal<bool> = use_signal(|| false);
 
     // Whether the kebab action menu should be left-anchored (open rightward) or
@@ -4789,9 +4800,6 @@ fn MessageGroupComponent(
     // fits neither side fully it scrolls internally instead of being clipped by
     // the scroll container with Edit/Delete unreachable (#402 review).
     let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
-
-    // Track if emoji picker should appear above (true) or below (false) the button
-    let mut picker_show_above: Signal<bool> = use_signal(|| false);
 
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
@@ -5310,15 +5318,14 @@ fn MessageGroupComponent(
                                 // `@media (hover:hover)`, so it can never appear on a
                                 // touch device. `.touch-actions` (main.css) reveals
                                 // this kebab only where there is no hover pointer;
-                                // tapping it opens a menu with the same Reply / React /
-                                // Edit / Delete actions.
+                                // tapping it opens a menu with the same Reply / Edit /
+                                // Delete actions.
                                 {
                                     let msg_id_kebab = msg.id.clone();
                                     let msg_id_kebab_toggle = msg.id.clone();
                                     let msg_id_menu_reply = msg.message_id.clone();
                                     let msg_id_menu_delete = msg.message_id.clone();
                                     let msg_id_menu_edit = msg.id.clone();
-                                    let msg_id_menu_react = msg.id.clone();
                                     let edit_text_kebab = msg.content_text.clone();
                                     let reply_author_kebab = group.author_name.clone();
                                     let reply_preview_kebab = clean_reply_preview(&msg.content_text, &member_names)
@@ -5417,9 +5424,6 @@ fn MessageGroupComponent(
                                                             menu_show_above.set(above);
                                                             menu_align_left.set(align_left);
                                                             menu_max_h.set(max_h);
-                                                            // Dismiss any open reaction picker so the two
-                                                            // popovers can't stack (#402 review).
-                                                            open_emoji_picker.set(None);
                                                             open_action_menu.set(Some(id));
                                                         });
                                                     }
@@ -5464,23 +5468,6 @@ fn MessageGroupComponent(
                                                         Icon { icon: FaReply, width: 14, height: 14 }
                                                         "Reply"
                                                     }
-                                                    button {
-                                                        class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
-                                                        onclick: move |_| {
-                                                            let picker_id = format!("inline-{}", msg_id_menu_react);
-                                                            // Inherit the kebab's flip direction so the picker
-                                                            // for a bottom message also opens upward, not
-                                                            // clipped by the composer (#402 review).
-                                                            let above = *menu_show_above.peek();
-                                                            crate::util::defer(move || {
-                                                                picker_show_above.set(above);
-                                                                open_emoji_picker.set(Some(picker_id));
-                                                                open_action_menu.set(None);
-                                                            });
-                                                        },
-                                                        Icon { icon: FaFaceSmile, width: 14, height: 14 }
-                                                        "React"
-                                                    }
                                                     if is_self {
                                                         button {
                                                             class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
@@ -5517,9 +5504,7 @@ fn MessageGroupComponent(
                             }
                             // Reactions display with inline add button
                             {
-                                let msg_id_for_inline = msg.id.clone();
                                 let msg_id_react = msg.message_id.clone();
-                                let is_inline_picker_open = open_emoji_picker.read().as_ref() == Some(&format!("inline-{}", msg_id_for_inline));
 
                                 // Find user's current reaction on this message (if any)
                                 // No known identity ⇒ no reaction is ours,
@@ -5533,7 +5518,6 @@ fn MessageGroupComponent(
                                         None
                                     }
                                 });
-                                let user_reaction_for_picker = user_reaction.clone();
 
                                 rsx! {
                                     div {
@@ -5600,89 +5584,11 @@ fn MessageGroupComponent(
                                                 }
                                             })
                                         }
-                                        // Inline add reaction button (same line height as reactions)
-                                        div {
-                                            // Raise the whole picker (grid + z-40 backdrop) above the
-                                            // z-50 message kebabs while it's open, so a nearby closed
-                                            // kebab can't paint over the emoji grid and steal a tap
-                                            // (mirrors the action menu's z-[60] behaviour). (#402 review)
-                                            class: format!(
-                                                "relative group/react inline-flex items-center {}",
-                                                if is_inline_picker_open { "z-[60]" } else { "" }
-                                            ),
-                                            // Invisible backdrop when picker is open
-                                            if is_inline_picker_open {
-                                                div {
-                                                    class: "fixed inset-0 z-40",
-                                                    onclick: move |_| open_emoji_picker.set(None),
-                                                }
-                                            }
-                                            button {
-                                                "data-testid": "add-reaction-button",
-                                                class: format!(
-                                                    "add-reaction-btn inline-flex items-center justify-center text-xl leading-none hover:scale-110 {}",
-                                                    if has_reactions || is_inline_picker_open { "has-reactions" } else { "" }
-                                                ),
-                                                title: "Add reaction",
-                                                onclick: {
-                                                    let picker_id = format!("inline-{}", msg_id_for_inline);
-                                                    move |e: MouseEvent| {
-                                                        e.stop_propagation();
-                                                        let current = open_emoji_picker.read().clone();
-                                                        if current.as_ref() == Some(&picker_id) {
-                                                            open_emoji_picker.set(None);
-                                                        } else {
-                                                            // Determine if picker should appear above or below based on click position
-                                                            // If click is in bottom 40% of viewport, show picker above
-                                                            let click_y = e.client_coordinates().y;
-                                                            let viewport_height = web_sys::window()
-                                                                .and_then(|w| w.inner_height().ok())
-                                                                .and_then(|h| h.as_f64())
-                                                                .unwrap_or(800.0);
-                                                            picker_show_above.set(click_y > viewport_height * 0.6);
-                                                            open_emoji_picker.set(Some(picker_id.clone()));
-                                                        }
-                                                    }
-                                                },
-                                                "+"
-                                            }
-                                            // Emoji picker for inline button (flips based on viewport position)
-                                            if is_inline_picker_open {
-                                                div {
-                                                    "data-testid": "emoji-picker",
-                                                    class: format!(
-                                                        "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid {} {}",
-                                                        if *picker_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                        if is_self { "right-0" } else { "left-0" }
-                                                    ),
-                                                    style: "grid-template-columns: repeat(4, 1fr); gap: 2px;",
-                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                    {FREQUENT_EMOJIS.iter().map(|emoji| {
-                                                        let emoji_str = emoji.to_string();
-                                                        let msg_id = msg_id_react.clone();
-                                                        let is_current = user_reaction_for_picker.as_ref() == Some(&emoji_str);
-                                                        rsx! {
-                                                            button {
-                                                                key: "{emoji}",
-                                                                class: format!(
-                                                                    "p-1 rounded hover:bg-surface transition-colors text-xl leading-none {}",
-                                                                    if is_current { "bg-accent/20 ring-2 ring-accent" } else { "" }
-                                                                ),
-                                                                title: if is_current {
-                                                                    format!("Remove {} reaction", emoji)
-                                                                } else {
-                                                                    format!("React with {}", emoji)
-                                                                },
-                                                                onclick: move |_| {
-                                                                    on_react.call((msg_id.clone(), emoji_str.clone()));
-                                                                    open_emoji_picker.set(None);
-                                                                },
-                                                                "{emoji}"
-                                                            }
-                                                        }
-                                                    })}
-                                                }
-                                            }
+                                        AddReactionButton {
+                                            message_id: msg_id_react.clone(),
+                                            user_reaction: user_reaction.clone(),
+                                            has_reactions,
+                                            picker_target,
                                         }
                                         // This message's own time, always visible at the
                                         // bubble's bottom right. `ml-auto` only on others'

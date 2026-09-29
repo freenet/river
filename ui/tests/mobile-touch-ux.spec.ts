@@ -148,43 +148,6 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await expect(page.getByTitle("Cancel reply")).toBeVisible({ timeout: 5_000 });
   });
 
-  test("React from the kebab opens the emoji picker and closes the menu", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    test.skip(
-      !(await isTouchOnly(page)),
-      "kebab menu is touch-only; desktop uses the hover action bar"
-    );
-
-    const menu = page.locator('[data-testid="message-action-menu"]');
-    await page.locator('[data-testid="message-kebab"]').first().click();
-    await menu.getByRole("button", { name: "React" }).click();
-
-    // The action menu closes and the emoji picker (emoji buttons titled
-    // "React with …") opens.
-    await expect(menu).toBeHidden();
-    await expect(page.getByTitle(/^React with/).first()).toBeVisible({
-      timeout: 5_000,
-    });
-
-    // While the picker is open its raised backdrop covers the kebabs, so a tap
-    // at a kebab lands on that backdrop and dismisses the picker (the two
-    // popovers can't stack). No action menu opens from that same tap.
-    const kbox = await page
-      .locator('[data-testid="message-kebab"]')
-      .first()
-      .boundingBox();
-    expect(kbox).not.toBeNull();
-    if (kbox) {
-      await page.mouse.click(kbox.x + kbox.width / 2, kbox.y + kbox.height / 2);
-    }
-    await expect(page.getByTitle(/^React with/)).toHaveCount(0);
-    await expect(menu).toBeHidden();
-  });
-
   test("menu stays on-screen and dismisses via a far tap (narrow phone)", async ({
     page,
   }) => {
