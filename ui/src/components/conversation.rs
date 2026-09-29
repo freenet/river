@@ -143,12 +143,6 @@ struct MessageGroup {
     author_impersonation: Option<ImpersonationWarning>,
     is_self: bool,
     first_time: DateTime<Utc>,
-    /// True if any message in this group carried a sender timestamp later than
-    /// when we received it, by more than [`CLOCK_SKEW_TOLERANCE_SECS`], and was
-    /// therefore clamped back to its arrival time.
-    time_clamped: bool,
-    /// Propagation delay for the first message in the group (shown in header)
-    first_delay_secs: Option<i64>,
     messages: Vec<GroupedMessage>,
 }
 
@@ -156,13 +150,11 @@ struct MessageGroup {
 struct GroupedMessage {
     content_text: String,
     content_html: String,
-    #[allow(dead_code)]
     time: DateTime<Utc>,
     /// True if the sender's timestamp ran ahead of when we received this
     /// message and was clamped back to that arrival time. (It is clamped to
     /// ARRIVAL, not to "now": see [`MessageClock`] for why the render's wall
     /// clock cannot be the target.)
-    #[allow(dead_code)]
     time_clamped: bool,
     id: String,
     message_id: MessageId,
@@ -172,7 +164,6 @@ struct GroupedMessage {
     /// room state — see [`ReplyStrip`] and [`resolve_reply_strip`].
     reply_strip: ReplyStrip,
     /// Propagation delay in seconds (send → receive), if known and significant
-    #[allow(dead_code)]
     receive_delay_secs: Option<i64>,
 }
 
@@ -668,9 +659,6 @@ fn group_messages(
 
         if should_group {
             if let Some(DisplayItem::Messages(ref mut group)) = items.last_mut() {
-                if time_clamped {
-                    group.time_clamped = true;
-                }
                 group.messages.push(grouped_message);
             }
         } else {
@@ -696,8 +684,6 @@ fn group_messages(
                 author_impersonation,
                 is_self,
                 first_time: message_time,
-                time_clamped,
-                first_delay_secs: receive_delay_secs,
                 messages: vec![grouped_message],
             }));
         }
@@ -4728,6 +4714,31 @@ pub fn Conversation() -> Element {
     }
 }
 
+/// Short time label (`~`-prefixed when clamped) and its full tooltip (clock-skew
+/// clamp or propagation delay noted).
+fn time_labels(time: DateTime<Utc>, clamped: bool, delay_secs: Option<i64>) -> (String, String) {
+    let timestamp_ms = time.timestamp_millis();
+    let clamp_mark = if clamped { "~" } else { "" };
+    let short = format!("{clamp_mark}{}", format_utc_as_local_time(timestamp_ms));
+    let full = if clamped {
+        format!(
+            "{} (sender's clock may be ahead of yours — their timestamp was later \
+             than when this message reached you, so the time shown is when it \
+             arrived)",
+            format_utc_as_full_datetime(timestamp_ms)
+        )
+    } else if let Some(secs) = delay_secs {
+        format!(
+            "{} (received after {} delay)",
+            format_utc_as_full_datetime(timestamp_ms),
+            format_delay(secs)
+        )
+    } else {
+        format_utc_as_full_datetime(timestamp_ms)
+    };
+    (short, full)
+}
+
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -4757,24 +4768,6 @@ fn MessageGroupComponent(
     // second popover — the single-popover guarantee comes from the z-order, not
     // a shared signal (#402).
     let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
-    let timestamp_ms = group.first_time.timestamp_millis();
-    let time_str = format_utc_as_local_time(timestamp_ms);
-    let delay_suffix = group
-        .first_delay_secs
-        .map(|s| format!(" (received after {} delay)", format_delay(s)));
-    let full_time_str = if group.time_clamped {
-        format!(
-            "{} (sender's clock may be ahead of yours — their timestamp was later \
-             than when this message reached you, so the time shown is when it \
-             arrived)",
-            format_utc_as_full_datetime(timestamp_ms)
-        )
-    } else if let Some(ref suffix) = delay_suffix {
-        format!("{}{}", format_utc_as_full_datetime(timestamp_ms), suffix)
-    } else {
-        format_utc_as_full_datetime(timestamp_ms)
-    };
-    let time_clamped = group.time_clamped;
     let is_self = group.is_self;
 
     // Whether the kebab action menu should open above (true) or below (false)
@@ -4857,19 +4850,21 @@ fn MessageGroupComponent(
             class: "msg-bubbles",
             "data-self": "{is_self}",
             {
-                let messages_len = group.messages.len();
                 group.messages.into_iter().enumerate().map(move |(idx, msg)| {
-                let is_last = idx == messages_len - 1;
                 let is_first = idx == 0;
                 let has_reactions = !msg.reactions.is_empty();
                 let reply_strip_val = msg.reply_strip.clone();
+                let (time_str, full_time_str) =
+                    time_labels(msg.time, msg.time_clamped, msg.receive_delay_secs);
+                let time_clamped = msg.time_clamped;
+                let time_iso = msg.time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
                 rsx! {
                     div {
                         key: "{msg.id}",
                         id: "msg-{msg.id}",
                         class: format!("msg-row group flex flex-col {}", if is_self { "items-end" } else { "items-start" }),
-                        // Header with name and time (only for others)
+                        // Header with name and badges (only for others)
                         if is_first && !is_self {
                             div { class: "msg-group-header flex items-baseline gap-2 pb-1 px-1",
                                 "data-testid": "message-group-header",
@@ -4934,15 +4929,6 @@ fn MessageGroupComponent(
                                             }
                                         }
                                     }
-                                }
-                                span {
-                                    class: if time_clamped {
-                                        "text-xs text-text-muted cursor-default italic opacity-70"
-                                    } else {
-                                        "text-xs text-text-muted cursor-default"
-                                    },
-                                    title: "{full_time_str}",
-                                    if time_clamped { "~{time_str}" } else { "{time_str}" }
                                 }
                             }
                         }
@@ -5698,20 +5684,23 @@ fn MessageGroupComponent(
                                                 }
                                             }
                                         }
+                                        // This message's own time, always visible at the
+                                        // bubble's bottom right. `ml-auto` only on others'
+                                        // rows: an own row is already `justify-end`, and there
+                                        // it would push the chips to the left edge.
+                                        time {
+                                            "data-testid": "message-time",
+                                            datetime: "{time_iso}",
+                                            class: format!(
+                                                "text-xs text-text-muted cursor-default whitespace-nowrap pl-2 {} {}",
+                                                if is_self { "" } else { "ml-auto" },
+                                                if time_clamped { "italic opacity-70" } else { "" }
+                                            ),
+                                            title: "{full_time_str}",
+                                            "{time_str}"
+                                        }
                                     }
                                 }
-                            }
-                        }
-                        // Time for self messages (shown at the end)
-                        if is_last && is_self {
-                            div {
-                                class: if time_clamped {
-                                    "text-xs text-text-muted pt-1 px-1 cursor-default italic opacity-70"
-                                } else {
-                                    "text-xs text-text-muted pt-1 px-1 cursor-default"
-                                },
-                                title: "{full_time_str}",
-                                if time_clamped { "~{time_str}" } else { "{time_str}" }
                             }
                         }
                     }
@@ -8704,7 +8693,10 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(g.time_clamped, "a future timestamp must be flagged clamped");
+        assert!(
+            g.messages[0].time_clamped,
+            "a future timestamp must be flagged clamped"
+        );
         assert_eq!(
             g.messages[0].time, first_seen,
             "the clamp target must be when we first saw the message, not the \
@@ -8777,7 +8769,7 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(g.time_clamped);
+        assert!(g.messages[0].time_clamped);
         assert_eq!(g.messages[0].time, now);
     }
 
@@ -8814,7 +8806,7 @@ mod group_messages_clock_tests {
         let g = only_group(&items);
 
         assert!(
-            g.time_clamped,
+            g.messages[0].time_clamped,
             "a send time an hour after arrival is skew, even though it is in \
              the past relative to this render"
         );
@@ -8853,7 +8845,7 @@ mod group_messages_clock_tests {
         let g = only_group(&items);
 
         assert!(
-            !g.time_clamped,
+            !g.messages[0].time_clamped,
             "a few seconds of clock skew is normal and must not put a \
              \"sender's clock may be wrong\" marker on the message"
         );
@@ -8894,8 +8886,50 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(!g.time_clamped);
+        assert!(!g.messages[0].time_clamped);
         assert_eq!(g.messages[0].time, sent);
+    }
+
+    /// A later clamped message marks only its own time, never an accurate one before it.
+    #[test]
+    fn each_message_carries_only_its_own_clamp_mark() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+        let now = at(1_700_000_000_000);
+        let first_seen = now - chrono::Duration::minutes(10);
+        let on_time = message_at(owner_id, &alice, first_seen);
+        let skewed = message_at(owner_id, &alice, now + chrono::Duration::hours(1));
+        let mut receive_times = ReceiveTimes::new();
+        receive_times.insert(on_time.id().0 .0, first_seen.timestamp_millis() as f64);
+        receive_times.insert(
+            skewed.id().0 .0,
+            (first_seen + chrono::Duration::minutes(1)).timestamp_millis() as f64,
+        );
+        let messages = state(vec![on_time, skewed]);
+        let items = group(
+            &messages,
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            now,
+        );
+        let g = only_group(&items);
+        assert_eq!(
+            g.messages.len(),
+            2,
+            "premise: the clamped message joins the first one's group"
+        );
+        let short =
+            |m: &GroupedMessage| time_labels(m.time, m.time_clamped, m.receive_delay_secs).0;
+        assert!(
+            !short(&g.messages[0]).starts_with('~'),
+            "the accurate first time must not be marked"
+        );
+        assert!(
+            short(&g.messages[1]).starts_with('~'),
+            "the clamped follow-up is marked"
+        );
     }
 }
 
