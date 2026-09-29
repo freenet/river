@@ -7,6 +7,7 @@ export function jump_to_reply_target(id) {
   const row = document.getElementById(id);
   if (!row) return;
   const view = row.closest("#chat-scroll-container");
+  // 24 = the row's scroll-margin-block (0.75rem) above and below.
   const tall = view && row.getBoundingClientRect().height + 24 > view.clientHeight;
   row.scrollIntoView({ block: tall ? "start" : "center" });
   live?.cancel();

@@ -2505,7 +2505,6 @@ pub fn Conversation() -> Element {
         });
     }
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
-    // Which message the shared reaction picker is open for.
     let picker_target: Signal<Option<PickerTarget>> = use_signal(|| None);
 
     // State for delete confirmation modal
@@ -3984,7 +3983,7 @@ pub fn Conversation() -> Element {
                 div {
                     // `overflow-x-hidden` is a backstop: clip anything a row
                     // pushes past the viewport edge rather than show a
-                    // horizontal scrollbar in the history. #402.
+                    // horizontal scrollbar in the history.
                     class: "h-full overflow-y-auto overflow-x-hidden",
                     // `overflow-anchor: none`: the pin machinery owns this
                     // container's `scrollTop`. Browser scroll anchoring rewrites
@@ -4409,7 +4408,7 @@ pub fn Conversation() -> Element {
                 }
             }
 
-            // The one reaction picker; every message's "+" opens it (top layer, so its DOM position is irrelevant).
+            // Top layer, so where it sits in the DOM does not matter.
             if current_room_data.is_some() {
                 ReactionPicker {
                     target: picker_target,
@@ -4762,7 +4761,7 @@ fn MessageGroupComponent(
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
     on_reply: EventHandler<ReplyContext>,
-    /// Only passed to each `AddReactionButton`.
+    /// Not read here, so opening the picker re-renders only the `AddReactionButton`s.
     picker_target: Signal<Option<PickerTarget>>,
 ) -> Element {
     let is_self = group.is_self;
@@ -5104,11 +5103,7 @@ fn MessageGroupComponent(
                                             {
                                                 match reply_strip_inner {
                                                     ReplyStrip::NotAReply => rsx! {},
-                                                    // Deliberately inert — a plain div with no
-                                                    // `onclick` — because there is no original
-                                                    // message to scroll to. It therefore carries
-                                                    // its own class rather than `reply-strip`,
-                                                    // whose focus outline assumes a button.
+                                                    // Inert (a plain div, not the `reply-strip` button): there is no original message to jump to.
                                                     //
                                                     // The wording stays neutral: absence cannot
                                                     // distinguish a ban from an ordinary aged-out
@@ -5177,7 +5172,7 @@ fn MessageGroupComponent(
                                     }
                                 }
                             }
-                            // Reactions display with inline add button
+                            // Row under the bubble: reactions, "+", reply/edit/delete, then the time.
                             {
                                 let msg_id_react = msg.message_id.clone();
                                 let msg_id_str_for_edit = msg.id.clone();
@@ -5283,7 +5278,7 @@ fn MessageGroupComponent(
                                         }
                                         div {
                                             "data-testid": "message-action-cluster",
-                                            // `pl-3`: at least 16px between a full reaction row and the buttons.
+                                            // `pl-3` plus the row's `gap-1`: at least 16px between the reactions and the buttons.
                                             class: "flex items-center gap-3 ml-auto pl-3 text-text-muted",
                                             button {
                                                 r#type: "button",
@@ -5328,9 +5323,7 @@ fn MessageGroupComponent(
                                                 }
                                             }
                                         }
-                                        // This message's own time, always visible at the
-                                        // bubble's bottom right, after the cluster (which
-                                        // takes the free space with its `ml-auto`).
+                                        // Last child: the cluster's `ml-auto` pushes it to the bottom right.
                                         time {
                                             "data-testid": "message-time",
                                             datetime: "{time_iso}",

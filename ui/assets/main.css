@@ -51,7 +51,7 @@
  * reaction-less messages.
  *
  * Gate on pointer CAPABILITY, not viewport width — see the #462 comment
- * above for why `(hover: none), (any-pointer: coarse)` is the correct query
+ * below for why `(hover: none), (any-pointer: coarse)` is the correct query
  * (`any-pointer: coarse` also catches a touchscreen laptop, which reports
  * `hover: hover` while a finger is on the glass).
  *
@@ -205,7 +205,7 @@
     text-overflow: ellipsis;
 }
 
-/* Keyboard focus draws an outline only, inset: the bubble's overflow-hidden clips one drawn outside. */
+/* Inset: the bubble's overflow-hidden clips an outline drawn outside it. */
 .reply-strip:focus-visible {
     outline: 2px solid currentColor;
     outline-offset: -2px;
@@ -213,9 +213,8 @@
 
 /* DM-rail Archive ✕ — touch reveal (freenet/river#462).
  *
- * Same failure mode as #402 (the old message action bar): the archive
- * button in the Direct Messages rail (`dm_rail_section.rs`) is `opacity-0`
- * and reveals via Tailwind
+ * The archive button in the Direct Messages rail (`dm_rail_section.rs`) is
+ * `opacity-0` and reveals via Tailwind
  * `group-hover:opacity-100`, which Tailwind v4 wraps in `@media (hover: hover)`.
  * On a touch device that reveal can never fire, so before this rule the button
  * was invisible on phones and — because it is `opacity-0` yet still

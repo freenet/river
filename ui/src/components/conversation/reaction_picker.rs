@@ -99,7 +99,6 @@ pub(super) fn ReactionPicker(
 #[component]
 pub(super) fn AddReactionButton(
     message_id: MessageId,
-    /// The viewer's current reaction on this message, if any.
     user_reaction: Option<String>,
     has_reactions: bool,
     picker_target: Signal<Option<PickerTarget>>,
