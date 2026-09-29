@@ -39,13 +39,12 @@ use crate::components::direct_messages::{
     send_structured_dm, InvitePickInflight, SendDmOutcome, INVITE_VIA_DM_PICKER,
     INVITE_VIA_DM_PICKER_INFLIGHT,
 };
-use crate::components::members::{collect_invitation_secrets, Invitation};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fa_solid_icons::FaLock, Icon};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use river_core::room_state::dm_body::{DirectMessageBody, InvitePayload};
-use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+use river_core::room_state::member::MemberId;
 use river_core::room_state::privacy::PrivacyMode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -300,32 +299,6 @@ pub fn InviteViaDmPickerModal() -> Element {
             .map(|c| c.label.clone())
             .unwrap_or_else(|| "Unknown room".to_string());
 
-        let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let invitee_vk = invitee_signing_key.verifying_key();
-        // The invitation is signed with the local key for the CANDIDATE room,
-        // so hoist it here: with no key there is nothing to sign, and the pick
-        // is refused through the picker's existing error slot (same shape as
-        // the "candidate room data missing" bail above). `invited_by` is the
-        // public half of this same key.
-        let Some(inviter_sk) = candidate_data.signing_key().cloned() else {
-            error!("invite-via-DM: no local signing key for the candidate room");
-            send_error.set(Some(
-                "This device doesn't hold your key for the room you picked, so it can't \
-                 create an invitation there."
-                    .into(),
-            ));
-            return;
-        };
-        let invited_by: MemberId = inviter_sk.verifying_key().into();
-        let owner_id: MemberId = candidate_data.owner_vk.into();
-
-        let member = Member {
-            owner_member_id: owner_id,
-            invited_by,
-            member_vk: invitee_vk,
-        };
-        let room_key = candidate_data.room_key();
-
         let my_generation = PICK_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
         crate::util::defer(move || {
@@ -337,17 +310,7 @@ pub fn InviteViaDmPickerModal() -> Element {
 
         let candidate_label_for_task = candidate_label.clone();
         crate::util::safe_spawn_local(async move {
-            let outcome = drive_send(
-                current_room,
-                target_peer,
-                candidate_data,
-                member,
-                room_key,
-                inviter_sk,
-                invitee_signing_key,
-                pmessage_opt,
-            )
-            .await;
+            let outcome = drive_send(current_room, target_peer, candidate_data, pmessage_opt).await;
 
             crate::util::defer(move || {
                 // This pick may have been superseded while `drive_send`
@@ -623,40 +586,15 @@ fn clear_inflight_if_matches(my_generation: u64) {
 /// Sign the invitation, encode it, and dispatch a structured
 /// `DirectMessageBody::Invite` DM. Returns a user-facing error string
 /// on failure or `Ok(())` on success.
-#[allow(clippy::too_many_arguments)]
 async fn drive_send(
     current_room: VerifyingKey,
     target_peer: MemberId,
     candidate_data: crate::room_data::RoomData,
-    member: Member,
-    room_key: river_core::chat_delegate::RoomKey,
-    inviter_sk: SigningKey,
-    invitee_signing_key: SigningKey,
     personal_message: Option<String>,
 ) -> Result<(), String> {
-    // Sign the member-claim via the delegate-backed signing path. Same
-    // semantics as the legacy URL-paste flow.
-    let mut member_bytes = Vec::new();
-    if ciborium::ser::into_writer(&member, &mut member_bytes).is_err() {
-        return Err("Couldn't serialize membership claim. Try again.".into());
-    }
-    let signature =
-        crate::signing::sign_member_with_fallback(room_key, member_bytes, &inviter_sk).await;
-    let authorized = AuthorizedMember::with_signature(member, signature);
-    // For a private room, embed the room secrets the inviter holds so the
-    // invitee can decrypt the room immediately on join. Empty for a public
-    // room or an empty secrets map.
-    let room_secrets = if candidate_data.is_private() {
-        collect_invitation_secrets(&candidate_data.secrets)
-    } else {
-        Vec::new()
-    };
-    let invitation = Invitation {
-        room: candidate_data.owner_vk,
-        invitee_signing_key,
-        invitee: authorized,
-        room_secrets,
-    };
+    // Signed with the local key for the CANDIDATE room, not the room being DM'd in.
+    let invitation =
+        crate::components::members::invitation_builder::create_invitation(&candidate_data).await?;
 
     // Encode the Invitation as CBOR — same bytes the URL form base58-
     // encodes. The recipient decodes these bytes back to `Invitation`.
