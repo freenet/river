@@ -1483,7 +1483,7 @@ const WINDOW_GROWTH_ITEMS: usize = 60;
 /// otherwise re-accumulate exactly the unbounded render the window exists to
 /// prevent (freenet/river#498). Four initial windows is the chosen bound:
 /// deep enough that trims are rare (240 items is hours of a busy room, and the
-/// bottom-settle trim usually fires long before), shallow enough that the
+/// bottom trim usually fires long before), shallow enough that the
 /// worst-case DOM stays ~4x the room-open cost rather than unbounded.
 ///
 /// The ceiling caps ARRIVAL growth only. A reader paging back through history
@@ -1590,10 +1590,8 @@ fn relocate_anchor(total: usize, hint: usize, is_anchor: impl Fn(usize) -> bool)
 /// toward rendering MORE history rather than losing the reader's place
 /// entirely.
 ///
-/// A parked reader's view is kept still across the TOP-CONTIGUOUS removals this
-/// relocation deals in (at-cap drains, batched or not, including a re-keyed
-/// multi-message head group, and small leading deletes the spares still cover)
-/// by `HistoryScroll::restore`, which puts their anchor row back.
+/// The view is held still by `HistoryScroll::restore`; this only picks which
+/// items render.
 fn relocate_window(
     total: usize,
     anchor: &WindowAnchor,
@@ -1870,7 +1868,7 @@ pub fn Conversation() -> Element {
     // far back have I looked in THIS room", so carrying it across rooms would
     // render a freshly-opened room to the depth of the last one.
     //
-    // Guarded on an ACTUAL key change for the same reason the force-scroll
+    // Guarded on an ACTUAL key change for the same reason the room-switch
     // effect below is: Dioxus re-runs the effect on any write to
     // `CURRENT_ROOM`, and re-selecting the already-open room in the sidebar
     // rewrites it with the same key. Without the guard, that would collapse a
@@ -2165,25 +2163,14 @@ pub fn Conversation() -> Element {
 
     // Keep the view right when the history changes.
     //
-    // Scroll the chat-scroll-container itself, not the last bubble:
-    // scrollIntoView aligns the bubble's top to the container's top, which can
-    // leave the actual bottom (reactions, sentinel, padding) off-screen. On
-    // page refresh this surfaced as scrolling only ~70% of the way down.
-    //
     // Re-runs on ANY change to the rendered history, not just a remount of the
-    // last bubble. The old trigger was an `onmounted` on the last message
-    // group, which is silent for every content change that leaves that row in
-    // place: a mid-list insert, a reaction, an edit, or another join folding
-    // into an existing "N people joined" summary (that summary is keyed on its
-    // FIRST event, so absorbing a new one grows it without remounting
-    // anything). Subscribing to the memo is what makes those cases reach this
-    // effect at all.
+    // last bubble: a mid-list insert, a reaction, an edit, or a join folding into
+    // an existing summary leaves that row in place, so an `onmounted` on it would
+    // miss them. Subscribing to the memo is what reaches this effect.
     //
-    // `restore` follows the reader if they are pinned or a snap was forced (a
-    // room switch or your own outgoing message, #402), and otherwise puts their
-    // anchor row back where it was. Synchronous: Dioxus has already patched the
-    // DOM when effects run, so a parked reader never paints a frame at the wrong
-    // offset. The ResizeObserver is the backstop for layout that follows.
+    // `restore` is synchronous: the DOM is patched when effects run, so a parked
+    // reader never paints a frame at the wrong offset. The ResizeObserver is the
+    // backstop for layout that follows.
     #[cfg(target_arch = "wasm32")]
     use_effect({
         let history = history.clone();
@@ -2225,24 +2212,16 @@ pub fn Conversation() -> Element {
 
     // Snap to the newest message whenever the selected room changes (#402). The
     // Conversation component is mounted once and reused across rooms (hidden or
-    // shown via CSS), so `#chat-scroll-container` and `is_at_bottom` otherwise
-    // persist from the previous room, frequently leaving the user far up the
-    // new room's history. Reading `CURRENT_ROOM` (which holds only `owner_key`)
-    // makes this effect re-run on every room change and nothing else.
+    // shown via CSS), so `#chat-scroll-container` persists from the previous room.
+    // Reading `CURRENT_ROOM` (which holds only `owner_key`) re-runs this on every
+    // room change and nothing else.
     //
-    // This effect only forces the snap; `restore` runs in the content effect
-    // above once the new room's groups are rendered (its trigger,
-    // `message_groups`, necessarily changes AFTER this room change, so the
-    // ordering is causal — not dependent on effect scheduling). The force is
-    // persistent, so nothing can cancel the snap in the gap between the two
-    // effects. `is_at_bottom` = true hides the scroll-to-latest button
-    // immediately on switch (the observer reconfirms after the snap).
+    // This only forces the snap; `restore` runs in the content effect above once
+    // the new room's groups render. The force persists until then.
     //
-    // Guarded on an ACTUAL key change: Dioxus re-runs the effect on any write
-    // to `CURRENT_ROOM`, and re-selecting the already-open room in the sidebar
-    // rewrites it with the same key. Without the guard that would force a snap
-    // with no new content to consume it, so a later message would snap the
-    // reader to the bottom (#402 review).
+    // Guarded on an ACTUAL key change: re-selecting the already-open room rewrites
+    // `CURRENT_ROOM` with the same key, and forcing a snap with no new content to
+    // consume it would snap the reader to the bottom on a later message (#402).
     {
         let history = history.clone();
         let prev_room =
@@ -2251,11 +2230,8 @@ pub fn Conversation() -> Element {
             let room = CURRENT_ROOM.read().owner_key;
             if prev_room.get() != room {
                 prev_room.set(room);
-                // Opening a room starts you at its newest message, pinned and
-                // forced, and an anchor from the room we just left says nothing
-                // about this one. Reset here rather than left to the snap,
-                // because a room with no messages produces no scroll at all
-                // and would otherwise inherit the previous room's state.
+                // Reset here, not left to the snap: a room with no messages
+                // produces no scroll and would inherit the previous room's state.
                 history.reset_for_room();
                 is_at_bottom.set(true);
             }
@@ -3148,8 +3124,9 @@ pub fn Conversation() -> Element {
                         if current_room_data.is_some() {
                             match message_groups.read().as_ref() {
                                 Some((groups, self_member_id, member_names)) => {
-                                    // A reader scroll whose event has not arrived yet is read
-                                    // now, while the DOM is still the previous render's.
+                                    // Read a reader scroll whose event has not arrived yet,
+                                    // while the DOM is still the previous render's (see the
+                                    // `history_scroll.rs` module doc).
                                     #[cfg(target_arch = "wasm32")]
                                     if !room_changed_this_render {
                                         history.take_in_undelivered_scroll();
@@ -3368,8 +3345,7 @@ pub fn Conversation() -> Element {
                                                         rsx! {
                                                             div {
                                                                 key: "{key}",
-                                                                // Item identity: the key
-                                                                // `WindowAnchor` remembers.
+                                                                // Test hook: the autoscroll spec locates rows by it.
                                                                 "data-item-key": "{key}",
                                                                 "data-anchor-row": "{key}",
                                                                 class: "flex justify-center py-1",
@@ -3383,15 +3359,7 @@ pub fn Conversation() -> Element {
                                                     DisplayRow::Item(DisplayItem::Messages(group)) => {
                                                         let key = group.messages[0].id.clone();
                                                         rsx! {
-                                                            // The wrapper exists to carry
-                                                            // `data-item-key` — the item
-                                                            // identity `WindowAnchor`
-                                                            // remembers — since a
-                                                            // component cannot carry a DOM
-                                                            // attribute directly. It is the
-                                                            // keyed list child, so diffing
-                                                            // and `space-y-4` spacing are
-                                                            // unchanged.
+                                                            // Test hook: the autoscroll spec locates rows by it.
                                                             div {
                                                                 key: "{key}",
                                                                 "data-item-key": "{key}",
@@ -8112,9 +8080,8 @@ mod autoscroll_wiring_pins {
         );
     }
 
-    /// `capture` sets the pin and the anchor from the reader's own position, so
-    /// it may only run for a scroll the reader made. Anything else calling it
-    /// would let a layout change move the pin: the #486 latch.
+    /// `capture` may only run for a scroll the reader made; anything else calling
+    /// it lets a layout change move the pin (the #486 latch).
     #[test]
     fn capture_runs_only_from_the_scroll_listener() {
         let hist = dense(history_source());
@@ -8143,10 +8110,8 @@ mod autoscroll_wiring_pins {
         );
     }
 
-    /// A `scroll` event arrives a frame after the scroll, and a content change
-    /// can land first. `restore`, and the render before a patch, must read a
-    /// pending reader scroll first: otherwise a stale pin drags the reader back
-    /// to the bottom, or the anchor is measured after the patch moved the rows.
+    /// `restore`, and the render before a patch, take in a pending reader scroll
+    /// first (see the `history_scroll.rs` module doc).
     #[test]
     fn a_pending_reader_scroll_is_taken_in_before_a_restore() {
         assert!(

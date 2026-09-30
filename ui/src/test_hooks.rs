@@ -1,9 +1,9 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
 //! INBOUND messages and to drive the no-room screen's load states.
 //!
-//! The composer is not a substitute: `handle_send_message` raises
-//! `force_scroll`, which deliberately bypasses the pin that the scroll specs
-//! exist to test, so a message sent through the UI proves nothing about how an
+//! The composer is not a substitute: `handle_send_message` calls
+//! `HistoryScroll::force_next`, which deliberately bypasses the pin that the
+//! scroll specs exist to test, so a message sent through the UI proves nothing about how an
 //! arriving one behaves. These write straight into `ROOMS`, as an arriving
 //! network update does.
 //!

@@ -402,6 +402,11 @@ impl HistoryScroll {
 
     /// Scroll to the newest message and re-arm the pin: asking for it is the
     /// clearest statement of intent there is.
+    ///
+    /// Scrolls the container itself, not the last bubble: `scrollIntoView` aligns
+    /// the bubble's top to the container's top and can leave the real bottom
+    /// (reactions, sentinel, padding) off-screen, which on a refresh scrolled
+    /// only ~70% of the way down.
     pub(super) fn snap_to_bottom(&self, behavior: web_sys::ScrollBehavior) {
         let Some(container) = chat_scroll_container() else {
             return;

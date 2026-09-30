@@ -38,7 +38,7 @@ import { waitForApp, selectRoom } from "./example-room";
 //
 // Assumes the example-data build, which exposes `window.__riverTest` for
 // delivering INBOUND messages. Sending through the composer would prove
-// nothing: that path raises `force_scroll`, deliberately bypassing the pin.
+// nothing: that path forces a snap to the bottom, deliberately bypassing the pin.
 
 // Rendered history rows: display items plus date separators.
 const HISTORY_ROWS = '[data-testid="conversation-history"] > *';
@@ -125,9 +125,9 @@ async function openRoomAtBottom(page: Page, roomName: string, path = "/") {
 /// Simulate the reader dragging the history with a pointing device.
 ///
 /// A synthetic `wheel` followed by a `scrollTop` assignment rather than
-/// `page.mouse.wheel`, which is unsupported on mobile WebKit. Both halves
-/// matter: the `wheel` is what tells the pin that the settle about to arrive is
-/// the reader's, and the `scrollTop` write is what produces that settle.
+/// `page.mouse.wheel`, which is unsupported on mobile WebKit. Nothing listens for
+/// gestures (the `scrollTop` write is the reader's scroll); the `wheel` is
+/// harmless and keeps the helper realistic.
 async function readerScrollsTo(page: Page, top: number) {
   await page.evaluate((t) => {
     const el = document.getElementById("chat-scroll-container")!;
@@ -140,13 +140,10 @@ async function readerScrollsTo(page: Page, top: number) {
 ///
 /// Not a contrivance: a native scrollbar drag dispatches no pointer event to
 /// the content on Firefox, and find-in-page, focus-driven scrolling and browser
-/// scroll restoration produce none either. Nothing in the implementation
-/// listens for gestures — whose settle it is, is decided by where the view came
-/// to rest — so this is the ordinary path rather than a fallback. Unlike
-/// `readerScrollsTo`, this helper waits for `scrollend` because the pin
-/// re-arms there, so an arrival before that races the handler. The pre-settle
-/// window is still covered on purpose by the batched at-cap test, which
-/// deliberately does not wait.
+/// scroll restoration produce none either. Unlike `readerScrollsTo`, this waits
+/// for `scrollend`, so the scroll has landed before the test acts. The pending
+/// scroll case is covered on purpose by the batched at-cap test, which does not
+/// wait.
 async function readerScrollsWithoutGesture(page: Page, top: number) {
   await page.evaluate(async (t) => {
     const el = document.getElementById("chat-scroll-container")!;
@@ -175,6 +172,17 @@ async function expectStaysPut(page: Page, why: string) {
   const before = await scrollTop(page);
   await page.waitForTimeout(600);
   expect(await scrollTop(page), why).toBeCloseTo(before, 0);
+}
+
+/// Wait out the layout a test just provoked.
+async function afterLayoutSettles(page: Page) {
+  // Past the frame that carries the scroll event and the ResizeObserver.
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 300))),
+      ),
+  );
 }
 
 /// The newest history message with any part inside the scroll container, and
@@ -259,13 +267,7 @@ test.describe("Conversation follows new messages (#486)", () => {
 
     // Clearing the draft gives the height back, so the container GROWS and the
     // browser clamps `scrollTop` down on its own. The follow has to survive
-    // that too, in both directions.
-    //
-    // It does NOT pin `reader_moved_up_since`'s `.min(max_scroll_top(...))`:
-    // deleting that clamp was tried and this still passed, because the browser
-    // fires a settle for its own clamping and the settle repairs the reference
-    // before the next arrival. The `.min` narrows a race window rather than
-    // deciding an outcome, and nothing here is strong enough to claim otherwise.
+    // that too, in both directions. The clamp is layout's, not the reader's.
     await page.getByTestId("message-input").fill("");
     await expect
       .poll(() => viewportHeight(page), { timeout: 5_000 })
@@ -335,12 +337,11 @@ test.describe("Conversation follows new messages (#486)", () => {
       "a message arrived while the reader was scrolled up and yanked the view"
     );
 
-    // The reader scrolls back to the bottom THEMSELVES. This is the settle
-    // handler's re-arm branch, and it is the only place in the suite that
-    // reaches it: the scroll-to-latest button re-arms the pin directly, so a
-    // suite that only used the button would still pass if the re-arm branch
-    // were narrowed to, say, `distance <= 0`, and a reader who stopped a few
-    // fractional pixels short would never be followed again.
+    // The reader scrolls back to the bottom THEMSELVES. Only this reaches the
+    // capture that re-pins them: the scroll-to-latest button re-pins directly, so
+    // a suite that only used the button would pass if the threshold narrowed to,
+    // say, `distance <= 0`, and a reader who stopped a few fractional pixels
+    // short would never be followed again.
     await readerScrollsWithoutGesture(page, await historyHeight(page));
     await expectSettledAtBottom(page, "the reader's own scroll should reach the bottom");
     await deliver(page, "arrived after the reader scrolled back down");
@@ -349,8 +350,8 @@ test.describe("Conversation follows new messages (#486)", () => {
       "the reader returned to the bottom and the follow did not re-arm"
     );
 
-    // The button is a second, independent way back, and it re-arms the pin
-    // itself rather than through a settle.
+    // The button is a second, independent way back, and it re-pins directly
+    // rather than through a captured scroll.
     await readerScrollsTo(page, 0);
     await expect(page.getByTestId("scroll-to-bottom")).toBeVisible({
       timeout: 5_000,
@@ -370,11 +371,9 @@ test.describe("Conversation follows new messages (#486)", () => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
 
-    // No `wheel`, no `pointerdown`, no `touchstart`: only the settle handler
-    // can notice this. Kept as its own test because an earlier implementation
-    // DID lean on gesture events to decide whose settle a settle was, and this
-    // is the shape that broke it — a native scrollbar drag on Firefox,
-    // find-in-page, or focus-driven scrolling, none of which produce one.
+    // No `wheel`, no `pointerdown`, no `touchstart`: only the scroll event itself
+    // can tell the reader moved. This is the shape a native scrollbar drag on
+    // Firefox, find-in-page or focus-driven scrolling takes.
     await readerScrollsWithoutGesture(page, 0);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
@@ -435,19 +434,8 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
-    // Let our own snap settle, so nothing re-records the mark after the clamp.
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) => {
-          const c = document.getElementById("chat-scroll-container")!;
-          let t = setTimeout(resolve, 300);
-          c.addEventListener("scrollend", () => {
-            clearTimeout(t);
-            t = setTimeout(resolve, 100);
-          });
-        })
-    );
-    const clamp = await page.evaluate(() => {
+    await afterLayoutSettles(page);
+    const { clamp, laidOutAgain } = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       const content = document.getElementById("chat-content")!;
       const rows = c.querySelectorAll('[data-testid="conversation-history"] > *');
@@ -465,11 +453,11 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
         c.scrollHeight !== heightBefore || content.clientWidth !== widthBefore;
       return { clamp: before - clamped, laidOutAgain };
     });
-    expect(clamp.clamp, "premise: hiding the newest row must clamp the view").toBeGreaterThan(
+    expect(clamp, "premise: hiding the newest row must clamp the view").toBeGreaterThan(
       AT_BOTTOM_EPSILON_PX
     );
     expect(
-      clamp.laidOutAgain,
+      laidOutAgain,
       "premise: the rewrap must change the history's height or the width it wraps at"
     ).toBe(true);
     await expectSettledAtBottom(page, "the reflow's own clamp was read as the reader scrolling up");
@@ -498,8 +486,8 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
       })
       .toBeLessThan(roomyViewport - BOTTOM_THRESHOLD_PX);
     await expectSettledAtBottom(page, "the composer grew and the view did not follow it");
-    // A follow still settling would re-record the mark after the clamp and
-    // hide the race.
+    // A scroll event still pending from the follow would capture after the clamp
+    // and hide the race.
     await page.waitForFunction(
       () => (window as any).__riverLastScrollEvent === "scrollend",
       undefined,
@@ -509,8 +497,7 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     // On `document`, so it runs after the app's own input handler has
     // collapsed the composer, before any frame.
     const GROWTH_PX = 80;
-    // Under BOTTOM_THRESHOLD_PX: the pin stays armed, so only
-    // reader_moved_up_since can refuse.
+    // Same frame as the collapse's clamp: one scroll event, two layout changes.
     await page.evaluate(
       ({ grow, collapsedAbove }) => {
         const c = document.getElementById("chat-scroll-container")!;
@@ -577,11 +564,7 @@ test.describe("The newest visible message stays in view", () => {
   async function parkMidHistory(page: Page) {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
-    const max = await page.evaluate(() => {
-      const c = document.getElementById("chat-scroll-container")!;
-      return c.scrollHeight - c.clientHeight;
-    });
-    await readerScrollsTo(page, Math.floor(max / 2));
+    await readerScrollsTo(page, Math.floor((await historyHeight(page)) / 2));
     await expect
       .poll(() => distanceFromBottom(page), {
         timeout: 5_000,
@@ -589,7 +572,7 @@ test.describe("The newest visible message stays in view", () => {
       })
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
     // The scroll has to have landed before we look at what is on screen.
-    await page.waitForTimeout(300);
+    await afterLayoutSettles(page);
     const before = await newestVisibleMessage(page);
     expect(before, "premise: a message should be visible").not.toBeNull();
     return before!;
@@ -612,9 +595,7 @@ test.describe("The newest visible message stays in view", () => {
       .toBeLessThanOrEqual(2);
   }
 
-  test("a parked reader keeps their newest visible message in place across a resize", async ({
-    page,
-  }) => {
+  test("the same message is still in place after resizing there and back", async ({ page }) => {
     const before = await parkMidHistory(page);
     await page.setViewportSize({ width: 380, height: 900 });
     await expectSameMessageInPlace(
@@ -622,12 +603,6 @@ test.describe("The newest visible message stays in view", () => {
       before,
       "the resize moved the message the reader was looking at",
     );
-  });
-
-  test("the same message is still in place after resizing there and back", async ({ page }) => {
-    const before = await parkMidHistory(page);
-    await page.setViewportSize({ width: 380, height: 900 });
-    await expectSameMessageInPlace(page, before, "the narrow layout lost the reader's message");
     await page.setViewportSize({ width: 1280, height: 900 });
     await expectSameMessageInPlace(
       page,
@@ -668,15 +643,9 @@ test.describe("The newest visible message stays in view", () => {
       laidOut.heightAfter,
       "premise: the width change must change the history's scrollHeight, or this test cannot tell a layout change from a reader's scroll"
     ).not.toBe(laidOut.heightBefore);
-    // A poll would pass on its first sample, before the frame that carries the
-    // scroll event and the ResizeObserver has run. Let that frame land, and then
-    // some, before asking where the reader is.
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) =>
-          requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 300)))
-        )
-    );
+    // A poll would pass on its first sample, before the scroll event and the
+    // ResizeObserver have run.
+    await afterLayoutSettles(page);
     expect(
       await distanceFromBottom(page),
       "the reader's scroll was lost to the width change"
@@ -690,11 +659,11 @@ test.describe("The newest visible message stays in view", () => {
 // Regression tests for freenet/river#501: the #498 windowed tail slid its
 // start index forward on every arrival, removing the oldest rendered rows in
 // the same patch that appended the new message. Browser scroll anchoring
-// rewrote scrollTop to hold the visible content still, `reader_moved_up_since`
-// attributed the browser's adjustment to the reader, and both follow paths
-// stood down — so a room deeper than the render window stopped following
-// arrivals entirely, while every room the old suite seeded (~15-20 items vs a
-// 60-item window) kept passing on the pre-window code path.
+// rewrote scrollTop to hold the visible content still, the old code read that
+// as the reader moving up, and both follow paths stood down — so a room deeper
+// than the render window stopped following arrivals entirely, while every room
+// the old suite seeded (~15-20 items vs a 60-item window) kept passing on the
+// pre-window code path.
 //
 // Every test here therefore asserts its PREMISE first — the backfill sentinel
 // is attached and the rendered row count is a windowed tail, not the whole
@@ -791,7 +760,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // fix that survives one arrival and then latches. Delivered arrivals
     // alternate authors (see `test_author` in test_hooks.rs), so each one
     // is its own display item and the loop interleaves window GROWTH with the
-    // settle-at-bottom TRIM — six arrivals folding into one group would
+    // bottom TRIM — six arrivals folding into one group would
     // exercise the windowing arithmetic zero times.
     for (let i = 1; i <= 6; i++) {
       await deliver(page, `windowed arrival ${i}`);
@@ -802,25 +771,23 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     }
 
     // Following six arrivals must not have cost the window its bound: each
-    // follow snap settles at the bottom, and that settle trims the window
-    // back toward its initial size. Polled because the last settle's trim
-    // lands asynchronously.
+    // follow snap ends at the bottom, and the capture there trims the window
+    // back toward its initial size. Polled because the trim lands
+    // asynchronously.
     //
     // NOTE on what this test does and does not guard. It is what CAUGHT the
     // trim/re-anchor bug (a trim shrinks the content, the browser clamps
-    // scrollTop, and an arrival landing before that clamp's settle was not
-    // followed) — but it only failed 5 runs in 16, so under the suite's
-    // `retries: 2` a regression has roughly a 3% chance of failing CI hard.
-    // The timing is not practical to force deterministically from a browser
-    // test. The DETERMINISTIC guard is the source pin
-    // `the_window_trims_at_the_bottom_and_backfill_defers_to_the_pin` in
-    // conversation.rs, which pins the flag, the guard and the scroll call;
-    // do not assume this test covers a revert.
+    // scrollTop, and an arrival landing before that clamp was not followed) —
+    // but it only failed 5 runs in 16, so under the suite's `retries: 2` a
+    // regression has roughly a 3% chance of failing CI hard. The timing is not
+    // practical to force deterministically from a browser test. The
+    // DETERMINISTIC guard is the source pin `the_trim_stays_gated_at_the_bottom`
+    // in conversation.rs; do not assume this test covers a revert.
     await expect
       .poll(() => renderedRowCount(page), {
         timeout: 5_000,
         message:
-          "the settle-at-bottom trim should return the window to ~initial size " +
+          "the bottom trim should return the window to ~initial size " +
           "after a followed burst",
       })
       .toBeLessThan(67);
@@ -918,9 +885,8 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // plus one half-pair that RE-KEYS the group at the drain boundary (a
     // group's key is its first message's id — the new key exists in no
     // pre-patch row). The window must re-anchor on the surviving neighbors
-    // (spare keys) and the reposition must measure through a surviving row
-    // (probe walk), or the parked reader's view is torn away (#505
-    // re-review blocker).
+    // (spare keys) and the restore must find a surviving anchor row, or the
+    // parked reader's view is torn away (#505 re-review blocker).
     //
     // No scrollTop-stability assertion here, deliberately: the compensation
     // MOVES scrollTop to hold the CONTENT still. The probed row's rect is
@@ -936,12 +902,10 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // rows just above the fold are the newest ones; they survive the drain,
     // and holding THEM still is the property under test.
     //
-    // Deliberately NO settle wait before delivering: the batch lands while
-    // the reader's `scrollend` is still in flight, so this also covers the
-    // pre-settle window, where `pinned_to_bottom` is stale-true and only
-    // `reader_moved_up_since` stands the follow paths down. That is exactly
-    // what the relative `last_scroll_top` update protects, so the test would
-    // go quiet about it if it waited the pin out first.
+    // Deliberately NO wait before delivering: the batch lands while the
+    // reader's scroll event may still be pending, so this also covers the pin
+    // being stale-true. `restore` must take that scroll in first, and the test
+    // would go quiet about it if it waited the event out.
     const parkedAt = Math.max(
       0,
       (await historyHeight(page)) - (await viewportHeight(page)) - 400
@@ -969,7 +933,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
           "premise: the batch should land with the surviving window rows kept",
       })
       .toBeGreaterThan(beforeBatch + 30);
-    // Let scroll events from the reposition settle before measuring.
+    // Let the restore's scroll events land before measuring.
     await page.waitForTimeout(300);
 
     const after = await taggedRowTop(page, "__riverProbeBatch");
@@ -1060,7 +1024,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     await expectWindowedRenderActive(page);
 
     // Park mid-history so the batch below grows the window (a pinned reader's
-    // follow-snap settle would trim the divergence away before paging).
+    // bottom trim would remove the divergence before paging).
     const mid = Math.floor((await historyHeight(page)) / 2);
     await readerScrollsTo(page, mid);
     await expect
