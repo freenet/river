@@ -28,7 +28,8 @@
 //! preserved because the iframe never reloads.
 //!
 //! Scope: only intercepts clicks on anchors whose `href` is an invite URL
-//! for THIS River: same origin, same `/v1/contract/web/<id>` as the page,
+//! for THIS River: same origin, same web-container contract id as the page
+//! (under `/v1/` or `/v2/contract/web/`),
 //! and `?invitation=` in the query (see [`invitation_code_to_intercept`]).
 //! Everything else (Freenet web URLs for other apps, including converted
 //! share links that happen to carry `?invitation=`, freenet.org, etc.) is
