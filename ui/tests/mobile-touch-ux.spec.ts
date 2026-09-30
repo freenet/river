@@ -259,6 +259,29 @@ test.describe("Message action kebab menu (#402.1)", () => {
       const above = k.y >= m.y + m.height - 1 && k.y - (m.y + m.height) <= 8;
       expect(below || above, at).toBe(true);
     });
+
+    test("a menu taller than the screen scrolls inside it", async ({ page }) => {
+      await page.goto("/");
+      await waitForApp(page);
+      await selectRoom(page, "Your Private Room");
+      test.skip(
+        !(await isTouchOnly(page)),
+        "kebab menu is touch-only; desktop uses the hover action bar"
+      );
+
+      // Three items this tall are ~540px, more than the 390px screen.
+      await page.addStyleTag({ content: "#message-action-menu button { padding-block: 5rem }" });
+      await page.locator('[id^="msg-"]:has(.bg-accent)').last().getByTestId("message-kebab").click();
+      const menu = page.getByTestId("message-action-menu");
+      await expect(menu.getByRole("menuitem", { name: "Delete" })).toBeVisible();
+      const m = await menu.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        return { top: r.top, bottom: r.bottom, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
+      });
+      expect(m.top).toBeGreaterThanOrEqual(0);
+      expect(m.bottom).toBeLessThanOrEqual(390);
+      expect(m.scrollHeight, "the menu scrolls inside itself").toBeGreaterThan(m.clientHeight);
+    });
   });
 
   test("never more than one menu open at a time", async ({ page }) => {
