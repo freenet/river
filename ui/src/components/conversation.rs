@@ -21,12 +21,14 @@ use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
     get_current_system_time, local_message_date, local_today,
 };
+mod action_menu;
 mod emoji_picker;
 mod mention;
 mod message_actions;
 mod message_input;
 mod not_member_notification;
 mod reaction_picker;
+use self::action_menu::{ActionMenu, KebabButton, MenuTarget};
 use self::not_member_notification::NotMemberNotification;
 use self::reaction_picker::{AddReactionButton, PickerTarget, ReactionPicker};
 use crate::components::conversation::message_input::MessageInput;
@@ -34,8 +36,7 @@ use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{
-    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaEllipsisVertical, FaPenToSquare,
-    FaReply, FaTrashCan, FaTriangleExclamation, FaUsers,
+    FaBars, FaBell, FaBellSlash, FaChevronDown, FaCircleInfo, FaTriangleExclamation, FaUsers,
 };
 use dioxus_free_icons::Icon;
 use freenet_scaffold::ComposableState;
@@ -2393,8 +2394,9 @@ pub fn Conversation() -> Element {
                 // Re-gate the backfill sentinel until the new room's opening
                 // snap has landed (#501 H2).
                 opening_snap_done.set(false);
-                // An open picker would react in the room just left.
+                // An open picker or menu would act in the room just left.
                 reaction_picker::close_reaction_picker();
+                action_menu::close_action_menu();
             }
         });
     }
@@ -2517,11 +2519,22 @@ pub fn Conversation() -> Element {
             }
         });
     }
-    // Which message's touch action menu (kebab) is open, by message ID string.
-    // Owned by Conversation (not per message group) so only ONE menu is open at
-    // a time across the whole history — opening one closes any other (#402).
-    let open_action_menu: Signal<Option<String>> = use_signal(|| None);
+    // Which message the shared touch action menu (kebab) is open for.
+    let menu_target: Signal<Option<MenuTarget>> = use_signal(|| None);
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
+    // Start a reply and focus the composer; shared by every group and the action menu.
+    let on_reply_ctx = move |ctx: ReplyContext| {
+        replying_to.set(Some(ctx));
+        if let Some(window) = web_sys::window() {
+            if let Some(doc) = window.document() {
+                if let Some(el) = doc.get_element_by_id("message-input") {
+                    if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                        let _ = el.focus();
+                    }
+                }
+            }
+        }
+    };
     // Which message the shared reaction picker is open for.
     let picker_target: Signal<Option<PickerTarget>> = use_signal(|| None);
 
@@ -4344,19 +4357,8 @@ pub fn Conversation() -> Element {
                                                                 on_edit: move |(msg_id, new_text)| {
                                                                     handle_edit_message(msg_id, new_text);
                                                                 },
-                                                                on_reply: move |ctx: ReplyContext| {
-                                                                    replying_to.set(Some(ctx));
-                                                                    if let Some(window) = web_sys::window() {
-                                                                        if let Some(doc) = window.document() {
-                                                                            if let Some(el) = doc.get_element_by_id("message-input") {
-                                                                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                                                                    let _ = el.focus();
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                },
-                                                                open_action_menu: open_action_menu,
+                                                                on_reply: on_reply_ctx,
+                                                                menu_target: menu_target,
                                                                 picker_target: picker_target,
                                                                 }
                                                             }
@@ -4429,11 +4431,17 @@ pub fn Conversation() -> Element {
                 }
             }
 
-            // The one reaction picker; every message's "+" opens it (top layer, so its DOM position is irrelevant).
+            // The one reaction picker and action menu; every "+" and kebab opens them (top layer, so DOM position is irrelevant).
             if current_room_data.is_some() {
                 ReactionPicker {
                     target: picker_target,
                     on_react: move |(id, emoji): (MessageId, String)| handle_toggle_reaction(id, emoji),
+                }
+                ActionMenu {
+                    target: menu_target,
+                    on_reply: on_reply_ctx,
+                    edit_trigger: edit_trigger,
+                    on_request_delete: move |msg_id| pending_delete.set(Some(msg_id)),
                 }
             }
 
@@ -4761,12 +4769,11 @@ fn MessageGroupComponent(
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
     on_reply: EventHandler<ReplyContext>,
-    // Shared across all groups so only one action menu is open at a time (#402).
-    open_action_menu: Signal<Option<String>>,
+    /// Only passed to each `KebabButton`.
+    menu_target: Signal<Option<MenuTarget>>,
     /// Only passed to each `AddReactionButton`.
     picker_target: Signal<Option<PickerTarget>>,
 ) -> Element {
-    let mut open_action_menu = open_action_menu;
     let timestamp_ms = group.first_time.timestamp_millis();
     let time_str = format_utc_as_local_time(timestamp_ms);
     let delay_suffix = group
@@ -4786,26 +4793,6 @@ fn MessageGroupComponent(
     };
     let time_clamped = group.time_clamped;
     let is_self = group.is_self;
-
-    // Whether the kebab action menu should open above (true) or below (false)
-    // the kebab. Set from the tap position so the menu for a message near the
-    // bottom of the viewport flips upward instead of being clipped by the
-    // composer (#402).
-    let mut menu_show_above: Signal<bool> = use_signal(|| false);
-
-    // Whether the kebab action menu should be left-anchored (open rightward) or
-    // right-anchored (open leftward). Chosen from the tap's horizontal position
-    // so the menu always opens toward the viewport centre regardless of
-    // self/other side or bubble width, and never clips its content off a narrow
-    // screen edge (#402 review).
-    let mut menu_align_left: Signal<bool> = use_signal(|| false);
-
-    // Max height (px) for the kebab action menu, measured at tap time as the
-    // actual space available on the chosen side within the chat scrollport. The
-    // menu is `overflow-y-auto`, so on a very short/landscape viewport where it
-    // fits neither side fully it scrolls internally instead of being clipped by
-    // the scroll container with Edit/Delete unreachable (#402 review).
-    let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
 
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
@@ -5327,191 +5314,30 @@ fn MessageGroupComponent(
                                         }
                                     }
                                 }
-                                // Touch-only kebab action menu (#402). The hover
-                                // action bar above is wrapped by Tailwind in
-                                // `@media (hover:hover)`, so it can never appear on a
-                                // touch device. `.touch-actions` (main.css) reveals
-                                // this kebab only where there is no hover pointer;
-                                // tapping it opens a menu with the same Reply / Edit /
-                                // Delete actions.
+                                // Touch-only kebab (#402): `.touch-actions` (main.css) shows it where the hover bar can't appear.
                                 {
-                                    let msg_id_kebab = msg.id.clone();
-                                    let msg_id_kebab_toggle = msg.id.clone();
-                                    let msg_id_menu_reply = msg.message_id.clone();
-                                    let msg_id_menu_delete = msg.message_id.clone();
-                                    let msg_id_menu_edit = msg.id.clone();
-                                    let edit_text_kebab = msg.content_text.clone();
-                                    let reply_author_kebab = group.author_name.clone();
-                                    let reply_preview_kebab = clean_reply_preview(&msg.content_text, &member_names)
-                                        .chars()
-                                        .take(100)
-                                        .collect::<String>();
-                                    let menu_open = open_action_menu.read().as_deref()
-                                        == Some(msg_id_kebab.as_str());
+                                    let target_for_me = MenuTarget {
+                                        message_id: msg.message_id.clone(),
+                                        dom_id: msg.id.clone(),
+                                        is_self,
+                                        reply: ReplyContext {
+                                            message_id: msg.message_id.clone(),
+                                            author_name: group.author_name.clone(),
+                                            content_preview: clean_reply_preview(&msg.content_text, &member_names)
+                                                .chars()
+                                                .take(100)
+                                                .collect::<String>(),
+                                        },
+                                        edit_text: msg.content_text.clone(),
+                                    };
                                     rsx! {
                                         div {
-                                            // Positioned in the gutter beside the bubble with
-                                            // `right-full`/`left-full` (NOT `translate`): a transform
-                                            // would become the containing block for the `fixed`
-                                            // dismiss backdrop below, shrinking it to this element
-                                            // instead of the viewport (#402 review).
-                                            // Raise the OPEN wrapper above sibling kebabs: every
-                                            // `.touch-actions` is z-50, and later ones paint above an
-                                            // open popover, so without this a nearby message's kebab
-                                            // could sit over the menu rows and steal the tap. `z-[60]`
-                                            // lifts the whole open popover+backdrop above them (and its
-                                            // backdrop then covers those kebabs, so a tap on one just
-                                            // dismisses). (#402 review)
+                                            // In the gutter beside the bubble; the menu it opens is a top-layer popover.
                                             class: format!(
-                                                "touch-actions absolute top-1 {} {}",
-                                                if menu_open { "z-[60]" } else { "z-50" },
+                                                "touch-actions absolute top-1 z-50 {}",
                                                 if is_self { "right-full mr-1" } else { "left-full ml-1" }
                                             ),
-                                            // Kebab toggle button
-                                            button {
-                                                class: "flex items-center justify-center w-8 h-8 rounded-full bg-panel shadow-md border border-border text-text-muted",
-                                                "aria-label": "Message actions",
-                                                "aria-haspopup": "menu",
-                                                "aria-expanded": "{menu_open}",
-                                                "data-testid": "message-kebab",
-                                                onclick: move |e: MouseEvent| {
-                                                    e.stop_propagation();
-                                                    let is_open = open_action_menu.peek().as_deref()
-                                                        == Some(msg_id_kebab_toggle.as_str());
-                                                    if is_open {
-                                                        crate::util::defer(move || open_action_menu.set(None));
-                                                    } else {
-                                                        // Position the menu from the tap coordinates: flip it
-                                                        // above the kebab when the tap is in the bottom ~40% of
-                                                        // the viewport (so the composer doesn't clip it), and
-                                                        // open it toward the viewport centre (left-anchored when
-                                                        // the kebab is on the left half, right-anchored on the
-                                                        // right half) so its content never runs off a screen edge.
-                                                        let coords = e.client_coordinates();
-                                                        let win_w = web_sys::window()
-                                                            .and_then(|w| w.inner_width().ok())
-                                                            .and_then(|v| v.as_f64())
-                                                            .unwrap_or(400.0);
-                                                        // Choose the flip direction from the space available in
-                                                        // BOTH directions within the chat scrollport (which lives
-                                                        // inside an overflow-y-auto container whose bounds sit
-                                                        // above the composer and below the header). Open downward
-                                                        // when the menu fits below; only flip up when it doesn't
-                                                        // fit below AND there's more room above. A received menu
-                                                        // (2 rows) is shorter than an own menu (4 rows), so it
-                                                        // stays down in cases where an own menu would flip.
-                                                        // (#402 review)
-                                                        let (sp_top, sp_bottom) = web_sys::window()
-                                                            .and_then(|w| w.document())
-                                                            .and_then(|d| {
-                                                                d.get_element_by_id("chat-scroll-container")
-                                                            })
-                                                            .map(|el| {
-                                                                let r = el.get_bounding_client_rect();
-                                                                (r.top(), r.bottom())
-                                                            })
-                                                            .unwrap_or((60.0, 600.0));
-                                                        let menu_height = if is_self { 200.0 } else { 110.0 };
-                                                        let space_below = sp_bottom - coords.y;
-                                                        let space_above = coords.y - sp_top;
-                                                        let above =
-                                                            space_below < menu_height && space_above > space_below;
-                                                        let align_left = coords.x < win_w * 0.5;
-                                                        // Cap the menu to the actual space on the chosen side
-                                                        // (minus a small gap) so it scrolls internally rather
-                                                        // than being clipped by the scroll container when it
-                                                        // fits neither side. Floor so it never collapses.
-                                                        // Exactly the space on the chosen side (minus the
-                                                        // mt-1/mb-1 gap): never larger, so the overflow-y-auto
-                                                        // menu can't exceed the scrollport and clip its own
-                                                        // rows. `above` already selects the roomier side, so
-                                                        // this is realistically ample; the 1px floor only
-                                                        // guards a degenerate near-zero measurement.
-                                                        let max_h = ((if above { space_above } else { space_below })
-                                                            - 16.0)
-                                                            .max(1.0);
-                                                        let id = msg_id_kebab_toggle.clone();
-                                                        // Defer signal writes out of the event handler per
-                                                        // .claude/rules/dioxus-signal-safety.md (Firefox-mobile
-                                                        // re-entrant borrow crashes).
-                                                        crate::util::defer(move || {
-                                                            menu_show_above.set(above);
-                                                            menu_align_left.set(align_left);
-                                                            menu_max_h.set(max_h);
-                                                            open_action_menu.set(Some(id));
-                                                        });
-                                                    }
-                                                },
-                                                Icon { icon: FaEllipsisVertical, width: 16, height: 16 }
-                                            }
-                                            // Action menu popover + dismiss backdrop. The backdrop is
-                                            // `fixed inset-0` (covers the viewport now that no transformed
-                                            // ancestor clips it) so a tap anywhere else dismisses.
-                                            if menu_open {
-                                                div {
-                                                    class: "fixed inset-0 z-40",
-                                                    onclick: move |_| crate::util::defer(move || open_action_menu.set(None)),
-                                                }
-                                                div {
-                                                    // Opens toward the bubble/centre (self: right of the
-                                                    // left-gutter kebab; other: left of the right-gutter
-                                                    // kebab); `max-w` clamps it to the viewport as a
-                                                    // backstop against a narrow-screen overflow.
-                                                    class: format!(
-                                                        "absolute z-50 min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {} {}",
-                                                        if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                        if *menu_align_left.read() { "left-0" } else { "right-0" }
-                                                    ),
-                                                    style: format!("max-height: {}px", *menu_max_h.read()),
-                                                    "data-testid": "message-action-menu",
-                                                    button {
-                                                        class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
-                                                        onclick: move |_| {
-                                                            let id = msg_id_menu_reply.clone();
-                                                            let author = reply_author_kebab.clone();
-                                                            let preview = reply_preview_kebab.clone();
-                                                            crate::util::defer(move || {
-                                                                on_reply.call(ReplyContext {
-                                                                    message_id: id,
-                                                                    author_name: author,
-                                                                    content_preview: preview,
-                                                                });
-                                                                open_action_menu.set(None);
-                                                            });
-                                                        },
-                                                        Icon { icon: FaReply, width: 14, height: 14 }
-                                                        "Reply"
-                                                    }
-                                                    if is_self {
-                                                        button {
-                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
-                                                            onclick: move |_| {
-                                                                let t = edit_text_kebab.clone();
-                                                                let id = msg_id_menu_edit.clone();
-                                                                crate::util::defer(move || {
-                                                                    edit_text.set(t);
-                                                                    editing_message.set(Some(id));
-                                                                    open_action_menu.set(None);
-                                                                });
-                                                            },
-                                                            Icon { icon: FaPenToSquare, width: 14, height: 14 }
-                                                            "Edit"
-                                                        }
-                                                        button {
-                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-error-bg text-left",
-                                                            onclick: move |_| {
-                                                                let id = msg_id_menu_delete.clone();
-                                                                crate::util::defer(move || {
-                                                                    on_request_delete.call(id);
-                                                                    open_action_menu.set(None);
-                                                                });
-                                                            },
-                                                            Icon { icon: FaTrashCan, width: 14, height: 14 }
-                                                            "Delete"
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            KebabButton { target_for_me, menu_target }
                                         }
                                     }
                                 }

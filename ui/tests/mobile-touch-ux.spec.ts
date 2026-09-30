@@ -202,7 +202,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     }
   });
 
-  test("menu is capped to the scrollport height on a short viewport", async ({
+  test("menu is capped to the viewport height on a short viewport", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 500, height: 340 });
@@ -214,9 +214,8 @@ test.describe("Message action kebab menu (#402.1)", () => {
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
-    // Own message (4-row menu) opened on a short scrollport: the menu must be
-    // capped to the available space (and scroll internally) rather than extend
-    // past the scroll container with actions unreachable.
+    // Own message (3-row menu) on a short viewport: the top-layer menu must fit
+    // the viewport (scrolling internally if it has to), actions all reachable.
     await page
       .locator('[id^="msg-"]:has(.bg-accent)')
       .first()
@@ -225,16 +224,10 @@ test.describe("Message action kebab menu (#402.1)", () => {
     const menu = page.locator('[data-testid="message-action-menu"]');
     await expect(menu).toBeVisible();
 
-    const box = await menu.boundingBox();
-    const scrollportH = await page.evaluate(() => {
-      const el = document.getElementById("chat-scroll-container");
-      return el ? el.clientHeight : 0;
-    });
-    expect(box).not.toBeNull();
-    if (box) {
-      // Fits within the scrollport (a few px slack), so nothing is clipped away.
-      expect(box.height).toBeLessThanOrEqual(scrollportH + 4);
-    }
+    const box = (await menu.boundingBox())!;
+    const innerHeight = await page.evaluate(() => window.innerHeight);
+    expect(box.y).toBeGreaterThanOrEqual(0);
+    expect(box.y + box.height).toBeLessThanOrEqual(innerHeight);
   });
 
   test("never more than one menu open at a time", async ({ page }) => {
@@ -246,25 +239,47 @@ test.describe("Message action kebab menu (#402.1)", () => {
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
-    const menus = page.locator('[data-testid="message-action-menu"]');
+    const menu = page.locator('[data-testid="message-action-menu"]');
     const kebabs = page.locator('[data-testid="message-kebab"]');
 
-    // Open the first message's menu.
     await kebabs.nth(0).click();
-    await expect(menus).toHaveCount(1);
+    await expect(menu).toBeVisible();
+    // One shared menu: another kebab's tap closes it, and the next tap opens it for that message.
+    await kebabs.nth(2).click();
+    await expect(menu).toBeHidden();
+    await kebabs.nth(2).click();
+    await expect(menu).toBeVisible();
+    await expect(kebabs.nth(2)).toHaveAttribute("aria-expanded", "true");
+  });
 
-    // While a menu is open its wrapper is raised (z-[60]) so its full-viewport
-    // backdrop covers every other kebab. A tap at a later message's kebab
-    // therefore lands on the backdrop (Playwright's .click() would refuse the
-    // obscured element, so dispatch at the coordinate) and dismisses the menu —
-    // never two open, and the menu's own rows can't be intercepted by a sibling
-    // kebab. A second tap would then open that message's menu.
-    const box = await kebabs.nth(2).boundingBox();
-    expect(box).not.toBeNull();
-    if (box) {
-      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-    }
-    await expect(menus).toHaveCount(0);
+  test("nothing covers the open menu, even over later messages", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    // The first message's menu opens over every later group.
+    await page.locator('[data-testid="message-kebab"]').nth(0).click();
+    const menu = page.locator('[data-testid="message-action-menu"]');
+    await expect(menu).toBeVisible();
+    const covered = await menu.evaluate((m) => {
+      const r = m.getBoundingClientRect();
+      // Edge midpoints 3px in, corners 8px in, as reaction-picker.spec.ts probes.
+      const cx = (r.left + r.right) / 2;
+      const cy = (r.top + r.bottom) / 2;
+      return [
+        [cx, r.top + 3], [cx, r.bottom - 3], [r.left + 3, cy], [r.right - 3, cy],
+        [r.left + 8, r.top + 8], [r.right - 8, r.top + 8], [r.left + 8, r.bottom - 8], [r.right - 8, r.bottom - 8],
+      ]
+        .map(([x, y]) => document.elementFromPoint(x, y))
+        .filter((hit) => !hit || !m.contains(hit))
+        .map((hit) => (hit ? `${hit.tagName.toLowerCase()}[${(hit as HTMLElement).dataset.testid ?? ""}]` : "nothing"));
+    });
+    expect(covered, "something paints over the menu").toEqual([]);
+    expect(await menu.evaluate((el) => el.matches(":popover-open"))).toBe(true);
   });
 });
 

@@ -44,6 +44,23 @@
     }
 }
 
+/* Anchored below its kebab, flipped to stay on screen; centred where anchor positioning is missing. */
+#message-action-menu {
+    margin: auto;
+    max-height: calc(100dvh - 1rem);
+    overflow-y: auto;
+}
+
+@supports (position-area: block-end) {
+    #message-action-menu {
+        /* As for the picker: without it a kebab near the screen edge squeezes the menu instead of flipping it. */
+        width: max-content;
+        margin: 0.25rem 0;
+        position-area: block-end span-inline-start;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    }
+}
+
 /* Touch reveal for the inline add-reaction "+" button (same failure mode as
  * #402/#462 above): `.add-reaction-btn` reveals via `.group:hover`, a real
  * CSS `:hover`, which touch devices can't reliably trigger — so on a phone
