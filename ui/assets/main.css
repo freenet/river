@@ -113,6 +113,17 @@
     max-width: min(85cqi, calc(100cqi - 3.5rem));
 }
 
+/* Engines without container units drop the cqi caps; these % caps stand in. */
+@supports not (width: 1cqi) {
+    .msg-group-header {
+        max-width: 75%;
+    }
+
+    .msg-body {
+        max-width: min(85%, calc(100% - 3.5rem));
+    }
+}
+
 .msg-edit-form {
     max-width: min(550px, 75cqi);
 }
