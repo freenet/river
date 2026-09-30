@@ -237,3 +237,30 @@ test("on page load neither popover holds focus", async ({ page }) => {
     await page.evaluate(() => !!document.activeElement?.closest("#reaction-picker, #message-action-menu"))
   ).toBe(false);
 });
+
+test("opening on B after A reacts to B", async ({ page }) => {
+  // Two rows with no reactions yet, pinned by id so adding a chip doesn't move the locator.
+  const [a, b] = await page
+    .locator(`[id^="msg-"]:not(:has(${CHIP}))`)
+    .evaluateAll((els) => [els[els.length - 2].id, els[els.length - 1].id]);
+  const rowA = page.locator(`[id="${a}"]`);
+  const rowB = page.locator(`[id="${b}"]`);
+  // By keyboard throughout, so no light dismiss closes anything for us.
+  await rowA.locator(PLUS).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(PICKER)).toBeVisible();
+  await expect(rowA.locator(PLUS)).toHaveAttribute("aria-expanded", "true");
+  await page.keyboard.press("Escape");
+  await expect(page.locator(PICKER)).toBeHidden();
+  await rowB.locator(PLUS).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(PICKER)).toBeVisible();
+  // Each target lands a tick after its open, which a keypress can beat and a person can't: wait for it.
+  await expect(rowB.locator(PLUS)).toHaveAttribute("aria-expanded", "true");
+  const emoji = (await page.locator(PICKER).locator("button").first().textContent())!.trim();
+  // Focus is on the first emoji.
+  await page.keyboard.press("Enter");
+  await expect(rowB.locator(CHIP)).toHaveCount(1);
+  await expect(rowB.locator(CHIP)).toContainText(emoji);
+  await expect(rowA.locator(CHIP)).toHaveCount(0);
+});
