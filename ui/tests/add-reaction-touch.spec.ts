@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { waitForApp } from "./example-room";
+import { openRoomWithComposer, waitForApp } from "./example-room";
 
 // Regression coverage for the inline add-reaction "+" button being invisible
 // (but still tappable) on touch devices.
@@ -92,4 +92,67 @@ test.describe("Add-reaction + button cascade", () => {
       }
     });
   }
+});
+
+test("on touch, the + takes taps 20px around it without growing the row", async ({ page }) => {
+  await page.goto("/");
+  await waitForApp(page);
+  await openRoomWithComposer(page);
+  test.skip(
+    !(await page.evaluate(() => matchMedia("(hover: none), (any-pointer: coarse)").matches)),
+    "the hit area is touch-only"
+  );
+
+  // A short reaction row (one or two chips), centred in the history so every probe lands on the page.
+  // Last in its group: the next row of a group starts right below, and its bubble paints over the hit area.
+  const LAST = '[id^="msg-"]:last-child';
+  const CHIP = '[data-testid="reaction-chip"]';
+  let id = await page.evaluate(
+    ([last, chip]) =>
+      [...document.querySelectorAll(last)].find((r) => {
+        const n = r.querySelectorAll(chip).length;
+        return n > 0 && n <= 2;
+      })?.id ?? null,
+    [LAST, CHIP]
+  );
+  if (!id) {
+    // The random history shows none: react to one through the picker first.
+    id = await page.locator(`${LAST}:not(:has(${CHIP}))`).last().evaluate((el) => el.id);
+    await page.locator(`[id="${id}"]`).getByTestId("add-reaction-button").click();
+    await page.getByTestId("emoji-picker").locator("button").first().click();
+    await expect(page.locator(`[id="${id}"]`).locator(CHIP)).toHaveCount(1);
+  }
+  const row = page.locator(`[id="${id}"]`);
+  await row.evaluate((el) => {
+    const scroller = document.getElementById("chat-scroll-container")!;
+    const plus = el.querySelector('[data-testid="add-reaction-button"]')!.getBoundingClientRect();
+    const s = scroller.getBoundingClientRect();
+    scroller.scrollBy(0, plus.top - (s.top + s.height / 2));
+  });
+  const m = await row.evaluate((el) => {
+    const plus = el.querySelector('[data-testid="add-reaction-button"]')!;
+    const chips = el.querySelectorAll('[data-testid="reaction-chip"]');
+    const chip = chips[chips.length - 1];
+    const r = plus.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const hitsPlus = (x: number, y: number) =>
+      document.elementFromPoint(x, y)?.closest('[data-testid="add-reaction-button"]') === plus;
+    const c = chip.getBoundingClientRect();
+    return {
+      height: r.height,
+      above: hitsPlus(cx, cy - 20),
+      below: hitsPlus(cx, cy + 20),
+      right: hitsPlus(cx + 20, cy),
+      chip:
+        document.elementFromPoint(c.left + c.width / 2, c.top + c.height / 2)?.closest('[data-testid="reaction-chip"]') ===
+        chip,
+    };
+  });
+  // The box itself did not grow (#605): only the hit area did.
+  expect(m.height).toBeLessThan(32);
+  expect(m.above, "a tap 20px above the + misses it").toBe(true);
+  expect(m.below, "a tap 20px below the + misses it").toBe(true);
+  expect(m.right, "a tap 20px right of the + misses it").toBe(true);
+  expect(m.chip, "the hit area steals the chip's taps").toBe(true);
 });

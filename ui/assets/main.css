@@ -79,14 +79,12 @@
  * (`any-pointer: coarse` also catches a touchscreen laptop, which reports
  * `hover: hover` while a finger is on the glass).
  *
- * Deliberately does NOT widen the tap target the way #462 did: a min-size
- * here (tried in #605, reverted after user feedback) grows the reaction
- * row's line height on every message, even ones without reactions yet,
- * which reads as "the composer now takes up more room" — a real visible
- * regression, not just a WCAG nice-to-have. This button is also a
- * lower-stakes target than the DM-archive ✕ (a mis-tap just opens the
- * emoji picker, not a destructive action). So: fix visibility only, leave
- * sizing alone. */
+ * The button's box stays the size it is: a min-size (tried in #605,
+ * reverted after user feedback) grew the reaction row's line height on every
+ * message, which read as "the composer now takes up more room". The `::before`
+ * below gives it a finger-sized hit area instead, without touching layout. It
+ * matters more now that the kebab menu no longer has a React row: this "+" is
+ * the only way to react on touch. */
 @media (hover: none), (any-pointer: coarse) {
     .add-reaction-btn {
         opacity: 0.4;
@@ -95,6 +93,10 @@
     .add-reaction-btn.has-reactions {
         opacity: 0.4;
     }
+
+    /* Hit area only: a bigger box grew every reaction row (#605). Mostly rightward, so the chip before it keeps its taps. */
+    .add-reaction-btn { position: relative; }
+    .add-reaction-btn::before { content: ""; position: absolute; inset: -12px -16px -12px -2px; }
 }
 
 /* Width caps are a share of the group's column. Never on #chat-content: WebKit 307984 blanks the room list after a resize. */
