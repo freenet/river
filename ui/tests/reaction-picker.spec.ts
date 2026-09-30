@@ -38,22 +38,28 @@ async function openFrom(page: Page, plus: Locator) {
   await expect(page.locator(PICKER)).toBeVisible();
 }
 
-/** An author name (a tap opens the member-info modal), fully on screen and clear of `popover`. */
-async function authorNameClearOf(page: Page, popover: string): Promise<Locator> {
+/** Something a tap opens a modal from, fully on screen and clear of `popover`: an author name, else the room title. */
+async function modalOpenerClearOf(page: Page, popover: string): Promise<Locator> {
   await page.evaluate((sel) => {
     const p = document.querySelector(sel)!.getBoundingClientRect();
     const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+    const clearOf = (r: DOMRect) => r.right < p.left || r.left > p.right || r.bottom < p.top || r.top > p.bottom;
+    // Example history is random, so the view may hold no other author's group; the header title is the fallback.
     const names = [...document.querySelectorAll('[data-testid="message-group-header"] span[title^="Member ID"]')];
-    const clear = names.find((n) => {
+    const name = names.find((n) => {
       const r = n.getBoundingClientRect();
-      const onScreen = r.width > 0 && r.top >= s.top && r.bottom <= s.bottom;
-      return onScreen && (r.right < p.left || r.left > p.right || r.bottom < p.top || r.top > p.bottom);
+      return r.width > 0 && r.top >= s.top && r.bottom <= s.bottom && clearOf(r);
     });
-    document.querySelectorAll("[data-test-clear-name]").forEach((e) => e.removeAttribute("data-test-clear-name"));
-    clear?.setAttribute("data-test-clear-name", "");
+    const title = document.querySelector('[data-testid="room-title-button"]');
+    const pick = name ?? (title && clearOf(title.getBoundingClientRect()) ? title : null);
+    document.querySelectorAll("[data-test-opener]").forEach((e) => e.removeAttribute("data-test-opener"));
+    pick?.setAttribute("data-test-opener", "");
   }, popover);
-  return page.locator("[data-test-clear-name]");
+  return page.locator("[data-test-opener]");
 }
+
+/** The member-info and room-details modals, which the openers above open. */
+const MODALS = '[data-testid="member-info-modal"], [data-testid="edit-room-modal"]';
 
 /** Whatever paints over any part of the open picker. */
 const pickerLayout = (page: Page) =>
@@ -177,10 +183,27 @@ test("its panels and buttons are hidden where the Popover API is missing", async
 
 test("the tap that closes it does nothing else", async ({ page }) => {
   await openFrom(page, await middlePlus(page));
-  const name = await authorNameClearOf(page, PICKER);
-  await name.click();
+  await (await modalOpenerClearOf(page, PICKER)).click();
   await expect(page.locator(PICKER)).toBeHidden();
-  // Light dismiss closed the picker; the same tap must not also open the author's member info.
+  // Light dismiss closed the picker; the same tap must not also open a modal.
   await page.waitForTimeout(300);
-  await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
+  await expect(page.locator(MODALS)).toHaveCount(0);
+});
+
+test("moving focus out closes it, so a modal never opens under it", async ({ page }) => {
+  const plus = await middlePlus(page);
+  await plus.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(PICKER)).toBeVisible();
+  const r = (await page.locator(PICKER).boundingBox())!;
+  // Tab's route: focus lands on a modal's opener outside the picker, then Enter opens the modal.
+  await page.getByTestId("room-info-button").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(PICKER)).toBeHidden();
+  await expect(page.getByTestId("edit-room-modal")).toBeVisible();
+  const covered = await page.evaluate(
+    ([x, y]) => !!document.elementFromPoint(x, y)?.closest(".fixed")?.querySelector('[data-testid="edit-room-modal"]'),
+    [r.x + r.width / 2, r.y + r.height / 2]
+  );
+  expect(covered, "the picker's place is under the modal, not over it").toBe(true);
 });

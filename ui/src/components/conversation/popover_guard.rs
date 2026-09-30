@@ -86,4 +86,12 @@ pub(super) fn install_popover_guards() {
             e.stop_immediate_propagation();
         }
     });
+    // Focus leaving closes it, so a modal opened by keyboard never sits under it. Invokers are exempt, as above.
+    listen("focusin", &passive, |e| {
+        if let Some(popover) =
+            popover_left_by(&e).and_then(|p| p.dyn_into::<web_sys::HtmlElement>().ok())
+        {
+            let _ = popover.hide_popover();
+        }
+    });
 }

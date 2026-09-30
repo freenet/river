@@ -14,22 +14,28 @@ async function isTouchOnly(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none)").matches);
 }
 
-/** An author name (a tap opens the member-info modal), fully on screen and clear of `popover`. */
-async function authorNameClearOf(page: Page, popover: string): Promise<Locator> {
+/** Something a tap opens a modal from, fully on screen and clear of `popover`: an author name, else the room title. */
+async function modalOpenerClearOf(page: Page, popover: string): Promise<Locator> {
   await page.evaluate((sel) => {
     const p = document.querySelector(sel)!.getBoundingClientRect();
     const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+    const clearOf = (r: DOMRect) => r.right < p.left || r.left > p.right || r.bottom < p.top || r.top > p.bottom;
+    // Example history is random, so the view may hold no other author's group; the header title is the fallback.
     const names = [...document.querySelectorAll('[data-testid="message-group-header"] span[title^="Member ID"]')];
-    const clear = names.find((n) => {
+    const name = names.find((n) => {
       const r = n.getBoundingClientRect();
-      const onScreen = r.width > 0 && r.top >= s.top && r.bottom <= s.bottom;
-      return onScreen && (r.right < p.left || r.left > p.right || r.bottom < p.top || r.top > p.bottom);
+      return r.width > 0 && r.top >= s.top && r.bottom <= s.bottom && clearOf(r);
     });
-    document.querySelectorAll("[data-test-clear-name]").forEach((e) => e.removeAttribute("data-test-clear-name"));
-    clear?.setAttribute("data-test-clear-name", "");
+    const title = document.querySelector('[data-testid="room-title-button"]');
+    const pick = name ?? (title && clearOf(title.getBoundingClientRect()) ? title : null);
+    document.querySelectorAll("[data-test-opener]").forEach((e) => e.removeAttribute("data-test-opener"));
+    pick?.setAttribute("data-test-opener", "");
   }, popover);
-  return page.locator("[data-test-clear-name]");
+  return page.locator("[data-test-opener]");
 }
+
+/** The member-info and room-details modals, which the openers above open. */
+const MODALS = '[data-testid="member-info-modal"], [data-testid="edit-room-modal"]';
 
 // The app scrolls to the bottom asynchronously on room entry. Wait for that to
 // settle before a test scrolls up, otherwise the pending async scroll races the
@@ -208,11 +214,11 @@ test.describe("Message action kebab menu (#402.1)", () => {
       );
       expect(hScroll).toBe(false);
 
-      // Dismiss with a tap on an author name: it closes the menu and does nothing else.
-      await (await authorNameClearOf(page, '[data-testid="message-action-menu"]')).click();
+      // Dismiss with a tap on a modal opener: it closes the menu and does nothing else.
+      await (await modalOpenerClearOf(page, '[data-testid="message-action-menu"]')).click();
       await expect(menu).toBeHidden();
       await page.waitForTimeout(300);
-      await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
+      await expect(page.locator(MODALS)).toHaveCount(0);
     }
   });
 
