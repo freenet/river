@@ -3,6 +3,7 @@
 pub mod confusable;
 pub mod display_name;
 pub mod ecies;
+pub mod share_link;
 pub mod signal_guard;
 #[cfg(test)]
 pub(crate) mod source_scan;

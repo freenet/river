@@ -4771,6 +4771,7 @@ dependencies = [
  "rand 0.8.6",
  "river-core",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.18",
  "tracing",
