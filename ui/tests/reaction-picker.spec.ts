@@ -281,3 +281,23 @@ test.describe("on the narrowest phone", () => {
     expect(p.x + p.width).toBeLessThanOrEqual(320);
   });
 });
+
+test("picking your own reaction again removes it", async ({ page }) => {
+  // A row carrying the viewer's reaction (underlined chip); if the window shows none, add one first.
+  const OWN = `${CHIP}.underline`;
+  let id = await page.locator(`[id^="msg-"]:has(${OWN})`).last().evaluate((el) => el.id).catch(() => null);
+  if (!id) {
+    id = await page.locator(`[id^="msg-"]:not(:has(${CHIP}))`).last().evaluate((el) => el.id);
+    await openFrom(page, page.locator(`[id="${id}"]`).locator(PLUS));
+    await page.locator(PICKER).locator("button").first().click();
+    await expect(page.locator(`[id="${id}"]`).locator(OWN)).toHaveCount(1);
+  }
+  const row = page.locator(`[id="${id}"]`);
+  await openFrom(page, row.locator(PLUS));
+  // The highlighted emoji; its title says what a click does.
+  const mine = page.locator(PICKER).locator('button[title^="Remove "]');
+  await expect(mine).toHaveCount(1);
+  await mine.click();
+  await expect(page.locator(PICKER)).toBeHidden();
+  await expect(row.locator(OWN)).toHaveCount(0);
+});
