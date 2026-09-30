@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { resolveColor, selectRoom, waitForApp } from "./example-room";
 
-test("hovering a group's author header lights its whole first row", async ({ page }) => {
+test("hovering a group's author header lights its whole first row, and the band stays while that row's picker is open", async ({ page }) => {
   test.skip(
     await page.evaluate(() => matchMedia("(hover: none), (any-pointer: coarse)").matches),
     "no band on touch"
@@ -25,4 +25,12 @@ test("hovering a group's author header lights its whole first row", async ({ pag
   const historyBox = (await page.getByTestId("conversation-history").boundingBox())!;
   expect(rowBox.x).toBeLessThanOrEqual(historyBox.x);
   expect(rowBox.x + rowBox.width).toBeGreaterThanOrEqual(historyBox.x + historyBox.width);
+
+  // The picker is not inside the row, so moving away ends the hover: the open picker's "+" keeps the band.
+  await row.getByTestId("add-reaction-button").click();
+  await page.mouse.move(0, 0);
+  // Let the band's 0.15s fade settle first: a poll passes on its first sample, which a fade in progress still satisfies.
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  await row.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)));
+  expect(await bg()).toEqual(await resolveColor(page, "var(--color-row-hover)"));
 });
