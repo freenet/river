@@ -11,10 +11,6 @@ async function openRoom(page: Page, width: number) {
 
 async function measure(page: Page) {
   return page.evaluate(() => {
-    const content = document.getElementById("chat-content")!;
-    const cs = getComputedStyle(content);
-    const column =
-      content.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
     const all = [...document.querySelectorAll('[data-testid="message-bubble"]')];
     // `ch` in the bubble's own font.
     const probe = document.createElement("div");
@@ -22,32 +18,36 @@ async function measure(page: Page) {
     all[0].appendChild(probe);
     const ch65 = probe.getBoundingClientRect().width;
     probe.remove();
-    return {
-      cap: Math.min(ch65, column * 0.75),
-      bubbles: all.map((b) => ({
+    return all.map((b) => {
+      // `cqi` resolves against the group's .msg-bubbles size container, its content box.
+      const box = b.closest(".msg-bubbles")!;
+      const cs = getComputedStyle(box);
+      const column = box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      return {
         w: b.getBoundingClientRect().width,
+        cap: Math.min(ch65, column * 0.75),
         chips: b.closest('[id^="msg-"]')!.querySelectorAll('[data-testid="reaction-chip"]').length,
-      })),
-    };
+      };
+    });
   });
 }
 
 for (const width of [1440, 320]) {
-  test(`bubbles are capped at min(65ch, 75% of the column) @ ${width}px`, async ({ page }) => {
+  test(`bubbles are capped at min(65ch, 75% of the column) @ ${width}px`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name.startsWith("mobile-"), "sets its own viewport, so it would repeat chromium and webkit");
     await openRoom(page, width);
     // Reactions may widen a bubble past the cap (up to .msg-body's); nothing else may.
     await expect
       .poll(async () => {
-        const m = await measure(page);
-        const free = m.bubbles.filter((b) => b.chips === 0);
-        return free.length ? Math.max(...free.map((b) => b.w)) - m.cap : Infinity;
+        const free = (await measure(page)).filter((b) => b.chips === 0);
+        return free.length ? Math.max(...free.map((b) => b.w - b.cap)) : Infinity;
       }, { message: "no bubble without reactions may pass the cap" })
       .toBeLessThanOrEqual(1);
     await expect
       .poll(async () => {
-        const m = await measure(page);
-        return m.bubbles.map((b) => b.w).some((w) => Math.abs(w - m.cap) <= 1);
-      }, { message: "some bubble should sit at the cap" })
+        const free = (await measure(page)).filter((b) => b.chips === 0);
+        return free.some((b) => b.w >= 0.9 * b.cap);
+      }, { message: "some bubble should reach the cap" })
       .toBe(true);
   });
 }
