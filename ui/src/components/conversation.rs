@@ -4290,6 +4290,7 @@ pub fn Conversation() -> Element {
                                                     DisplayRow::DateSeparator { key, label } => rsx! {
                                                         div {
                                                             key: "{key}",
+                                                            "data-anchor-row": "{key}",
                                                             class: "flex justify-center py-2",
                                                             span {
                                                                 class: "text-xs font-medium text-text-muted bg-surface px-3 py-1 rounded-full",
@@ -4307,6 +4308,7 @@ pub fn Conversation() -> Element {
                                                                 // head-reposition machinery
                                                                 // (`history_row_offset_top`).
                                                                 "data-item-key": "{key}",
+                                                                "data-anchor-row": "{key}",
                                                                 class: "flex justify-center py-1",
                                                                 span {
                                                                     class: "text-xs text-text-muted italic",
@@ -4978,6 +4980,7 @@ fn MessageGroupComponent(
                             div {
                                 key: "{msg.id}",
                                 id: "msg-{msg.id}",
+                                "data-anchor-row": "{msg.id}",
                                 class: "flex flex-col group min-w-0 max-w-full",
                                 // Container for message bubble + hover actions
                                 div {
