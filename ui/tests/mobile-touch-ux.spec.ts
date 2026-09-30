@@ -198,6 +198,45 @@ test.describe("Message action kebab menu (#402.1)", () => {
     }
   });
 
+  test.describe("on a short landscape screen", () => {
+    // A phone held sideways: less room below a low kebab than the menu is tall.
+    test.use({ viewport: { width: 844, height: 390 } });
+
+    test("menu stays on screen vertically, flipped beside its kebab", async ({ page }) => {
+      await page.goto("/");
+      await waitForApp(page);
+      await selectRoom(page, "Your Private Room");
+      test.skip(
+        !(await isTouchOnly(page)),
+        "kebab menu is touch-only; desktop uses the hover action bar"
+      );
+
+      // An own message's kebab (Reply, Edit, Delete: the tallest menu), scrolled to sit low on the screen.
+      const kebabs = page.locator('[id^="msg-"]:has(.bg-accent) [data-testid="message-kebab"]');
+      const kebab = kebabs.nth(Math.floor((await kebabs.count()) / 2));
+      await kebab.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        document.getElementById("chat-scroll-container")!.scrollBy(0, r.top + r.height / 2 - 290);
+      });
+      await kebab.click();
+      const menu = page.locator('[data-testid="message-action-menu"]');
+      await expect(menu).toBeVisible();
+      // The target lands a tick after the open; measure the full three-action menu.
+      await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
+
+      const k = (await kebab.boundingBox())!;
+      const m = (await menu.boundingBox())!;
+      const at = `menu y ${m.y}..${m.y + m.height} vs kebab y ${k.y}..${k.y + k.height}`;
+      expect(390 - (k.y + k.height), `no room below, so it must flip: ${at}`).toBeLessThan(m.height);
+      expect(m.y, at).toBeGreaterThanOrEqual(0);
+      expect(m.y + m.height, at).toBeLessThanOrEqual(390 + 1);
+      // Touches the kebab below or above it, within the 0.25rem gap: flipped, not slid over it.
+      const below = m.y >= k.y + k.height - 1 && m.y - (k.y + k.height) <= 8;
+      const above = k.y >= m.y + m.height - 1 && k.y - (m.y + m.height) <= 8;
+      expect(below || above, at).toBe(true);
+    });
+  });
+
   test("never more than one menu open at a time", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
