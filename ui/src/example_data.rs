@@ -747,8 +747,8 @@ fn add_example_messages(
     // width cap. On a self (right-aligned) message that used to
     // overflow the viewport on narrow mobile screens, clipping the bubble off
     // both edges. Kept in example data so the mobile-overflow Playwright
-    // regression test has a self bubble that WOULD overflow without the
-    // per-message width clamp.
+    // regression test has a self bubble that WOULD overflow without
+    // `.msg-body`'s width cap.
     if let Some(long_url_msg) = messages.messages.last().cloned() {
         let target_id = long_url_msg.id();
         let target_author_id = long_url_msg.message.author;

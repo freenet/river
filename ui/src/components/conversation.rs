@@ -4849,7 +4849,6 @@ fn MessageGroupComponent(
     rsx! {
         div {
             class: "msg-bubbles",
-            "data-self": "{is_self}",
             {
                 let messages_len = group.messages.len();
                 group.messages.into_iter().enumerate().map(move |(idx, msg)| {
