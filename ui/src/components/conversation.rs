@@ -1373,18 +1373,22 @@ fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
         // the URL) names its own destination and is exempt.
         if rewrite_freenet_hrefs {
             if let Some(dest_id) = node_destination(original_href.as_deref()) {
-                // A pasted link needs no exemption: its text names its own
-                // contract, a consistent claim. The one exemption is a URL
-                // whose destination is UNKNOWN but whose text is exactly the
-                // absolute URL with nothing that moves it unreadably (no dot
-                // segment, no percent-escape), e.g. an id that does not
-                // parse: what the reader sees is where it goes.
-                let bare = dest_id.is_none()
-                    && original_href.as_deref() == Some(inner)
-                    && plain_absolute_url(inner);
+                // A pasted absolute URL (its text IS the href) shows where it
+                // goes, host and contract id first, so its label is not
+                // checked (a River invite's long `?invitation=` code, or an
+                // app path holding other ids, is not a claim). Unless its
+                // destination is unknown AND something in it moves where it
+                // lands unreadably (a dot segment, a percent-escape).
+                let bare =
+                    original_href.as_deref() == Some(inner) && has_scheme_and_authority(inner);
                 // A tooltip is label text too.
                 let title = extract_attr(&opening, "title");
-                if !bare && label_contradicts_destination(inner, title.as_deref(), dest_id) {
+                let unlink = if bare {
+                    dest_id.is_none() && !plain_absolute_url(inner)
+                } else {
+                    label_contradicts_destination(inner, title.as_deref(), dest_id)
+                };
+                if unlink {
                     out.push_str(inner);
                     rest = tail;
                     continue;
@@ -1535,18 +1539,37 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
     // comparison, not rendering, so joining too much can only unlink more,
     // never link something new.
     let decoded = decode_html_text(&visible_text_with_alt(inner));
+    // Near-invisible spaces and line breaks (an id wrapping looks the same)
+    // are dropped; full-width spaces (no-break, ideographic, …) are visible
+    // and stay separators, like an ASCII space.
     let spaced: String = decoded
         .chars()
-        .filter(|c| !(c.is_whitespace() && *c != ' '))
+        .filter(|c| {
+            !matches!(
+                c,
+                '\n' | '\r' | '\u{2006}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+            )
+        })
         .collect();
+    // Colon look-alikes read as the `:` of a `freenet:` marker.
     let folded: Vec<char> = crate::util::confusable::visual_ascii(&spaced)
         .chars()
+        .map(|c| match c {
+            '\u{02D0}' | '\u{0589}' | '\u{05C3}' | '\u{1804}' | '\u{205A}' | '\u{2236}'
+            | '\u{A789}' | '\u{FE13}' | '\u{FE55}' => ':',
+            other => other,
+        })
         .collect();
-    // Any non-ASCII character left after the visual fold that sits between
-    // two ASCII letters/digits (an unfolded homoglyph, a zero-width combining
-    // mark, …) is kept INSIDE the run as a placeholder, so it cannot split an
-    // id; a run containing it can never be a prefix of an (ASCII) id.
+    // A short run (1-3) of non-ASCII characters from the alphabetic and
+    // combining blocks (Latin, IPA, Greek, Cyrillic, Armenian, Hebrew, Arabic,
+    // Indic, Thai, … up to U+1FFF, plus combining marks for symbols) left
+    // between two ASCII letters/digits after the visual fold is an unfolded
+    // homoglyph or a zero-width mark inside an id: keep it IN the run as a
+    // placeholder, which can never be a prefix of an (ASCII) id. Anything
+    // else (CJK, punctuation, longer foreign words) separates, as it looks.
     const JOINED: char = '\u{FFFD}';
+    let joinable =
+        |c: char| !c.is_whitespace() && matches!(u32::from(c), 0x80..=0x1FFF | 0x20D0..=0x20FF);
     let mut text = String::with_capacity(folded.len());
     let mut k = 0;
     while k < folded.len() {
@@ -1563,7 +1586,9 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
             && folded[k - 1].is_ascii_alphanumeric()
             && folded
                 .get(run_end)
-                .is_some_and(|n| n.is_ascii_alphanumeric());
+                .is_some_and(|n| n.is_ascii_alphanumeric())
+            && run_end - k <= 3
+            && folded[k..run_end].iter().all(|&c| joinable(c));
         text.push(if flanked { JOINED } else { ' ' });
         k = run_end;
     }
@@ -1577,15 +1602,14 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
         let run = &text[start..end];
         let len = run.chars().count();
         let has_upper = run.chars().any(|c| c.is_ascii_uppercase());
-        // After a `freenet:` marker, a SHORT run only counts if it looks like
-        // an id (a digit, or a capital after the first character), so
-        // "Freenet: Harvest market" is prose, not a claim.
+        // A SHORT run counts only right after a `freenet:` marker with no
+        // space (`freenet:UDzGbcWr`, `freenet://…`, the shapes River itself
+        // displays), 8+ long and looking like an id (a digit, or a capital
+        // after the first character), so "Freenet: GitHub mirror" is prose.
         let id_like_short = run.chars().any(|c| c.is_ascii_digit() || c == JOINED)
             || run.chars().skip(1).any(|c| c.is_ascii_uppercase());
-        let after_marker = lower[..start]
-            .trim_end_matches([' ', '/'])
-            .ends_with("freenet:");
-        if (len >= 32 && has_upper) || (len >= 6 && after_marker && id_like_short) {
+        let after_marker = lower[..start].trim_end_matches('/').ends_with("freenet:");
+        if (len >= 32 && has_upper) || (len >= 8 && after_marker && id_like_short) {
             claims.push(run.to_string());
         }
     };
@@ -8212,8 +8236,9 @@ mod tests {
             format!("{head}\u{200A}{tail}"),
             format!("{head}\u{2009}{tail}"),
             format!("{head}\u{202F}{tail}"),
-            "freenet: raAqMhMG".to_string(),
             "freenet:/raAqMhMG".to_string(),
+            "freenet\u{A789}raAqMhMG".to_string(),
+            "freenet\u{2236}raAqMhMG".to_string(),
         ] {
             let html = message_to_html(&format!("[{label}]({hidden})"));
             assert!(
@@ -8318,6 +8343,12 @@ mod tests {
             "Freenet: Ghostkey",
             "Get Freenet: Windows installer",
             "freenet:Harvest",
+            "Freenet: GitHub mirror",
+            "freenet: iPhone app",
+            "Freenet: River2026 launch",
+            "Freenet: Stra\u{00DF}e",
+            "Join\u{00A0}the\u{00A0}Freenet\u{00A0}Official\u{00A0}River\u{00A0}Chat\u{00A0}Room",
+            "FreenetのRiverでチャット、DeltaでWebサイト、AtlasでHarvest市場",
         ] {
             let html = message_to_html(&format!("[{label}]({href})"));
             assert!(
@@ -8354,26 +8385,51 @@ mod tests {
         );
     }
 
-    /// A pasted gateway URL whose path names a second contract shows two
-    /// ids, only one of which it opens, so it is shown as text; one naming
-    /// only its own contract is still a (shortened) link.
+    /// A pasted gateway URL is a link to what it shows (host and contract
+    /// id first); when its path also names a contract it is shown in full
+    /// rather than shortened to an 8-character id prefix.
     #[test]
-    fn gateway_url_whose_path_names_another_contract_is_not_a_link() {
+    fn pasted_gateway_url_naming_another_contract_is_shown_in_full() {
         for url in [
             format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/freenet:{RIVER_ID}"),
             format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/x/{RIVER_ID}"),
         ] {
             let html = message_to_html(&url);
-            assert!(!html.contains("<a "), "{html}");
-            assert!(html.contains(&url), "{html}");
+            assert!(html.contains(&format!(">{url}</a>")), "{html}");
+            assert!(
+                html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/")),
+                "{html}"
+            );
         }
-        let html = message_to_html(&format!(
-            "http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/?invitation=abc"
-        ));
-        assert!(
-            html.contains(&format!(">freenet:{}/?invitation=abc</a>", &SAMPLE_ID[..8])),
-            "{html}"
-        );
+    }
+
+    /// River's own invite links carry a long base58 code; a pasted one must
+    /// stay a (shortened) link, not be read as naming another contract.
+    #[test]
+    fn pasted_river_invite_link_stays_a_link() {
+        let code =
+            "2NEpo7TZRRrLZSi2U7MpNwwdMV3fjDaZaYcAhMR1FUD4xYLQ7mQAnfk9dVYNEUoGXxBxcMGRgHtqXPC";
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{RIVER_ID}/?invitation={code}");
+        for text in [
+            url.clone(),
+            format!("Join: {url}"),
+            format!("2. Open this link: {url}"),
+        ] {
+            let html = message_to_html(&text);
+            assert!(
+                html.contains(&format!(
+                    "href=\"/v1/contract/web/{RIVER_ID}/?invitation={code}\""
+                )),
+                "{text:?}: {html}"
+            );
+            assert!(
+                html.contains(&format!(
+                    ">freenet:{}/?invitation={code}</a>",
+                    &RIVER_ID[..8]
+                )),
+                "{text:?}: {html}"
+            );
+        }
     }
 
     /// A share link that sits right against a non-prose range (no space)
