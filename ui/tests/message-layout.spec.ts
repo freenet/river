@@ -39,8 +39,7 @@ test.describe("Edit box width (#205)", () => {
 });
 
 // #206 and #207: at a narrow viewport, a reply message bubble should not be
-// wider than a sibling non-reply bubble, and hovering the reply strip should
-// not change the bubble's width.
+// wider than a sibling non-reply bubble, and its strip stays on one line.
 test.describe("Reply bubble layout (#206, #207)", () => {
   test.use({ viewport: { width: 480, height: 900 } });
 
@@ -66,7 +65,11 @@ test.describe("Reply bubble layout (#206, #207)", () => {
       const hasReplyStrip = await bubble
         .locator(".reply-strip")
         .count();
-      if (hasReplyStrip === 0) {
+      // Reactions widen a bubble past the cap (see bubble-width.spec.ts), so they are no baseline.
+      const chips = await bubble.evaluate(
+        (el) => el.closest('[id^="msg-"]')!.querySelectorAll('[data-testid="reaction-chip"]').length
+      );
+      if (hasReplyStrip === 0 && chips === 0) {
         const w = await bubble.evaluate(
           (el) => el.getBoundingClientRect().width
         );
@@ -85,70 +88,34 @@ test.describe("Reply bubble layout (#206, #207)", () => {
     //
     // Before the fix: reply bubbles were dramatically wider because the
     // reply-strip's nowrap text forced the shrink-to-fit width up to
-    // max-w-prose. After the fix: bubble is sized by the body, strip
-    // ellipsizes within it.
+    // the bubble's 65ch cap. After the fix: bubble is sized by the body,
+    // strip ellipsizes within it.
     expect(replyWidth).toBeLessThanOrEqual(maxNonReplyWidth + 40);
   });
 
-  test("hovering the reply strip does not change the bubble width", async ({
-    page,
-  }, testInfo) => {
+  test("the reply strip is one line", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    const replyStrip = page.locator(".reply-strip").first();
-    await expect(replyStrip).toBeVisible({ timeout: 10_000 });
+    const strips = page.getByTestId("reply-strip");
+    await expect(strips.first()).toBeVisible({ timeout: 10_000 });
 
-    // The hover-expand CSS is gated behind
-    // `@media (hover: hover) and (pointer: fine)`, which evaluates false
-    // on touch-emulated Playwright projects AND on some headless desktop
-    // Firefox configurations. On those browsers the :hover rule never
-    // applies, so hovering cannot cause a reflow at all — the test would
-    // pass for the wrong reason. Skip when the media query is false, so
-    // the test only runs (and only matters) when it actually exercises
-    // the hover reflow pathway.
-    const hoverCapable = await page.evaluate(() =>
-      window.matchMedia("(hover: hover) and (pointer: fine)").matches
-    );
-    test.skip(
-      !hoverCapable,
-      `(hover: hover) and (pointer: fine) is false in this browser (project: ${testInfo.project.name}); the hover-expand CSS is suppressed and there is nothing to exercise`
-    );
-
-    const replyBubble = replyStrip.locator(
-      "xpath=ancestor::*[@data-testid='message-bubble'][1]"
-    );
-
-    const widthBefore = await replyBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-
-    // Move mouse to the origin first to ensure no prior hover state
-    // affects the measurement, then hover the reply strip.
-    await page.mouse.move(0, 0);
-    await replyStrip.hover();
-    // Poll until the computed `white-space` flips to `normal`, which
-    // proves the hover CSS actually engaged.
-    await expect
-      .poll(async () =>
-        replyStrip.evaluate((el) => getComputedStyle(el).whiteSpace)
-      )
-      .toMatch(/normal/);
-
-    const widthAfter = await replyBubble.evaluate(
-      (el) => el.getBoundingClientRect().width
-    );
-
-    // Width must not change when the reply strip expands on hover.
-    expect(Math.abs(widthAfter - widthBefore)).toBeLessThanOrEqual(0.5);
+    // Content height (less padding) against the line height: one line at any width.
+    for (const strip of await strips.all()) {
+      const { content, line } = await strip.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        return {
+          content: el.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom),
+          line: parseFloat(cs.lineHeight),
+        };
+      });
+      expect(content, `strip content ${content}px vs line ${line}px`).toBeLessThanOrEqual(1.5 * line);
+    }
   });
 });
 
-// #210: the reply strip has onclick and cursor-pointer but was previously a
-// plain div with no tabindex / role / key handler, and the hover-expand CSS
-// had no :focus-visible equivalent, so keyboard users couldn't reach or
-// activate it.
+// #210: keyboard users can reach and activate the reply strip, and see where focus is.
 test.describe("Reply strip keyboard accessibility (#210)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -165,13 +132,13 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     const replyStrip = page.locator('[data-testid="reply-strip"]').first();
     await expect(replyStrip).toBeVisible({ timeout: 10_000 });
 
-    // ARIA contract
-    await expect(replyStrip).toHaveAttribute("role", "button");
-    await expect(replyStrip).toHaveAttribute("tabindex", "0");
-    await expect(replyStrip).toHaveAttribute("aria-label", /reply/i);
+    // A native button: its accessible name is the quote and its title is the
+    // description, so a screen reader announces the author and text.
+    expect(await replyStrip.evaluate((el) => el.tagName)).toBe("BUTTON");
+    await expect(replyStrip).toHaveRole("button");
+    await expect(replyStrip).toHaveAccessibleName(/@.+:/);
+    await expect(replyStrip).toHaveAccessibleDescription(/original message/i);
 
-    // Focusable via .focus() — this also verifies the element accepts focus
-    // at the DOM level (tabindex >= 0).
     await replyStrip.evaluate((el) => (el as HTMLElement).focus());
     const isFocused = await replyStrip.evaluate(
       (el) => document.activeElement === el
@@ -220,33 +187,8 @@ test.describe("Reply strip keyboard accessibility (#210)", () => {
     });
     expect(
       hasFocusVisibleRule,
-      ".reply-strip:focus-visible CSS rule must exist so keyboard users see full preview (#210)"
+      ".reply-strip:focus-visible CSS rule must exist so keyboard users see the focus outline (#210)"
     ).toBe(true);
-  });
-
-  test("pressing Enter or Space on the focused reply strip scrolls to the original", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-
-    const replyStrip = page.locator(".reply-strip").first();
-    await expect(replyStrip).toBeVisible({ timeout: 10_000 });
-
-    // The onclick handler adds the `reply-highlight` class to the target
-    // message after scrolling; pressing Enter/Space on the focused strip
-    // must do the same (Space needs preventDefault to stop the page from
-    // scrolling).
-    await replyStrip.focus();
-    await page.keyboard.press("Enter");
-
-    // Wait for the highlight class to appear on any `[id^='msg-']` element.
-    await expect
-      .poll(async () =>
-        page.locator("[id^='msg-'].reply-highlight").count()
-      )
-      .toBeGreaterThan(0);
   });
 });
 
@@ -660,15 +602,15 @@ test.describe("Auto-scroll to bottom on refresh", () => {
 });
 
 // Mobile self-message overflow: a SELF (right-aligned) bubble must stay fully
-// within a narrow viewport. Regression: a self reply whose reply-strip preview
-// held a long unbreakable URL rendered nowrap, driving the bubble to its full
-// `max-w-prose` (65ch) width. As a non-stretched flex item under the self
-// bubbles wrapper's `items-end`, that wrapper sized to the bubble's content and
-// escaped the `max-w-[75%]` column, so the bubble spilled off BOTH edges of a
-// 375px screen (clipped, message text cut off left and right), exactly the
-// "text going off the edge" report. Received (left-aligned) bubbles were fine
-// because their wrapper is a plain block that already fills the column. Fixed
-// by `min-w-0 max-w-full` on the per-message wrapper (conversation.rs). The
+// within a narrow viewport. Regression: a self reply whose reply-strip preview held
+// a long unbreakable URL rendered nowrap, driving the bubble to its full
+// `max-w-prose` (65ch) width. As a non-stretched flex item under the self bubbles
+// wrapper's `items-end`, that wrapper sized to the bubble's content and escaped the
+// old `max-w-[75%]` column, so the bubble spilled off BOTH edges of a 375px screen
+// (clipped, message text cut off left and right), exactly the "text going off the
+// edge" report. Received (left-aligned) bubbles were fine because their wrapper is
+// a plain block that already fills the column. Fixed then by `min-w-0 max-w-full`
+// on the content wrapper; today the wrapper is `.msg-body`, capped in main.css. The
 // example data carries a self reply to the long-URL message so this reproduces.
 test.describe("Self message bubble mobile overflow", () => {
   test.use({ viewport: { width: 375, height: 667 } });

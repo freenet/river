@@ -19,8 +19,8 @@
 //! `main.css` forces it fully visible with a 44px tap target, because
 //! the `group-hover` reveal Tailwind emits is itself wrapped in
 //! `@media (hover: hover)` and can never fire there. This mirrors the
-//! `.hover-actions` / `.touch-actions` split #402 introduced for the
-//! message action bar. Archived threads stay out of the rail until
+//! touch reveal of the message buttons (`.msg-action-btn`, #402).
+//! Archived threads stay out of the rail until
 //! either side sends a new DM. The "Archived (N)" link at the bottom of
 //! the section lists currently-archived threads and offers per-row
 //! Un-archive, closing #266.
@@ -2298,7 +2298,7 @@ mod tests {
     /// inside a POINTER-CAPABILITY media query, and widen the row padding.
     ///
     /// The containment check is a brace scan, not a prefix search. `main.css`
-    /// already opens a touch media query for the #402 message-action bar well
+    /// already opens touch media queries (the "+" and the message buttons) well
     /// above this rule, so "some `@media` opens somewhere earlier in the file"
     /// is satisfied by ANY placement below it — including moving the rule out
     /// to top level, which would force the ✕ permanently visible on a
@@ -2355,9 +2355,9 @@ mod tests {
              another device class"
         );
 
-        // Slice by CHAR boundary, not byte arithmetic: main.css contains ✕, —
-        // and ⋮ in its comments, so a fixed byte window can land mid-codepoint
-        // and panic with an error that looks nothing like the real failure.
+        // Slice by CHAR boundary, not byte arithmetic: main.css contains ✕ and —
+        // in its comments, so a fixed byte window can land mid-codepoint and
+        // panic with an error that looks nothing like the real failure.
         let rule = MAIN_CSS[idx..]
             .split_once('}')
             .map(|(head, _)| head)

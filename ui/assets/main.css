@@ -1,3 +1,5 @@
+/* Unlayered: every rule in this file beats Tailwind's layered utilities, whatever their specificity. */
+
 /* Reaction button hover visibility */
 .add-reaction-btn {
     opacity: 0;
@@ -21,8 +23,29 @@
     opacity: 0.4;
 }
 
-/* Touch reveal for the inline add-reaction "+" button (same failure mode as
- * #402/#462 above): `.add-reaction-btn` reveals via `.group:hover`, a real
+/* Keep a row's "+" shown while its picker is open. */
+.add-reaction-btn[aria-expanded="true"] {
+    opacity: 0.4;
+}
+
+/* Tailwind's reset zeroes the popover's UA auto margin, which pinned the picker to the top left; centre it again. */
+#reaction-picker {
+    margin: auto;
+}
+
+/* Anchored beside its "+", flipped to stay on screen; centred where anchor positioning is missing. No @starting-style: WebKit 317926. */
+@supports (position-area: block-end) {
+    #reaction-picker {
+        /* Otherwise a "+" near the screen edge squeezes the picker into the sliver beside it, and it never flips. */
+        width: max-content;
+        margin: 0.25rem 0;
+        position-area: block-end span-inline-end;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    }
+}
+
+/* Touch reveal for the inline add-reaction "+" button (the failure mode of
+ * #402 and #462): `.add-reaction-btn` reveals via `.group:hover`, a real
  * CSS `:hover`, which touch devices can't reliably trigger — so on a phone
  * the button was invisible (opacity: 0) yet still tappable, unless the
  * message already had reactions (`.has-reactions` gives it opacity: 0.2 at
@@ -30,7 +53,7 @@
  * reaction-less messages.
  *
  * Gate on pointer CAPABILITY, not viewport width — see the #462 comment
- * above for why `(hover: none), (any-pointer: coarse)` is the correct query
+ * below for why `(hover: none), (any-pointer: coarse)` is the correct query
  * (`any-pointer: coarse` also catches a touchscreen laptop, which reports
  * `hover: hover` while a finger is on the glass).
  *
@@ -40,11 +63,8 @@
  * which reads as "the composer now takes up more room" — a real visible
  * regression, not just a WCAG nice-to-have. This button is also a
  * lower-stakes target than the DM-archive ✕ (a mis-tap just opens the
- * emoji picker, not a destructive action) and touch users have a second
- * path to the same action via the message kebab menu's "React" entry
- * (`conversation.rs`, `.touch-actions`) — a full menu row, comfortably
- * above the WCAG 2.5.8 AA 24px floor though still short of the 44px AAA
- * target itself. So: fix visibility only, leave sizing alone. */
+ * emoji picker, not a destructive action). So: fix visibility only, leave
+ * sizing alone. */
 @media (hover: none), (any-pointer: coarse) {
     .add-reaction-btn {
         opacity: 0.4;
@@ -52,6 +72,95 @@
 
     .add-reaction-btn.has-reactions {
         opacity: 0.4;
+    }
+}
+
+/* Reply, edit and delete stay hidden until their row is hovered or holds keyboard focus. */
+.msg-action-btn {
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.msg-row:is(:hover, :has(:focus-visible)) .msg-action-btn {
+    opacity: 0.4;
+}
+
+.msg-row:is(:hover, :has(:focus-visible)) .msg-action-btn:is(:hover, :focus-visible) {
+    opacity: 0.7;
+}
+
+/* Touch can't hover: always shown, with a 26x28 hit area that takes no layout space (WCAG 2.5.8). */
+@media (hover: none), (any-pointer: coarse) {
+    .msg-action-btn {
+        opacity: 0.4;
+        position: relative;
+    }
+
+    .msg-action-btn::after {
+        content: "";
+        position: absolute;
+        inset: -4px -6px;
+    }
+}
+
+/* Width caps are a share of the group's column. Never on #chat-content: WebKit 307984 blanks the room list after a resize. */
+.msg-bubbles {
+    container-type: inline-size;
+}
+
+/* One radius on every corner, grouped or not: a smaller corner toward a neighbour reads as one that failed to round. */
+.msg-bubble {
+    max-width: min(65ch, 75cqi);
+    border-radius: 1rem;
+}
+
+.msg-group-header {
+    max-width: 75cqi;
+}
+
+/* Reactions widen a bubble up to here, then wrap; the gutter keeps max(15%, 3.5rem). */
+.msg-body {
+    max-width: min(85cqi, calc(100cqi - 3.5rem));
+}
+
+/* Engines without container units drop the cqi caps; these % caps stand in. */
+@supports not (width: 1cqi) {
+    .msg-group-header {
+        max-width: 75%;
+    }
+
+    .msg-body {
+        max-width: min(85%, calc(100% - 3.5rem));
+    }
+}
+
+.msg-edit-form {
+    max-width: min(550px, 75cqi);
+}
+
+/* Rows bleed 8px into the column gutter so the band has room: 8px around a group, 2px between its rows. */
+.msg-row {
+    margin-inline: -0.5rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.5rem;
+    transition: background-color 0.15s;
+    scroll-margin-block: 0.75rem; /* room above/below a reply jump */
+}
+
+.msg-row:first-child {
+    padding-top: 0.5rem;
+}
+
+.msg-row:last-child {
+    padding-bottom: 0.5rem;
+}
+
+/* The complement of the touch rules' query: a touchscreen laptop gets no band. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
+    /* The band also stays while a popover the row opened (the reaction picker) is showing. */
+    .msg-row:hover,
+    .msg-row:has([aria-expanded="true"]) {
+        background-color: var(--color-row-hover);
     }
 }
 
@@ -108,81 +217,23 @@
     outline-color: #fff;
 }
 
-/* Reply highlight animation (when clicking "scroll to original") */
-.reply-highlight {
-    animation: replyHighlight 2s ease-out;
-}
-
-@keyframes replyHighlight {
-    0% { background-color: rgba(59, 130, 246, 0.2); }
-    100% { background-color: transparent; }
-}
-
-/* Reply strip text truncation. The strip lives inside the message bubble
- * and always shows a single ellipsized line; on devices with a real pointer
- * (mouse) it expands to full text on hover. Touch devices skip the hover
- * expansion because (a) they have no reliable hover state and (b) tapping
- * the strip already scrolls to the quoted original message. */
+/* Reply strip: always one ellipsized line. */
 .reply-strip {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-@media (hover: hover) and (pointer: fine) {
-    .reply-strip:hover {
-        white-space: normal;
-        text-overflow: clip;
-    }
-}
-
-/* Keyboard users get the same full-preview expansion via focus-visible,
- * on all devices (not just those with a pointer). The strip is reachable
- * with Tab because it has role="button" and tabindex="0". */
+/* Inset: the bubble's overflow-hidden clips an outline drawn outside it. */
 .reply-strip:focus-visible {
-    white-space: normal;
-    text-overflow: clip;
     outline: 2px solid currentColor;
-    outline-offset: 1px;
-}
-
-/* Touch-only message action affordance (freenet/river#402).
- *
- * The per-message hover action bar (reply / edit / delete) is built with
- * Tailwind `group-hover:` utilities, which Tailwind v4 automatically wraps in
- * `@media (hover: hover)`. On a touch device (phone, tablet) there is no hover
- * pointer, so that bar can NEVER become visible and touch users have no way to
- * reach reply / edit / delete / react.
- *
- * `.touch-actions` is the exact complement: hidden by default (so mouse users
- * keep the clean hover-reveal desktop UI) and shown only where `hover: none`
- * matches — i.e. precisely the devices where the hover bar cannot appear. It
- * decorates the always-visible kebab (⋮) button that opens the touch action
- * menu. */
-.touch-actions {
-    display: none;
-}
-
-@media (hover: none) {
-    .touch-actions {
-        display: flex;
-    }
-
-    /* The hover action bar (reply/edit/delete) is opacity-0 until hovered, but
-     * an opacity-0 element still captures taps. On a touch device (no hover) it
-     * can never become visible, so make it non-interactive there; otherwise a
-     * tap on the gutter where it sits would fire an invisible reply/edit/delete.
-     * Left interactive on desktop (@media hover:hover) so slow mouse travel
-     * across the gap to the bar still works. (#402) */
-    .hover-actions {
-        pointer-events: none;
-    }
+    outline-offset: -2px;
 }
 
 /* DM-rail Archive ✕ — touch reveal (freenet/river#462).
  *
- * Same failure mode as #402 above: the archive button in the Direct Messages
- * rail (`dm_rail_section.rs`) is `opacity-0` and reveals via Tailwind
+ * The archive button in the Direct Messages rail (`dm_rail_section.rs`) is
+ * `opacity-0` and reveals via Tailwind
  * `group-hover:opacity-100`, which Tailwind v4 wraps in `@media (hover: hover)`.
  * On a touch device that reveal can never fire, so before this rule the button
  * was invisible on phones and — because it is `opacity-0` yet still

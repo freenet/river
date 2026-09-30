@@ -478,13 +478,52 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     );
   });
 
+  // The reflow test above only trips on some font stacks (Linux CI's, not
+  // macOS's): Chromium clamps scrollTop partway through the reflow, then the
+  // history comes out taller. This makes the same clamp happen on every engine.
+  test("follows a reflow that clamped the view on its way to a taller history", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    // Let our own snap settle, so nothing re-records the mark after the clamp.
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => {
+          const c = document.getElementById("chat-scroll-container")!;
+          let t = setTimeout(resolve, 300);
+          c.addEventListener("scrollend", () => {
+            clearTimeout(t);
+            t = setTimeout(resolve, 100);
+          });
+        })
+    );
+    const clamp = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const content = document.getElementById("chat-content")!;
+      const rows = c.querySelectorAll('[data-testid="conversation-history"] > *');
+      const newest = rows[rows.length - 1] as HTMLElement;
+      const before = c.scrollTop;
+      // Short, clamped, then rewrapped taller: all inside one task.
+      newest.style.display = "none";
+      const clamped = c.scrollTop;
+      newest.style.display = "";
+      content.style.maxWidth = `${content.clientWidth - 120}px`;
+      return before - clamped;
+    });
+    expect(clamp, "premise: hiding the newest row must clamp the view").toBeGreaterThan(
+      AT_BOTTOM_EPSILON_PX
+    );
+    await expectSettledAtBottom(page, "the reflow's own clamp was read as the reader scrolling up");
+  });
+
   test("does not drag a parked reader down when a resize reflows the history", async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
 
-    await readerScrollsTo(page, 0);
+    // Settled first: offsets don't compare across a rewrap, so a scroll still unsettled when the width changes is followed.
+    await readerScrollsWithoutGesture(page, 0);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);

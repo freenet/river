@@ -52,19 +52,12 @@ export async function openRoomWithComposer(page: Page) {
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
 
-// The edit form on the first own (accent) message: its kebab on touch, its hover
-// actions otherwise (freenet/river#402). Returns the edit textarea.
+// Opens the first own message's edit form; returns its textarea.
 export async function openOwnMessageEdit(page: Page): Promise<Locator> {
-  const ownRow = page.locator('[id^="msg-"]:has(.bg-accent)').first();
+  const ownRow = page.locator('[data-self="true"] [id^="msg-"]').first();
   await expect(ownRow).toBeVisible();
   await ownRow.scrollIntoViewIfNeeded();
-  if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
-    await ownRow.getByTestId("message-kebab").click();
-    await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
-  } else {
-    await ownRow.getByTestId("message-bubble").hover();
-    await ownRow.getByRole("button", { name: /edit/i }).click();
-  }
+  await ownRow.getByTestId("message-edit-button").click();
   const editArea = page.locator('textarea[id^="edit-msg-"]');
   await expect(editArea).toBeVisible({ timeout: 5_000 });
   return editArea;
@@ -86,3 +79,11 @@ export function resolveColor(page: Page, css: string): Promise<number[]> {
     return [r, g, b, a / 255];
   }, css);
 }
+
+export async function computedColor(el: Locator, prop: "color" | "backgroundColor" = "color") {
+  return resolveColor(el.page(), await el.evaluate((e, p) => getComputedStyle(e)[p], prop));
+}
+
+// The same query as main.css's touch blocks.
+export const isCoarsePointer = (page: Page) =>
+  page.evaluate(() => matchMedia("(hover: none), (any-pointer: coarse)").matches);

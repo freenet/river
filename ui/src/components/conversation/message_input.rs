@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 
 use super::emoji_picker::EmojiPicker;
+use super::inline_icons::ReplyIcon;
 use super::mention::{
     apply_mention_selection, handle_mention_keydown, update_mention_from_input,
     MentionAutocomplete, MentionDropdown,
@@ -151,7 +152,7 @@ fn computed_style(el: &web_sys::Element, prop: &str) -> Option<String> {
         .ok()
 }
 
-fn get_message_textarea() -> Option<web_sys::HtmlTextAreaElement> {
+pub(super) fn get_message_textarea() -> Option<web_sys::HtmlTextAreaElement> {
     web_sys::window()?
         .document()?
         .get_element_by_id("message-input")?
@@ -245,7 +246,7 @@ pub fn MessageInput(
                         rsx! {
                             div { class: "flex items-center gap-2 mb-2 px-3 py-1.5 bg-surface border-l-2 border-accent rounded text-sm text-text-muted",
                                 span { class: "flex-1 truncate",
-                                    span { class: "font-medium", "\u{21a9} @{author}: " }
+                                    span { class: "font-medium", ReplyIcon {} " @{author}: " }
                                     "{preview}"
                                 }
                                 button {
