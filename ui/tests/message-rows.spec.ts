@@ -21,6 +21,8 @@ test("hovering a group's author header lights its whole first row, and the band 
   const historyBox = (await page.getByTestId("conversation-history").boundingBox())!;
   expect(rowBox.x).toBeLessThanOrEqual(historyBox.x);
   expect(rowBox.x + rowBox.width).toBeGreaterThanOrEqual(historyBox.x + historyBox.width);
+  // Rows bleed 8px into the gutter by design; nothing may overflow the scroller.
+  expect(await page.evaluate(() => { const c = document.getElementById("chat-scroll-container")!; return c.scrollWidth - c.clientWidth; })).toBeLessThanOrEqual(0);
 
   // The picker is not inside the row, so moving away ends the hover: the open picker's "+" keeps the band.
   await row.getByTestId("add-reaction-button").click();

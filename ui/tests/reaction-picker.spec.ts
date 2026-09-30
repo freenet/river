@@ -41,7 +41,7 @@ async function openFrom(page: Page, plus: Locator) {
   await expect(page.locator(PICKER)).toBeVisible();
 }
 
-/** Where the open picker sits, and whether anything paints over any part of it. */
+/** Whatever paints over any part of the open picker. */
 const pickerLayout = (page: Page) =>
   page.evaluate((sel) => {
     const p = document.querySelector(sel)!;
@@ -65,7 +65,7 @@ const pickerLayout = (page: Page) =>
       .map((hit) =>
         hit ? `${hit.tagName.toLowerCase()}[${(hit as HTMLElement).dataset.testid ?? ""}]` : "nothing"
       );
-    return { bottom: r.bottom, viewportHeight: window.innerHeight, covered };
+    return { covered };
   }, PICKER);
 
 test("Escape closes it", async ({ page }) => {
@@ -100,6 +100,20 @@ test("picking an emoji reacts to that message and closes the picker", async ({ p
   await expect(row.locator(CHIP)).toHaveCount(1);
 });
 
+test("switching rooms closes it", async ({ page }) => {
+  await openFrom(page, await middlePlus(page));
+  // By keyboard: a click outside would light-dismiss the picker before the room changes.
+  const room = page.getByTestId("room-list").getByRole("button", { name: "Team Chat Room" });
+  if (!(await room.isVisible())) {
+    await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).focus();
+    await page.keyboard.press("Enter");
+  }
+  await room.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("heading", { name: "Team Chat Room" })).toBeVisible();
+  await expect(page.locator(PICKER)).toBeHidden();
+});
+
 test.describe("on a short landscape screen", () => {
   // A phone held sideways: the history is ~250px tall between header and composer.
   test.use({ viewport: { width: 844, height: 390 } });
@@ -111,7 +125,6 @@ test.describe("on a short landscape screen", () => {
     await openFrom(page, plus);
     const l = await pickerLayout(page);
     expect(l.covered, "something paints over the picker").toEqual([]);
-    expect(l.bottom).toBeLessThanOrEqual(l.viewportHeight + 1);
   });
 
   test("opens beside the + that opened it, flipped to stay on screen", async ({ page }) => {
@@ -126,5 +139,7 @@ test.describe("on a short landscape screen", () => {
     const above = b.y >= p.y + p.height - 1 && b.y - (p.y + p.height) <= 8;
     expect(below || above, `picker y ${p.y}..${p.y + p.height} vs + y ${b.y}..${b.y + b.height}`).toBe(true);
     expect(p.x <= b.x + b.width && p.x + p.width >= b.x, `picker x ${p.x}..${p.x + p.width} vs + x ${b.x}..${b.x + b.width}`).toBe(true);
+    expect(p.y).toBeGreaterThanOrEqual(0);
+    expect(p.y + p.height).toBeLessThanOrEqual(390 + 1);
   });
 });

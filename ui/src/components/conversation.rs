@@ -52,7 +52,6 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys;
 
@@ -1904,12 +1903,20 @@ fn first_history_row_identity() -> Option<(String, i32)> {
 #[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
-/// Both edges of the view as last accounted for; see `reader_moved_up_since`.
+/// Both edges of the view as last accounted for, and the width the history was
+/// laid out at then; see `reader_moved_up_since`.
 #[cfg(target_arch = "wasm32")]
 #[derive(Default)]
 struct ScrollMark {
     top: std::cell::Cell<i32>,
     height: std::cell::Cell<i32>,
+    width: std::cell::Cell<i32>,
+}
+
+/// The width the history's text wraps at. Offsets only compare within one.
+#[cfg(target_arch = "wasm32")]
+fn history_layout_width() -> i32 {
+    chat_content_wrapper().map_or(0, |c| c.client_width())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1923,6 +1930,11 @@ impl ScrollMark {
     fn record(&self, top: i32, height: i32) {
         self.top.set(top);
         self.height.set(height);
+        self.width.set(history_layout_width());
+    }
+    /// The history has been rewrapped since the mark was taken.
+    fn rewrapped(&self) -> bool {
+        self.width.get() != history_layout_width()
     }
     /// Content above the view moved by `delta`, which moves both edges.
     fn shift(&self, delta: i32) {
@@ -1960,6 +1972,13 @@ fn reader_moved_up_since(last_top: &Rc<ScrollMark>) -> bool {
     let Some(container) = chat_scroll_container() else {
         return false;
     };
+    // Offsets from before a rewrap say nothing about the view after it, and
+    // the rewrap can clamp `scrollTop` partway through before the history comes
+    // out taller: Chromium does, with a size container in the history (8px on
+    // Linux fonts), leaving both edges above the mark and no `scrollend` coming.
+    if last_top.rewrapped() {
+        return false;
+    }
     let top = container.scroll_top();
     let bottom = top + container.client_height();
     // Never judge against an edge the container can no longer reach: if the
@@ -2065,6 +2084,7 @@ fn install_scroll_pin_listeners(
                 return;
             };
             let settled_at = container.scroll_top();
+            let rewrapped = last_top.rewrapped();
             let ours = (settled_at - last_top.top()).abs() <= SCROLL_TOP_SLACK_PX;
             // Where the view ended up is a fact whoever caused it, and it is
             // what everything else compares against. Recorded before the
@@ -2135,7 +2155,10 @@ fn install_scroll_pin_listeners(
             if ours {
                 return;
             }
-            pinned.set(distance <= BOTTOM_THRESHOLD_PX);
+            // A settle across a rewrap can't be placed against the mark, and
+            // WebKit settles the rewrap's own clamp: it may arm the pin, never
+            // clear it.
+            pinned.set(distance <= BOTTOM_THRESHOLD_PX || (rewrapped && pinned.get()));
         }) as Box<dyn FnMut()>)
     };
     let settle_fn: js_sys::Function = settle.as_ref().unchecked_ref::<js_sys::Function>().clone();
@@ -2505,6 +2528,13 @@ pub fn Conversation() -> Element {
         });
     }
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
+    // Start a reply and focus the composer.
+    let on_reply_ctx = move |ctx: ReplyContext| {
+        replying_to.set(Some(ctx));
+        if let Some(el) = message_input::get_message_textarea() {
+            let _ = el.focus();
+        }
+    };
     let picker_target: Signal<Option<PickerTarget>> = use_signal(|| None);
 
     // State for delete confirmation modal
@@ -4324,18 +4354,7 @@ pub fn Conversation() -> Element {
                                                                 on_edit: move |(msg_id, new_text)| {
                                                                     handle_edit_message(msg_id, new_text);
                                                                 },
-                                                                on_reply: move |ctx: ReplyContext| {
-                                                                    replying_to.set(Some(ctx));
-                                                                    if let Some(window) = web_sys::window() {
-                                                                        if let Some(doc) = window.document() {
-                                                                            if let Some(el) = doc.get_element_by_id("message-input") {
-                                                                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                                                                    let _ = el.focus();
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                },
+                                                                on_reply: on_reply_ctx,
                                                                 picker_target: picker_target,
                                                                 }
                                                             }
@@ -4408,12 +4427,10 @@ pub fn Conversation() -> Element {
                 }
             }
 
-            // Top layer, so where it sits in the DOM does not matter.
-            if current_room_data.is_some() {
-                ReactionPicker {
-                    target: picker_target,
-                    on_react: move |(id, emoji)| handle_toggle_reaction(id, emoji),
-                }
+            // The one reaction picker; every "+" opens it (top layer, so DOM position is irrelevant).
+            ReactionPicker {
+                target: picker_target,
+                on_react: move |(id, emoji): (MessageId, String)| handle_toggle_reaction(id, emoji),
             }
 
             // Message input or status
@@ -4900,9 +4917,9 @@ fn MessageGroupComponent(
                                 }
                             }
                         }
-                        // Content-sized: the bubble spans its reaction row, past its own cap if need be (min-w-full).
+                        // Content-sized up to .msg-body's cap: reactions widen the bubble to it (min-w-full), then wrap.
                         div {
-                            class: "flex flex-col min-w-0 max-w-full",
+                            class: "msg-body flex flex-col min-w-0",
                             // Message bubble (or edit form if editing)
                             {
                                 let is_editing = editing_message.read().as_ref() == Some(&msg.id);
@@ -5040,7 +5057,6 @@ fn MessageGroupComponent(
                                                         }
                                                     }
                                                     div { class: "flex justify-end gap-3 mt-3",
-                                                        style: "overflow: visible;",
                                                         button {
                                                             class: if is_self {
                                                                 "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"

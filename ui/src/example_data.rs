@@ -577,6 +577,12 @@ fn add_example_messages(
         current_time_ms += (rand::random::<u64>() % 870 + 30) * 1000;
     }
 
+    // Short messages that get a large pile of reactions below: the deputy's
+    // (always received) and the owner's welcome (self in owner-rooms, received
+    // otherwise), so both bubble alignments carry a reaction row wider than
+    // the column.
+    let mut pile_up_targets: Vec<MessageId> = Vec::new();
+
     // One guaranteed message from the owner-appointed deputy, so the
     // conversation always has an author line carrying the 🛡 badge. The random
     // loop above may or may not pick them.
@@ -592,6 +598,7 @@ fn add_example_messages(
             },
             deputy_key,
         );
+        pile_up_targets.push(msg.id());
         messages.messages.push(msg);
         current_time_ms += 60_000;
     }
@@ -631,6 +638,7 @@ fn add_example_messages(
             },
             owner_key,
         );
+        pile_up_targets.push(msg.id());
         messages.messages.push(msg);
         current_time_ms += 60_000;
     }
@@ -739,8 +747,8 @@ fn add_example_messages(
     // width cap. On a self (right-aligned) message that used to
     // overflow the viewport on narrow mobile screens, clipping the bubble off
     // both edges. Kept in example data so the mobile-overflow Playwright
-    // regression test has a self bubble that WOULD overflow without the
-    // per-message width clamp.
+    // regression test has a self bubble that WOULD overflow without
+    // `.msg-body`'s width cap.
     if let Some(long_url_msg) = messages.messages.last().cloned() {
         let target_id = long_url_msg.id();
         let target_author_id = long_url_msg.message.author;
@@ -812,6 +820,26 @@ fn add_example_messages(
         let msg_id = non_owner_messages[1].id();
         let mut reactions = HashMap::new();
         reactions.insert("🎉".to_string(), vec![*owner_id]);
+        messages.actions_state.reactions.insert(msg_id, reactions);
+    }
+
+    // A pile of distinct reactions on each short target, each from reactors
+    // unique to that message (one reaction per user per message). Reactors
+    // are fresh identities outside the member list, so the member list and
+    // its specs are unchanged; their tooltip names read "Unknown".
+    const PILE_EMOJIS: [&str; 24] = [
+        "👍", "❤️", "😂", "🎉", "🔥", "👀", "🙏", "💯", "🚀", "😮", "😢", "🤔", "👏", "✅", "🙌",
+        "💡", "😍", "🤝", "⭐", "🍕", "🌈", "🐢", "🎸", "🧠",
+    ];
+    for msg_id in pile_up_targets {
+        let mut reactions: HashMap<String, Vec<MemberId>> = HashMap::new();
+        for (i, emoji) in PILE_EMOJIS.iter().enumerate() {
+            // Counts 1..=5 so some chips carry a number and are wider.
+            let reactors = (0..(i % 5) + 1)
+                .map(|_| MemberId::from(&SigningKey::generate(&mut OsRng).verifying_key()))
+                .collect();
+            reactions.insert(emoji.to_string(), reactors);
+        }
         messages.actions_state.reactions.insert(msg_id, reactions);
     }
 

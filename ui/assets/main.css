@@ -36,6 +36,8 @@
 /* Anchored beside its "+", flipped to stay on screen; centred where anchor positioning is missing. No @starting-style: WebKit 317926. */
 @supports (position-area: block-end) {
     #reaction-picker {
+        /* Otherwise a "+" near the screen edge squeezes the picker into the sliver beside it, and it never flips. */
+        width: max-content;
         margin: 0.25rem 0;
         position-area: block-end span-inline-end;
         position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
@@ -116,6 +118,22 @@
     max-width: 75cqi;
 }
 
+/* Reactions widen a bubble up to here, then wrap; the gutter keeps max(15%, 3.5rem). */
+.msg-body {
+    max-width: min(85cqi, calc(100cqi - 3.5rem));
+}
+
+/* Engines without container units drop the cqi caps; these % caps stand in. */
+@supports not (width: 1cqi) {
+    .msg-group-header {
+        max-width: 75%;
+    }
+
+    .msg-body {
+        max-width: min(85%, calc(100% - 3.5rem));
+    }
+}
+
 .msg-edit-form {
     max-width: min(550px, 75cqi);
 }
@@ -137,7 +155,8 @@
     padding-bottom: 0.5rem;
 }
 
-@media (hover: hover) {
+/* The complement of the touch rules' query: a touchscreen laptop gets no band. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
     /* The band also stays while a popover the row opened (the reaction picker) is showing. */
     .msg-row:hover,
     .msg-row:has([aria-expanded="true"]) {

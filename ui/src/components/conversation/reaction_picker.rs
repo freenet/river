@@ -23,22 +23,23 @@ pub(super) struct PickerTarget {
     current: Option<String>,
 }
 
-fn picker_element() -> Option<web_sys::HtmlElement> {
+/// The picker, if it is showing; the DOM owns that state.
+fn open_picker() -> Option<web_sys::HtmlElement> {
     web_sys::window()?
         .document()?
         .get_element_by_id(REACTION_PICKER_ID)?
-        .dyn_into()
+        .dyn_into::<web_sys::HtmlElement>()
         .ok()
+        .filter(|el| el.matches(":popover-open").unwrap_or(false))
 }
 
-/// Whether the picker is showing, read from the DOM, which owns that state.
 fn picker_is_open() -> bool {
-    picker_element().is_some_and(|el| el.matches(":popover-open").unwrap_or(false))
+    open_picker().is_some()
 }
 
-/// Close the picker (a no-op when closed); its `toggle` handler clears the target. A DOM call, not a signal write.
+/// Close the picker if it is open; its `toggle` handler then clears the target. A DOM call, not a signal write.
 pub(super) fn close_reaction_picker() {
-    if let Some(el) = picker_element() {
+    if let Some(el) = open_picker() {
         let _ = el.hide_popover();
     }
 }

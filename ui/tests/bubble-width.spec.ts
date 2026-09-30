@@ -11,10 +11,6 @@ async function openRoom(page: Page, width: number) {
 
 async function measure(page: Page) {
   return page.evaluate(() => {
-    const content = document.getElementById("chat-content")!;
-    const cs = getComputedStyle(content);
-    const column =
-      content.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
     const all = [...document.querySelectorAll('[data-testid="message-bubble"]')];
     // `ch` in the bubble's own font.
     const probe = document.createElement("div");
@@ -22,46 +18,63 @@ async function measure(page: Page) {
     all[0].appendChild(probe);
     const ch65 = probe.getBoundingClientRect().width;
     probe.remove();
-    return {
-      cap: Math.min(ch65, column * 0.75),
-      widths: all.map((b) => b.getBoundingClientRect().width),
-    };
+    return all.map((b) => {
+      // `cqi` resolves against the group's .msg-bubbles size container, its content box.
+      const box = b.closest(".msg-bubbles")!;
+      const cs = getComputedStyle(box);
+      const column = box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      return {
+        w: b.getBoundingClientRect().width,
+        cap: Math.min(ch65, column * 0.75),
+        chips: b.closest('[id^="msg-"]')!.querySelectorAll('[data-testid="reaction-chip"]').length,
+      };
+    });
   });
 }
 
 for (const width of [1440, 320]) {
-  test(`bubbles are capped at min(65ch, 75% of the column) @ ${width}px`, async ({ page }) => {
+  test(`bubbles are capped at min(65ch, 75% of the column) @ ${width}px`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name.startsWith("mobile-"), "sets its own viewport, so it would repeat chromium and webkit");
     await openRoom(page, width);
+    // Reactions may widen a bubble past the cap (up to .msg-body's); nothing else may.
     await expect
       .poll(async () => {
-        const m = await measure(page);
-        return m.widths.some((w) => Math.abs(w - m.cap) <= 1);
-      }, { message: "some bubble should sit at the cap" })
+        const free = (await measure(page)).filter((b) => b.chips === 0);
+        return free.length ? Math.max(...free.map((b) => b.w - b.cap)) : Infinity;
+      }, { message: "no bubble without reactions may pass the cap" })
+      .toBeLessThanOrEqual(1);
+    await expect
+      .poll(async () => {
+        const free = (await measure(page)).filter((b) => b.chips === 0);
+        return free.some((b) => b.w >= 0.9 * b.cap);
+      }, { message: "some bubble should reach the cap" })
       .toBe(true);
   });
 }
 
-test("a reaction row wider than its message widens the bubble", { tag: "@chromium-only" }, async ({
-  page,
-}) => {
-  await page.goto("/");
-  await waitForApp(page);
-  await openRoomWithComposer(page);
-
-  const input = page.getByTestId("message-input");
-  await input.fill("k");
-  await input.press("Enter");
-
-  const bubble = page.getByTestId("message-bubble").filter({ hasText: /^\s*k\s*$/ }).last();
-  await expect(bubble).toBeVisible();
-  const row = bubble.locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]");
-  await row.getByTestId("add-reaction-button").click();
-  await page.getByTestId("emoji-picker").getByRole("button").first().click();
-  await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
-
-  const bubbleBox = (await bubble.boundingBox())!;
-  const rowBox = (await row.getByTestId("message-reaction-row").boundingBox())!;
-  expect(bubbleBox.width, "the bubble widens to its reaction row").toBeGreaterThanOrEqual(
-    rowBox.width - 1
-  );
-});
+for (const width of [1280, 320]) {
+  test(`action controls stay in the column under a pile of reactions @ ${width}px`, async ({
+    page,
+  }) => {
+    await openRoom(page, width);
+    const scroller = (await page.locator("#chat-scroll-container").boundingBox())!;
+    // Received (left-aligned) and own (right-aligned); example data piles 24 chips on each.
+    for (const text of [/keep it civil/, /welcome/]) {
+      const row = page
+        .locator('[id^="msg-"]')
+        .filter({ has: page.getByTestId("message-bubble").filter({ hasText: text }) });
+      await expect(row.getByTestId("reaction-chip")).toHaveCount(24);
+      const bubbleBox = (await row.getByTestId("message-bubble").boundingBox())!;
+      const reactionBox = (await row.getByTestId("message-reaction-row").boundingBox())!;
+      expect(bubbleBox.width, `${text}: the bubble spans its reaction row`).toBeGreaterThanOrEqual(
+        reactionBox.width - 1
+      );
+      const control = row.getByTestId("message-action-cluster");
+      const box = (await control.boundingBox())!;
+      expect(box.x, `${text} control's left edge`).toBeGreaterThanOrEqual(scroller.x);
+      expect(box.x + box.width, `${text} control's right edge`).toBeLessThanOrEqual(
+        scroller.x + scroller.width
+      );
+    }
+  });
+}
