@@ -1605,13 +1605,44 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
         let run_end = (k..folded.len())
             .find(|&e| folded[e].is_ascii())
             .unwrap_or(folded.len());
-        let flanked = k > 0
+        let between_alnum = k > 0
             && folded[k - 1].is_ascii_alphanumeric()
             && folded
                 .get(run_end)
-                .is_some_and(|n| n.is_ascii_alphanumeric())
-            && run_end - k <= 8
-            && folded[k..run_end].iter().all(|&c| joinable(c));
+                .is_some_and(|n| n.is_ascii_alphanumeric());
+        // Nonspacing marks stack on the previous letter, so they do not count
+        // towards the run cap (nine stacked points look like one).
+        let is_mark = |c: char| {
+            matches!(u32::from(c),
+                0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05C7 | 0x0610..=0x061A
+                | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06ED | 0x0900..=0x0903
+                | 0x093A..=0x094F | 0x0951..=0x0957 | 0x0E31 | 0x0E34..=0x0E3A
+                | 0x0E47..=0x0E4E | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF
+                | 0x302A..=0x302F | 0x3099..=0x309A | 0xFE20..=0xFE2F | 0x1D165..=0x1D169
+                | 0x1D16D..=0x1D172 | 0x1D17B..=0x1D182)
+        };
+        let len = folded[k..run_end].iter().filter(|&&c| !is_mark(c)).count();
+        // Thai, Lao, Myanmar and Khmer write words without spaces, so only a
+        // very short run of them (a mark or a stray letter) is part of an id.
+        let no_space_script = folded[k..run_end]
+            .iter()
+            .any(|&c| matches!(u32::from(c), 0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1780..=0x17FF));
+        // A lone letter-like or operator look-alike (`∪` for U, `ℙ` for P,
+        // `ㄚ` for Y) is also part of an id, though its block is excluded.
+        let lone_lookalike = run_end - k == 1
+            && matches!(u32::from(folded[k]),
+                0x20A8                  // ₨ "Rs"
+                | 0x2100..=0x218F       // letterlike symbols, Roman numerals
+                | 0x2200..=0x22FF       // mathematical operators
+                | 0x27C0..=0x27EF       // misc mathematical symbols A
+                | 0x2980..=0x2AFF       // misc mathematical symbols B, operators
+                | 0x2E26
+                | 0x3100..=0x312F); // Bopomofo
+        let flanked = between_alnum
+            && ((len <= 8
+                && !(no_space_script && len > 3)
+                && folded[k..run_end].iter().all(|&c| joinable(c)))
+                || lone_lookalike);
         // Marks sitting on a marker's `:` or `/` (`freenet:\u{05BC}<id>`)
         // are dropped, so the marker still sits right before the id.
         let on_marker = k > 0
@@ -1619,7 +1650,7 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
             && folded
                 .get(run_end)
                 .is_some_and(|n| n.is_ascii_alphanumeric())
-            && run_end - k <= 8
+            && len <= 8
             && folded[k..run_end].iter().all(|&c| joinable(c));
         if flanked {
             text.push(JOINED);
@@ -8312,6 +8343,12 @@ mod tests {
             "freenet:\u{05BC}raAqMhMG".to_string(),
             "freenet:/\u{0E31}raAqMhMG".to_string(),
             "freenet\u{A4FD}raAqMhMG".to_string(),
+            format!("{head}\u{222A}{tail}"),
+            format!("{head}\u{2A2F}{tail}"),
+            format!("{head}\u{311A}{tail}"),
+            format!("{head}{}{tail}", "\u{05BC}".repeat(12)),
+            format!("{head}\u{27D9}{tail}"),
+            format!("freenet:{}\u{2178}GbcW", &SAMPLE_ID_2[..3]),
             "freenet\u{2236}raAqMhMG".to_string(),
         ] {
             let html = message_to_html(&format!("[{label}]({hidden})"));
@@ -8445,6 +8482,7 @@ mod tests {
             "Freenet: Stra\u{00DF}e",
             "Join\u{00A0}the\u{00A0}Freenet\u{00A0}Official\u{00A0}River\u{00A0}Chat\u{00A0}Room",
             "FreenetのRiverでチャット、DeltaでWebサイト、AtlasでHarvest市場",
+            "ติดตั้งFreenetแล้วเปิดRiverและDeltaหรือGhostKeyและHarvestได้เลย",
         ] {
             let html = message_to_html(&format!("[{label}]({href})"));
             assert!(
