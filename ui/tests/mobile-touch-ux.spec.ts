@@ -1,4 +1,4 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect, Locator, Page } from "@playwright/test";
 import { waitForApp, selectRoom } from "./example-room";
 
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
@@ -12,6 +12,23 @@ import { waitForApp, selectRoom } from "./example-room";
 // The kebab is shown only in that case; the hover action bar only otherwise.
 async function isTouchOnly(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none)").matches);
+}
+
+/** An author name (a tap opens the member-info modal), fully on screen and clear of `popover`. */
+async function authorNameClearOf(page: Page, popover: string): Promise<Locator> {
+  await page.evaluate((sel) => {
+    const p = document.querySelector(sel)!.getBoundingClientRect();
+    const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+    const names = [...document.querySelectorAll('[data-testid="message-group-header"] span[title^="Member ID"]')];
+    const clear = names.find((n) => {
+      const r = n.getBoundingClientRect();
+      const onScreen = r.width > 0 && r.top >= s.top && r.bottom <= s.bottom;
+      return onScreen && (r.right < p.left || r.left > p.right || r.bottom < p.top || r.top > p.bottom);
+    });
+    document.querySelectorAll("[data-test-clear-name]").forEach((e) => e.removeAttribute("data-test-clear-name"));
+    clear?.setAttribute("data-test-clear-name", "");
+  }, popover);
+  return page.locator("[data-test-clear-name]");
 }
 
 // The app scrolls to the bottom asynchronously on room entry. Wait for that to
@@ -191,10 +208,11 @@ test.describe("Message action kebab menu (#402.1)", () => {
       );
       expect(hScroll).toBe(false);
 
-      // Dismiss via a far viewport tap before the next iteration.
-      const farX = box && vp && box.x > vp.width / 2 ? 5 : (vp?.width ?? 100) - 5;
-      await page.mouse.click(farX, 5);
+      // Dismiss with a tap on an author name: it closes the menu and does nothing else.
+      await (await authorNameClearOf(page, '[data-testid="message-action-menu"]')).click();
       await expect(menu).toBeHidden();
+      await page.waitForTimeout(300);
+      await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
     }
   });
 

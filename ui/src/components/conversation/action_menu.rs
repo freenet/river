@@ -16,7 +16,7 @@ use wasm_bindgen::JsCast;
 use super::ReplyContext;
 
 /// DOM id of the menu, and the value every kebab names in `popovertarget`.
-const ACTION_MENU_ID: &str = "message-action-menu";
+pub(super) const ACTION_MENU_ID: &str = "message-action-menu";
 
 /// Which message the open menu acts on. Set by the kebab tap, cleared when the menu closes.
 #[derive(Clone, PartialEq)]

@@ -38,6 +38,23 @@ async function openFrom(page: Page, plus: Locator) {
   await expect(page.locator(PICKER)).toBeVisible();
 }
 
+/** An author name (a tap opens the member-info modal), fully on screen and clear of `popover`. */
+async function authorNameClearOf(page: Page, popover: string): Promise<Locator> {
+  await page.evaluate((sel) => {
+    const p = document.querySelector(sel)!.getBoundingClientRect();
+    const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+    const names = [...document.querySelectorAll('[data-testid="message-group-header"] span[title^="Member ID"]')];
+    const clear = names.find((n) => {
+      const r = n.getBoundingClientRect();
+      const onScreen = r.width > 0 && r.top >= s.top && r.bottom <= s.bottom;
+      return onScreen && (r.right < p.left || r.left > p.right || r.bottom < p.top || r.top > p.bottom);
+    });
+    document.querySelectorAll("[data-test-clear-name]").forEach((e) => e.removeAttribute("data-test-clear-name"));
+    clear?.setAttribute("data-test-clear-name", "");
+  }, popover);
+  return page.locator("[data-test-clear-name]");
+}
+
 /** Whatever paints over any part of the open picker. */
 const pickerLayout = (page: Page) =>
   page.evaluate((sel) => {
@@ -156,4 +173,14 @@ test("its panels and buttons are hidden where the Popover API is missing", async
   for (const sel of ["#reaction-picker", "#message-action-menu", ".add-reaction-btn", ".touch-actions"]) {
     expect(hidden).toContain(sel);
   }
+});
+
+test("the tap that closes it does nothing else", async ({ page }) => {
+  await openFrom(page, await middlePlus(page));
+  const name = await authorNameClearOf(page, PICKER);
+  await name.click();
+  await expect(page.locator(PICKER)).toBeHidden();
+  // Light dismiss closed the picker; the same tap must not also open the author's member info.
+  await page.waitForTimeout(300);
+  await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
 });

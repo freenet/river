@@ -27,6 +27,8 @@ mod mention;
 mod message_actions;
 mod message_input;
 mod not_member_notification;
+#[cfg(target_arch = "wasm32")]
+mod popover_guard;
 mod reaction_picker;
 use self::action_menu::{ActionMenu, KebabButton, MenuTarget};
 use self::not_member_notification::NotMemberNotification;
@@ -2261,6 +2263,11 @@ fn NoRoomFooter() -> Element {
 
 #[component]
 pub fn Conversation() -> Element {
+    // Document listeners that keep the picker and menu from acting on taps and focus meant to close them.
+    use_hook(|| {
+        #[cfg(target_arch = "wasm32")]
+        popover_guard::install_popover_guards();
+    });
     let current_room_data = {
         let current_room = CURRENT_ROOM.read();
         if let Some(key) = current_room.owner_key {

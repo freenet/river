@@ -13,7 +13,7 @@ use wasm_bindgen::JsCast;
 use super::emoji_picker::FREQUENT_EMOJIS;
 
 /// DOM id of the picker, and the value every "+" names in `popovertarget`.
-const REACTION_PICKER_ID: &str = "reaction-picker";
+pub(super) const REACTION_PICKER_ID: &str = "reaction-picker";
 
 /// Which message the open picker reacts to. Set by the "+" click, cleared when the picker closes.
 #[derive(Clone)]
