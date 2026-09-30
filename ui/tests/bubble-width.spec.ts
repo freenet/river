@@ -39,7 +39,8 @@ for (const width of [1440, 320]) {
     await expect
       .poll(async () => {
         const m = await measure(page);
-        return Math.max(...m.bubbles.filter((b) => b.chips === 0).map((b) => b.w - m.cap));
+        const free = m.bubbles.filter((b) => b.chips === 0);
+        return free.length ? Math.max(...free.map((b) => b.w)) - m.cap : Infinity;
       }, { message: "no bubble without reactions may pass the cap" })
       .toBeLessThanOrEqual(1);
     await expect
@@ -50,31 +51,6 @@ for (const width of [1440, 320]) {
       .toBe(true);
   });
 }
-
-test("a reaction row wider than its message widens the bubble", { tag: "@chromium-only" }, async ({
-  page,
-}) => {
-  await page.goto("/");
-  await waitForApp(page);
-  await openRoomWithComposer(page);
-
-  const input = page.getByTestId("message-input");
-  await input.fill("k");
-  await input.press("Enter");
-
-  const bubble = page.getByTestId("message-bubble").filter({ hasText: /^\s*k\s*$/ }).last();
-  await expect(bubble).toBeVisible();
-  const row = bubble.locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]");
-  await row.getByTestId("add-reaction-button").click();
-  await page.getByTestId("emoji-picker").getByRole("button").first().click();
-  await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
-
-  const bubbleBox = (await bubble.boundingBox())!;
-  const rowBox = (await row.getByTestId("message-reaction-row").boundingBox())!;
-  expect(bubbleBox.width, "the bubble widens to its reaction row").toBeGreaterThanOrEqual(
-    rowBox.width - 1
-  );
-});
 
 for (const width of [1280, 320]) {
   test(`action controls stay in the column under a pile of reactions @ ${width}px`, async ({

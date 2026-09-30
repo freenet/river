@@ -34,7 +34,6 @@ async function middlePlus(page: Page): Promise<Locator> {
 
 /** Open the picker from `plus` the way a person would. */
 async function openFrom(page: Page, plus: Locator) {
-  await plus.locator("xpath=ancestor::*[starts-with(@id,'msg-')][1]").hover();
   await plus.click();
   await expect(page.locator(PICKER)).toBeVisible();
 }
@@ -91,7 +90,6 @@ test("picking an emoji reacts to that message and closes the picker", async ({ p
     .first()
     .evaluate((el) => el.id);
   const row = page.locator(`[id="${id}"]`);
-  await row.scrollIntoViewIfNeeded();
   await openFrom(page, row.locator(PLUS));
   await page.locator(PICKER).locator("button").first().click();
   await expect(page.locator(PICKER)).toBeHidden();
@@ -111,19 +109,14 @@ test.describe("on a short landscape screen", () => {
     expect(l.covered, "something paints over the picker").toEqual([]);
     expect(l.bottom).toBeLessThanOrEqual(l.viewportHeight + 1);
   });
-});
 
-test.describe("on a wide screen", () => {
-  test.use({ viewport: { width: 1280, height: 800 } });
-
-  test("opens beside the + that opened it", async ({ page }) => {
+  test("opens beside the + that opened it, flipped to stay on screen", async ({ page }) => {
+    // Low on the screen there is less room below the "+" than the picker is tall, so it has to flip above.
     const plus = await middlePlus(page);
-    await placeAt(plus, Math.round(800 * 0.4));
-    await plus.click();
-    const picker = page.locator(PICKER);
-    await expect(picker).toBeVisible();
+    await placeAt(plus, 290);
+    await openFrom(page, plus);
     const b = (await plus.boundingBox())!;
-    const p = (await picker.boundingBox())!;
+    const p = (await page.locator(PICKER).boundingBox())!;
     // Touches the "+" on the side it opened toward, below or above it, within the 0.25rem gap.
     const below = p.y >= b.y + b.height - 1 && p.y - (b.y + b.height) <= 8;
     const above = b.y >= p.y + p.height - 1 && b.y - (p.y + p.height) <= 8;

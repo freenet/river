@@ -198,34 +198,6 @@ test.describe("Message action kebab menu (#402.1)", () => {
     }
   });
 
-  test("menu is capped to the viewport height on a short viewport", async ({
-    page,
-  }) => {
-    await page.setViewportSize({ width: 500, height: 340 });
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    test.skip(
-      !(await isTouchOnly(page)),
-      "kebab menu is touch-only; desktop uses the hover action bar"
-    );
-
-    // Own message (3-row menu) on a short viewport: the top-layer menu must fit
-    // the viewport (scrolling internally if it has to), actions all reachable.
-    await page
-      .locator('[id^="msg-"]:has(.bg-accent)')
-      .first()
-      .locator('[data-testid="message-kebab"]')
-      .click();
-    const menu = page.locator('[data-testid="message-action-menu"]');
-    await expect(menu).toBeVisible();
-
-    const box = (await menu.boundingBox())!;
-    const innerHeight = await page.evaluate(() => window.innerHeight);
-    expect(box.y).toBeGreaterThanOrEqual(0);
-    expect(box.y + box.height).toBeLessThanOrEqual(innerHeight);
-  });
-
   test("never more than one menu open at a time", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);

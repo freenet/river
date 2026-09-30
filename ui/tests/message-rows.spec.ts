@@ -32,8 +32,7 @@ test("hovering a group's author header lights its whole first row, and the band 
   // The picker is not inside the row, so moving away ends the hover: the open picker's "+" keeps the band.
   await row.getByTestId("add-reaction-button").click();
   await page.mouse.move(0, 0);
-  // Let the band's 0.15s fade settle first: a poll passes on its first sample, which a fade in progress still satisfies.
-  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  // Wait out the band's 0.15s fade: a fade in progress would still pass the check.
   await row.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)));
   expect(await bg()).toEqual(await resolveColor(page, "var(--color-row-hover)"));
 });
