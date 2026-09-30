@@ -36,6 +36,13 @@ fn picker_is_open() -> bool {
     picker_element().is_some_and(|el| el.matches(":popover-open").unwrap_or(false))
 }
 
+/// Close the picker if it is open; its `toggle` handler then clears the target. A DOM call, not a signal write.
+pub(super) fn close_reaction_picker() {
+    if let Some(el) = picker_element().filter(|el| el.matches(":popover-open").unwrap_or(false)) {
+        let _ = el.hide_popover();
+    }
+}
+
 #[component]
 pub(super) fn ReactionPicker(
     target: Signal<Option<PickerTarget>>,

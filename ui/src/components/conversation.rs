@@ -2393,6 +2393,8 @@ pub fn Conversation() -> Element {
                 // Re-gate the backfill sentinel until the new room's opening
                 // snap has landed (#501 H2).
                 opening_snap_done.set(false);
+                // An open picker would react in the room just left.
+                reaction_picker::close_reaction_picker();
             }
         });
     }
