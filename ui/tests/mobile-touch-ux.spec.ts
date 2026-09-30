@@ -304,6 +304,25 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await expect(page.locator('textarea[id^="edit-msg-"]')).toHaveValue("edited elsewhere");
   });
 
+  test("deleting the message closes its menu", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    const id = await page.locator('[id^="msg-"]:has(.bg-accent)').last().evaluate((el) => el.id);
+    await page.locator(`[id="${id}"]`).getByTestId("message-kebab").click();
+    const menu = page.getByTestId("message-action-menu");
+    await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
+    // Deleted on another device while the menu is open.
+    await page.evaluate(() => (window as any).__riverTest.deleteLastOwnMessage(0));
+    await expect(page.locator(`[id="${id}"]`)).toHaveCount(0);
+    await expect.poll(() => menu.evaluate((el) => el.matches(":popover-open"))).toBe(false);
+  });
+
   test("nothing covers the open menu, even over later messages", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);

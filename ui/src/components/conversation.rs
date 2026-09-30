@@ -2855,6 +2855,28 @@ pub fn Conversation() -> Element {
         }
     });
 
+    // A popover whose message was deleted or windowed out would act on a row that is no longer there.
+    use_effect(move || {
+        let _ = message_groups.read();
+        let _ = window_items.read();
+        let gone = |dom_id: &str| {
+            web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id(&format!("msg-{dom_id}")))
+                .is_none()
+        };
+        if menu_target.peek().as_ref().is_some_and(|t| gone(&t.dom_id)) {
+            action_menu::close_action_menu();
+        }
+        if picker_target
+            .peek()
+            .as_ref()
+            .is_some_and(|t| gone(&t.dom_id))
+        {
+            reaction_picker::close_reaction_picker();
+        }
+    });
+
     // The pin that actually gates auto-scroll. Installed once, in its own
     // effect, because the listeners must outlive every re-render of the
     // history. Reading `message_groups` only makes the effect re-runnable, so
@@ -5459,6 +5481,7 @@ fn MessageGroupComponent(
                                         }
                                         AddReactionButton {
                                             message_id: msg_id_react.clone(),
+                                            dom_id: msg.id.clone(),
                                             user_reaction: user_reaction.clone(),
                                             has_reactions,
                                             picker_target,

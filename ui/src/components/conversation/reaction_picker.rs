@@ -19,6 +19,8 @@ pub(super) const REACTION_PICKER_ID: &str = "reaction-picker";
 #[derive(Clone)]
 pub(super) struct PickerTarget {
     message_id: MessageId,
+    /// The row's `msg.id`; the picker closes once `msg-{dom_id}` leaves the DOM.
+    pub(super) dom_id: String,
     /// The viewer's current reaction on that message; picking it again removes it.
     current: Option<String>,
 }
@@ -100,6 +102,7 @@ pub(super) fn ReactionPicker(
 #[component]
 pub(super) fn AddReactionButton(
     message_id: MessageId,
+    dom_id: String,
     user_reaction: Option<String>,
     has_reactions: bool,
     picker_target: Signal<Option<PickerTarget>>,
@@ -126,6 +129,7 @@ pub(super) fn AddReactionButton(
                 if !picker_is_open() {
                     let t = PickerTarget {
                         message_id: message_id.clone(),
+                        dom_id: dom_id.clone(),
                         current: user_reaction.clone(),
                     };
                     let mut picker_target = picker_target;

@@ -207,3 +207,15 @@ test("moving focus out closes it, so a modal never opens under it", async ({ pag
   );
   expect(covered, "the picker's place is under the modal, not over it").toBe(true);
 });
+
+test("deleting the message closes its picker", async ({ page }) => {
+  const id = await page.locator('[id^="msg-"]:has(.bg-accent)').last().evaluate((el) => el.id);
+  // By keyboard: nothing light-dismisses it on the way.
+  await page.locator(`[id="${id}"]`).locator(PLUS).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(PICKER)).toBeVisible();
+  // Deleted on another device while the picker is open.
+  await page.evaluate(() => (window as any).__riverTest.deleteLastOwnMessage(0));
+  await expect(page.locator(`[id="${id}"]`)).toHaveCount(0);
+  await expect.poll(() => page.locator(PICKER).evaluate((el) => el.matches(":popover-open"))).toBe(false);
+});
