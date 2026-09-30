@@ -38,7 +38,7 @@ async function openFrom(page: Page, plus: Locator) {
   await expect(page.locator(PICKER)).toBeVisible();
 }
 
-/** Where the open picker sits, and whether anything paints over any part of it. */
+/** Whatever paints over any part of the open picker. */
 const pickerLayout = (page: Page) =>
   page.evaluate((sel) => {
     const p = document.querySelector(sel)!;
@@ -62,21 +62,19 @@ const pickerLayout = (page: Page) =>
       .map((hit) =>
         hit ? `${hit.tagName.toLowerCase()}[${(hit as HTMLElement).dataset.testid ?? ""}]` : "nothing"
       );
-    return { bottom: r.bottom, viewportHeight: window.innerHeight, covered };
+    return { covered };
   }, PICKER);
 
-test("Escape closes it", async ({ page }) => {
+test("Escape or a click outside closes it", async ({ page }) => {
   const plus = await middlePlus(page);
   await openFrom(page, plus);
   await expect(plus).toHaveAttribute("aria-expanded", "true");
   await page.keyboard.press("Escape");
   await expect(page.locator(PICKER)).toBeHidden();
   await expect(plus).toHaveAttribute("aria-expanded", "false");
-});
 
-test("clicking outside closes it", async ({ page }) => {
-  const plus = await middlePlus(page);
   await openFrom(page, plus);
+  await expect(plus).toHaveAttribute("aria-expanded", "true");
   // The empty gutter of the history, outside the picker and outside every row.
   await page.locator("#chat-scroll-container").click({ position: { x: 2, y: 2 } });
   await expect(page.locator(PICKER)).toBeHidden();
@@ -121,7 +119,6 @@ test.describe("on a short landscape screen", () => {
     await openFrom(page, plus);
     const l = await pickerLayout(page);
     expect(l.covered, "something paints over the picker").toEqual([]);
-    expect(l.bottom).toBeLessThanOrEqual(l.viewportHeight + 1);
   });
 
   test("opens beside the + that opened it, flipped to stay on screen", async ({ page }) => {

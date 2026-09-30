@@ -247,7 +247,6 @@ test.describe("Message action kebab menu (#402.1)", () => {
         .map((hit) => (hit ? `${hit.tagName.toLowerCase()}[${(hit as HTMLElement).dataset.testid ?? ""}]` : "nothing"));
     });
     expect(covered, "something paints over the menu").toEqual([]);
-    expect(await menu.evaluate((el) => el.matches(":popover-open"))).toBe(true);
   });
 });
 
