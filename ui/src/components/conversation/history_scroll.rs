@@ -170,8 +170,8 @@ pub(super) struct HistoryScroll {
     /// The layout and `scrollTop` as last accounted for, to classify a `scroll`.
     sig: Cell<LayoutSig>,
     top: Cell<i32>,
-    /// What `capture` needs, kept from `install` so a restore can first take in a
-    /// scroll the browser has not delivered an event for yet.
+    /// What `capture` needs for the trim. Set by `install` once the listeners
+    /// exist, so `is_some` also means "installed".
     trim: RefCell<Option<TrimHooks>>,
 }
 
@@ -242,7 +242,7 @@ impl HistoryScroll {
 
     /// Take the reader's position as the new truth. Only ever called from
     /// `on_scroll`, for a scroll the reader made.
-    fn capture(&self, trim: &TrimHooks) {
+    fn capture(&self) {
         let Some(container) = chat_scroll_container() else {
             return;
         };
@@ -293,25 +293,27 @@ impl HistoryScroll {
         // exact bottom. Skipped when the trimmed tail would leave the backfill
         // sentinel in range of the bottom, or the two oscillate at render speed
         // (#505; see `trim_would_rearm_backfill`).
-        if distance <= SCROLL_TOP_SLACK_PX as f64
-            && trim.window_overgrown.get()
-            && !trim_would_rearm_backfill(
-                sig.scroll_height,
-                sig.client_height,
-                trim.window_rendered.get(),
-                INITIAL_WINDOW_ITEMS,
-            )
-        {
-            trim.window_overgrown.set(false);
-            let window_anchor = trim.window_anchor.clone();
-            let mut window_items = trim.window_items;
-            // Deferred: this runs from a raw JS callback with no Dioxus scope,
-            // and `window_items` is a signal the render subscribes to. See
-            // .claude/rules/dioxus-signal-safety.md.
-            crate::util::defer(move || {
-                *window_anchor.borrow_mut() = None;
-                window_items.set(INITIAL_WINDOW_ITEMS);
-            });
+        if let Some(trim) = self.trim.borrow().as_ref() {
+            if distance <= SCROLL_TOP_SLACK_PX as f64
+                && trim.window_overgrown.get()
+                && !trim_would_rearm_backfill(
+                    sig.scroll_height,
+                    sig.client_height,
+                    trim.window_rendered.get(),
+                    INITIAL_WINDOW_ITEMS,
+                )
+            {
+                trim.window_overgrown.set(false);
+                let window_anchor = trim.window_anchor.clone();
+                let mut window_items = trim.window_items;
+                // Deferred: this runs from a raw JS callback with no Dioxus scope,
+                // and `window_items` is a signal the render subscribes to. See
+                // .claude/rules/dioxus-signal-safety.md.
+                crate::util::defer(move || {
+                    *window_anchor.borrow_mut() = None;
+                    window_items.set(INITIAL_WINDOW_ITEMS);
+                });
+            }
         }
     }
 
@@ -334,12 +336,19 @@ impl HistoryScroll {
         if top == self.top.get() {
             return;
         }
-        let cause = classify_scroll(self.sig.get(), read_sig(&container), self.top.get(), top);
-        if cause == ScrollCause::Reader {
-            if let Some(trim) = self.trim.borrow().clone() {
-                self.on_scroll(&trim);
-            }
+        if self.cause_now(&container) == ScrollCause::Reader {
+            self.on_scroll();
         }
+    }
+
+    /// Who the `scroll` event now pending (or being handled) belongs to.
+    fn cause_now(&self, container: &web_sys::Element) -> ScrollCause {
+        classify_scroll(
+            self.sig.get(),
+            read_sig(container),
+            self.top.get(),
+            container.scroll_top(),
+        )
     }
 
     fn restore_now(&self) -> bool {
@@ -389,21 +398,15 @@ impl HistoryScroll {
     }
 
     /// Read a `scroll` event as layout's doing (restore) or the reader's (capture).
-    fn on_scroll(&self, trim: &TrimHooks) {
+    fn on_scroll(&self) {
         let Some(container) = chat_scroll_container() else {
             return;
         };
-        let cause = classify_scroll(
-            self.sig.get(),
-            read_sig(&container),
-            self.top.get(),
-            container.scroll_top(),
-        );
-        match cause {
+        match self.cause_now(&container) {
             ScrollCause::Layout => {
                 self.restore_now();
             }
-            ScrollCause::Reader => self.capture(trim),
+            ScrollCause::Reader => self.capture(),
         }
     }
 
@@ -421,13 +424,16 @@ impl HistoryScroll {
         self.record(&container);
     }
 
-    /// Listen for the reader's scrolls and for layout changes. Returns `false` if
-    /// the history is not in the DOM yet, so the caller retries.
-    #[must_use]
-    pub(super) fn install(self: &Rc<Self>, trim: TrimHooks) -> bool {
+    /// Listen for the reader's scrolls and for layout changes. Idempotent: a
+    /// no-op once installed; before the history is in the DOM it does nothing and
+    /// the next call retries.
+    pub(super) fn install(self: &Rc<Self>, trim: TrimHooks) {
+        if self.trim.borrow().is_some() {
+            return;
+        }
         let (Some(container), Some(content)) = (chat_scroll_container(), chat_content_wrapper())
         else {
-            return false;
+            return;
         };
 
         // The ResizeObserver sees the content growing or reflowing, and the
@@ -440,10 +446,10 @@ impl HistoryScroll {
             }) as Box<dyn FnMut(js_sys::Array)>)
         };
         let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) else {
-            return false;
+            return;
         };
         self.record(&container);
-        *self.trim.borrow_mut() = Some(trim.clone());
+        *self.trim.borrow_mut() = Some(trim);
         observer.observe(&content);
         observer.observe(&container);
 
@@ -453,7 +459,7 @@ impl HistoryScroll {
         passive.set_passive(true);
         let on_scroll = {
             let this = self.clone();
-            Closure::wrap(Box::new(move |_: web_sys::Event| this.on_scroll(&trim))
+            Closure::wrap(Box::new(move |_: web_sys::Event| this.on_scroll())
                 as Box<dyn FnMut(web_sys::Event)>)
         };
         let _ = container.add_event_listener_with_callback_and_add_event_listener_options(
@@ -467,7 +473,6 @@ impl HistoryScroll {
         // cleanup hook, so there is nothing to disconnect these from.
         on_resize.forget();
         on_scroll.forget();
-        true
     }
 }
 

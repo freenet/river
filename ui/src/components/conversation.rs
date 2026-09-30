@@ -2183,33 +2183,6 @@ pub fn Conversation() -> Element {
         }
     });
 
-    // The scroll listener and ResizeObserver behind `history`. Installed once,
-    // in its own effect, because they must outlive every re-render of the
-    // history. Reading `message_groups` only makes the effect re-runnable, so a
-    // first attempt that found no container yet (nothing rendered) gets another
-    // chance; `installed` is set only on success, so a successful install is
-    // never repeated.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let history = history.clone();
-        let trim = TrimHooks {
-            window_items,
-            window_anchor: window_anchor.clone(),
-            window_overgrown: window_overgrown.clone(),
-            window_rendered: window_rendered.clone(),
-        };
-        let installed = use_hook(|| Rc::new(std::cell::Cell::new(false)));
-        use_effect(move || {
-            let _retry_on_content_change = message_groups.read().is_some();
-            if installed.get() {
-                return;
-            }
-            if history.install(trim.clone()) {
-                installed.set(true);
-            }
-        });
-    }
-
     // Keep the view right when the history changes.
     //
     // Scroll the chat-scroll-container itself, not the last bubble:
@@ -2231,38 +2204,43 @@ pub fn Conversation() -> Element {
     // anchor row back where it was. Synchronous: Dioxus has already patched the
     // DOM when effects run, so a parked reader never paints a frame at the wrong
     // offset. The ResizeObserver is the backstop for layout that follows.
+    #[cfg(target_arch = "wasm32")]
     use_effect({
         let history = history.clone();
+        // The scroll listener and ResizeObserver behind `history` must outlive
+        // every re-render of the history, so `install` runs once and is a no-op
+        // after. Calling it here (before the `!has_content` return) is what
+        // retries it when the first attempt found no container yet.
+        let trim = TrimHooks {
+            window_items,
+            window_anchor: window_anchor.clone(),
+            window_overgrown: window_overgrown.clone(),
+            window_rendered: window_rendered.clone(),
+        };
         move || {
             // A backfill or trim changes the window and not the messages.
             let _ = window_items();
             let has_content = message_groups.read().is_some();
+            history.install(trim.clone());
             if !has_content {
                 return;
             }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let forced = history.is_forced();
-                if history.restore() && (forced || !*opening_snap_done.peek()) {
-                    // The opening snap for this room has landed, so the
-                    // backfill sentinel may mount (#501 H2). Deferred, and the
-                    // signal is only written on the transition, so steady-state
-                    // arrivals do not re-notify the render for nothing. The
-                    // room is re-checked because this task can outlive a rapid
-                    // room switch, and a stale set here would un-gate the new
-                    // room's sentinel before ITS snap (#505 review).
-                    let room_at_snap = CURRENT_ROOM.peek().owner_key;
-                    crate::util::defer(move || {
-                        if CURRENT_ROOM.peek().owner_key == room_at_snap
-                            && !*opening_snap_done.peek()
-                        {
-                            opening_snap_done.set(true);
-                        }
-                    });
-                }
+            let forced = history.is_forced();
+            if history.restore() && (forced || !*opening_snap_done.peek()) {
+                // The opening snap for this room has landed, so the
+                // backfill sentinel may mount (#501 H2). Deferred, and the
+                // signal is only written on the transition, so steady-state
+                // arrivals do not re-notify the render for nothing. The
+                // room is re-checked because this task can outlive a rapid
+                // room switch, and a stale set here would un-gate the new
+                // room's sentinel before ITS snap (#505 review).
+                let room_at_snap = CURRENT_ROOM.peek().owner_key;
+                crate::util::defer(move || {
+                    if CURRENT_ROOM.peek().owner_key == room_at_snap && !*opening_snap_done.peek() {
+                        opening_snap_done.set(true);
+                    }
+                });
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            let _ = &history;
         }
     });
 
