@@ -1577,10 +1577,14 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
     // can only unlink more, never link something new.
     const JOINED: char = '\u{FFFD}';
     let separates = |c: char| {
-        // Combining marks inside the full-width blocks still stack.
-        let cjk_mark = matches!(u32::from(c), 0x302A..=0x302F | 0x3099..=0x309A);
+        // Combining marks inside the full-width blocks still stack, and a few
+        // characters there read as a Latin letter (`⸦`/`⸧` as C, `〇` and the
+        // Hangul compatibility jamo such as `ㅇ` as o; real Korean text uses
+        // syllables, U+AC00 on): these join like any look-alike.
+        let exempt = matches!(u32::from(c),
+            0x302A..=0x302F | 0x3099..=0x309A | 0x2E26 | 0x2E27 | 0x3007 | 0x3130..=0x318F);
         c.is_whitespace()
-            || !cjk_mark
+            || !exempt
                 && matches!(u32::from(c),
                 0x2000..=0x206F      // general punctuation
                 | 0x22EE..=0x22F1    // ellipses
@@ -8336,6 +8340,8 @@ mod tests {
             format!("{head}\u{222A}\u{05C4}{tail}"),
             format!("{head}\u{2A2F}\u{15F7}{tail}"),
             format!("{head}\u{2282}\u{10B3}{tail}"),
+            format!("{head}\u{2E26}{tail}"),
+            format!("{head}\u{3147}{tail}"),
             "freenet\u{2236}raAqMhMG".to_string(),
         ] {
             let html = message_to_html(&format!("[{label}]({hidden})"));
