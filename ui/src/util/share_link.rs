@@ -29,6 +29,9 @@ const MAX_CANDIDATE_ID_LEN: usize = 64;
 const MAX_REST_LEN: usize = 2000;
 /// A contract instance id is a 32-byte hash.
 const CONTRACT_KEY_BYTES: usize = 32;
+/// Longest link any form can validate: `freenet://` + id + rest.
+pub(crate) const MAX_SHARE_LINK_LEN: usize =
+    "freenet://".len() + MAX_CANDIDATE_ID_LEN + MAX_REST_LEN;
 
 /// A validated share-link destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +232,7 @@ fn is_valid_rest(rest: &str) -> bool {
 /// A single- or double-dot segment once percent-decoded, per the WHATWG URL
 /// Standard (compared against the raw segment, case-insensitively, exactly as
 /// a browser does).
-fn is_dot_segment(segment: &str) -> bool {
+pub(crate) fn is_dot_segment(segment: &str) -> bool {
     let s = segment.to_ascii_lowercase();
     matches!(s.as_str(), "." | "%2e" | ".." | ".%2e" | "%2e." | "%2e%2e")
 }
@@ -328,8 +331,8 @@ mod tests {
             format!("https://freenet.org/opener#{id}/"),
             format!("https://freenet.org/open?x=1#{id}/"),
             format!("https://freenet.org/other/open#{id}/"),
-            format!("https://freenet.org/open"),
-            format!("https://freenet.org/open#"),
+            "https://freenet.org/open".to_string(),
+            "https://freenet.org/open#".to_string(),
         ] {
             assert_eq!(parse_share_link(&link), None, "{link} must be refused");
         }

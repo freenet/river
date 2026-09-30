@@ -206,6 +206,17 @@ and the version-number policy) lives in
 4. `delegates/chat-delegate`: handles chat-specific workflows and background tasks.
 5. `ui/`: Dioxus UI, including `example-data` and `no-sync` modes for offline testing.
 
+## Share Links in Messages
+
+Freenet share links in message text (`https://freenet.org/open#<id>…`,
+`freenet:<id>…`, `freenet://<id>…`) render as links to the reader's own node.
+The validator in `ui/src/util/share_link.rs` must accept exactly what the
+freenet.org/open page (freenet/web) and freenet-core's `freenet:` handler
+accept; all three test against one vector file, whose copy lives at
+`ui/src/util/share-link-vectors.json` (the `share-link-vectors.yml` workflow
+fails when it drifts from freenet-core main). Change a rule only together with
+that file and the other two sides.
+
 ## In-Room Direct Messages
 
 End-to-end-encrypted DMs between two members of the same room, carried

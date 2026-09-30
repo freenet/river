@@ -978,20 +978,28 @@ fn message_to_html_inner(text: &str, behind_gateway: bool) -> String {
 
 /// Convert markdown text to HTML with clickable links that open in new tabs.
 fn markdown_to_html(text: &str, behind_gateway: bool) -> String {
+    // GFM only autolinks http(s)/www text, so a bare `freenet:<id>` share link
+    // would stay plain text. Pull valid ones out BEFORE markdown runs, so
+    // emphasis/strikethrough syntax inside a link (`…/a*b*c`) cannot split it,
+    // and put them back as anchors afterwards; turning an anchor into a link to
+    // the reader's node is `finalize_anchors`' job, the same as for every other
+    // share link. Only behind a gateway, because without one there is no node
+    // to link to (see `finalize_anchors`).
+    let (text, bare_links) = if behind_gateway {
+        extract_bare_freenet_links(text)
+    } else {
+        (std::borrow::Cow::Borrowed(text), Vec::new())
+    };
+
     // Convert markdown to HTML using GFM mode, which includes autolink
     // literals that correctly handle code spans, existing links, etc.
-    let html = markdown::to_html_with_options(text, &markdown::Options::gfm())
-        .unwrap_or_else(|_| markdown::to_html(text));
+    let html = markdown::to_html_with_options(&text, &markdown::Options::gfm())
+        .unwrap_or_else(|_| markdown::to_html(&text));
 
-    // GFM only autolinks http(s)/www text, so a bare `freenet:<id>` share link
-    // would stay plain text. Wrap valid ones in an anchor here; turning the
-    // anchor into a link to the reader's node is `finalize_anchors`' job, the
-    // same as for every other share link. Only behind a gateway, because
-    // without one there is no node to link to (see `finalize_anchors`).
-    let html = if behind_gateway {
-        wrap_bare_freenet_links(&html)
-    } else {
+    let html = if bare_links.is_empty() {
         html
+    } else {
+        restore_bare_freenet_links(&html, &bare_links)
     };
 
     finalize_anchors(&html, behind_gateway)
@@ -1296,11 +1304,22 @@ fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
         };
         let opening = &tag[..=open_end];
         let after_open = &tag[open_end + 1..];
-        let Some(close_pos) = after_open.find("</a>") else {
+        let Some(close_pos) = matching_anchor_close(after_open) else {
             out.push_str(tag);
             return out;
         };
-        let inner = &after_open[..close_pos];
+        // The markdown crate still emits an anchor for an angle-bracket
+        // autolink inside a link label (`[<x:y>](url)`), i.e. a nested `<a>`.
+        // Browsers split those into two anchors, so the inner one would escape
+        // this function (no target/rel, and an empty href that reloads River
+        // in place). Flatten it to its text: the outer link is what is shown.
+        let flattened;
+        let inner = if after_open[..close_pos].contains("<a ") {
+            flattened = strip_anchor_tags(&after_open[..close_pos]);
+            flattened.as_str()
+        } else {
+            &after_open[..close_pos]
+        };
         let tail = &after_open[close_pos + 4..];
 
         let opening = opening.replacen(
@@ -1316,17 +1335,18 @@ fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
         // it is (full contract id included): the link goes exactly where it
         // says, so `[freenet:<A>](https://freenet.org/open#<B>)` opens A, and
         // a share link hidden behind a label is left as a plain link to the
-        // freenet.org page, which shows the id before anything opens.
+        // freenet.org page, which shows the id before anything opens. (Pasted
+        // gateway URLs, `http://…/v1/contract/web/<id>/…`, are a separate,
+        // older rewrite below, which does apply to labelled links.)
         if rewrite_freenet_hrefs {
-            if let (Some(orig), Some(target)) =
-                (original_href.as_deref(), share_link_in_anchor_text(inner))
-            {
-                let opening = opening.replacen(
-                    &format!("href=\"{orig}\""),
-                    &format!("href=\"{}\"", escape_html_attr(&target.local_path())),
-                    1,
-                );
-                out.push_str(&opening);
+            if let Some(target) = share_link_in_anchor_text(inner) {
+                // Rebuilt from scratch rather than edited, so nothing else
+                // from the message survives on the anchor: a `title` naming
+                // some other link would otherwise show as its tooltip.
+                out.push_str(&format!(
+                    "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"{}\">",
+                    escape_html_attr(&target.local_path())
+                ));
                 out.push_str(inner);
                 out.push_str("</a>");
                 rest = tail;
@@ -1369,6 +1389,8 @@ fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
 /// entity-encoded (`&amp;`, `&lt;`, `&gt;`, `&quot;`), and any nested markup
 /// (emphasis, a mention sentinel's chip, ...) means it is not a bare link.
 fn share_link_in_anchor_text(inner: &str) -> Option<crate::util::share_link::ShareTarget> {
+    // Defense in depth: the validator refuses `<` and `>` anyway, but nested
+    // markup is never a bare link, so do not even decode it.
     if inner.contains('<') {
         return None;
     }
@@ -1417,27 +1439,180 @@ fn encode_html_text(s: &str) -> String {
     out
 }
 
-/// Wrap each bare, valid `freenet:` share link in the rendered HTML's text in
-/// `<a href="">…</a>`, the shape the markdown crate itself emits for an
-/// autolink with a scheme it does not allow (`<freenet:…>`). `finalize_anchors`
-/// then gives it its real href from the text.
+/// Private-use sentinels that stand in for a bare `freenet:` link while
+/// markdown runs (`{BARE_LINK_OPEN}<index>{BARE_LINK_CLOSE}`). Distinct from the
+/// mention sentinels (`U+E000`/`U+E001`), and stripped from the input before
+/// any are inserted, so a message cannot forge one.
+const BARE_LINK_OPEN: char = '\u{E002}';
+const BARE_LINK_CLOSE: char = '\u{E003}';
+
+/// Longest whitespace-free run examined as a bare `freenet:` link candidate:
+/// the longest link the validator can accept, plus slack for trailing
+/// punctuation that trimming would remove.
+const MAX_BARE_LINK_CANDIDATE_LEN: usize = crate::util::share_link::MAX_SHARE_LINK_LEN + 128;
+
+/// Find each bare, valid `freenet:` share link in the markdown SOURCE and
+/// replace it with a sentinel, returning the rewritten source and the links in
+/// sentinel order. Messages with no `freenet:` at all are returned untouched.
 ///
-/// Only text outside `<a>`, `<code>` and `<pre>` is scanned, so a link that is
-/// already a link, or that sits in a code span or block, is left alone. Tag
-/// interiors (attribute values such as an image's `alt`) are never scanned: the
-/// markdown crate encodes `>` inside attributes, so the first `>` ends a tag.
-fn wrap_bare_freenet_links(html: &str) -> String {
+/// A candidate starts at `freenet:` (any case) that does not follow a letter
+/// or digit, runs to the next whitespace, and then loses trailing punctuation
+/// exactly as the markdown crate's GFM autolink does (`!"'),.:;?_~*`, with `)`
+/// only when unbalanced), so "see freenet:<id>." links the id without the full
+/// stop. A `.` that follows `/` or `.` is kept, so trimming can never turn a
+/// refused dot segment (`…/a/..`) into an accepted link (`…/a/`). Only a
+/// candidate that passes the shared share-link validation is taken.
+///
+/// A candidate inside any construct whose text is not rendered as plain prose
+/// (code, links and autolinks, images, raw HTML, definitions, footnote
+/// references) is left alone. Those are found by parsing the source once more
+/// to an mdast, which only happens when a valid candidate exists.
+fn extract_bare_freenet_links(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>) {
+    use std::borrow::Cow;
     const SCHEME: &str = "freenet:";
-    if !html.to_ascii_lowercase().contains(SCHEME) {
-        return html.to_string();
+    if !text.to_ascii_lowercase().contains(SCHEME) {
+        return (Cow::Borrowed(text), Vec::new());
     }
-    let mut out = String::with_capacity(html.len() + 32);
+    let clean: String = text
+        .chars()
+        .filter(|c| *c != BARE_LINK_OPEN && *c != BARE_LINK_CLOSE)
+        .collect();
+
+    // ASCII lowercasing keeps byte offsets identical to `clean`.
+    let lower = clean.to_ascii_lowercase();
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
+    let mut search_from = 0;
+    // End of the whitespace-free run the current candidate sits in, cached so
+    // `freenet:freenet:…` does not rescan the same run once per occurrence.
+    let mut run_end = 0;
+    while let Some(rel) = lower[search_from..].find(SCHEME) {
+        let start = search_from + rel;
+        search_from = start + SCHEME.len();
+        if clean[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric())
+        {
+            continue;
+        }
+        if run_end <= start {
+            run_end = clean[start..]
+                .find(char::is_whitespace)
+                .map_or(clean.len(), |p| start + p);
+        }
+        // Message text is attacker-controlled, so bound the work per
+        // candidate: anything longer than the longest valid link plus some
+        // trailing punctuation cannot validate, so it is not even trimmed.
+        if run_end - start > MAX_BARE_LINK_CANDIDATE_LEN {
+            continue;
+        }
+        let mut token = &clean[start..run_end];
+        let open_parens = token.matches('(').count();
+        let mut close_parens = token.matches(')').count();
+        while let Some(last) = token.chars().next_back() {
+            let unbalanced_paren = last == ')' && close_parens > open_parens;
+            let dot_in_segment = last == '.'
+                && matches!(
+                    token[..token.len() - 1].chars().next_back(),
+                    Some('/' | '.')
+                );
+            if ("!\"',.:;?_~*".contains(last) && !dot_in_segment) || unbalanced_paren {
+                token = &token[..token.len() - last.len_utf8()];
+                if last == ')' {
+                    close_parens -= 1;
+                }
+            } else {
+                break;
+            }
+        }
+        if crate::util::share_link::parse_freenet_link(token).is_some() {
+            candidates.push((start, start + token.len()));
+            search_from = start + token.len();
+        }
+    }
+    if candidates.is_empty() {
+        return (Cow::Borrowed(text), Vec::new());
+    }
+
+    let excluded = non_prose_ranges(&clean);
+    let mut out = String::with_capacity(clean.len());
+    let mut links = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in candidates {
+        if excluded.iter().any(|&(s, e)| start < e && s < end) {
+            continue;
+        }
+        out.push_str(&clean[cursor..start]);
+        out.push(BARE_LINK_OPEN);
+        out.push_str(&links.len().to_string());
+        out.push(BARE_LINK_CLOSE);
+        links.push(clean[start..end].to_string());
+        cursor = end;
+    }
+    if links.is_empty() {
+        return (Cow::Borrowed(text), Vec::new());
+    }
+    out.push_str(&clean[cursor..]);
+    (Cow::Owned(out), links)
+}
+
+/// Byte ranges of the markdown source that are NOT rendered as plain prose.
+fn non_prose_ranges(source: &str) -> Vec<(usize, usize)> {
+    use markdown::mdast::Node;
+    fn walk(node: &Node, out: &mut Vec<(usize, usize)>) {
+        let skip = matches!(
+            node,
+            Node::InlineCode(_)
+                | Node::Code(_)
+                | Node::Link(_)
+                | Node::LinkReference(_)
+                | Node::Image(_)
+                | Node::ImageReference(_)
+                | Node::Definition(_)
+                | Node::Html(_)
+                | Node::FootnoteReference(_)
+                | Node::FootnoteDefinition(_)
+                | Node::InlineMath(_)
+                | Node::Math(_)
+        );
+        if skip {
+            if let Some(pos) = node.position() {
+                out.push((pos.start.offset, pos.end.offset));
+            }
+            return;
+        }
+        if let Some(children) = node.children() {
+            for child in children {
+                walk(child, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    match markdown::to_mdast(source, &markdown::ParseOptions::gfm()) {
+        Ok(root) => walk(&root, &mut out),
+        // Unparseable: treat everything as non-prose, so nothing is linked.
+        Err(_) => out.push((0, source.len())),
+    }
+    out
+}
+
+/// Put the links taken out by [`extract_bare_freenet_links`] back into the
+/// rendered HTML. A sentinel in prose becomes `<a href="">…</a>`, the shape the
+/// markdown crate itself emits for an autolink with a scheme it does not allow
+/// (`<freenet:…>`), and `finalize_anchors` then gives it its real href from
+/// the text. A sentinel anywhere else (inside `<a>`, `<code>` or `<pre>`, or
+/// inside a tag's attributes) is put back as the plain, escaped link text, so
+/// a construct the source scan did not anticipate can never nest an anchor or
+/// break out of an attribute. The markdown crate encodes `>` inside
+/// attributes, so the first `>` always ends a tag.
+fn restore_bare_freenet_links(html: &str, links: &[String]) -> String {
+    let mut out = String::with_capacity(html.len() + links.len() * 64);
     let mut skip_depth: usize = 0;
     let mut rest = html;
     while !rest.is_empty() {
         if rest.starts_with('<') {
             let Some(end) = rest.find('>') else {
-                out.push_str(rest);
+                out.push_str(&replace_bare_link_sentinels(rest, links, escape_html_attr));
                 break;
             };
             let tag = &rest[..=end];
@@ -1458,15 +1633,17 @@ fn wrap_bare_freenet_links(html: &str) -> String {
                     skip_depth += 1;
                 }
             }
-            out.push_str(tag);
+            out.push_str(&replace_bare_link_sentinels(tag, links, escape_html_attr));
             rest = &rest[end + 1..];
         } else {
             let text_end = rest.find('<').unwrap_or(rest.len());
             let text = &rest[..text_end];
             if skip_depth == 0 {
-                out.push_str(&wrap_freenet_links_in_text(text));
+                out.push_str(&replace_bare_link_sentinels(text, links, |link| {
+                    format!("<a href=\"\">{}</a>", encode_html_text(link))
+                }));
             } else {
-                out.push_str(text);
+                out.push_str(&replace_bare_link_sentinels(text, links, encode_html_text));
             }
             rest = &rest[text_end..];
         }
@@ -1474,74 +1651,91 @@ fn wrap_bare_freenet_links(html: &str) -> String {
     out
 }
 
-/// `wrap_bare_freenet_links` for one encoded text run.
-///
-/// A candidate starts at `freenet:` (any case) that does not follow a letter
-/// or digit, runs to the next whitespace, and then loses trailing punctuation
-/// the way a GFM autolink does (`?!.,:;*_~'"` and an unbalanced `)`), so
-/// "see freenet:<id>." links the id without the full stop. A `.` that follows
-/// `/` or `.` is kept, so trimming can never turn a refused dot segment into
-/// an accepted link. Only a candidate
-/// that passes the shared share-link validation becomes a link; anything else
-/// stays exactly as it was.
-fn wrap_freenet_links_in_text(encoded: &str) -> String {
-    const SCHEME: &str = "freenet:";
-    let plain = decode_html_text(encoded);
-    // ASCII lowercasing keeps byte offsets identical to `plain`.
-    let lower = plain.to_ascii_lowercase();
-    let mut out = String::new();
-    let mut cursor = 0;
-    let mut search_from = 0;
-    let mut found_any = false;
-    while let Some(rel) = lower[search_from..].find(SCHEME) {
-        let start = search_from + rel;
-        search_from = start + SCHEME.len();
-        if plain[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric())
-        {
-            continue;
-        }
-        let end = plain[start..]
-            .find(char::is_whitespace)
-            .map_or(plain.len(), |p| start + p);
-        let mut token = &plain[start..end];
-        loop {
-            let Some(last) = token.chars().next_back() else {
-                break;
-            };
-            let unbalanced_paren =
-                last == ')' && token.matches(')').count() > token.matches('(').count();
-            // A `.` after `/` or `.` is part of a (dot) segment, not a full
-            // stop: trimming it would turn the invalid `…/a/..` into the
-            // valid `…/a/`, linking a message the validator refused.
-            let dot_in_segment = last == '.'
-                && matches!(
-                    token[..token.len() - 1].chars().next_back(),
-                    Some('/' | '.')
-                );
-            if ("?!.,:;*_~'\"".contains(last) && !dot_in_segment) || unbalanced_paren {
-                token = &token[..token.len() - last.len_utf8()];
-            } else {
-                break;
+/// Replace every `{BARE_LINK_OPEN}<index>{BARE_LINK_CLOSE}` in `s` with
+/// `render(&links[index])`. Anything that is not a well-formed sentinel for a
+/// known index is copied through unchanged.
+fn replace_bare_link_sentinels(
+    s: &str,
+    links: &[String],
+    render: impl Fn(&str) -> String,
+) -> String {
+    if !s.contains(BARE_LINK_OPEN) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find(BARE_LINK_OPEN) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + BARE_LINK_OPEN.len_utf8()..];
+        let link = after.find(BARE_LINK_CLOSE).and_then(|close| {
+            let idx: usize = after[..close].parse().ok()?;
+            Some((links.get(idx)?, close))
+        });
+        match link {
+            Some((link, close)) => {
+                out.push_str(&render(link));
+                rest = &after[close + BARE_LINK_CLOSE.len_utf8()..];
+            }
+            None => {
+                out.push(BARE_LINK_OPEN);
+                rest = after;
             }
         }
-        if crate::util::share_link::parse_freenet_link(token).is_none() {
-            continue;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Offset of the `</a>` that closes an anchor whose content starts at the
+/// beginning of `after_open`, counting any nested `<a …>` opened inside it.
+fn matching_anchor_close(after_open: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < after_open.len() {
+        let rest = &after_open[i..];
+        let next_open = rest.find("<a ");
+        let next_close = rest.find("</a>")?;
+        match next_open {
+            Some(o) if o < next_close => {
+                depth += 1;
+                i += o + 3;
+            }
+            _ => {
+                if depth == 0 {
+                    return Some(i + next_close);
+                }
+                depth -= 1;
+                i += next_close + 4;
+            }
         }
-        out.push_str(&encode_html_text(&plain[cursor..start]));
-        out.push_str("<a href=\"\">");
-        out.push_str(&encode_html_text(token));
-        out.push_str("</a>");
-        cursor = start + token.len();
-        search_from = cursor;
-        found_any = true;
     }
-    if !found_any {
-        return encoded.to_string();
+    None
+}
+
+/// Remove every `<a …>` and `</a>` tag from `html`, keeping their content.
+fn strip_anchor_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    loop {
+        let open = rest.find("<a ");
+        let close = rest.find("</a>");
+        let (pos, is_open) = match (open, close) {
+            (Some(o), Some(c)) if o < c => (o, true),
+            (Some(o), None) => (o, true),
+            (_, Some(c)) => (c, false),
+            (None, None) => break,
+        };
+        out.push_str(&rest[..pos]);
+        rest = if is_open {
+            match rest[pos..].find('>') {
+                Some(end) => &rest[pos + end + 1..],
+                None => "",
+            }
+        } else {
+            &rest[pos + 4..]
+        };
     }
-    out.push_str(&encode_html_text(&plain[cursor..]));
+    out.push_str(rest);
     out
 }
 
@@ -1573,7 +1767,8 @@ struct FreenetWebUrl<'a> {
 /// markdown can in theory carry other schemes; we don't want to rewrite a
 /// `javascript:`-flavored input even though the rewrite would defang it).
 ///
-/// The suffix must not contain `..` path segments. Without this guard, a
+/// The suffix must not contain dot path segments, literal or percent-encoded
+/// (see `suffix_has_dotdot_segment`). Without this guard, a
 /// pasted `http://attacker/v1/contract/web/<valid-shape-id>/../../foo`
 /// would be rewritten to a same-origin path that the browser normalizes
 /// into `/foo` on the reader's local gateway — sending the click to a
@@ -1607,14 +1802,19 @@ fn parse_freenet_web_url(url: &str) -> Option<FreenetWebUrl<'_>> {
     })
 }
 
-/// True if any path segment in `suffix` is exactly `..`. Path segments are
-/// the `/`-separated components before any `?` query or `#` fragment.
+/// True if any path segment in `suffix` is a dot segment, literal or
+/// percent-encoded (`..`, `%2e%2e`, `.%2E`, `.`, ...), which a browser resolves
+/// the same way. Checking only a literal `..` let `…/<A>/%2e%2e/<B>/` open
+/// contract B, or climb out of `/v1/contract/web/` altogether. Path segments
+/// are the `/`-separated components before any `?` query or `#` fragment.
 fn suffix_has_dotdot_segment(suffix: &str) -> bool {
     let path_only = suffix
         .split_once(['?', '#'])
         .map(|(p, _)| p)
         .unwrap_or(suffix);
-    path_only.split('/').any(|seg| seg == "..")
+    path_only
+        .split('/')
+        .any(crate::util::share_link::is_dot_segment)
 }
 
 /// Bitcoin-style base58 alphabet: digits and letters minus the visually
@@ -7320,6 +7520,245 @@ mod tests {
         assert!(html.contains(&format!("href=\"{link}\"")), "{html}");
         let html = message_to_html_inner(&format!("freenet:{RIVER_ID}/"), false);
         assert!(!html.contains("<a "), "{html}");
+    }
+
+    /// Markdown syntax that is valid inside a share link must not split it:
+    /// `…/a*b*c` used to render as `…/a<em>b</em>c` and link only `…/a`.
+    #[test]
+    fn markdown_syntax_inside_a_bare_link_does_not_split_it() {
+        for rest in ["/a*b*c", "/a_b_c", "/a~~b~~c", "/x*y", "/#a*b*c"] {
+            let link = format!("freenet:{RIVER_ID}{rest}");
+            let html = message_to_html(&format!("see {link} now"));
+            let path = format!("/v1/contract/web/{RIVER_ID}{rest}");
+            assert!(anchor_to(&html, &path, &link), "{link}: {html}");
+        }
+    }
+
+    #[test]
+    fn emphasised_bare_link_is_linked_inside_the_emphasis() {
+        let html = message_to_html(&format!(
+            "*freenet:{RIVER_ID}/* and **freenet:{HARVEST_ID}/**"
+        ));
+        assert!(
+            html.contains(&format!(
+                "<em><a target=\"_blank\" rel=\"noopener noreferrer\" \
+                 href=\"/v1/contract/web/{RIVER_ID}/\">freenet:{RIVER_ID}/</a></em>"
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "<strong><a target=\"_blank\" rel=\"noopener noreferrer\" \
+                 href=\"/v1/contract/web/{HARVEST_ID}/\">freenet:{HARVEST_ID}/</a></strong>"
+            )),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn bare_link_at_the_very_start_of_a_message() {
+        let link = format!("freenet:{RIVER_ID}/");
+        let html = message_to_html(&link);
+        assert!(
+            anchor_to(&html, &format!("/v1/contract/web/{RIVER_ID}/"), &link),
+            "{html}"
+        );
+    }
+
+    /// Byte offsets from the markdown parser must line up with the source even
+    /// after multi-byte text: the code-span link stays code, the other links.
+    #[test]
+    fn non_ascii_before_links_keeps_code_exclusion_aligned() {
+        let text = format!("é ü 🦀 `freenet:{RIVER_ID}/` then freenet:{HARVEST_ID}/");
+        let html = message_to_html(&text);
+        assert!(
+            html.contains(&format!("<code>freenet:{RIVER_ID}/</code>")),
+            "{html}"
+        );
+        assert!(
+            anchor_to(
+                &html,
+                &format!("/v1/contract/web/{HARVEST_ID}/"),
+                &format!("freenet:{HARVEST_ID}/")
+            ),
+            "{html}"
+        );
+        assert!(
+            !html.contains(&format!("/v1/contract/web/{RIVER_ID}")),
+            "{html}"
+        );
+    }
+
+    /// A bare link inside a construct that is not prose must never nest an
+    /// anchor or land in an attribute.
+    #[test]
+    fn bare_links_inside_links_titles_and_footnotes_stay_plain() {
+        for text in [
+            format!("[see freenet:{RIVER_ID}/](https://example.com/)"),
+            format!("[x](https://example.com/ \"freenet:{RIVER_ID}/\")"),
+            format!("text[^freenet:{RIVER_ID}/]\n\n[^freenet:{RIVER_ID}/]: note"),
+            format!("[r]: https://example.com/ \"freenet:{RIVER_ID}/\"\n\n[x][r]"),
+            format!("<span title=\"freenet:{RIVER_ID}/\">x</span>"),
+            format!("[x](freenet:{RIVER_ID}/)"),
+            format!("![x](freenet:{RIVER_ID}/)"),
+        ] {
+            let html = message_to_html(&text);
+            assert!(
+                !html.contains(&format!("href=\"/v1/contract/web/{RIVER_ID}")),
+                "{text:?}: {html}"
+            );
+            assert!(
+                !html.contains('\u{E002}') && !html.contains("%EE%80%82"),
+                "{text:?}: sentinel leaked: {html}"
+            );
+            // No anchor opens inside another anchor.
+            for piece in html.split("<a ").skip(1) {
+                let close = piece.find("</a>").unwrap_or(piece.len());
+                assert!(!piece[..close].contains("<a "), "{text:?}: nested: {html}");
+            }
+        }
+    }
+
+    /// A message cannot forge the private-use sentinels the bare-link pass
+    /// uses: they are stripped before any are inserted.
+    #[test]
+    fn forged_bare_link_sentinels_are_inert() {
+        let text = format!("\u{E002}0\u{E003} \u{E002}1\u{E003} freenet:{RIVER_ID}/");
+        let html = message_to_html(&text);
+        assert_eq!(html.matches("<a ").count(), 1, "{html}");
+        assert!(
+            !html.contains('\u{E002}') && !html.contains('\u{E003}'),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn share_links_render_alongside_mentions() {
+        let member = MemberId(freenet_scaffold::util::FastHash(42));
+        let names: HashMap<MemberId, String> = [(member, "Bob".to_string())].into();
+        let token = river_core::mention::encode_mention(member, "Bob");
+        let html = message_to_html_with_mentions(
+            &format!("{token} try freenet:{RIVER_ID}/ and https://freenet.org/open#{HARVEST_ID}/"),
+            &names,
+            None,
+        );
+        assert!(html.contains("river-mention"), "{html}");
+        assert!(
+            anchor_to(
+                &html,
+                &format!("/v1/contract/web/{RIVER_ID}/"),
+                &format!("freenet:{RIVER_ID}/")
+            ),
+            "{html}"
+        );
+        assert!(
+            anchor_to(
+                &html,
+                &format!("/v1/contract/web/{HARVEST_ID}/"),
+                &format!("https://freenet.org/open#{HARVEST_ID}/")
+            ),
+            "{html}"
+        );
+    }
+
+    /// A converted anchor carries nothing else from the message, so a `title`
+    /// cannot name a different link in the tooltip.
+    #[test]
+    fn converted_share_link_drops_title() {
+        let html = message_to_html(&format!(
+            "[freenet:{RIVER_ID}/](https://x.example/ \"https://freenet.org/open#{HARVEST_ID}/\")"
+        ));
+        assert!(
+            anchor_to(
+                &html,
+                &format!("/v1/contract/web/{RIVER_ID}/"),
+                &format!("freenet:{RIVER_ID}/")
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("title="), "{html}");
+    }
+
+    /// Pre-existing gateway-URL rewrite: an ENCODED dot segment is resolved by
+    /// the browser just like `..`, so it must be refused too.
+    #[test]
+    fn gateway_url_with_encoded_dot_segments_is_not_rewritten() {
+        for suffix in [
+            format!("/%2e%2e/{SAMPLE_ID_2}/"),
+            "/%2E%2e/%2e%2E/%2e%2e/permission/apps".to_string(),
+            "/.%2e/x".to_string(),
+            "/%2e./x".to_string(),
+        ] {
+            let url = format!("https://x.example/v1/contract/web/{SAMPLE_ID}{suffix}");
+            let html = message_to_html(&format!("[River update]({url})"));
+            assert!(
+                !html.contains("href=\"/v1/contract/web/"),
+                "{suffix}: {html}"
+            );
+        }
+    }
+
+    /// Message text is attacker-controlled: a crafted body must not make the
+    /// bare-link scan super-linear. `freenet:freenet:…)))` made every
+    /// occurrence a candidate spanning the rest of the run, trimmed one
+    /// character at a time with a full parenthesis recount each step (O(n^3):
+    /// 186 s for 16 KB natively). The size is small enough that a cubic
+    /// regression still FINISHES (2.4 s release, far longer in a debug test
+    /// build) and fails the bound, rather than hanging the test run; the fixed
+    /// scan renders all of these in milliseconds.
+    #[test]
+    fn adversarial_bare_link_text_renders_in_bounded_time() {
+        let n = 4 * 1024;
+        let payloads = [
+            format!("{}{}", "freenet:".repeat(n / 16), ")".repeat(n / 2)),
+            format!("freenet:{}", ")".repeat(n)),
+            "freenet:".repeat(n / 8),
+            format!("freenet:{RIVER_ID}/ ").repeat(n / 55),
+            "(freenet:x) ".repeat(n / 12),
+        ];
+        for payload in payloads {
+            let started = std::time::Instant::now();
+            let _ = message_to_html(&payload);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "rendering {} bytes took {elapsed:?}",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn longest_valid_bare_link_still_converts() {
+        let rest = format!("/{}", "a".repeat(1999));
+        let link = format!("freenet://{RIVER_ID}{rest}");
+        let html = message_to_html(&format!("{link}."));
+        assert!(
+            anchor_to(&html, &format!("/v1/contract/web/{RIVER_ID}{rest}"), &link),
+            "a 2000-byte rest is valid and must still link"
+        );
+    }
+
+    /// `[<freenet:A/>](https://x)` nests an anchor inside a link label; the
+    /// inner one used to escape `finalize_anchors` with an empty href.
+    #[test]
+    fn nested_autolink_in_a_label_is_flattened() {
+        let html = message_to_html(&format!("[<freenet:{RIVER_ID}/>](https://evil.example/)"));
+        assert_eq!(html.matches("<a ").count(), 1, "{html}");
+        assert!(
+            anchor_to(
+                &html,
+                &format!("/v1/contract/web/{RIVER_ID}/"),
+                &format!("freenet:{RIVER_ID}/")
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("evil.example"), "{html}");
+
+        let html = message_to_html("[see <mailto:a@b.example> here](https://x.example/)");
+        assert_eq!(html.matches("<a ").count(), 1, "{html}");
+        assert_eq!(html.matches("</a>").count(), 1, "{html}");
+        assert!(html.contains("href=\"https://x.example/\""), "{html}");
     }
 
     /// Whitespace, `<` and `>` end an angle-bracket autolink, after which GFM
