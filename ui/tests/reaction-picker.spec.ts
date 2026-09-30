@@ -112,3 +112,22 @@ test.describe("on a short landscape screen", () => {
     expect(l.bottom).toBeLessThanOrEqual(l.viewportHeight + 1);
   });
 });
+
+test.describe("on a wide screen", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("opens beside the + that opened it", async ({ page }) => {
+    const plus = await middlePlus(page);
+    await placeAt(plus, Math.round(800 * 0.4));
+    await plus.click();
+    const picker = page.locator(PICKER);
+    await expect(picker).toBeVisible();
+    const b = (await plus.boundingBox())!;
+    const p = (await picker.boundingBox())!;
+    // Touches the "+" on the side it opened toward, below or above it, within the 0.25rem gap.
+    const below = p.y >= b.y + b.height - 1 && p.y - (b.y + b.height) <= 8;
+    const above = b.y >= p.y + p.height - 1 && b.y - (p.y + p.height) <= 8;
+    expect(below || above, `picker y ${p.y}..${p.y + p.height} vs + y ${b.y}..${b.y + b.height}`).toBe(true);
+    expect(p.x <= b.x + b.width && p.x + p.width >= b.x, `picker x ${p.x}..${p.x + p.width} vs + x ${b.x}..${b.x + b.width}`).toBe(true);
+  });
+});

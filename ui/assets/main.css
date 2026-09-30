@@ -33,6 +33,17 @@
     margin: auto;
 }
 
+/* Anchored beside its "+", flipped to stay on screen; centred where anchor positioning is missing. No @starting-style: WebKit 317926. */
+@supports (position-area: block-end) {
+    #reaction-picker {
+        /* Otherwise a "+" near the screen edge squeezes the picker into the sliver beside it, and it never flips. */
+        width: max-content;
+        margin: 0.25rem 0;
+        position-area: block-end span-inline-end;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    }
+}
+
 /* Touch reveal for the inline add-reaction "+" button (same failure mode as
  * #402/#462 above): `.add-reaction-btn` reveals via `.group:hover`, a real
  * CSS `:hover`, which touch devices can't reliably trigger — so on a phone
