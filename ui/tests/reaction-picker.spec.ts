@@ -119,14 +119,8 @@ test("picking an emoji reacts to that message and closes the picker", async ({ p
 
 test("switching rooms closes it", async ({ page }) => {
   await openFrom(page, await middlePlus(page));
-  // By keyboard: a click outside would light-dismiss the picker before the room changes.
-  const room = page.getByTestId("room-list").getByRole("button", { name: "Team Chat Room" });
-  if (!(await room.isVisible())) {
-    await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).focus();
-    await page.keyboard.press("Enter");
-  }
-  await room.focus();
-  await page.keyboard.press("Enter");
+  // As a notification does: a click would light-dismiss the picker, and moving focus closes it too.
+  await page.evaluate(() => (window as any).__riverTest.switchRoom("Team Chat Room"));
   await expect(page.getByRole("heading", { name: "Team Chat Room" })).toBeVisible();
   await expect(page.locator(PICKER)).toBeHidden();
 });

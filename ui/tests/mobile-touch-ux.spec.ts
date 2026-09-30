@@ -416,6 +416,24 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await expect(preview).toContainText(`@${b.author}: ${b.text}`);
   });
 
+  test("switching rooms closes the menu", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    await page.getByTestId("message-kebab").first().click();
+    const menu = page.getByTestId("message-action-menu");
+    await expect(menu).toBeVisible();
+    // As a notification does: a click would light-dismiss the menu, and moving focus closes it too.
+    await page.evaluate(() => (window as any).__riverTest.switchRoom("Team Chat Room"));
+    await expect(page.getByRole("heading", { name: "Team Chat Room" })).toBeVisible();
+    await expect(menu).toBeHidden();
+  });
+
   test("nothing covers the open menu, even over later messages", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
