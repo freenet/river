@@ -126,7 +126,7 @@ pub fn parse_share_fragment(raw: &str) -> Option<ShareTarget> {
 /// short input rather than rejecting it, so the decoded bytes must re-encode
 /// to the identical text. An id made only of `'1'`s is refused to match the
 /// page, whose decoder turns 32 `'1'`s into 33 bytes.
-fn is_valid_contract_id(candidate: &str) -> bool {
+pub(crate) fn is_valid_contract_id(candidate: &str) -> bool {
     if candidate.is_empty() || candidate.len() > MAX_CANDIDATE_ID_LEN {
         return false;
     }

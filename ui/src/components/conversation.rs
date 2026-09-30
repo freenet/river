@@ -1371,21 +1371,24 @@ fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
         // DIFFERENT contract: show such a label as plain text rather than as
         // a link that is not what it says. A bare pasted link (its text is
         // the URL) names its own destination and is exempt.
-        let mut opening = opening;
         if rewrite_freenet_hrefs {
             if let Some(dest_id) = node_destination(original_href.as_deref()) {
-                // Bare: the text IS the absolute URL, host included, so it
-                // shows where it goes. (Not for relative hrefs, whose text can
-                // hide where the browser resolves them.)
-                let bare = label_names_same_contract_as(inner, original_href.as_deref())
-                    || (original_href.as_deref() == Some(inner) && inner.contains("://"));
-                if !bare && label_contradicts_destination(inner, dest_id) {
+                // A pasted link needs no exemption: its text names its own
+                // contract, a consistent claim. The one exemption is a URL
+                // whose destination is UNKNOWN but whose text is exactly the
+                // absolute URL with nothing that moves it unreadably (no dot
+                // segment, no percent-escape), e.g. an id that does not
+                // parse: what the reader sees is where it goes.
+                let bare = dest_id.is_none()
+                    && original_href.as_deref() == Some(inner)
+                    && plain_absolute_url(inner);
+                // A tooltip is label text too.
+                let title = extract_attr(&opening, "title");
+                if !bare && label_contradicts_destination(inner, title.as_deref(), dest_id) {
                     out.push_str(inner);
                     rest = tail;
                     continue;
                 }
-                // A tooltip is label text too, and is not checked: drop it.
-                opening = strip_title_attr(&opening);
             }
         }
         let opening = if rewrite_freenet_hrefs {
@@ -1442,7 +1445,7 @@ fn node_destination(href: Option<&str>) -> Option<Option<String>> {
     // Protocol-relative `//host/…` takes the page's scheme.
     let absolute = match href.strip_prefix("//") {
         Some(rest) => Some(format!("http://{rest}")),
-        None => href.contains("://").then(|| href.to_string()),
+        None => has_scheme_and_authority(href).then(|| href.to_string()),
     };
     if let Some(absolute) = absolute {
         if let Some(parsed) = parse_freenet_web_url(&absolute) {
@@ -1491,14 +1494,28 @@ fn node_destination(href: Option<&str>) -> Option<Option<String>> {
 /// ([`crate::util::confusable::visual_ascii`] of the decoded text, tags
 /// dropped but image `alt` kept), so invisible characters, character
 /// references, fancy text and homoglyphs inside an id do not hide it. A claim
-/// is a run of 32+ base58 characters with an uppercase letter (a contract id
-/// is 43-44; a hex hash or an ordinary word is not), or a run of 6+ right
-/// after `freenet:`/`freenet://` (a shortened id such as `freenet:UDzGbcWr`).
-/// Each claim must be a prefix of the destination id. An id broken up by
-/// spaces or punctuation is not recognised; a label naming no contract
-/// (`[River update](…)`) claims nothing, like any other link text.
-fn label_contradicts_destination(inner: &str, dest_id: Option<String>) -> bool {
-    let claims = label_claimed_ids(inner);
+/// is a run of 32+ ASCII letters/digits with an uppercase letter (a contract
+/// id is 43-44; a hex hash or an ordinary word is not), or an id-looking run
+/// of 6+ after a `freenet:` marker (a shortened id such as
+/// `freenet:UDzGbcWr`). Each claim must be a prefix of the destination id,
+/// and the label's tooltip and any image tooltip inside it are read too. An id
+/// broken up by a visible ASCII space or punctuation is not recognised
+/// (freenet/river#736); a label naming no contract (`[River update](…)`)
+/// claims nothing, like any other link text.
+fn label_contradicts_destination(
+    inner: &str,
+    title: Option<&str>,
+    dest_id: Option<String>,
+) -> bool {
+    // The label, the link's tooltip, and any tooltip of an image inside it.
+    let mut claims = label_claimed_ids(inner);
+    let img_titles = inner
+        .split("<img")
+        .skip(1)
+        .filter_map(|rest| extract_attr(&format!("<img{}", rest.split('>').next()?), "title"));
+    for text in title.map(str::to_string).into_iter().chain(img_titles) {
+        claims.extend(label_claimed_ids(&text));
+    }
     if claims.is_empty() {
         return false;
     }
@@ -1511,37 +1528,70 @@ fn label_contradicts_destination(inner: &str, dest_id: Option<String>) -> bool {
 /// The contract-id claims in an anchor's visible text. See
 /// [`label_contradicts_destination`].
 fn label_claimed_ids(inner: &str) -> Vec<String> {
-    // Anything that can split an id without the reader seeing a break is
-    // dropped, not treated as a separator: line breaks (an id wrapping looks
-    // the same), every non-ASCII space (hair, thin, no-break, …), and any
-    // non-ASCII character that is not a letter or digit after the visual fold
-    // (stray combining marks, symbols). This is a comparison, not rendering,
-    // so joining too much can only unlink more, never link something new.
+    // Anything that can split an id without the reader seeing a break must
+    // not: line breaks (an id wrapping looks the same) and every non-ASCII
+    // space (hair, thin, no-break, …) are dropped, and other non-ASCII
+    // characters between letters/digits are joined (below). This is a
+    // comparison, not rendering, so joining too much can only unlink more,
+    // never link something new.
     let decoded = decode_html_text(&visible_text_with_alt(inner));
     let spaced: String = decoded
         .chars()
         .filter(|c| !(c.is_whitespace() && *c != ' '))
         .collect();
-    let text: String = crate::util::confusable::visual_ascii(&spaced)
+    let folded: Vec<char> = crate::util::confusable::visual_ascii(&spaced)
         .chars()
-        .filter(|c| c.is_ascii() || c.is_alphanumeric())
         .collect();
+    // Any non-ASCII character left after the visual fold that sits between
+    // two ASCII letters/digits (an unfolded homoglyph, a zero-width combining
+    // mark, …) is kept INSIDE the run as a placeholder, so it cannot split an
+    // id; a run containing it can never be a prefix of an (ASCII) id.
+    const JOINED: char = '\u{FFFD}';
+    let mut text = String::with_capacity(folded.len());
+    let mut k = 0;
+    while k < folded.len() {
+        let c = folded[k];
+        if c.is_ascii() {
+            text.push(c);
+            k += 1;
+            continue;
+        }
+        let run_end = (k..folded.len())
+            .find(|&e| folded[e].is_ascii())
+            .unwrap_or(folded.len());
+        let flanked = k > 0
+            && folded[k - 1].is_ascii_alphanumeric()
+            && folded
+                .get(run_end)
+                .is_some_and(|n| n.is_ascii_alphanumeric());
+        text.push(if flanked { JOINED } else { ' ' });
+        k = run_end;
+    }
     let lower = text.to_ascii_lowercase();
-    let is_base58 = |c: char| matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z');
+    // Runs are over ASCII letters and digits, not just base58: `O`, `0`, `I`
+    // and `l` read as part of an id, and a run containing one can never be a
+    // prefix of a real id.
+    let in_run = |c: char| c.is_ascii_alphanumeric() || c == JOINED;
     let mut claims = Vec::new();
-    let mut run_start: Option<usize> = None;
     let flush = |start: usize, end: usize, claims: &mut Vec<String>| {
         let run = &text[start..end];
+        let len = run.chars().count();
+        let has_upper = run.chars().any(|c| c.is_ascii_uppercase());
+        // After a `freenet:` marker, a SHORT run only counts if it looks like
+        // an id (a digit, or a capital after the first character), so
+        // "Freenet: Harvest market" is prose, not a claim.
+        let id_like_short = run.chars().any(|c| c.is_ascii_digit() || c == JOINED)
+            || run.chars().skip(1).any(|c| c.is_ascii_uppercase());
         let after_marker = lower[..start]
             .trim_end_matches([' ', '/'])
             .ends_with("freenet:");
-        let looks_like_id = run.len() >= 32 && run.bytes().any(|b| b.is_ascii_uppercase());
-        if looks_like_id || (run.len() >= 6 && after_marker) {
+        if (len >= 32 && has_upper) || (len >= 6 && after_marker && id_like_short) {
             claims.push(run.to_string());
         }
     };
+    let mut run_start: Option<usize> = None;
     for (i, c) in text.char_indices() {
-        match (is_base58(c), run_start) {
+        match (in_run(c), run_start) {
             (true, None) => run_start = Some(i),
             (false, Some(start)) => {
                 flush(start, i, &mut claims);
@@ -1556,18 +1606,42 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
     claims
 }
 
-/// `opening` (an `<a …>` tag as the markdown crate emits it) without its
-/// `title="…"` attribute. The crate encodes `"` inside attribute values, so
-/// the next `"` closes it.
-fn strip_title_attr(opening: &str) -> String {
-    let Some(start) = opening.find(" title=\"") else {
-        return opening.to_string();
+/// True for `scheme://…` (RFC 3986 scheme syntax), i.e. an absolute URL with
+/// an authority. A `://` later in the href (in a query or fragment) does not
+/// count, so `../x/#://` stays relative.
+fn has_scheme_and_authority(href: &str) -> bool {
+    let Some(colon) = href.find("://") else {
+        return false;
     };
-    let value_start = start + " title=\"".len();
-    match opening[value_start..].find('"') {
-        Some(end) => format!("{}{}", &opening[..start], &opening[value_start + end + 1..]),
-        None => opening.to_string(),
+    let scheme = &href[..colon];
+    scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// True for an absolute `scheme://host/path` whose text is where it goes:
+/// no percent-escapes and no dot segments in the path.
+fn plain_absolute_url(url: &str) -> bool {
+    if !has_scheme_and_authority(url) || url.contains('%') {
+        return false;
     }
+    let after_authority = url
+        .split_once("://")
+        .map(|(_, rest)| rest.find('/').map_or("", |p| &rest[p..]))
+        .unwrap_or("");
+    let path = after_authority.split(['?', '#']).next().unwrap_or("");
+    !path.split('/').any(crate::util::share_link::is_dot_segment)
+}
+
+/// The raw (still entity-encoded) value of attribute `name` in a tag emitted
+/// by the markdown crate, which always double-quotes values and encodes `"`
+/// inside them.
+fn extract_attr(tag: &str, name: &str) -> Option<String> {
+    let marker = format!(" {name}=\"");
+    let start = tag.find(&marker)? + marker.len();
+    let end = tag[start..].find('"')?;
+    Some(tag[start..start + end].to_string())
 }
 
 /// An anchor's inner HTML reduced to what a reader sees: tags dropped, except
@@ -1586,32 +1660,14 @@ fn visible_text_with_alt(html: &str) -> String {
         // No padding: a broken image shows its alt inline, and an empty one
         // shows nothing, so neither must split what the reader sees as one id.
         if tag.starts_with("<img") {
-            if let Some(alt) = tag.find("alt=\"").and_then(|i| {
-                let v = &tag[i + 5..];
-                v.find('"').map(|e| &v[..e])
-            }) {
-                out.push_str(alt);
+            if let Some(alt) = extract_attr(tag, "alt") {
+                out.push_str(&alt);
             }
         }
         rest = &rest[pos + end + 1..];
     }
     out.push_str(rest);
     out
-}
-
-/// True if the anchor's visible text is itself a gateway URL for the same
-/// contract as `href` (a bare pasted link, whose href is just the markdown
-/// crate's normalisation of the text).
-fn label_names_same_contract_as(inner: &str, href: Option<&str>) -> bool {
-    let Some(href) = href else { return false };
-    if inner.contains('<') {
-        return false;
-    }
-    let label = decode_html_text(inner);
-    match (parse_freenet_web_url(&label), parse_freenet_web_url(href)) {
-        (Some(a), Some(b)) => a.contract_id == b.contract_id,
-        _ => false,
-    }
 }
 
 /// True for an href with no scheme and no authority, i.e. one the browser
@@ -1719,13 +1775,15 @@ fn extract_bare_freenet_links(text: &str) -> (std::borrow::Cow<'_, str>, Vec<Str
         if clean[..start]
             .chars()
             .next_back()
-            .is_some_and(|c| c.is_alphanumeric())
+            .is_some_and(|c| c.is_ascii_alphanumeric())
         {
             continue;
         }
         if run_end <= start {
+            // A `|` ends it too: tables split cells on it before inline
+            // parsing, which this pass runs ahead of.
             run_end = clean[start..]
-                .find(char::is_whitespace)
+                .find(|c: char| c.is_whitespace() || c == '|')
                 .map_or(clean.len(), |p| start + p);
         }
         // Message text is attacker-controlled, so bound the work per
@@ -1744,7 +1802,13 @@ fn extract_bare_freenet_links(text: &str) -> (std::borrow::Cow<'_, str>, Vec<Str
                     token[..token.len() - 1].chars().next_back(),
                     Some('/' | '.')
                 );
-            if ("!\"',.:;?_~*".contains(last) && !dot_in_segment) || unbalanced_paren {
+            // Non-ASCII punctuation (`。`, `」`, …) can never be part of a
+            // valid link, so it is trimmed like ASCII sentence punctuation.
+            let foreign_punctuation = !last.is_ascii() && !last.is_alphanumeric();
+            if ("!\"',.:;?_~*".contains(last) && !dot_in_segment)
+                || unbalanced_paren
+                || foreign_punctuation
+            {
                 token = &token[..token.len() - last.len_utf8()];
                 if last == ')' {
                     close_parens -= 1;
@@ -2097,7 +2161,11 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
     // not read as a Freenet link of its own: `…/web/<B>/freenet:<A>` would
     // otherwise read as a link to A. Show such a URL in full instead.
     let suffix_seen = crate::util::confusable::visual_ascii(parsed.suffix).to_ascii_lowercase();
-    if suffix_seen.contains("freenet") || suffix_seen.contains("contract/web") {
+    let names_a_contract = parsed
+        .suffix
+        .split(|c: char| !is_base58_char(c))
+        .any(crate::util::share_link::is_valid_contract_id);
+    if suffix_seen.contains("freenet") || suffix_seen.contains("contract/web") || names_a_contract {
         return None;
     }
     // A bare trailing slash adds no information; drop it.
@@ -8155,35 +8223,157 @@ mod tests {
         }
     }
 
-    /// A tooltip is label text the check does not read, so a link that opens
-    /// on the reader's node drops it.
+    /// A tooltip is label text too: one naming another contract unlinks a
+    /// link that opens on the reader's node; an honest one is kept.
     #[test]
-    fn node_link_drops_title() {
+    fn node_link_title_is_checked_like_the_label() {
+        let href = format!("/v1/contract/web/{SAMPLE_ID}/");
+        for text in [
+            format!("[River]({href} \"freenet:{RIVER_ID}\")"),
+            format!("[![River](x.png \"freenet:{RIVER_ID}\")]({href})"),
+        ] {
+            let html = message_to_html(&text);
+            assert!(!html.contains("<a "), "{text:?}: {html}");
+        }
         let html = message_to_html(&format!(
-            "[River](/v1/contract/web/{SAMPLE_ID}/ \"freenet:{RIVER_ID}\")"
+            "[Explore with Atlas](http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/ \"Atlas search engine\")"
         ));
-        assert!(html.contains("<a "), "{html}");
-        assert!(!html.contains("title="), "{html}");
-        // External links keep theirs.
-        let html = message_to_html("[docs](https://example.com/ \"The docs\")");
-        assert!(html.contains("title=\"The docs\""), "{html}");
+        assert!(
+            html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/\""))
+                && html.contains("title=\"Atlas search engine\""),
+            "{html}"
+        );
     }
 
-    /// A shortened gateway label shows only an 8-character id prefix, so a
-    /// URL whose path names another contract is shown in full instead.
     #[test]
-    fn gateway_label_is_not_shortened_when_its_path_names_a_contract() {
+    fn round5_label_bypasses_are_closed() {
+        let a = RIVER_ID;
+        let b = SAMPLE_ID;
+        let (head, tail) = a.split_at(20);
+        for text in [
+            // `://` later in a relative href does not make it absolute.
+            format!("[River {a}](/v1/contract/./web/{b}/?x=://)"),
+            format!("[River {a}](../{b}/#://)"),
+            format!("[freenet:raAqMhMG](../{b}/#://)"),
+            // Unfolded homoglyphs and zero-width marks inside an id.
+            format!("[{head}\u{0261}{tail}](/v1/contract/web/{b}/)"),
+            format!("[{head}\u{051A}{tail}](/v1/contract/web/{b}/)"),
+            format!("[{head}\u{0417}{tail}](/v1/contract/web/{b}/)"),
+            format!("[River: {head}\u{05BC}{tail}](/v1/contract/web/{b}/)"),
+            format!("[open freenet:raAq\u{05BC}MhMG](/v1/contract/web/{b}/)"),
+            // A look-alike that is not base58.
+            format!("[River: {head}O{tail}](/v1/contract/web/{b}/)"),
+            // Userinfo shows `freenet:<A>` first.
+            format!(
+                "[http://freenet:{a}@x.example/v1/contract/web/{b}/](http://127.0.0.1:7509/v1/contract/web/{b}/)"
+            ),
+        ] {
+            let html = message_to_html(&text);
+            assert!(!html.contains("<a "), "{text:?}: {html}");
+        }
+        // A bare URL whose text hides where it lands (encoded dot segment and
+        // id) is not a link.
+        let html = message_to_html(&format!(
+            "http://127.0.0.1:7509/v1/contract/web/{a}/%2e%2e/%36%46{}/",
+            &b[2..]
+        ));
+        assert!(!html.contains("<a "), "{html}");
+        let rel = format!("/v1/contract/web/{a}/%2e%2e/{b}/#://");
+        let html = message_to_html(&format!("[{rel}]({rel})"));
+        assert!(!html.contains("<a "), "{html}");
+    }
+
+    #[test]
+    fn claim_rule_edges() {
+        let b = SAMPLE_ID;
+        let href = format!("/v1/contract/web/{b}/");
+        // A claim must be a PREFIX of the destination id, not just appear in it.
+        let html = message_to_html(&format!("[freenet:{}]({href})", &b[3..12]));
+        assert!(!html.contains("<a "), "substring, not prefix: {html}");
+        let html = message_to_html(&format!("[freenet:{}]({href})", &b[..9]));
+        assert!(html.contains("<a "), "a true prefix is consistent: {html}");
+        // A long lowercase run (a hex hash) is not an id claim.
+        let html = message_to_html(&format!(
+            "[commit 3f2a9c1be47d58a6f0c2e9b1d3a4f5e6c7b8a9d0]({href})"
+        ));
+        assert!(html.contains("<a "), "hex hash is not a claim: {html}");
+        // A URL-shaped label for the right contract that ALSO names another.
+        let html = message_to_html(&format!(
+            "[http://other.example/v1/contract/web/{b}/freenet:{RIVER_ID}](http://other.example/v1/contract/web/{b}/x)"
+        ));
+        assert!(!html.contains("<a "), "embedded second claim: {html}");
+        // A bare URL whose id is percent-encoded does not show where it goes.
+        let html = message_to_html(&format!(
+            "http://127.0.0.1:7509/v1/contract/web/%36%46{}/",
+            &b[2..]
+        ));
+        assert!(!html.contains("<a "), "encoded id: {html}");
+    }
+
+    #[test]
+    fn freenet_in_prose_labels_is_not_a_claim() {
+        let href = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/");
+        for label in [
+            "Try it on Freenet: Harvest market",
+            "Freenet: Ghostkey",
+            "Get Freenet: Windows installer",
+            "freenet:Harvest",
+        ] {
+            let html = message_to_html(&format!("[{label}]({href})"));
+            assert!(
+                html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/\"")),
+                "{label:?}: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_link_in_a_table_cell_stops_at_the_cell() {
+        let html = message_to_html(&format!("|a|b|\n|-|-|\n|freenet:{RIVER_ID}/x|y|"));
+        assert!(
+            anchor_to(
+                &html,
+                &format!("/v1/contract/web/{RIVER_ID}/x"),
+                &format!("freenet:{RIVER_ID}/x")
+            ),
+            "{html}"
+        );
+        assert!(html.contains("<td>y</td>"), "{html}");
+    }
+
+    #[test]
+    fn bare_link_inside_cjk_text() {
+        let html = message_to_html(&format!("打开freenet:{RIVER_ID}/。"));
+        assert!(
+            anchor_to(
+                &html,
+                &format!("/v1/contract/web/{RIVER_ID}/"),
+                &format!("freenet:{RIVER_ID}/")
+            ),
+            "{html}"
+        );
+    }
+
+    /// A pasted gateway URL whose path names a second contract shows two
+    /// ids, only one of which it opens, so it is shown as text; one naming
+    /// only its own contract is still a (shortened) link.
+    #[test]
+    fn gateway_url_whose_path_names_another_contract_is_not_a_link() {
         for url in [
             format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/freenet:{RIVER_ID}"),
-            format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/x/contract/web/{RIVER_ID}"),
+            format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/x/{RIVER_ID}"),
         ] {
             let html = message_to_html(&url);
-            assert!(
-                !html.contains(&format!(">freenet:{}", &SAMPLE_ID[..8])),
-                "{html}"
-            );
-            assert!(html.contains(&format!(">{url}</a>")), "{html}");
+            assert!(!html.contains("<a "), "{html}");
+            assert!(html.contains(&url), "{html}");
         }
+        let html = message_to_html(&format!(
+            "http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/?invitation=abc"
+        ));
+        assert!(
+            html.contains(&format!(">freenet:{}/?invitation=abc</a>", &SAMPLE_ID[..8])),
+            "{html}"
+        );
     }
 
     /// A share link that sits right against a non-prose range (no space)
@@ -8673,10 +8863,12 @@ mod tests {
             !html.contains("freenet:"),
             "URL with `..` segments in suffix must not be beautified either: {html}"
         );
+        // Its text names a contract but the dot segments move where it lands
+        // (on the reader's node too, when the host is theirs), so since #733
+        // it is shown as plain text rather than as a link to either place.
         assert!(
-            html.contains(&format!("href=\"{url}\"")),
-            "original URL must be left intact so the click goes to attacker.example, \
-             not to the reader's own gateway: {html}"
+            !html.contains("<a ") && html.contains(&url),
+            "a `..` gateway URL must be shown as text, never as a link: {html}"
         );
     }
 

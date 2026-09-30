@@ -1665,6 +1665,21 @@ fn damerau_within(a: &[char], b: &[char], cap: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visual_ascii_folds_what_the_reader_sees_and_keeps_case() {
+        assert_eq!(visual_ascii("raAqM"), "raAqM");
+        // Cyrillic homoglyphs, both cases.
+        assert_eq!(visual_ascii("\u{0430}\u{0410}"), "aA");
+        // Fullwidth forms, including punctuation.
+        assert_eq!(visual_ascii("\u{FF52}\u{FF1A}"), "r:");
+        // Mathematical bold.
+        assert_eq!(visual_ascii("\u{1D41F}\u{1D42B}"), "fr");
+        // Invisible and joiner characters dropped; hidden spaces become ' '.
+        assert_eq!(visual_ascii("fr\u{200B}ee\u{200D}net"), "freenet");
+        // Combining accents stripped, precomposed ones too.
+        assert_eq!(visual_ascii("e\u{0301}\u{00E9}"), "ee");
+    }
+
     use super::*;
 
     fn mid(n: i64) -> MemberId {
