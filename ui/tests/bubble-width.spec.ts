@@ -65,3 +65,26 @@ test("a reaction row wider than its message widens the bubble", { tag: "@chromiu
     rowBox.width - 1
   );
 });
+
+for (const width of [1280, 320]) {
+  test(`action controls stay in the column under a pile of reactions @ ${width}px`, async ({
+    page,
+  }) => {
+    await openRoom(page, width);
+    const touch = await page.evaluate(() => matchMedia("(hover: none)").matches);
+    const scroller = (await page.locator("#chat-scroll-container").boundingBox())!;
+    // Received (left-aligned) and own (right-aligned); example data piles 24 chips on each.
+    for (const text of [/keep it civil/, /welcome/]) {
+      const row = page
+        .locator('[id^="msg-"]')
+        .filter({ has: page.getByTestId("message-bubble").filter({ hasText: text }) });
+      await expect(row.getByTestId("reaction-chip")).toHaveCount(24);
+      const control = row.getByTestId(touch ? "message-kebab" : "message-hover-actions");
+      const box = (await control.boundingBox())!;
+      expect(box.x, `${text} control's left edge`).toBeGreaterThanOrEqual(scroller.x);
+      expect(box.x + box.width, `${text} control's right edge`).toBeLessThanOrEqual(
+        scroller.x + scroller.width
+      );
+    }
+  });
+}

@@ -4946,9 +4946,9 @@ fn MessageGroupComponent(
                                 }
                             }
                         }
-                        // Content-sized: the bubble spans its reaction row, past its own cap if need be (min-w-full).
+                        // Content-sized up to 75cqi: reactions widen the bubble to that cap (min-w-full), then wrap.
                         div {
-                            class: "flex flex-col min-w-0 max-w-full",
+                            class: "msg-body flex flex-col min-w-0",
                             // Container for message bubble + hover actions
                             div {
                                 class: "relative",
@@ -5278,6 +5278,7 @@ fn MessageGroupComponent(
                                             // desktop, where the pointer must cross an empty gap to
                                             // reach it (a Tailwind `group-hover:pointer-events` gate
                                             // would drop hover mid-gap and make it unreachable). #402.
+                                            "data-testid": "message-hover-actions",
                                             class: format!(
                                                 "hover-actions absolute top-1/2 -translate-y-1/2 transition-opacity z-50 flex flex-col items-start bg-panel rounded-lg shadow-md border border-border px-2 py-1.5 opacity-0 group-hover:opacity-100 {} {}",
                                                 if is_self { "left-0 -translate-x-full -ml-2" } else { "right-0 translate-x-full ml-2" },
