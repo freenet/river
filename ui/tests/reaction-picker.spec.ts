@@ -137,3 +137,23 @@ test.describe("on a short landscape screen", () => {
     expect(p.y + p.height).toBeLessThanOrEqual(390 + 1);
   });
 });
+
+test("its panels and buttons are hidden where the Popover API is missing", async ({ page }) => {
+  // No supporting engine can run the guard, so read the rule through the CSSOM, which keeps it either way.
+  const hidden = await page.evaluate(() => {
+    const rules = [...document.styleSheets].flatMap((s) => {
+      try {
+        return [...s.cssRules];
+      } catch {
+        return [];
+      }
+    });
+    const guard = rules.find(
+      (r) => r instanceof CSSSupportsRule && /not\s+selector\(:popover-open\)/.test(r.conditionText)
+    ) as CSSSupportsRule | undefined;
+    return guard ? [...guard.cssRules].map((r) => (r as CSSStyleRule).selectorText).join(",") : "";
+  });
+  for (const sel of ["#reaction-picker", "#message-action-menu", ".add-reaction-btn", ".touch-actions"]) {
+    expect(hidden).toContain(sel);
+  }
+});

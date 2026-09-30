@@ -61,6 +61,11 @@
     }
 }
 
+/* No Popover API (Safari < 17, Firefox < 125, Chromium < 114): the panels would render in the page and their buttons would do nothing. */
+@supports not selector(:popover-open) {
+    #reaction-picker, #message-action-menu, .add-reaction-btn, .touch-actions { display: none !important; }
+}
+
 /* Touch reveal for the inline add-reaction "+" button (same failure mode as
  * #402/#462 below): `.add-reaction-btn` reveals via `.group:hover`, a real
  * CSS `:hover`, which touch devices can't reliably trigger — so on a phone
