@@ -1917,12 +1917,20 @@ fn first_history_row_identity() -> Option<(String, i32)> {
 #[cfg(target_arch = "wasm32")]
 const SCROLL_TOP_SLACK_PX: i32 = 2;
 
-/// Both edges of the view as last accounted for; see `reader_moved_up_since`.
+/// Both edges of the view as last accounted for, and the width the history was
+/// laid out at then; see `reader_moved_up_since`.
 #[cfg(target_arch = "wasm32")]
 #[derive(Default)]
 struct ScrollMark {
     top: std::cell::Cell<i32>,
     height: std::cell::Cell<i32>,
+    width: std::cell::Cell<i32>,
+}
+
+/// The width the history's text wraps at. Offsets only compare within one.
+#[cfg(target_arch = "wasm32")]
+fn history_layout_width() -> i32 {
+    chat_content_wrapper().map_or(0, |c| c.client_width())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1936,6 +1944,11 @@ impl ScrollMark {
     fn record(&self, top: i32, height: i32) {
         self.top.set(top);
         self.height.set(height);
+        self.width.set(history_layout_width());
+    }
+    /// The history has been rewrapped since the mark was taken.
+    fn rewrapped(&self) -> bool {
+        self.width.get() != history_layout_width()
     }
     /// Content above the view moved by `delta`, which moves both edges.
     fn shift(&self, delta: i32) {
@@ -1973,6 +1986,13 @@ fn reader_moved_up_since(last_top: &Rc<ScrollMark>) -> bool {
     let Some(container) = chat_scroll_container() else {
         return false;
     };
+    // Offsets from before a rewrap say nothing about the view after it, and
+    // the rewrap can clamp `scrollTop` partway through before the history comes
+    // out taller: Chromium does, with a size container in the history (8px on
+    // Linux fonts), leaving both edges above the mark and no `scrollend` coming.
+    if last_top.rewrapped() {
+        return false;
+    }
     let top = container.scroll_top();
     let bottom = top + container.client_height();
     // Never judge against an edge the container can no longer reach: if the
@@ -2078,6 +2098,7 @@ fn install_scroll_pin_listeners(
                 return;
             };
             let settled_at = container.scroll_top();
+            let rewrapped = last_top.rewrapped();
             let ours = (settled_at - last_top.top()).abs() <= SCROLL_TOP_SLACK_PX;
             // Where the view ended up is a fact whoever caused it, and it is
             // what everything else compares against. Recorded before the
@@ -2148,7 +2169,10 @@ fn install_scroll_pin_listeners(
             if ours {
                 return;
             }
-            pinned.set(distance <= BOTTOM_THRESHOLD_PX);
+            // A settle across a rewrap can't be placed against the mark, and
+            // WebKit settles the rewrap's own clamp: it may arm the pin, never
+            // clear it.
+            pinned.set(distance <= BOTTOM_THRESHOLD_PX || (rewrapped && pinned.get()));
         }) as Box<dyn FnMut()>)
     };
     let settle_fn: js_sys::Function = settle.as_ref().unchecked_ref::<js_sys::Function>().clone();

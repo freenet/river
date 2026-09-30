@@ -107,8 +107,7 @@
     max-width: 75cqi;
 }
 
-/* The gutter keeps max(15%, 3.5rem) for the 54px hover bar and the kebab (until PR 12 inlines them).
- * Wider trips #486's resize test in Chromium: a transient scrollTop clamp reads as a reader scroll. */
+/* The gutter keeps max(15%, 3.5rem) for the 54px hover bar and the kebab (until PR 12 inlines them). */
 .msg-body {
     max-width: min(85cqi, calc(100cqi - 3.5rem));
 }
