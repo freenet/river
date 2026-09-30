@@ -4735,6 +4735,15 @@ pub fn Conversation() -> Element {
     }
 }
 
+/// Scroll the row of the message with id `target` into view and highlight it.
+fn scroll_to_message(target: freenet_scaffold::util::FastHash) -> Option<()> {
+    let el = web_sys::window()?
+        .document()?
+        .get_element_by_id(&format!("msg-{target:?}"))?;
+    el.scroll_into_view();
+    el.class_list().add_1("reply-highlight").ok()
+}
+
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -5067,7 +5076,6 @@ fn MessageGroupComponent(
                                                             }
                                                         }
                                                         div { class: "flex justify-end gap-3 mt-3",
-                                                            style: "overflow: visible;",
                                                             button {
                                                                 class: if is_self {
                                                                     "flex-shrink-0 px-3 py-1.5 text-xs rounded-lg bg-white/20 text-white hover:bg-white/30"
@@ -5099,7 +5107,6 @@ fn MessageGroupComponent(
                                             }
                                         }
                                     } else {
-                                        let reply_strip_inner = reply_strip_val.clone();
                                         rsx! {
                                             // Message bubble. The reply strip (if any) is rendered as
                                             // the first child INSIDE the bubble so it shares the
@@ -5128,7 +5135,7 @@ fn MessageGroupComponent(
                                                 // was invisible on self bubbles because the strip
                                                 // composited to the same colour as the bubble.
                                                 {
-                                                    match reply_strip_inner {
+                                                    match reply_strip_val {
                                                         ReplyStrip::NotAReply => rsx! {},
                                                         // Deliberately inert — no `role`/`tabindex`/
                                                         // `onclick` — because there is no original
@@ -5155,10 +5162,7 @@ fn MessageGroupComponent(
                                                             }
                                                         },
                                                         ReplyStrip::Quote { author, preview, target_id } => {
-                                                            let target_id_str = format!("{:?}", target_id.0);
-                                                            // Clone the target id so we can own one copy in the
-                                                            // onclick handler and one in the onkeydown handler.
-                                                            let target_id_for_key = target_id_str.clone();
+                                                            let target = target_id.0;
                                                             rsx! {
                                                                 div {
                                                                     "data-testid": "reply-strip",
@@ -5171,14 +5175,7 @@ fn MessageGroupComponent(
                                                                     tabindex: "0",
                                                                     "aria-label": "Scroll to the message this is a reply to",
                                                                     onclick: move |_| {
-                                                                        if let Some(window) = web_sys::window() {
-                                                                            if let Some(doc) = window.document() {
-                                                                                if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
-                                                                                    el.scroll_into_view();
-                                                                                    let _ = el.class_list().add_1("reply-highlight");
-                                                                                }
-                                                                            }
-                                                                        }
+                                                                        scroll_to_message(target);
                                                                     },
                                                                     onkeydown: move |e: KeyboardEvent| {
                                                                         // Activate the same scroll-to-original
@@ -5186,14 +5183,7 @@ fn MessageGroupComponent(
                                                                         // users can reach it without a mouse.
                                                                         if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
                                                                             e.prevent_default();
-                                                                            if let Some(window) = web_sys::window() {
-                                                                                if let Some(doc) = window.document() {
-                                                                                    if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_for_key)) {
-                                                                                        el.scroll_into_view();
-                                                                                        let _ = el.class_list().add_1("reply-highlight");
-                                                                                    }
-                                                                                }
-                                                                            }
+                                                                            scroll_to_message(target);
                                                                         }
                                                                     },
                                                                     span { class: "font-medium", "\u{21a9} @{author}: " }
