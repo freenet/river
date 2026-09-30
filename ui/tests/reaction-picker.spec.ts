@@ -122,5 +122,7 @@ test.describe("on a short landscape screen", () => {
     const above = b.y >= p.y + p.height - 1 && b.y - (p.y + p.height) <= 8;
     expect(below || above, `picker y ${p.y}..${p.y + p.height} vs + y ${b.y}..${b.y + b.height}`).toBe(true);
     expect(p.x <= b.x + b.width && p.x + p.width >= b.x, `picker x ${p.x}..${p.x + p.width} vs + x ${b.x}..${b.x + b.width}`).toBe(true);
+    expect(p.y).toBeGreaterThanOrEqual(0);
+    expect(p.y + p.height).toBeLessThanOrEqual(390 + 1);
   });
 });

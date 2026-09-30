@@ -66,7 +66,11 @@ test.describe("Reply bubble layout (#206, #207)", () => {
       const hasReplyStrip = await bubble
         .locator(".reply-strip")
         .count();
-      if (hasReplyStrip === 0) {
+      // Reactions widen a bubble past the cap (see bubble-width.spec.ts), so they are no baseline.
+      const chips = await bubble.evaluate(
+        (el) => el.closest('[id^="msg-"]')!.querySelectorAll('[data-testid="reaction-chip"]').length
+      );
+      if (hasReplyStrip === 0 && chips === 0) {
         const w = await bubble.evaluate(
           (el) => el.getBoundingClientRect().width
         );
