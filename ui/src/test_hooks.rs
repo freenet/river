@@ -1,5 +1,6 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
-//! INBOUND messages and to drive the no-room screen's load states.
+//! INBOUND messages, to edit or delete the viewer's own message as another of
+//! their devices would, and to drive the no-room screen's load states.
 //!
 //! The composer is not a substitute: `handle_send_message` raises
 //! `force_scroll`, which deliberately bypasses the pin that the scroll specs
@@ -120,7 +121,89 @@ pub fn install_test_hooks() {
         });
     });
 
+    // Change the viewer's newest message as if another of their devices had:
+    // a real signed action, so the render path is the one an arrival takes.
+    expose(&hooks, "editLastOwnMessage", move |text: String| {
+        crate::util::defer(move || act_on_last_own_message(OwnAction::Edit(text)));
+    });
+
+    // The argument is unused; `expose` needs one.
+    expose(&hooks, "deleteLastOwnMessage", move |_: u32| {
+        crate::util::defer(move || act_on_last_own_message(OwnAction::Delete));
+    });
+
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
+}
+
+/// What [`act_on_last_own_message`] does to the viewer's newest message.
+enum OwnAction {
+    Edit(String),
+    Delete,
+}
+
+/// Append an edit or delete of the current room's newest own message, signed
+/// with the room's own key, in ONE `ROOMS` mutation.
+fn act_on_last_own_message(action: OwnAction) {
+    use river_core::room_state::content::ActionContentV1;
+
+    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+        return;
+    };
+    ROOMS.with_mut(|rooms| {
+        let Some(room) = rooms.map.get_mut(&room_key) else {
+            return;
+        };
+        let Some(sk) = room.self_sk.clone() else {
+            return;
+        };
+        let self_id = MemberId::from(&sk.verifying_key());
+        let messages = &room.room_state.recent_messages;
+        let Some(target) = messages
+            .messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m.message.author == self_id
+                    && !m.message.content.is_action()
+                    && !messages.actions_state.deleted.contains(&m.id())
+            })
+            .map(|m| m.id())
+        else {
+            web_sys::console::error_1(&"__riverTest: no own message in the current room".into());
+            return;
+        };
+        let content = match (room.is_private(), room.get_secret()) {
+            (true, Some((secret, version))) => {
+                let action = match action {
+                    OwnAction::Edit(text) => ActionContentV1::edit(target, text),
+                    OwnAction::Delete => ActionContentV1::delete(target),
+                };
+                let (ciphertext, nonce) =
+                    crate::util::ecies::encrypt_with_symmetric_key(secret, &action.encode());
+                RoomMessageBody::private_action(ciphertext, nonce, version)
+            }
+            (true, None) => {
+                web_sys::console::error_1(&"__riverTest: private room with no secret".into());
+                return;
+            }
+            (false, _) => match action {
+                OwnAction::Edit(text) => RoomMessageBody::edit(target, text),
+                OwnAction::Delete => RoomMessageBody::delete(target),
+            },
+        };
+        let message = AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: MemberId::from(&room_key),
+                author: self_id,
+                content,
+                time: crate::util::get_current_system_time(),
+            },
+            &sk,
+        );
+        room.room_state.recent_messages.messages.push(message);
+        room.room_state.recent_messages.rebuild_actions_state();
+        room.rebuild_private_actions_state();
+    });
 }
 
 /// Where a delivered message lands in the room's message list.

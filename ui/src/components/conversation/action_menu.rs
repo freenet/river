@@ -13,20 +13,17 @@ use dioxus_free_icons::Icon;
 use river_core::room_state::message::MessageId;
 use wasm_bindgen::JsCast;
 
-use super::ReplyContext;
-
 /// DOM id of the menu, and the value every kebab names in `popovertarget`.
 pub(super) const ACTION_MENU_ID: &str = "message-action-menu";
 
 /// Which message the open menu acts on. Set by the kebab tap, cleared when the menu closes.
+/// Only ids: the actions look the message up when they run, so they never act on a stale copy.
 #[derive(Clone, PartialEq)]
 pub(super) struct MenuTarget {
     pub(super) message_id: MessageId,
-    /// The row's `msg.id`, which `edit_trigger` and the kebab's `aria-expanded` match on.
+    /// The row's `msg.id`, which the kebab's `aria-expanded` matches on.
     pub(super) dom_id: String,
     pub(super) is_self: bool,
-    pub(super) reply: ReplyContext,
-    pub(super) edit_text: String,
 }
 
 fn menu_element() -> Option<web_sys::HtmlElement> {
@@ -52,8 +49,8 @@ pub(super) fn close_action_menu() {
 #[component]
 pub(super) fn ActionMenu(
     target: Signal<Option<MenuTarget>>,
-    on_reply: EventHandler<ReplyContext>,
-    edit_trigger: Signal<Option<(String, String)>>,
+    on_reply: EventHandler<MessageId>,
+    on_edit: EventHandler<MessageId>,
     on_request_delete: EventHandler<MessageId>,
 ) -> Element {
     let is_self = target.read().as_ref().is_some_and(|t| t.is_self);
@@ -80,7 +77,7 @@ pub(super) fn ActionMenu(
                     class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
                     onclick: move |_| {
                         if let Some(t) = target.peek().clone() {
-                            crate::util::defer(move || on_reply.call(t.reply));
+                            crate::util::defer(move || on_reply.call(t.message_id));
                         }
                     },
                     Icon { icon: FaReply, width: 14, height: 14 }
@@ -94,8 +91,7 @@ pub(super) fn ActionMenu(
                         class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
                         onclick: move |_| {
                             if let Some(t) = target.peek().clone() {
-                                let mut edit_trigger = edit_trigger;
-                                crate::util::defer(move || edit_trigger.set(Some((t.dom_id, t.edit_text))));
+                                crate::util::defer(move || on_edit.call(t.message_id));
                             }
                         },
                         Icon { icon: FaPenToSquare, width: 14, height: 14 }

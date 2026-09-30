@@ -283,6 +283,27 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await expect(kebabs.nth(2)).toHaveAttribute("aria-expanded", "true");
   });
 
+  test("Edit loads the message as it is now, not as it was when the menu opened", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    const id = await page.locator('[id^="msg-"]:has(.bg-accent)').last().evaluate((el) => el.id);
+    const row = page.locator(`[id="${id}"]`);
+    await row.getByTestId("message-kebab").click();
+    const menu = page.getByTestId("message-action-menu");
+    await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
+    // Edited on another device while the menu is open.
+    await page.evaluate(() => (window as any).__riverTest.editLastOwnMessage("edited elsewhere"));
+    await expect(row.getByTestId("message-bubble")).toContainText("edited elsewhere");
+    await menu.getByRole("button", { name: "Edit" }).click();
+    await expect(page.locator('textarea[id^="edit-msg-"]')).toHaveValue("edited elsewhere");
+  });
+
   test("nothing covers the open menu, even over later messages", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);

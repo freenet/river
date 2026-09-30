@@ -856,6 +856,38 @@ pub(crate) fn decrypt_message_content(
     }
 }
 
+/// The group and message `id` names in `items`, or `None` once it has gone (deleted, pruned, or another room).
+fn find_message<'a>(
+    items: &'a [DisplayItem],
+    id: &MessageId,
+) -> Option<(&'a MessageGroup, &'a GroupedMessage)> {
+    items.iter().find_map(|item| match item {
+        DisplayItem::Messages(group) => group
+            .messages
+            .iter()
+            .find(|m| &m.message_id == id)
+            .map(|m| (group, m)),
+        DisplayItem::Event(_) => None,
+    })
+}
+
+/// A reply to `msg` by `author_name`; the hover bar and the action menu both build it here.
+fn reply_context_for(
+    author_name: &str,
+    msg: &GroupedMessage,
+    member_names: &HashMap<MemberId, String>,
+) -> ReplyContext {
+    ReplyContext {
+        message_id: msg.message_id.clone(),
+        author_name: author_name.to_string(),
+        // Cleaned BEFORE truncating, so no consumer ever sees a raw mention token cut in half.
+        content_preview: clean_reply_preview(&msg.content_text, member_names)
+            .chars()
+            .take(100)
+            .collect(),
+    }
+}
+
 /// Clean a quoted reply-preview snapshot for display: resolve `@[name](rv:id)`
 /// mention tokens to plain `@name` (using each member's *current* nickname, with
 /// the token snapshot as fallback) and strip markdown formatting, so the preview
@@ -4454,10 +4486,30 @@ pub fn Conversation() -> Element {
                 target: picker_target,
                 on_react: move |(id, emoji): (MessageId, String)| handle_toggle_reaction(id, emoji),
             }
+            // The menu hands back an id and the message is looked up now, so it acts on the message as it is now.
             ActionMenu {
                 target: menu_target,
-                on_reply: on_reply_ctx,
-                edit_trigger: edit_trigger,
+                on_reply: move |id: MessageId| {
+                    let ctx = message_groups.peek().as_ref().and_then(|(items, _, names)| {
+                        find_message(items, &id).map(|(g, m)| reply_context_for(&g.author_name, m, names))
+                    });
+                    match ctx {
+                        Some(ctx) => {
+                            let mut reply = on_reply_ctx;
+                            reply(ctx);
+                        }
+                        None => warn!("Reply target {id:?} is no longer in the history; reply dropped"),
+                    }
+                },
+                on_edit: move |id: MessageId| {
+                    let found = message_groups.peek().as_ref().and_then(|(items, _, _)| {
+                        find_message(items, &id).map(|(_, m)| (m.id.clone(), m.content_text.clone()))
+                    });
+                    match found {
+                        Some(trigger) => edit_trigger.set(Some(trigger)),
+                        None => warn!("Edit target {id:?} is no longer in the history; edit dropped"),
+                    }
+                },
                 on_request_delete: move |msg_id| pending_delete.set(Some(msg_id)),
             }
 
@@ -5257,17 +5309,8 @@ fn MessageGroupComponent(
                                 {
                                     let msg_id_str_for_edit = msg.id.clone();
                                     let msg_id_for_delete = msg.message_id.clone();
-                                    let msg_id_for_reply = msg.message_id.clone();
                                     let current_text = msg.content_text.clone();
-                                    // Clean the snapshot (mentions -> @name, markdown stripped)
-                                    // BEFORE truncating, so the stored preview is plain text and
-                                    // no consumer (UI, CLI, old client) ever sees a raw token —
-                                    // even one that would have crossed the truncation boundary.
-                                    let reply_text_preview = clean_reply_preview(&msg.content_text, &member_names)
-                                        .chars()
-                                        .take(100)
-                                        .collect::<String>();
-                                    let reply_author_name = group.author_name.clone();
+                                    let reply_ctx = reply_context_for(&group.author_name, &msg, &member_names);
                                     rsx! {
                                         div {
                                             // `.hover-actions` (main.css) makes this invisible
@@ -5287,13 +5330,7 @@ fn MessageGroupComponent(
                                             button {
                                                 class: "text-xs text-text-muted hover:text-accent transition-colors",
                                                 title: "Reply",
-                                                onclick: move |_| {
-                                                    on_reply.call(ReplyContext {
-                                                        message_id: msg_id_for_reply.clone(),
-                                                        author_name: reply_author_name.clone(),
-                                                        content_preview: reply_text_preview.clone(),
-                                                    });
-                                                },
+                                                onclick: move |_| on_reply.call(reply_ctx.clone()),
                                                 "reply"
                                             }
                                             // Edit/Delete buttons - only for own messages
@@ -5325,15 +5362,6 @@ fn MessageGroupComponent(
                                         message_id: msg.message_id.clone(),
                                         dom_id: msg.id.clone(),
                                         is_self,
-                                        reply: ReplyContext {
-                                            message_id: msg.message_id.clone(),
-                                            author_name: group.author_name.clone(),
-                                            content_preview: clean_reply_preview(&msg.content_text, &member_names)
-                                                .chars()
-                                                .take(100)
-                                                .collect::<String>(),
-                                        },
-                                        edit_text: msg.content_text.clone(),
                                     };
                                     rsx! {
                                         div {
@@ -8240,6 +8268,89 @@ mod resolve_reply_strip_tests {
 
         let ctx = resolve(&plain, &state(vec![plain.clone()]), &info(vec![]));
         assert_eq!(ctx, ReplyStrip::NotAReply);
+    }
+}
+
+/// Tests for the click-time lookups the action menu resolves its target through.
+#[cfg(test)]
+mod find_message_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use std::time::{Duration as StdDuration, UNIX_EPOCH};
+
+    fn message(owner: MemberId, sk: &SigningKey, text: &str, secs: u64) -> AuthorizedMessageV1 {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner,
+                author: MemberId::from(&sk.verifying_key()),
+                time: UNIX_EPOCH + StdDuration::from_secs(secs),
+                content: RoomMessageBody::public(text.to_string()),
+            },
+            sk,
+        )
+    }
+
+    /// Two authors, so two `DisplayItem::Messages` groups.
+    fn items(messages: Vec<AuthorizedMessageV1>, owner: MemberId) -> Vec<DisplayItem> {
+        group_messages(
+            &MessagesV1 {
+                messages,
+                actions_state: Default::default(),
+            },
+            &MemberInfoV1::default(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &ImpersonationChecker::default(),
+            owner,
+            MessageClock {
+                receive_times: &ReceiveTimes::default(),
+                fallback_now: Utc::now(),
+            },
+        )
+    }
+
+    #[test]
+    fn find_message_returns_the_current_message_or_none() {
+        let (alice, bob) = (
+            SigningKey::from_bytes(&[1; 32]),
+            SigningKey::from_bytes(&[2; 32]),
+        );
+        let owner = MemberId::from(&alice.verifying_key());
+        let a = message(owner, &alice, "from A", 1_000);
+        let b = message(owner, &bob, "from B", 2_000);
+        let id_b = b.id();
+        let items = items(vec![a, b], owner);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i, DisplayItem::Messages(_)))
+                .count(),
+            2
+        );
+
+        let (group, msg) = find_message(&items, &id_b).expect("B is in the history");
+        assert_eq!(msg.content_text, "from B");
+        assert_eq!(group.author_id, MemberId::from(&bob.verifying_key()));
+
+        let gone = message(owner, &alice, "never shown", 3_000).id();
+        assert!(find_message(&items, &gone).is_none());
+    }
+
+    #[test]
+    fn reply_context_for_names_the_author_and_caps_the_preview_at_100_chars() {
+        let alice = SigningKey::from_bytes(&[1; 32]);
+        let owner = MemberId::from(&alice.verifying_key());
+        let long = message(owner, &alice, &"x".repeat(150), 1_000);
+        let id = long.id();
+        let items = items(vec![long], owner);
+        let (group, msg) = find_message(&items, &id).unwrap();
+
+        let ctx = reply_context_for(&group.author_name, msg, &HashMap::new());
+        assert_eq!(ctx.message_id, id);
+        assert_eq!(ctx.author_name, group.author_name);
+        assert_eq!(ctx.content_preview, "x".repeat(100));
     }
 }
 
