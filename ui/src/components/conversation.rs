@@ -22,6 +22,7 @@ use crate::util::{
     get_current_system_time, local_message_date, local_today,
 };
 mod emoji_picker;
+mod history_scroll;
 mod mention;
 mod message_actions;
 mod message_input;
@@ -1448,7 +1449,6 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
 ///
 /// Shared by the scroll-to-latest button's IntersectionObserver `rootMargin`
 /// and by the pin flag, so the two agree about where the bottom is.
-#[cfg(target_arch = "wasm32")]
 const BOTTOM_THRESHOLD_PX: f64 = 100.0;
 
 /// How many display items (message groups and event summaries) the conversation
