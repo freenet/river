@@ -264,3 +264,26 @@ test("opening on B after A reacts to B", async ({ page }) => {
   await expect(rowB.locator(CHIP)).toContainText(emoji);
   await expect(rowA.locator(CHIP)).toHaveCount(0);
 });
+
+test.describe("on the narrowest phone", () => {
+  test.use({ viewport: { width: 320, height: 640 } });
+
+  test("at 320px the picker stays on screen from the rightmost +", async ({ page }) => {
+    // The visible "+" nearest the right edge: the picker has the least room beside it.
+    await page.evaluate(() => {
+      const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+      const visible = [...document.querySelectorAll('[data-testid="add-reaction-button"]')].filter((el) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.top >= s.top && r.bottom <= s.bottom;
+      });
+      const rightmost = visible.reduce((a, b) => (b.getBoundingClientRect().right > a.getBoundingClientRect().right ? b : a));
+      rightmost.setAttribute("data-test-rightmost", "");
+    });
+    const plus = page.locator("[data-test-rightmost]");
+    await plus.hover();
+    await openFrom(page, plus);
+    const p = (await page.locator(PICKER).boundingBox())!;
+    expect(p.x).toBeGreaterThanOrEqual(0);
+    expect(p.x + p.width).toBeLessThanOrEqual(320);
+  });
+});
