@@ -1566,25 +1566,27 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
             other => other,
         })
         .collect();
-    // A short run (up to 8) of non-ASCII characters left between two ASCII
-    // letters/digits after the visual fold is an unfolded homoglyph or a
-    // stack of zero-width marks inside an id: keep it IN the run as a
-    // placeholder, which can never be a prefix of an (ASCII) id. Spaces,
-    // punctuation and symbol blocks, and CJK / kana / Hangul text separate,
-    // as they look (Japanese and Chinese put Latin words next to their own
-    // script with no space).
+    // A run of non-ASCII characters left between two ASCII letters/digits
+    // after the visual fold is kept IN the id run as one placeholder (which
+    // can never be a prefix of an ASCII id): an unfolded homoglyph, a lone
+    // symbol look-alike, or any number of zero-width marks stacked on a
+    // letter. It separates, as it looks, only if it holds a space,
+    // punctuation, an ellipsis, a full-width character (CJK, kana, Hangul,
+    // Yi, fullwidth forms, emoji), or a real word of a script written without
+    // spaces (Thai, Lao, Myanmar, Khmer). This errs towards joining: joining
+    // can only unlink more, never link something new.
     const JOINED: char = '\u{FFFD}';
-    let joinable = |c: char| {
-        // Combining marks join even inside the blocks excluded below.
-        let combining = matches!(u32::from(c),
-            0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF
-            | 0x302A..=0x302F | 0x3099..=0x309A | 0xFE20..=0xFE2F);
-        combining
-            || !c.is_whitespace()
-                && !matches!(u32::from(c),
-                0x2000..=0x2BFF      // punctuation, symbols, arrows, shapes
+    let separates = |c: char| {
+        // Combining marks inside the full-width blocks still stack.
+        let cjk_mark = matches!(u32::from(c), 0x302A..=0x302F | 0x3099..=0x309A);
+        c.is_whitespace()
+            || !cjk_mark
+                && matches!(u32::from(c),
+                0x2000..=0x206F      // general punctuation
+                | 0x22EE..=0x22F1    // ellipses
                 | 0x2E00..=0x2E7F    // supplemental punctuation
-                | 0x2E80..=0x9FFF    // CJK radicals, symbols, kana, unified
+                | 0x2E80..=0x30FF    // CJK radicals, symbols, kana
+                | 0x3130..=0x9FFF    // Hangul compatibility, CJK unified
                 | 0xA000..=0xA4CF    // Yi
                 | 0xAC00..=0xD7FF    // Hangul
                 | 0xF900..=0xFAFF    // CJK compatibility
@@ -1592,6 +1594,19 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
                 | 0xFF00..=0xFFEF    // halfwidth / fullwidth forms left unfolded
                 | 0x1F000..=0x1FAFF  // emoji and pictographs
                 | 0x20000..=0x3FFFF) // CJK extensions
+    };
+    // Letters (not marks) of the scripts written without spaces.
+    let no_space_letter = |c: char| {
+        let cp = u32::from(c);
+        let block = matches!(cp, 0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1780..=0x17FF);
+        let mark = matches!(cp,
+            0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E              // Thai
+            | 0x0EB1 | 0x0EB4..=0x0EBC | 0x0EC8..=0x0ECE           // Lao
+            | 0x102B..=0x103E | 0x1056..=0x1059 | 0x105E..=0x1060  // Myanmar
+            | 0x1062..=0x1064 | 0x1067..=0x106D | 0x1071..=0x1074
+            | 0x1082..=0x108D | 0x108F | 0x109A..=0x109D
+            | 0x17B4..=0x17D3 | 0x17DD); // Khmer
+        block && !mark
     };
     let mut text = String::with_capacity(folded.len());
     let mut k = 0;
@@ -1605,53 +1620,18 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
         let run_end = (k..folded.len())
             .find(|&e| folded[e].is_ascii())
             .unwrap_or(folded.len());
-        let between_alnum = k > 0
-            && folded[k - 1].is_ascii_alphanumeric()
-            && folded
-                .get(run_end)
-                .is_some_and(|n| n.is_ascii_alphanumeric());
-        // Nonspacing marks stack on the previous letter, so they do not count
-        // towards the run cap (nine stacked points look like one).
-        let is_mark = |c: char| {
-            matches!(u32::from(c),
-                0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05C7 | 0x0610..=0x061A
-                | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06ED | 0x0900..=0x0903
-                | 0x093A..=0x094F | 0x0951..=0x0957 | 0x0E31 | 0x0E34..=0x0E3A
-                | 0x0E47..=0x0E4E | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF
-                | 0x302A..=0x302F | 0x3099..=0x309A | 0xFE20..=0xFE2F | 0x1D165..=0x1D169
-                | 0x1D16D..=0x1D172 | 0x1D17B..=0x1D182)
-        };
-        let len = folded[k..run_end].iter().filter(|&&c| !is_mark(c)).count();
-        // Thai, Lao, Myanmar and Khmer write words without spaces, so only a
-        // very short run of them (a mark or a stray letter) is part of an id.
-        let no_space_script = folded[k..run_end]
-            .iter()
-            .any(|&c| matches!(u32::from(c), 0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1780..=0x17FF));
-        // A lone letter-like or operator look-alike (`∪` for U, `ℙ` for P,
-        // `ㄚ` for Y) is also part of an id, though its block is excluded.
-        let lone_lookalike = run_end - k == 1
-            && matches!(u32::from(folded[k]),
-                0x20A8                  // ₨ "Rs"
-                | 0x2100..=0x218F       // letterlike symbols, Roman numerals
-                | 0x2200..=0x22FF       // mathematical operators
-                | 0x27C0..=0x27EF       // misc mathematical symbols A
-                | 0x2980..=0x2AFF       // misc mathematical symbols B, operators
-                | 0x2E26
-                | 0x3100..=0x312F); // Bopomofo
-        let flanked = between_alnum
-            && ((len <= 8
-                && !(no_space_script && len > 3)
-                && folded[k..run_end].iter().all(|&c| joinable(c)))
-                || lone_lookalike);
+        let run = &folded[k..run_end];
+        let next_is_alnum = folded
+            .get(run_end)
+            .is_some_and(|n| n.is_ascii_alphanumeric());
+        // (Bopomofo, U+3100-312F, is deliberately not a separator: a lone
+        // `ㄚ` reads as Y.)
+        let joins = !run.iter().any(|&c| separates(c))
+            && run.iter().filter(|&&c| no_space_letter(c)).count() <= 3;
+        let flanked = k > 0 && folded[k - 1].is_ascii_alphanumeric() && next_is_alnum && joins;
         // Marks sitting on a marker's `:` or `/` (`freenet:\u{05BC}<id>`)
         // are dropped, so the marker still sits right before the id.
-        let on_marker = k > 0
-            && matches!(folded[k - 1], ':' | '/')
-            && folded
-                .get(run_end)
-                .is_some_and(|n| n.is_ascii_alphanumeric())
-            && len <= 8
-            && folded[k..run_end].iter().all(|&c| joinable(c));
+        let on_marker = k > 0 && matches!(folded[k - 1], ':' | '/') && next_is_alnum && joins;
         if flanked {
             text.push(JOINED);
         } else if !on_marker {
@@ -8228,6 +8208,7 @@ mod tests {
             "my freenet: node".to_string(),
             format!("freenet:{SAMPLE_ID} (mirror)"),
             format!("freenet:{}", &SAMPLE_ID[..8]),
+            format!("freenet:{}\u{22EF}{}", &SAMPLE_ID[..8], &SAMPLE_ID[36..]),
         ] {
             let html = message_to_html(&format!("[{label}]({href})"));
             assert!(html.contains(&local), "{label:?}: {html}");
@@ -8349,6 +8330,12 @@ mod tests {
             format!("{head}{}{tail}", "\u{05BC}".repeat(12)),
             format!("{head}\u{27D9}{tail}"),
             format!("freenet:{}\u{2178}GbcW", &SAMPLE_ID_2[..3]),
+            format!("{head}{}{tail}", "\u{0EC8}".repeat(4)),
+            format!("{head}{}{tail}", "\u{0730}".repeat(9)),
+            format!("{head}\u{0E31}{}{tail}", "\u{0730}".repeat(4)),
+            format!("{head}\u{222A}\u{05C4}{tail}"),
+            format!("{head}\u{2A2F}\u{15F7}{tail}"),
+            format!("{head}\u{2282}\u{10B3}{tail}"),
             "freenet\u{2236}raAqMhMG".to_string(),
         ] {
             let html = message_to_html(&format!("[{label}]({hidden})"));
