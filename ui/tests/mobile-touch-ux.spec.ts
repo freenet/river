@@ -359,6 +359,40 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await expect(kebab).toBeFocused();
   });
 
+  test("Reply from B after A replies to B", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    // Two received rows that open a group (so they show their author), without a quote, with different text.
+    const rows = await page
+      .locator('[id^="msg-"]:has([data-testid="message-group-header"]):not(:has([data-testid="reply-strip"]))')
+      .evaluateAll((els) =>
+        els.map((el) => ({
+          id: el.id,
+          author: el.querySelector('[data-testid="message-group-header"] span')!.textContent!.trim(),
+          text: (el.querySelector('[data-testid="message-bubble"]') as HTMLElement).innerText.trim().slice(0, 12),
+        }))
+      );
+    const b = rows[rows.length - 1];
+    const a = rows.slice(0, -1).reverse().find((r) => r.text !== b.text)!;
+    const menu = page.getByTestId("message-action-menu");
+
+    await page.locator(`[id="${a.id}"]`).getByTestId("message-kebab").click();
+    await expect(menu).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+    await page.locator(`[id="${b.id}"]`).getByTestId("message-kebab").click();
+    await menu.getByRole("menuitem", { name: "Reply" }).click();
+
+    const preview = page.getByTitle("Cancel reply").locator("..");
+    await expect(preview).toContainText(`@${b.author}: ${b.text}`);
+  });
+
   test("nothing covers the open menu, even over later messages", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
