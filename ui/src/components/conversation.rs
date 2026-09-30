@@ -889,10 +889,16 @@ fn clean_reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> 
 /// reply-preview snapshot, never for the message body (which renders full
 /// markdown). Falls back to the input unchanged if parsing fails.
 fn strip_markdown(text: &str) -> String {
+    // The preview is truncated anyway, so parse at most a bounded prefix.
+    let text = truncate_to_char_boundary(text, MARKDOWN_MAX_SOURCE_BYTES);
+    if !markdown_cost_is_bounded(text) {
+        return text.to_string();
+    }
     match markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
         Ok(node) => {
             let mut out = String::with_capacity(text.len());
             collect_mdast_text(&node, &mut out);
+            drop_mdast(node);
             out
         }
         Err(_) => text.to_string(),
@@ -900,22 +906,50 @@ fn strip_markdown(text: &str) -> String {
 }
 
 /// Depth-first collection of the visible text from a markdown AST node.
-fn collect_mdast_text(node: &markdown::mdast::Node, out: &mut String) {
+///
+/// Iterative, not recursive: nesting depth is chosen by whoever wrote the
+/// text, and a recursive walk of a deep tree overflows the stack.
+fn collect_mdast_text(root: &markdown::mdast::Node, out: &mut String) {
     use markdown::mdast::Node;
-    match node {
-        Node::Text(t) => out.push_str(&t.value),
-        Node::InlineCode(c) => out.push_str(&c.value),
-        Node::Code(c) => out.push_str(&c.value),
-        // A hard/soft break or thematic break becomes a space so words on
-        // separate lines don't run together in the single-line preview.
-        Node::Break(_) | Node::ThematicBreak(_) => out.push(' '),
-        _ => {}
-    }
-    if let Some(children) = node.children() {
-        for child in children {
-            collect_mdast_text(child, out);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Text(t) => out.push_str(&t.value),
+            Node::InlineCode(c) => out.push_str(&c.value),
+            Node::Code(c) => out.push_str(&c.value),
+            // A hard/soft break or thematic break becomes a space so words on
+            // separate lines don't run together in the single-line preview.
+            Node::Break(_) | Node::ThematicBreak(_) => out.push(' '),
+            _ => {}
+        }
+        if let Some(children) = node.children() {
+            stack.extend(children.iter().rev());
         }
     }
+}
+
+/// Drop a markdown AST without recursing: the tree's own `Drop` recurses once
+/// per nesting level, which overflows the stack on deeply nested text.
+fn drop_mdast(root: markdown::mdast::Node) {
+    let mut stack = vec![root];
+    while let Some(mut node) = stack.pop() {
+        if let Some(children) = node.children_mut() {
+            stack.append(children);
+        }
+    }
+}
+
+/// The longest prefix of `text` that is at most `max` bytes and ends on a
+/// char boundary.
+fn truncate_to_char_boundary(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The id of the message this reply quotes, or `None` if it is not a reply (or
@@ -969,15 +1003,124 @@ pub(crate) fn message_to_html(text: &str) -> String {
 }
 
 fn message_to_html_inner(text: &str, behind_gateway: bool) -> String {
+    if !markdown_cost_is_bounded(text) {
+        return plain_text_to_html(text);
+    }
+
     // Convert single newlines to hard breaks (two spaces + newline)
     // This preserves line breaks in chat messages as users expect
     let with_hard_breaks = text.replace("\n", "  \n");
 
-    markdown_to_html(&with_hard_breaks, behind_gateway)
+    markdown_to_html(&with_hard_breaks, text, behind_gateway)
+}
+
+/// Longest text rendered as markdown.
+const MARKDOWN_MAX_SOURCE_BYTES: usize = 4096;
+
+/// Most block containers (`>`, `-`, `1.` ...) opened at the start of one line.
+const MARKDOWN_MAX_LINE_NESTING: usize = 16;
+
+/// Most `|` on one line, which bounds the columns of a table.
+const MARKDOWN_MAX_LINE_PIPES: usize = 32;
+
+/// Longest HTML kept from rendering markdown (see `markdown_to_html`).
+const MARKDOWN_MAX_HTML_BYTES: usize = 64 * 1024;
+
+/// Whether `text` is cheap enough to parse as markdown. The parser's time
+/// grows faster than linearly with nesting depth, and a table's output with
+/// columns times rows, so text past these limits is shown as plain text.
+/// Depth is counted per line. Nesting built up across lines needs growing
+/// indentation, which the size limit bounds to a few hundred levels (a few
+/// ms to parse at the default 1000-byte message size, tens of ms at the size
+/// limit). Only DMs and rooms that raised `max_message_size` above the
+/// default can carry text past the size limit, which is large enough for the
+/// longest valid share link (see `longest_valid_bare_link_still_converts`).
+fn markdown_cost_is_bounded(text: &str) -> bool {
+    if text.len() > MARKDOWN_MAX_SOURCE_BYTES {
+        return false;
+    }
+    // Characters that can hide a marker from the count below but not from
+    // the parser: a leading byte order mark, which the parser skips, and the
+    // sentinels `extract_bare_freenet_links` may drop before parsing.
+    let ignored = ['\u{feff}', BARE_LINK_OPEN, BARE_LINK_CLOSE];
+    let text: std::borrow::Cow<str> = if text.contains(ignored) {
+        text.replace(ignored, "").into()
+    } else {
+        text.into()
+    };
+    // `\r` alone also ends a line in markdown.
+    text.split(['\n', '\r']).all(|line| {
+        line_container_depth(line) <= MARKDOWN_MAX_LINE_NESTING
+            && line.bytes().filter(|&b| b == b'|').count() <= MARKDOWN_MAX_LINE_PIPES
+    })
+}
+
+/// How many block quote, list item or footnote definition markers open at
+/// the start of `line` (an over-count is fine: it only makes plain text more
+/// likely).
+fn line_container_depth(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut depth = 0;
+    loop {
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        let marker_end = match bytes.get(i) {
+            Some(b'>') => i + 1,
+            // A GFM footnote definition, `[^label]: `.
+            Some(b'[') if bytes.get(i + 1) == Some(&b'^') => match line[i..].find("]:") {
+                Some(end) => {
+                    depth += 1;
+                    i += end + 2;
+                    continue;
+                }
+                None => return depth,
+            },
+            Some(b'-' | b'*' | b'+') => i + 1,
+            Some(b'0'..=b'9') => {
+                let mut j = i;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                match bytes.get(j) {
+                    Some(b'.' | b')') => j + 1,
+                    _ => return depth,
+                }
+            }
+            _ => return depth,
+        };
+        // A list marker must be followed by whitespace or the line's end.
+        let is_quote = bytes[i] == b'>';
+        if !is_quote && !matches!(bytes.get(marker_end), None | Some(b' ' | b'\t')) {
+            return depth;
+        }
+        depth += 1;
+        i = marker_end;
+    }
+}
+
+/// Render a room description: markdown, or plain text when
+/// [`markdown_cost_is_bounded`] says no.
+fn description_to_html(text: &str, behind_gateway: bool) -> String {
+    if !markdown_cost_is_bounded(text) {
+        plain_text_to_html(text)
+    } else {
+        markdown_to_html(text, text, behind_gateway)
+    }
+}
+
+/// Text not rendered as markdown: escaped, with each line break kept.
+fn plain_text_to_html(text: &str) -> String {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    format!("<p>{}</p>", escape_html(&text).replace('\n', "<br />\n"))
 }
 
 /// Convert markdown text to HTML with clickable links that open in new tabs.
-fn markdown_to_html(original_text: &str, behind_gateway: bool) -> String {
+///
+/// `plain` is what to show as plain text if the HTML comes out too long: the
+/// text as the user wrote it, before any markdown-specific rewriting.
+fn markdown_to_html(original_text: &str, plain: &str, behind_gateway: bool) -> String {
     // GFM only autolinks http(s)/www text, so a bare `freenet:<id>` share link
     // would stay plain text. Pull valid ones out BEFORE markdown runs, so
     // emphasis/strikethrough syntax inside a link (`…/a*b*c`) cannot split it,
@@ -991,8 +1134,17 @@ fn markdown_to_html(original_text: &str, behind_gateway: bool) -> String {
         (std::borrow::Cow::Borrowed(original_text), Vec::new())
     };
 
+    // Some shapes (many references to a definition with a long title, a
+    // table with many rows) expand a short message into megabytes, so HTML
+    // past `MARKDOWN_MAX_HTML_BYTES` is dropped for plain text before any
+    // further work is done on it.
+    let too_long = |html: &String| html.len() > MARKDOWN_MAX_HTML_BYTES;
+    let rendered = render_gfm(&text);
+    if too_long(&rendered) {
+        return plain_text_to_html(plain);
+    }
     let html = if bare_links.is_empty() {
-        render_gfm(&text)
+        rendered
     } else {
         // The source scan and the render parse slightly different text (a
         // sentinel in place of each link), so in rare shapes they disagree
@@ -1000,13 +1152,20 @@ fn markdown_to_html(original_text: &str, behind_gateway: bool) -> String {
         // destination. If any link did not come back exactly once, in prose,
         // or a sentinel survived anywhere, render the original text with no
         // bare-link pass rather than show a mangled message.
-        match restore_bare_freenet_links(&render_gfm(&text), &bare_links) {
+        match restore_bare_freenet_links(&rendered, &bare_links) {
             Some(html) => html,
             None => render_gfm(original_text),
         }
     };
+    if too_long(&html) {
+        return plain_text_to_html(plain);
+    }
 
-    finalize_anchors(&html, behind_gateway)
+    let html = finalize_anchors(&html, behind_gateway);
+    if too_long(&html) {
+        return plain_text_to_html(plain);
+    }
+    html
 }
 
 /// Convert markdown to HTML using GFM mode, which includes autolink literals
@@ -1092,12 +1251,50 @@ pub(crate) fn message_to_html_with_mentions(
     }
 
     let mut html = message_to_html(&working);
+    // Markdown can move a placeholder into a tag (a link title) or copy it
+    // (a reference definition's title, used many times). Substituting there
+    // would put chip markup inside an attribute or multiply it, so unless
+    // every placeholder comes back exactly once, in text, show the message
+    // as plain text, where each one does.
+    if !mention_placeholders_are_sound(&html, chips.len(), OPEN, CLOSE) {
+        html = plain_text_to_html(&working);
+    }
     // The CLOSE delimiter bounds each index, so `…0␁` never matches inside
     // `…10␁` — replacement is unambiguous regardless of order.
     for (idx, chip) in chips.iter().enumerate() {
         html = html.replace(&format!("{OPEN}{idx}{CLOSE}"), chip);
     }
     html
+}
+
+/// Whether each of the `count` mention placeholders (`{open}{index}{close}`)
+/// appears exactly once in `html`, and only in text, never inside a tag. The
+/// markdown crate encodes `>` inside attributes, so the first `>` always ends
+/// a tag.
+fn mention_placeholders_are_sound(html: &str, count: usize, open: char, close: char) -> bool {
+    let mut seen = vec![0usize; count];
+    let mut in_tag = false;
+    for (i, c) in html.char_indices() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if c == open => {
+                if in_tag {
+                    return false;
+                }
+                let rest = &html[i + open.len_utf8()..];
+                let Some(end) = rest.find(close) else {
+                    return false;
+                };
+                match rest[..end].parse::<usize>() {
+                    Ok(idx) if idx < count => seen[idx] += 1,
+                    _ => return false,
+                }
+            }
+            _ => {}
+        }
+    }
+    seen.iter().all(|&n| n == 1)
 }
 
 thread_local! {
@@ -1956,37 +2153,43 @@ fn extract_bare_freenet_links(text: &str) -> (std::borrow::Cow<'_, str>, Vec<Str
 /// Byte ranges of the markdown source that are NOT rendered as plain prose.
 fn non_prose_ranges(source: &str) -> Vec<(usize, usize)> {
     use markdown::mdast::Node;
-    fn walk(node: &Node, out: &mut Vec<(usize, usize)>) {
-        let skip = matches!(
-            node,
-            Node::InlineCode(_)
-                | Node::Code(_)
-                | Node::Link(_)
-                | Node::LinkReference(_)
-                | Node::Image(_)
-                | Node::ImageReference(_)
-                | Node::Definition(_)
-                | Node::Html(_)
-                | Node::FootnoteReference(_)
-                | Node::FootnoteDefinition(_)
-                | Node::InlineMath(_)
-                | Node::Math(_)
-        );
-        if skip {
-            if let Some(pos) = node.position() {
-                out.push((pos.start.offset, pos.end.offset));
+    // Iterative for the same reason as `collect_mdast_text`. Ranges come out
+    // in document order, as a recursive pre-order walk would give them.
+    fn walk(root: &Node, out: &mut Vec<(usize, usize)>) {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let skip = matches!(
+                node,
+                Node::InlineCode(_)
+                    | Node::Code(_)
+                    | Node::Link(_)
+                    | Node::LinkReference(_)
+                    | Node::Image(_)
+                    | Node::ImageReference(_)
+                    | Node::Definition(_)
+                    | Node::Html(_)
+                    | Node::FootnoteReference(_)
+                    | Node::FootnoteDefinition(_)
+                    | Node::InlineMath(_)
+                    | Node::Math(_)
+            );
+            if skip {
+                if let Some(pos) = node.position() {
+                    out.push((pos.start.offset, pos.end.offset));
+                }
+                continue;
             }
-            return;
-        }
-        if let Some(children) = node.children() {
-            for child in children {
-                walk(child, out);
+            if let Some(children) = node.children() {
+                stack.extend(children.iter().rev());
             }
         }
     }
     let mut out = Vec::new();
     match markdown::to_mdast(source, &markdown::ParseOptions::gfm()) {
-        Ok(root) => walk(&root, &mut out),
+        Ok(root) => {
+            walk(&root, &mut out);
+            drop_mdast(root);
+        }
         // Unparseable: treat everything as non-prose, so nothing is linked.
         Err(_) => out.push((0, source.len())),
     }
@@ -3431,7 +3634,7 @@ pub fn Conversation() -> Element {
                     if text.is_empty() {
                         return None;
                     }
-                    return Some(markdown_to_html(&text, running_behind_freenet_gateway()));
+                    return Some(description_to_html(&text, running_behind_freenet_gateway()));
                 }
             }
             None
@@ -8139,6 +8342,237 @@ mod tests {
                 "rendering {} bytes took {elapsed:?}",
                 payload.len()
             );
+        }
+    }
+
+    /// Every path that renders user-written text as markdown: message bodies
+    /// (with and without the gateway-only bare link pass, which also parses
+    /// to an AST), room descriptions, bodies with mentions, and reply
+    /// previews.
+    fn render_every_markdown_path(text: &str) {
+        let member = MemberId(freenet_scaffold::util::FastHash(7));
+        let names: HashMap<MemberId, String> = [(member, "Bob".to_string())].into();
+        for behind_gateway in [true, false] {
+            let _ = message_to_html_inner(text, behind_gateway);
+            let _ = description_to_html(text, behind_gateway);
+        }
+        let with_mention = format!(
+            "{} {text}",
+            river_core::mention::encode_mention(member, "Bob")
+        );
+        let _ = message_to_html_with_mentions(&with_mention, &names, Some(member));
+        let _ = clean_reply_preview(text, &names);
+        let _ = strip_markdown(text);
+    }
+
+    /// Inputs the unpatched `markdown` crate panics on (see
+    /// `[patch.crates-io]` in the root Cargo.toml).
+    #[test]
+    fn malformed_markdown_renders_without_panicking() {
+        let inputs = [
+            // A line ending inside a link title or reference label. The
+            // renderer turns every `\n` into a hard break (`"  \n"`), so a
+            // plain line break inside the title is enough.
+            "[a](b \"x\ny\")",
+            "[a](b 'x\ny')",
+            "[a](b (x\ny))",
+            "![a](b \"x\ny\")",
+            "[a](b \"x \ny\")",
+            "[a](b \"x \r\ny\")",
+            "[x](/x \"> \n\")",
+            "[a][b\nc]\n\n[b c]: d",
+            "[][a \n]\n\n[a ]:\0",
+            // An email address in an image title that spans lines.
+            "![a](b \"c@d.com\ne\")",
+            // Setext underlines next to each other.
+            "=\n=\n=\na\n=",
+            "}\n-\n--\n]\n=",
+            // A list item ending in unclosed code or HTML, then another marker.
+            "1. <!--\n-",
+            "*\t~~~\n1.",
+            "- ```\n1)",
+            // An unfinished CDATA opener, then an empty numeric reference.
+            "<![C&#;",
+            // A table head, then a new container on the last line.
+            "a\n|-\n- <",
+            "a\n|-\n> <",
+        ];
+        for input in inputs {
+            for text in [input.to_string(), format!("freenet:{RIVER_ID}/ {input}")] {
+                let rendered = std::panic::catch_unwind(|| render_every_markdown_path(&text));
+                assert!(rendered.is_ok(), "rendering {text:?} panicked");
+            }
+        }
+    }
+
+    /// The AST helpers walk and drop a tree without recursion, so a deep tree
+    /// cannot overflow the stack even if one gets past
+    /// `markdown_cost_is_bounded`. Runs on a small stack to leave a margin
+    /// below wasm's 1 MiB.
+    #[test]
+    fn deep_markdown_trees_are_walked_without_recursion() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let deep = format!("{}`a` b", ">".repeat(5_000));
+                assert!(!non_prose_ranges(&deep).is_empty());
+                let tree = markdown::to_mdast(&deep, &markdown::ParseOptions::gfm()).unwrap();
+                let mut text = String::new();
+                collect_mdast_text(&tree, &mut text);
+                assert!(text.starts_with('a'), "{text}");
+                drop_mdast(tree);
+            })
+            .expect("spawn")
+            .join()
+            .expect("walking a deep markdown tree panicked");
+    }
+
+    /// Deep block nesting on one line, a wide table, or too much text is
+    /// shown as plain text, however the line breaks are written.
+    #[test]
+    fn costly_markdown_is_shown_as_plain_text() {
+        let deep_list = format!("{}x", "- ".repeat(MARKDOWN_MAX_LINE_NESTING + 1));
+        let deep_quote = format!("{}x", "> 1. ".repeat(MARKDOWN_MAX_LINE_NESTING));
+        let wide_table = format!("{}\n{}\n|", "|a".repeat(40), "|-".repeat(40));
+        for costly in [
+            deep_list.clone(),
+            format!("a\r{deep_list}"),
+            format!("a\r\n{deep_quote}"),
+            format!("[^a]: {deep_list}"),
+            format!("\u{feff}{deep_list}"),
+            format!("{BARE_LINK_OPEN}{deep_list}"),
+            wide_table,
+            "a\n".repeat(MARKDOWN_MAX_SOURCE_BYTES),
+        ] {
+            assert!(!markdown_cost_is_bounded(&costly), "{costly:?}");
+            assert!(message_to_html(&costly).starts_with("<p>"), "{costly:?}");
+        }
+        for fine in [
+            format!("{}x", "- ".repeat(MARKDOWN_MAX_LINE_NESTING)),
+            "> quote\n- item\n  1. nested".to_string(),
+            "| a | b |\n| - | - |\n| 1 | 2 |".to_string(),
+            "-1 and 2.5 and -x".to_string(),
+        ] {
+            assert!(markdown_cost_is_bounded(&fine), "{fine:?}");
+        }
+        assert_eq!(line_container_depth("  > - 1) * x"), 4);
+        assert_eq!(line_container_depth(">>> x"), 3);
+        assert_eq!(line_container_depth("-x"), 0);
+        assert_eq!(line_container_depth("2024. was"), 1);
+        assert_eq!(line_container_depth("[^a]: > - x"), 3);
+        assert_eq!(line_container_depth("[^a] x"), 0);
+    }
+
+    /// Markdown that renders to far more HTML than its size is shown as plain
+    /// text instead.
+    #[test]
+    fn markdown_that_expands_too_far_is_shown_as_plain_text() {
+        let text = format!("[a]: b '{}'\n\n{}", "\"".repeat(100), "[a]".repeat(300));
+        assert!(markdown_cost_is_bounded(&text));
+        assert!(render_gfm(&text).len() > MARKDOWN_MAX_HTML_BYTES);
+        let html = message_to_html(&text);
+        assert!(html.starts_with("<p>[a]: b"), "{}", &html[..200]);
+        assert!(html.len() < 2 * text.len(), "{}", html.len());
+        assert!(description_to_html(&text, true).starts_with("<p>[a]: b"));
+        // The plain text is the message as written, without the hard-break
+        // rewrite, so CRLF line breaks are not doubled.
+        let crlf = text.replace('\n', "\r\n");
+        let html = message_to_html(&crlf);
+        assert!(html.starts_with("<p>[a]: b"), "{}", &html[..200]);
+        assert!(!html.contains("  <br />"), "{}", &html[..400]);
+    }
+
+    /// A mention that markdown moves into an attribute or copies (through a
+    /// reference definition's title) is not substituted there: the message
+    /// is shown as plain text with one chip per mention.
+    #[test]
+    fn mentions_markdown_moves_or_copies_fall_back_to_plain_text() {
+        let member = MemberId(freenet_scaffold::util::FastHash(7));
+        let names: HashMap<MemberId, String> = [(member, "Bob".to_string())].into();
+        let token = river_core::mention::encode_mention(member, "Bob");
+        let copied = format!("[a]: b '{}'\n\n{}", token.repeat(20), "[a] ".repeat(150));
+        let in_title = format!("[x](https://x.example \"{token}\")");
+        let in_destination = format!("[x](https://x.example/{token})");
+        let in_alt = format!("![{token}](https://x.example/i.png)");
+        for text in [copied, in_title, in_destination, in_alt] {
+            let html = message_to_html_with_mentions(&text, &names, None);
+            assert!(html.starts_with("<p>"), "{html}");
+            assert!(!html.contains("<a "), "{html}");
+            assert!(html.len() < 20 * text.len(), "{}", html.len());
+            assert!(html.contains("river-mention"), "{html}");
+        }
+        // A mention in link text still renders as a chip inside the link.
+        let html = message_to_html_with_mentions(
+            &format!("[hi {token}](https://x.example)"),
+            &names,
+            None,
+        );
+        assert!(
+            html.contains("<a ") && html.contains("river-mention"),
+            "{html}"
+        );
+    }
+
+    /// Past the size limit, text is shown as escaped plain text with its line
+    /// breaks, and mentions still become chips.
+    #[test]
+    fn text_past_the_markdown_limit_renders_as_plain_text() {
+        let member = MemberId(freenet_scaffold::util::FastHash(7));
+        let names: HashMap<MemberId, String> = [(member, "Bob".to_string())].into();
+        let long = "**<b>x</b>**\n".repeat(MARKDOWN_MAX_SOURCE_BYTES / 10);
+        assert!(long.len() > MARKDOWN_MAX_SOURCE_BYTES);
+        let html = message_to_html(&long);
+        assert!(
+            html.starts_with("<p>**&lt;b&gt;x&lt;/b&gt;**<br />\n"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("<strong>") && !html.contains("<b>"),
+            "{html}"
+        );
+        let with_mention = format!(
+            "{} {long}",
+            river_core::mention::encode_mention(member, "Bob")
+        );
+        let html = message_to_html_with_mentions(&with_mention, &names, None);
+        assert!(html.contains("river-mention"), "{html}");
+        assert!(description_to_html(&long, true).starts_with("<p>**&lt;b&gt;"));
+        // The reply preview parses only a prefix, as markdown.
+        assert!(
+            strip_markdown(&long).starts_with('x'),
+            "{}",
+            strip_markdown(&long)
+        );
+    }
+
+    /// A seeded sweep over short strings of markdown syntax, the shape that
+    /// found every input above. It is deterministic (fixed seed), so a failure
+    /// reproduces exactly; the panic message names the input.
+    #[test]
+    fn generated_markdown_renders_without_panicking() {
+        #[rustfmt::skip]
+        const PIECES: &[&str] = &[
+            "[", "]", "(", ")", "\"", "'", " ", "  ", "\t", "\n", "\n", "\r\n", "\r", "a",
+            "x y", "!", ":", "<", ">", "*", "_", "~", "`", "```", "~~~", "\\", "-", "#", "|",
+            "^", "=", "&", "&amp;", "&#;", "&#65;", "https://x.example", "www.a.example",
+            "c@d.example", "1.", "1)", "é", "\u{a0}", "😀", "[a](b \"", "[a](b '", "[a](b (",
+            "[a][", "[^", "]: ", "![", "](", "<a ", "<!--", "-->", "<![C", "    ", "> ",
+            "- ", "---", "| - |", "\\\n", "[ ]", "[x]", "\0",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..3_000 {
+            let len = 1 + (next() % 24) as usize;
+            let text: String = (0..len)
+                .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+                .collect();
+            let rendered = std::panic::catch_unwind(|| render_every_markdown_path(&text));
+            assert!(rendered.is_ok(), "rendering {text:?} panicked");
         }
     }
 
