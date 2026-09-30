@@ -1384,7 +1384,11 @@ fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
                 // A tooltip is label text too.
                 let title = extract_attr(&opening, "title");
                 let unlink = if bare {
-                    dest_id.is_none() && !plain_absolute_url(inner)
+                    (dest_id.is_none() && !plain_absolute_url(inner))
+                        || pasted_url_poses_before_its_path(inner)
+                        || title.as_deref().is_some_and(|t| {
+                            label_contradicts_destination(t, None, dest_id.clone())
+                        })
                 } else {
                     label_contradicts_destination(inner, title.as_deref(), dest_id)
                 };
@@ -1500,8 +1504,8 @@ fn node_destination(href: Option<&str>) -> Option<Option<String>> {
 /// references, fancy text and homoglyphs inside an id do not hide it. A claim
 /// is a run of 32+ ASCII letters/digits with an uppercase letter (a contract
 /// id is 43-44; a hex hash or an ordinary word is not), or an id-looking run
-/// of 6+ after a `freenet:` marker (a shortened id such as
-/// `freenet:UDzGbcWr`). Each claim must be a prefix of the destination id,
+/// of 8+ directly after a `freenet:` marker with no space (a shortened id
+/// such as `freenet:UDzGbcWr`). Each claim must be a prefix of the destination id,
 /// and the label's tooltip and any image tooltip inside it are read too. An id
 /// broken up by a visible ASCII space or punctuation is not recognised
 /// (freenet/river#736); a label naming no contract (`[River update](…)`)
@@ -1533,43 +1537,62 @@ fn label_contradicts_destination(
 /// [`label_contradicts_destination`].
 fn label_claimed_ids(inner: &str) -> Vec<String> {
     // Anything that can split an id without the reader seeing a break must
-    // not: line breaks (an id wrapping looks the same) and every non-ASCII
-    // space (hair, thin, no-break, …) are dropped, and other non-ASCII
-    // characters between letters/digits are joined (below). This is a
-    // comparison, not rendering, so joining too much can only unlink more,
-    // never link something new.
+    // not (the whitespace and joining rules below). This is a comparison, not
+    // rendering, so joining too much can only unlink more, never link
+    // something new.
     let decoded = decode_html_text(&visible_text_with_alt(inner));
-    // Near-invisible spaces and line breaks (an id wrapping looks the same)
-    // are dropped; full-width spaces (no-break, ideographic, …) are visible
-    // and stay separators, like an ASCII space.
+    // Visible, full-width spaces separate, like an ASCII space. Every other
+    // whitespace character is dropped: line and paragraph breaks (an id
+    // wrapping looks the same), narrow and hair spaces, and controls a
+    // browser draws with no width.
+    let visible_space = |c: char| {
+        matches!(
+            c,
+            ' ' | '\t' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{2005}' | '\u{2007}' | '\u{2008}' | '\u{3000}'
+        )
+    };
     let spaced: String = decoded
         .chars()
-        .filter(|c| {
-            !matches!(
-                c,
-                '\n' | '\r' | '\u{2006}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
-            )
-        })
+        .filter(|&c| !c.is_whitespace() || visible_space(c))
         .collect();
     // Colon look-alikes read as the `:` of a `freenet:` marker.
     let folded: Vec<char> = crate::util::confusable::visual_ascii(&spaced)
         .chars()
         .map(|c| match c {
-            '\u{02D0}' | '\u{0589}' | '\u{05C3}' | '\u{1804}' | '\u{205A}' | '\u{2236}'
-            | '\u{A789}' | '\u{FE13}' | '\u{FE55}' => ':',
+            '\u{02D0}' | '\u{02F8}' | '\u{0589}' | '\u{05C3}' | '\u{0903}' | '\u{0A83}'
+            | '\u{1361}' | '\u{1804}' | '\u{205A}' | '\u{2236}' | '\u{A4FD}' | '\u{A789}'
+            | '\u{FE13}' | '\u{FE30}' | '\u{FE55}' => ':',
             other => other,
         })
         .collect();
-    // A short run (1-3) of non-ASCII characters from the alphabetic and
-    // combining blocks (Latin, IPA, Greek, Cyrillic, Armenian, Hebrew, Arabic,
-    // Indic, Thai, … up to U+1FFF, plus combining marks for symbols) left
-    // between two ASCII letters/digits after the visual fold is an unfolded
-    // homoglyph or a zero-width mark inside an id: keep it IN the run as a
-    // placeholder, which can never be a prefix of an (ASCII) id. Anything
-    // else (CJK, punctuation, longer foreign words) separates, as it looks.
+    // A short run (up to 8) of non-ASCII characters left between two ASCII
+    // letters/digits after the visual fold is an unfolded homoglyph or a
+    // stack of zero-width marks inside an id: keep it IN the run as a
+    // placeholder, which can never be a prefix of an (ASCII) id. Spaces,
+    // punctuation and symbol blocks, and CJK / kana / Hangul text separate,
+    // as they look (Japanese and Chinese put Latin words next to their own
+    // script with no space).
     const JOINED: char = '\u{FFFD}';
-    let joinable =
-        |c: char| !c.is_whitespace() && matches!(u32::from(c), 0x80..=0x1FFF | 0x20D0..=0x20FF);
+    let joinable = |c: char| {
+        // Combining marks join even inside the blocks excluded below.
+        let combining = matches!(u32::from(c),
+            0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF
+            | 0x302A..=0x302F | 0x3099..=0x309A | 0xFE20..=0xFE2F);
+        combining
+            || !c.is_whitespace()
+                && !matches!(u32::from(c),
+                0x2000..=0x2BFF      // punctuation, symbols, arrows, shapes
+                | 0x2E00..=0x2E7F    // supplemental punctuation
+                | 0x2E80..=0x9FFF    // CJK radicals, symbols, kana, unified
+                | 0xA000..=0xA4CF    // Yi
+                | 0xAC00..=0xD7FF    // Hangul
+                | 0xF900..=0xFAFF    // CJK compatibility
+                | 0xFE30..=0xFE4F    // CJK compatibility forms
+                | 0xFF00..=0xFFEF    // halfwidth / fullwidth forms left unfolded
+                | 0x1F000..=0x1FAFF  // emoji and pictographs
+                | 0x20000..=0x3FFFF) // CJK extensions
+    };
     let mut text = String::with_capacity(folded.len());
     let mut k = 0;
     while k < folded.len() {
@@ -1587,9 +1610,22 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
             && folded
                 .get(run_end)
                 .is_some_and(|n| n.is_ascii_alphanumeric())
-            && run_end - k <= 3
+            && run_end - k <= 8
             && folded[k..run_end].iter().all(|&c| joinable(c));
-        text.push(if flanked { JOINED } else { ' ' });
+        // Marks sitting on a marker's `:` or `/` (`freenet:\u{05BC}<id>`)
+        // are dropped, so the marker still sits right before the id.
+        let on_marker = k > 0
+            && matches!(folded[k - 1], ':' | '/')
+            && folded
+                .get(run_end)
+                .is_some_and(|n| n.is_ascii_alphanumeric())
+            && run_end - k <= 8
+            && folded[k..run_end].iter().all(|&c| joinable(c));
+        if flanked {
+            text.push(JOINED);
+        } else if !on_marker {
+            text.push(' ');
+        }
         k = run_end;
     }
     let lower = text.to_ascii_lowercase();
@@ -1642,6 +1678,29 @@ fn has_scheme_and_authority(href: &str) -> bool {
         && scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// True if a pasted URL's text before its contract path could be read as a
+/// different destination: any userinfo (`http://freenet:<A>@host/…`), or a
+/// contract id or `freenet:` claim in the host (`http://<A>.example/…`).
+/// What follows the contract path is the app's own business (a River
+/// invite's long code, an app path holding other ids) and is not read.
+fn pasted_url_poses_before_its_path(url: &str) -> bool {
+    let decoded = decode_html_text(url);
+    let Some((_, after_scheme)) = decoded.split_once("://") else {
+        return false;
+    };
+    let head_end = ["/v1/contract/web/", "/v2/contract/web/"]
+        .iter()
+        .filter_map(|m| after_scheme.find(m))
+        .min()
+        .unwrap_or_else(|| {
+            after_scheme
+                .find(['/', '?', '#'])
+                .unwrap_or(after_scheme.len())
+        });
+    let head = &after_scheme[..head_end];
+    head.contains('@') || !label_claimed_ids(head).is_empty()
 }
 
 /// True for an absolute `scheme://host/path` whose text is where it goes:
@@ -8238,6 +8297,21 @@ mod tests {
             format!("{head}\u{202F}{tail}"),
             "freenet:/raAqMhMG".to_string(),
             "freenet\u{A789}raAqMhMG".to_string(),
+            format!("{head}\u{000B}{tail}"),
+            format!("{head}\u{000C}{tail}"),
+            format!("{head}\u{0085}{tail}"),
+            format!("{head}\u{2028}{tail}"),
+            format!("{head}\u{2029}{tail}"),
+            format!("{head}\u{A7B3}{tail}"),
+            format!("{head}\u{10317}{tail}"),
+            format!("{head}\u{05BC}\u{05BC}\u{05BC}\u{05BC}{tail}"),
+            format!("{head}\u{A7AB}{tail}"),
+            format!("{head}\u{2D5D}{tail}"),
+            format!("{head}\u{302A}{tail}"),
+            format!("{head}\u{1D167}{tail}"),
+            "freenet:\u{05BC}raAqMhMG".to_string(),
+            "freenet:/\u{0E31}raAqMhMG".to_string(),
+            "freenet\u{A4FD}raAqMhMG".to_string(),
             "freenet\u{2236}raAqMhMG".to_string(),
         ] {
             let html = message_to_html(&format!("[{label}]({hidden})"));
@@ -8333,6 +8407,28 @@ mod tests {
             &b[2..]
         ));
         assert!(!html.contains("<a "), "encoded id: {html}");
+    }
+
+    /// A pasted URL is a link to what it shows, but not when the text before
+    /// its contract path reads as another destination, or its tooltip does.
+    #[test]
+    fn pasted_url_that_poses_before_its_path_is_not_a_link() {
+        let b = SAMPLE_ID;
+        let a = RIVER_ID;
+        for url in [
+            format!("http://freenet.org:{a}@127.0.0.1:7509/v1/contract/web/{b}/#freenet"),
+            format!("http://freenet:{a}@127.0.0.1:7509/v1/contract/web/{b}/?via=freenet"),
+            format!("http://{a}.example/v1/contract/web/{b}/#freenet"),
+            format!("http://River@127.0.0.1:7509/v1/contract/web/{b}/"),
+        ] {
+            for text in [url.clone(), format!("<{url}>"), format!("[{url}]({url})")] {
+                let html = message_to_html(&text);
+                assert!(!html.contains("<a "), "{text:?}: {html}");
+            }
+        }
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{b}/");
+        let html = message_to_html(&format!("[{url}]({url} \"freenet:{a}\")"));
+        assert!(!html.contains("<a "), "title on a pasted link: {html}");
     }
 
     #[test]
