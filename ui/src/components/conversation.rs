@@ -4946,7 +4946,7 @@ fn MessageGroupComponent(
                                 }
                             }
                         }
-                        // Content-sized up to 75cqi: reactions widen the bubble to that cap (min-w-full), then wrap.
+                        // Content-sized up to .msg-body's cap: reactions widen the bubble to it (min-w-full), then wrap.
                         div {
                             class: "msg-body flex flex-col min-w-0",
                             // Container for message bubble + hover actions
