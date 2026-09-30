@@ -177,6 +177,27 @@ async function expectStaysPut(page: Page, why: string) {
   expect(await scrollTop(page), why).toBeCloseTo(before, 0);
 }
 
+/// The newest history message with any part inside the scroll container, and
+/// how far its top sits above the container's bottom edge.
+///
+/// Found from `[id^="msg-"]`, not from the implementation's own row attribute,
+/// so these tests stay a contract on behaviour.
+function newestVisibleMessage(page: Page): Promise<{ id: string; gap: number } | null> {
+  return page.evaluate(() => {
+    const c = document.getElementById("chat-scroll-container");
+    if (!c) return null;
+    const box = c.getBoundingClientRect();
+    let found: { id: string; gap: number } | null = null;
+    for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+      const r = row.getBoundingClientRect();
+      if (r.bottom > box.top && r.top < box.bottom) {
+        found = { id: row.id, gap: box.bottom - r.top };
+      }
+    }
+    return found;
+  });
+}
+
 /// Add enough history to have somewhere to scroll back through.
 async function fillHistory(page: Page) {
   for (let i = 0; i < 8; i++) {
@@ -407,6 +428,44 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     );
   });
 
+  // The reflow test above only trips on some font stacks (Linux CI's, not
+  // macOS's): Chromium clamps scrollTop partway through the reflow, then the
+  // history comes out taller. This makes the same clamp happen on every engine.
+  test("follows a reflow that clamped the view on its way to a taller history", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    // Let our own snap settle, so nothing re-records the mark after the clamp.
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => {
+          const c = document.getElementById("chat-scroll-container")!;
+          let t = setTimeout(resolve, 300);
+          c.addEventListener("scrollend", () => {
+            clearTimeout(t);
+            t = setTimeout(resolve, 100);
+          });
+        })
+    );
+    const clamp = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const content = document.getElementById("chat-content")!;
+      const rows = c.querySelectorAll('[data-testid="conversation-history"] > *');
+      const newest = rows[rows.length - 1] as HTMLElement;
+      const before = c.scrollTop;
+      // Short, clamped, then rewrapped taller: all inside one task.
+      newest.style.display = "none";
+      const clamped = c.scrollTop;
+      newest.style.display = "";
+      content.style.maxWidth = `${content.clientWidth - 120}px`;
+      return before - clamped;
+    });
+    expect(clamp, "premise: hiding the newest row must clamp the view").toBeGreaterThan(
+      AT_BOTTOM_EPSILON_PX
+    );
+    await expectSettledAtBottom(page, "the reflow's own clamp was read as the reader scrolling up");
+  });
+
   test("follows history that grows in the same frame the composer collapses", async ({
     page,
   }) => {
@@ -497,6 +556,111 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+  });
+});
+
+// The reader's position is a message, not an offset: whichever message is the
+// newest one on screen stays where it was when the window changes shape.
+test.describe("The newest visible message stays in view", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  /// Park a reader mid-history and remember the newest message they can see.
+  async function parkMidHistory(page: Page) {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    const max = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      return c.scrollHeight - c.clientHeight;
+    });
+    await readerScrollsTo(page, Math.floor(max / 2));
+    await expect
+      .poll(() => distanceFromBottom(page), {
+        timeout: 5_000,
+        message: "premise: the reader should be parked above the bottom",
+      })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    // The scroll has to have landed before we look at what is on screen.
+    await page.waitForTimeout(300);
+    const before = await newestVisibleMessage(page);
+    expect(before, "premise: a message should be visible").not.toBeNull();
+    return before!;
+  }
+
+  async function expectSameMessageInPlace(
+    page: Page,
+    before: { id: string; gap: number },
+    why: string,
+  ) {
+    await expect
+      .poll(
+        async () => {
+          const now = await newestVisibleMessage(page);
+          // Infinity: a different message is now the newest visible one.
+          return now && now.id === before.id ? Math.abs(now.gap - before.gap) : Infinity;
+        },
+        { timeout: 5_000, message: why },
+      )
+      .toBeLessThanOrEqual(2);
+  }
+
+  test("a parked reader keeps their newest visible message in place across a resize", async ({
+    page,
+  }) => {
+    const before = await parkMidHistory(page);
+    await page.setViewportSize({ width: 380, height: 900 });
+    await expectSameMessageInPlace(
+      page,
+      before,
+      "the resize moved the message the reader was looking at",
+    );
+  });
+
+  test("the same message is still in place after resizing there and back", async ({ page }) => {
+    const before = await parkMidHistory(page);
+    await page.setViewportSize({ width: 380, height: 900 });
+    await expectSameMessageInPlace(page, before, "the narrow layout lost the reader's message");
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await expectSameMessageInPlace(
+      page,
+      before,
+      "resizing back did not return the reader's message to where it was",
+    );
+  });
+
+  test("stops following when the reader scrolls up after a resize", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await page.setViewportSize({ width: 380, height: 900 });
+    await expectSettledAtBottom(page, "the resize should have kept the view at the bottom");
+
+    await readerScrollsTo(page, 0);
+    await expect
+      .poll(() => distanceFromBottom(page), { timeout: 5_000 })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    await deliver(page, "arrival after the reader left");
+    await expectStaysPut(page, "an arrival dragged a reader who scrolled up after a resize");
+  });
+
+  test("a reader scroll in the same frame as a width change is kept", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+
+    // One task: the scroll event and the rewrap's layout change land together.
+    await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const content = document.getElementById("chat-content")!;
+      c.scrollTop = 0;
+      content.style.maxWidth = `${content.clientWidth - 120}px`;
+    });
+    await expect
+      .poll(() => distanceFromBottom(page), {
+        timeout: 5_000,
+        message: "the reader's scroll was lost to the width change",
+      })
+      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    await deliver(page, "arrival after a same-frame scroll");
+    await expectStaysPut(page, "an arrival dragged a reader whose scroll shared a frame with a rewrap");
   });
 });
 
