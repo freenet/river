@@ -2225,8 +2225,7 @@ pub fn Conversation() -> Element {
             if !has_content {
                 return;
             }
-            let forced = history.is_forced();
-            if history.restore() && (forced || !*opening_snap_done.peek()) {
+            if history.restore() {
                 // The opening snap for this room has landed, so the
                 // backfill sentinel may mount (#501 H2). Deferred, and the
                 // signal is only written on the transition, so steady-state
@@ -8084,7 +8083,7 @@ mod autoscroll_wiring_pins {
             );
         }
         assert!(
-            dense(prod).contains("ifhistory.restore()&&(forced||"),
+            dense(prod).contains("ifhistory.restore(){"),
             "the content effect must restore through `history`, which owns the pin"
         );
     }

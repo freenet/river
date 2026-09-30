@@ -186,11 +186,6 @@ impl HistoryScroll {
         self.force.set(true);
     }
 
-    /// Whether a forced snap is waiting for the next restore.
-    pub(super) fn is_forced(&self) -> bool {
-        self.force.get()
-    }
-
     /// A new room opens at its newest message: forget the old room's position.
     pub(super) fn reset_for_room(&self) {
         self.anchor.borrow_mut().clear();
@@ -635,7 +630,7 @@ mod tests {
     fn a_fresh_history_is_pinned_and_unforced() {
         let history = HistoryScroll::default();
         assert!(history.pinned.get());
-        assert!(!history.is_forced());
+        assert!(!history.force.get());
         assert!(history.anchor.borrow().is_empty());
     }
 
@@ -649,7 +644,7 @@ mod tests {
 
         history.reset_for_room();
 
-        assert!(history.pinned.get() && history.is_forced());
+        assert!(history.pinned.get() && history.force.get());
         assert!(history.anchor.borrow().is_empty());
         assert_eq!(history.sig.get(), LayoutSig::default());
         assert_eq!(history.top.get(), 0);
@@ -660,7 +655,7 @@ mod tests {
         let history = HistoryScroll::default();
         history.pinned.set(false);
         history.force_next();
-        assert!(history.is_forced());
+        assert!(history.force.get());
         assert!(!history.pinned.get());
     }
 
