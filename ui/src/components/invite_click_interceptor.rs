@@ -140,7 +140,7 @@ pub fn install_invite_click_interceptor() {
 ///
 /// `origin` and `pathname` are the page's own (`window.location`). The link is
 /// intercepted only when it points at this same River: the same origin and the
-/// same `/v1/contract/web/<id>` (or `/v2/...`) web-container path as the page, with
+/// web-container contract id as the page (under `/v1/` or `/v2/`), with
 /// `?invitation=<code>` in its query (not merely somewhere in its fragment).
 /// A `?invitation=` link to any other contract is some other app's business.
 pub(crate) fn invitation_code_to_intercept(
@@ -148,19 +148,23 @@ pub(crate) fn invitation_code_to_intercept(
     origin: &str,
     pathname: &str,
 ) -> Option<String> {
-    // The gateway serves webapps under `/v1/` and `/v2/`; the link must use
-    // the same one as the page (the invite URL is built from the page's own).
-    let marker = ["/v1/contract/web/", "/v2/contract/web/"]
-        .into_iter()
-        .find(|m| pathname.starts_with(m))?;
-    let own_id = pathname[marker.len()..].split('/').next()?;
+    // The gateway serves webapps under `/v1/` and `/v2/`. Either route on
+    // either side names the same River, so match the contract id, not the
+    // route (a v1 invite clicked on a v2 page is still ours).
+    const MARKERS: [&str; 2] = ["/v1/contract/web/", "/v2/contract/web/"];
+    let strip_marker = |path: &'_ str| -> Option<String> {
+        MARKERS
+            .iter()
+            .find_map(|m| path.strip_prefix(m))
+            .map(str::to_string)
+    };
+    let page_rest = strip_marker(pathname)?;
+    let own_id = page_rest.split('/').next()?;
     if own_id.is_empty() {
         return None;
     }
-    let after_prefix = href
-        .strip_prefix(origin)?
-        .strip_prefix(marker)?
-        .strip_prefix(own_id)?;
+    let href_rest = strip_marker(href.strip_prefix(origin)?)?;
+    let after_prefix = href_rest.strip_prefix(own_id)?;
     // The id must end here, not merely share a prefix with a longer one.
     if !after_prefix.starts_with(['/', '?']) {
         return None;
@@ -231,15 +235,19 @@ mod tests {
     }
 
     #[test]
-    fn v2_page_matches_only_v2_links() {
+    fn v1_and_v2_routes_name_the_same_river() {
         let v2_page = format!("/v2/contract/web/{RIVER}/");
         let v2 = format!("{ORIGIN}/v2/contract/web/{RIVER}/?invitation=abc");
         let v1 = format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation=abc");
-        assert_eq!(
-            invitation_code_to_intercept(&v2, ORIGIN, &v2_page).as_deref(),
-            Some("abc")
-        );
-        assert_eq!(invitation_code_to_intercept(&v1, ORIGIN, &v2_page), None);
+        for (href, page) in [(&v2, &v2_page), (&v1, &v2_page), (&v2, &page())] {
+            assert_eq!(
+                invitation_code_to_intercept(href, ORIGIN, page).as_deref(),
+                Some("abc"),
+                "{href} on {page}"
+            );
+        }
+        let other = format!("{ORIGIN}/v2/contract/web/{OTHER}/?invitation=abc");
+        assert_eq!(invitation_code_to_intercept(&other, ORIGIN, &v2_page), None);
     }
 
     #[test]

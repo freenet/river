@@ -977,7 +977,7 @@ fn message_to_html_inner(text: &str, behind_gateway: bool) -> String {
 }
 
 /// Convert markdown text to HTML with clickable links that open in new tabs.
-fn markdown_to_html(text: &str, behind_gateway: bool) -> String {
+fn markdown_to_html(original_text: &str, behind_gateway: bool) -> String {
     // GFM only autolinks http(s)/www text, so a bare `freenet:<id>` share link
     // would stay plain text. Pull valid ones out BEFORE markdown runs, so
     // emphasis/strikethrough syntax inside a link (`…/a*b*c`) cannot split it,
@@ -986,23 +986,34 @@ fn markdown_to_html(text: &str, behind_gateway: bool) -> String {
     // share link. Only behind a gateway, because without one there is no node
     // to link to (see `finalize_anchors`).
     let (text, bare_links) = if behind_gateway {
-        extract_bare_freenet_links(text)
+        extract_bare_freenet_links(original_text)
     } else {
-        (std::borrow::Cow::Borrowed(text), Vec::new())
+        (std::borrow::Cow::Borrowed(original_text), Vec::new())
     };
 
-    // Convert markdown to HTML using GFM mode, which includes autolink
-    // literals that correctly handle code spans, existing links, etc.
-    let html = markdown::to_html_with_options(&text, &markdown::Options::gfm())
-        .unwrap_or_else(|_| markdown::to_html(&text));
-
     let html = if bare_links.is_empty() {
-        html
+        render_gfm(&text)
     } else {
-        restore_bare_freenet_links(&html, &bare_links)
+        // The source scan and the render parse slightly different text (a
+        // sentinel in place of each link), so in rare shapes they disagree
+        // about what is prose, e.g. a link's own `(` inside a link
+        // destination. If any link did not come back exactly once, in prose,
+        // or a sentinel survived anywhere, render the original text with no
+        // bare-link pass rather than show a mangled message.
+        match restore_bare_freenet_links(&render_gfm(&text), &bare_links) {
+            Some(html) => html,
+            None => render_gfm(original_text),
+        }
     };
 
     finalize_anchors(&html, behind_gateway)
+}
+
+/// Convert markdown to HTML using GFM mode, which includes autolink literals
+/// that correctly handle code spans, existing links, etc.
+fn render_gfm(text: &str) -> String {
+    markdown::to_html_with_options(text, &markdown::Options::gfm())
+        .unwrap_or_else(|_| markdown::to_html(text))
 }
 
 /// Render message text to HTML, turning `@[name](rv:id)` mention tokens into
@@ -1252,7 +1263,7 @@ fn escape_html_attr(s: &str) -> String {
 }
 
 /// True when River is currently being served from a path under
-/// `/v1/contract/web/`, which is what gateway hosting looks like to the
+/// `/v1/contract/web/` (or `/v2/…`), which is what gateway hosting looks like to the
 /// browser. Returning false here suppresses the host-stripping href rewrite
 /// for `dx serve`, `cargo make dev-example`, and the static-server flows
 /// documented in AGENTS.md, where rewriting `https://gw.example/v1/...` to
@@ -1263,7 +1274,7 @@ fn escape_html_attr(s: &str) -> String {
 fn running_behind_freenet_gateway() -> bool {
     web_sys::window()
         .and_then(|w| w.location().pathname().ok())
-        .map(|p| p.starts_with("/v1/contract/web/"))
+        .map(|p| p.starts_with("/v1/contract/web/") || p.starts_with("/v2/contract/web/"))
         .unwrap_or(false)
 }
 
@@ -1354,7 +1365,27 @@ fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
             }
         }
 
-        let opening = if rewrite_freenet_hrefs {
+        // The older rewrite below applies to labelled links too. A label that
+        // itself reads like a Freenet link but is not exactly one (a share
+        // link padded with a space or a zero-width character, or a gateway
+        // URL naming another contract) must not become a one-click open of
+        // whatever the hidden href names: leave such a link pointing at the
+        // host in its href, which is where it went before any rewriting.
+        let label_poses_as_freenet_link = label_mentions_freenet_link(inner)
+            && !label_names_same_contract_as(inner, original_href.as_deref());
+        // A relative href already resolves on the reader's node (`/v1/…`,
+        // or `../<id>/` from River's own path), so behind such a label it is
+        // a one-click open of whatever it names. Show the label as plain
+        // text instead of a link that is not what it says.
+        if rewrite_freenet_hrefs
+            && label_poses_as_freenet_link
+            && original_href.as_deref().is_some_and(is_relative_href)
+        {
+            out.push_str(inner);
+            rest = tail;
+            continue;
+        }
+        let opening = if rewrite_freenet_hrefs && !label_poses_as_freenet_link {
             match original_href.as_deref().and_then(rewrite_freenet_href) {
                 Some(new_href) => {
                     let orig = original_href.as_deref().unwrap();
@@ -1395,6 +1426,58 @@ fn share_link_in_anchor_text(inner: &str) -> Option<crate::util::share_link::Sha
         return None;
     }
     crate::util::share_link::parse_share_link(&decode_html_text(inner))
+}
+
+/// True if an anchor's visible text contains anything that reads as a Freenet
+/// link: a `freenet:` share link, a freenet.org/open URL, or a gateway
+/// `/v1|v2/contract/web/` path. Tags are dropped first, so a label split by
+/// emphasis still counts.
+fn label_mentions_freenet_link(inner: &str) -> bool {
+    let text = decode_html_text(&strip_tags(inner)).to_ascii_lowercase();
+    ["freenet:", "freenet.org/open", "/contract/web/"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// True if the anchor's visible text is itself a gateway URL for the same
+/// contract as `href` (a bare pasted link, whose href is just the markdown
+/// crate's normalisation of the text).
+fn label_names_same_contract_as(inner: &str, href: Option<&str>) -> bool {
+    let Some(href) = href else { return false };
+    if inner.contains('<') {
+        return false;
+    }
+    let label = decode_html_text(inner);
+    match (parse_freenet_web_url(&label), parse_freenet_web_url(href)) {
+        (Some(a), Some(b)) => a.contract_id == b.contract_id,
+        _ => false,
+    }
+}
+
+/// True for an href with no scheme and no authority, i.e. one the browser
+/// resolves against River's own URL (including the empty href the markdown
+/// crate emits for a scheme it does not allow).
+fn is_relative_href(href: &str) -> bool {
+    if href.starts_with("//") {
+        return false;
+    }
+    let first_delimiter = href.find(['/', '?', '#']).unwrap_or(href.len());
+    !href[..first_delimiter].contains(':')
+}
+
+/// Drop every `<…>` tag from markdown-crate HTML, keeping the text.
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(pos) = rest.find('<') {
+        out.push_str(&rest[..pos]);
+        rest = match rest[pos..].find('>') {
+            Some(end) => &rest[pos + end + 1..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Undo the markdown crate's text encoding (`&amp;`, `&lt;`, `&gt;`, `&quot;`)
@@ -1534,12 +1617,19 @@ fn extract_bare_freenet_links(text: &str) -> (std::borrow::Cow<'_, str>, Vec<Str
         return (Cow::Borrowed(text), Vec::new());
     }
 
-    let excluded = non_prose_ranges(&clean);
+    let mut excluded = non_prose_ranges(&clean);
+    excluded.sort_unstable();
     let mut out = String::with_capacity(clean.len());
     let mut links = Vec::new();
     let mut cursor = 0;
+    // Both lists are in source order and the excluded ranges do not nest
+    // (the walk does not descend into an excluded node), so one sweep does.
+    let mut next_excluded = 0;
     for (start, end) in candidates {
-        if excluded.iter().any(|&(s, e)| start < e && s < end) {
+        while next_excluded < excluded.len() && excluded[next_excluded].1 <= start {
+            next_excluded += 1;
+        }
+        if excluded.get(next_excluded).is_some_and(|&(s, _)| s < end) {
             continue;
         }
         out.push_str(&clean[cursor..start]);
@@ -1597,25 +1687,31 @@ fn non_prose_ranges(source: &str) -> Vec<(usize, usize)> {
 }
 
 /// Put the links taken out by [`extract_bare_freenet_links`] back into the
-/// rendered HTML. A sentinel in prose becomes `<a href="">…</a>`, the shape the
-/// markdown crate itself emits for an autolink with a scheme it does not allow
-/// (`<freenet:…>`), and `finalize_anchors` then gives it its real href from
-/// the text. A sentinel anywhere else (inside `<a>`, `<code>` or `<pre>`, or
-/// inside a tag's attributes) is put back as the plain, escaped link text, so
-/// a construct the source scan did not anticipate can never nest an anchor or
-/// break out of an attribute. The markdown crate encodes `>` inside
+/// rendered HTML, each as `<a href="">…</a>`: the shape the markdown crate
+/// itself emits for an autolink with a scheme it does not allow
+/// (`<freenet:…>`). `finalize_anchors` then gives it its real href from the
+/// text.
+///
+/// Returns `None`, so the caller renders the message without the bare-link
+/// pass, unless every link comes back exactly once and in prose: a sentinel
+/// inside a tag (an attribute), inside `<a>`, `<code>` or `<pre>`, repeated,
+/// missing, or surviving percent-encoded in a URL means the source scan and
+/// the render disagreed about the message's structure, and guessing could
+/// nest an anchor or break an attribute. The markdown crate encodes `>` inside
 /// attributes, so the first `>` always ends a tag.
-fn restore_bare_freenet_links(html: &str, links: &[String]) -> String {
+fn restore_bare_freenet_links(html: &str, links: &[String]) -> Option<String> {
+    let has_sentinel = |s: &str| s.contains([BARE_LINK_OPEN, BARE_LINK_CLOSE]);
+    let mut restored = vec![0usize; links.len()];
     let mut out = String::with_capacity(html.len() + links.len() * 64);
     let mut skip_depth: usize = 0;
     let mut rest = html;
     while !rest.is_empty() {
         if rest.starts_with('<') {
-            let Some(end) = rest.find('>') else {
-                out.push_str(&replace_bare_link_sentinels(rest, links, escape_html_attr));
-                break;
-            };
+            let end = rest.find('>')?;
             let tag = &rest[..=end];
+            if has_sentinel(tag) {
+                return None;
+            }
             let (closing, name) = match tag[1..].strip_prefix('/') {
                 Some(after) => (true, after),
                 None => (false, &tag[1..]),
@@ -1633,57 +1729,55 @@ fn restore_bare_freenet_links(html: &str, links: &[String]) -> String {
                     skip_depth += 1;
                 }
             }
-            out.push_str(&replace_bare_link_sentinels(tag, links, escape_html_attr));
+            out.push_str(tag);
             rest = &rest[end + 1..];
         } else {
             let text_end = rest.find('<').unwrap_or(rest.len());
             let text = &rest[..text_end];
-            if skip_depth == 0 {
-                out.push_str(&replace_bare_link_sentinels(text, links, |link| {
-                    format!("<a href=\"\">{}</a>", encode_html_text(link))
-                }));
+            if skip_depth > 0 {
+                if has_sentinel(text) {
+                    return None;
+                }
+                out.push_str(text);
             } else {
-                out.push_str(&replace_bare_link_sentinels(text, links, encode_html_text));
+                out.push_str(&replace_bare_link_sentinels(text, links, &mut restored)?);
             }
             rest = &rest[text_end..];
         }
     }
-    out
+    let encoded_sentinel = ["%EE%80%82", "%EE%80%83"]
+        .iter()
+        .any(|e| out.to_ascii_uppercase().contains(e));
+    if restored.iter().any(|&n| n != 1) || has_sentinel(&out) || encoded_sentinel {
+        return None;
+    }
+    Some(out)
 }
 
-/// Replace every `{BARE_LINK_OPEN}<index>{BARE_LINK_CLOSE}` in `s` with
-/// `render(&links[index])`. Anything that is not a well-formed sentinel for a
-/// known index is copied through unchanged.
+/// Replace every `{BARE_LINK_OPEN}<index>{BARE_LINK_CLOSE}` in one prose text
+/// run with its link's anchor, counting each restore in `restored`. `None` for
+/// anything that is not a well-formed sentinel for a known index.
 fn replace_bare_link_sentinels(
     s: &str,
     links: &[String],
-    render: impl Fn(&str) -> String,
-) -> String {
-    if !s.contains(BARE_LINK_OPEN) {
-        return s.to_string();
-    }
+    restored: &mut [usize],
+) -> Option<String> {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(pos) = rest.find(BARE_LINK_OPEN) {
         out.push_str(&rest[..pos]);
         let after = &rest[pos + BARE_LINK_OPEN.len_utf8()..];
-        let link = after.find(BARE_LINK_CLOSE).and_then(|close| {
-            let idx: usize = after[..close].parse().ok()?;
-            Some((links.get(idx)?, close))
-        });
-        match link {
-            Some((link, close)) => {
-                out.push_str(&render(link));
-                rest = &after[close + BARE_LINK_CLOSE.len_utf8()..];
-            }
-            None => {
-                out.push(BARE_LINK_OPEN);
-                rest = after;
-            }
-        }
+        let close = after.find(BARE_LINK_CLOSE)?;
+        let idx: usize = after[..close].parse().ok()?;
+        let link = links.get(idx)?;
+        restored[idx] += 1;
+        out.push_str("<a href=\"\">");
+        out.push_str(&encode_html_text(link));
+        out.push_str("</a>");
+        rest = &after[close + BARE_LINK_CLOSE.len_utf8()..];
     }
     out.push_str(rest);
-    out
+    Some(out)
 }
 
 /// Offset of the `</a>` that closes an anchor whose content starts at the
@@ -7759,6 +7853,136 @@ mod tests {
         assert_eq!(html.matches("<a ").count(), 1, "{html}");
         assert_eq!(html.matches("</a>").count(), 1, "{html}");
         assert!(html.contains("href=\"https://x.example/\""), "{html}");
+    }
+
+    /// A label that reads like a Freenet link but is not exactly one must not
+    /// turn a hidden gateway href into a one-click open of another contract.
+    #[test]
+    fn label_posing_as_a_freenet_link_blocks_the_gateway_rewrite() {
+        let hidden = format!("http://x.example/v1/contract/web/{SAMPLE_ID}/");
+        for label in [
+            format!("freenet:{RIVER_ID}/ "),
+            format!("freenet:{RIVER_ID}/&#8203;"),
+            format!("*freenet:{RIVER_ID}/* app"),
+            format!("https://freenet.org/open#{RIVER_ID}/ "),
+            format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID_2}/"),
+        ] {
+            let html = message_to_html(&format!("[{label}]({hidden})"));
+            assert!(
+                !html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}")),
+                "{label:?}: {html}"
+            );
+            assert!(
+                html.contains(&format!("href=\"{hidden}\"")),
+                "{label:?}: {html}"
+            );
+        }
+        // An ordinary label, and a bare link whose href is the markdown
+        // crate's normalisation of its text, are still rewritten.
+        let html = message_to_html(&format!("[River update]({hidden})"));
+        assert!(
+            html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/\"")),
+            "{html}"
+        );
+        let bare = format!("http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/{{x}}");
+        let html = message_to_html(&bare);
+        assert!(
+            html.contains(&format!("href=\"/v1/contract/web/{SAMPLE_ID}/%7Bx%7D\"")),
+            "{html}"
+        );
+    }
+
+    /// A relative link already resolves on the reader's node, so behind a
+    /// label that reads as a different Freenet link it is shown as text.
+    #[test]
+    fn relative_link_behind_a_freenet_looking_label_is_unlinked() {
+        for text in [
+            format!("[freenet:{RIVER_ID}/ ](/v1/contract/web/{SAMPLE_ID}/)"),
+            format!("[**freenet:{RIVER_ID}/**](../{SAMPLE_ID}/)"),
+            format!("[https://freenet.org/open#{RIVER_ID}/ ](/v1/contract/web/{SAMPLE_ID}/)"),
+            format!("[freenet:{RIVER_ID}/ ](javascript:alert(1))"),
+        ] {
+            let html = message_to_html(&text);
+            assert!(!html.contains("<a "), "{text:?}: {html}");
+            assert!(html.contains("freenet"), "{text:?}: label kept: {html}");
+        }
+        // An ordinary relative link, and an external one, are left alone.
+        let html = message_to_html(&format!("[docs](/v1/contract/web/{SAMPLE_ID}/)"));
+        assert!(html.contains("<a "), "{html}");
+        let html = message_to_html(&format!("[freenet:{RIVER_ID}/ ](https://example.com/)"));
+        assert!(html.contains("href=\"https://example.com/\""), "{html}");
+    }
+
+    #[test]
+    fn relative_href_classification() {
+        for h in ["", "/v1/x", "../x", "x", "?q", "#f", "a/b:c"] {
+            assert!(is_relative_href(h), "{h:?}");
+        }
+        for h in ["//evil.example/", "https://x", "mailto:a@b", "javascript:x"] {
+            assert!(!is_relative_href(h), "{h:?}");
+        }
+    }
+
+    /// The source scan and the render parse different text (a sentinel in
+    /// place of the link); where they disagree, the message renders as if the
+    /// bare-link pass had not run, never with a sentinel in a URL or with
+    /// content lost.
+    #[test]
+    fn bare_link_pass_falls_back_when_the_two_parses_disagree() {
+        for text in [
+            format!("[x](freenet:{RIVER_ID}/(a )"),
+            format!("![x](freenet:{RIVER_ID}/(a )"),
+            format!("[r]: freenet:{RIVER_ID}/(a \n\n[x][r]"),
+            format!("[r]: /x/freenet:{RIVER_ID}/(\n\n[r]"),
+            format!("[see freenet:{RIVER_ID}/] ](https://example.com/)"),
+        ] {
+            let html = message_to_html(&text);
+            let plain = message_to_html_inner(&text, false);
+            assert!(
+                !html.contains('\u{E002}') && !html.to_ascii_uppercase().contains("%EE%80%82"),
+                "{text:?}: {html}"
+            );
+            // Same structure as a render with no bare-link pass (the gateway
+            // flag only changes hrefs, and none of these has a gateway URL).
+            assert_eq!(html, plain, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn restore_accepts_only_prose_sentinels_each_exactly_once() {
+        let links = vec![format!("freenet:{RIVER_ID}/")];
+        let s = |i: usize| format!("{BARE_LINK_OPEN}{i}{BARE_LINK_CLOSE}");
+        let ok = restore_bare_freenet_links(&format!("<p>a {} b</p>", s(0)), &links);
+        assert_eq!(
+            ok.as_deref(),
+            Some(format!("<p>a <a href=\"\">freenet:{RIVER_ID}/</a> b</p>").as_str())
+        );
+        for html in [
+            format!("<p><code>{}</code></p>", s(0)),
+            format!("<p><a href=\"x\">{}</a></p>", s(0)),
+            format!("<pre><code>{}</code></pre>", s(0)),
+            format!("<img alt=\"{}\" />", s(0)),
+            format!("<p>{} {}</p>", s(0), s(0)),
+            "<p>missing</p>".to_string(),
+            format!("<p>{}</p>", s(1)),
+            format!("<a href=\"%EE%80%820%EE%80%83\">x</a><p>{}</p>", s(0)),
+        ] {
+            assert_eq!(restore_bare_freenet_links(&html, &links), None, "{html}");
+        }
+    }
+
+    /// Candidates longer than the longest valid link plus trailing-punctuation
+    /// slack are not examined at all (the scan's work bound), even if trimming
+    /// would have left a valid link.
+    #[test]
+    fn bare_link_candidate_length_cap_is_enforced() {
+        let link = format!("freenet:{RIVER_ID}");
+        let short = format!("{link}{}", "!".repeat(10));
+        let html = message_to_html(&short);
+        assert!(html.contains("href=\"/v1/contract/web/"), "{html}");
+        let over = format!("{link}{}", "!".repeat(MAX_BARE_LINK_CANDIDATE_LEN));
+        let html = message_to_html(&over);
+        assert!(!html.contains("<a "), "over-long candidate must be skipped");
     }
 
     /// Whitespace, `<` and `>` end an angle-bracket autolink, after which GFM
