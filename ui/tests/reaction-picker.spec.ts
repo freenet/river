@@ -103,7 +103,7 @@ test.describe("on a short landscape screen", () => {
   test.use({ viewport: { width: 844, height: 390 } });
 
   test("nothing covers it", async ({ page }) => {
-    // Just above the middle: the old heuristic opened downward here and 44px went under the composer.
+    // Top layer: the composer never paints over it.
     const plus = await middlePlus(page);
     await placeAt(plus, Math.round(390 * 0.55));
     await openFrom(page, plus);

@@ -33,7 +33,7 @@
     margin: auto;
 }
 
-/* Anchored beside its "+", flipped to stay on screen; centred where anchor positioning is missing. No @starting-style: WebKit 317926. */
+/* Anchored below its "+", flipped to stay on screen; centred where anchor positioning is missing. No @starting-style: WebKit 317926. */
 @supports (position-area: block-end) {
     #reaction-picker {
         /* Otherwise a "+" near the screen edge squeezes the picker into the sliver beside it, and it never flips. */
@@ -62,7 +62,7 @@
 }
 
 /* Touch reveal for the inline add-reaction "+" button (same failure mode as
- * #402/#462 above): `.add-reaction-btn` reveals via `.group:hover`, a real
+ * #402/#462 below): `.add-reaction-btn` reveals via `.group:hover`, a real
  * CSS `:hover`, which touch devices can't reliably trigger — so on a phone
  * the button was invisible (opacity: 0) yet still tappable, unless the
  * message already had reactions (`.has-reactions` gives it opacity: 0.2 at
@@ -70,7 +70,7 @@
  * reaction-less messages.
  *
  * Gate on pointer CAPABILITY, not viewport width — see the #462 comment
- * above for why `(hover: none), (any-pointer: coarse)` is the correct query
+ * below for why `(hover: none), (any-pointer: coarse)` is the correct query
  * (`any-pointer: coarse` also catches a touchscreen laptop, which reports
  * `hover: hover` while a finger is on the glass).
  *
@@ -144,7 +144,7 @@
     padding-bottom: 0.5rem;
 }
 
-/* Same device split as the touch rules below: a touchscreen laptop gets no band. */
+/* The complement of the touch rules' query: a touchscreen laptop gets no band. */
 @media (hover: hover) and (not (any-pointer: coarse)) {
     /* The band also stays while a popover the row opened (the reaction picker) is showing. */
     .msg-row:hover,
@@ -250,7 +250,7 @@
  * Tailwind `group-hover:` utilities, which Tailwind v4 automatically wraps in
  * `@media (hover: hover)`. On a touch device (phone, tablet) there is no hover
  * pointer, so that bar can NEVER become visible and touch users have no way to
- * reach reply / edit / delete / react.
+ * reach reply / edit / delete.
  *
  * `.touch-actions` is the exact complement: hidden by default (so mouse users
  * keep the clean hover-reveal desktop UI) and shown only where `hover: none`

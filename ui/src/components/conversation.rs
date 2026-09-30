@@ -2518,7 +2518,6 @@ pub fn Conversation() -> Element {
             }
         });
     }
-    // Which message the shared touch action menu (kebab) is open for.
     let menu_target: Signal<Option<MenuTarget>> = use_signal(|| None);
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
     // Start a reply and focus the composer; shared by every group and the action menu.
@@ -2528,7 +2527,6 @@ pub fn Conversation() -> Element {
             let _ = el.focus();
         }
     };
-    // Which message the shared reaction picker is open for.
     let picker_target: Signal<Option<PickerTarget>> = use_signal(|| None);
 
     // State for delete confirmation modal
@@ -4005,11 +4003,7 @@ pub fn Conversation() -> Element {
             div {
                 class: "flex-1 min-h-0 relative",
                 div {
-                    // `overflow-x-hidden` is a backstop: a kebab action menu on
-                    // a very short self message can extend a few px past the
-                    // viewport edge; clip it (trailing whitespace only — the
-                    // menu content is left-aligned and stays visible) rather
-                    // than show a horizontal scrollbar in the history. #402.
+                    // overflow-x-hidden is a backstop: a gutter control (hover bar, kebab) past the history's edge is clipped, not scrolled to. #402.
                     class: "h-full overflow-y-auto overflow-x-hidden",
                     // `overflow-anchor: none`: the pin machinery owns this
                     // container's `scrollTop`. Browser scroll anchoring rewrites

@@ -115,9 +115,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await expect(menu.getByRole("button", { name: "Edit" })).toBeVisible();
     await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
 
-    // Tapping anywhere else (a real viewport coordinate far from the menu, NOT
-    // the backdrop's own local origin) dismisses the menu — this verifies the
-    // fixed backdrop actually covers the viewport, not just the kebab box.
+    // A tap far from the menu light-dismisses it.
     const vp = page.viewportSize();
     const box = await menu.boundingBox();
     const farX = box && vp && box.x > vp.width / 2 ? 5 : (vp?.width ?? 100) - 5;
@@ -160,8 +158,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     );
 
     const vp = page.viewportSize();
-    // Both a self (accent bubble) and a received (surface bubble) message: the
-    // menu opens on opposite sides, so both must stay within the viewport.
+    // A self and a received message: their kebabs sit on opposite sides, and both menus must stay on screen.
     for (const sel of [
       '[id^="msg-"]:has(.bg-accent)',
       '[id^="msg-"]:has(.bg-surface)',
@@ -178,8 +175,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
         expect(box.x).toBeGreaterThanOrEqual(-1);
         expect(box.x + box.width).toBeLessThanOrEqual(vp.width + 1);
       }
-      // The menu content (first action) must be fully on-screen, not clipped by
-      // the scroll container's overflow-x-hidden backstop.
+      // The first action must be fully on-screen too.
       const replyBox = await menu
         .getByRole("button", { name: "Reply" })
         .boundingBox();
