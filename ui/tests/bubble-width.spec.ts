@@ -24,7 +24,10 @@ async function measure(page: Page) {
     probe.remove();
     return {
       cap: Math.min(ch65, column * 0.75),
-      widths: all.map((b) => b.getBoundingClientRect().width),
+      bubbles: all.map((b) => ({
+        w: b.getBoundingClientRect().width,
+        chips: b.closest('[id^="msg-"]')!.querySelectorAll('[data-testid="reaction-chip"]').length,
+      })),
     };
   });
 }
@@ -32,10 +35,17 @@ async function measure(page: Page) {
 for (const width of [1440, 320]) {
   test(`bubbles are capped at min(65ch, 75% of the column) @ ${width}px`, async ({ page }) => {
     await openRoom(page, width);
+    // Reactions may widen a bubble past the cap (up to .msg-body's); nothing else may.
     await expect
       .poll(async () => {
         const m = await measure(page);
-        return m.widths.some((w) => Math.abs(w - m.cap) <= 1);
+        return Math.max(...m.bubbles.filter((b) => b.chips === 0).map((b) => b.w - m.cap));
+      }, { message: "no bubble without reactions may pass the cap" })
+      .toBeLessThanOrEqual(1);
+    await expect
+      .poll(async () => {
+        const m = await measure(page);
+        return m.bubbles.map((b) => b.w).some((w) => Math.abs(w - m.cap) <= 1);
       }, { message: "some bubble should sit at the cap" })
       .toBe(true);
   });
@@ -79,6 +89,11 @@ for (const width of [1280, 320]) {
         .locator('[id^="msg-"]')
         .filter({ has: page.getByTestId("message-bubble").filter({ hasText: text }) });
       await expect(row.getByTestId("reaction-chip")).toHaveCount(24);
+      const bubbleBox = (await row.getByTestId("message-bubble").boundingBox())!;
+      const reactionBox = (await row.getByTestId("message-reaction-row").boundingBox())!;
+      expect(bubbleBox.width, `${text}: the bubble spans its reaction row`).toBeGreaterThanOrEqual(
+        reactionBox.width - 1
+      );
       const control = row.getByTestId(touch ? "message-kebab" : "message-hover-actions");
       const box = (await control.boundingBox())!;
       expect(box.x, `${text} control's left edge`).toBeGreaterThanOrEqual(scroller.x);
