@@ -18,7 +18,6 @@ use crate::components::direct_messages::{
 use crate::components::members::Invitation;
 use crate::components::room_list::receive_invitation_modal::present_invitation;
 use crate::room_data::SendMessageError;
-use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -309,14 +308,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                     target_room_data.map(|rd| rd.can_participate()),
                                 );
                                 let room_label = target_room_data
-                                    .map(|rd| {
-                                        let sealed =
-                                            &rd.room_state.configuration.configuration.display.name;
-                                        match unseal_bytes_with_secrets(sealed, &rd.secrets) {
-                                            Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                                            Err(_) => sealed.to_string_lossy(),
-                                        }
-                                    })
+                                    .map(|rd| rd.display_name())
                                     .unwrap_or_else(|| {
                                         format!("Room {}", short_vk_prefix(&payload.room_owner_vk))
                                     });

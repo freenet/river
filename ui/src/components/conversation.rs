@@ -16,7 +16,7 @@ use crate::components::members::{
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
 use crate::util::display_name::{display_nickname, sanitize_display_name};
-use crate::util::ecies::{encrypt_with_symmetric_key, unseal_bytes_with_secrets};
+use crate::util::ecies::{encrypt_with_symmetric_key, unseal_text_or_placeholder};
 use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
     get_current_system_time, local_message_date, local_today,
@@ -2539,16 +2539,7 @@ pub fn Conversation() -> Element {
                     return "No Room Selected".to_string();
                 };
                 if let Some(room_data) = rooms.map.get(&key) {
-                    let sealed_name = &room_data
-                        .room_state
-                        .configuration
-                        .configuration
-                        .display
-                        .name;
-                    return match unseal_bytes_with_secrets(sealed_name, &room_data.secrets) {
-                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                        Err(_) => sealed_name.to_string_lossy(),
-                    };
+                    return room_data.display_name();
                 }
             }
             "No Room Selected".to_string()
@@ -2604,10 +2595,7 @@ pub fn Conversation() -> Element {
                         .display
                         .description
                         .as_ref()?;
-                    let text = match unseal_bytes_with_secrets(sealed_desc, &room_data.secrets) {
-                        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                        Err(_) => sealed_desc.to_string_lossy(),
-                    };
+                    let text = unseal_text_or_placeholder(sealed_desc, &room_data.secrets);
                     if text.is_empty() {
                         return None;
                     }

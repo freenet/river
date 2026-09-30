@@ -8,7 +8,7 @@
 
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::room_data::{CurrentRoom, NotificationMode};
-use crate::util::ecies::{decrypt_with_symmetric_key, unseal_bytes_with_secrets};
+use crate::util::ecies::{decrypt_with_symmetric_key, unseal_text_or_placeholder};
 use dioxus::logger::tracing::{debug, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -1335,11 +1335,10 @@ pub fn notify_new_messages(
         .ok()
         .and_then(|rooms| {
             rooms.map.get(room_key).map(|rd| {
-                let sealed_name = &rd.room_state.configuration.configuration.display.name;
-                match unseal_bytes_with_secrets(sealed_name, room_secrets) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                    Err(_) => sealed_name.to_string_lossy(),
-                }
+                unseal_text_or_placeholder(
+                    &rd.room_state.configuration.configuration.display.name,
+                    room_secrets,
+                )
             })
         })
         .unwrap_or_else(|| "Room".to_string());

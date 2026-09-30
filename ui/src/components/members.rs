@@ -22,6 +22,7 @@ use crate::constants::ROOM_CONTRACT_WASM;
 use crate::util::to_cbor_vec;
 use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 
+pub(crate) mod invitation_builder;
 pub mod invite_member_modal;
 pub mod member_info_modal;
 use self::invite_member_modal::InviteMemberModal;

@@ -1,12 +1,9 @@
 use crate::components::app::{CURRENT_ROOM, ROOMS};
-use crate::components::members::{collect_invitation_secrets, Invitation};
+use crate::components::members::Invitation;
 use crate::room_data::RoomData;
-use crate::util::ecies::unseal_bytes_with_secrets;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_solid_icons::{FaArrowsRotate, FaCopy, FaXmark};
 use dioxus_free_icons::Icon;
-use ed25519_dalek::SigningKey;
-use river_core::room_state::member::{AuthorizedMember, Member};
 
 /// Fallback URL for non-browser environments or when `window.location` is
 /// unavailable. This is ONLY reached off the browser (native/test builds) or
@@ -49,73 +46,11 @@ pub(crate) fn get_invitation_base_url() -> String {
     }
 }
 
-fn room_display_name(room: &RoomData) -> String {
-    let sealed_name = &room.room_state.configuration.configuration.display.name;
-    match unseal_bytes_with_secrets(sealed_name, &room.secrets) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-        Err(_) => sealed_name.to_string_lossy(),
-    }
-}
-
 async fn create_invitation(room_data: Option<RoomData>) -> Result<Invitation, String> {
     let Some(room_data) = room_data else {
         return Err("No room selected".to_string());
     };
-    // Issuing an invitation signs the invitee's `Member` record
-    // with the inviter's key, so this whole path needs the
-    // private half. Surface it as a normal resource error (the
-    // modal already renders `Err(String)`) rather than panicking.
-    let Some(self_sk) = room_data.signing_key().cloned() else {
-        return Err(
-            "The local signing key for this room is unavailable, so an invitation cannot be created."
-                .to_string(),
-        );
-    };
-    // Generate new signing key for invitee
-    let invitee_signing_key = SigningKey::generate(&mut rand::thread_rng());
-    let invitee_verifying_key = invitee_signing_key.verifying_key();
-
-    // Create member struct
-    let member = Member {
-        owner_member_id: room_data.owner_vk.into(),
-        invited_by: self_sk.verifying_key().into(),
-        member_vk: invitee_verifying_key,
-    };
-
-    // Serialize member to CBOR for signing
-    let mut member_bytes = Vec::new();
-    ciborium::ser::into_writer(&member, &mut member_bytes)
-        .map_err(|e| format!("Failed to serialize member: {}", e))?;
-
-    // Sign using delegate with fallback to local signing
-    let signature =
-        crate::signing::sign_member_with_fallback(room_data.room_key(), member_bytes, &self_sk)
-            .await;
-
-    // Create authorized member with pre-computed signature
-    let authorized_member = AuthorizedMember::with_signature(member, signature);
-
-    // For a private room, embed the room secrets the inviter
-    // holds so the invitee can decrypt the room immediately on
-    // join, without waiting for the owner delegate's
-    // `encrypted_secrets` back-fill. Empty for a public room,
-    // or if the inviter holds no secret yet (then the invitee
-    // falls back to that wait).
-    let room_secrets = if room_data.is_private() {
-        collect_invitation_secrets(&room_data.secrets)
-    } else {
-        Vec::new()
-    };
-
-    // Create invitation
-    let invitation = Invitation {
-        room: room_data.owner_vk,
-        invitee_signing_key,
-        invitee: authorized_member,
-        room_secrets,
-    };
-
-    Ok(invitation)
+    crate::components::members::invitation_builder::create_invitation(&room_data).await
 }
 
 #[component]
@@ -207,7 +142,7 @@ fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> El
         }
         // Named from the same snapshot the link is minted from, so the message
         // can never name one room while the link grants another.
-        let room_name = room_data.as_ref().map(room_display_name);
+        let room_name = room_data.as_ref().map(|r| r.display_name());
         create_invitation(room_data)
             .await
             .map(|invitation| (invitation, room_name))

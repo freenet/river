@@ -552,6 +552,27 @@ impl RoomData {
         )
     }
 
+    /// The room name, or `None` while it can't be decrypted (or is empty).
+    pub fn decrypted_name(&self) -> Option<String> {
+        let name = &self.room_state.configuration.configuration.display.name;
+        crate::util::ecies::unseal_bytes_with_secrets(name, &self.secrets)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// The room name, or the encrypted placeholder until its secret is available.
+    pub fn display_name(&self) -> String {
+        self.decrypted_name().unwrap_or_else(|| {
+            self.room_state
+                .configuration
+                .configuration
+                .display
+                .name
+                .to_string_lossy()
+        })
+    }
+
     /// Get the current (latest) secret for encryption/decryption
     pub fn get_secret(&self) -> Option<(&[u8; 32], u32)> {
         self.current_secret_version
@@ -5260,6 +5281,40 @@ mod tests {
             previous_contract_key: None,
             invitation_secrets: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn display_name_covers_public_private_and_missing_secret() {
+        let mut rng = rand::thread_rng();
+        let public_room = test_minimal_room_data(SigningKey::generate(&mut rng).verifying_key());
+        assert_eq!(public_room.display_name(), "Default Room Name");
+
+        let owner_sk = SigningKey::generate(&mut rng);
+        let member_sk = SigningKey::generate(&mut rng);
+        let mut room = make_private_owner_room(&owner_sk, &member_sk);
+        let (secret, version) = room
+            .get_secret()
+            .map(|(s, v)| (*s, v))
+            .expect("fixture seeds a secret");
+        room.room_state.configuration.configuration.display.name =
+            seal_bytes(b"Secret Room", &secret, version);
+        assert_eq!(room.display_name(), "Secret Room");
+
+        room.secrets.clear();
+        let placeholder = room
+            .room_state
+            .configuration
+            .configuration
+            .display
+            .name
+            .to_string_lossy();
+        assert!(placeholder.starts_with("[Encrypted:"));
+        assert_eq!(room.display_name(), placeholder);
+        assert_eq!(
+            room.decrypted_name(),
+            None,
+            "PR 19's toast must never get the placeholder"
+        );
     }
 
     /// Regression test for freenet/river#310: in a private room, an edited
