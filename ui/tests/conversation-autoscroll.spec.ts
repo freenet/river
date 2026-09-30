@@ -453,16 +453,25 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
       const rows = c.querySelectorAll('[data-testid="conversation-history"] > *');
       const newest = rows[rows.length - 1] as HTMLElement;
       const before = c.scrollTop;
+      const heightBefore = c.scrollHeight;
+      const widthBefore = content.clientWidth;
       // Short, clamped, then rewrapped taller: all inside one task.
       newest.style.display = "none";
       const clamped = c.scrollTop;
       newest.style.display = "";
       content.style.maxWidth = `${content.clientWidth - 120}px`;
-      return before - clamped;
+      // Read synchronously, so the layout has been redone before we look.
+      const laidOutAgain =
+        c.scrollHeight !== heightBefore || content.clientWidth !== widthBefore;
+      return { clamp: before - clamped, laidOutAgain };
     });
-    expect(clamp, "premise: hiding the newest row must clamp the view").toBeGreaterThan(
+    expect(clamp.clamp, "premise: hiding the newest row must clamp the view").toBeGreaterThan(
       AT_BOTTOM_EPSILON_PX
     );
+    expect(
+      clamp.laidOutAgain,
+      "premise: the rewrap must change the history's height or the width it wraps at"
+    ).toBe(true);
     await expectSettledAtBottom(page, "the reflow's own clamp was read as the reader scrolling up");
   });
 
@@ -646,18 +655,32 @@ test.describe("The newest visible message stays in view", () => {
     await fillHistory(page);
 
     // One task: the scroll event and the rewrap's layout change land together.
-    await page.evaluate(() => {
+    const laidOut = await page.evaluate(() => {
       const c = document.getElementById("chat-scroll-container")!;
       const content = document.getElementById("chat-content")!;
+      const heightBefore = c.scrollHeight;
       c.scrollTop = 0;
       content.style.maxWidth = `${content.clientWidth - 120}px`;
+      // Read synchronously, so the layout has been redone before we look.
+      return { heightBefore, heightAfter: c.scrollHeight };
     });
-    await expect
-      .poll(() => distanceFromBottom(page), {
-        timeout: 5_000,
-        message: "the reader's scroll was lost to the width change",
-      })
-      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    expect(
+      laidOut.heightAfter,
+      "premise: the width change must change the history's scrollHeight, or this test cannot tell a layout change from a reader's scroll"
+    ).not.toBe(laidOut.heightBefore);
+    // A poll would pass on its first sample, before the frame that carries the
+    // scroll event and the ResizeObserver has run. Let that frame land, and then
+    // some, before asking where the reader is.
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 300)))
+        )
+    );
+    expect(
+      await distanceFromBottom(page),
+      "the reader's scroll was lost to the width change"
+    ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
 
     await deliver(page, "arrival after a same-frame scroll");
     await expectStaysPut(page, "an arrival dragged a reader whose scroll shared a frame with a rewrap");

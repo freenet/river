@@ -67,12 +67,14 @@ pub(super) const ANCHOR_FALLBACK_ROWS: usize = 4;
 /// captures.
 pub(super) const LAYOUT_SHIFT_ALLOWANCE_PX: i32 = 200;
 
-/// The three numbers that change when the history is laid out again.
+/// The numbers that change when the history is laid out again, including the
+/// width it wraps at.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(super) struct LayoutSig {
     pub scroll_height: i32,
     pub client_height: i32,
     pub client_width: i32,
+    pub content_width: i32,
 }
 
 /// Who a `scroll` event belongs to.
@@ -212,6 +214,7 @@ fn read_sig(container: &web_sys::Element) -> LayoutSig {
         scroll_height: container.scroll_height(),
         client_height: container.client_height(),
         client_width: container.client_width(),
+        content_width: chat_content_wrapper().map_or(0, |content| content.client_width()),
     }
 }
 
@@ -485,6 +488,7 @@ mod tests {
             scroll_height,
             client_height,
             client_width,
+            content_width: client_width,
         }
     }
 
@@ -579,6 +583,23 @@ mod tests {
                 2000 - LAYOUT_SHIFT_ALLOWANCE_PX - 1
             ),
             ScrollCause::Reader
+        );
+    }
+
+    #[test]
+    fn a_change_of_the_wrap_width_alone_is_a_layout_change() {
+        // Rewrapping can leave scrollHeight and the container as they were (the
+        // fixture's 1280 -> 700 grows by 0px), so the width the history wraps at
+        // has to be part of the signature or the clamp is read as the reader.
+        let before = sig(3000, 600, 1000);
+        let after = LayoutSig {
+            content_width: 700,
+            ..before
+        };
+        assert_ne!(before, after);
+        assert_eq!(
+            classify_scroll(before, after, 2000, 1944),
+            ScrollCause::Layout
         );
     }
 
