@@ -96,6 +96,20 @@ test("picking an emoji reacts to that message and closes the picker", async ({ p
   await expect(row.locator(CHIP)).toHaveCount(1);
 });
 
+test("switching rooms closes it", async ({ page }) => {
+  await openFrom(page, await middlePlus(page));
+  // By keyboard: a click outside would light-dismiss the picker before the room changes.
+  const room = page.getByTestId("room-list").getByRole("button", { name: "Team Chat Room" });
+  if (!(await room.isVisible())) {
+    await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).focus();
+    await page.keyboard.press("Enter");
+  }
+  await room.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("heading", { name: "Team Chat Room" })).toBeVisible();
+  await expect(page.locator(PICKER)).toBeHidden();
+});
+
 test.describe("on a short landscape screen", () => {
   // A phone held sideways: the history is ~250px tall between header and composer.
   test.use({ viewport: { width: 844, height: 390 } });
