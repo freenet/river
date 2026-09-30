@@ -90,20 +90,33 @@ pub(super) enum ScrollCause {
 /// intersects the viewport `[view_top, view_bottom]`. The rows above it are
 /// fallbacks and need not be visible. Empty if no row is visible.
 ///
-/// `rows` are `(top, bottom)` in document order, so their tops are monotonic
-/// and the newest row starting above the viewport's bottom edge is a binary
-/// search away. Touching an edge is not intersecting it.
+/// There are `len` rows in document order and `rect(i)` gives row `i`'s
+/// `(top, bottom)`, so their tops are monotonic and the newest row starting above
+/// the viewport's bottom edge is a binary search away. `rect` is a closure, not a
+/// slice, because each call is a layout read in production: this makes O(log n)
+/// of them plus one for the newest row's bottom edge. Touching an edge is not
+/// intersecting it.
 pub(super) fn newest_visible_rows(
-    rows: &[(i32, i32)],
+    len: usize,
+    rect: impl Fn(usize) -> (i32, i32),
     view_top: i32,
     view_bottom: i32,
     n: usize,
 ) -> Vec<usize> {
-    let started = rows.partition_point(|&(top, _)| top < view_bottom);
-    let Some(newest) = started.checked_sub(1) else {
+    // The first row whose top is not above the viewport's bottom edge.
+    let (mut lo, mut hi) = (0, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if rect(mid).0 < view_bottom {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let Some(newest) = lo.checked_sub(1) else {
         return Vec::new();
     };
-    if n == 0 || rows[newest].1 <= view_top {
+    if n == 0 || rect(newest).1 <= view_top {
         return Vec::new();
     }
     (0..=newest).rev().take(n).collect()
@@ -218,48 +231,6 @@ fn read_sig(container: &web_sys::Element) -> LayoutSig {
     }
 }
 
-/// The anchor rows with their `(top, bottom)` relative to the container's top
-/// edge, so a sidebar toggle can't skew them.
-#[cfg(target_arch = "wasm32")]
-struct Rows {
-    list: web_sys::NodeList,
-    rects: Vec<(i32, i32)>,
-    view_bottom: i32,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Rows {
-    fn read(container: &web_sys::Element) -> Option<Self> {
-        let list = container.query_selector_all(ANCHOR_ROWS).ok()?;
-        let view = container.get_bounding_client_rect();
-        let rects = (0..list.length())
-            .map(|i| {
-                let el = list
-                    .item(i)
-                    .unwrap_throw()
-                    .unchecked_into::<web_sys::Element>();
-                let r = el.get_bounding_client_rect();
-                (
-                    (r.top() - view.top()).round() as i32,
-                    (r.bottom() - view.top()).round() as i32,
-                )
-            })
-            .collect();
-        Some(Self {
-            list,
-            rects,
-            view_bottom: (view.bottom() - view.top()).round() as i32,
-        })
-    }
-
-    fn key(&self, i: usize) -> Option<String> {
-        self.list
-            .item(i as u32)?
-            .unchecked_into::<web_sys::Element>()
-            .get_attribute(ANCHOR_ATTR)
-    }
-}
-
 #[cfg(target_arch = "wasm32")]
 impl HistoryScroll {
     /// Record the layout and `scrollTop` as they are now. Read back after any write,
@@ -279,12 +250,35 @@ impl HistoryScroll {
         let top = container.scroll_top();
         let distance = (sig.scroll_height - sig.client_height - top) as f64;
         self.pinned.set(is_pinned(distance));
-        if let Some(rows) = Rows::read(&container) {
-            let picked =
-                newest_visible_rows(&rows.rects, 0, rows.view_bottom, ANCHOR_FALLBACK_ROWS + 1);
+        if let Ok(list) = container.query_selector_all(ANCHOR_ROWS) {
+            // Relative to the container's top edge, so a sidebar toggle can't skew
+            // them. Each call is a layout read, and the search makes few of them.
+            let view = container.get_bounding_client_rect();
+            let view_bottom = (view.bottom() - view.top()).round() as i32;
+            let item = |i: usize| {
+                list.item(i as u32)
+                    .unwrap_throw()
+                    .unchecked_into::<web_sys::Element>()
+            };
+            let rect = |i: usize| {
+                let r = item(i).get_bounding_client_rect();
+                (
+                    (r.top() - view.top()).round() as i32,
+                    (r.bottom() - view.top()).round() as i32,
+                )
+            };
+            let picked = newest_visible_rows(
+                list.length() as usize,
+                rect,
+                0,
+                view_bottom,
+                ANCHOR_FALLBACK_ROWS + 1,
+            );
             *self.anchor.borrow_mut() = picked
                 .into_iter()
-                .filter_map(|i| Some((rows.key(i)?, rows.view_bottom - rows.rects[i].0)))
+                .filter_map(|i| {
+                    Some((item(i).get_attribute(ANCHOR_ATTR)?, view_bottom - rect(i).0))
+                })
                 .collect();
         }
         self.sig.set(sig);
@@ -483,6 +477,11 @@ mod tests {
 
     const VIEW: (i32, i32) = (0, 500);
 
+    /// `newest_visible_rows` over an array: the closure is all it gets to see.
+    fn newest(rows: &[(i32, i32)], view_top: i32, view_bottom: i32, n: usize) -> Vec<usize> {
+        newest_visible_rows(rows.len(), |i| rows[i], view_top, view_bottom, n)
+    }
+
     fn sig(scroll_height: i32, client_height: i32, client_width: i32) -> LayoutSig {
         LayoutSig {
             scroll_height,
@@ -503,23 +502,20 @@ mod tests {
             (450, 650),
             (650, 800),
         ];
-        assert_eq!(newest_visible_rows(&rows, VIEW.0, VIEW.1, 1), vec![4]);
+        assert_eq!(newest(&rows, VIEW.0, VIEW.1, 1), vec![4]);
 
         // The newest row ends inside the view, so the ones below it are off screen.
-        assert_eq!(newest_visible_rows(&rows[..4], VIEW.0, VIEW.1, 1), vec![3]);
+        assert_eq!(newest(&rows[..4], VIEW.0, VIEW.1, 1), vec![3]);
 
         // Only a row straddling the top edge is visible.
         let above = [(-300, -200), (-200, 20), (600, 700)];
-        assert_eq!(newest_visible_rows(&above, VIEW.0, VIEW.1, 1), vec![1]);
+        assert_eq!(newest(&above, VIEW.0, VIEW.1, 1), vec![1]);
 
         // A row taller than the viewport, covering both edges.
         let tall = [(-100, 900)];
-        assert_eq!(newest_visible_rows(&tall, VIEW.0, VIEW.1, 1), vec![0]);
+        assert_eq!(newest(&tall, VIEW.0, VIEW.1, 1), vec![0]);
 
-        assert_eq!(
-            newest_visible_rows(&[], VIEW.0, VIEW.1, 1),
-            Vec::<usize>::new()
-        );
+        assert_eq!(newest(&[], VIEW.0, VIEW.1, 1), Vec::<usize>::new());
     }
 
     #[test]
@@ -533,26 +529,43 @@ mod tests {
             (500, 600),
         ];
         // Row 4 is the newest visible one; the n rows are it and those above it.
-        assert_eq!(newest_visible_rows(&rows, 0, 450, 3), vec![4, 3, 2]);
+        assert_eq!(newest(&rows, 0, 450, 3), vec![4, 3, 2]);
         // Fewer rows exist than were asked for.
-        assert_eq!(newest_visible_rows(&rows[..2], 0, 450, 5), vec![1, 0]);
+        assert_eq!(newest(&rows[..2], 0, 450, 5), vec![1, 0]);
         // The fallbacks need not be visible themselves.
-        assert_eq!(newest_visible_rows(&rows, 250, 450, 4), vec![4, 3, 2, 1]);
-        assert_eq!(newest_visible_rows(&rows, 0, 450, 0), Vec::<usize>::new());
+        assert_eq!(newest(&rows, 250, 450, 4), vec![4, 3, 2, 1]);
+        assert_eq!(newest(&rows, 0, 450, 0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn newest_visible_rows_reads_only_a_handful_of_rects() {
+        // Capture runs on every scroll event, and each rect is a layout read.
+        let rows: Vec<(i32, i32)> = (0..10_000).map(|i| (i * 100, i * 100 + 90)).collect();
+        let reads = Cell::new(0usize);
+        let picked = newest_visible_rows(
+            rows.len(),
+            |i| {
+                reads.set(reads.get() + 1);
+                rows[i]
+            },
+            300_000,
+            300_500,
+            ANCHOR_FALLBACK_ROWS + 1,
+        );
+        assert_eq!(picked, vec![3_004, 3_003, 3_002, 3_001, 3_000]);
+        // log2(10_000) is about 14: the search, plus the one bottom-edge read.
+        assert!(reads.get() <= 16, "read {} rects", reads.get());
     }
 
     #[test]
     fn a_row_touching_the_edge_by_one_pixel_is_not_visible() {
         // Its bottom edge is the viewport's top edge: no overlap at all.
-        assert!(newest_visible_rows(&[(-100, 0)], 0, 500, 1).is_empty());
+        assert!(newest(&[(-100, 0)], 0, 500, 1).is_empty());
         // Its top edge is the viewport's bottom edge.
-        assert_eq!(
-            newest_visible_rows(&[(0, 100), (500, 600)], 0, 500, 1),
-            vec![0]
-        );
+        assert_eq!(newest(&[(0, 100), (500, 600)], 0, 500, 1), vec![0]);
         // One pixel of overlap is visible.
-        assert_eq!(newest_visible_rows(&[(-100, 1)], 0, 500, 1), vec![0]);
-        assert_eq!(newest_visible_rows(&[(499, 600)], 0, 500, 1), vec![0]);
+        assert_eq!(newest(&[(-100, 1)], 0, 500, 1), vec![0]);
+        assert_eq!(newest(&[(499, 600)], 0, 500, 1), vec![0]);
     }
 
     #[test]
