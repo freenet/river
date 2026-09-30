@@ -52,7 +52,6 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys;
 
@@ -2525,14 +2524,8 @@ pub fn Conversation() -> Element {
     // Start a reply and focus the composer; shared by every group and the action menu.
     let on_reply_ctx = move |ctx: ReplyContext| {
         replying_to.set(Some(ctx));
-        if let Some(window) = web_sys::window() {
-            if let Some(doc) = window.document() {
-                if let Some(el) = doc.get_element_by_id("message-input") {
-                    if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                        let _ = el.focus();
-                    }
-                }
-            }
+        if let Some(el) = message_input::get_message_textarea() {
+            let _ = el.focus();
         }
     };
     // Which message the shared reaction picker is open for.
