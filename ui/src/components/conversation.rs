@@ -1561,21 +1561,6 @@ struct WindowAnchor {
 /// item anyway.
 const WINDOW_ANCHOR_KEYS: usize = 8;
 
-/// Where the anchored window starts after the item list changed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct RelocatedWindow {
-    /// Start index for the resolve: the head's new position when it survived,
-    /// otherwise derived from the first surviving spare (its position minus
-    /// its offset in the anchor), otherwise 0.
-    start: usize,
-    /// Whether the HEAD itself survived under its own key. False means the
-    /// pre-patch head row is gone or re-keyed. Nothing in production reads
-    /// it now (the history scroll model restores by anchor row instead), but
-    /// the relocation tests pin it as the record of what relocation found.
-    #[cfg_attr(not(test), allow(dead_code))]
-    head_survived: bool,
-}
-
 /// Search for one anchored key after the item list changed.
 ///
 /// Front prunes shift every surviving index DOWN, so the hint is checked
@@ -1592,8 +1577,9 @@ fn relocate_anchor(total: usize, hint: usize, is_anchor: impl Fn(usize) -> bool)
     (hint.saturating_add(1)..total).find(|&i| is_anchor(i))
 }
 
-/// Re-locate the anchored window: the head by its own key, else by the first
-/// surviving spare, else index 0.
+/// Re-locate the anchored window's start: the head by its own key, else by the
+/// first surviving spare (its position minus its offset in the anchor), else
+/// index 0.
 ///
 /// The index-0 fallback is exact for a front-contiguous drain that consumed
 /// the head and every spare — the oldest remaining item IS then the nearest
@@ -1612,20 +1598,14 @@ fn relocate_window(
     total: usize,
     anchor: &WindowAnchor,
     key_at: impl Fn(usize, &str) -> bool,
-) -> RelocatedWindow {
+) -> usize {
     for (spare, key) in anchor.keys.iter().enumerate() {
         let located = relocate_anchor(total, anchor.index + spare, |i| key_at(i, key));
         if let Some(i) = located {
-            return RelocatedWindow {
-                start: i.saturating_sub(spare),
-                head_survived: spare == 0,
-            };
+            return i.saturating_sub(spare);
         }
     }
-    RelocatedWindow {
-        start: 0,
-        head_survived: false,
-    }
+    0
 }
 
 /// Does `key` identify `item`, without allocating a key `String`?
@@ -3207,7 +3187,7 @@ pub fn Conversation() -> Element {
                                     let history_window = HistoryWindow::resolve(
                                         groups.len(),
                                         requested_window,
-                                        relocated.as_ref().map(|r| r.start),
+                                        relocated,
                                     );
                                     // Remember where this render started so the
                                     // NEXT one grows instead of sliding (#501).
@@ -5281,10 +5261,8 @@ mod tests {
             keys.remove(0);
             keys.push(format!("new{arrival}"));
             let relocated = relocate_window(keys.len(), &anchor, |i, key| keys[i] == key);
-            assert!(relocated.head_survived, "arrival {arrival}: head survives");
             let start =
-                HistoryWindow::resolve(keys.len(), INITIAL_WINDOW_ITEMS, Some(relocated.start))
-                    .start;
+                HistoryWindow::resolve(keys.len(), INITIAL_WINDOW_ITEMS, Some(relocated)).start;
             assert_eq!(
                 keys[start], head_key,
                 "arrival {arrival}: the window head changed identity — the \
@@ -5301,9 +5279,8 @@ mod tests {
         keys.remove(0);
         keys.push("new40".into());
         let relocated = relocate_window(keys.len(), &anchor, |i, key| keys[i] == key);
-        assert!(!relocated.head_survived, "the head itself was pruned");
         assert_eq!(
-            relocated.start, 0,
+            relocated, 0,
             "the first surviving spare pins the window to the nearest \
              surviving item"
         );
@@ -5325,13 +5302,8 @@ mod tests {
         };
         let post_keys = ["m1", "b", "c", "d", "e"];
         let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(
-            !relocated.head_survived,
-            "the re-keyed head must count as removed — its row is replaced \
-             and its height changed"
-        );
         assert_eq!(
-            relocated.start, 0,
+            relocated, 0,
             "the first spare (\"b\", found at index 1, offset 1 in the \
              anchor) pins the window back to the re-keyed group"
         );
@@ -5364,9 +5336,8 @@ mod tests {
             .chain((0..10).map(|i| format!("rest{i}")))
             .collect();
         let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(!relocated.head_survived);
         assert_eq!(
-            relocated.start, 0,
+            relocated, 0,
             "spare 7 found at index 7, offset 7 in the anchor → start 0"
         );
     }
@@ -5386,9 +5357,8 @@ mod tests {
             .chain((0..30).map(|i| format!("new{i}")))
             .collect();
         let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(!relocated.head_survived);
         assert_eq!(
-            relocated.start, 0,
+            relocated, 0,
             "spare m30 found at index 0, offset 5 in the anchor → start 0: \
              the whole surviving remainder of the old window stays rendered"
         );
@@ -5400,8 +5370,7 @@ mod tests {
             .chain((0..40).map(|i| format!("new{i}")))
             .collect();
         let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(!relocated.head_survived);
-        assert_eq!(relocated.start, 0);
+        assert_eq!(relocated, 0);
     }
 
     /// The case where the spares are load-bearing and no fallback can stand
@@ -5422,9 +5391,8 @@ mod tests {
             .cloned()
             .collect();
         let relocated = relocate_window(post_keys.len(), &anchor, |i, key| post_keys[i] == key);
-        assert!(!relocated.head_survived);
         assert_eq!(
-            relocated.start, 39,
+            relocated, 39,
             "spare m41 (offset 1) found at index 40 → start 39: the window \
              re-anchors one slot back, not at the front of the room"
         );
