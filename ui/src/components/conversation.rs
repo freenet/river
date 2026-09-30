@@ -8047,3 +8047,190 @@ mod group_messages_clock_tests {
         assert_eq!(g.messages[0].time, sent);
     }
 }
+
+/// Source-grep pins for the auto-scroll wiring in [`Conversation`] and
+/// `history_scroll.rs`.
+///
+/// The behaviour these guard is only observable in a browser (it is measured
+/// by `ui/tests/conversation-autoscroll.spec.ts`), so these exist to make a
+/// silent revert in a refactor fail at `cargo test` rather than in the field.
+/// freenet/river#486 is what a silent revert costs: the view stopped following
+/// the conversation for 54 consecutive arrivals.
+#[cfg(test)]
+mod autoscroll_wiring_pins {
+    /// The production half of this file, cut at the first test module.
+    ///
+    /// Cut by a needle that cannot match itself — it contains an escaped
+    /// newline in the source, not a literal one. `rfind` would land on
+    /// whichever test module was appended most recently and quietly put these
+    /// needles inside the scanned text, making every assertion below
+    /// self-satisfying (freenet/river#471).
+    fn production_source() -> &'static str {
+        let source = include_str!("conversation.rs");
+        &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")]
+    }
+
+    /// The production half of the scroll model, cut the same way.
+    fn history_source() -> &'static str {
+        let source = include_str!("conversation/history_scroll.rs");
+        &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("history_scroll.rs should have a `#[cfg(test)] mod tests` block")]
+    }
+
+    /// Source with all whitespace removed: `cargo fmt` decides how a condition
+    /// wraps, and a pin a reformat can break is a pin that gets deleted.
+    fn dense(source: &str) -> String {
+        source.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// `is_at_bottom` answers "is the end of the history on screen right now?".
+    /// Gating auto-scroll on it is the #486 latch: once the gap exceeded the
+    /// observer's margin the gate read false and nothing re-armed it. The
+    /// signal may still drive the scroll-to-latest button, so this pins the
+    /// narrow thing — it must not appear in the auto-scroll effect's condition.
+    #[test]
+    fn autoscroll_is_not_gated_on_the_intersection_observer() {
+        let prod = production_source();
+        for forbidden in [
+            "forced || *is_at_bottom.peek()",
+            "*is_at_bottom.peek() || forced",
+            "forced || is_at_bottom()",
+        ] {
+            assert!(
+                !prod.contains(forbidden),
+                "auto-scroll must follow the history's own pin, not the \
+                 scroll-to-latest button's IntersectionObserver: found `{forbidden}`"
+            );
+        }
+        assert!(
+            dense(prod).contains("ifhistory.restore()&&(forced||"),
+            "the content effect must restore through `history`, which owns the pin"
+        );
+    }
+
+    /// The trigger, not just the gate. An `onmounted` on the last bubble is
+    /// silent for every content change that leaves that row in place, so the
+    /// effect has to subscribe to the grouped-message memo instead.
+    #[test]
+    fn autoscroll_is_triggered_by_content_change_not_by_a_remount() {
+        let prod = production_source();
+        assert!(
+            !prod.contains("last_chat_element"),
+            "the last-bubble mount handle is not a content-change trigger; it \
+             misses mid-list inserts, merged join summaries, reactions and edits"
+        );
+        let dense_prod = dense(prod);
+        assert!(
+            dense_prod
+                .contains("let_=window_items();lethas_content=message_groups.read().is_some();"),
+            "the content effect must subscribe to `message_groups` so any content \
+             change re-runs it, and to `window_items` so a backfill or trim does"
+        );
+        // Two observations, not one. The content wrapper sees the history
+        // growing or reflowing; only the container sees the WINDOW shrinking,
+        // which is what growing the composer does — #486's third cause.
+        assert!(
+            dense(history_source())
+                .contains("web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref())")
+                && dense(history_source())
+                    .contains("observer.observe(&content);observer.observe(&container);"),
+            "the resize follow must watch BOTH the content wrapper and the \
+             scroll container; watching only the wrapper misses the composer \
+             taking height away from the history"
+        );
+    }
+
+    /// The scroll container must opt out of browser scroll anchoring (#501).
+    /// With anchoring on, any change to rendered rows above the viewport (a
+    /// window trim, date-separator churn) makes the browser rewrite
+    /// `scrollTop` behind the scroll model's back.
+    #[test]
+    fn the_scroll_container_disables_scroll_anchoring() {
+        assert!(
+            dense(production_source()).contains(concat!("style:\"overflow-", "anchor:none;\"")),
+            "#chat-scroll-container must set `overflow-anchor: none` — browser \
+             scroll anchoring rewriting scrollTop is #501's H1"
+        );
+    }
+
+    /// The backfill sentinel waits for the room-open snap (#501 H2), including
+    /// the one render where the previous room's `opening_snap_done` is still true.
+    #[test]
+    fn the_backfill_sentinel_waits_for_the_opening_snap() {
+        assert!(
+            dense(production_source()).contains(
+                "ifhistory_window.has_older&&opening_snap_done()&&!room_changed_this_render"
+            ),
+            "a sentinel mounted before the opening snap fires from the top and \
+             cascades the backfill (#501 H2)"
+        );
+    }
+
+    /// `capture` sets the pin and the anchor from the reader's own position, so
+    /// it may only run for a scroll the reader made. Anything else calling it
+    /// would let a layout change move the pin: the #486 latch.
+    #[test]
+    fn capture_runs_only_from_the_scroll_listener() {
+        let hist = dense(history_source());
+        let on_scroll = hist
+            .split("fnon_scroll(")
+            .nth(1)
+            .and_then(|rest| rest.split("fnsnap_to_bottom(").next())
+            .expect("history_scroll.rs should define `on_scroll` before `snap_to_bottom`");
+        assert!(
+            hist.matches(".capture(").count() == 1 && on_scroll.contains(".capture("),
+            "`.capture(` must appear exactly once in history_scroll.rs, inside `on_scroll`"
+        );
+    }
+
+    /// The ResizeObserver reports layout, never the reader: capturing from it
+    /// would read a growing composer or a rewrap as the reader moving.
+    #[test]
+    fn layout_changes_restore_and_never_capture() {
+        let hist = dense(history_source());
+        let closure = hist
+            .split("leton_resize={")
+            .nth(1)
+            .and_then(|rest| rest.split("asBox<dynFnMut(js_sys::Array)>)").next())
+            .expect("install should build the ResizeObserver closure as `on_resize`");
+        assert!(
+            closure.contains("this.restore();") && !closure.contains("capture"),
+            "the ResizeObserver closure must restore, and must not capture"
+        );
+    }
+
+    /// A trim is only invisible at the exact bottom, and only when the trimmed
+    /// tail would not re-fire the backfill (#505). Loosening either gate yanks
+    /// a reader parked in the pin band, or oscillates trim against backfill.
+    #[test]
+    fn the_trim_stays_gated_at_the_bottom() {
+        assert!(
+            dense(history_source()).contains(
+                "distance<=SCROLL_TOP_SLACK_PXasf64&&trim.window_overgrown.get()&&!trim_would_rearm_backfill("
+            ),
+            "the trim must need distance <= SCROLL_TOP_SLACK_PX, an overgrown \
+             window, and a tail that does not re-arm the backfill"
+        );
+    }
+
+    /// A `scroll` event arrives a frame after the scroll, and a content change
+    /// can land first. `restore`, and the render before a patch, must read a
+    /// pending reader scroll first: otherwise a stale pin drags the reader back
+    /// to the bottom, or the anchor is measured after the patch moved the rows.
+    #[test]
+    fn a_pending_reader_scroll_is_taken_in_before_a_restore() {
+        assert!(
+            dense(history_source()).contains(
+                "pub(super)fnrestore(&self)->bool{self.take_in_undelivered_scroll();self.restore_now()}"
+            ),
+            "`restore` must take in an undelivered reader scroll before `restore_now`"
+        );
+        assert!(
+            dense(production_source()).contains("history.take_in_undelivered_scroll();"),
+            "the render must read a pending reader scroll before the patch"
+        );
+    }
+}
