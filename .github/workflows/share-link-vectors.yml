@@ -1,0 +1,46 @@
+name: Share link vectors
+
+# River converts Freenet share links (https://freenet.org/open#... and
+# freenet:...) in chat messages into links to the reader's own node, so it
+# must accept exactly the links the /open page (freenet/web) and the freenet:
+# handler (freenet-core) accept. All three are tested against one vector file,
+# which lives in freenet-core (crates/core/tests/data/share-link-vectors.json).
+# River keeps a copy at ui/src/util/share-link-vectors.json, which the river-ui
+# unit tests (build.yml) run the validator over. This workflow fails if that
+# copy has drifted from freenet-core main.
+
+on:
+  pull_request:
+    paths:
+      - 'ui/src/util/share_link.rs'
+      - 'ui/src/util/share-link-vectors.json'
+      - '.github/workflows/share-link-vectors.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'ui/src/util/share_link.rs'
+      - 'ui/src/util/share-link-vectors.json'
+      - '.github/workflows/share-link-vectors.yml'
+  schedule:
+    # Catch a rule change on the freenet-core side, which no change here
+    # would trigger.
+    - cron: '47 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vectors-match-upstream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vector copy matches freenet-core main
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/freenet/freenet-core/main/crates/core/tests/data/share-link-vectors.json \
+            -o /tmp/upstream-vectors.json
+          if ! diff -u /tmp/upstream-vectors.json ui/src/util/share-link-vectors.json; then
+            echo "::error::ui/src/util/share-link-vectors.json differs from freenet-core main. Copy it over, and update ui/src/util/share_link.rs if the rules changed."
+            exit 1
+          fi
