@@ -219,3 +219,21 @@ test("deleting the message closes its picker", async ({ page }) => {
   await expect(page.locator(`[id="${id}"]`)).toHaveCount(0);
   await expect.poll(() => page.locator(PICKER).evaluate((el) => el.matches(":popover-open"))).toBe(false);
 });
+
+test("opening it by keyboard focuses the first emoji; Esc returns focus to the +", async ({ page }) => {
+  const plus = await middlePlus(page);
+  await plus.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("dialog", { name: /reaction/i })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => !!document.activeElement?.closest("#reaction-picker"))).toBe(true);
+  await page.keyboard.press("Escape");
+  await expect(page.locator(PICKER)).toBeHidden();
+  await expect(plus).toBeFocused();
+});
+
+test("on page load neither popover holds focus", async ({ page }) => {
+  // `autofocus` inside a closed popover must not take focus when the page loads.
+  expect(
+    await page.evaluate(() => !!document.activeElement?.closest("#reaction-picker, #message-action-menu"))
+  ).toBe(false);
+});

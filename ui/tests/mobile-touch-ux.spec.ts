@@ -134,9 +134,9 @@ test.describe("Message action kebab menu (#402.1)", () => {
 
     const menu = page.locator('[data-testid="message-action-menu"]');
     await expect(menu).toBeVisible();
-    await expect(menu.getByRole("button", { name: "Reply" })).toBeVisible();
-    await expect(menu.getByRole("button", { name: "Edit" })).toBeVisible();
-    await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
+    await expect(menu.getByRole("menuitem", { name: "Reply" })).toBeVisible();
+    await expect(menu.getByRole("menuitem", { name: "Edit" })).toBeVisible();
+    await expect(menu.getByRole("menuitem", { name: "Delete" })).toBeVisible();
 
     // A tap far from the menu light-dismisses it.
     const vp = page.viewportSize();
@@ -161,7 +161,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
     await kebab.click();
     await page
       .locator('[data-testid="message-action-menu"]')
-      .getByRole("button", { name: "Reply" })
+      .getByRole("menuitem", { name: "Reply" })
       .click();
 
     // The composer shows a reply-preview strip (with a "Cancel reply" button)
@@ -200,7 +200,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
       }
       // The first action must be fully on-screen too.
       const replyBox = await menu
-        .getByRole("button", { name: "Reply" })
+        .getByRole("menuitem", { name: "Reply" })
         .boundingBox();
       if (replyBox && vp) {
         expect(replyBox.x).toBeGreaterThanOrEqual(-1);
@@ -246,7 +246,7 @@ test.describe("Message action kebab menu (#402.1)", () => {
       const menu = page.locator('[data-testid="message-action-menu"]');
       await expect(menu).toBeVisible();
       // The target lands a tick after the open; measure the full three-action menu.
-      await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
+      await expect(menu.getByRole("menuitem", { name: "Delete" })).toBeVisible();
 
       const k = (await kebab.boundingBox())!;
       const m = (await menu.boundingBox())!;
@@ -296,11 +296,11 @@ test.describe("Message action kebab menu (#402.1)", () => {
     const row = page.locator(`[id="${id}"]`);
     await row.getByTestId("message-kebab").click();
     const menu = page.getByTestId("message-action-menu");
-    await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
+    await expect(menu.getByRole("menuitem", { name: "Delete" })).toBeVisible();
     // Edited on another device while the menu is open.
     await page.evaluate(() => (window as any).__riverTest.editLastOwnMessage("edited elsewhere"));
     await expect(row.getByTestId("message-bubble")).toContainText("edited elsewhere");
-    await menu.getByRole("button", { name: "Edit" }).click();
+    await menu.getByRole("menuitem", { name: "Edit" }).click();
     await expect(page.locator('textarea[id^="edit-msg-"]')).toHaveValue("edited elsewhere");
   });
 
@@ -316,11 +316,47 @@ test.describe("Message action kebab menu (#402.1)", () => {
     const id = await page.locator('[id^="msg-"]:has(.bg-accent)').last().evaluate((el) => el.id);
     await page.locator(`[id="${id}"]`).getByTestId("message-kebab").click();
     const menu = page.getByTestId("message-action-menu");
-    await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
+    await expect(menu.getByRole("menuitem", { name: "Delete" })).toBeVisible();
     // Deleted on another device while the menu is open.
     await page.evaluate(() => (window as any).__riverTest.deleteLastOwnMessage(0));
     await expect(page.locator(`[id="${id}"]`)).toHaveCount(0);
     await expect.poll(() => menu.evaluate((el) => el.matches(":popover-open"))).toBe(false);
+  });
+
+  test("the menu is a keyboard menu", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    test.skip(
+      !(await isTouchOnly(page)),
+      "kebab menu is touch-only; desktop uses the hover action bar"
+    );
+
+    const kebab = page.locator('[id^="msg-"]:has(.bg-accent)').last().getByTestId("message-kebab");
+    await kebab.focus();
+    await page.keyboard.press("Enter");
+    const menu = page.getByRole("menu");
+    // The target lands a tick after the open; wait for all three items.
+    await expect(menu.getByRole("menuitem")).toHaveCount(3);
+    const focused = () =>
+      page.evaluate(() => {
+        const el = document.activeElement;
+        return el ? `${el.getAttribute("role")}:${el.textContent?.trim()}` : "";
+      });
+    await expect.poll(focused).toBe("menuitem:Reply");
+    await page.keyboard.press("ArrowDown");
+    expect(await focused()).toBe("menuitem:Edit");
+    await page.keyboard.press("End");
+    expect(await focused()).toBe("menuitem:Delete");
+    await page.keyboard.press("ArrowDown");
+    expect(await focused()).toBe("menuitem:Reply");
+    await page.keyboard.press("ArrowUp");
+    expect(await focused()).toBe("menuitem:Delete");
+    await page.keyboard.press("Home");
+    expect(await focused()).toBe("menuitem:Reply");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("message-action-menu")).toBeHidden();
+    await expect(kebab).toBeFocused();
   });
 
   test("nothing covers the open menu, even over later messages", async ({ page }) => {

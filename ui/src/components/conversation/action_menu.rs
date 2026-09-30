@@ -39,6 +39,32 @@ fn menu_is_open() -> bool {
     menu_element().is_some_and(|el| el.matches(":popover-open").unwrap_or(false))
 }
 
+/// Arrow keys, Home and End move focus between the menu's items, wrapping at the ends. DOM calls only.
+fn move_menu_focus(key: &Key) -> bool {
+    let Some(list) = menu_element().and_then(|m| m.first_element_child()) else {
+        return false;
+    };
+    let active = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.active_element())
+        .filter(|a| a.parent_element().as_ref() == Some(&list));
+    let next = match key {
+        Key::ArrowDown => active
+            .and_then(|a| a.next_element_sibling())
+            .or_else(|| list.first_element_child()),
+        Key::ArrowUp => active
+            .and_then(|a| a.previous_element_sibling())
+            .or_else(|| list.last_element_child()),
+        Key::Home => list.first_element_child(),
+        Key::End => list.last_element_child(),
+        _ => return false,
+    };
+    if let Some(el) = next.and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok()) {
+        let _ = el.focus();
+    }
+    true
+}
+
 /// Close the menu if it is open; its `toggle` handler then clears the target. A DOM call, not a signal write.
 pub(super) fn close_action_menu() {
     if let Some(el) = menu_element().filter(|el| el.matches(":popover-open").unwrap_or(false)) {
@@ -59,8 +85,15 @@ pub(super) fn ActionMenu(
             id: ACTION_MENU_ID,
             "data-testid": "message-action-menu",
             popover: "auto",
+            role: "menu",
+            "aria-label": "Message actions",
             // No display utility on the root: it would show a closed popover.
             class: "bg-panel text-text rounded-lg shadow-lg border border-border py-1 min-w-[8rem]",
+            onkeydown: move |evt: KeyboardEvent| {
+                if move_menu_focus(&evt.key()) {
+                    evt.prevent_default();
+                }
+            },
             // Fires on every open and close, however it happened; a close clears the target.
             ontoggle: move |_| {
                 if !menu_is_open() {
@@ -68,9 +101,12 @@ pub(super) fn ActionMenu(
                     crate::util::defer(move || target.set(None));
                 }
             },
-            div { class: "flex flex-col",
+            div { class: "flex flex-col", role: "none",
                 button {
                     r#type: "button",
+                    role: "menuitem",
+                    // The popover's focusing steps move focus here when it opens.
+                    autofocus: true,
                     // Closes the menu natively, after `onclick` has read the target.
                     popovertarget: ACTION_MENU_ID,
                     popovertargetaction: "hide",
@@ -86,6 +122,7 @@ pub(super) fn ActionMenu(
                 if is_self {
                     button {
                         r#type: "button",
+                        role: "menuitem",
                         popovertarget: ACTION_MENU_ID,
                         popovertargetaction: "hide",
                         class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
@@ -99,6 +136,7 @@ pub(super) fn ActionMenu(
                     }
                     button {
                         r#type: "button",
+                        role: "menuitem",
                         popovertarget: ACTION_MENU_ID,
                         popovertargetaction: "hide",
                         class: "flex items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-error-bg text-left",

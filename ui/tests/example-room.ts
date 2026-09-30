@@ -60,7 +60,7 @@ export async function openOwnMessageEdit(page: Page): Promise<Locator> {
   await ownRow.scrollIntoViewIfNeeded();
   if (await page.evaluate(() => window.matchMedia("(hover: none)").matches)) {
     await ownRow.getByTestId("message-kebab").click();
-    await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
+    await page.getByTestId("message-action-menu").getByRole("menuitem", { name: /edit/i }).click();
   } else {
     await ownRow.getByTestId("message-bubble").hover();
     await ownRow.getByRole("button", { name: /edit/i }).click();

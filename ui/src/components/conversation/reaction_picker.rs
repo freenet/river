@@ -57,6 +57,8 @@ pub(super) fn ReactionPicker(
             id: REACTION_PICKER_ID,
             "data-testid": "emoji-picker",
             popover: "auto",
+            role: "dialog",
+            "aria-label": "Choose a reaction",
             // No display utility on the root: it would show a closed popover.
             class: "p-1.5 bg-panel text-text rounded-xl shadow-xl border border-border",
             // Fires on every open and close, however it happened; a close clears the target.
@@ -67,10 +69,12 @@ pub(super) fn ReactionPicker(
                 }
             },
             div { class: "grid grid-cols-4 gap-0.5",
-                for (emoji, is_current) in FREQUENT_EMOJIS.iter().map(|&e| (e, current.as_deref() == Some(e))) {
+                for (i, (emoji, is_current)) in FREQUENT_EMOJIS.iter().map(|&e| (e, current.as_deref() == Some(e))).enumerate() {
                     button {
                         key: "{emoji}",
                         r#type: "button",
+                        // The popover's focusing steps move focus here when it opens.
+                        autofocus: i == 0,
                         // Closes the picker natively, after `onclick` has read the target.
                         popovertarget: REACTION_PICKER_ID,
                         popovertargetaction: "hide",
@@ -122,6 +126,7 @@ pub(super) fn AddReactionButton(
             "aria-label": "Add reaction",
             "data-testid": "add-reaction-button",
             popovertarget: REACTION_PICKER_ID,
+            "aria-haspopup": "dialog",
             // Keeps this "+" shown while its picker is open (main.css) and names its owner.
             "aria-expanded": "{open_for_me}",
             onclick: move |_| {
