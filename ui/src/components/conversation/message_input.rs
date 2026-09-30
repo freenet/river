@@ -151,7 +151,7 @@ fn computed_style(el: &web_sys::Element, prop: &str) -> Option<String> {
         .ok()
 }
 
-fn get_message_textarea() -> Option<web_sys::HtmlTextAreaElement> {
+pub(super) fn get_message_textarea() -> Option<web_sys::HtmlTextAreaElement> {
     web_sys::window()?
         .document()?
         .get_element_by_id("message-input")?

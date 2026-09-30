@@ -66,7 +66,11 @@ test.describe("Reply bubble layout (#206, #207)", () => {
       const hasReplyStrip = await bubble
         .locator(".reply-strip")
         .count();
-      if (hasReplyStrip === 0) {
+      // Reactions widen a bubble past the cap (see bubble-width.spec.ts), so they are no baseline.
+      const chips = await bubble.evaluate(
+        (el) => el.closest('[id^="msg-"]')!.querySelectorAll('[data-testid="reaction-chip"]').length
+      );
+      if (hasReplyStrip === 0 && chips === 0) {
         const w = await bubble.evaluate(
           (el) => el.getBoundingClientRect().width
         );
@@ -85,8 +89,8 @@ test.describe("Reply bubble layout (#206, #207)", () => {
     //
     // Before the fix: reply bubbles were dramatically wider because the
     // reply-strip's nowrap text forced the shrink-to-fit width up to
-    // max-w-prose. After the fix: bubble is sized by the body, strip
-    // ellipsizes within it.
+    // the bubble's 65ch cap. After the fix: bubble is sized by the body,
+    // strip ellipsizes within it.
     expect(replyWidth).toBeLessThanOrEqual(maxNonReplyWidth + 40);
   });
 
@@ -660,15 +664,15 @@ test.describe("Auto-scroll to bottom on refresh", () => {
 });
 
 // Mobile self-message overflow: a SELF (right-aligned) bubble must stay fully
-// within a narrow viewport. Regression: a self reply whose reply-strip preview
-// held a long unbreakable URL rendered nowrap, driving the bubble to its full
-// `max-w-prose` (65ch) width. As a non-stretched flex item under the self
-// bubbles wrapper's `items-end`, that wrapper sized to the bubble's content and
-// escaped the `max-w-[75%]` column, so the bubble spilled off BOTH edges of a
-// 375px screen (clipped, message text cut off left and right), exactly the
-// "text going off the edge" report. Received (left-aligned) bubbles were fine
-// because their wrapper is a plain block that already fills the column. Fixed
-// by `min-w-0 max-w-full` on the per-message wrapper (conversation.rs). The
+// within a narrow viewport. Regression: a self reply whose reply-strip preview held
+// a long unbreakable URL rendered nowrap, driving the bubble to its full
+// `max-w-prose` (65ch) width. As a non-stretched flex item under the self bubbles
+// wrapper's `items-end`, that wrapper sized to the bubble's content and escaped the
+// old `max-w-[75%]` column, so the bubble spilled off BOTH edges of a 375px screen
+// (clipped, message text cut off left and right), exactly the "text going off the
+// edge" report. Received (left-aligned) bubbles were fine because their wrapper is
+// a plain block that already fills the column. Fixed then by `min-w-0 max-w-full`
+// on the content wrapper; today the wrapper is `.msg-body`, capped in main.css. The
 // example data carries a self reply to the long-URL message so this reproduces.
 test.describe("Self message bubble mobile overflow", () => {
   test.use({ viewport: { width: 375, height: 667 } });

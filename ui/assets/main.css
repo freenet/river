@@ -1,3 +1,5 @@
+/* Unlayered: every rule in this file beats Tailwind's layered utilities, whatever their specificity. */
+
 /* Reaction button hover visibility */
 .add-reaction-btn {
     opacity: 0;
@@ -21,8 +23,51 @@
     opacity: 0.4;
 }
 
+/* Keep a row's "+" shown while its picker is open. */
+.add-reaction-btn[aria-expanded="true"] {
+    opacity: 0.4;
+}
+
+/* Tailwind's reset zeroes the popover's UA auto margin, which pinned the picker to the top left; centre it again. */
+#reaction-picker {
+    margin: auto;
+}
+
+/* Anchored below its "+", flipped to stay on screen; centred where anchor positioning is missing. No @starting-style: WebKit 317926. */
+@supports (position-area: block-end) {
+    #reaction-picker {
+        /* Otherwise a "+" near the screen edge squeezes the picker into the sliver beside it, and it never flips. */
+        width: max-content;
+        margin: 0.25rem 0;
+        position-area: block-end span-inline-end;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    }
+}
+
+/* Anchored below its kebab, flipped to stay on screen; centred where anchor positioning is missing. */
+#message-action-menu {
+    margin: auto;
+    max-height: calc(100dvh - 1rem);
+    overflow-y: auto;
+}
+
+@supports (position-area: block-end) {
+    #message-action-menu {
+        /* As for the picker: without it a kebab near the screen edge squeezes the menu instead of flipping it. */
+        width: max-content;
+        margin: 0.25rem 0;
+        position-area: block-end span-inline-start;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    }
+}
+
+/* No Popover API (Safari < 17, Firefox < 125, Chromium < 114): the panels would render in the page and their buttons would do nothing. */
+@supports not selector(:popover-open) {
+    #reaction-picker, #message-action-menu, .add-reaction-btn, .touch-actions { display: none !important; }
+}
+
 /* Touch reveal for the inline add-reaction "+" button (same failure mode as
- * #402/#462 above): `.add-reaction-btn` reveals via `.group:hover`, a real
+ * #402/#462 below): `.add-reaction-btn` reveals via `.group:hover`, a real
  * CSS `:hover`, which touch devices can't reliably trigger — so on a phone
  * the button was invisible (opacity: 0) yet still tappable, unless the
  * message already had reactions (`.has-reactions` gives it opacity: 0.2 at
@@ -30,21 +75,16 @@
  * reaction-less messages.
  *
  * Gate on pointer CAPABILITY, not viewport width — see the #462 comment
- * above for why `(hover: none), (any-pointer: coarse)` is the correct query
+ * below for why `(hover: none), (any-pointer: coarse)` is the correct query
  * (`any-pointer: coarse` also catches a touchscreen laptop, which reports
  * `hover: hover` while a finger is on the glass).
  *
- * Deliberately does NOT widen the tap target the way #462 did: a min-size
- * here (tried in #605, reverted after user feedback) grows the reaction
- * row's line height on every message, even ones without reactions yet,
- * which reads as "the composer now takes up more room" — a real visible
- * regression, not just a WCAG nice-to-have. This button is also a
- * lower-stakes target than the DM-archive ✕ (a mis-tap just opens the
- * emoji picker, not a destructive action) and touch users have a second
- * path to the same action via the message kebab menu's "React" entry
- * (`conversation.rs`, `.touch-actions`) — a full menu row, comfortably
- * above the WCAG 2.5.8 AA 24px floor though still short of the 44px AAA
- * target itself. So: fix visibility only, leave sizing alone. */
+ * The button's box stays the size it is: a min-size (tried in #605,
+ * reverted after user feedback) grew the reaction row's line height on every
+ * message, which read as "the composer now takes up more room". The `::before`
+ * below gives it a finger-sized hit area instead, without touching layout. It
+ * matters more now that the kebab menu no longer has a React row: this "+" is
+ * the only way to react on touch. */
 @media (hover: none), (any-pointer: coarse) {
     .add-reaction-btn {
         opacity: 0.4;
@@ -52,6 +92,70 @@
 
     .add-reaction-btn.has-reactions {
         opacity: 0.4;
+    }
+
+    /* Hit area only: a bigger box grew every reaction row (#605). Mostly rightward, so the chip before it keeps its taps. */
+    .add-reaction-btn { position: relative; }
+    .add-reaction-btn::before { content: ""; position: absolute; inset: -12px -16px -12px -2px; }
+}
+
+/* Width caps are a share of the group's column. Never on #chat-content: WebKit 307984 blanks the room list after a resize. */
+.msg-bubbles {
+    container-type: inline-size;
+}
+
+/* One radius on every corner, grouped or not: a smaller corner toward a neighbour reads as one that failed to round. */
+.msg-bubble {
+    max-width: min(65ch, 75cqi);
+    border-radius: 1rem;
+}
+
+.msg-group-header {
+    max-width: 75cqi;
+}
+
+/* The gutter keeps max(15%, 3.5rem) for the 54px hover bar and the kebab (until PR 12 inlines them). */
+.msg-body {
+    max-width: min(85cqi, calc(100cqi - 3.5rem));
+}
+
+/* Engines without container units drop the cqi caps; these % caps stand in. */
+@supports not (width: 1cqi) {
+    .msg-group-header {
+        max-width: 75%;
+    }
+
+    .msg-body {
+        max-width: min(85%, calc(100% - 3.5rem));
+    }
+}
+
+.msg-edit-form {
+    max-width: min(550px, 75cqi);
+}
+
+/* Rows bleed 8px into the column gutter so the band has room: 8px around a group, 2px between its rows. */
+.msg-row {
+    margin-inline: -0.5rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.5rem;
+    transition: background-color 0.15s;
+}
+
+.msg-row:first-child {
+    padding-top: 0.5rem;
+}
+
+.msg-row:last-child {
+    padding-bottom: 0.5rem;
+}
+
+/* The complement of the touch rules' query: a touchscreen laptop gets no band. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
+    /* The band also stays while a popover the row opened (the reaction picker) is showing. */
+    .msg-row:hover,
+    .msg-row:has([aria-expanded="true"]) {
+        background-color: var(--color-row-hover);
     }
 }
 
@@ -152,7 +256,7 @@
  * Tailwind `group-hover:` utilities, which Tailwind v4 automatically wraps in
  * `@media (hover: hover)`. On a touch device (phone, tablet) there is no hover
  * pointer, so that bar can NEVER become visible and touch users have no way to
- * reach reply / edit / delete / react.
+ * reach reply / edit / delete.
  *
  * `.touch-actions` is the exact complement: hidden by default (so mouse users
  * keep the clean hover-reveal desktop UI) and shown only where `hover: none`
