@@ -4432,17 +4432,15 @@ pub fn Conversation() -> Element {
             }
 
             // The one reaction picker and action menu; every "+" and kebab opens them (top layer, so DOM position is irrelevant).
-            if current_room_data.is_some() {
-                ReactionPicker {
-                    target: picker_target,
-                    on_react: move |(id, emoji): (MessageId, String)| handle_toggle_reaction(id, emoji),
-                }
-                ActionMenu {
-                    target: menu_target,
-                    on_reply: on_reply_ctx,
-                    edit_trigger: edit_trigger,
-                    on_request_delete: move |msg_id| pending_delete.set(Some(msg_id)),
-                }
+            ReactionPicker {
+                target: picker_target,
+                on_react: move |(id, emoji): (MessageId, String)| handle_toggle_reaction(id, emoji),
+            }
+            ActionMenu {
+                target: menu_target,
+                on_reply: on_reply_ctx,
+                edit_trigger: edit_trigger,
+                on_request_delete: move |msg_id| pending_delete.set(Some(msg_id)),
             }
 
             // Message input or status
