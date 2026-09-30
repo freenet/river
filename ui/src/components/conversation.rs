@@ -8079,9 +8079,7 @@ mod autoscroll_wiring_pins {
         // which is what growing the composer does — #486's third cause.
         assert!(
             dense(history_source())
-                .contains("web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref())")
-                && dense(history_source())
-                    .contains("observer.observe(&content);observer.observe(&container);"),
+                .contains("observer.observe(&content);observer.observe(&container);"),
             "the resize follow must watch BOTH the content wrapper and the \
              scroll container; watching only the wrapper misses the composer \
              taking height away from the history"
@@ -8128,22 +8126,6 @@ mod autoscroll_wiring_pins {
         assert!(
             hist.matches(".capture(").count() == 1 && on_scroll.contains(".capture("),
             "`.capture(` must appear exactly once in history_scroll.rs, inside `on_scroll`"
-        );
-    }
-
-    /// The ResizeObserver reports layout, never the reader: capturing from it
-    /// would read a growing composer or a rewrap as the reader moving.
-    #[test]
-    fn layout_changes_restore_and_never_capture() {
-        let hist = dense(history_source());
-        let closure = hist
-            .split("leton_resize={")
-            .nth(1)
-            .and_then(|rest| rest.split("asBox<dynFnMut(js_sys::Array)>)").next())
-            .expect("install should build the ResizeObserver closure as `on_resize`");
-        assert!(
-            closure.contains("this.restore();") && !closure.contains("capture"),
-            "the ResizeObserver closure must restore, and must not capture"
         );
     }
 

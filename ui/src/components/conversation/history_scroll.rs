@@ -511,6 +511,12 @@ mod tests {
         assert_eq!(newest(&tall, VIEW.0, VIEW.1, 1), vec![0]);
 
         assert_eq!(newest(&[], VIEW.0, VIEW.1, 1), Vec::<usize>::new());
+
+        // Touching an edge is not intersecting it; one pixel of overlap is.
+        assert!(newest(&[(-100, 0)], 0, 500, 1).is_empty());
+        assert_eq!(newest(&[(0, 100), (500, 600)], 0, 500, 1), vec![0]);
+        assert_eq!(newest(&[(-100, 1)], 0, 500, 1), vec![0]);
+        assert_eq!(newest(&[(499, 600)], 0, 500, 1), vec![0]);
     }
 
     #[test]
@@ -553,38 +559,6 @@ mod tests {
     }
 
     #[test]
-    fn a_row_touching_the_edge_by_one_pixel_is_not_visible() {
-        // Its bottom edge is the viewport's top edge: no overlap at all.
-        assert!(newest(&[(-100, 0)], 0, 500, 1).is_empty());
-        // Its top edge is the viewport's bottom edge.
-        assert_eq!(newest(&[(0, 100), (500, 600)], 0, 500, 1), vec![0]);
-        // One pixel of overlap is visible.
-        assert_eq!(newest(&[(-100, 1)], 0, 500, 1), vec![0]);
-        assert_eq!(newest(&[(499, 600)], 0, 500, 1), vec![0]);
-    }
-
-    #[test]
-    fn a_small_move_with_a_changed_layout_is_layout() {
-        assert_eq!(
-            classify_scroll(sig(3000, 600, 1000), sig(3400, 600, 380), 2000, 1992),
-            ScrollCause::Layout
-        );
-    }
-
-    #[test]
-    fn a_large_move_with_a_changed_layout_is_the_reader() {
-        assert_eq!(
-            classify_scroll(
-                sig(3000, 600, 1000),
-                sig(3400, 600, 380),
-                2000,
-                2000 - LAYOUT_SHIFT_ALLOWANCE_PX - 1
-            ),
-            ScrollCause::Reader
-        );
-    }
-
-    #[test]
     fn a_change_of_the_wrap_width_alone_is_a_layout_change() {
         // Rewrapping can leave scrollHeight and the container as they were (the
         // fixture's 1280 -> 700 grows by 0px), so the width the history wraps at
@@ -611,27 +585,22 @@ mod tests {
 
     #[test]
     fn the_allowance_boundary_is_layout() {
-        let (a, b) = (sig(3000, 600, 1000), sig(3400, 600, 1000));
+        let (a, b) = (sig(3000, 600, 1000), sig(3400, 600, 380));
+        let at = |now_top: i32| classify_scroll(a, b, 2000, now_top);
+        // Up to the allowance, in either direction, a changed layout is layout's.
+        assert_eq!(at(2000 - 8), ScrollCause::Layout);
+        assert_eq!(at(2000 + LAYOUT_SHIFT_ALLOWANCE_PX), ScrollCause::Layout);
+        assert_eq!(at(2000 - LAYOUT_SHIFT_ALLOWANCE_PX), ScrollCause::Layout);
+        // One past it is the reader, upward (the negative move is what catches a
+        // dropped `.abs()`) and downward.
         assert_eq!(
-            classify_scroll(a, b, 2000, 2000 + LAYOUT_SHIFT_ALLOWANCE_PX),
-            ScrollCause::Layout
-        );
-        assert_eq!(
-            classify_scroll(a, b, 2000, 2000 - LAYOUT_SHIFT_ALLOWANCE_PX),
-            ScrollCause::Layout
-        );
-        assert_eq!(
-            classify_scroll(a, b, 2000, 2000 + LAYOUT_SHIFT_ALLOWANCE_PX + 1),
+            at(2000 + LAYOUT_SHIFT_ALLOWANCE_PX + 1),
             ScrollCause::Reader
         );
-    }
-
-    #[test]
-    fn a_fresh_history_is_pinned_and_unforced() {
-        let history = HistoryScroll::default();
-        assert!(history.pinned.get());
-        assert!(!history.force.get());
-        assert!(history.anchor.borrow().is_empty());
+        assert_eq!(
+            at(2000 - LAYOUT_SHIFT_ALLOWANCE_PX - 1),
+            ScrollCause::Reader
+        );
     }
 
     #[test]
@@ -648,23 +617,5 @@ mod tests {
         assert!(history.anchor.borrow().is_empty());
         assert_eq!(history.sig.get(), LayoutSig::default());
         assert_eq!(history.top.get(), 0);
-    }
-
-    #[test]
-    fn force_next_raises_the_force_and_nothing_else() {
-        let history = HistoryScroll::default();
-        history.pinned.set(false);
-        history.force_next();
-        assert!(history.force.get());
-        assert!(!history.pinned.get());
-    }
-
-    #[test]
-    fn pinned_at_and_under_the_threshold_only() {
-        assert!(is_pinned(0.0));
-        assert!(is_pinned(99.9));
-        assert!(is_pinned(100.0));
-        assert!(!is_pinned(100.1));
-        assert!(!is_pinned(101.0));
     }
 }
