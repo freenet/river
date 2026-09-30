@@ -55,31 +55,29 @@ use wasm_bindgen::{prelude::*, JsCast};
 
 /// How many rows above the newest visible one are remembered as fallbacks, for
 /// when the anchor row itself is deleted or windowed out before the restore.
-pub(super) const ANCHOR_FALLBACK_ROWS: usize = 4;
+const ANCHOR_FALLBACK_ROWS: usize = 4;
 
 /// The most a `scroll` event may move `scrollTop` and still be read as the
 /// browser's clamp after a layout change rather than the reader.
 ///
 /// The clamps measured so far were 8px (Linux CI), 56px (a spike) and 111px (the
-/// synthetic clamp test), so this leaves headroom over the largest. A reader who
-/// moves less than this in the single frame a layout change lands in loses only
-/// that frame's movement, and the pin can't latch because the next scroll event
-/// captures.
-pub(super) const LAYOUT_SHIFT_ALLOWANCE_PX: i32 = 200;
+/// synthetic clamp test), so this leaves headroom over the largest. What a
+/// reader who moves less than this loses is in the module doc.
+const LAYOUT_SHIFT_ALLOWANCE_PX: i32 = 200;
 
 /// The numbers that change when the history is laid out again, including the
 /// width it wraps at.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub(super) struct LayoutSig {
-    pub scroll_height: i32,
-    pub client_height: i32,
-    pub client_width: i32,
-    pub content_width: i32,
+struct LayoutSig {
+    scroll_height: i32,
+    client_height: i32,
+    client_width: i32,
+    content_width: i32,
 }
 
 /// Who a `scroll` event belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum ScrollCause {
+enum ScrollCause {
     /// The reader moved the view: it becomes the new anchor.
     Reader,
     /// A layout change moved it (a browser clamp): put the anchor back.
@@ -96,7 +94,7 @@ pub(super) enum ScrollCause {
 /// slice, because each call is a layout read in production: this makes O(log n)
 /// of them plus one for the newest row's bottom edge. Touching an edge is not
 /// intersecting it.
-pub(super) fn newest_visible_rows(
+fn newest_visible_rows(
     len: usize,
     rect: impl Fn(usize) -> (i32, i32),
     view_top: i32,
@@ -116,23 +114,17 @@ pub(super) fn newest_visible_rows(
     let Some(newest) = lo.checked_sub(1) else {
         return Vec::new();
     };
-    if n == 0 || rect(newest).1 <= view_top {
+    if rect(newest).1 <= view_top {
         return Vec::new();
     }
     (0..=newest).rev().take(n).collect()
-}
-
-/// How far to scroll so a row whose top sat `saved_gap` above the viewport's
-/// bottom, and now sits `current_gap` above it, is back where it was.
-pub(super) fn restore_delta(saved_gap: i32, current_gap: i32) -> i32 {
-    saved_gap - current_gap
 }
 
 /// Read a `scroll` event as a layout change's doing or the reader's.
 ///
 /// It is layout only if the layout changed since it was last recorded AND
 /// `scrollTop` moved no more than `LAYOUT_SHIFT_ALLOWANCE_PX`.
-pub(super) fn classify_scroll(
+fn classify_scroll(
     recorded: LayoutSig,
     now: LayoutSig,
     recorded_top: i32,
@@ -146,7 +138,7 @@ pub(super) fn classify_scroll(
 }
 
 /// Whether a reader `distance_from_bottom` px above the end is still following.
-pub(super) fn is_pinned(distance_from_bottom: f64) -> bool {
+fn is_pinned(distance_from_bottom: f64) -> bool {
     distance_from_bottom <= BOTTOM_THRESHOLD_PX
 }
 
@@ -207,13 +199,6 @@ impl HistoryScroll {
         self.sig.set(LayoutSig::default());
         self.top.set(0);
     }
-
-    /// Whether the reader is following the newest message. Read by tests only:
-    /// production code acts on the pin inside `restore`.
-    #[cfg(test)]
-    pub(super) fn is_pinned(&self) -> bool {
-        self.pinned.get()
-    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -229,6 +214,27 @@ fn read_sig(container: &web_sys::Element) -> LayoutSig {
         client_width: container.client_width(),
         content_width: chat_content_wrapper().map_or(0, |content| content.client_width()),
     }
+}
+
+/// How far above the container's bottom edge `row`'s top edge sits.
+#[cfg(target_arch = "wasm32")]
+fn gap(view: &web_sys::DomRect, row: &web_sys::Element) -> i32 {
+    (view.bottom() - row.get_bounding_client_rect().top()).round() as i32
+}
+
+/// `CSS.escape(value)`, through `Reflect` because web-sys's `Css` feature is not
+/// enabled. `None` if the browser has no `CSS.escape`.
+#[cfg(target_arch = "wasm32")]
+fn css_escape(value: &str) -> Option<String> {
+    let css = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("CSS")).ok()?;
+    let escape: js_sys::Function = js_sys::Reflect::get(&css, &JsValue::from_str("escape"))
+        .ok()?
+        .dyn_into()
+        .ok()?;
+    escape
+        .call1(&css, &JsValue::from_str(value))
+        .ok()?
+        .as_string()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -251,8 +257,8 @@ impl HistoryScroll {
         let distance = (sig.scroll_height - sig.client_height - top) as f64;
         self.pinned.set(is_pinned(distance));
         if let Ok(list) = container.query_selector_all(ANCHOR_ROWS) {
-            // Relative to the container's top edge, so a sidebar toggle can't skew
-            // them. Each call is a layout read, and the search makes few of them.
+            // Relative to the container, the frame `newest_visible_rows` works in.
+            // Each call is a layout read, and the search makes few of them.
             let view = container.get_bounding_client_rect();
             let view_bottom = (view.bottom() - view.top()).round() as i32;
             let item = |i: usize| {
@@ -277,7 +283,8 @@ impl HistoryScroll {
             *self.anchor.borrow_mut() = picked
                 .into_iter()
                 .filter_map(|i| {
-                    Some((item(i).get_attribute(ANCHOR_ATTR)?, view_bottom - rect(i).0))
+                    let row = item(i);
+                    Some((row.get_attribute(ANCHOR_ATTR)?, gap(&view, &row)))
                 })
                 .collect();
         }
@@ -367,29 +374,17 @@ impl HistoryScroll {
     /// Scroll the first anchor row that still exists back to its gap. If none
     /// survives, leave the view alone: the next reader scroll captures a new one.
     fn restore_anchor(&self, container: &web_sys::Element) {
-        let anchor = self.anchor.borrow();
-        if anchor.is_empty() {
-            return;
-        }
-        let Ok(list) = container.query_selector_all(ANCHOR_ROWS) else {
-            return;
-        };
-        let view_bottom = container.get_bounding_client_rect().bottom();
-        // Newest first, and the anchor's newest row is the last of the rows that
-        // survive, so scanning from the end finds the first survivor quickly.
-        for i in (0..list.length()).rev() {
-            let el = list
-                .item(i)
-                .unwrap_throw()
-                .unchecked_into::<web_sys::Element>();
-            let Some(key) = el.get_attribute(ANCHOR_ATTR) else {
+        let view = container.get_bounding_client_rect();
+        // Newest first, so the first row found is the newest survivor.
+        for (key, saved_gap) in self.anchor.borrow().iter() {
+            let Some(key) = css_escape(key) else {
                 continue;
             };
-            let Some((_, saved_gap)) = anchor.iter().find(|(k, _)| *k == key) else {
+            let selector = format!("#chat-content [{ANCHOR_ATTR}=\"{key}\"]");
+            let Ok(Some(row)) = container.query_selector(&selector) else {
                 continue;
             };
-            let current_gap = (view_bottom - el.get_bounding_client_rect().top()).round() as i32;
-            let delta = restore_delta(*saved_gap, current_gap);
+            let delta = saved_gap - gap(&view, &row);
             if delta.abs() > SCROLL_TOP_SLACK_PX {
                 container.set_scroll_top(container.scroll_top() + delta);
             }
@@ -574,16 +569,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_delta_moves_the_row_back_to_its_gap() {
-        // The row's top sat 200px above the viewport's bottom. Content above it grew
-        // by 40, so it is now 160 above the bottom: scroll down 40 to bring it back.
-        assert_eq!(restore_delta(200, 160), 40);
-        // Content above it shrank by 40: the row is 240 above the bottom, scroll up.
-        assert_eq!(restore_delta(200, 240), -40);
-        assert_eq!(restore_delta(200, 200), 0);
-    }
-
-    #[test]
     fn a_small_move_with_a_changed_layout_is_layout() {
         assert_eq!(
             classify_scroll(sig(3000, 600, 1000), sig(3400, 600, 380), 2000, 1992),
@@ -649,7 +634,7 @@ mod tests {
     #[test]
     fn a_fresh_history_is_pinned_and_unforced() {
         let history = HistoryScroll::default();
-        assert!(history.is_pinned());
+        assert!(history.pinned.get());
         assert!(!history.is_forced());
         assert!(history.anchor.borrow().is_empty());
     }
@@ -664,7 +649,7 @@ mod tests {
 
         history.reset_for_room();
 
-        assert!(history.is_pinned() && history.is_forced());
+        assert!(history.pinned.get() && history.is_forced());
         assert!(history.anchor.borrow().is_empty());
         assert_eq!(history.sig.get(), LayoutSig::default());
         assert_eq!(history.top.get(), 0);
@@ -676,7 +661,7 @@ mod tests {
         history.pinned.set(false);
         history.force_next();
         assert!(history.is_forced());
-        assert!(!history.is_pinned());
+        assert!(!history.pinned.get());
     }
 
     #[test]
