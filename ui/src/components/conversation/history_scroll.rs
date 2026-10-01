@@ -116,11 +116,21 @@ enum ScrollCause {
     Layout,
 }
 
-/// Whether `top` is up past rounding from `from`, where the gesture started.
+/// The view's two edges in the content: `scrollTop`, and `scrollTop` plus the
+/// container's height.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ViewEdges {
+    top: i32,
+    bottom: i32,
+}
+
+/// Whether the view is up past rounding from `from`, where the gesture started.
 /// Measured against the start, never the previous frame, so slow 1-2px frames
-/// add up.
-fn moved_up(from: i32, top: i32) -> bool {
-    top < from - SCROLL_TOP_SLACK_PX
+/// add up. BOTH edges, as `main`'s `reader_moved_up_since` (#722): a composer
+/// collapsing grows the container and clamps `scrollTop` up while the bottom
+/// edge stays where it was, and that is not the reader looking back.
+fn moved_up(from: ViewEdges, now: ViewEdges) -> bool {
+    now.top < from.top - SCROLL_TOP_SLACK_PX && now.bottom < from.bottom - SCROLL_TOP_SLACK_PX
 }
 
 /// Whether `top` is within rounding of the live end `max`.
@@ -250,6 +260,9 @@ enum Follow {
     Free,
     /// The scroll-to-latest animation is travelling to the end.
     Seeking,
+    /// A reader gesture moved up from where it started: restores keep the
+    /// anchor, never snap, until it settles.
+    Held,
 }
 
 /// The history's scroll state. See the module doc.
@@ -264,6 +277,12 @@ pub(super) struct HistoryScroll {
     sig: Cell<LayoutSig>,
     top: Cell<i32>,
     follow: Cell<Follow>,
+    /// The view's edges before the current reader gesture's first move, shifted
+    /// by every layout correction since; `None` outside a gesture.
+    gesture_from: Cell<Option<ViewEdges>>,
+    /// A gesture ended while the history was hidden; finish it on the first
+    /// laid-out restore.
+    settle_pending: Cell<bool>,
     /// The debounce standing in for `scrollend` where the browser lacks it.
     settle_timer: Cell<Option<i32>>,
     /// Set by `install` once the listeners exist, so `is_some` also means
@@ -280,6 +299,8 @@ impl Default for HistoryScroll {
             sig: Cell::new(LayoutSig::default()),
             top: Cell::new(0),
             follow: Cell::new(Follow::Free),
+            gesture_from: Cell::new(None),
+            settle_pending: Cell::new(false),
             settle_timer: Cell::new(None),
             hooks: RefCell::new(None),
         }
@@ -302,9 +323,12 @@ impl HistoryScroll {
         self.end_interaction();
     }
 
-    /// Forget any seek in flight: a room switch or a forced snap supersedes it.
+    /// Forget any seek or gesture in flight, and any settle still to come for
+    /// it: a room switch, a forced snap or a new seek supersedes them.
     fn end_interaction(&self) {
         self.follow.set(Follow::Free);
+        self.gesture_from.set(None);
+        self.settle_pending.set(false);
         #[cfg(target_arch = "wasm32")]
         if let (Some(handle), Some(window)) = (self.settle_timer.take(), web_sys::window()) {
             window.clear_timeout_with_handle(handle);
@@ -377,6 +401,15 @@ fn css_escape(value: &str) -> Option<String> {
 
 #[cfg(target_arch = "wasm32")]
 impl HistoryScroll {
+    /// The view's edges as last recorded.
+    fn recorded_edges(&self) -> ViewEdges {
+        let top = self.top.get();
+        ViewEdges {
+            top,
+            bottom: top + self.sig.get().client_height,
+        }
+    }
+
     /// Record the layout and `scrollTop` as they are now. Read back after any write,
     /// since the browser clamps.
     fn record(&self, container: &web_sys::Element) {
@@ -504,9 +537,14 @@ impl HistoryScroll {
 
     fn restore_now(&self) {
         // Hidden: keep the pin, the anchor and any pending `force` for the reveal.
+        // A hide also ends whatever gesture was going on, and an engine sends no
+        // `scrollend` for a scroll a hide cut short, so its settle waits for the
+        // reveal (a no-op if there was no gesture).
         let Some(container) = laid_out_container() else {
+            self.settle_pending.set(true);
             return;
         };
+        let before = self.recorded_edges();
         if self.force.take() {
             self.end_interaction();
             self.snap_and_tell();
@@ -515,10 +553,22 @@ impl HistoryScroll {
         match self.follow.get() {
             Follow::Seeking => self.seek(&container),
             Follow::Free if self.pinned.get() => self.snap_and_tell(),
-            Follow::Free => {
+            Follow::Free | Follow::Held => {
                 self.restore_anchor(&container);
                 self.record(&container);
             }
+        }
+        // Everything that moved the view since the last record was layout (a
+        // pending reader move was taken in first), so it is not the gesture's.
+        if let Some(from) = self.gesture_from.get() {
+            let after = self.recorded_edges();
+            self.gesture_from.set(Some(ViewEdges {
+                top: from.top + after.top - before.top,
+                bottom: from.bottom + after.bottom - before.bottom,
+            }));
+        }
+        if self.settle_pending.take() {
+            self.end_gesture();
         }
     }
 
@@ -591,7 +641,19 @@ impl HistoryScroll {
     /// is the reader.
     fn on_reader_scroll(&self, container: &web_sys::Element) {
         if self.follow.get() != Follow::Seeking {
+            let from = self
+                .gesture_from
+                .get()
+                .unwrap_or_else(|| self.recorded_edges());
+            self.gesture_from.set(Some(from));
             self.capture();
+            if at_end(container.scroll_top(), max_scroll_top(container)) {
+                // Back at the end: following again, whatever came before.
+                self.follow.set(Follow::Free);
+                self.gesture_from.set(None);
+            } else if moved_up(from, self.recorded_edges()) {
+                self.follow.set(Follow::Held);
+            }
             return;
         }
         match seek_step(
@@ -606,19 +668,44 @@ impl HistoryScroll {
                 self.trim_at_bottom(container);
             }
             SeekStep::TakenOver => {
-                self.follow.set(Follow::Free);
+                // The reader's gesture, started where the last frame was.
+                self.follow.set(Follow::Held);
+                self.gesture_from.set(Some(self.recorded_edges()));
                 self.capture();
             }
         }
     }
 
     /// A scroll has come to rest (`scrollend`, or the debounce standing in for
-    /// it). Finishes or re-aims a seek whose animation ended short of the end.
+    /// it). Finishes or re-aims a seek whose animation ended short of the end,
+    /// and ends a reader gesture. Nothing else: a stale `scrollend` (another
+    /// room's, an old gesture's) finds no gesture and does nothing.
     fn settle(&self) {
         self.settle_timer.set(None);
         if self.follow.get() == Follow::Seeking {
             self.restore_now();
+            return;
         }
+        if self.gesture_from.get().is_none() {
+            return;
+        }
+        if laid_out_container().is_none() {
+            self.settle_pending.set(true);
+            return;
+        }
+        self.end_gesture();
+    }
+
+    /// The gesture is over: where it came to rest decides the pin, as on `main`.
+    /// Measured directly, never through `on_scroll`, because the position has
+    /// usually been recorded already and would read as an echo. Does not snap.
+    fn end_gesture(&self) {
+        if self.follow.get() == Follow::Seeking || self.gesture_from.get().is_none() {
+            return;
+        }
+        self.follow.set(Follow::Free);
+        self.gesture_from.set(None);
+        self.capture();
     }
 
     /// A finger on the history stops the scroll-to-latest animation where it is:
@@ -1006,17 +1093,37 @@ mod tests {
         );
     }
 
+    /// A view `height` px tall whose top is at `top`.
+    fn edges(top: i32, height: i32) -> ViewEdges {
+        ViewEdges {
+            top,
+            bottom: top + height,
+        }
+    }
+
     #[test]
     fn moving_up_is_measured_from_where_the_gesture_started() {
-        let from = 1000;
+        let from = edges(1000, 600);
+        let at = |top: i32| edges(top, 600);
         // Three 1px frames: none is past the slack on its own, the third is
         // past it from where the gesture started.
-        assert!(!moved_up(from, from - 1));
-        assert!(!moved_up(from, from - SCROLL_TOP_SLACK_PX));
-        assert!(moved_up(from, from - SCROLL_TOP_SLACK_PX - 1));
+        assert!(!moved_up(from, at(999)));
+        assert!(!moved_up(from, at(1000 - SCROLL_TOP_SLACK_PX)));
+        assert!(moved_up(from, at(1000 - SCROLL_TOP_SLACK_PX - 1)));
         // Jitter back within the slack, and any downward move, is not up.
-        assert!(!moved_up(from, from + 1));
-        assert!(!moved_up(from, from + 500));
+        assert!(!moved_up(from, at(1001)));
+        assert!(!moved_up(from, at(1500)));
+    }
+
+    #[test]
+    fn a_container_growing_over_a_clamped_top_is_not_moving_up() {
+        // The composer collapses by 250px: the container grows by that much and
+        // the browser clamps `scrollTop` up by the same, so the bottom edge
+        // stays put. Past any allowance, so it reaches the reader branch.
+        let from = edges(2000, 500);
+        assert!(!moved_up(from, edges(1750, 750)));
+        // The reader moving up while it grows is still moving up.
+        assert!(moved_up(from, edges(1700, 750)));
     }
 
     #[test]
@@ -1061,12 +1168,16 @@ mod tests {
         history.anchor.borrow_mut().push(("m1".into(), 120));
         history.sig.set(sig(3000, 600, 1000));
         history.top.set(2000);
-        history.follow.set(Follow::Seeking);
+        history.follow.set(Follow::Held);
+        history.gesture_from.set(Some(edges(1800, 600)));
+        history.settle_pending.set(true);
 
         history.reset_for_room();
 
         assert!(history.pinned.get() && history.force.get());
         assert_eq!(history.follow.get(), Follow::Free);
+        assert_eq!(history.gesture_from.get(), None);
+        assert!(!history.settle_pending.get());
         assert!(history.anchor.borrow().is_empty());
         assert_eq!(history.sig.get(), LayoutSig::default());
         assert_eq!(history.top.get(), 0);
