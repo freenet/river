@@ -1,4 +1,4 @@
-import { Page } from "@playwright/test";
+import { expect, Page } from "@playwright/test";
 
 // Browser-test utilities for the history-scroll specs. Each section belongs to
 // one scenario family; nothing here writes application state or implements a
@@ -276,4 +276,238 @@ export function seekClockLog(record: SeekClockRecord): string {
     )
     .join(" ");
   return `${head}; per frame ms:px(left): ${body}`;
+}
+
+// ---- task 3: settle ordering ----
+//
+// Calling `__riverTest.appendMessage` only REQUESTS a delivery (the hook defers
+// it), so an arrival asked for from a scroll listener can land after the
+// browser's own `scrollend` has already settled the gesture. Which comes first
+// is the browser's business: on Linux CI, desktop WebKit settled first in every
+// attempt of both wheel-gesture tests, and Firefox sometimes did too.
+// A test that needs "the arrival lands while the gesture is still unsettled"
+// therefore has to establish that order, not hope for it.
+//
+// `gateScrollendGesture` does, for one gesture on `#chat-scroll-container`:
+//
+// * it steps the view in-page, one `scrollTop` write per animation frame, so
+//   protocol round trips cannot space the steps out past a settle interval;
+// * a capture-phase `scrollend` listener on `window` (ahead of the app's own
+//   listener on the container) consumes every native end on the container
+//   while the gesture is held, so programmatic steps, which the browser settles
+//   frame by frame, add up to ONE gesture;
+// * it requests the arrival from the first scroll event that reaches the
+//   plan's delivery point, and stops stepping;
+// * once the arrival's row is in the DOM, and the frame that lays it out has
+//   run (the app answers a patch from its ResizeObserver), it releases exactly
+//   one marked `scrollend` to the app, and stops gating.
+//
+// This proves what the app does for that order. It does not prove a native
+// gesture always produces it; the native-input smoke tests cover real wheel and
+// touch without requiring an order.
+
+/// One controlled gesture: where to step, what to deliver, and when.
+export type GateScrollendPlan = {
+  /// The inbound message to deliver. Its first 40 characters must be unique.
+  text: string;
+  /// `scrollTop` for each frame, as offsets from where the gesture starts.
+  path: number[];
+  /// Deliver at the first scroll event that has moved up `upPx` from the start
+  /// (`"up"`), or that has done so and come back to the end (`"back-at-end"`).
+  deliverWhen: "up" | "back-at-end";
+  upPx: number;
+};
+
+/// What the controlled gesture saw.
+export type GateScrollendRun = {
+  /// In order: `input` (a step written), `scroll` (an event on the container),
+  /// `deliver` (the hook was asked for the arrival), `patch` (its row is in the
+  /// DOM), `held` (a native `scrollend` consumed before it reached the app),
+  /// `settle` (the released `scrollend`, after the app handled it) and
+  /// `settle (native)` (a native one that reached the app: after the release,
+  /// unless the gate failed).
+  events: string[];
+  /// How far each scroll event moved the view, up to the delivery.
+  steps: number[];
+  /// The newest message row with any part in view at the delivery, and how far
+  /// its top sat above the container's bottom edge.
+  at: { id: string; gap: number } | null;
+  delivered: boolean;
+  released: boolean;
+  /// The same row's position, and scrollHeight - scrollTop - clientHeight, as
+  /// the settle was released: what the arrival did while the gesture was held.
+  atRelease: { id: string; gap: number } | null;
+  distanceAtRelease: number | null;
+};
+
+/// Runs in the page, so it is self-contained.
+function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun> {
+  return new Promise<GateScrollendRun>((resolve) => {
+    const c = document.getElementById("chat-scroll-container")!;
+    const history = document.querySelector('[data-testid="conversation-history"]')!;
+    const run: GateScrollendRun = {
+      events: [],
+      steps: [],
+      at: null,
+      delivered: false,
+      released: false,
+      atRelease: null,
+      distanceAtRelease: null,
+    };
+    const note = (what: string) => run.events.push(what);
+    const releasedEnds = new WeakSet<Event>();
+    const start = c.scrollTop;
+    let last = start;
+    let wentUp = false;
+    let gating = true;
+    let frame = 0;
+    let raf = 0;
+    let done = false;
+    const timers: number[] = [];
+
+    const gapOf = (id: string) => {
+      const row = document.getElementById(id);
+      if (!row || !c.contains(row)) return null;
+      return { id, gap: c.getBoundingClientRect().bottom - row.getBoundingClientRect().top };
+    };
+    const newestVisible = () => {
+      const box = c.getBoundingClientRect();
+      let found: { id: string; gap: number } | null = null;
+      for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+        const r = row.getBoundingClientRect();
+        if (r.bottom > box.top && r.top < box.bottom) found = { id: row.id, gap: box.bottom - r.top };
+      }
+      return found;
+    };
+    const marker = plan.text.slice(0, 40);
+    const landed = () =>
+      Array.from(history.querySelectorAll<HTMLElement>('[id^="msg-"]')).some((row) =>
+        row.textContent?.includes(marker),
+      );
+
+    // Ahead of the app: capture on `window` runs before any listener at the target.
+    const gate = (e: Event) => {
+      if (e.target !== c || releasedEnds.has(e) || !gating) return;
+      e.stopImmediatePropagation();
+      note("held");
+    };
+    // At the target, registered after the app's listener: runs once the app has.
+    const received = (e: Event) => note(releasedEnds.has(e) ? "settle" : "settle (native)");
+    const onScroll = () => {
+      note("scroll");
+      if (run.delivered) return;
+      const top = c.scrollTop;
+      run.steps.push(top - last);
+      last = top;
+      if (start - top >= plan.upPx) wentUp = true;
+      const ready =
+        plan.deliverWhen === "up" ? wentUp : wentUp && c.scrollHeight - c.clientHeight - top <= 1;
+      if (!ready) return;
+      run.delivered = true;
+      run.at = newestVisible();
+      note("deliver");
+      (window as any).__riverTest.appendMessage(plan.text);
+    };
+    const release = () => {
+      gating = false;
+      run.released = true;
+      run.atRelease = run.at && gapOf(run.at.id);
+      run.distanceAtRelease = c.scrollHeight - c.scrollTop - c.clientHeight;
+      const end = new Event("scrollend");
+      releasedEnds.add(end);
+      c.dispatchEvent(end);
+      // Long enough for a late native end to show up in the record.
+      timers.push(window.setTimeout(finish, 300));
+    };
+    const patched = new MutationObserver(() => {
+      if (!run.delivered || !landed()) return;
+      patched.disconnect();
+      note("patch");
+      // The frame that lays the patch out runs the app's restore (ResizeObserver
+      // delivery follows animation frames), so release on the frame after it.
+      raf = requestAnimationFrame(() => {
+        raf = requestAnimationFrame(release);
+      });
+    });
+    const step = () => {
+      if (run.delivered) return;
+      // The previous step's scroll event was dispatched before this frame's
+      // callbacks: out of path and still not delivered means it never will be.
+      if (frame >= plan.path.length) return finish();
+      c.scrollTop = start + plan.path[frame++];
+      note("input");
+      raf = requestAnimationFrame(step);
+    };
+    function finish() {
+      if (done) return;
+      done = true;
+      gating = false;
+      cancelAnimationFrame(raf);
+      timers.forEach((t) => clearTimeout(t));
+      patched.disconnect();
+      window.removeEventListener("scrollend", gate, { capture: true });
+      c.removeEventListener("scrollend", received);
+      c.removeEventListener("scroll", onScroll);
+      delete (window as any).__riverSettleGate;
+      resolve(run);
+    }
+
+    (window as any).__riverSettleGate = { stop: finish };
+    window.addEventListener("scrollend", gate, { capture: true });
+    c.addEventListener("scrollend", received);
+    c.addEventListener("scroll", onScroll);
+    patched.observe(history, { childList: true, subtree: true, characterData: true });
+    timers.push(window.setTimeout(finish, 5_000));
+    raf = requestAnimationFrame(step);
+  });
+}
+
+/// Run one controlled gesture (see the section comment). Every listener,
+/// observer and timer it installs is removed before it returns, whatever happens.
+export async function gateScrollendGesture(page: Page, plan: GateScrollendPlan): Promise<GateScrollendRun> {
+  try {
+    return await page.evaluate(gateScrollendInPage, plan);
+  } finally {
+    await page.evaluate(() => (window as any).__riverSettleGate?.stop()).catch(() => {});
+  }
+}
+
+/// The record as one line, a repeated event or cycle of up to three collapsed:
+/// `(input → scroll → held) ×4 → input → scroll → deliver → ...`.
+export function gateScrollendTimeline(run: GateScrollendRun): string {
+  const e = run.events;
+  const same = (a: number, b: number, len: number) => e.slice(a, a + len).join("|") === e.slice(b, b + len).join("|");
+  const out: string[] = [];
+  for (let i = 0; i < e.length; ) {
+    let len = 1;
+    let reps = 1;
+    for (let l = 1; l <= 3; l++) {
+      let r = 1;
+      while (i + (r + 1) * l <= e.length && same(i, i + r * l, l)) r++;
+      if (r > 1 && r * l > len * reps) [len, reps] = [l, r];
+    }
+    const cycle = e.slice(i, i + len).join(" → ");
+    out.push(reps === 1 ? cycle : len === 1 ? `${cycle} ×${reps}` : `(${cycle}) ×${reps}`);
+    i += len * reps;
+  }
+  const at = run.distanceAtRelease === null ? "" : ` (released ${run.distanceAtRelease.toFixed(1)}px above the end)`;
+  return `${out.join(" → ")}${at}`;
+}
+
+/// The order the controlled gesture exists to establish: the reader's input
+/// scrolled the view, the arrival was requested and its row landed, and only
+/// then did the app receive a settle, the released one, ahead of any native end.
+export function gateScrollendExpectOrder(run: GateScrollendRun) {
+  const timeline = gateScrollendTimeline(run);
+  expect(run.delivered, `premise: the gesture reached its delivery point (${timeline})`).toBe(true);
+  expect(run.released, `premise: the arrival landed and the settle was released (${timeline})`).toBe(true);
+  const firsts: string[] = [];
+  for (const e of run.events) {
+    if (e !== "held" && !firsts.includes(e)) firsts.push(e);
+    if (e.startsWith("settle")) break;
+  }
+  expect(
+    firsts,
+    `premise: input → scroll → deliver → patch → settle, with no settle reaching the app before the patch (${timeline})`,
+  ).toEqual(["input", "scroll", "deliver", "patch", "settle"]);
 }

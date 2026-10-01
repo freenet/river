@@ -1,6 +1,7 @@
 import { test, expect, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { waitForApp, selectRoom, selectListedRoom } from "./example-room";
+import { gateScrollendExpectOrder, gateScrollendGesture, gateScrollendTimeline } from "./history-scroll-fixture";
 
 // Regression tests for freenet/river#486: new messages arrived and the view
 // did not follow them.
@@ -1922,6 +1923,11 @@ test.describe("The scroll-to-latest animation keeps following to the end", () =>
 /// settles ~90ms after the last tick) and Firefox (which sent no `scrollend`
 /// after synthetic wheel ticks at all). Mobile WebKit has neither: the tests
 /// using this skip there. Null where unsupported.
+///
+/// Native input only, for the smoke tests: the browser still decides when a
+/// wheel gesture settles, and a protocol round trip per tick can outlast
+/// WebKit's settle interval. The tests that need a given order use
+/// `gateScrollendGesture` (history-scroll-fixture.ts) instead.
 async function unsettledGesture(page: Page, browserName: string, isMobile: boolean) {
   if (browserName === "webkit" && isMobile) return null;
   const box = (await page.locator("#chat-scroll-container").boundingBox())!;
@@ -1935,10 +1941,14 @@ async function unsettledGesture(page: Page, browserName: string, isMobile: boole
     c.addEventListener("scroll", () => (window as any).__riverGestureFrames++);
   });
   /// Step `step` (one finger pixel or one wheel tick) until the view has moved
-  /// by `px`, or give up after a generous number of steps.
-  const moveBy = async (px: number, step: (dir: number) => Promise<unknown>) => {
+  /// by `px` or `stop` says so, or give up after a generous number of steps.
+  const moveBy = async (px: number, step: (dir: number) => Promise<unknown>, stop?: () => Promise<boolean>) => {
     const from = await scrollTop(page);
-    for (let i = 0; i < 4 * Math.abs(px) && Math.abs((await scrollTop(page)) - from) < Math.abs(px); i++) {
+    for (
+      let i = 0;
+      i < 4 * Math.abs(px) && Math.abs((await scrollTop(page)) - from) < Math.abs(px) && !(await stop?.());
+      i++
+    ) {
       await step(Math.sign(px));
       await page.waitForTimeout(20);
     }
@@ -1960,28 +1970,34 @@ async function unsettledGesture(page: Page, browserName: string, isMobile: boole
     expect(await frames(), "premise: the touch drag should start scrolling").toBeGreaterThan(0);
     return {
       /// Move the view by `px` (negative is up), a pixel a frame.
-      scrollBy: (px: number) =>
-        moveBy(px, (dir) => {
-          y -= dir;
-          return touch("touchMove", y);
-        }),
+      scrollBy: (px: number, stop?: () => Promise<boolean>) =>
+        moveBy(
+          px,
+          (dir) => {
+            y -= dir;
+            return touch("touchMove", y);
+          },
+          stop,
+        ),
       end: () => touch("touchEnd"),
     };
   }
   await page.mouse.move(x, y);
   return {
-    scrollBy: (px: number) => moveBy(px, (dir) => page.mouse.wheel(0, dir)),
+    scrollBy: (px: number, stop?: () => Promise<boolean>) => moveBy(px, (dir) => page.mouse.wheel(0, dir), stop),
     end: async () => {},
   };
 }
 
 /// What `armArrival` saw: every frame's move before it delivered, the newest
-/// visible message at that moment, and the order of the arrival's patch
-/// against the next `scrollend`.
+/// visible message at that moment, how many `scrollend`s reached the app before
+/// it (each one split the gesture), and the order of the delivery request, the
+/// arrival's patch and the next `scrollend` the app received.
 type ArmedArrival = {
   fired: boolean;
   steps: number[];
   at: RowPosition | null;
+  settledBefore: number;
   order: string[];
 };
 
@@ -1996,12 +2012,14 @@ function armArrival(page: Page, text: string, when: "up" | "back-at-end", upPx: 
       const start = c.scrollTop;
       let last = start;
       let wentUp = false;
-      const rec: ArmedArrival = { fired: false, steps: [], at: null, order: [] };
+      const rec: ArmedArrival = { fired: false, steps: [], at: null, settledBefore: 0, order: [] };
       (window as any).__riverArmed = rec;
       // The text is delivered only once fired, so its row cannot land before.
       window.__riverScroll.patchLanded(text.slice(0, 40), () => rec.order.push("patch"));
+      // Registered after the app's listener, so each one has reached the app.
       c.addEventListener("scrollend", () => {
-        if (rec.fired && !rec.order.includes("scrollend")) rec.order.push("scrollend");
+        if (!rec.fired) rec.settledBefore++;
+        else if (!rec.order.includes("scrollend")) rec.order.push("scrollend");
       });
       const onScroll = () => {
         const top = c.scrollTop;
@@ -2015,12 +2033,23 @@ function armArrival(page: Page, text: string, when: "up" | "back-at-end", upPx: 
         rec.fired = true;
         rec.at = window.__riverScroll.newestVisible(c);
         c.removeEventListener("scroll", onScroll);
+        rec.order.push("deliver");
         (window as any).__riverTest.appendMessage(text);
       };
       c.addEventListener("scroll", onScroll);
     },
     { text, when, upPx },
   );
+}
+
+/// Whether `armArrival` has requested its delivery yet.
+function armedFired(page: Page): Promise<boolean> {
+  return page.evaluate(() => Boolean((window as any).__riverArmed?.fired));
+}
+
+/// An armed arrival's record as one line, for failure messages.
+function armedTimeline(armed: ArmedArrival) {
+  return `${armed.settledBefore} scrollend(s) before the delivery, then ${armed.order.join(" → ")}; steps ${armed.steps.join(",")}`;
 }
 
 async function armedArrival(page: Page, text: string): Promise<ArmedArrival> {
@@ -2077,21 +2106,38 @@ async function scrollThen(
 /// is a gesture in progress. (Whether its `scroll` event came first does not
 /// matter; the render takes a pending one in.)
 function expectArrivalBeforeSettle(order: string[]) {
-  const patch = order.indexOf("patch");
-  const settled = order.indexOf("scrollend");
   expect(
-    patch >= 0 && (settled < 0 || patch < settled),
+    arrivedBeforeSettle(order),
     `premise: the arrival renders before the scroll settles (observed: ${order.join(" → ")})`,
   ).toBe(true);
+}
+
+function arrivedBeforeSettle(order: string[]) {
+  const patch = order.indexOf("patch");
+  const settled = order.indexOf("scrollend");
+  return patch >= 0 && (settled < 0 || patch < settled);
 }
 
 // An upward scroll inside the follow band holds new messages until it settles,
 // so an arrival does not snap a reader who has started to look back (finding
 // 5). When it settles, where it came to rest decides the pin, as on `main`.
 // Direction is measured from where the gesture started, so slow frames add up.
+//
+// The tests marked "controlled order" establish scroll → patch → settle with
+// `gateScrollendGesture`, so they need no real gesture input and run on mobile
+// WebKit too: the arrival hook only requests a delivery, and without the gate
+// every engine settles a programmatic step before the patch lands. The "native
+// input smoke" tests drive real wheel ticks or a held touch and check the
+// outcome against whatever order the browser chose; only Chromium's held finger
+// guarantees one.
 test.describe("An upward scroll holds new messages until it settles", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
   const UP_PX = 40;
+  /// One pixel a frame: up `up` pixels, then down `down` (past the end clamps).
+  const pixelSteps = (up: number, down = 0) => [
+    ...Array.from({ length: up }, (_, i) => -(i + 1)),
+    ...Array.from({ length: down }, (_, i) => -up + i + 1),
+  ];
 
   test("an arrival during an upward scroll inside the band keeps the reader's message", async ({ page }) => {
     await openRoomAtBottom(page, "Team Chat Room");
@@ -2103,26 +2149,67 @@ test.describe("An upward scroll holds new messages until it settles", () => {
     await expectInPlace(page, race.at!, "an arrival snapped a reader scrolling up inside the band", { hold: true });
   });
 
-  test("five 1px upward frames in one gesture hold an arrival", async ({ page, browserName, isMobile }) => {
+  test("five 1px upward frames in one gesture hold an arrival (controlled order: scroll → patch → settle)", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await afterLayoutSettles(page);
+    const text = `arrival after slow frames: ${"s".repeat(200)}`;
+    const run = await gateScrollendGesture(page, { text, path: pixelSteps(8), deliverWhen: "up", upPx: 5 });
+    const timeline = gateScrollendTimeline(run);
+    gateScrollendExpectOrder(run);
+    expect(run.steps.length, `premise: at least five frames (${run.steps.join(",")})`).toBeGreaterThanOrEqual(5);
+    expect(
+      Math.max(...run.steps.map(Math.abs)),
+      `premise: no single frame moves past rounding (${run.steps.join(",")})`,
+    ).toBeLessThanOrEqual(2);
+    expect(run.at, "premise: a message should be visible").not.toBeNull();
+    expect(
+      run.atRelease ? Math.abs(run.atRelease.gap - run.at!.gap) : Infinity,
+      `the arrival moved the reader's message before the gesture settled (${timeline})`,
+    ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+    await expectInPlace(page, run.at!, `slow upward frames did not hold the arrival (${timeline})`, { hold: true });
+  });
+
+  test("native input smoke: five 1px upward wheel or held-touch frames, then an arrival", async ({
+    page,
+    browserName,
+    isMobile,
+  }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
     const gesture = await unsettledGesture(page, browserName, isMobile);
     test.skip(!gesture, "mobile WebKit has no gesture input that stays unsettled between frames");
-    const text = `arrival after slow frames: ${"s".repeat(200)}`;
+    const text = `arrival after slow native frames: ${"s".repeat(200)}`;
     await armArrival(page, text, "up", 5);
-    await gesture!.scrollBy(-8);
+    await gesture!.scrollBy(-8, () => armedFired(page));
     const armed = await armedArrival(page, text);
     await gesture!.end();
-    expect(armed.fired, "premise: the gesture should move up 5px").toBe(true);
-    expect(armed.steps.length, `premise: at least five frames (${armed.steps.join(",")})`).toBeGreaterThanOrEqual(5);
+    const timeline = armedTimeline(armed);
+    expect(armed.fired, `premise: the gesture should move up 5px (${timeline})`).toBe(true);
+    expect(armed.steps.length, `premise: at least five frames (${timeline})`).toBeGreaterThanOrEqual(5);
     expect(
       Math.max(...armed.steps.map(Math.abs)),
-      `premise: no single frame moves past rounding (${armed.steps.join(",")})`,
+      `premise: no single frame moves past rounding (${timeline})`,
     ).toBeLessThanOrEqual(2);
-    expect(armed.order[0], `premise: the arrival renders before the gesture settles (${armed.order.join(" → ")})`).toBe(
-      "patch",
-    );
-    await expectInPlace(page, armed.at!, "slow upward frames did not hold the arrival", { hold: true });
+    // One unsettled gesture from the first frame to the patch: the arrival is held.
+    const oneGesture = armed.settledBefore === 0 && arrivedBeforeSettle(armed.order);
+    if (browserName === "chromium") {
+      expect(oneGesture, `premise: a held finger sends no scrollend before it lifts (${timeline})`).toBe(true);
+    }
+    if (oneGesture) {
+      await expectInPlace(page, armed.at!, `slow upward frames did not hold the arrival (${timeline})`, { hold: true });
+    } else {
+      // The browser settled part of the way: where it split the gesture decides
+      // whether the arrival is held or followed. Either, but nothing in between.
+      await expectDriftWithin(
+        page,
+        async () => Math.min(await positionDrift(page, armed.at!, true), await distanceFromBottom(page)),
+        `the arrival neither held the reader's message nor followed (${timeline})`,
+        { hold: true },
+      );
+    }
   });
 
   test("a settle inside the band does not snap, and the next arrival follows", async ({ page }) => {
@@ -2137,28 +2224,70 @@ test.describe("An upward scroll holds new messages until it settles", () => {
     await expectSettledAtBottom(page, "a reader who settled inside the band was not followed");
   });
 
-  test("a tall arrival while held, then the settle, leaves the reader parked through the next arrival", async ({
+  test("a tall arrival while held, then the settle, leaves the reader parked through the next arrival (controlled order: scroll → patch → settle)", async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
-    const tall = TALL("tall arrival while held");
-    const race = await scrollThen(page, await endMinus(page, UP_PX), { deliver: tall });
-    expect(race.at, "premise: a message should be visible").not.toBeNull();
-    expectArrivalBeforeSettle(race.order);
-    expect(race.order, `premise: the gesture has settled (observed: ${race.order.join(" → ")})`).toContain(
-      "scrollend",
-    );
-    await expectInPlace(page, race.at!, "the tall arrival snapped a reader scrolling up", { hold: true });
+    await afterLayoutSettles(page);
+    // One frame's move up, inside the band; delivered from its scroll event.
+    const run = await gateScrollendGesture(page, {
+      text: TALL("tall arrival while held"),
+      path: [-UP_PX],
+      deliverWhen: "up",
+      upPx: UP_PX - 1,
+    });
+    const timeline = gateScrollendTimeline(run);
+    gateScrollendExpectOrder(run);
+    expect(run.at, "premise: a message should be visible").not.toBeNull();
+    expect(
+      run.atRelease ? Math.abs(run.atRelease.gap - run.at!.gap) : Infinity,
+      `the tall arrival moved the reader's message before the gesture settled (${timeline})`,
+    ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+    expect(
+      run.distanceAtRelease,
+      `premise: the tall arrival leaves the reader outside the band before the settle (${timeline})`,
+    ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    await expectInPlace(page, run.at!, `the tall arrival snapped a reader scrolling up (${timeline})`, { hold: true });
     expect(
       await distanceFromBottom(page),
       "premise: the tall arrival leaves the reader outside the band",
     ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
     await deliver(page, `arrival after the settle: ${"r".repeat(200)}`);
-    await expectInPlace(page, race.at!, "the settle did not re-measure the pin outside the band", { hold: true });
+    await expectInPlace(page, run.at!, `the settle did not re-measure the pin outside the band (${timeline})`, {
+      hold: true,
+    });
   });
 
-  test("returning to the end before the gesture settles follows the next arrival", async ({
+  test("returning to the end before the gesture settles follows the next arrival (controlled order: scroll → patch → settle)", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page);
+    await afterLayoutSettles(page);
+    const text = `arrival back at the end: ${"p".repeat(200)}`;
+    const run = await gateScrollendGesture(page, {
+      text,
+      path: pixelSteps(8, 12),
+      deliverWhen: "back-at-end",
+      upPx: 6,
+    });
+    const timeline = gateScrollendTimeline(run);
+    gateScrollendExpectOrder(run);
+    const up = run.steps.filter((d) => d < 0).reduce((a, d) => a - d, 0);
+    const down = run.steps.filter((d) => d > 0).reduce((a, d) => a + d, 0);
+    expect(up, `premise: the gesture went up (${run.steps.join(",")})`).toBeGreaterThanOrEqual(6);
+    expect(down, `premise: and came back down (${run.steps.join(",")})`).toBeGreaterThanOrEqual(6);
+    expect(
+      run.distanceAtRelease,
+      `a reader back at the end was not followed before the gesture settled (${timeline})`,
+    ).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
+    await expectSettledAtBottom(page, `a reader back at the end before settling was not followed (${timeline})`);
+    await deliver(page, "arrival after the gesture ended");
+    await expectSettledAtBottom(page, "the follow did not survive the gesture");
+  });
+
+  test("native input smoke: returning to the end with wheel or held-touch frames follows the arrivals", async ({
     page,
     browserName,
     isMobile,
@@ -2167,18 +2296,24 @@ test.describe("An upward scroll holds new messages until it settles", () => {
     await fillHistory(page);
     const gesture = await unsettledGesture(page, browserName, isMobile);
     test.skip(!gesture, "mobile WebKit has no gesture input that stays unsettled between frames");
-    const text = `arrival back at the end: ${"p".repeat(200)}`;
+    const text = `arrival back at the end, native: ${"p".repeat(200)}`;
     await armArrival(page, text, "back-at-end", 6);
     await gesture!.scrollBy(-8);
-    await gesture!.scrollBy(12);
+    await gesture!.scrollBy(12, () => armedFired(page));
     const armed = await armedArrival(page, text);
-    expect(armed.fired, `premise: the gesture should go up and come back (${armed.steps.join(",")})`).toBe(true);
-    expect(armed.order[0], `premise: the arrival renders before the gesture settles (${armed.order.join(" → ")})`).toBe(
-      "patch",
-    );
-    await expectSettledAtBottom(page, "a reader back at the end before settling was not followed");
+    const timeline = armedTimeline(armed);
+    expect(armed.fired, `premise: the gesture should go up and come back (${timeline})`).toBe(true);
+    if (browserName === "chromium") {
+      expect(
+        armed.settledBefore === 0 && arrivedBeforeSettle(armed.order),
+        `premise: a held finger sends no scrollend before it lifts (${timeline})`,
+      ).toBe(true);
+    }
+    // Back at the end, the arrival is followed whether or not the browser
+    // settled the gesture first.
+    await expectSettledAtBottom(page, `a reader back at the end was not followed (${timeline})`);
     await gesture!.end();
-    await deliver(page, "arrival after the gesture ended");
+    await deliver(page, "arrival after the native gesture ended");
     await expectSettledAtBottom(page, "the follow did not survive the gesture");
   });
 
