@@ -317,40 +317,60 @@ export function seekClockLog(record: SeekClockRecord): string {
 //   run (the app answers a patch from its ResizeObserver), it releases exactly
 //   one marked `scrollend` to the app, and stops gating.
 //
+// Or, for a gesture cut short by hiding the chat (`hide`), it clicks the mobile
+// panel opener at that point instead, keeps gating until the chat has no
+// height, and releases the one `scrollend` on the frame after: the settle comes
+// while hidden, never while the chat is shown.
+//
+// Only one runs at a time: a gesture refuses to start while another one's gate
+// is still in place, so nothing of an earlier one (in an earlier room, say) can
+// reach the next.
+//
 // This proves what the app does for that order. It does not prove a native
 // gesture always produces it; the native-input smoke tests cover real wheel and
 // touch without requiring an order.
 
-/// One controlled gesture: where to step, what to deliver, and when.
+/// One controlled gesture: where to step, what to do, and when.
 export type GateScrollendPlan = {
-  /// The inbound message to deliver. Its first 40 characters must be unique.
-  text: string;
   /// `scrollTop` for each frame, as offsets from where the gesture starts.
   path: number[];
-  /// Deliver at the first scroll event that has moved up `upPx` from the start
+  /// Act at the first scroll event that has moved up `upPx` from the start
   /// (`"up"`), or that has done so and come back to the end (`"back-at-end"`).
   deliverWhen: "up" | "back-at-end";
   upPx: number;
-};
+} & (
+  | {
+      /// The inbound message to deliver. Its first 40 characters must be unique.
+      text: string;
+    }
+  | {
+      /// Or hide the chat with this mobile panel opener, and settle while hidden.
+      hide: "hamburger-rooms-button" | "header-members-button";
+    }
+);
 
 /// What the controlled gesture saw.
 export type GateScrollendRun = {
   /// In order: `input` (a step written), `scroll` (an event on the container),
   /// `deliver` (the hook was asked for the arrival), `patch` (its row is in the
-  /// DOM), `held` (a native `scrollend` consumed before it reached the app),
-  /// `settle` (the released `scrollend`, after the app handled it) and
+  /// DOM), or for `hide`: `hide` (the opener clicked) and `hidden` (the chat has
+  /// no height); `held` (a native `scrollend` consumed before it reached the
+  /// app), `settle` (the released `scrollend`, after the app handled it) and
   /// `settle (native)` (a native one that reached the app: after the release,
-  /// unless the gate failed).
+  /// unless the gate failed). A settle that reached the app while the chat had
+  /// no height is tagged ` (hidden)`.
   events: string[];
   /// How far each scroll event moved the view, up to the delivery.
   steps: number[];
   /// The newest message row with any part in view at the delivery, and how far
   /// its top sat above the container's bottom edge.
   at: { id: string; gap: number } | null;
+  /// The plan's action ran: the arrival was requested, or the opener clicked.
   delivered: boolean;
   released: boolean;
   /// The same row's position, and scrollHeight - scrollTop - clientHeight, as
   /// the settle was released: what the arrival did while the gesture was held.
+  /// Null for `hide`, where the hidden chat has no geometry.
   atRelease: { id: string; gap: number } | null;
   distanceAtRelease: number | null;
 };
@@ -364,7 +384,8 @@ declare global {
 
 /// Runs in the page, so it is self-contained.
 function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun> {
-  return new Promise<GateScrollendRun>((resolve) => {
+  return new Promise<GateScrollendRun>((resolve, reject) => {
+    if (window.__riverSettleGate) return reject(new Error("a controlled gesture's gate is still in place"));
     const c = document.getElementById("chat-scroll-container")!;
     const history = document.querySelector('[data-testid="conversation-history"]')!;
     const run: GateScrollendRun = {
@@ -401,8 +422,9 @@ function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun>
       }
       return found;
     };
-    const marker = plan.text.slice(0, 40);
+    const marker = "text" in plan ? plan.text.slice(0, 40) : null;
     const landed = () =>
+      marker !== null &&
       Array.from(history.querySelectorAll<HTMLElement>('[id^="msg-"]')).some((row) =>
         row.textContent?.includes(marker),
       );
@@ -414,7 +436,8 @@ function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun>
       note("held");
     };
     // At the target, registered after the app's listener: runs once the app has.
-    const received = (e: Event) => note(releasedEnds.has(e) ? "settle" : "settle (native)");
+    const received = (e: Event) =>
+      note(`${releasedEnds.has(e) ? "settle" : "settle (native)"}${c.clientHeight === 0 ? " (hidden)" : ""}`);
     const onScroll = () => {
       note("scroll");
       if (run.delivered) return;
@@ -427,14 +450,35 @@ function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun>
       if (!ready) return;
       run.delivered = true;
       run.at = newestVisible();
-      note("deliver");
-      window.__riverTest!.appendMessage(plan.text);
+      if ("text" in plan) {
+        note("deliver");
+        window.__riverTest!.appendMessage(plan.text);
+        return;
+      }
+      const opener = Array.from(document.querySelectorAll<HTMLElement>(`[data-testid="${plan.hide}"]`)).find(
+        (el) => el.getClientRects().length > 0,
+      );
+      if (!opener) return finish();
+      note("hide");
+      opener.click();
+      raf = requestAnimationFrame(untilHidden);
+    };
+    // The app hides the chat on its next render, not in the click.
+    const untilHidden = () => {
+      if (c.clientHeight > 0) {
+        raf = requestAnimationFrame(untilHidden);
+        return;
+      }
+      note("hidden");
+      raf = requestAnimationFrame(release);
     };
     const release = () => {
       gating = false;
       run.released = true;
-      run.atRelease = run.at && gapOf(run.at.id);
-      run.distanceAtRelease = c.scrollHeight - c.scrollTop - c.clientHeight;
+      if ("text" in plan) {
+        run.atRelease = run.at && gapOf(run.at.id);
+        run.distanceAtRelease = c.scrollHeight - c.scrollTop - c.clientHeight;
+      }
       const end = new Event("scrollend");
       releasedEnds.add(end);
       c.dispatchEvent(end);
@@ -503,19 +547,37 @@ export function gateScrollendTimeline(run: GateScrollendRun): string {
 /// The order the controlled gesture exists to establish: the reader's input
 /// scrolled the view, the arrival was requested and its row landed, and only
 /// then did the app receive a settle, the released one, ahead of any native end.
+/// For `hide`: the opener was clicked, the chat lost its height, and the first
+/// settle the app received was the released one, while hidden; none reached it
+/// while the chat was shown.
 export function gateScrollendExpectOrder(run: GateScrollendRun) {
   const timeline = gateScrollendTimeline(run);
+  const hide = run.events.includes("hide");
   expect(run.delivered, `premise: the gesture reached its delivery point (${timeline})`).toBe(true);
-  expect(run.released, `premise: the arrival landed and the settle was released (${timeline})`).toBe(true);
+  expect(
+    run.released,
+    `premise: ${hide ? "the chat was hidden" : "the arrival landed"} and the settle was released (${timeline})`,
+  ).toBe(true);
   const firsts: string[] = [];
   for (const e of run.events) {
     if (e !== "held" && !firsts.includes(e)) firsts.push(e);
     if (e.startsWith("settle")) break;
   }
+  if (!hide) {
+    expect(
+      firsts,
+      `premise: input → scroll → deliver → patch → settle, with no settle reaching the app before the patch (${timeline})`,
+    ).toEqual(["input", "scroll", "deliver", "patch", "settle"]);
+    return;
+  }
   expect(
     firsts,
-    `premise: input → scroll → deliver → patch → settle, with no settle reaching the app before the patch (${timeline})`,
-  ).toEqual(["input", "scroll", "deliver", "patch", "settle"]);
+    `premise: input → scroll → hide → hidden → settle (hidden), with no settle reaching the app before the hide (${timeline})`,
+  ).toEqual(["input", "scroll", "hide", "hidden", "settle (hidden)"]);
+  expect(
+    run.events.filter((e) => e.startsWith("settle") && !e.endsWith("(hidden)")),
+    `premise: no settle reached the app while the chat was shown (${timeline})`,
+  ).toEqual([]);
 }
 
 // ---- settle debounce ----

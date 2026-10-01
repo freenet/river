@@ -1958,61 +1958,28 @@ async function armedArrival(page: Page, text: string): Promise<ArmedArrival> {
   return page.evaluate(() => window.__riverArmed!);
 }
 
-/// In one task: move the view to `top` and then run `then`, before any scroll
+/// In one task: move the view to `top` and switch to `room`, before any scroll
 /// event. No synthetic wheel: after one, WebKit sends this scroll's `scrollend`
-/// ahead of its `scroll` event. Returns
-/// the newest visible message right after the move, and the order the arrival's
-/// patch (if `then` delivers `text`), the scroll event and `scrollend` came in.
-async function scrollThen(
-  page: Page,
-  top: number,
-  then: { deliver: string } | { hide: true } | { switchRoom: string },
-) {
+/// ahead of its `scroll` event.
+async function scrollThenSwitchRoom(page: Page, top: number, room: string) {
   // A follow snap's events and work still in flight would race this one.
   await afterLayoutSettles(page);
-  return page.evaluate(
-    ({ top, then }) =>
-      new Promise<{ at: RowPosition | null; order: string[] }>((resolve) => {
-        const c = document.getElementById("chat-scroll-container")!;
-        const order: string[] = [];
-        const note = (what: string) => {
-          const tag = c.clientHeight > 0 ? what : `${what} (hidden)`;
-          if (!order.includes(tag)) order.push(tag);
-        };
-        const stopPatch =
-          "deliver" in then
-            ? window.__riverScroll.patchLanded(then.deliver.slice(0, 40), () => note("patch"))
-            : () => {};
-        c.addEventListener("scroll", () => note("scroll"));
-        c.addEventListener("scrollend", () => note("scrollend"));
+  await page.evaluate(
+    ({ top, room }) =>
+      new Promise<void>((resolve) => {
         requestAnimationFrame(() => {
-          c.scrollTop = top;
-          const at = window.__riverScroll.newestVisible(c);
-          const hooks = window.__riverTest!;
-          if ("deliver" in then) hooks.appendMessage(then.deliver);
-          else if ("hide" in then)
-            (document.querySelector('[data-testid="hamburger-rooms-button"]') as HTMLElement).click();
-          else hooks.switchRoom(then.switchRoom);
-          setTimeout(() => {
-            stopPatch();
-            resolve({ at, order });
-          }, 600);
+          document.getElementById("chat-scroll-container")!.scrollTop = top;
+          window.__riverTest!.switchRoom(room);
+          setTimeout(resolve, 600);
         });
       }),
-    { top, then },
+    { top, room },
   );
 }
 
 /// The arrival rendered before the scroll came to rest: until then the scroll
 /// is a gesture in progress. (Whether its `scroll` event came first does not
 /// matter; the render takes a pending one in.)
-function expectArrivalBeforeSettle(order: string[]) {
-  expect(
-    arrivedBeforeSettle(order),
-    `premise: the arrival renders before the scroll settles (observed: ${order.join(" → ")})`,
-  ).toBe(true);
-}
-
 function arrivedBeforeSettle(order: string[]) {
   const patch = order.indexOf("patch");
   const settled = order.indexOf("scrollend");
@@ -2040,14 +2007,29 @@ test.describe("An upward scroll holds new messages until it settles", () => {
     ...Array.from({ length: down }, (_, i) => -up + i + 1),
   ];
 
-  test("an arrival during an upward scroll inside the band keeps the reader's message", async ({ page }) => {
+  test("an arrival during an upward scroll inside the band keeps the reader's message (controlled order: scroll → patch → settle)", async ({
+    page,
+  }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
-    const text = `arrival during the upward scroll: ${"t".repeat(200)}`;
-    const race = await scrollThen(page, await endMinus(page, UP_PX), { deliver: text });
-    expect(race.at, "premise: a message should be visible").not.toBeNull();
-    expectArrivalBeforeSettle(race.order);
-    await expectInPlace(page, race.at!, "an arrival snapped a reader scrolling up inside the band", { hold: true });
+    await afterLayoutSettles(page);
+    // One frame's move up, inside the band; delivered from its scroll event.
+    const run = await gateScrollendGesture(page, {
+      text: `arrival during the upward scroll: ${"t".repeat(200)}`,
+      path: [-UP_PX],
+      deliverWhen: "up",
+      upPx: UP_PX - 1,
+    });
+    const timeline = gateScrollendTimeline(run);
+    gateScrollendExpectOrder(run);
+    expect(run.at, "premise: a message should be visible").not.toBeNull();
+    expect(
+      run.atRelease ? Math.abs(run.atRelease.gap - run.at!.gap) : Infinity,
+      `an arrival snapped a reader scrolling up inside the band before the gesture settled (${timeline})`,
+    ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+    await expectInPlace(page, run.at!, `an arrival snapped a reader scrolling up inside the band (${timeline})`, {
+      hold: true,
+    });
   });
 
   test("five 1px upward frames in one gesture hold an arrival (controlled order: scroll → patch → settle)", async ({
@@ -2223,7 +2205,7 @@ test.describe("An upward scroll holds new messages until it settles", () => {
   }) => {
     await openRoomAtBottom(page, "Team Chat Room", DEEP_ROOM_PATH);
     await fillHistory(page);
-    await scrollThen(page, await endMinus(page, UP_PX), { switchRoom: "Deep History Room" });
+    await scrollThenSwitchRoom(page, await endMinus(page, UP_PX), "Deep History Room");
     await expect(page.getByRole("heading", { name: "Deep History Room" })).toBeVisible();
     await expectSettledAtBottom(page, "the new room did not open at its newest message");
     await afterLayoutSettles(page);
@@ -2761,6 +2743,20 @@ test.describe("The hidden mobile chat column", () => {
     await chatHidden(page);
   }
 
+  /// A 40px upward gesture inside the band, cut short by opening the room list
+  /// from its scroll event; its one settle comes while the chat is hidden.
+  async function hideMidGesture(page: Page) {
+    const run = await gateScrollendGesture(page, {
+      hide: "hamburger-rooms-button",
+      path: [-40],
+      deliverWhen: "up",
+      upPx: 39,
+    });
+    gateScrollendExpectOrder(run);
+    expect(run.at, "premise: a message should be visible").not.toBeNull();
+    return run;
+  }
+
   /// Go back to the chat from the room list or the member list, and wait out the
   /// reveal's own observer pass.
   async function revealChat(page: Page, back: "rooms-back-button" | "members-back-button") {
@@ -2838,19 +2834,13 @@ test.describe("The hidden mobile chat column", () => {
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page);
-    const race = await scrollThen(page, await endMinus(page, 40), { hide: true });
-    expect(race.at, "premise: a message should be visible").not.toBeNull();
-    expect(
-      race.order.filter((e) => e.startsWith("scrollend") && !e.endsWith("(hidden)")),
-      `premise: the gesture must not settle while the chat is shown (observed: ${race.order.join(" → ")})`,
-    ).toEqual([]);
+    await afterLayoutSettles(page);
+    const run = await hideMidGesture(page);
+    const timeline = gateScrollendTimeline(run);
     await chatHidden(page);
     await revealChat(page, "rooms-back-button");
     await deliver(page, "arrival after the hidden gesture");
-    await expectSettledAtBottom(
-      page,
-      `a reader inside the band stayed held after the reveal (observed: ${race.order.join(" → ")})`,
-    );
+    await expectSettledAtBottom(page, `a reader inside the band stayed held after the reveal (${timeline})`);
   });
 
   test("a gesture cut short by hiding, then a room switch while hidden: the new room opens at its newest message and holds its own gesture", async ({
@@ -2858,7 +2848,8 @@ test.describe("The hidden mobile chat column", () => {
   }) => {
     await openRoomAtBottom(page, "Team Chat Room", DEEP_ROOM_PATH);
     await fillHistory(page);
-    await scrollThen(page, await endMinus(page, 40), { hide: true });
+    await afterLayoutSettles(page);
+    await hideMidGesture(page);
     await chatHidden(page);
     await callRiverTest(page, "switchRoom", "Deep History Room");
     await afterLayoutSettles(page);
@@ -2869,9 +2860,29 @@ test.describe("The hidden mobile chat column", () => {
     await expectSettledAtBottom(page, "the new room did not follow");
 
     // A new gesture in the new room is its own: nothing left over settles it.
-    const race = await scrollThen(page, await endMinus(page, 40), { deliver: TALL("tall arrival in the new room") });
-    expectArrivalBeforeSettle(race.order);
-    await expectInPlace(page, race.at!, "the new room's upward gesture did not hold the tall arrival", { hold: true });
+    // Its gate is a new one (the old room's was torn down, or this would refuse
+    // to start), so a settle reaching the app before the patch is the app's.
+    await afterLayoutSettles(page);
+    const run = await gateScrollendGesture(page, {
+      text: TALL("tall arrival in the new room"),
+      path: [-40],
+      deliverWhen: "up",
+      upPx: 39,
+    });
+    const timeline = gateScrollendTimeline(run);
+    gateScrollendExpectOrder(run);
+    expect(run.at, "premise: a message should be visible").not.toBeNull();
+    expect(
+      run.atRelease ? Math.abs(run.atRelease.gap - run.at!.gap) : Infinity,
+      `the new room's upward gesture did not hold the tall arrival before it settled (${timeline})`,
+    ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+    expect(
+      run.distanceAtRelease,
+      `premise: the tall arrival leaves the reader outside the band before the settle (${timeline})`,
+    ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+    await expectInPlace(page, run.at!, `the new room's upward gesture did not hold the tall arrival (${timeline})`, {
+      hold: true,
+    });
   });
 
   for (const reveal of [
