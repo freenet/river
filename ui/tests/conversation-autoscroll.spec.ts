@@ -1111,7 +1111,8 @@ async function offsetDrift(page: Page, top: number): Promise<number> {
 test.describe("Anchor rows", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  test("the anchor-row class and data-anchor-row mark the same rows in the same order", async ({
+  // DOM membership only, no layout or input: one engine is enough.
+  test("the anchor-row class and data-anchor-row mark the same rows in the same order", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
