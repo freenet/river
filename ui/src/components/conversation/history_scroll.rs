@@ -40,8 +40,9 @@
 //!   the reader. Back at the end, it is `Free` again at once.
 //! * **Settle** (`scrollend`, or a 120ms debounce on `scroll` where it is
 //!   missing) ends a gesture: it measures the pin and anchor where the view came
-//!   to rest, as `main` did, and does not snap. The debounce cannot tell a
-//!   paused finger from a lifted one. A settle with no gesture in progress does
+//!   to rest, as `main` did, and does not snap. It first takes in a move whose
+//!   `scroll` event has not arrived yet: WebKit can send the `scrollend` first.
+//!   The debounce cannot tell a paused finger from a lifted one. A settle with no gesture in progress does
 //!   nothing, which is what makes a stale `scrollend` (another room's, an old
 //!   gesture's) harmless: room switches, forced snaps and new seeks clear the
 //!   gesture. During `Seeking`, a settle finishes or re-aims the seek.
@@ -734,6 +735,10 @@ impl HistoryScroll {
     /// room's, an old gesture's) finds no gesture and does nothing.
     fn settle(&self) {
         self.settle_timer.set(None);
+        // WebKit can send `scrollend` before the `scroll` event of the move it
+        // ends: read that move first, as `restore` does, or the gesture it
+        // starts is never settled.
+        self.take_in_undelivered_scroll();
         if self.follow.get() == Follow::Seeking {
             self.restore_now();
             return;
