@@ -56,6 +56,66 @@ const LAYOUT_SHIFT_ALLOWANCE_PX = 200;
 /// A draft long enough to take more than BOTTOM_THRESHOLD_PX off the history.
 const LONG_DRAFT = Array.from({ length: 12 }, (_, i) => `draft line ${i}`).join("\n");
 
+/// A tall inbound message: `marker`, then `lines` more lines. At the default 12,
+/// more than the follow band on its own.
+const TALL = (marker: string, lines = 12) =>
+  `${marker}\n${Array.from({ length: lines }, (_, i) => `line ${i}`).join("\n")}`;
+
+/// The in-page helpers the evaluations below share (`window.__riverScroll`).
+/// Message rows are found from `[id^="msg-"]`, not from the implementation's own
+/// row attribute, so these tests stay a contract on behaviour.
+type ScrollHelpers = {
+  /// The newest message row with any part inside `c`, and how far its top sits
+  /// above `c`'s bottom edge.
+  newestVisible(c: HTMLElement): RowPosition | null;
+  /// The history's message row whose text includes `text`.
+  rowWithText(text: string): HTMLElement | null;
+  /// Call `then` once the row with `text` is in the history; returns a stop.
+  patchLanded(text: string, then: (row: HTMLElement) => void): () => void;
+};
+
+declare global {
+  interface Window {
+    __riverScroll: ScrollHelpers;
+  }
+}
+
+/// Runs in the page (`addInitScript`), so it must be self-contained.
+function installScrollHelpers() {
+  const HISTORY = '[data-testid="conversation-history"]';
+  const helpers: ScrollHelpers = {
+    newestVisible(c) {
+      const box = c.getBoundingClientRect();
+      let found: RowPosition | null = null;
+      for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+        const r = row.getBoundingClientRect();
+        if (r.bottom > box.top && r.top < box.bottom) found = { id: row.id, gap: box.bottom - r.top };
+      }
+      return found;
+    },
+    rowWithText(text) {
+      const rows = document.querySelectorAll<HTMLElement>(`${HISTORY} [id^="msg-"]`);
+      return Array.from(rows).find((row) => row.textContent?.includes(text)) ?? null;
+    },
+    patchLanded(text, then) {
+      const observer = new MutationObserver(() => {
+        const row = helpers.rowWithText(text);
+        if (!row) return;
+        observer.disconnect();
+        then(row);
+      });
+      observer.observe(document.querySelector(HISTORY)!, { childList: true, subtree: true });
+      return () => observer.disconnect();
+    },
+  };
+  window.__riverScroll = helpers;
+}
+
+// Before every navigation of every test, so each evaluation can rely on it.
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(installScrollHelpers);
+});
+
 /// scrollHeight - scrollTop - clientHeight: how far the end of the history is
 /// below the visible area. 0 means the newest message is fully in view.
 function distanceFromBottom(page: Page): Promise<number> {
@@ -80,6 +140,11 @@ function viewportHeight(page: Page): Promise<number> {
     const el = document.getElementById("chat-scroll-container");
     return el ? el.clientHeight : Number.NaN;
   });
+}
+
+/// The `scrollTop` that leaves the view `px` above its end.
+async function endMinus(page: Page, px: number) {
+  return (await historyHeight(page)) - (await viewportHeight(page)) - px;
 }
 
 function scrollTop(page: Page): Promise<number> {
@@ -127,18 +192,37 @@ async function openRoomAtBottom(page: Page, roomName: string, path = "/") {
   await expectSettledAtBottom(page, "opening a room should land on its newest message");
 }
 
-/// Simulate the reader dragging the history with a pointing device.
+/// Simulate the reader dragging the history with a pointing device. Returns
+/// where it landed, read in the same task, before any scroll event or restore
+/// can answer it.
 ///
 /// A synthetic `wheel` followed by a `scrollTop` assignment rather than
 /// `page.mouse.wheel`, which is unsupported on mobile WebKit. Nothing listens for
-/// gestures (the `scrollTop` write is the reader's scroll); the `wheel` is
-/// harmless and keeps the helper realistic.
-async function readerScrollsTo(page: Page, top: number) {
-  await page.evaluate((t) => {
-    const el = document.getElementById("chat-scroll-container")!;
-    el.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
-    el.scrollTop = t;
-  }, top);
+/// gestures (the `scrollTop` write is the reader's scroll); the `wheel` keeps
+/// the helper realistic. `wheel: false` leaves it out: after one, WebKit
+/// dispatches every later `scroll` event on the element twice (measured on a
+/// bare scroller outside the app, 2026-10-01; Chromium and Firefox send one).
+function readerScrollsTo(page: Page, top: number, { wheel = true } = {}): Promise<number> {
+  return page.evaluate(
+    ({ t, wheel }) => {
+      const el = document.getElementById("chat-scroll-container")!;
+      if (wheel) el.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
+      el.scrollTop = t;
+      return el.scrollTop;
+    },
+    { t: top, wheel },
+  );
+}
+
+/// `readerScrollsTo`, then wait until the view is where it was aimed.
+async function readerParksAt(page: Page, target: number) {
+  await readerScrollsTo(page, target);
+  await expect
+    .poll(() => offsetDrift(page, target), {
+      timeout: 5_000,
+      message: "premise: the reader's scroll should land where it was aimed",
+    })
+    .toBeLessThanOrEqual(1);
 }
 
 /// The same, with NO gesture event at all.
@@ -149,23 +233,28 @@ async function readerScrollsTo(page: Page, top: number) {
 /// for `scrollend`, so the scroll has landed before the test acts. The pending
 /// scroll case is covered on purpose by the batched at-cap test, which does not
 /// wait.
-async function readerScrollsWithoutGesture(page: Page, top: number) {
-  await page.evaluate(async (t) => {
-    const el = document.getElementById("chat-scroll-container")!;
-    const settled = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
-      el.addEventListener(
-        "scrollend",
-        () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        { once: true },
-      );
-    });
-    el.scrollTop = t;
-    await settled;
-  }, top);
+///
+/// Resolves with `scrollTop` as it is right after the app has handled the
+/// `scrollend` (its listener was installed first): whatever the settle did, it
+/// did synchronously.
+function readerScrollsWithoutGesture(page: Page, top: number): Promise<number> {
+  return page.evaluate(
+    (t) =>
+      new Promise<number>((resolve, reject) => {
+        const el = document.getElementById("chat-scroll-container")!;
+        const timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
+        el.addEventListener(
+          "scrollend",
+          () => {
+            clearTimeout(timer);
+            resolve(el.scrollTop);
+          },
+          { once: true },
+        );
+        el.scrollTop = t;
+      }),
+    top,
+  );
 }
 
 /// Hold for a moment and assert the view did not move.
@@ -192,22 +281,10 @@ async function afterLayoutSettles(page: Page) {
 
 /// The newest history message with any part inside the scroll container, and
 /// how far its top sits above the container's bottom edge.
-///
-/// Found from `[id^="msg-"]`, not from the implementation's own row attribute,
-/// so these tests stay a contract on behaviour.
-function newestVisibleMessage(page: Page): Promise<{ id: string; gap: number } | null> {
+function newestVisibleMessage(page: Page): Promise<RowPosition | null> {
   return page.evaluate(() => {
     const c = document.getElementById("chat-scroll-container");
-    if (!c) return null;
-    const box = c.getBoundingClientRect();
-    let found: { id: string; gap: number } | null = null;
-    for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-      const r = row.getBoundingClientRect();
-      if (r.bottom > box.top && r.top < box.bottom) {
-        found = { id: row.id, gap: box.bottom - r.top };
-      }
-    }
-    return found;
+    return c ? window.__riverScroll.newestVisible(c) : null;
   });
 }
 
@@ -238,27 +315,11 @@ function rowGap(page: Page, id: string): Promise<number | null> {
 /// evaluation. Infinity when the row is gone, or (with `newest`) when another
 /// message is now the newest visible one: a missing row is a failure, never a
 /// zero drift.
-function positionDrift(page: Page, before: RowPosition, newest: boolean): Promise<number> {
-  return page.evaluate(
-    ({ id, gap, newest }) => {
-      const c = document.getElementById("chat-scroll-container");
-      if (!c) return Infinity;
-      const box = c.getBoundingClientRect();
-      if (newest) {
-        let found: HTMLElement | null = null;
-        for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-          const r = row.getBoundingClientRect();
-          if (r.bottom > box.top && r.top < box.bottom) found = row;
-        }
-        if (!found || found.id !== id) return Infinity;
-        return Math.abs(box.bottom - found.getBoundingClientRect().top - gap);
-      }
-      const row = document.getElementById(id);
-      if (!row || !c.contains(row)) return Infinity;
-      return Math.abs(box.bottom - row.getBoundingClientRect().top - gap);
-    },
-    { ...before, newest },
-  );
+async function positionDrift(page: Page, before: RowPosition, newest: boolean): Promise<number> {
+  const now = newest
+    ? await newestVisibleMessage(page)
+    : { id: before.id, gap: await rowGap(page, before.id) };
+  return now?.id === before.id && now.gap !== null ? Math.abs(now.gap - before.gap) : Infinity;
 }
 
 /// `before`'s row is back at its gap. `newest` (the default) also requires it to
@@ -801,14 +862,8 @@ test.describe("The newest visible message stays in view", () => {
 
     const target = after.top - SMALL_MOVE_PX;
     expect(target, "premise: the reader's target is inside the history").toBeGreaterThan(0);
-    const landed = await page.evaluate((t) => {
-      const c = document.getElementById("chat-scroll-container")!;
-      c.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
-      c.scrollTop = t;
-      return c.scrollTop;
-    }, target);
+    const landed = await readerScrollsTo(page, target);
     expect(Math.abs(landed - target), "premise: the reader's scroll lands where it was aimed").toBeLessThanOrEqual(1);
-    await afterLayoutSettles(page);
     await expectDriftWithin(page, () => offsetDrift(page, target), "the reader's small scroll after a resize was put back", {
       hold: true,
     });
@@ -882,10 +937,13 @@ function anchorRows(page: Page): Promise<AnchorRow[]> {
   });
 }
 
-/// The rows `fillHistory` delivered, in order, by their `filler N:` text.
-function fillerRows(rows: AnchorRow[]): AnchorRow[] {
-  return rows.filter((row) => row.id.startsWith("msg-") && /^filler \d+:/.test(row.text));
+/// The message rows among `rows` whose text matches `re`, in order.
+function messageRows(rows: AnchorRow[], re: RegExp): AnchorRow[] {
+  return rows.filter((row) => row.id.startsWith("msg-") && re.test(row.text));
 }
+
+/// The rows `fillHistory` delivered, in order, by their `filler N:` text.
+const fillerRows = (rows: AnchorRow[]) => messageRows(rows, /^filler \d+:/);
 
 /// Scroll so the message row `id` is the newest one visible, its top `peek` px
 /// above the container's bottom edge, and wait for the scroll to land.
@@ -900,13 +958,7 @@ async function parkOnRow(page: Page, id: string, peek = 60): Promise<RowPosition
     { id, peek },
   );
   expect(target, "premise: the parking offset is inside the history").toBeGreaterThan(0);
-  await readerScrollsTo(page, target);
-  await expect
-    .poll(async () => Math.abs((await scrollTop(page)) - target), {
-      timeout: 5_000,
-      message: "premise: the reader's scroll should land where it was aimed",
-    })
-    .toBeLessThanOrEqual(1);
+  await readerParksAt(page, target);
   await afterLayoutSettles(page);
   expect(
     await distanceFromBottom(page),
@@ -1010,9 +1062,9 @@ test.describe("The reader's place survives removed and late content (#507)", () 
     const firstAt = rows.findIndex((row) => row.bottom > -viewport);
     const doomed = rows.slice(firstAt, newestAt + 1);
     expect(
-      doomed.every((row) => row.id.startsWith("msg-") && /^filler \d+:/.test(row.text)),
+      fillerRows(doomed),
       "premise: the deleted neighbourhood holds plain messages only, no separator or event row",
-    ).toBe(true);
+    ).toEqual(doomed);
     expect(rows[firstAt].top, "premise: the deletion reaches a viewport above the top edge").toBeLessThanOrEqual(
       -viewport,
     );
@@ -1198,23 +1250,6 @@ function expectSameShape(a: Shape, b: Shape, why: string) {
   }
 }
 
-/// The reader sets `scrollTop` to `top`; returns where it landed, read in the
-/// same task, before any scroll event or restore can answer it. `wheel: false`
-/// leaves out the synthetic wheel `readerScrollsTo` sends: after one, WebKit
-/// dispatches every later `scroll` event on the element twice (measured on a
-/// bare scroller outside the app, 2026-10-01; Chromium and Firefox send one).
-function readerScrollsToNow(page: Page, top: number, { wheel = true } = {}): Promise<number> {
-  return page.evaluate(
-    ({ t, wheel }) => {
-      const c = document.getElementById("chat-scroll-container")!;
-      if (wheel) c.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1 }));
-      c.scrollTop = t;
-      return c.scrollTop;
-    },
-    { t: top, wheel },
-  );
-}
-
 // The browser clamps `scrollTop` when the scroll range shrinks below it. A clamp
 // is not the reader moving, however far it goes and whether or not anything the
 // layout signature describes changed; a reader's own move is theirs, even right
@@ -1241,9 +1276,7 @@ test.describe("A clamp to the end is not the reader", () => {
     // Among the short rows, which barely rewrap: the rows below the reader keep
     // their height, so the reader's message can go back to its gap without
     // running into the new end.
-    const shortRows = (await anchorRows(page)).filter(
-      (row) => row.id.startsWith("msg-") && /^short \d+/.test(row.text),
-    );
+    const shortRows = messageRows(await anchorRows(page), /^short \d+/);
     expect(shortRows.length, "premise: the short rows are on the page").toBe(10);
     const before = await parkOnRow(page, shortRows[shortRows.length - 4].id);
 
@@ -1297,9 +1330,8 @@ test.describe("A clamp to the end is not the reader", () => {
     expect(await scrollTop(page), "premise: the overhang does not move the view").toBeCloseTo(grown.before.top, 0);
 
     const target = grown.after.top - SMALL_MOVE_PX;
-    const landed = await readerScrollsToNow(page, target);
+    const landed = await readerScrollsTo(page, target);
     expect(Math.abs(landed - target), "premise: the reader's scroll lands where it was aimed").toBeLessThanOrEqual(1);
-    await afterLayoutSettles(page);
     await expectDriftWithin(
       page,
       () => offsetDrift(page, target),
@@ -1334,7 +1366,7 @@ test.describe("A clamp to the end is not the reader", () => {
 
       const contentEnd = created.before.max;
       const target = contentEnd + INTO_OVERHANG_PX;
-      const landed = await readerScrollsToNow(page, target, { wheel });
+      const landed = await readerScrollsTo(page, target, { wheel });
       expect(Math.abs(landed - target), "premise: the reader's scroll lands where it was aimed").toBeLessThanOrEqual(1);
       await afterLayoutSettles(page);
       expect(await distanceFromBottom(page), "premise: the reader is parked above the end").toBeGreaterThan(
@@ -1353,7 +1385,6 @@ test.describe("A clamp to the end is not the reader", () => {
         Math.abs(removed.after.max - removed.after.top),
         "premise: the clamp lands at the new end",
       ).toBeLessThanOrEqual(1);
-      await afterLayoutSettles(page);
       // The old gap is out of reach until the history grows again: the view stays
       // where the clamp put it.
       await expectDriftWithin(
@@ -1365,17 +1396,10 @@ test.describe("A clamp to the end is not the reader", () => {
 
       // Tall enough to make the old gap reachable again, with room to spare.
       const marker = "tall arrival after the overhang went";
-      await callRiverTest(
-        page,
-        "appendMessage",
-        `${marker}\n${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}`,
-      );
+      await callRiverTest(page, "appendMessage", TALL(marker, 30));
       await expect(page.getByText(marker).last()).toBeAttached({ timeout: 5_000 });
       const arrivalHeight = await page.evaluate(
-        (marker) =>
-          Array.from(document.querySelectorAll<HTMLElement>('[id^="msg-"]'))
-            .find((row) => row.textContent?.includes(marker))!
-            .getBoundingClientRect().height,
+        (marker) => window.__riverScroll.rowWithText(marker)!.getBoundingClientRect().height,
         marker,
       );
       expect(
@@ -1418,14 +1442,7 @@ test.describe("Our own scroll's echo is not the reader", () => {
     await expectSettledAtBottom(page, "premise: the padded newest row should have been followed");
     await afterLayoutSettles(page);
 
-    const parkAt = (await historyHeight(page)) - (await viewportHeight(page)) - PARKED_PX;
-    await readerScrollsTo(page, parkAt);
-    await expect
-      .poll(async () => Math.abs((await scrollTop(page)) - parkAt), {
-        timeout: 5_000,
-        message: "premise: the reader's scroll should land where it was aimed",
-      })
-      .toBeLessThanOrEqual(1);
+    await readerParksAt(page, await endMinus(page, PARKED_PX));
     await afterLayoutSettles(page);
     const parked = await distanceFromBottom(page);
     expect(parked, "premise: the reader is parked just outside the follow band").toBeGreaterThan(
@@ -1668,8 +1685,7 @@ test.describe("The scroll-to-latest animation keeps following to the end", () =>
     }, SEEK_SPEED_FILLERS);
     await expect(page.getByText(`speed filler ${SEEK_SPEED_FILLERS - 1}:`)).toBeAttached({ timeout: 5_000 });
     await expectSettledAtBottom(page, "premise: the fillers should have been followed");
-    const end = (await historyHeight(page)) - (await viewportHeight(page));
-    await readerScrollsWithoutGesture(page, end - SEEK_SPEED_PARK_PX);
+    await readerScrollsWithoutGesture(page, await endMinus(page, SEEK_SPEED_PARK_PX));
     await afterLayoutSettles(page);
     expect(await distanceFromBottom(page), "premise: the reader should be parked far up").toBeGreaterThan(
       SEEK_SPEED_PARK_PX - BOTTOM_THRESHOLD_PX,
@@ -1855,32 +1871,13 @@ function armArrival(page: Page, text: string, when: "up" | "back-at-end", upPx: 
   return page.evaluate(
     ({ text, when, upPx }) => {
       const c = document.getElementById("chat-scroll-container")!;
-      const history = document.querySelector('[data-testid="conversation-history"]')!;
       const start = c.scrollTop;
       let last = start;
       let wentUp = false;
-      const rec = { fired: false, steps: [] as number[], at: null as any, order: [] as string[] };
+      const rec: ArmedArrival = { fired: false, steps: [], at: null, order: [] };
       (window as any).__riverArmed = rec;
-      const newest = () => {
-        const box = c.getBoundingClientRect();
-        let found: any = null;
-        for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-          const r = row.getBoundingClientRect();
-          if (r.bottom > box.top && r.top < box.bottom) found = { id: row.id, gap: box.bottom - r.top };
-        }
-        return found;
-      };
-      const patched = new MutationObserver(() => {
-        if (!rec.fired || rec.order.includes("patch")) return;
-        const row = Array.from(history.querySelectorAll<HTMLElement>('[id^="msg-"]')).find((r) =>
-          r.textContent?.includes(text.slice(0, 40)),
-        );
-        if (row) {
-          rec.order.push("patch");
-          patched.disconnect();
-        }
-      });
-      patched.observe(history, { childList: true, subtree: true });
+      // The text is delivered only once fired, so its row cannot land before.
+      window.__riverScroll.patchLanded(text.slice(0, 40), () => rec.order.push("patch"));
       c.addEventListener("scrollend", () => {
         if (rec.fired && !rec.order.includes("scrollend")) rec.order.push("scrollend");
       });
@@ -1894,7 +1891,7 @@ function armArrival(page: Page, text: string, when: "up" | "back-at-end", upPx: 
           when === "up" ? wentUp : wentUp && c.scrollHeight - c.clientHeight - top <= 1;
         if (!ready) return;
         rec.fired = true;
-        rec.at = newest();
+        rec.at = window.__riverScroll.newestVisible(c);
         c.removeEventListener("scroll", onScroll);
         (window as any).__riverTest.appendMessage(text);
       };
@@ -1923,43 +1920,29 @@ async function scrollThen(
   await afterLayoutSettles(page);
   return page.evaluate(
     ({ top, then }) =>
-      new Promise<{ at: { id: string; gap: number } | null; order: string[] }>((resolve) => {
+      new Promise<{ at: RowPosition | null; order: string[] }>((resolve) => {
         const c = document.getElementById("chat-scroll-container")!;
-        const history = document.querySelector('[data-testid="conversation-history"]')!;
         const order: string[] = [];
         const note = (what: string) => {
           const tag = c.clientHeight > 0 ? what : `${what} (hidden)`;
           if (!order.includes(tag)) order.push(tag);
         };
-        const text = "deliver" in then ? then.deliver.slice(0, 40) : null;
-        const patched = new MutationObserver(() => {
-          if (!text) return;
-          const row = Array.from(history.querySelectorAll<HTMLElement>('[id^="msg-"]')).find((r) =>
-            r.textContent?.includes(text),
-          );
-          if (row) {
-            note("patch");
-            patched.disconnect();
-          }
-        });
-        patched.observe(history, { childList: true, subtree: true });
+        const stopPatch =
+          "deliver" in then
+            ? window.__riverScroll.patchLanded(then.deliver.slice(0, 40), () => note("patch"))
+            : () => {};
         c.addEventListener("scroll", () => note("scroll"));
         c.addEventListener("scrollend", () => note("scrollend"));
         requestAnimationFrame(() => {
           c.scrollTop = top;
-          const box = c.getBoundingClientRect();
-          let at: { id: string; gap: number } | null = null;
-          for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
-            const r = row.getBoundingClientRect();
-            if (r.bottom > box.top && r.top < box.bottom) at = { id: row.id, gap: box.bottom - r.top };
-          }
+          const at = window.__riverScroll.newestVisible(c);
           const hooks = (window as any).__riverTest;
           if ("deliver" in then) hooks.appendMessage(then.deliver);
           else if ("hide" in then)
             (document.querySelector('[data-testid="hamburger-rooms-button"]') as HTMLElement).click();
           else hooks.switchRoom(then.switchRoom);
           setTimeout(() => {
-            patched.disconnect();
+            stopPatch();
             resolve({ at, order });
           }, 600);
         });
@@ -1979,38 +1962,6 @@ function expectArrivalBeforeSettle(order: string[]) {
     `premise: the arrival renders before the scroll settles (observed: ${order.join(" → ")})`,
   ).toBe(true);
 }
-
-/// The reader scrolls to `top` with no gesture event, as
-/// `readerScrollsWithoutGesture` does, and this returns `scrollTop` as it is
-/// right after the app has handled the `scrollend` (its listener was installed
-/// first): whatever the settle did, it did synchronously.
-function scrollTopAfterSettle(page: Page, top: number): Promise<number> {
-  return page.evaluate(
-    (t) =>
-      new Promise<number>((resolve, reject) => {
-        const c = document.getElementById("chat-scroll-container")!;
-        const timer = setTimeout(() => reject(new Error("the scroll never settled")), 5_000);
-        c.addEventListener(
-          "scrollend",
-          () => {
-            clearTimeout(timer);
-            resolve(c.scrollTop);
-          },
-          { once: true },
-        );
-        c.scrollTop = t;
-      }),
-    top,
-  );
-}
-
-/// The `scrollTop` that leaves the view `px` above its end.
-async function endMinus(page: Page, px: number) {
-  return (await historyHeight(page)) - (await viewportHeight(page)) - px;
-}
-
-/// A tall inbound message: more than the follow band on its own.
-const TALL = (marker: string) => `${marker}\n${Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n")}`;
 
 // An upward scroll inside the follow band holds new messages until it settles,
 // so an arrival does not snap a reader who has started to look back (finding
@@ -2058,7 +2009,7 @@ test.describe("An upward scroll holds new messages until it settles", () => {
     const target = await endMinus(page, UP_PX);
     // A pinned reader is kept at the end by any later restore, so this checks
     // the settle itself, at the moment it ran.
-    const settledAt = await scrollTopAfterSettle(page, target);
+    const settledAt = await readerScrollsWithoutGesture(page, target);
     expect(Math.abs(settledAt - target), "the settle snapped the reader").toBeLessThanOrEqual(1);
     await deliver(page, "arrival after a settle inside the band");
     await expectSettledAtBottom(page, "a reader who settled inside the band was not followed");
@@ -2142,25 +2093,18 @@ test.describe("An arrival ahead of the reader's scroll event (#723)", () => {
       "premise: the reader is parked well above the end",
     ).toBeGreaterThan(4 * BOTTOM_THRESHOLD_PX);
 
-    const tall = `tall arrival ahead of the scroll event\n${Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n")}`;
+    const marker = "tall arrival ahead of the scroll event";
     // One sequence, in a frame callback: the scroll's event is then due in the
     // NEXT frame, while the hook's delivery runs on a timer before it.
     const race = await page.evaluate(
-      (text) =>
+      ({ text, marker }) =>
         new Promise<{ order: string[]; arrivalHeight: number }>((resolve) => {
           const c = document.getElementById("chat-scroll-container")!;
-          const history = document.querySelector('[data-testid="conversation-history"]')!;
           const order: string[] = [];
           let arrivalHeight = 0;
-          const marker = "tall arrival ahead of the scroll event";
-          const patched = new MutationObserver(() => {
-            const row = Array.from(history.querySelectorAll<HTMLElement>('[id^="msg-"]')).find((r) =>
-              r.textContent?.includes(marker),
-            );
-            if (row && !order.includes("patch")) {
-              order.push("patch");
-              arrivalHeight = row.getBoundingClientRect().height;
-            }
+          const stopPatch = window.__riverScroll.patchLanded(marker, (row) => {
+            order.push("patch");
+            arrivalHeight = row.getBoundingClientRect().height;
             done();
           });
           const onScroll = () => {
@@ -2173,18 +2117,17 @@ test.describe("An arrival ahead of the reader's scroll event (#723)", () => {
           }
           function finish() {
             clearTimeout(timer);
-            patched.disconnect();
+            stopPatch();
             c.removeEventListener("scroll", onScroll);
             resolve({ order, arrivalHeight });
           }
-          patched.observe(history, { childList: true, subtree: true });
           c.addEventListener("scroll", onScroll);
           requestAnimationFrame(() => {
             c.scrollTop = c.scrollHeight;
             (window as any).__riverTest.appendMessage(text);
           });
         }),
-      tall,
+      { text: TALL(marker), marker },
     );
     expect(
       race.order,
@@ -2447,10 +2390,7 @@ test.describe("Windowed history follows arrivals (#501)", () => {
     // reader's scroll event may still be pending, so this also covers the pin
     // being stale-true. `restore` must take that scroll in first, and the test
     // would go quiet about it if it waited the event out.
-    const parkedAt = Math.max(
-      0,
-      (await historyHeight(page)) - (await viewportHeight(page)) - 400
-    );
+    const parkedAt = Math.max(0, await endMinus(page, 400));
     await readerScrollsTo(page, parkedAt);
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
@@ -2632,13 +2572,27 @@ test.describe("The hidden mobile chat column", () => {
 
   const chat = (page: Page) => page.locator("#chat-scroll-container");
 
-  /// Open another mobile panel and wait out the hide's own observer pass.
-  async function hideChat(page: Page, opener: "hamburger-rooms-button" | "header-members-button") {
-    await page.getByTestId(opener).filter({ visible: true }).click();
+  /// The chat column is hidden, with no height, and the hide's own observer
+  /// pass is over.
+  async function chatHidden(page: Page) {
     await expect(chat(page)).toBeHidden({ timeout: 5_000 });
     await expect
       .poll(() => viewportHeight(page), { message: "premise: the hidden chat has no height" })
       .toBe(0);
+    await afterLayoutSettles(page);
+  }
+
+  /// Open another mobile panel, hiding the chat.
+  async function hideChat(page: Page, opener: "hamburger-rooms-button" | "header-members-button") {
+    await page.getByTestId(opener).filter({ visible: true }).click();
+    await chatHidden(page);
+  }
+
+  /// Go back to the chat from the room list or the member list, and wait out the
+  /// reveal's own observer pass.
+  async function revealChat(page: Page, back: "rooms-back-button" | "members-back-button") {
+    await page.getByTestId(back).click();
+    await expect(chat(page)).toBeVisible();
     await afterLayoutSettles(page);
   }
 
@@ -2647,7 +2601,7 @@ test.describe("The hidden mobile chat column", () => {
   }) => {
     // At its cap, so every arrival drains the oldest message above the reader.
     await openRoomAtBottom(page, "Capped History Room", DEEP_ROOM_PATH);
-    await readerScrollsTo(page, (await historyHeight(page)) - (await viewportHeight(page)) - 400);
+    await readerScrollsTo(page, await endMinus(page, 400));
     await expect
       .poll(() => distanceFromBottom(page), { timeout: 5_000 })
       .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
@@ -2666,9 +2620,7 @@ test.describe("The hidden mobile chat column", () => {
       .toBeGreaterThan(beforeBatch + 30);
     await afterLayoutSettles(page);
 
-    await page.getByTestId("members-back-button").click();
-    await expect(chat(page)).toBeVisible();
-    await afterLayoutSettles(page);
+    await revealChat(page, "members-back-button");
     await expectSameMessageInPlace(
       page,
       before!,
@@ -2701,10 +2653,8 @@ test.describe("The hidden mobile chat column", () => {
     await openRoomAtBottom(page, "Team Chat Room");
     await fillHistory(page, 12);
     await seekAndInterrupt(page, { kind: "hide" });
-    await expect(chat(page)).toBeHidden({ timeout: 5_000 });
-    await afterLayoutSettles(page);
-    await page.getByTestId("rooms-back-button").click();
-    await expect(chat(page)).toBeVisible();
+    await chatHidden(page);
+    await revealChat(page, "rooms-back-button");
     await expectSettledAtBottom(page, "the hidden animation did not finish at the newest message on reveal");
     await deliver(page, "arrival after the hidden animation");
     await expectSettledAtBottom(page, "the follow did not survive the animation being hidden");
@@ -2721,11 +2671,8 @@ test.describe("The hidden mobile chat column", () => {
       race.order.filter((e) => e.startsWith("scrollend") && !e.endsWith("(hidden)")),
       `premise: the gesture must not settle while the chat is shown (observed: ${race.order.join(" → ")})`,
     ).toEqual([]);
-    await expect(chat(page)).toBeHidden({ timeout: 5_000 });
-    await afterLayoutSettles(page);
-    await page.getByTestId("rooms-back-button").click();
-    await expect(chat(page)).toBeVisible();
-    await afterLayoutSettles(page);
+    await chatHidden(page);
+    await revealChat(page, "rooms-back-button");
     await deliver(page, "arrival after the hidden gesture");
     await expectSettledAtBottom(
       page,
@@ -2739,11 +2686,10 @@ test.describe("The hidden mobile chat column", () => {
     await openRoomAtBottom(page, "Team Chat Room", DEEP_ROOM_PATH);
     await fillHistory(page);
     await scrollThen(page, await endMinus(page, 40), { hide: true });
-    await expect(chat(page)).toBeHidden({ timeout: 5_000 });
+    await chatHidden(page);
     await callRiverTest(page, "switchRoom", "Deep History Room");
     await afterLayoutSettles(page);
-    await page.getByTestId("rooms-back-button").click();
-    await expect(chat(page)).toBeVisible();
+    await revealChat(page, "rooms-back-button");
     await expect(page.getByRole("heading", { name: "Deep History Room" })).toBeVisible();
     await expectSettledAtBottom(page, "the room switched to while hidden did not open at its newest message");
     await deliver(page, "arrival in the new room");
