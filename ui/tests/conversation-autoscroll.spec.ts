@@ -218,6 +218,17 @@ const IN_PLACE_TOLERANCE_PX = 4;
 
 type RowPosition = { id: string; gap: number };
 
+/// The gap from the container's bottom edge to the top of the row whose DOM id
+/// is `id`, or null when that row is not on the page.
+function rowGap(page: Page, id: string): Promise<number | null> {
+  return page.evaluate((rowId) => {
+    const c = document.getElementById("chat-scroll-container");
+    const row = document.getElementById(rowId);
+    if (!c || !row || !c.contains(row)) return null;
+    return c.getBoundingClientRect().bottom - row.getBoundingClientRect().top;
+  }, id);
+}
+
 /// How far a remembered position has drifted, identity and gap read in ONE
 /// evaluation. Infinity when the row is gone, or (with `newest`) when another
 /// message is now the newest visible one: a missing row is a failure, never a
@@ -728,6 +739,204 @@ test.describe("The newest visible message stays in view", () => {
 
     await deliver(page, "arrival after a same-frame scroll");
     await expectStaysPut(page, "an arrival dragged a reader whose scroll shared a frame with a rewrap");
+  });
+});
+
+/// An anchor-bearing history row: a message, a date separator or an event
+/// summary. `top`/`bottom` are relative to the container's top edge, so a row
+/// with `bottom < 0` is entirely above the viewport.
+type AnchorRow = { id: string; text: string; top: number; bottom: number };
+
+/// Every anchor-bearing row, in DOM order. The deletion fixtures need the real
+/// order to know which rows border the reader, so this reads the rows the scroll
+/// model can anchor on rather than only the messages.
+function anchorRows(page: Page): Promise<AnchorRow[]> {
+  return page.evaluate(() => {
+    const c = document.getElementById("chat-scroll-container")!;
+    const top = c.getBoundingClientRect().top;
+    return Array.from(c.querySelectorAll<HTMLElement>("#chat-content [data-anchor-row]")).map(
+      (row) => {
+        const r = row.getBoundingClientRect();
+        return {
+          id: row.id,
+          text: (row.textContent ?? "").trim().slice(0, 40),
+          top: r.top - top,
+          bottom: r.bottom - top,
+        };
+      },
+    );
+  });
+}
+
+/// The rows `fillHistory` delivered, in order, by their `filler N:` text.
+function fillerRows(rows: AnchorRow[]): AnchorRow[] {
+  return rows.filter((row) => row.id.startsWith("msg-") && /^filler \d+:/.test(row.text));
+}
+
+/// Scroll so the message row `id` is the newest one visible, its top `peek` px
+/// above the container's bottom edge, and wait for the scroll to land.
+async function parkOnRow(page: Page, id: string, peek = 60): Promise<RowPosition> {
+  const target = await page.evaluate(
+    ({ id, peek }) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const row = document.getElementById(id)!;
+      const offset = row.getBoundingClientRect().top - c.getBoundingClientRect().top;
+      return c.scrollTop + offset + peek - c.clientHeight;
+    },
+    { id, peek },
+  );
+  expect(target, "premise: the parking offset is inside the history").toBeGreaterThan(0);
+  await readerScrollsTo(page, target);
+  await expect
+    .poll(async () => Math.abs((await scrollTop(page)) - target), {
+      timeout: 5_000,
+      message: "premise: the reader's scroll should land where it was aimed",
+    })
+    .toBeLessThanOrEqual(1);
+  await afterLayoutSettles(page);
+  expect(
+    await distanceFromBottom(page),
+    "premise: the reader should be parked outside the follow band",
+  ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+  const newest = await newestVisibleMessage(page);
+  expect(newest?.id, "premise: the aimed-at row should be the newest visible one").toBe(id);
+  return newest!;
+}
+
+/// Remove messages by row id in one state change, and require every one to have
+/// named a message and to be gone from the page.
+async function removeMessages(page: Page, ids: string[]) {
+  const unmatched = await callRiverTest(page, "removeMessages", ids);
+  expect(unmatched, "premise: every id should have named a message").toEqual([]);
+  await expect
+    .poll(
+      () => page.evaluate((ids) => ids.filter((id) => document.getElementById(id)).length, ids),
+      { timeout: 5_000, message: "premise: every removed message should leave the page" },
+    )
+    .toBe(0);
+}
+
+/// The reader's `scrollTop` drifting from `top`, for the case with no row left
+/// to compare against.
+async function offsetDrift(page: Page, top: number): Promise<number> {
+  return Math.abs((await scrollTop(page)) - top);
+}
+
+// Content that changes AT the reader without them scrolling: a moderator
+// deleting the messages they are looking at. With `overflow-anchor: none`,
+// nothing but the scroll model holds the reader's text still (#507).
+//
+// The deletions use a test hook that only re-renders without the messages; it
+// says nothing about whether a removal would be authorized. Every fixture is
+// plain filler messages (one row each, no reactions or replies), with enough
+// history kept below the reader that the offsets involved stay reachable.
+test.describe("The reader's place survives removed and late content (#507)", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("a deleted newest visible message falls back to the row above it @fractional-geometry", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page, 24);
+    const deleted = fillerRows(await anchorRows(page))[11];
+    await parkOnRow(page, deleted.id);
+
+    const rows = await anchorRows(page);
+    const at = rows.findIndex((row) => row.id === deleted.id);
+    const survivor = rows[at - 1];
+    // A date separator or event row here would be the first fallback instead,
+    // and the premise below would not be the one the test claims.
+    expect(
+      survivor.id,
+      "premise: the anchor-bearing row right above the reader's message is a message",
+    ).toMatch(/^msg-/);
+    const farAbove = fillerRows(rows)[1];
+    const viewport = await viewportHeight(page);
+    expect(farAbove.bottom, "premise: the second deletion is well above the viewport").toBeLessThan(
+      -viewport / 2,
+    );
+
+    const before = { id: survivor.id, gap: (await rowGap(page, survivor.id))! };
+    const heightBefore = await historyHeight(page);
+    await removeMessages(page, [deleted.id, farAbove.id]);
+    // Unanswered, the row removed above would move the survivor by its height.
+    expect(
+      heightBefore - (await historyHeight(page)),
+      "premise: the deletion should change the geometry materially",
+    ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    await expectInPlace(
+      page,
+      before,
+      "the reader's message was deleted and the row above it did not keep its place",
+      { newest: false, hold: true },
+    );
+    await deliver(page, "arrival after the reader's message was deleted");
+    await expectInPlace(page, before, "an arrival after the deletion moved the reader", {
+      newest: false,
+      hold: true,
+    });
+  });
+
+  test("the reader stays at their offset when the whole remembered neighbourhood is deleted @fractional-geometry", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    await fillHistory(page, 24);
+    await parkOnRow(page, fillerRows(await anchorRows(page))[11].id);
+
+    // Every row on screen, and every row within a viewport's height above it.
+    // The model remembers a handful of rows ending at the newest visible one;
+    // this covers that neighbourhood whatever the handful is, without mirroring
+    // its size.
+    const viewport = await viewportHeight(page);
+    const rows = await anchorRows(page);
+    const newestAt = rows.findLastIndex((row) => row.top < viewport && row.bottom > 0);
+    const firstAt = rows.findIndex((row) => row.bottom > -viewport);
+    const doomed = rows.slice(firstAt, newestAt + 1);
+    expect(
+      doomed.every((row) => row.id.startsWith("msg-") && /^filler \d+:/.test(row.text)),
+      "premise: the deleted neighbourhood holds plain messages only, no separator or event row",
+    ).toBe(true);
+    expect(rows[firstAt].top, "premise: the deletion reaches a viewport above the top edge").toBeLessThanOrEqual(
+      -viewport,
+    );
+    expect(firstAt, "premise: rows remain above the deletion").toBeGreaterThan(0);
+
+    const top = await scrollTop(page);
+    await removeMessages(page, doomed.map((row) => row.id));
+    expect(
+      (await anchorRows(page)).filter((row) => doomed.some((d) => d.id === row.id)),
+      "premise: no anchor-bearing row of the neighbourhood survives",
+    ).toEqual([]);
+    // The old offset must still be reachable with room to spare, so a clamp
+    // cannot be what keeps (or moves) the view.
+    const after = await page.evaluate(() => {
+      const c = document.getElementById("chat-scroll-container")!;
+      return { max: c.scrollHeight - c.clientHeight, viewport: c.clientHeight };
+    });
+    expect(after.viewport, "premise: the history is laid out").toBeGreaterThan(0);
+    expect(
+      after.max - top,
+      "premise: the old offset stays reachable, well outside the follow band",
+    ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+
+    await expectDriftWithin(
+      page,
+      () => offsetDrift(page, top),
+      "with no remembered row left, the reader's offset was moved",
+      { hold: true },
+    );
+    await deliver(page, "arrival after the neighbourhood was deleted");
+    await expectDriftWithin(
+      page,
+      () => offsetDrift(page, top),
+      "an arrival after the neighbourhood was deleted moved the reader",
+      { hold: true },
+    );
+    expect(await distanceFromBottom(page), "the arrival repinned the reader").toBeGreaterThan(
+      BOTTOM_THRESHOLD_PX,
+    );
   });
 });
 

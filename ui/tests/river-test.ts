@@ -9,6 +9,9 @@ export type RiverTestHooks = {
   appendMessages(count: number): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   switchRoom(name: string): void;
+  /// Removes the messages whose rows have these DOM ids (`msg-...`) in one
+  /// state change. Resolves with the ids that matched no message.
+  removeMessages(domIds: string[]): Promise<string[]>;
 };
 
 // One hook per round trip.

@@ -120,7 +120,60 @@ pub fn install_test_hooks() {
         });
     });
 
+    // Remove messages by their row's DOM id (`msg-{id}`), all in ONE `ROOMS`
+    // mutation, as a delta that drops several messages renders. Only the
+    // rendering is simulated: nothing here checks that a removal is authorized.
+    // Resolves with the ids that matched no message, so a fixture that removes
+    // nothing fails instead of passing quietly.
+    let remove_messages =
+        Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(move |dom_ids: JsValue| {
+            let mut wanted: Vec<String> = js_sys::Array::from(&dom_ids)
+                .iter()
+                .filter_map(|id| id.as_string())
+                .collect();
+            wanted.sort();
+            wanted.dedup();
+            let mut resolve = None;
+            let promise = js_sys::Promise::new(&mut |res, _rej| resolve = Some(res));
+            let resolve = resolve.expect("Promise::new runs its executor synchronously");
+            // Reading ROOMS needs the Dioxus runtime, which a raw JS call lacks.
+            crate::util::defer(move || {
+                let unmatched: js_sys::Array = remove(wanted)
+                    .into_iter()
+                    .map(|id| JsValue::from_str(&id))
+                    .collect();
+                let _ = resolve.call1(&JsValue::NULL, &unmatched);
+            });
+            promise
+        })
+        .into_js_value();
+    let _ = js_sys::Reflect::set(
+        &hooks,
+        &JsValue::from_str("removeMessages"),
+        &remove_messages,
+    );
+
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
+}
+
+/// Remove every message of the current room whose row id is in `dom_ids`, in one
+/// `ROOMS` mutation. Returns the ids that matched nothing.
+fn remove(dom_ids: Vec<String>) -> Vec<String> {
+    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+        return dom_ids;
+    };
+    let mut unmatched: std::collections::BTreeSet<String> = dom_ids.into_iter().collect();
+    ROOMS.with_mut(|rooms| {
+        let Some(room) = rooms.map.get_mut(&room_key) else {
+            return;
+        };
+        // The row id convention of the conversation's message rows.
+        room.room_state
+            .recent_messages
+            .messages
+            .retain(|message| !unmatched.remove(&format!("msg-{:?}", message.id().0)));
+    });
+    unmatched.into_iter().collect()
 }
 
 /// Where a delivered message lands in the room's message list.
