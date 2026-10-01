@@ -2338,7 +2338,7 @@ test.describe("An upward scroll holds new messages until it settles", () => {
 test.describe("An arrival ahead of the reader's scroll event (#723)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  test("a reader who scrolled to the end follows a tall arrival that beat their scroll event", async ({
+  test("a reader who scrolled to the end follows a tall arrival that beat their scroll event (controlled order: patch → scroll)", async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
@@ -2351,17 +2351,31 @@ test.describe("An arrival ahead of the reader's scroll event (#723)", () => {
     ).toBeGreaterThan(4 * BOTTOM_THRESHOLD_PX);
 
     const marker = "tall arrival ahead of the scroll event";
-    // One sequence, in a frame callback: the scroll's event is then due in the
-    // NEXT frame, while the hook's delivery runs on a timer before it.
+    // One sequence, in a frame callback: the scroll's event is due in the NEXT
+    // frame, while the hook's delivery runs on a timer before it. Which lands
+    // first is the engine's call (Linux CI Firefox delivers the scroll first), so
+    // a capture-phase gate holds the native scroll events back from the app
+    // until the arrival's row has landed, then hands it one marked `scroll`.
     const race = await page.evaluate(
       ({ text, marker }) =>
-        new Promise<{ order: string[]; arrivalHeight: number }>((resolve) => {
+        new Promise<{ order: string[]; arrivalHeight: number; held: number }>((resolve) => {
           const c = document.getElementById("chat-scroll-container")!;
           const order: string[] = [];
           let arrivalHeight = 0;
+          let held = 0;
+          const released = new WeakSet<Event>();
+          const gate = (e: Event) => {
+            if (e.target !== c || released.has(e) || order.includes("patch")) return;
+            e.stopImmediatePropagation();
+            held += 1;
+          };
+          window.addEventListener("scroll", gate, true);
           const stopPatch = window.__riverScroll.patchLanded(marker, (row) => {
             order.push("patch");
             arrivalHeight = row.getBoundingClientRect().height;
+            const release = new Event("scroll");
+            released.add(release);
+            c.dispatchEvent(release);
             done();
           });
           const onScroll = () => {
@@ -2375,8 +2389,9 @@ test.describe("An arrival ahead of the reader's scroll event (#723)", () => {
           function finish() {
             clearTimeout(timer);
             stopPatch();
+            window.removeEventListener("scroll", gate, true);
             c.removeEventListener("scroll", onScroll);
-            resolve({ order, arrivalHeight });
+            resolve({ order, arrivalHeight, held });
           }
           c.addEventListener("scroll", onScroll);
           requestAnimationFrame(() => {
@@ -2388,7 +2403,7 @@ test.describe("An arrival ahead of the reader's scroll event (#723)", () => {
     );
     expect(
       race.order,
-      `premise: the arrival's patch must land before the scroll event (observed: ${race.order.join(" → ") || "nothing"})`,
+      `premise: the app sees the arrival's patch before the scroll event (observed: ${race.order.join(" → ") || "nothing"}; native scroll events held back: ${race.held})`,
     ).toEqual(["patch", "scroll"]);
     expect(
       race.arrivalHeight,

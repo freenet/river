@@ -827,6 +827,11 @@ export async function debouncePauseWhenQuiet(page: Page): Promise<number> {
   const now = await page.evaluate(() => Date.now());
   await page.clock.pauseAt(now + 1_000);
   await debounceFrames(page, 3);
+  // A restore landing after the poll (a late layout pass) scrolls and re-arms the
+  // debounce on the paused clock: let it settle before the test starts.
+  for (let i = 0; i < 5 && debouncePending(await debounceState(page)).length > 0; i++) {
+    await debounceAdvance(page, DEBOUNCE_SETTLE_MS);
+  }
   const state = await debounceState(page);
   expect(debouncePending(state), "premise: nothing pending once paused").toEqual([]);
   return state.registrations.length;

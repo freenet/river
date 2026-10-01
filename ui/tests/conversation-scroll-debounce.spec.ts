@@ -12,6 +12,7 @@ import {
   debounceFrames,
   debounceOnlyPending,
   debounceOpenFilledRoom,
+  debouncePending,
   debouncePauseWhenQuiet,
   debounceRestore,
   debounceScrollTo,
@@ -66,6 +67,13 @@ async function expectNewDeadline(page: Page, why: string) {
   const fresh = !!latest && !latest.cleared && !latest.fired && latest.at === state.now;
   expect(fresh, `${why} (${JSON.stringify(latest)})`).toBe(true);
   return latest!;
+}
+
+/// The newest settle still pending: the deadline the next quiet interval runs from.
+async function lastRearm(page: Page, why: string) {
+  const pending = debouncePending(await debounceState(page));
+  expect(pending.length, why).toBeGreaterThan(0);
+  return pending.reduce((a, b) => (b.seq > a.seq ? b : a));
 }
 
 /// The reader's message is where it was when they scrolled.
@@ -225,6 +233,10 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
       await debounceDistanceFromBottom(page),
       "premise: the new room opened at its newest message",
     ).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
+    // The new room's newest message can be from yesterday in the browser's
+    // timezone, and then the next arrival also brings a "Today" divider, pushing
+    // the held join below out of the band. Let one arrival put it in place.
+    await expectFollowing(page, "first arrival in the new room", "premise: the new room follows before the gesture");
 
     // A fresh gesture in the new room, whose own deadline is after the old one.
     const at = await readerScrollsUp(page, UP_PX, "the upward scroll in the new room");
@@ -239,8 +251,12 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
     await debounceDeliverJoin(page);
     await expectHeld(page, at, "the old room's deadline settled the new room's gesture, so the arrival snapped");
 
-    // The fresh gesture settles on its own deadline, and following resumes.
-    await debounceAdvance(page, fresh.at + DEBOUNCE_SETTLE_MS - 1 - (await debounceState(page)).now);
+    // The fresh gesture settles 120ms after the last scroll that re-armed it. In
+    // this windowed room the held arrival moves rows above the reader, and the
+    // anchor correction is itself a scroll, so that can be later than `fresh`.
+    const settleFrom = await lastRearm(page, "premise: the fresh gesture has a settle pending");
+    expect(settleFrom.seq, "premise: the pending settle is the fresh gesture's or later").toBeGreaterThanOrEqual(fresh.seq);
+    await debounceAdvance(page, settleFrom.at + DEBOUNCE_SETTLE_MS - 1 - (await debounceState(page)).now);
     expect(debounceFired(await debounceState(page), setup), "a settle ran before the fresh deadline").toEqual([]);
     await expectHeld(page, at, "the fresh hold let go before its deadline");
     await debounceAdvance(page, 1);
@@ -258,6 +274,8 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
       oldRec.cleared!.duringScroll,
       "the old room's deadline was cleared by a later scroll, not by the room switch",
     ).toBe(false);
-    expect(debounceFired(state, setup).map((r) => r.handle), "only the fresh deadline settled").toEqual([fresh.handle]);
+    expect(debounceFired(state, setup).map((r) => r.handle), "only the fresh gesture's last deadline settled").toEqual([
+      settleFrom.handle,
+    ]);
   });
 });
