@@ -19,17 +19,23 @@
 //! | State | Restore does | Ends when |
 //! |---|---|---|
 //! | `Free` | pinned: snap to the bottom; else the anchor back at its gap | a reader gesture moves up (`Held`), or the button (`Seeking`) |
-//! | `Seeking` | re-aims the smooth scroll at the live end; never an anchor write | it reaches the end, the reader takes over, a touch, a force, a room switch |
+//! | `Seeking` | keeps the animation's frame loop running; never an anchor write | it reaches the end, the reader takes over, a touch, a force, a room switch |
 //! | `Held` | the anchor back at its gap, even when pinned; never a snap | the gesture settles, or comes back to the end |
 //!
-//! * **`Seeking`** is the scroll-to-latest button's smooth scroll. Its frames
-//!   are recorded, not captured, so they cannot unpin the reader who asked to
-//!   follow. Reaching the end finishes it (and trims, as a snap does). A frame
-//!   that moves up past rounding from the previous one is the reader taking over
-//!   (the animation only moves down), and enters `Held`. A `touchstart` stops it
-//!   where it is and captures. Re-aiming retargets the browser's animation, and
-//!   restarts one a hide cut short; how smooth that looks is the engine's.
-//!   Seeking never reports an opening snap: only an instant snap does.
+//! * **`Seeking`** is the scroll-to-latest button's animation: our own
+//!   `requestAnimationFrame` loop, each frame stepping towards the live end
+//!   (`seek_advance`, an ease-out whose speed follows the distance left). Its
+//!   frames are recorded, not captured, so their `scroll` events are echoes and
+//!   cannot unpin the reader who asked to follow. Re-aiming is implicit: an
+//!   arrival moves the end and the next step is larger. Native smooth scrolling
+//!   restarted its ease-in on every re-issue in Chromium (317px a frame down to
+//!   0-2px in the app) and dipped in WebKit, so an arrival mid-flight stalled it.
+//!   Reaching the end finishes it (and trims, as a snap does). A move up past
+//!   rounding from the last frame is the reader taking over (the animation only
+//!   moves down), and enters `Held`. A `touchstart` stops it where it is and
+//!   captures. Any of these, a force, a room switch or a hide stops the loop at
+//!   its next frame; the reveal restarts it. Seeking never reports an opening
+//!   snap: only an instant snap does.
 //! * **`Held`**: a reader gesture remembers where it started (`gesture_from`,
 //!   both edges of the view, as `main`'s `reader_moved_up_since`). Once both have
 //!   moved up past rounding from there, restores keep the anchor and do not
@@ -45,7 +51,8 @@
 //!   The debounce cannot tell a paused finger from a lifted one. A settle with no gesture in progress does
 //!   nothing, which is what makes a stale `scrollend` (another room's, an old
 //!   gesture's) harmless: room switches, forced snaps and new seeks clear the
-//!   gesture. During `Seeking`, a settle finishes or re-aims the seek.
+//!   gesture. During `Seeking`, a settle restores, which leaves the loop
+//!   running or finishes it.
 //!
 //! # Where capture runs
 //!
@@ -90,7 +97,7 @@
 //! * **Hidden**: the mobile layout hides the history (`display:none`), and every
 //!   read is then 0. It stays observed, but nothing measures, records or
 //!   restores it until it has height again: the ResizeObserver's restore on
-//!   reveal picks up where it was, re-aims a seek the hide cut short, and then
+//!   reveal picks up where it was, restarts a seek the hide cut short, and then
 //!   finishes the settle of a gesture the hide ended (engines send no
 //!   `scrollend` for it), after putting the anchor back.
 //! * **Touch momentum**: a restore that writes `scrollTop` (an anchor
@@ -212,6 +219,34 @@ fn seek_step(prev_top: i32, top: i32, max: i32) -> SeekStep {
     } else {
         SeekStep::Travelling
     }
+}
+
+/// The scroll-to-latest animation's time constant: each frame covers
+/// `1 - exp(-dt / SEEK_TAU_MS)` of what is left.
+const SEEK_TAU_MS: f64 = 80.0;
+/// Its slowest speed, so the ease-out has no long tail near the end.
+const SEEK_MIN_PX_PER_MS: f64 = 1.5;
+/// The frame interval a step is computed for. A zero interval still moves, and
+/// a frame after a long stall moves no further than a 64ms one.
+const SEEK_MIN_DT_MS: f64 = 1.0;
+const SEEK_MAX_DT_MS: f64 = 64.0;
+
+/// How far the scroll-to-latest animation moves in one frame of `dt_ms`, with
+/// `remaining` px to the live end: an exponential ease-out with a speed floor,
+/// at least 1px (rounded up, so it always progresses) and never past the end.
+///
+/// The speed is proportional to what is left, so an arrival that moves the end
+/// away makes the next step larger rather than starting the animation over:
+/// about 430ms for 10,000px and 200ms for 500px at 60fps.
+fn seek_advance(remaining: i32, dt_ms: f64) -> i32 {
+    if remaining <= 0 {
+        return 0;
+    }
+    let dt = dt_ms.clamp(SEEK_MIN_DT_MS, SEEK_MAX_DT_MS);
+    let remaining_px = f64::from(remaining);
+    let eased = remaining_px * (1.0 - (-dt / SEEK_TAU_MS).exp());
+    let floor = remaining_px.min(SEEK_MIN_PX_PER_MS * dt);
+    (eased.max(floor).ceil() as i32).clamp(1, remaining)
 }
 
 /// Indices of up to `n` rows, newest first, starting at the newest row that
@@ -338,6 +373,13 @@ pub(super) struct HistoryScroll {
     settle_pending: Cell<bool>,
     /// The debounce standing in for `scrollend` where the browser lacks it.
     settle_timer: Cell<Option<i32>>,
+    /// The scroll-to-latest animation's frame callback, made once by `install`.
+    seek_frame: RefCell<Option<js_sys::Function>>,
+    /// The animation frame asked for and not run yet, so `seek` never asks twice.
+    seek_raf: Cell<Option<i32>>,
+    /// When the animation's previous frame ran; `None` before a seek's first
+    /// frame, and after the loop stops.
+    seek_prev_t: Cell<Option<f64>>,
     /// Set by `install` once the listeners exist, so `is_some` also means
     /// "installed".
     hooks: RefCell<Option<HistoryHooks>>,
@@ -355,6 +397,9 @@ impl Default for HistoryScroll {
             gesture_from: Cell::new(None),
             settle_pending: Cell::new(false),
             settle_timer: Cell::new(None),
+            seek_frame: RefCell::new(None),
+            seek_raf: Cell::new(None),
+            seek_prev_t: Cell::new(None),
             hooks: RefCell::new(None),
         }
     }
@@ -639,19 +684,70 @@ impl HistoryScroll {
         }
     }
 
-    /// Aim the scroll-to-latest animation at the live end, or finish it when it is
-    /// already there. Re-issuing it retargets an animation in flight and restarts
-    /// one a hide cut short. Never an opening snap: nothing is told.
+    /// Keep the scroll-to-latest animation running, or finish it when it is
+    /// already at the end. Idempotent: every frame reads the live end, so there
+    /// is nothing to re-aim, and a frame already asked for is not asked again.
+    /// Restarts a loop a hide stopped. Never an opening snap: nothing is told.
     fn seek(&self, container: &web_sys::Element) {
         if at_end(container.scroll_top(), max_scroll_top(container)) {
             self.follow.set(Follow::Free);
         } else {
-            let opts = web_sys::ScrollToOptions::new();
-            opts.set_top(container.scroll_height() as f64);
-            opts.set_behavior(web_sys::ScrollBehavior::Smooth);
-            container.scroll_to_with_scroll_to_options(&opts);
+            self.request_seek_frame();
         }
         self.record(container);
+    }
+
+    fn request_seek_frame(&self) {
+        if self.seek_raf.get().is_some() {
+            return;
+        }
+        let frame = self.seek_frame.borrow().clone();
+        let (Some(window), Some(frame)) = (web_sys::window(), frame) else {
+            return;
+        };
+        if let Ok(handle) = window.request_animation_frame(&frame) {
+            self.seek_raf.set(Some(handle));
+        }
+    }
+
+    /// One frame of the scroll-to-latest animation: a step towards the live end
+    /// (`seek_advance`), recorded so that its own `scroll` event is an echo. The
+    /// loop stops itself as soon as the follow state is not `Seeking` (a touch,
+    /// the reader taking over, a force, a room switch) or the history is hidden;
+    /// the reveal's restore starts it again.
+    fn on_seek_frame(&self, t: f64) {
+        // A reader move since the last frame whose `scroll` event has not been
+        // handled yet would be erased by this frame's write, so read it first.
+        // Browsers dispatch `scroll` events before frame callbacks, so this is
+        // normally a no-op (taking it out failed no test); it is the same
+        // late-event step `restore` and `settle` take. Before the handle is
+        // cleared, so a restore it causes asks for no second frame.
+        self.take_in_undelivered_scroll();
+        self.seek_raf.set(None);
+        let prev_t = self.seek_prev_t.take();
+        if self.follow.get() != Follow::Seeking {
+            return;
+        }
+        let Some(container) = laid_out_container() else {
+            return;
+        };
+        let dt = prev_t.map_or(16.0, |prev| t - prev);
+        let top = container.scroll_top();
+        let max = max_scroll_top(&container);
+        container.set_scroll_top(top + seek_advance(max - top, dt));
+        let moved = container.scroll_top() != top;
+        if !moved {
+            // Rounding at a fractional device scale can swallow a small step.
+            container.set_scroll_top(max);
+        }
+        self.record(&container);
+        if !moved || at_end(container.scroll_top(), max_scroll_top(&container)) {
+            self.follow.set(Follow::Free);
+            self.trim_at_bottom(&container);
+        } else {
+            self.seek_prev_t.set(Some(t));
+            self.request_seek_frame();
+        }
     }
 
     /// Scroll the first anchor row that still exists back to its gap. If none
@@ -730,9 +826,10 @@ impl HistoryScroll {
     }
 
     /// A scroll has come to rest (`scrollend`, or the debounce standing in for
-    /// it). Finishes or re-aims a seek whose animation ended short of the end,
-    /// and ends a reader gesture. Nothing else: a stale `scrollend` (another
-    /// room's, an old gesture's) finds no gesture and does nothing.
+    /// it). During a seek it only restores (the loop carries on, or finishes at
+    /// the end); otherwise it ends a reader gesture. Nothing else: a stale
+    /// `scrollend` (another room's, an old gesture's) finds no gesture and does
+    /// nothing.
     fn settle(&self) {
         self.settle_timer.set(None);
         // WebKit can send `scrollend` before the `scroll` event of the move it
@@ -792,6 +889,7 @@ impl HistoryScroll {
             // The animation's frames are not the reader: see `on_reader_scroll`.
             self.end_interaction();
             self.follow.set(Follow::Seeking);
+            self.seek_prev_t.set(None);
             self.seek(&container);
             return;
         }
@@ -838,6 +936,18 @@ impl HistoryScroll {
         *self.hooks.borrow_mut() = Some(hooks);
         observer.observe(&content);
         observer.observe(&container);
+
+        // The scroll-to-latest animation's frame callback (`on_seek_frame`).
+        let seek_frame = {
+            let this = self.clone();
+            Closure::wrap(Box::new(move |t: f64| this.on_seek_frame(t)) as Box<dyn FnMut(f64)>)
+        };
+        *self.seek_frame.borrow_mut() = Some(
+            seek_frame
+                .as_ref()
+                .unchecked_ref::<js_sys::Function>()
+                .clone(),
+        );
 
         // Passive: nothing here calls `preventDefault`, and the jank this
         // replaced (#151) came from work on the scroll path.
@@ -916,6 +1026,7 @@ impl HistoryScroll {
         // (rooms are swapped by CSS, not by unmount) and `use_effect` has no
         // cleanup hook, so there is nothing to disconnect these from.
         on_resize.forget();
+        seek_frame.forget();
         on_scroll.forget();
         settle.forget();
         on_settle_signal.forget();
@@ -1216,6 +1327,72 @@ mod tests {
             SeekStep::TakenOver
         );
         assert_eq!(seek_step(1000, 200, max), SeekStep::TakenOver);
+    }
+
+    /// Frames of `dt_ms` until a seek that starts `remaining` px from the end
+    /// gets there.
+    fn frames_to_arrive(mut remaining: i32, dt_ms: f64) -> usize {
+        let mut frames = 0;
+        while remaining > 0 {
+            remaining -= seek_advance(remaining, dt_ms);
+            frames += 1;
+            assert!(frames < 1_000, "the seek never arrived");
+        }
+        frames
+    }
+
+    #[test]
+    fn a_seek_frame_always_progresses_and_never_overshoots() {
+        for dt in [1.0, 16.0, 33.0, 64.0] {
+            for remaining in [1, 2, 3, 7, 50, 119, 120, 121, 500, 10_000, 1_000_000] {
+                let step = seek_advance(remaining, dt);
+                assert!(
+                    (1..=remaining).contains(&step),
+                    "{remaining}px at {dt}ms stepped {step}px"
+                );
+            }
+        }
+        // Already there, or past it (a range that just shrank): nothing to do.
+        assert_eq!(seek_advance(0, 16.0), 0);
+        assert_eq!(seek_advance(-40, 16.0), 0);
+    }
+
+    #[test]
+    fn a_seek_has_no_long_tail() {
+        // 60fps frames: a long trip and a short one both finish quickly.
+        assert!(frames_to_arrive(10_000, 16.0) < 40);
+        assert!(frames_to_arrive(500, 16.0) < 16);
+    }
+
+    #[test]
+    fn a_seek_goes_faster_when_the_end_moves_away() {
+        // An arrival makes the remaining distance larger: the next step must
+        // not be smaller than it would have been, or the animation stalls.
+        for dt in [1.0, 16.0, 64.0] {
+            let mut prev = 0;
+            for remaining in 1..20_000 {
+                let step = seek_advance(remaining, dt);
+                assert!(
+                    step >= prev,
+                    "at {dt}ms, {remaining}px stepped {step}px, less than {prev}px"
+                );
+                prev = step;
+            }
+        }
+    }
+
+    #[test]
+    fn a_seek_frames_length_is_clamped() {
+        for remaining in [5, 300, 8_000] {
+            // A zero or negative interval still moves, as a 1ms frame does.
+            assert_eq!(seek_advance(remaining, 0.0), seek_advance(remaining, 1.0));
+            assert_eq!(seek_advance(remaining, -5.0), seek_advance(remaining, 1.0));
+            // A frame after a long stall moves no further than a 64ms one.
+            assert_eq!(
+                seek_advance(remaining, 500.0),
+                seek_advance(remaining, 64.0)
+            );
+        }
     }
 
     #[test]

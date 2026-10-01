@@ -1477,6 +1477,19 @@ test.describe("Our own scroll's echo is not the reader", () => {
 /// seek test interrupts it, so the interruption is mid-flight, not at the end.
 const SEEK_MID_FLIGHT_PX = 300;
 
+/// The speed test: tall fillers, how far above the end the reader parks, how far
+/// the view must have travelled when the arrival lands and how far from the end
+/// it must still be, where the check stops (an ease-out
+/// is slow at the very end on purpose), the frame length past which a frame is
+/// the machine's, and how long the whole trip may take.
+const SEEK_SPEED_FILLERS = 30;
+const SEEK_SPEED_PARK_PX = 7_000;
+const SEEK_SPEED_ARRIVE_AFTER_PX = 1_500;
+const SEEK_SPEED_ARRIVE_ABOVE_PX = 1_500;
+const SEEK_SPEED_NEAR_END_PX = 300;
+const SEEK_SPEED_LONG_FRAME_MS = 50;
+const SEEK_SPEED_BUDGET_MS = 1_200;
+
 /// What a seek test does to the scroll-to-latest animation mid-flight.
 type SeekInterruption =
   | { kind: "arrival"; text: string }
@@ -1540,11 +1553,10 @@ async function seekAndInterrupt(page: Page, interruption: SeekInterruption) {
               c.scrollTop = top - interruption.px;
               break;
             case "touch-stop":
-              // A finger landing on the moving history: the browser stops the
-              // animation where it is. Synthetic, so the 1px write is what
-              // stops it here.
+              // A finger landing on the moving history, holding still. The
+              // animation is the app's own frame loop, so the touchstart alone
+              // has to stop it: no scroll write that would stop a native one.
               c.dispatchEvent(new Event("touchstart", { bubbles: true }));
-              c.scrollTop = top - 1;
               break;
             case "hide":
               (document.querySelector('[data-testid="hamburger-rooms-button"]') as HTMLElement).click();
@@ -1636,6 +1648,131 @@ test.describe("The scroll-to-latest animation keeps following to the end", () =>
       await expectInPlace(page, parked!, `an arrival after ${interruption.kind} moved the reader`, { hold: true });
     });
   }
+
+  // Chromium restarted the native smooth scroll's ease-in every time it was
+  // re-aimed, so a message landing mid-flight dropped it from ~140px to ~5px a
+  // frame (evidence/seek-stall-probe in the plans). Speeds are px/ms, not px
+  // per frame, so a slow machine's long frames are not read as a stall. Each
+  // frame is compared with the three before IT, not with a fixed speed from
+  // before the arrival: an ease-out slows down as it gets close by design, and
+  // only a sudden drop is a stall.
+  test("the scroll-to-latest animation keeps its speed when a message lands mid-flight", async ({ page }) => {
+    await openRoomAtBottom(page, "Team Chat Room");
+    // Tall rows, so the history is far longer than the window and the parked
+    // reader below starts well clear of the backfill strip at the top.
+    await page.evaluate(async (count) => {
+      for (let i = 0; i < count; i++) {
+        (window as any).__riverTest.appendMessage(`speed filler ${i}: ${"w ".repeat(450)}`);
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      }
+    }, SEEK_SPEED_FILLERS);
+    await expect(page.getByText(`speed filler ${SEEK_SPEED_FILLERS - 1}:`)).toBeAttached({ timeout: 5_000 });
+    await expectSettledAtBottom(page, "premise: the fillers should have been followed");
+    const end = (await historyHeight(page)) - (await viewportHeight(page));
+    await readerScrollsWithoutGesture(page, end - SEEK_SPEED_PARK_PX);
+    await afterLayoutSettles(page);
+    expect(await distanceFromBottom(page), "premise: the reader should be parked far up").toBeGreaterThan(
+      SEEK_SPEED_PARK_PX - BOTTOM_THRESHOLD_PX,
+    );
+    expect(await scrollTop(page), "premise: parked clear of the backfill strip").toBeGreaterThan(800);
+    await expect(page.getByTestId("scroll-to-bottom")).toBeVisible({ timeout: 5_000 });
+
+    const run = await page.evaluate(
+      ({ text, arriveAfterPx, arriveAbovePx }) =>
+        new Promise<{ pressedAt: number; arrivalAt: number; frames: { t: number; top: number; max: number }[] }>(
+          (resolve) => {
+            const c = document.getElementById("chat-scroll-container")!;
+            const frames: { t: number; top: number; max: number }[] = [];
+            const push = (t: number) => frames.push({ t, top: c.scrollTop, max: c.scrollHeight - c.clientHeight });
+            let arrivalAt = -1;
+            const moved = (k: number) => k >= 1 && frames[k].top > frames[k - 1].top;
+            // Read where a frame left the view only once the frame is over: a
+            // callback of ours can run before or after the app's own frame
+            // callback, and reading before it would charge one frame's step to
+            // the next frame's interval.
+            const afterFrame = new MessageChannel();
+            let frameT = 0;
+            afterFrame.port1.onmessage = () => {
+              push(frameT);
+              const n = frames.length;
+              const { top, max } = frames[n - 1];
+              // A good way into the trip, so a native animation is past its
+              // ease-in, with three speeds to compare against.
+              if (arrivalAt < 0 && moved(n - 1) && moved(n - 2) && moved(n - 3) && top - frames[0].top >= arriveAfterPx) {
+                if (max - top > arriveAbovePx) (window as any).__riverTest.appendMessage(text);
+                arrivalAt = n - 1;
+              }
+              // Until the animation has clearly stopped, or long past any budget.
+              const last = frames.slice(-10);
+              const stopped = arrivalAt >= 0 && last.length === 10 && last.every((f) => f.top === top && f.max === max);
+              if (frameT - frames[0].t > 2_000 || stopped) {
+                afterFrame.port1.close();
+                resolve({ pressedAt: frames[0].t, arrivalAt, frames });
+              } else requestAnimationFrame(sample);
+            };
+            const sample = (t: number) => {
+              frameT = t;
+              afterFrame.port2.postMessage(null);
+            };
+            // Pressed inside a frame, so the press is frame 0 on the same clock
+            // as the frames after it.
+            requestAnimationFrame((t) => {
+              (document.querySelector('[data-testid="scroll-to-bottom"]') as HTMLElement).click();
+              push(t);
+              requestAnimationFrame(sample);
+            });
+          },
+        ),
+      {
+        text: `arrival during the fast animation: ${"v".repeat(200)}`,
+        arriveAfterPx: SEEK_SPEED_ARRIVE_AFTER_PX,
+        arriveAbovePx: SEEK_SPEED_ARRIVE_ABOVE_PX,
+      },
+    );
+
+    const { frames, arrivalAt, pressedAt } = run;
+    const at = frames[arrivalAt];
+    expect(arrivalAt, "premise: the animation should have moved for three frames").toBeGreaterThanOrEqual(3);
+    expect(
+      at.max - at.top,
+      `premise: the arrival should land more than ${SEEK_SPEED_ARRIVE_ABOVE_PX}px from the end`,
+    ).toBeGreaterThan(SEEK_SPEED_ARRIVE_ABOVE_PX);
+    expect(
+      frames[frames.length - 1].max,
+      "premise: the arrival should have grown the history",
+    ).toBeGreaterThan(at.max);
+
+    const speed = (k: number) => (frames[k].top - frames[k - 1].top) / (frames[k].t - frames[k - 1].t);
+    const median3 = (xs: number[]) => [...xs].sort((a, b) => a - b)[1];
+    const log = frames
+      .map((f, k) => `${Math.round(f.t - pressedAt)}ms:${k ? f.top - frames[k - 1].top : 0}${k === arrivalAt ? "*" : ""}`)
+      .join(" ");
+    let checked = 0;
+    for (let k = arrivalAt + 1; k < frames.length; k++) {
+      if (frames[k].max - frames[k].top <= SEEK_SPEED_NEAR_END_PX) break;
+      // A frame the machine stretched says nothing about the animation.
+      if (frames[k].t - frames[k - 1].t > SEEK_SPEED_LONG_FRAME_MS) continue;
+      const before = median3([speed(k - 3), speed(k - 2), speed(k - 1)]);
+      expect(
+        speed(k),
+        `the animation stalled ${Math.round(frames[k].t - pressedAt)}ms after the press: ` +
+          `${speed(k).toFixed(2)}px/ms against ${before.toFixed(2)}px/ms just before (per-frame px: ${log})`,
+      ).toBeGreaterThanOrEqual(before / 4);
+      checked++;
+    }
+    expect(checked, `premise: frames between the arrival and the end should be checked (${log})`).toBeGreaterThanOrEqual(3);
+
+    const reached = frames.find((f) => f.max - f.top <= AT_BOTTOM_EPSILON_PX && f.max >= frames[frames.length - 1].max);
+    expect(reached, `the animation never reached the end (per-frame px: ${log})`).toBeDefined();
+    expect(
+      reached!.t - pressedAt,
+      `the animation took too long to reach the end (per-frame px: ${log})`,
+    ).toBeLessThanOrEqual(SEEK_SPEED_BUDGET_MS);
+
+    await expectSettledAtBottom(page, "the view left the newest message after the animation ended");
+    await deliver(page, "arrival after the fast animation");
+    await expectSettledAtBottom(page, "the follow did not survive the animation");
+  });
 });
 
 /// A reader gesture the browser does not settle between frames, so its small

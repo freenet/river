@@ -3441,8 +3441,9 @@ pub fn Conversation() -> Element {
                             // pin (inside `snap_to_bottom`) even though the
                             // button itself renders off the IntersectionObserver.
                             // The smooth scroll is a seek: its frames are not
-                            // read as the reader, and it re-aims at the end if
-                            // messages land on the way (history_scroll.rs).
+                            // read as the reader, and each one steps towards the
+                            // live end, so it follows messages landing on the way
+                            // (history_scroll.rs).
                             #[cfg(target_arch = "wasm32")]
                             {
                                 let history = history.clone();
