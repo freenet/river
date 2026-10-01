@@ -264,8 +264,8 @@ type SeekEndEvent = { kind: "scroll" | "end" | "wheel" | "touch" | "deliver"; t:
 // business, and every attempt is reported.
 //
 // Measured here (2026-10-02, headless, macOS): no engine produced the order. Every
-// frame's end reached the app in the same task-time as its own `scroll`, before
-// the next event. Chromium's last frame can end after the `touchstart` that
+// frame's end reached the app in the same millisecond as its own `scroll`,
+// before the next event. Chromium's last frame can end after the `touchstart` that
 // stopped the animation, but before any upward move, when the follow is `Free`
 // and a settle does nothing. The held finger landed 120-290px from the end
 // (protocol latency), never inside the band, so its outcome check never ran.
