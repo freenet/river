@@ -43,6 +43,16 @@ export default defineConfig({
       grepInvert: CHROMIUM_ONLY,
       use: { ...devices["Desktop Safari"] },
     },
+    // A fractional device scale, so rows and scroll offsets land on fractional
+    // CSS pixels. Only the geometry cases that opt in with @fractional-geometry;
+    // they run on every other project too.
+    {
+      name: "chromium-dpr-1.5",
+      testMatch: "conversation-autoscroll.spec.ts",
+      grep: /@fractional-geometry/,
+      grepInvert: CHROMIUM_ONLY,
+      use: { ...devices["Desktop Chrome"], deviceScaleFactor: 1.5 },
+    },
     // Mobile viewports (Chromium engine)
     {
       name: "mobile-chrome",

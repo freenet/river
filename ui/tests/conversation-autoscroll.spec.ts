@@ -206,23 +206,87 @@ function newestVisibleMessage(page: Page): Promise<{ id: string; gap: number } |
   });
 }
 
-/// The message `newestVisibleMessage` returned is the newest visible one again,
-/// at the same gap.
-async function expectSameMessageInPlace(
+/// The geometry budget for "the reader's message did not move", in CSS px.
+///
+/// A test contract, deliberately NOT derived from the implementation's own
+/// slack: it allows the residual understood so far (the scroll model reads
+/// `scrollTop` and row gaps as whole pixels, and at a fractional device scale
+/// rows sit at fractional offsets) and stays far below a visible row movement
+/// (a fixture row is ~80-120px). If a production constant changes, investigate
+/// measured drift rather than widening this.
+const IN_PLACE_TOLERANCE_PX = 4;
+
+type RowPosition = { id: string; gap: number };
+
+/// How far a remembered position has drifted, identity and gap read in ONE
+/// evaluation. Infinity when the row is gone, or (with `newest`) when another
+/// message is now the newest visible one: a missing row is a failure, never a
+/// zero drift.
+function positionDrift(page: Page, before: RowPosition, newest: boolean): Promise<number> {
+  return page.evaluate(
+    ({ id, gap, newest }) => {
+      const c = document.getElementById("chat-scroll-container");
+      if (!c) return Infinity;
+      const box = c.getBoundingClientRect();
+      if (newest) {
+        let found: HTMLElement | null = null;
+        for (const row of c.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+          const r = row.getBoundingClientRect();
+          if (r.bottom > box.top && r.top < box.bottom) found = row;
+        }
+        if (!found || found.id !== id) return Infinity;
+        return Math.abs(box.bottom - found.getBoundingClientRect().top - gap);
+      }
+      const row = document.getElementById(id);
+      if (!row || !c.contains(row)) return Infinity;
+      return Math.abs(box.bottom - row.getBoundingClientRect().top - gap);
+    },
+    { ...before, newest },
+  );
+}
+
+/// `before`'s row is back at its gap. `newest` (the default) also requires it to
+/// be the newest visible message again; pass false for a known surviving row
+/// that need not be (a fallback after the newest visible one was deleted).
+///
+/// `hold` asks for bounded evidence that nothing undoes it a moment later, for
+/// scenarios a later callback could reverse: after converging, five samples over
+/// 500ms, any one out of budget failing with the whole sequence. Bounded
+/// evidence, not proof of indefinite stability.
+async function expectInPlace(
   page: Page,
-  before: { id: string; gap: number },
+  before: RowPosition,
   why: string,
+  { newest = true, hold = false, tolerance = IN_PLACE_TOLERANCE_PX } = {},
 ) {
-  await expect
-    .poll(
-      async () => {
-        const now = await newestVisibleMessage(page);
-        // Infinity: a different message is now the newest visible one.
-        return now && now.id === before.id ? Math.abs(now.gap - before.gap) : Infinity;
-      },
-      { timeout: 5_000, message: why },
-    )
-    .toBeLessThanOrEqual(2);
+  await expectDriftWithin(page, () => positionDrift(page, before, newest), why, { hold, tolerance });
+}
+
+/// `drift()` comes within `tolerance`, polled; with `hold`, then stays there for
+/// five samples over 500ms (see `expectInPlace`).
+async function expectDriftWithin(
+  page: Page,
+  drift: () => Promise<number>,
+  why: string,
+  { hold = false, tolerance = IN_PLACE_TOLERANCE_PX } = {},
+) {
+  await expect.poll(drift, { timeout: 5_000, message: why }).toBeLessThanOrEqual(tolerance);
+  if (!hold) return;
+  const drifts: number[] = [];
+  for (let i = 0; i < 5; i++) {
+    await page.waitForTimeout(100);
+    drifts.push(await drift());
+  }
+  expect(
+    Math.max(...drifts),
+    `${why} (it converged, then drifted; samples every 100ms: ${drifts.map((d) => d.toFixed(2)).join(", ")})`,
+  ).toBeLessThanOrEqual(tolerance);
+}
+
+/// The message `newestVisibleMessage` returned is the newest visible one again,
+/// at the same gap. Keeps the 2px bound these older tests were written against.
+async function expectSameMessageInPlace(page: Page, before: RowPosition, why: string) {
+  await expectInPlace(page, before, why, { tolerance: 2 });
 }
 
 /// The fixture variant with rooms deeper than the render window.
@@ -233,12 +297,31 @@ function renderedRowCount(page: Page): Promise<number> {
   return page.locator(HISTORY_ROWS).count();
 }
 
-/// Add enough history to have somewhere to scroll back through.
-async function fillHistory(page: Page) {
-  for (let i = 0; i < 8; i++) {
+/// Add enough history to have somewhere to scroll back through: `count` plain
+/// messages (alternating authors, so one row each; no reactions or replies).
+async function fillHistory(page: Page, count = 8) {
+  for (let i = 0; i < count; i++) {
     await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
   }
   await expectSettledAtBottom(page, "filler messages should have been followed");
+}
+
+/// Park a reader mid-history and remember the newest message they can see.
+async function parkMidHistory(page: Page): Promise<RowPosition> {
+  await openRoomAtBottom(page, "Team Chat Room");
+  await fillHistory(page);
+  await readerScrollsTo(page, Math.floor((await historyHeight(page)) / 2));
+  await expect
+    .poll(() => distanceFromBottom(page), {
+      timeout: 5_000,
+      message: "premise: the reader should be parked above the bottom",
+    })
+    .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+  // The scroll has to have landed before we look at what is on screen.
+  await afterLayoutSettles(page);
+  const before = await newestVisibleMessage(page);
+  expect(before, "premise: a message should be visible").not.toBeNull();
+  return before!;
 }
 
 test.describe("Conversation follows new messages (#486)", () => {
@@ -457,7 +540,7 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
   // The reflow test above only trips on some font stacks (Linux CI's, not
   // macOS's): Chromium clamps scrollTop partway through the reflow, then the
   // history comes out taller. This makes the same clamp happen on every engine.
-  test("follows a reflow that clamped the view on its way to a taller history", async ({
+  test("follows a reflow that clamped the view on its way to a taller history @fractional-geometry", async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Team Chat Room");
@@ -587,25 +670,7 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
 test.describe("The newest visible message stays in view", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
-  /// Park a reader mid-history and remember the newest message they can see.
-  async function parkMidHistory(page: Page) {
-    await openRoomAtBottom(page, "Team Chat Room");
-    await fillHistory(page);
-    await readerScrollsTo(page, Math.floor((await historyHeight(page)) / 2));
-    await expect
-      .poll(() => distanceFromBottom(page), {
-        timeout: 5_000,
-        message: "premise: the reader should be parked above the bottom",
-      })
-      .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
-    // The scroll has to have landed before we look at what is on screen.
-    await afterLayoutSettles(page);
-    const before = await newestVisibleMessage(page);
-    expect(before, "premise: a message should be visible").not.toBeNull();
-    return before!;
-  }
-
-  test("the same message is still in place after resizing there and back", async ({ page }) => {
+  test("the same message is still in place after resizing there and back @fractional-geometry", async ({ page }) => {
     const before = await parkMidHistory(page);
     await page.setViewportSize({ width: 380, height: 900 });
     await expectSameMessageInPlace(
@@ -1104,7 +1169,7 @@ test.describe("The hidden mobile chat column", () => {
     await afterLayoutSettles(page);
   }
 
-  test("a parked reader keeps their message when rows above it change while hidden", async ({
+  test("a parked reader keeps their message when rows above it change while hidden @fractional-geometry", async ({
     page,
   }) => {
     // At its cap, so every arrival drains the oldest message above the reader.
