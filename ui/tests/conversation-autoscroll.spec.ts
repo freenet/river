@@ -574,6 +574,187 @@ test.describe("Conversation follows new messages (#486)", () => {
   });
 });
 
+/// `scrollTop`, `clientHeight` and `scrollHeight` of the history's container.
+type Geometry = { top: number; client: number; height: number };
+
+/// What `collapseUnderArrival` saw: the geometry before the composer was
+/// cleared, right after its collapse, and when the arrival's row landed, and the
+/// order the arrival's patch and the clamp's scroll event came in.
+type CollapseUnderArrival = {
+  before: Geometry;
+  collapsed: Geometry | null;
+  atPatch: Geometry | null;
+  order: string[];
+};
+
+/// How many times `collapseUnderArrival` may set up the collapse to get the
+/// order it wants (see there).
+const COLLAPSE_ATTEMPTS = 3;
+
+/// Open Team Chat Room, fill the composer to its cap, then clear it and deliver a
+/// 30-line inbound message from the input event, after the app's own handler has
+/// collapsed the composer. `fill` clears it with Playwright's `fill`;
+/// `after-a-frame` in a task queued from a frame callback, so the clamp's
+/// scroll event and resize wait for the next frame, a frame interval away.
+///
+/// Which comes first, the arrival's patch or the clamp's scroll event, is up to
+/// the engine's scheduling: a loaded host can run a frame between any two tasks.
+/// An attempt that does not produce `want` must still follow (it is the other
+/// order, which the clamp-to-the-end rule covers), and the setup runs again, up
+/// to `COLLAPSE_ATTEMPTS` times. The caller asserts the order of the last.
+/// `either` takes the first attempt, in whichever order it came.
+async function collapseUnderArrival(
+  page: Page,
+  clear: "fill" | "after-a-frame",
+  want: CollapseOrder,
+): Promise<CollapseUnderArrival> {
+  await openRoomAtBottom(page, "Team Chat Room");
+  const roomyViewport = await viewportHeight(page);
+  await page.evaluate(() => {
+    const c = document.getElementById("chat-scroll-container")!;
+    for (const type of ["scroll", "scrollend"]) {
+      c.addEventListener(type, () => {
+        (window as any).__riverLastScrollEvent = type;
+      });
+    }
+  });
+  const seen: string[] = [];
+  let rec: CollapseUnderArrival | null = null;
+  for (let attempt = 1; attempt <= COLLAPSE_ATTEMPTS; attempt++) {
+    rec = await collapseOnce(page, clear, `collapse arrival ${attempt}`, roomyViewport);
+    seen.push(rec.order.join(" → "));
+    if (want === "either" || rec.order[0] === want) break;
+    await expectSettledAtBottom(page, "the other order of the collapse and the arrival was not followed");
+  }
+  test.info().annotations.push({ type: "collapse order", description: seen.join(" | ") });
+  return rec!;
+}
+
+/// One attempt of `collapseUnderArrival`, with the arrival marked `marker`.
+async function collapseOnce(
+  page: Page,
+  clear: "fill" | "after-a-frame",
+  marker: string,
+  roomyViewport: number,
+): Promise<CollapseUnderArrival> {
+  const input = page.getByTestId("message-input");
+  await page.evaluate(() => ((window as any).__riverLastScrollEvent = null));
+  const capDraft = Array.from({ length: 30 }, (_, i) => `draft line ${i}`).join("\n");
+  await input.fill(capDraft);
+  await expect
+    .poll(() => viewportHeight(page), {
+      timeout: 5_000,
+      message: "premise: the composer should take more than the layout allowance off the history",
+    })
+    .toBeLessThan(roomyViewport - LAYOUT_SHIFT_ALLOWANCE_PX);
+  expect(
+    await input.evaluate((el) => el.scrollHeight > el.clientHeight),
+    "premise: a 30-line draft should hold the composer at its cap",
+  ).toBe(true);
+  await expectSettledAtBottom(page, "the composer grew and the view did not follow it");
+  // A scroll event still pending from the follow would be taken for the clamp's.
+  await page.waitForFunction(
+    () => (window as any).__riverLastScrollEvent === "scrollend",
+    undefined,
+    { timeout: 5_000 },
+  );
+
+  await page.evaluate((text) => {
+    const c = document.getElementById("chat-scroll-container")!;
+    const read = (): Geometry => ({ top: c.scrollTop, client: c.clientHeight, height: c.scrollHeight });
+    const rec: CollapseUnderArrival = { before: read(), collapsed: null, atPatch: null, order: [] };
+    (window as any).__riverCollapse = rec;
+    // Capturing on `document`, so it is noted before the app's own listener on
+    // the container handles the event.
+    const onScroll = (e: Event) => {
+      if (e.target !== c || !rec.collapsed) return;
+      rec.order.push("scroll");
+      document.removeEventListener("scroll", onScroll, { capture: true });
+    };
+    document.addEventListener("scroll", onScroll, { capture: true });
+    window.__riverScroll.patchLanded(text.slice(0, 40), () => {
+      rec.order.push("patch");
+      rec.atPatch = read();
+    });
+    // On `document`, so after the app's input handler: reading the geometry
+    // forces the collapse and its clamp now. The hook defers its state change,
+    // as a network update does, so the arrival renders in a later task.
+    document.addEventListener(
+      "input",
+      () => {
+        rec.collapsed = read();
+        (window as any).__riverTest.appendMessage(text);
+      },
+      { once: true },
+    );
+  }, TALL(marker, 30));
+  if (clear === "fill") {
+    await input.fill("");
+  } else {
+    await input.evaluate(
+      (el: HTMLTextAreaElement) =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() =>
+            setTimeout(() => {
+              el.value = "";
+              el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+              resolve();
+            }),
+          ),
+        ),
+    );
+  }
+  await expect(page.getByText(marker).last()).toBeAttached({ timeout: 5_000 });
+  await afterLayoutSettles(page);
+  return page.evaluate(() => (window as any).__riverCollapse as CollapseUnderArrival);
+}
+
+/// Which of the arrival's patch and the clamp's scroll event is wanted first, or
+/// `either` where the engine does not fix it.
+type CollapseOrder = "patch" | "scroll" | "either";
+
+/// The premises of `collapseUnderArrival`: the collapse clamped the view up past
+/// the allowance with its lower edge held by the container's growth, and the
+/// arrival grew the history past the follow band. `first` is which of the
+/// arrival's patch and the clamp's scroll event is expected first: with the
+/// patch first, no frame has run since the clamp, so neither its scroll event
+/// nor the ResizeObserver has handled it before the history grew.
+function expectCollapseUnderArrival(
+  { before, collapsed, atPatch, order }: CollapseUnderArrival,
+  first: CollapseOrder,
+) {
+  expect(collapsed, "premise: the composer should collapse inside the input handler").not.toBeNull();
+  expect(
+    before.top - collapsed!.top,
+    "premise: the collapse should clamp the view up by more than the layout allowance",
+  ).toBeGreaterThan(LAYOUT_SHIFT_ALLOWANCE_PX);
+  expect(
+    Math.abs(collapsed!.top + collapsed!.client - (before.top + before.client)),
+    "premise: the container's growth should keep the view's lower edge where it was",
+  ).toBeLessThanOrEqual(AT_BOTTOM_EPSILON_PX);
+  const observed = `(observed: ${order.join(" → ")})`;
+  if (first === "either") {
+    expect(order, `premise: the arrival's patch should be observed ${observed}`).toContain("patch");
+  } else {
+    expect(
+      order[0],
+      `premise: which of the arrival's patch and the clamp's scroll event comes first ${observed}`,
+    ).toBe(first);
+  }
+  expect(
+    atPatch!.height - collapsed!.height,
+    "premise: the arrival should grow the history by more than the follow band",
+  ).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+}
+
+/// Following through the collapse, and through the next tall arrival.
+async function expectStillFollowingAfterCollapse(page: Page) {
+  await expectSettledAtBottom(page, "the composer collapsed under a tall arrival and the view stopped following");
+  await callRiverTest(page, "appendMessage", TALL("after the collapse", 30));
+  await expect(page.getByText("after the collapse").last()).toBeAttached({ timeout: 5_000 });
+  await expectSettledAtBottom(page, "the arrival after the collapse was not followed");
+}
+
 test.describe("Conversation follows layout-only growth (#486)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -733,6 +914,41 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
       page,
       "the history grew in the same frame the composer collapsed and the view did not follow it",
     );
+  });
+
+  // The same race at full size. A cap-height composer collapsing clamps the view
+  // up by far more than the layout allowance, and an arrival that renders before
+  // the clamp's scroll event leaves the view short of the new end, so neither
+  // the allowance nor the clamp-to-the-end rule covers it. What does: the lower
+  // edge of the view did not move.
+  //
+  // Chromium dispatches input at the start of a frame, so Playwright's `fill`
+  // has the clamp's scroll event out before the arrival can render. Clearing in
+  // a task just after a frame instead leaves the arrival a frame interval to
+  // land in, on every engine; the second test keeps the engines' own order.
+  test("keeps following when a cap-height composer collapses under a tall arrival", async ({
+    page,
+  }) => {
+    const collapse = await collapseUnderArrival(page, "after-a-frame", "patch");
+    expectCollapseUnderArrival(collapse, "patch");
+    await expectStillFollowingAfterCollapse(page);
+  });
+
+  test("keeps following a cap-height composer collapse under a tall arrival, in the engine's input order", async ({
+    page,
+    browserName,
+  }) => {
+    // WebKit renders the arrival before the clamp's scroll event (the review's
+    // reproduction). Chromium's input is aligned to the frame, so its own order
+    // is the other one. Firefox's depends on load: one 20-run sample at a load
+    // average of ~40-70 saw the scroll event first in three attempts in a row,
+    // so its order is recorded (the "collapse order" annotation), not asserted;
+    // the test above establishes the arrival first on Firefox too.
+    const first: CollapseOrder =
+      browserName === "webkit" ? "patch" : browserName === "chromium" ? "scroll" : "either";
+    const collapse = await collapseUnderArrival(page, "fill", first);
+    expectCollapseUnderArrival(collapse, first);
+    await expectStillFollowingAfterCollapse(page);
   });
 
   test("does not drag a parked reader down when a resize reflows the history", async ({

@@ -64,17 +64,24 @@
 //!   anything was resized (removing a positioned overhang clamps with nothing
 //!   resized); or the signature changed since it was recorded AND `scrollTop`
 //!   moved no more than `LAYOUT_SHIFT_ALLOWANCE_PX`, for a clamp taken during a
-//!   shorter intermediate layout that ends short of the end. It restores.
+//!   shorter intermediate layout that ends short of the end; or the container
+//!   grew, `scrollTop` went down, and the view's bottom edge stayed where it was
+//!   (within rounding), however far: a composer collapsing grows the container
+//!   and the browser clamps the top up by the same amount, and content that
+//!   arrives before the event is read leaves that clamp short of the end and
+//!   past the allowance (a cap-height composer moves it ~400px). It restores.
 //! * **Reader**: anything else, handled by the follow state above.
 //!
 //! Residuals: a reader who moves less than the allowance in the very frame a
 //! layout change lands loses that frame's movement; an intermediate clamp larger
-//! than the allowance is taken as the reader; and a reader who scrolls to the end
-//! in the frame of a final-end clamp is indistinguishable from it. The signature
-//! records the layout's shape (content and container sizes); the scroll range is
-//! always read live. It can still be stale when an event is classified:
-//! ResizeObserver delivery is asynchronous, a hidden history records nothing, and
-//! the sizes read are client sizes, not exactly the boxes the observer watches.
+//! than the allowance that also moves the bottom edge is taken as the reader; a
+//! reader who scrolls to the end in the frame of a final-end clamp is
+//! indistinguishable from it; and so is one who scrolls up by exactly what the
+//! container grew in the frame it grows. The signature records the layout's
+//! shape (content and container sizes); the scroll range is always read live. It
+//! can still be stale when an event is classified: ResizeObserver delivery is
+//! asynchronous, a hidden history records nothing, and the sizes read are client
+//! sizes, not exactly the boxes the observer watches.
 //!
 //! # Timing and visibility
 //!
@@ -259,11 +266,13 @@ fn newest_visible_rows(
 /// (the module doc has the rules and what each gets wrong). `max` is the live
 /// scroll range (`max_scroll_top`), never a recorded one.
 ///
-/// Layout is either clause: **final-end clamp**, the recorded `scrollTop` is
-/// past `max` by more than rounding and the view sits at `max` (within rounding,
-/// either side), whether or not the signature changed; or **changed layout,
-/// small move**, the signature changed AND `scrollTop` moved no more than
-/// `LAYOUT_SHIFT_ALLOWANCE_PX`.
+/// Layout is any of three clauses: **final-end clamp**, the recorded `scrollTop`
+/// is past `max` by more than rounding and the view sits at `max` (within
+/// rounding, either side), whether or not the signature changed; **changed
+/// layout, small move**, the signature changed AND `scrollTop` moved no more than
+/// `LAYOUT_SHIFT_ALLOWANCE_PX`; or **container grew over a clamped top**, the
+/// container is taller, `scrollTop` is lower, and the view's bottom edge is where
+/// it was (within rounding), however far the top moved.
 fn classify_scroll(
     recorded: LayoutSig,
     now: LayoutSig,
@@ -278,7 +287,12 @@ fn classify_scroll(
         recorded_top > max + SCROLL_TOP_SLACK_PX && (now_top - max).abs() <= SCROLL_TOP_SLACK_PX;
     let small_layout_move =
         recorded != now && (now_top - recorded_top).abs() <= LAYOUT_SHIFT_ALLOWANCE_PX;
-    if clamped_to_end || small_layout_move {
+    let bottom_edge_held = (now_top + now.client_height - (recorded_top + recorded.client_height))
+        .abs()
+        <= SCROLL_TOP_SLACK_PX;
+    let grew_over_a_clamped_top =
+        now.client_height > recorded.client_height && now_top < recorded_top && bottom_edge_held;
+    if clamped_to_end || small_layout_move || grew_over_a_clamped_top {
         ScrollCause::Layout
     } else {
         ScrollCause::Reader
@@ -1113,13 +1127,95 @@ mod tests {
         let (a, b) = (sig(3000, 600, 1000), sig(3100, 600, 880));
         let max = 2500;
         assert_eq!(classify_scroll(a, b, 2000, 1889, max), ScrollCause::Layout);
-        // The documented residual: a larger intermediate clamp reads as the reader.
+        // The documented residual: a larger intermediate clamp that moves the
+        // bottom edge too (the container is unchanged here) reads as the reader.
         assert_eq!(
             classify_scroll(a, b, 2000, 2000 - LAYOUT_SHIFT_ALLOWANCE_PX - 1, max),
             ScrollCause::Reader
         );
         // And with nothing in the signature changed, it is the reader at any size.
         assert_eq!(classify_scroll(a, a, 2000, 1889, max), ScrollCause::Reader);
+    }
+
+    /// A pinned view at the end of a 3000px history in a 400px container (top
+    /// 2600, bottom edge 3000), then a 406px composer collapse that the browser
+    /// clamps by the same 406px, and a 700px arrival before the event is read.
+    const COLLAPSED: i32 = 406;
+    const BEFORE_COLLAPSE: (i32, i32) = (3000, 400);
+    const ARRIVAL: i32 = 700;
+
+    /// `classify_scroll` for that collapse with the view now at `now_top`.
+    fn after_collapse(now_top: i32, client_height: i32) -> ScrollCause {
+        let (content, client) = BEFORE_COLLAPSE;
+        let now = sig(content + ARRIVAL, client_height, 1000);
+        let max = content + ARRIVAL - client_height;
+        classify_scroll(
+            sig(content, client, 1000),
+            now,
+            content - client,
+            now_top,
+            max,
+        )
+    }
+
+    #[test]
+    fn a_container_growing_over_a_clamped_top_is_layout_however_far_it_moved() {
+        // The bottom edge stayed at 3000, but the arrival put the end 700px below
+        // it, so the final-end clause cannot see the clamp, and it is past the
+        // allowance.
+        let (content, client) = BEFORE_COLLAPSE;
+        let top = content - client - COLLAPSED;
+        const { assert!(COLLAPSED > LAYOUT_SHIFT_ALLOWANCE_PX) };
+        assert!(content + ARRIVAL - (client + COLLAPSED) - top > SCROLL_TOP_SLACK_PX);
+        assert_eq!(after_collapse(top, client + COLLAPSED), ScrollCause::Layout);
+    }
+
+    #[test]
+    fn a_container_growing_while_the_reader_moves_is_still_the_reader() {
+        let (content, client) = BEFORE_COLLAPSE;
+        let clamped = content - client - COLLAPSED;
+        let grown = client + COLLAPSED;
+        // Both edges up: the reader looking back as the composer collapses.
+        assert_eq!(after_collapse(clamped - 300, grown), ScrollCause::Reader);
+        // The same move with the container unchanged: both edges up, past the
+        // allowance.
+        assert_eq!(after_collapse(clamped, client), ScrollCause::Reader);
+        // The bottom edge is allowed rounding and no more, either way.
+        assert_eq!(
+            after_collapse(clamped - SCROLL_TOP_SLACK_PX, grown),
+            ScrollCause::Layout
+        );
+        assert_eq!(
+            after_collapse(clamped + SCROLL_TOP_SLACK_PX, grown),
+            ScrollCause::Layout
+        );
+        assert_eq!(
+            after_collapse(clamped - SCROLL_TOP_SLACK_PX - 1, grown),
+            ScrollCause::Reader
+        );
+        assert_eq!(
+            after_collapse(clamped + SCROLL_TOP_SLACK_PX + 1, grown),
+            ScrollCause::Reader
+        );
+    }
+
+    #[test]
+    fn a_container_shrinking_under_a_top_moving_down_is_the_reader() {
+        // The mirror image keeps the bottom edge too, but a composer growing
+        // never moves `scrollTop`: the top moving down 406px is the reader's.
+        let (content, client) = BEFORE_COLLAPSE;
+        let (from_top, from_client) = (content - client - COLLAPSED, client + COLLAPSED);
+        let now = sig(content, client, 1000);
+        assert_eq!(
+            classify_scroll(
+                sig(content, from_client, 1000),
+                now,
+                from_top,
+                from_top + COLLAPSED,
+                content - client + 300,
+            ),
+            ScrollCause::Reader
+        );
     }
 
     #[test]
@@ -1170,7 +1266,9 @@ mod tests {
     fn a_container_growing_over_a_clamped_top_is_not_moving_up() {
         // The composer collapses by 250px: the container grows by that much and
         // the browser clamps `scrollTop` up by the same, so the bottom edge
-        // stays put. Past any allowance, so it reaches the reader branch.
+        // stays put. `classify_scroll` reads that alone as layout; with any other
+        // movement in the same event it reaches the reader branch, where only
+        // the reader's own part may count as moving up.
         let from = edges(2000, 500);
         assert!(!moved_up(from, edges(1750, 750)));
         // The reader moving up while it grows is still moving up.
