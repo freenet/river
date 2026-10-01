@@ -283,25 +283,65 @@ test.describe("Message action kebab menu (#402.1)", () => {
       "kebab menu is touch-only; desktop uses the hover action bar"
     );
 
-    const menus = page.locator('[data-testid="message-action-menu"]');
-    const kebabs = page.locator('[data-testid="message-kebab"]');
+    const menus = page.getByTestId("message-action-menu");
+    const kebabs = page.getByTestId("message-kebab");
+    // A kebab click scrolls its row into view; let the opening snap land first
+    // so it can't move the history between that scroll and the taps below.
+    await waitSettledAtBottom(page);
 
-    // Open the first message's menu.
-    await kebabs.nth(0).click();
+    // Example messages have random lengths, so pick two kebabs from what is on
+    // screen rather than by index: a fixed index can sit below the viewport,
+    // where a tap reaches no element at all. The target comes later in the DOM
+    // than the opener, so only the open wrapper's z-[60] raise keeps it covered.
+    const pair = await page.evaluate(() => {
+      const sp = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+      const visible = Array.from(document.querySelectorAll('[data-testid="message-kebab"]'))
+        .map((el, i) => ({ i, r: el.getBoundingClientRect() }))
+        .filter(({ r }) => r.top >= sp.top && r.bottom <= Math.min(sp.bottom, innerHeight));
+      let best: [number, number] | null = null;
+      let bestScore = 0;
+      for (const a of visible) {
+        for (const b of visible) {
+          if (b.i <= a.i) continue;
+          // Prefer the opposite gutter, then the largest gap: either keeps the
+          // target clear of the opener's menu, which is checked once it opens.
+          const score = (a.r.left !== b.r.left ? 1000 : 0) + (b.r.top - a.r.top);
+          if (score > bestScore) [best, bestScore] = [[a.i, b.i], score];
+        }
+      }
+      return best;
+    });
+    expect(pair, "premise: two kebabs fully inside the scrollport").not.toBeNull();
+    const [opener, target] = pair!;
+
+    await kebabs.nth(opener).click();
     await expect(menus).toHaveCount(1);
 
-    // While a menu is open its wrapper is raised (z-[60]) so its full-viewport
-    // backdrop covers every other kebab. A tap at a later message's kebab
-    // therefore lands on the backdrop (Playwright's .click() would refuse the
-    // obscured element, so dispatch at the coordinate) and dismisses the menu —
-    // never two open, and the menu's own rows can't be intercepted by a sibling
-    // kebab. A second tap would then open that message's menu.
-    const box = await kebabs.nth(2).boundingBox();
-    expect(box).not.toBeNull();
-    if (box) {
-      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-    }
+    // Measure and hit-test the target in one evaluation. The tap is a separate
+    // step and can still race a layout change; if it fails, compare this point
+    // with the trace before blaming the backdrop.
+    const tap = await page.evaluate((target) => {
+      const sp = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+      const menu = document.querySelector('[data-testid="message-action-menu"]')!.getBoundingClientRect();
+      const r = document.querySelectorAll('[data-testid="message-kebab"]')[target].getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      const inside = (b: DOMRect) => x >= b.left && x <= b.right && y >= b.top && y <= b.bottom;
+      const onScreen = inside(sp) && x <= innerWidth && y <= innerHeight;
+      const hit = document.elementFromPoint(x, y)?.closest("[data-testid]")?.getAttribute("data-testid");
+      return { x, y, onScreen, inMenu: inside(menu), hit };
+    }, target);
+    test.info().annotations.push({ type: "tap", description: JSON.stringify(tap) });
+    expect(tap.onScreen, `premise: (${tap.x}, ${tap.y}) is inside the scrollport`).toBe(true);
+    expect(tap.inMenu, `premise: (${tap.x}, ${tap.y}) is outside the open menu`).toBe(false);
+    // Soft, so a stacking regression still reaches the tap and shows what it does.
+    expect.soft(tap.hit, "the open menu's backdrop covers the other kebab").toBe("message-action-menu-backdrop");
+
+    // A real tap: forcing a click on the kebab or dispatching one to the
+    // backdrop would skip the z-order this test is about.
+    await page.mouse.click(tap.x, tap.y);
     await expect(menus).toHaveCount(0);
+    await expect(kebabs.and(page.locator('[aria-expanded="true"]'))).toHaveCount(0);
   });
 });
 

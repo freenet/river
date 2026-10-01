@@ -4536,6 +4536,7 @@ fn MessageGroupComponent(
                                                 if menu_open {
                                                     div {
                                                         class: "fixed inset-0 z-40",
+                                                        "data-testid": "message-action-menu-backdrop",
                                                         onclick: move |_| crate::util::defer(move || open_action_menu.set(None)),
                                                     }
                                                     div {
