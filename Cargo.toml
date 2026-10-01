@@ -108,3 +108,12 @@ inherits = "dev"
 toolchain = "nightly"
 
 # We need to pin specific versions to resolve dependency conflicts
+
+# markdown 1.0.0 (the latest release) plus parser fixes that upstream has not
+# released (wooorm/markdown-rs GH-22, GH-23, GH-31, GH-79, #206, #263, #267, and
+# one more in the branch below). Drop this only once a release contains all of
+# them; ui/src/components/conversation.rs `malformed_markdown_renders_without_panicking`
+# fails if one is missing.
+# https://github.com/freenet/markdown-rs/commits/freenet/panic-fixes
+[patch.crates-io]
+markdown = { git = "https://github.com/freenet/markdown-rs", rev = "4dcf957506808e39dbbd42aed8cfc874415ebc36" }
