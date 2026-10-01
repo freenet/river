@@ -1484,7 +1484,8 @@ type SeekInterruption =
   | { kind: "growth-above"; px: number }
   | { kind: "wheel-up"; px: number }
   | { kind: "touch-stop" }
-  | { kind: "hide" };
+  | { kind: "hide" }
+  | { kind: "switch-room"; room: string };
 
 /// Scroll the reader to the top, press the scroll-to-latest button, and apply
 /// `interruption` from inside the first scroll event of its animation that has
@@ -1548,6 +1549,9 @@ async function seekAndInterrupt(page: Page, interruption: SeekInterruption) {
             case "hide":
               (document.querySelector('[data-testid="hamburger-rooms-button"]') as HTMLElement).click();
               break;
+            case "switch-room":
+              hooks.switchRoom(interruption.room);
+              break;
           }
           finish({ fired: true, distance, why: "" });
         };
@@ -1597,6 +1601,22 @@ test.describe("The scroll-to-latest animation keeps following to the end", () =>
       await expectSettledAtBottom(page, `the follow did not survive ${interruption.kind} during the animation`);
     });
   }
+
+  test("a room switch mid-flight opens the new room at its newest message, and the seek does not carry over", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room", DEEP_ROOM_PATH);
+    await fillHistory(page, 16);
+    await seekAndInterrupt(page, { kind: "switch-room", room: "Deep History Room" });
+    await expect(page.getByRole("heading", { name: "Deep History Room" })).toBeVisible();
+    await expectSettledAtBottom(page, "the room switched to mid-seek did not open at its newest message");
+    await afterLayoutSettles(page);
+    // A seek still running would take this reader back to the end.
+    await readerScrollsWithoutGesture(page, Math.floor((await historyHeight(page)) / 2));
+    await afterLayoutSettles(page);
+    await deliver(page, "arrival in the new room");
+    await expectStaysPut(page, "the old room's seek carried over and moved a parked reader");
+  });
 
   for (const interruption of [{ kind: "wheel-up", px: 400 }, { kind: "touch-stop" }] as const) {
     test(`the reader taking over mid-flight (${interruption.kind}) stays parked through the next arrival`, async ({
@@ -2574,6 +2594,28 @@ test.describe("The hidden mobile chat column", () => {
       page,
       `a reader inside the band stayed held after the reveal (observed: ${race.order.join(" → ")})`,
     );
+  });
+
+  test("a gesture cut short by hiding, then a room switch while hidden: the new room opens at its newest message and holds its own gesture", async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Team Chat Room", DEEP_ROOM_PATH);
+    await fillHistory(page);
+    await scrollThen(page, await endMinus(page, 40), { hide: true });
+    await expect(chat(page)).toBeHidden({ timeout: 5_000 });
+    await callRiverTest(page, "switchRoom", "Deep History Room");
+    await afterLayoutSettles(page);
+    await page.getByTestId("rooms-back-button").click();
+    await expect(chat(page)).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Deep History Room" })).toBeVisible();
+    await expectSettledAtBottom(page, "the room switched to while hidden did not open at its newest message");
+    await deliver(page, "arrival in the new room");
+    await expectSettledAtBottom(page, "the new room did not follow");
+
+    // A new gesture in the new room is its own: nothing left over settles it.
+    const race = await scrollThen(page, await endMinus(page, 40), { deliver: TALL("tall arrival in the new room") });
+    expectArrivalBeforeSettle(race.order);
+    await expectInPlace(page, race.at!, "the new room's upward gesture did not hold the tall arrival", { hold: true });
   });
 
   for (const reveal of [
