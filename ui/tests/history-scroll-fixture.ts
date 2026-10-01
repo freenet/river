@@ -159,7 +159,7 @@ function installSeekRecorder({ guard, boundMs }: { guard: SeekClockGuard; boundM
         if (run >= guard.minMovedFrames && top - frames[0].top >= guard.minTravelPx) {
           decided = true;
           if (max - top > guard.minDistancePx) {
-            (window as any).__riverTest.appendMessage(guard.text);
+            window.__riverTest!.appendMessage(guard.text);
             record.requestedAt = n - 1;
           } else {
             record.declined = `frame ${n - 1} was only ${max - top}px above the end`;
@@ -355,6 +355,13 @@ export type GateScrollendRun = {
   distanceAtRelease: number | null;
 };
 
+declare global {
+  interface Window {
+    /// `gateScrollendGesture`'s teardown, present while a gesture runs.
+    __riverSettleGate?: { stop(): void };
+  }
+}
+
 /// Runs in the page, so it is self-contained.
 function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun> {
   return new Promise<GateScrollendRun>((resolve) => {
@@ -421,7 +428,7 @@ function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun>
       run.delivered = true;
       run.at = newestVisible();
       note("deliver");
-      (window as any).__riverTest.appendMessage(plan.text);
+      window.__riverTest!.appendMessage(plan.text);
     };
     const release = () => {
       gating = false;
@@ -463,11 +470,11 @@ function gateScrollendInPage(plan: GateScrollendPlan): Promise<GateScrollendRun>
       window.removeEventListener("scrollend", gate, { capture: true });
       c.removeEventListener("scrollend", received);
       c.removeEventListener("scroll", onScroll);
-      delete (window as any).__riverSettleGate;
+      delete window.__riverSettleGate;
       resolve(run);
     }
 
-    (window as any).__riverSettleGate = { stop: finish };
+    window.__riverSettleGate = { stop: finish };
     window.addEventListener("scrollend", gate, { capture: true });
     c.addEventListener("scrollend", received);
     c.addEventListener("scroll", onScroll);
@@ -483,7 +490,7 @@ export async function gateScrollendGesture(page: Page, plan: GateScrollendPlan):
   try {
     return await page.evaluate(gateScrollendInPage, plan);
   } finally {
-    await page.evaluate(() => (window as any).__riverSettleGate?.stop()).catch(() => {});
+    await page.evaluate(() => window.__riverSettleGate?.stop()).catch(() => {});
   }
 }
 

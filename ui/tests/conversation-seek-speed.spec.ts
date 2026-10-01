@@ -67,7 +67,7 @@ async function parkFarAboveTheEnd(page: Page) {
   await openRoomAtBottom(page, "Team Chat Room");
   await page.evaluate(async (count) => {
     for (let i = 0; i < count; i++) {
-      (window as any).__riverTest.appendMessage(`speed filler ${i}: ${"w ".repeat(450)}`);
+      window.__riverTest!.appendMessage(`speed filler ${i}: ${"w ".repeat(450)}`);
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     }
   }, SEEK_SPEED_FILLERS);

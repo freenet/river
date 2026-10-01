@@ -16,6 +16,14 @@ export type RiverTestHooks = {
   removeMessages(domIds: string[]): Promise<string[]>;
 };
 
+declare global {
+  interface Window {
+    /// Installed by `App` in example-data, no-sync builds (ui/src/test_hooks.rs);
+    /// absent before the app starts and in every other build.
+    __riverTest?: RiverTestHooks;
+  }
+}
+
 // One hook per round trip.
 export async function callRiverTest<K extends keyof RiverTestHooks>(
   page: Page,

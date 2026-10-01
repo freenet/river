@@ -89,6 +89,14 @@ type ScrollHelpers = {
 declare global {
   interface Window {
     __riverScroll: ScrollHelpers;
+    // Per-test records, each set by the test that reads it and absent until then.
+    /// The type of the container's latest `scroll`/`scrollend` event.
+    __riverLastScrollEvent?: string | null;
+    __riverCollapse?: CollapseUnderArrival;
+    __riverSameFrame?: { collapsed: boolean; grew: number };
+    /// Scroll events on the container since `unsettledGesture` started counting.
+    __riverGestureFrames?: number;
+    __riverArmed?: ArmedArrival;
   }
 }
 
@@ -507,7 +515,7 @@ async function collapseUnderArrival(
     const c = document.getElementById("chat-scroll-container")!;
     for (const type of ["scroll", "scrollend"]) {
       c.addEventListener(type, () => {
-        (window as any).__riverLastScrollEvent = type;
+        window.__riverLastScrollEvent = type;
       });
     }
   });
@@ -531,7 +539,7 @@ async function collapseOnce(
   roomyViewport: number,
 ): Promise<CollapseUnderArrival> {
   const input = page.getByTestId("message-input");
-  await page.evaluate(() => ((window as any).__riverLastScrollEvent = null));
+  await page.evaluate(() => (window.__riverLastScrollEvent = null));
   const capDraft = Array.from({ length: 30 }, (_, i) => `draft line ${i}`).join("\n");
   await input.fill(capDraft);
   await expect
@@ -547,7 +555,7 @@ async function collapseOnce(
   await expectSettledAtBottom(page, "the composer grew and the view did not follow it");
   // A scroll event still pending from the follow would be taken for the clamp's.
   await page.waitForFunction(
-    () => (window as any).__riverLastScrollEvent === "scrollend",
+    () => window.__riverLastScrollEvent === "scrollend",
     undefined,
     { timeout: 5_000 },
   );
@@ -556,7 +564,7 @@ async function collapseOnce(
     const c = document.getElementById("chat-scroll-container")!;
     const read = (): Geometry => ({ top: c.scrollTop, client: c.clientHeight, height: c.scrollHeight });
     const rec: CollapseUnderArrival = { before: read(), collapsed: null, atPatch: null, order: [] };
-    (window as any).__riverCollapse = rec;
+    window.__riverCollapse = rec;
     // Capturing on `document`, so it is noted before the app's own listener on
     // the container handles the event.
     const onScroll = (e: Event) => {
@@ -576,7 +584,7 @@ async function collapseOnce(
       "input",
       () => {
         rec.collapsed = read();
-        (window as any).__riverTest.appendMessage(text);
+        window.__riverTest!.appendMessage(text);
       },
       { once: true },
     );
@@ -599,7 +607,7 @@ async function collapseOnce(
   }
   await expect(page.getByText(marker).last()).toBeAttached({ timeout: 5_000 });
   await afterLayoutSettles(page);
-  return page.evaluate(() => (window as any).__riverCollapse as CollapseUnderArrival);
+  return page.evaluate(() => window.__riverCollapse!);
 }
 
 /// Which of the arrival's patch and the clamp's scroll event is wanted first, or
@@ -748,7 +756,7 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
       const c = document.getElementById("chat-scroll-container")!;
       for (const type of ["scroll", "scrollend"]) {
         c.addEventListener(type, () => {
-          (window as any).__riverLastScrollEvent = type;
+          window.__riverLastScrollEvent = type;
         });
       }
     });
@@ -765,7 +773,7 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     // A scroll event still pending from the follow would capture after the clamp
     // and hide the race.
     await page.waitForFunction(
-      () => (window as any).__riverLastScrollEvent === "scrollend",
+      () => window.__riverLastScrollEvent === "scrollend",
       undefined,
       { timeout: 5_000 },
     );
@@ -784,7 +792,7 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
           const collapsed = c.clientHeight > collapsedAbove;
           const before = c.scrollHeight;
           newest.style.paddingBottom = `${grow}px`;
-          (window as any).__riverSameFrame = {
+          window.__riverSameFrame = {
             collapsed,
             grew: c.scrollHeight - before,
           };
@@ -795,7 +803,7 @@ test.describe("Conversation follows layout-only growth (#486)", () => {
     );
     await page.getByTestId("message-input").fill("");
 
-    const premise = await page.evaluate(() => (window as any).__riverSameFrame);
+    const premise = await page.evaluate(() => window.__riverSameFrame!);
     expect(
       premise.collapsed,
       "premise: the composer should collapse inside the input handler",
@@ -1686,7 +1694,7 @@ async function seekAndInterrupt(page: Page, interruption: SeekInterruption) {
             finish({ fired: false, distance, why: "the animation was already near the end" });
             return;
           }
-          const hooks = (window as any).__riverTest;
+          const hooks = window.__riverTest!;
           switch (interruption.kind) {
             case "arrival":
               hooks.appendMessage(interruption.text);
@@ -1826,11 +1834,11 @@ async function unsettledGesture(page: Page, browserName: string, isMobile: boole
   const x = box.x + box.width / 2;
   let y = box.y + box.height / 2;
   const frames = () =>
-    page.evaluate(() => (window as any).__riverGestureFrames as number);
+    page.evaluate(() => window.__riverGestureFrames!);
   await page.evaluate(() => {
     const c = document.getElementById("chat-scroll-container")!;
-    (window as any).__riverGestureFrames = 0;
-    c.addEventListener("scroll", () => (window as any).__riverGestureFrames++);
+    window.__riverGestureFrames = 0;
+    c.addEventListener("scroll", () => window.__riverGestureFrames!++);
   });
   /// Step `step` (one finger pixel or one wheel tick) until the view has moved
   /// by `px` or `stop` says so, or give up after a generous number of steps.
@@ -1905,7 +1913,7 @@ function armArrival(page: Page, text: string, when: "up" | "back-at-end", upPx: 
       let last = start;
       let wentUp = false;
       const rec: ArmedArrival = { fired: false, steps: [], at: null, settledBefore: 0, order: [] };
-      (window as any).__riverArmed = rec;
+      window.__riverArmed = rec;
       // The text is delivered only once fired, so its row cannot land before.
       window.__riverScroll.patchLanded(text.slice(0, 40), () => rec.order.push("patch"));
       // Registered after the app's listener, so each one has reached the app.
@@ -1926,7 +1934,7 @@ function armArrival(page: Page, text: string, when: "up" | "back-at-end", upPx: 
         rec.at = window.__riverScroll.newestVisible(c);
         c.removeEventListener("scroll", onScroll);
         rec.order.push("deliver");
-        (window as any).__riverTest.appendMessage(text);
+        window.__riverTest!.appendMessage(text);
       };
       c.addEventListener("scroll", onScroll);
     },
@@ -1936,7 +1944,7 @@ function armArrival(page: Page, text: string, when: "up" | "back-at-end", upPx: 
 
 /// Whether `armArrival` has requested its delivery yet.
 function armedFired(page: Page): Promise<boolean> {
-  return page.evaluate(() => Boolean((window as any).__riverArmed?.fired));
+  return page.evaluate(() => Boolean(window.__riverArmed?.fired));
 }
 
 /// An armed arrival's record as one line, for failure messages.
@@ -1946,7 +1954,7 @@ function armedTimeline(armed: ArmedArrival) {
 
 async function armedArrival(page: Page, text: string): Promise<ArmedArrival> {
   await expect(page.getByText(text.slice(0, 40), { exact: false }).last()).toBeAttached({ timeout: 5_000 });
-  return page.evaluate(() => (window as any).__riverArmed as ArmedArrival);
+  return page.evaluate(() => window.__riverArmed!);
 }
 
 /// In one task: move the view to `top` and then run `then`, before any scroll
@@ -1979,7 +1987,7 @@ async function scrollThen(
         requestAnimationFrame(() => {
           c.scrollTop = top;
           const at = window.__riverScroll.newestVisible(c);
-          const hooks = (window as any).__riverTest;
+          const hooks = window.__riverTest!;
           if ("deliver" in then) hooks.appendMessage(then.deliver);
           else if ("hide" in then)
             (document.querySelector('[data-testid="hamburger-rooms-button"]') as HTMLElement).click();
@@ -2288,7 +2296,7 @@ test.describe("An arrival ahead of the reader's scroll event (#723)", () => {
           c.addEventListener("scroll", onScroll);
           requestAnimationFrame(() => {
             c.scrollTop = c.scrollHeight;
-            (window as any).__riverTest.appendMessage(text);
+            window.__riverTest!.appendMessage(text);
           });
         }),
       { text: TALL(marker), marker },
