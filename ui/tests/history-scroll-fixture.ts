@@ -597,8 +597,14 @@ export function gateScrollendExpectOrder(run: GateScrollendRun) {
 // * The app's fallback registrations are recognised by where they come from: a
 //   `setTimeout(settle, 120)` made while a `scroll` event on that container is
 //   being dispatched (the reader's move, read in the app's listener), with the
-//   same callback every time (the one quiet-deadline closure). Their clears and
+//   same callback every time (the one quiet-deadline closure). Once that
+//   callback is known, every later registration of it is recorded too, with
+//   its actual delay, wherever it is made (a deadline that takes in a pending
+//   reader move re-arms from the timer, with no DOM event). Their clears and
 //   firings are recorded; every other timer passes straight through.
+// * `debounceBeforeSettleFire` arms a one-shot action on that callback: just
+//   before its next firing, in the same task, it moves `scrollTop` and records
+//   what it saw. It only writes geometry; it dispatches nothing.
 // * Playwright's clock runs every timer, so the test decides when 120ms have
 //   passed. It also runs `crate::util::defer`'s `setTimeout(0)`: an inbound
 //   delivery and any deferred signal write wait for an explicit advance.
@@ -616,6 +622,11 @@ export type DebounceRegistration = {
   handle: number;
   at: number;
   seq: number;
+  /// The delay the app asked for.
+  delay: number;
+  /// Whether it was made while a `scroll` event on the container was being
+  /// dispatched (false: from a timer, such as the deadline itself).
+  duringScroll: boolean;
   cleared: { at: number; seq: number; duringScroll: boolean } | null;
   fired: { at: number; seq: number } | null;
 };
@@ -636,6 +647,23 @@ export type DebounceState = {
   /// Reflect.has on a non-container element, overridden vs native, to show the
   /// override is scoped.
   otherLookupDelegated: boolean;
+  /// `scroll` events that reached the container (counted after the app's
+  /// listener), since the fallback was selected.
+  scrollsDelivered: number;
+  /// What each `debounceBeforeSettleFire` action saw, in the task the settle
+  /// callback then ran in.
+  beforeFire: DebounceBeforeFire[];
+};
+
+export type DebounceBeforeFire = {
+  /// The registration whose firing it ran ahead of.
+  handle: number;
+  at: number;
+  topBefore: number;
+  topAfter: number;
+  /// `scrollsDelivered` as the action ran: the callback runs in this same task,
+  /// so its own move's `scroll` event cannot have been delivered by then.
+  scrollsDelivered: number;
 };
 
 type DebounceRow = { id: string; gap: number };
@@ -643,6 +671,9 @@ type DebounceRow = { id: string; gap: number };
 type DebounceDom = {
   probe: Omit<DebounceState, "now" | "otherLookupDelegated">;
   restore(): void;
+  /// Arm the one-shot action: move `scrollTop` by `px` just before the settle
+  /// callback next fires.
+  beforeSettleFire(px: number): void;
   /// Resolve after `n` native rendering updates.
   frames(n: number): Promise<void>;
   newestVisible(): DebounceRow | null;
@@ -668,9 +699,13 @@ function debounceInitScript() {
     installListeners: [],
     registrations: [],
     strayCallbacks: 0,
+    scrollsDelivered: 0,
+    beforeFire: [],
   };
   let seq = 0;
   let armed = false;
+  /// The one-shot action's distance, while one is armed.
+  let lateMovePx: number | null = null;
   const container = () => document.getElementById(CONTAINER_ID) as HTMLElement;
   const duringContainerScroll = (c: Element) => {
     const ev = (window as { event?: Event }).event;
@@ -686,6 +721,11 @@ function debounceInitScript() {
     let installing = true;
     queueMicrotask(() => (installing = false));
     const nativeAdd = c.addEventListener;
+    // Added after the app's own `scroll` listener (install adds it before the
+    // lookup), so it counts events the app has had.
+    const countScroll = () => probe.scrollsDelivered++;
+    nativeAdd.call(c, "scroll", countScroll);
+    undo.push(() => c.removeEventListener("scroll", countScroll));
     c.addEventListener = function (this: Element, type: string, ...rest: unknown[]) {
       if (installing) probe.installListeners.push(String(type));
       return (nativeAdd as (...a: unknown[]) => void).call(this, type, ...rest);
@@ -714,16 +754,42 @@ function debounceInitScript() {
       return handle;
     };
     let settle: unknown = null;
+    const beforeFire = (rec: DebounceRegistration) => {
+      if (lateMovePx === null) return;
+      const px = lateMovePx;
+      lateMovePx = null;
+      const topBefore = c.scrollTop;
+      c.scrollTop = topBefore + px;
+      probe.beforeFire.push({
+        handle: rec.handle,
+        at: Date.now(),
+        topBefore,
+        topAfter: c.scrollTop,
+        scrollsDelivered: probe.scrollsDelivered,
+      });
+    };
     window.setTimeout = function (cb: unknown, delay?: number, ...args: unknown[]) {
-      if (delay === SETTLE_MS && typeof cb === "function" && duringContainerScroll(c)) {
+      const scrolling = duringContainerScroll(c);
+      if (delay === SETTLE_MS && typeof cb === "function" && scrolling) {
         settle ??= cb;
-        if (cb === settle) {
-          const rec: DebounceRegistration = { handle: 0, at: Date.now(), seq: seq++, cleared: null, fired: null };
-          rec.handle = schedule(cb, delay, args, () => (rec.fired = { at: Date.now(), seq: seq++ }));
-          probe.registrations.push(rec);
-          return rec.handle;
-        }
-        probe.strayCallbacks++;
+        if (cb !== settle) probe.strayCallbacks++;
+      }
+      if (settle !== null && cb === settle) {
+        const rec: DebounceRegistration = {
+          handle: 0,
+          at: Date.now(),
+          seq: seq++,
+          delay: Number(delay ?? 0),
+          duringScroll: scrolling,
+          cleared: null,
+          fired: null,
+        };
+        rec.handle = schedule(cb, delay, args, () => {
+          beforeFire(rec);
+          rec.fired = { at: Date.now(), seq: seq++ };
+        });
+        probe.registrations.push(rec);
+        return rec.handle;
       }
       return schedule(cb, delay, args);
     } as typeof window.setTimeout;
@@ -772,7 +838,11 @@ function debounceInitScript() {
   const dom: DebounceDom = {
     probe,
     restore() {
+      lateMovePx = null;
       while (undo.length) undo.pop()!();
+    },
+    beforeSettleFire(px) {
+      lateMovePx = px;
     },
     async frames(n) {
       for (let i = 0; i < n; i++) await frame();
@@ -844,6 +914,13 @@ export function debounceOnlyPending(state: DebounceState, why: string): Debounce
 /// result: the setup's own settles are not the test's).
 export function debounceFired(state: DebounceState, from: number): DebounceRegistration[] {
   return state.registrations.slice(from).filter((r) => r.fired);
+}
+
+/// Arm the one-shot action (see the section comment): just before the settle
+/// callback next fires, move the view by `px` (negative is up), with no event of
+/// its own. Its record is in `debounceState(page).beforeFire`.
+export function debounceBeforeSettleFire(page: Page, px: number) {
+  return page.evaluate((px) => window.__riverDebounce.beforeSettleFire(px), px);
 }
 
 export function debounceFrames(page: Page, n = 2): Promise<void> {

@@ -5,6 +5,7 @@ import {
   FollowEntry,
   RowPosition,
   followAwaitAfter,
+  followBeforeSettleFire,
   followDeliver,
   followFrame,
   followGate,
@@ -16,6 +17,7 @@ import {
   followReaderMove,
   followRecorderStart,
   followRecorderStop,
+  followSettleRecord,
   followTimeline,
   followUngate,
   newestVisibleRow,
@@ -279,14 +281,17 @@ const READER_QUIET_MS = 60;
 /// so the gesture is held and unsettled, as under a finger. Leaves the clock
 /// paused and the recorder running, gated: the caller stops both in a
 /// `finally`. The reader's newest visible message.
-async function heldGesture(page: Page, { path = "/", upPx = CORRECTED_UP_PX, fillers = 8 } = {}) {
+async function heldGesture(
+  page: Page,
+  { path = "/", upPx = CORRECTED_UP_PX, fillers = 8, observeSettle = false } = {},
+) {
   await seekClockInstall(page);
   await openRoomAtBottom(page, "Team Chat Room", path);
   for (let i = 0; i < fillers; i++) await deliver(page, `filler ${i}: ${"y".repeat(200)}`);
   await expectSettledAtBottom(page, "premise: the fillers should have been followed");
   await afterLayoutSettles(page);
   await seekClockPause(page);
-  await followRecorderStart(page, { gateEnds: true });
+  await followRecorderStart(page, { gateEnds: true, observeSettle });
 
   await followMark(page, "move");
   const move = await followReaderMove(page, -upPx);
@@ -303,8 +308,11 @@ async function heldGesture(page: Page, { path = "/", upPx = CORRECTED_UP_PX, fil
 /// growth above the reader, and wait for the correction's own end to reach the
 /// app. Leaves the clock paused and the recorder running: the caller stops both
 /// in a `finally`.
-async function correctedHeldGesture(page: Page, { path = "/", upPx = CORRECTED_UP_PX, fillers = 8 } = {}) {
-  const at = await heldGesture(page, { path, upPx, fillers });
+async function correctedHeldGesture(
+  page: Page,
+  { path = "/", upPx = CORRECTED_UP_PX, fillers = 8, observeSettle = false } = {},
+) {
+  const at = await heldGesture(page, { path, upPx, fillers, observeSettle });
 
   await page.clock.runFor(READER_QUIET_MS);
   expect(await followUngate(page), "premise: the gate was still in place").toBe(true);
@@ -402,6 +410,76 @@ test.describe("An anchor correction's own scrollend", () => {
       await toQuietDeadline(page);
       await followDeliver(page, `arrival after the quiet deadline: ${"r".repeat(200)}`);
       await expectRowHeld(page, at, `the settle outside the band did not leave the reader parked (${await followLog(page)})`);
+    } finally {
+      await teardown(page);
+    }
+  });
+
+  // The native-mode counterpart of the debounce spec's late-move case: the
+  // correction's end was refused, so the reader's quiet deadline is armed, and a
+  // reader move the deadline finds made but not yet delivered must start a
+  // fresh quiet interval. With `scrollend` nothing else re-arms it (the fired
+  // handle is gone by then), so before, the deadline settled over the move. The
+  // late move's own end is gated: it is a programmatic write, which every
+  // engine ends at once, and would settle the gesture on its own.
+  test("a reader move just before the correction's quiet deadline restarts it, counted from that move (controlled order: correction end → move → deadline → its scroll event)", async ({
+    page,
+  }) => {
+    const LATE_PX = -6;
+    try {
+      await correctedHeldGesture(page, { observeSettle: true });
+      const armed = await followSettleRecord(page);
+      expect(armed.settle.length, `premise: the refused correction end armed one deadline (${JSON.stringify(armed)})`).toBe(1);
+      const deadline = armed.settle[0];
+      expect(deadline.cleared ?? deadline.fired, "premise: the deadline is pending").toBeNull();
+      expect(deadline.delay, "premise: it runs from the reader's move, not the correction").toBe(QUIET_MS - READER_QUIET_MS);
+      expect(await followGate(page), "premise: the gate was removed for the correction").toBe(false);
+      await followMark(page, "late armed");
+      await followBeforeSettleFire(page, LATE_PX);
+      await toQuietDeadline(page);
+      await followRealFrames(page, 3);
+
+      const fired = await followSettleRecord(page);
+      const log = await followLog(page);
+      const what = `${JSON.stringify(fired)}; ${log}`;
+      expect(fired.beforeFire.length, `premise: the late move ran ahead of the deadline (${what})`).toBe(1);
+      const late = fired.beforeFire[0];
+      expect(late.handle, `premise: ahead of the armed deadline (${what})`).toBe(deadline.handle);
+      expect(late.after - late.before, `premise: the late move went up (${what})`).toBeCloseTo(LATE_PX, 0);
+      expect(log.slice(log.lastIndexOf("late armed")), `premise: move, deadline, then its scroll event; its end held (${what})`).toMatch(
+        /^late armed late move deadline scroll\b/,
+      );
+      expect(log.slice(log.lastIndexOf("late armed")), `premise: no end reached the app after the late move (${what})`).not.toMatch(
+        /\bend\b/,
+      );
+      const at = await newestVisibleRow(page);
+      expect(at, "premise: a message should be visible").not.toBeNull();
+      expect(await distanceFromBottom(page), `premise: the reader is still inside the band (${what})`).toBeLessThanOrEqual(
+        BOTTOM_THRESHOLD_PX - 40 - IN_PLACE_TOLERANCE_PX,
+      );
+
+      await followDeliver(page, "join");
+      await expectRowHeld(page, at!, `the deadline settled over the late reader move, so the arrival snapped (${what})`);
+
+      const after = await followSettleRecord(page);
+      const pending = after.settle.filter((t) => t.cleared === null && t.fired === null);
+      expect(pending.length, `a fresh deadline after the late move (${JSON.stringify(after)})`).toBe(1);
+      expect(pending[0].at, "the fresh deadline was armed at the late move").toBe(late.at);
+      expect(pending[0].delay, "the fresh deadline is a full quiet interval").toBe(QUIET_MS);
+      await page.clock.runFor(late.at + QUIET_MS - 1 - after.now);
+      await followRealFrames(page, 2);
+      expect((await followSettleRecord(page)).settle.filter((t) => t.fired !== null).length, "the gesture settled early").toBe(1);
+      expect(await rowDrift(page, at!), "the hold let go before the fresh deadline").toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      const beforeSettle = await scrollTop(page);
+      await page.clock.runFor(1);
+      await followRealFrames(page, 2);
+      expect(await scrollTop(page), "the settle moved the view").toBe(beforeSettle);
+      expect(
+        (await followSettleRecord(page)).settle.filter((t) => t.fired !== null).map((t) => t.handle),
+        "premise: the fresh deadline settled the gesture",
+      ).toEqual([deadline.handle, pending[0].handle]);
+      await followDeliver(page, "arrival after the fresh deadline");
+      await expectSettledAtBottom(page, `the gesture settled inside the band was not followed (${await followLog(page)})`);
     } finally {
       await teardown(page);
     }

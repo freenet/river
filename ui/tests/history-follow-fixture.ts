@@ -19,6 +19,16 @@ import { SEEK_CLOCK_FRAME_MS } from "./history-scroll-fixture";
 // (`held`) until `followUngate` removes it (`followGate` puts it back). A gate is
 // for setup only: an end the test is about must reach the app, so the test
 // ungates first and checks the log for an `end` after its mark.
+//
+// With `observeSettle` (on the seek clock only) the recorder also watches the
+// app's quiet-deadline callback. It is identified once, by its registration
+// while a container `scrollend` is being dispatched to the app with a delay
+// (a correction's end refused, the one native-mode path that arms it from an
+// end); every registration of that same callback after it is recorded with its
+// delay, clear and firing (`followSettleRecord`), wherever it is made.
+// `followBeforeSettleFire` arms a one-shot action on it: just before its next
+// firing, in the same task, it moves `scrollTop` and records what it saw. It
+// only writes geometry; it dispatches nothing.
 
 /// One line of the timeline: an app frame stepped on the clock, or a reader move.
 /// `top` and `max` (the live end) are read once the step's work is over.
@@ -35,9 +45,33 @@ export type FollowEntry =
       delivered: boolean;
     };
 
+/// One registration of the app's quiet-deadline callback (`observeSettle`), on
+/// the page's clock.
+export type FollowSettleTimer = {
+  handle: number;
+  at: number;
+  delay: number;
+  cleared: number | null;
+  fired: number | null;
+};
+
+/// What a `followBeforeSettleFire` action saw, in the task the callback then ran in.
+export type FollowBeforeFire = {
+  handle: number;
+  at: number;
+  before: number;
+  after: number;
+  /// `scroll` events the app had had by then (its own move's cannot be among them).
+  scrolls: number;
+};
+
 type FollowRecorder = {
   entries: FollowEntry[];
   log: string[];
+  settle: FollowSettleTimer[];
+  beforeFire: FollowBeforeFire[];
+  /// Arm the one-shot action: move the view by `px` just before the callback fires.
+  armBeforeFire(px: number): void;
   /// Put the gate in place or remove it; whether it was in place before.
   setGate(on: boolean): boolean;
   /// After the next real rendering pass and the task after it.
@@ -53,8 +87,12 @@ declare global {
 
 /// Start the timeline. Pair with `followRecorderStop` in a `finally`. Needs the
 /// seek clock installed, unless `ownClock` says the test runs on the browser's.
-export async function followRecorderStart(page: Page, { gateEnds = false, ownClock = false } = {}) {
-  await page.evaluate(({ gateEnds, ownClock }) => {
+export async function followRecorderStart(
+  page: Page,
+  { gateEnds = false, ownClock = false, observeSettle = false } = {},
+) {
+  await page.evaluate(({ gateEnds, ownClock, observeSettle }) => {
+    if (ownClock && observeSettle) throw new Error("follow recorder: settle observation needs the seek clock");
     if (ownClock) window.__seekClockNative ??= { raf: window.requestAnimationFrame.bind(window), isNative: true };
     if (!window.__seekClockNative?.isNative) throw new Error("follow recorder: install the seek clock first");
     const raf = window.__seekClockNative.raf;
@@ -68,8 +106,20 @@ export async function followRecorderStart(page: Page, { gateEnds = false, ownClo
       log.push("held");
     };
     // At the target, after the app's own listeners: the app has had the event.
-    const onScroll = () => log.push("scroll");
+    let scrolls = 0;
+    const onScroll = () => {
+      scrolls++;
+      log.push("scroll");
+    };
     const onEnd = () => log.push("end");
+    const settle: FollowSettleTimer[] = [];
+    const beforeFire: FollowBeforeFire[] = [];
+    let settleCb: unknown = null;
+    let lateMovePx: number | null = null;
+    const duringAppEnd = () => {
+      const ev = (window as { event?: Event }).event;
+      return !!ev && ev.type === "scrollend" && ev.currentTarget === c;
+    };
     const setGate = (on: boolean) => {
       const was = gating;
       gating = on;
@@ -95,10 +145,30 @@ export async function followRecorderStart(page: Page, { gateEnds = false, ownClo
       let next = 1;
       window.setTimeout = function (cb: unknown, delay?: number, ...args: unknown[]) {
         const handle = next++;
+        if (observeSettle && settleCb === null && typeof cb === "function" && (delay ?? 0) > 0 && duringAppEnd()) {
+          settleCb = cb;
+        }
+        const timer: FollowSettleTimer | null =
+          settleCb !== null && cb === settleCb
+            ? { handle, at: Date.now(), delay: Number(delay ?? 0), cleared: null, fired: null }
+            : null;
+        if (timer) settle.push(timer);
         const run =
           typeof cb === "function"
             ? function (this: unknown, ...a: unknown[]) {
                 ids.delete(handle);
+                if (timer) {
+                  if (lateMovePx !== null) {
+                    const px = lateMovePx;
+                    lateMovePx = null;
+                    const before = c.scrollTop;
+                    c.scrollTop = before + px;
+                    beforeFire.push({ handle, at: Date.now(), before, after: c.scrollTop, scrolls });
+                    log.push("late move");
+                  }
+                  timer.fired = Date.now();
+                  log.push("deadline");
+                }
                 return (cb as (...a: unknown[]) => unknown).apply(this, a);
               }
             : cb;
@@ -106,6 +176,8 @@ export async function followRecorderStart(page: Page, { gateEnds = false, ownClo
         return handle;
       } as typeof window.setTimeout;
       window.clearTimeout = function (handle?: number) {
+        const timer = settle.find((t) => t.handle === handle && t.cleared === null && t.fired === null);
+        if (timer) timer.cleared = Date.now();
         const id = handle === undefined ? undefined : ids.get(handle);
         if (id === undefined) return clockClear.call(window, handle);
         ids.delete(handle!);
@@ -115,6 +187,12 @@ export async function followRecorderStart(page: Page, { gateEnds = false, ownClo
     window.__followRecorder = {
       entries: [],
       log,
+      settle,
+      beforeFire,
+      armBeforeFire(px) {
+        if (!observeSettle) throw new Error("follow recorder: started without observeSettle");
+        lateMovePx = px;
+      },
       setGate,
       afterRealFrame(then) {
         raf(() => {
@@ -131,6 +209,7 @@ export async function followRecorderStart(page: Page, { gateEnds = false, ownClo
         });
       },
       stop() {
+        lateMovePx = null;
         for (const p of ports) p.close();
         ports.clear();
         setGate(false);
@@ -139,7 +218,22 @@ export async function followRecorderStart(page: Page, { gateEnds = false, ownClo
         c.removeEventListener("scrollend", onEnd);
       },
     };
-  }, { gateEnds, ownClock });
+  }, { gateEnds, ownClock, observeSettle });
+}
+
+/// The quiet-deadline registrations and before-fire records so far (`observeSettle`).
+export function followSettleRecord(page: Page): Promise<{ now: number; settle: FollowSettleTimer[]; beforeFire: FollowBeforeFire[] }> {
+  return page.evaluate(() => {
+    const rec = window.__followRecorder!;
+    return JSON.parse(JSON.stringify({ now: Date.now(), settle: rec.settle, beforeFire: rec.beforeFire }));
+  });
+}
+
+/// Arm the one-shot action (`observeSettle`): just before the quiet-deadline
+/// callback next fires, move the view by `px` (negative is up), with no event of
+/// its own, and log `late move` then `deadline`.
+export function followBeforeSettleFire(page: Page, px: number) {
+  return page.evaluate((px) => window.__followRecorder!.armBeforeFire(px), px);
 }
 
 export async function followRecorderStop(page: Page): Promise<FollowEntry[]> {

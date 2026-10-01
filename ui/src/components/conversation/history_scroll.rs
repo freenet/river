@@ -1013,9 +1013,23 @@ impl HistoryScroll {
 
     /// The reader's quiet deadline has passed: the gesture settles wherever the
     /// view is. Hidden, it waits for the reveal's restore, as any settle does.
+    /// Unless the take-in finds the reader moved since their last delivered
+    /// scroll (a new revision) and the gesture goes on: that move is the
+    /// reader's latest, so a full quiet interval runs from it instead. Armed
+    /// here explicitly, since with `scrollend` the move's own intake does not
+    /// (the fired handle is already gone); a move that came back to the end has
+    /// made the follow `Free` and settles nothing.
     fn settle_quiet(&self) {
+        // The callback running now has fired.
         self.settle_timer.set(None);
+        let reader_rev = self.reader_rev.get();
         self.take_in_undelivered_scroll();
+        if self.reader_rev.get() != reader_rev
+            && matches!(self.follow.get(), Follow::Gesture { .. })
+        {
+            self.arm_quiet_deadline();
+            return;
+        }
         self.settle_eligible();
     }
 

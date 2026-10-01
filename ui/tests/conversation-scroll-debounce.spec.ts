@@ -3,6 +3,7 @@ import { callRiverTest } from "./river-test";
 import {
   DEBOUNCE_SETTLE_MS,
   debounceAdvance,
+  debounceBeforeSettleFire,
   debounceDeliver,
   debounceDeliverJoin,
   debounceDistanceFromBottom,
@@ -204,6 +205,71 @@ test.describe("Without scrollend, a gesture settles after 120ms of quiet", () =>
 
     await debounceDeliver(page, `arrival after the settle: ${"r".repeat(200)}`);
     await expectHeld(page, at, "the settle re-measured the pin outside the band, so the arrival snapped");
+  });
+
+  // A reader move the deadline finds already made, its `scroll` event not yet
+  // delivered, is still the reader moving. The deadline takes it in first; before,
+  // it then settled the gesture anyway, so a reader still scrolling up inside the
+  // band was snapped by the next short arrival. The move is written in the same
+  // task, just before the deadline's callback, so the browser has moved the view
+  // and not yet sent its `scroll`; the settle now waits a full quiet interval
+  // from that move.
+  test("a reader move just before the quiet deadline restarts it, counted from that move (controlled order: move → deadline → its scroll event)", async ({
+    page,
+  }) => {
+    const LATE_PX = -6;
+    await debounceOpenFilledRoom(page, "Team Chat Room");
+    await debounceExpectFallbackSelected(page);
+    const setup = await debouncePauseWhenQuiet(page);
+
+    await readerScrollsUp(page, UP_PX, "the upward scroll");
+    const armed = await expectFreshDeadline(page, "premise: the upward scroll armed the debounce");
+    await debounceBeforeSettleFire(page, LATE_PX);
+    await debounceAdvance(page, DEBOUNCE_SETTLE_MS);
+
+    const afterFire = await debounceState(page);
+    const late = afterFire.beforeFire;
+    const what = JSON.stringify({ late, registrations: afterFire.registrations.slice(setup) });
+    expect(late.length, `premise: the late move ran ahead of the deadline (${what})`).toBe(1);
+    expect(late[0].handle, `premise: it ran ahead of the armed deadline (${what})`).toBe(armed.handle);
+    expect(late[0].at - armed.at, `premise: at the deadline, 120ms after the scroll (${what})`).toBe(DEBOUNCE_SETTLE_MS);
+    expect(late[0].topAfter - late[0].topBefore, `premise: the late move went up (${what})`).toBeCloseTo(LATE_PX, 0);
+    expect(
+      afterFire.scrollsDelivered,
+      `premise: the late move's own scroll event arrived only after the deadline's callback (${what})`,
+    ).toBeGreaterThan(late[0].scrollsDelivered);
+    expect(
+      debounceFired(afterFire, setup).map((r) => r.handle),
+      `premise: the armed deadline is the one that fired (${what})`,
+    ).toEqual([armed.handle]);
+    const at = await page.evaluate(() => window.__riverDebounce.newestVisible());
+    expect(at, "premise: a message is visible").not.toBeNull();
+    expect(
+      await debounceDistanceFromBottom(page),
+      "premise: the reader is still inside the band",
+    ).toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX - 40 - IN_PLACE_TOLERANCE_PX);
+
+    await debounceDeliverJoin(page);
+    await expectHeld(page, at!, `the deadline settled over the late reader move, so the arrival snapped (${what})`);
+
+    const fresh = debounceOnlyPending(await debounceState(page), "a fresh deadline after the late move");
+    expect(fresh.at, "the fresh deadline was armed at the late move").toBe(late[0].at);
+    expect(fresh.delay, "the fresh deadline is a full quiet interval").toBe(DEBOUNCE_SETTLE_MS);
+    await debounceAdvance(page, fresh.at + DEBOUNCE_SETTLE_MS - 1 - (await debounceState(page)).now);
+    expect(
+      debounceFired(await debounceState(page), setup).map((r) => r.handle),
+      "the gesture settled before 120ms of quiet after the late move",
+    ).toEqual([armed.handle]);
+    await expectHeld(page, at!, "the hold let go before the fresh deadline");
+
+    const beforeSettle = await debounceScrollTop(page);
+    await debounceAdvance(page, 1);
+    expect(await debounceScrollTop(page), "the settle moved the view").toBe(beforeSettle);
+    expect(
+      debounceFired(await debounceState(page), setup).map((r) => r.handle),
+      "premise: the fresh deadline settled the gesture",
+    ).toEqual([armed.handle, fresh.handle]);
+    await expectFollowing(page, "arrival after the fresh settle", "a reader who settled inside the band was not followed");
   });
 
   // An anchor correction is our own write, and its `scroll` event is an echo:
