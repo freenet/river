@@ -610,7 +610,7 @@ declare global {
 }
 
 /// Runs in the page before the app (`addInitScript`), so it is self-contained.
-export function debounceInitScript() {
+function debounceInitScript() {
   const CONTAINER_ID = "chat-scroll-container";
   const SETTLE_MS = 120;
   const nativeHas = Reflect.has;
