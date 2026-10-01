@@ -17,6 +17,8 @@ import {
   followReaderMove,
   followRecorderStart,
   followRecorderStop,
+  followResizeBeforeEnd,
+  followResizeRecord,
   followSettleRecord,
   followTimeline,
   followUngate,
@@ -480,6 +482,64 @@ test.describe("An anchor correction's own scrollend", () => {
       ).toEqual([deadline.handle, pending[0].handle]);
       await followDeliver(page, "arrival after the fresh deadline");
       await expectSettledAtBottom(page, `the gesture settled inside the band was not followed (${await followLog(page)})`);
+    } finally {
+      await teardown(page);
+    }
+  });
+
+  // The correction's own end is recognised by where it left the view. A
+  // container resize between the correction and that end (the composer
+  // growing) moves the view's bottom edge and not its top, and nobody moved the
+  // view; before, the end no longer matched both edges, so it settled the held
+  // gesture and the observer's restore then snapped the reader. Matching now
+  // compares the top and the reader revision. The resize is made in a
+  // capture-phase listener ahead of the app's, at the correction's real end, so
+  // no observer can report it first.
+  test("a container resize just before the correction's end keeps the gesture held (controlled order: correction → resize → its end → observer)", async ({
+    page,
+  }) => {
+    const SHRINK_PX = 24;
+    try {
+      const at = await heldGesture(page);
+      await page.clock.runFor(READER_QUIET_MS);
+      expect(await followUngate(page), "premise: the gate was still in place").toBe(true);
+      await followRealFrames(page, 3);
+      await followResizeBeforeEnd(page, SHRINK_PX);
+      const grow = await followGrowAbove(page, GROW_PX);
+      expect(Math.abs(grow.after - grow.before), "premise: the growth did not clamp the view").toBeLessThanOrEqual(1);
+      const ended = await followAwaitAfter(page, "grow", "end", 20);
+      await followRealFrames(page, 3);
+      const log = await followLog(page);
+      const resize = await followResizeRecord(page);
+      const what = `${JSON.stringify({ grow, resize })}; ${log}`;
+      test.info().annotations.push({ type: "resize before the correction's end", description: what });
+      expect(ended, `premise: the correction's own scrollend reached the app (${what})`).toBe(true);
+      expect(resize.ran, `premise: the resize ran at the correction's end (${what})`).toBe(true);
+      expect(
+        log.slice(log.lastIndexOf("ungated")),
+        `premise: correction, then the resize at its end, which reached the app before any observer (${what})`,
+      ).toMatch(/^ungated (scroll )*grow (scroll )+resize end\b.*\bobserved\b/);
+      expect(
+        Math.abs(resize.before.top - grow.before - GROW_PX),
+        `premise: the correction moved the view by the growth before its end (${what})`,
+      ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      expect(resize.after.top, `premise: the resize left the top where the correction put it (${what})`).toBe(resize.before.top);
+      expect(resize.before.height - resize.after.height, `premise: the container shrank (${what})`).toBe(SHRINK_PX);
+      expect(await distanceFromBottom(page), `premise: the reader is still inside the band (${what})`).toBeLessThanOrEqual(
+        BOTTOM_THRESHOLD_PX - 40 - IN_PLACE_TOLERANCE_PX,
+      );
+
+      expect(
+        await rowDrift(page, at),
+        `the resized correction's end settled the held gesture, and the observer's restore then snapped the reader (${what})`,
+      ).toBeLessThanOrEqual(IN_PLACE_TOLERANCE_PX);
+      await expectShortArrivalHeld(page, at);
+      await toQuietDeadline(page);
+      await followDeliver(page, "arrival after the quiet deadline");
+      await expectSettledAtBottom(
+        page,
+        `the resized gesture did not settle at the reader's quiet deadline (${await followLog(page)})`,
+      );
     } finally {
       await teardown(page);
     }

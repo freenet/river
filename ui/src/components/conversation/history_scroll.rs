@@ -251,10 +251,13 @@ enum SettleCause {
 
 /// Whether a settle from `cause` ends the gesture, with the view at `now` and
 /// `reader_rev` the current reader revision. A quiet deadline always does, even
-/// at the corrected view: the reader has stopped. A native end exactly where our
-/// latest correction left the view, with no reader move since, may be that
-/// correction's own, so it does not; it cannot be told from the reader's last
-/// end coalesced with it, which is why the quiet deadline backs it up.
+/// at the corrected view: the reader has stopped. A native end with the view's
+/// top exactly where our latest correction left it, with no reader move since,
+/// may be that correction's own, so it does not; it cannot be told from the
+/// reader's last end coalesced with it, which is why the quiet deadline backs it
+/// up. The top only, exactly: the bottom edge also moves when the container is
+/// resized (the composer growing) before the observer has reported it, and that
+/// is not anyone moving the view.
 fn settle_ends_gesture(
     cause: SettleCause,
     correction: Option<Correction>,
@@ -262,7 +265,7 @@ fn settle_ends_gesture(
     reader_rev: u32,
 ) -> bool {
     cause == SettleCause::Quiet
-        || correction.is_none_or(|c| c.edges != now || c.reader_rev != reader_rev)
+        || correction.is_none_or(|c| c.edges.top != now.top || c.reader_rev != reader_rev)
 }
 
 /// Whether a settle that ends the gesture must put the view back first: a
@@ -1758,13 +1761,43 @@ mod tests {
         // Every end that matches is refused, not just the first: an engine can
         // send more than one for a write.
         assert!(!history.settle_allowed(SettleCause::Native, CORRECTED));
-        // Anywhere else, it is an end the correction cannot have caused.
-        for other in [edges(2299, 600), edges(2301, 600), edges(2300, 601)] {
+        // Any other top is an end the correction cannot have caused.
+        for other in [edges(2299, 600), edges(2301, 600)] {
             assert!(
                 history.settle_allowed(SettleCause::Native, other),
                 "{other:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_container_height_change_alone_keeps_our_corrections_end_refused() {
+        // The container resized under the corrected view before its end was
+        // read: only the bottom edge moved, and nobody moved the view.
+        let history = corrected_gesture();
+        let height = CORRECTED.bottom - CORRECTED.top;
+        for resized in [height - 40, height - 1, height + 1, height + 40] {
+            assert!(
+                !history.settle_allowed(SettleCause::Native, edges(CORRECTED.top, resized)),
+                "{resized}px tall"
+            );
+        }
+        // With the same resize, another top is still an end it cannot have caused.
+        for other in [
+            edges(CORRECTED.top - 1, height - 40),
+            edges(CORRECTED.top + 1, height + 40),
+        ] {
+            assert!(
+                history.settle_allowed(SettleCause::Native, other),
+                "{other:?}"
+            );
+        }
+        // A reader move since lets it settle at the corrected top, resized or not.
+        history.note_reader_move();
+        assert!(history.settle_allowed(SettleCause::Native, edges(CORRECTED.top, height - 40)));
+        // And the quiet deadline settles there whatever the height.
+        let history = corrected_gesture();
+        assert!(history.settle_allowed(SettleCause::Quiet, edges(CORRECTED.top, height + 40)));
     }
 
     #[test]

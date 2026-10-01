@@ -72,6 +72,8 @@ type FollowRecorder = {
   beforeFire: FollowBeforeFire[];
   /// Arm the one-shot action: move the view by `px` just before the callback fires.
   armBeforeFire(px: number): void;
+  /// Undone by `stop`: listeners, observers and styles a helper put in place.
+  cleanups: (() => void)[];
   /// Put the gate in place or remove it; whether it was in place before.
   setGate(on: boolean): boolean;
   /// After the next real rendering pass and the task after it.
@@ -189,6 +191,7 @@ export async function followRecorderStart(
       log,
       settle,
       beforeFire,
+      cleanups: [],
       armBeforeFire(px) {
         if (!observeSettle) throw new Error("follow recorder: started without observeSettle");
         lateMovePx = px;
@@ -210,6 +213,7 @@ export async function followRecorderStart(
       },
       stop() {
         lateMovePx = null;
+        for (const undo of this.cleanups.splice(0).reverse()) undo();
         for (const p of ports) p.close();
         ports.clear();
         setGate(false);
@@ -350,6 +354,61 @@ export function followGrowAboveThenEnd(page: Page, px: number, id: string) {
       }),
     { px, id },
   );
+}
+
+/// What `followResizeBeforeEnd` saw: the container's `scrollTop` and height
+/// just before and just after its resize, in the listener, and when it ran.
+export type FollowResize = {
+  ran: boolean;
+  before: { top: number; height: number };
+  after: { top: number; height: number };
+};
+
+/// Arm a one-shot, capture-phase `scrollend` listener on `window`, ahead of the
+/// app's: at the container's next end it shrinks the container by `px`
+/// (`max-height`, removed by `followRecorderStop`), forces layout with a geometry
+/// read and logs `resize`, so the app reads that end with the container already
+/// resized and before any ResizeObserver can report it (the mutation and the
+/// app's listener run in one task). It then logs `observed` at its own observer's
+/// first delivery on the container, which comes after the app's (made first).
+/// Read the record with `followResizeRecord`. The ordering is made, not native.
+export function followResizeBeforeEnd(page: Page, px: number) {
+  return page.evaluate((px) => {
+    const c = document.getElementById("chat-scroll-container")!;
+    const rec = window.__followRecorder!;
+    const record: FollowResize = {
+      ran: false,
+      before: { top: Number.NaN, height: Number.NaN },
+      after: { top: Number.NaN, height: Number.NaN },
+    };
+    (window as unknown as { __followResize: FollowResize }).__followResize = record;
+    let observer: ResizeObserver | null = null;
+    const onEnd = (e: Event) => {
+      if (e.target !== c) return;
+      window.removeEventListener("scrollend", onEnd, { capture: true });
+      record.ran = true;
+      record.before = { top: c.scrollTop, height: c.clientHeight };
+      c.style.maxHeight = `${c.clientHeight - px}px`;
+      record.after = { top: c.scrollTop, height: c.clientHeight };
+      rec.log.push("resize");
+      observer = new ResizeObserver(() => {
+        observer!.disconnect();
+        rec.log.push("observed");
+      });
+      observer.observe(c);
+    };
+    window.addEventListener("scrollend", onEnd, { capture: true });
+    rec.cleanups.push(() => {
+      window.removeEventListener("scrollend", onEnd, { capture: true });
+      observer?.disconnect();
+      c.style.removeProperty("max-height");
+      delete (window as unknown as { __followResize?: FollowResize }).__followResize;
+    });
+  }, px);
+}
+
+export function followResizeRecord(page: Page): Promise<FollowResize> {
+  return page.evaluate(() => (window as unknown as { __followResize: FollowResize }).__followResize);
 }
 
 /// The history's event-summary rows (join events and the like).
